@@ -10,3 +10,7 @@ class IntegrationDestinationType(enum.Enum):
 
 class IntegrationDestination(enum.Enum):
     BIGCOMMERCE = 1
+
+class BrandProvider(enum.Enum):
+    CATALOG = 1
+    DISTRIBUTOR = 2
