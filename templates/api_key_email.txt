@@ -1,0 +1,10 @@
+We are pleased to inform you that your new API key for JSON Cargo has been generated successfully. Below is your new API key:
+
+{{ api_key.key }}
+
+Please keep this key secure and do not share it with anyone.
+
+If you have any questions or need further assistance, please feel free to contact our support team.
+
+Best regards,
+The JSON Cargo Team
