@@ -1,5 +1,5 @@
 import enum
-
+from django.contrib.auth import models as auth_models
 from django.db import models as django_db_models
 
 class Company(django_db_models.Model):
@@ -108,3 +108,19 @@ class CompanyDestinationPartsHistory(django_db_models.Model):
     class Meta:
         db_table = "company_destination_parts_history"
         # unique_together = ["company_destination"]
+
+class UserProfile(django_db_models.Model):
+    user = django_db_models.OneToOneField(
+        auth_models.User, on_delete=django_db_models.CASCADE, related_name="profile"
+    )
+    company = django_db_models.ForeignKey(
+        Company,
+        on_delete=django_db_models.CASCADE,
+        related_name="user_profiles"
+    )
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "auth_user_profile"
