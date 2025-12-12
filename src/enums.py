@@ -14,3 +14,10 @@ class IntegrationDestination(enum.Enum):
 class BrandProvider(enum.Enum):
     CATALOG = 1
     DISTRIBUTOR = 2
+
+class BrandProviderKind(enum.Enum):
+    TURN_14 = 1
+
+class BrandProviderStatus(enum.Enum):
+    ACTIVE = 1
+    INACTIVE = 2
