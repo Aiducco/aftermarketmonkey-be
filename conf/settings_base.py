@@ -192,3 +192,5 @@ EMAIL_HOST_PASSWORD = "your-email-account-password"  # Replace with the actual p
 DEFAULT_FROM_EMAIL = "noreply@jsoncargo.com"
 
 LOGGING_EMAIL_RECIPIENT_LIST = ["hajdukbet@gmail.com"]
+
+TURN14_BASE_URL = 'https://api.turn14.com/v1'
