@@ -21,6 +21,8 @@ class JWTAuthenticationMiddleware:
                 token = auth_header.split()[1]
 
                 decoded_data = decode_jwt_token(token)
+
+                request.company_id = decoded_data.get("company_id")
                 user_id = decoded_data.get("user_id")
 
                 try:
