@@ -3,6 +3,7 @@ import typing
 import pgbulk
 
 from src import enums as src_enums
+from src import messages as src_messages
 from src import models as src_models
 from src.integrations.ecommerce.bigcommerce.gateways import client as bigcommerce_client
 from src.integrations.ecommerce.bigcommerce.gateways import exceptions as bigcommerce_exceptions
@@ -348,3 +349,120 @@ def fetch_and_sync_ecommerce_parts_for_company_brand_to_bigcommerce(
         2. Check if product needs to be synced 
         3. Sync product  
     '''
+    products_for_sync = prepare_products_for_syncing_into_bigcommerce(
+        company=company_brand.company_brand.company, brand=company_brand.company_brand.brand, destination=company_brand.destination
+    )
+
+
+
+def prepare_products_for_syncing_into_bigcommerce(
+        company: src_models.Company,
+        brand: src_models.Brands,
+        destination: src_models.CompanyDestinations
+) -> list[src_messages.BigCommercePart]:
+    '''
+        TODO:   BUILD CONFIGURATION BASED ON PREFERENCES
+
+    '''
+    brand_providers = src_models.BrandProviders.objects.filter(
+        brand=brand
+    )
+    if not brand_providers:
+        logger.error('{} No brand providers found for brand {}.'.format(
+            _LOG_PREFIX, brand.name
+        ))
+        raise Exception('{} No brand providers found for brand {}.'.format(_LOG_PREFIX, brand.name))
+
+    brand_parts = {}
+    for brand_provider in brand_providers:
+        if brand_provider.provider.kind_name == src_enums.BrandProviderKind.TURN_14.name:
+            try:
+                parts = prepare_turn_14_products_for_bigcommerce(brand=brand)
+            except Exception as e:
+                logger.exception('{} Error while preparing turn14 products for brand {}.'.format(_LOG_PREFIX, brand))
+                continue
+
+            brand_parts[src_enums.BrandProviderKind.TURN_14] = parts
+
+
+    return brand_parts[src_enums.BrandProviderKind.TURN_14]
+
+
+def prepare_turn_14_products_for_bigcommerce(brand: src_models.Brands) -> list[src_messages.BigCommercePart]:
+    bigcommerce_parts = []
+    turn_14_items = src_models.Turn14Items.objects.filter(
+        brand_id=brand.id
+    )
+
+    if not turn_14_items:
+        logger.info('{} No turn 14 items found for brand {}.'.format(_LOG_PREFIX, brand.name))
+        return []
+
+    bigcommerce_brand = src_models.BigCommerceBrands.objects.get(brand_id=brand.id)
+    turn_14_item_data = {
+        item_data.external_id: item_data for item_data in src_models.Turn14BrandData.objects.filter(brand_id=brand.id)
+    }
+    turn_14_item_pricing = {
+        item_data.external_id: item_data for item_data in src_models.Turn14BrandPricing.objects.filter(brand_id=brand.id)
+    }
+    turn_14_item_inventory = {
+        item_data.external_id: item_data for item_data in src_models.Turn14BrandPricing.objects.filter(brand_id=brand.id)
+    }
+    for turn_14_item in turn_14_items:
+        turn_14_pricing = turn_14_item_pricing.get(turn_14_item.external_id, None)
+        if not turn_14_pricing:
+            logger.info('{} No pricing found for item {}. Skipping'.format(_LOG_PREFIX, turn_14_item.external_id))
+            continue
+
+        turn_14_data = turn_14_item_data.get(turn_14_item.external_id, None)
+        if not turn_14_data:
+            logger.info('{} No data found for item {}. Skipping'.format(_LOG_PREFIX, turn_14_item.external_id))
+            continue
+
+
+        bigcommerce_part = src_messages.BigCommercePart(
+            brand_id=int(bigcommerce_brand.external_id),
+            product_title='{}{}'.format(turn_14_item.part_description, turn_14_item.part_number),
+            sku=turn_14_item.part_number,
+            mpn=turn_14_item.mfr_part_number,
+            default_price= _get_turn_14_price(turn_14_pricing),
+            weight=_get_turn_14_weight(turn_14_item=turn_14_item),
+            description=_get_turn_14_description(turn_14_data=turn_14_data),
+            images=[],
+            inventory=,
+            custom_fields=[],
+        )
+
+    return bigcommerce_parts
+
+
+def _get_turn_14_price(turn_14_pricing: src_models.Turn14BrandPricing) -> float:
+    # TODO: Improve and add correct pricing
+    price = 0.0
+    for price in turn_14_pricing.pricelists:
+        if price.get('name') == 'MAP':
+            price = price.get('price')
+
+
+    return price
+
+def _get_turn_14_weight(turn_14_item: src_models.Turn14Items) -> float:
+    weight = 0.0
+
+    if not turn_14_item.dimensions:
+        return weight
+
+    weight_in_lbs = turn_14_item.dimensions[0].get('weight', 0)
+
+    return weight_in_lbs * 16
+
+def _get_turn_14_description(turn_14_data: src_models.Turn14BrandData) -> str:
+    description = ''
+    for turn_14_desc in turn_14_data.descriptions:
+        if turn_14_desc.get('type') == 'Market Description':
+            description += turn_14_desc.get('description')
+
+        if turn_14_desc.get('type') == 'Product Description - Extended':
+            description += turn_14_desc.get('description')
+
+    return description
