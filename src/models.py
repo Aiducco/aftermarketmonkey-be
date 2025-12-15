@@ -162,6 +162,8 @@ class Turn14Brand(django_db_models.Model):
 class CompanyBrands(django_db_models.Model):
     company = django_db_models.ForeignKey(Company, on_delete=django_db_models.CASCADE, related_name="brands")
     brand = django_db_models.ForeignKey(Brands, on_delete=django_db_models.CASCADE, related_name="brands")
+    status = django_db_models.PositiveSmallIntegerField()
+    status_name = django_db_models.CharField(max_length=255)
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
@@ -169,6 +171,18 @@ class CompanyBrands(django_db_models.Model):
     class Meta:
         db_table = "company_brands"
         unique_together = ["company", "brand"]
+
+
+class CompanyBrandDestination(django_db_models.Model):
+    company_brand = django_db_models.ForeignKey(CompanyBrands, on_delete=django_db_models.CASCADE, related_name="destinations")
+    destination = django_db_models.ForeignKey(CompanyDestinations, on_delete=django_db_models.CASCADE, related_name="company_brands")
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "company_brand_destination"
+        unique_together = ["company_brand", "destination"]
 
 
 class BrandTurn14BrandMapping(django_db_models.Model):
@@ -271,3 +285,32 @@ class Turn14BrandInventory(django_db_models.Model):
     class Meta:
         db_table = "turn14_brand_inventory"
         unique_together = ["external_id"]
+
+
+class BigCommerceParts(django_db_models.Model):
+    external_id = django_db_models.CharField(max_length=255)
+    sku = django_db_models.TextField(max_length=255)
+    raw_data = django_db_models.JSONField(null=True)
+    external_brand_id = django_db_models.CharField(max_length=255, null=True)
+    company_destination = django_db_models.ForeignKey(CompanyDestinations, on_delete=django_db_models.CASCADE, related_name="bigcommerce_parts")
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "bigcommerce_parts"
+        unique_together = ["external_id", "sku", "company_destination"]
+
+
+class BigCommerceBrands(django_db_models.Model):
+    external_id = django_db_models.CharField(max_length=255)
+    name = django_db_models.TextField(max_length=255)
+    brand = django_db_models.ForeignKey(Brands, on_delete=django_db_models.CASCADE, related_name="bigcommerce_brands")
+    company_destination = django_db_models.ForeignKey(CompanyDestinations, on_delete=django_db_models.CASCADE, related_name="bigcommerce_brands")
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "bigcommerce_brands"
+        unique_together = ["external_id", "brand", "company_destination"]
