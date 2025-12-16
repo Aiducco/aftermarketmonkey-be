@@ -13,4 +13,5 @@ class BigCommercePart:
     images: list
     inventory: int
     custom_fields: list
+    active: bool
 

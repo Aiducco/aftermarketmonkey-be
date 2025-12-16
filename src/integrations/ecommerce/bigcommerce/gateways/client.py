@@ -22,7 +22,7 @@ REQUESTS_PER_30_SECONDS = 150
 
 class BigCommerceApiClient(object):
     API_BASE_URL = "https://api.bigcommerce.com/stores"
-    VALID_STATUS_CODES = [200]
+    VALID_STATUS_CODES = [200, 201, 207]
     RATE_LIMIT_STATUS_CODE = 429
 
     LOG_PREFIX = "[BIGCOMMERCE-API-CLIENT]"
@@ -167,4 +167,30 @@ class BigCommerceApiClient(object):
         next_page = None if page >= total_pages else potential_next_page
 
         return data, next_page
+
+    def create_product(self, product_data: typing.Dict) -> typing.Dict:
+        response = simplejson.loads(
+            self._request(
+                endpoint="catalog/products",
+                method=common_enums.HttpMethod.POST,
+                payload=product_data,
+                params={
+                    "include": "images,custom_fields",
+                },
+            ).content
+        )
+        return response.get("data", {})
+
+    def update_product(self, product_id: int, product_data: typing.Dict) -> typing.Dict:
+        response = simplejson.loads(
+            self._request(
+                endpoint=f"catalog/products/{product_id}",
+                method=common_enums.HttpMethod.PUT,
+                payload=product_data,
+                params={
+                    "include": "images,custom_fields",
+                },
+            ).content
+        )
+        return response.get("data", {})
 
