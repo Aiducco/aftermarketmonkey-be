@@ -105,9 +105,12 @@ class CompanyDestinationPartsPreferences(django_db_models.Model):
 
 class CompanyDestinationParts(django_db_models.Model):
     company_destination = django_db_models.ForeignKey(CompanyDestinations, on_delete=django_db_models.CASCADE, related_name="parts")
+    part_unique_key = django_db_models.CharField(max_length=255)
     source_data = django_db_models.JSONField()
-    source_external_id = django_db_models.CharField(max_length=255)
-    brand_id = django_db_models.ForeignKey(Brands, on_delete=django_db_models.CASCADE, related_name="parts")
+    source_external_id = django_db_models.TextField()
+    destination_data = django_db_models.JSONField(null=True)
+    destination_external_id = django_db_models.TextField(null=True)
+    brand = django_db_models.ForeignKey(Brands, on_delete=django_db_models.CASCADE, related_name="parts")
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
@@ -116,16 +119,7 @@ class CompanyDestinationParts(django_db_models.Model):
         db_table = "company_destination_parts"
         # unique_together = ["company_destination"]
 
-class CompanyDestinationPartsHistory(django_db_models.Model):
-    destination_part = django_db_models.ForeignKey(CompanyDestinationParts, on_delete=django_db_models.CASCADE, related_name="history")
-    data = django_db_models.JSONField()
 
-    created_at = django_db_models.DateTimeField(auto_now_add=True)
-    updated_at = django_db_models.DateTimeField(auto_now=True)
-
-    class Meta:
-        db_table = "company_destination_parts_history"
-        # unique_together = ["company_destination"]
 
 class UserProfile(django_db_models.Model):
     user = django_db_models.OneToOneField(
@@ -184,6 +178,38 @@ class CompanyBrandDestination(django_db_models.Model):
         db_table = "company_brand_destination"
         unique_together = ["company_brand", "destination"]
 
+
+class CompanyDestinationExecutionRun(django_db_models.Model):
+    company_brand_destination = django_db_models.ForeignKey(CompanyBrandDestination, on_delete=django_db_models.CASCADE, related_name="execution_runs")
+    status = django_db_models.PositiveSmallIntegerField()
+    status_name = django_db_models.CharField(max_length=255)
+    products_processed = django_db_models.IntegerField(default=0)
+    products_created = django_db_models.IntegerField(default=0)
+    products_updated = django_db_models.IntegerField(default=0)
+    products_failed = django_db_models.IntegerField(default=0)
+    error_message = django_db_models.TextField(null=True)
+    message = django_db_models.TextField(null=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+    completed_at = django_db_models.DateTimeField(null=True)
+
+    class Meta:
+        db_table = "company_destination_execution_run"
+
+class CompanyDestinationPartsHistory(django_db_models.Model):
+    destination_part = django_db_models.ForeignKey(CompanyDestinationParts, on_delete=django_db_models.CASCADE, related_name="history")
+    execution_run = django_db_models.ForeignKey(CompanyDestinationExecutionRun, on_delete=django_db_models.CASCADE, related_name="history_records", null=True)
+    data = django_db_models.JSONField()
+    changes = django_db_models.JSONField(null=True)
+    synced = django_db_models.BooleanField(default=False)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "company_destination_parts_history"
+        # unique_together = ["company_destination"]
 
 class BrandTurn14BrandMapping(django_db_models.Model):
     brand = django_db_models.ForeignKey(Brands, on_delete=django_db_models.CASCADE, related_name="turn14_brand_mappings")

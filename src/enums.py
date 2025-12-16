@@ -26,3 +26,8 @@ class BrandProviderStatus(enum.Enum):
 class CompanyBrandStatus(enum.Enum):
     ACTIVE = 1
     INACTIVE = 2
+
+class DestinationExecutionRunStatus(enum.Enum):
+    STARTED = 1
+    COMPLETED = 2
+    FAILED = 3
