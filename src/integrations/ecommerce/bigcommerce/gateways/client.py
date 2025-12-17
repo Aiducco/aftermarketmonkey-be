@@ -22,7 +22,7 @@ REQUESTS_PER_30_SECONDS = 150
 
 class BigCommerceApiClient(object):
     API_BASE_URL = "https://api.bigcommerce.com/stores"
-    VALID_STATUS_CODES = [200, 201, 207]
+    VALID_STATUS_CODES = [200, 201, 204, 207]
     RATE_LIMIT_STATUS_CODE = 429
 
     LOG_PREFIX = "[BIGCOMMERCE-API-CLIENT]"
@@ -187,6 +187,43 @@ class BigCommerceApiClient(object):
                 endpoint=f"catalog/products/{product_id}",
                 method=common_enums.HttpMethod.PUT,
                 payload=product_data,
+                params={
+                    "include": "images,custom_fields",
+                },
+            ).content
+        )
+        return response.get("data", {})
+
+    def get_product_images(self, product_id: int) -> typing.List[typing.Dict]:
+        response = simplejson.loads(
+            self._request(
+                endpoint=f"catalog/products/{product_id}/images",
+                method=common_enums.HttpMethod.GET,
+            ).content
+        )
+        return response.get("data", [])
+
+    def delete_product_image(self, product_id: int, image_id: int) -> None:
+        self._request(
+            endpoint=f"catalog/products/{product_id}/images/{image_id}",
+            method=common_enums.HttpMethod.DELETE,
+        )
+
+    def create_product_image(self, product_id: int, image_data: typing.Dict) -> typing.Dict:
+        response = simplejson.loads(
+            self._request(
+                endpoint=f"catalog/products/{product_id}/images",
+                method=common_enums.HttpMethod.POST,
+                payload=image_data,
+            ).content
+        )
+        return response.get("data", {})
+
+    def get_product(self, product_id: int) -> typing.Dict:
+        response = simplejson.loads(
+            self._request(
+                endpoint=f"catalog/products/{product_id}",
+                method=common_enums.HttpMethod.GET,
                 params={
                     "include": "images,custom_fields",
                 },

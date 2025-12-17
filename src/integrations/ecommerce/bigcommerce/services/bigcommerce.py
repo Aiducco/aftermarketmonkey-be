@@ -540,13 +540,18 @@ def prepare_turn_14_products_for_bigcommerce(brand: src_models.Brands) -> list[s
             continue
 
 
+        default_price, msrp = _get_turn_14_prices(turn_14_pricing)
+        cost = _get_turn_14_cost(turn_14_pricing)
+        
         bigcommerce_parts.append(
             src_messages.BigCommercePart(
                 brand_id=int(bigcommerce_brand.external_id),
-                product_title='{}{}'.format(turn_14_item.part_description, turn_14_item.part_number),
+                product_title='{} - {}'.format(turn_14_item.part_description, turn_14_item.part_number),
                 sku=turn_14_item.part_number,
                 mpn=turn_14_item.mfr_part_number,
-                default_price= _get_turn_14_price(turn_14_pricing),
+                default_price=default_price,
+                cost=cost,
+                msrp=msrp,
                 weight=_get_turn_14_weight(turn_14_item=turn_14_item),
                 description=_get_turn_14_description(turn_14_data=turn_14_data),
                 images=_get_turn_14_images(turn_14_item=turn_14_item, turn_14_data=turn_14_data),
@@ -559,22 +564,55 @@ def prepare_turn_14_products_for_bigcommerce(brand: src_models.Brands) -> list[s
     return bigcommerce_parts
 
 
-def _get_turn_14_price(turn_14_pricing: src_models.Turn14BrandPricing) -> float:
-    price = 0.0
+def _get_turn_14_prices(turn_14_pricing: src_models.Turn14BrandPricing) -> typing.Tuple[float, float]:
+    default_price = 0.0
+    msrp = 0.0
+    
     if not turn_14_pricing.pricelists:
-        return price
+        return default_price, msrp
 
+    map_price = None
+    retail_price = None
+    msrp_price = None
+    
     for pricelist_item in turn_14_pricing.pricelists:
-        if isinstance(pricelist_item, dict) and pricelist_item.get('name') == 'MAP':
-            price_value = pricelist_item.get('price')
-            if price_value is not None:
-                try:
-                    price = float(price_value)
-                    break
-                except (ValueError, TypeError):
-                    continue
+        if not isinstance(pricelist_item, dict):
+            continue
+            
+        pricelist_name = pricelist_item.get('name')
+        price_value = pricelist_item.get('price')
+        
+        if price_value is None:
+            continue
+            
+        try:
+            price_float = float(price_value)
+            
+            if pricelist_name == 'MAP':
+                map_price = price_float
+            elif pricelist_name == 'Retail':
+                retail_price = price_float
+            elif pricelist_name == 'MSRP':
+                msrp_price = price_float
+        except (ValueError, TypeError):
+            continue
 
-    return price
+    # For default_price: use MAP if available, otherwise Retail, otherwise MSRP
+    default_price = map_price if map_price is not None else (retail_price if retail_price is not None else (msrp_price if msrp_price is not None else 0.0))
+    
+    # For retail_price (MSRP): use Retail if available, otherwise MSRP
+    msrp = retail_price if retail_price is not None else (msrp_price if msrp_price is not None else 0.0)
+    
+    return default_price, msrp
+
+
+def _get_turn_14_cost(turn_14_pricing: src_models.Turn14BrandPricing) -> float:
+    if turn_14_pricing.purchase_cost is not None:
+        try:
+            return float(turn_14_pricing.purchase_cost)
+        except (ValueError, TypeError):
+            pass
+    return 0.0
 
 def _get_turn_14_weight(turn_14_item: src_models.Turn14Items) -> float:
     weight = 0.0
@@ -682,8 +720,10 @@ def _update_product_on_bigcommerce(
             _LOG_PREFIX, product_to_sync.sku, bigcommerce_part.external_id
         ))
 
+        product_id = int(bigcommerce_part.external_id)
+
         try:
-            product_api_data = _transform_bigcommerce_part_to_api_format(product_to_sync)
+            product_api_data = _transform_bigcommerce_part_to_api_format(product_to_sync, include_images=False)
         except Exception as e:
             logger.error('{} Error transforming product data for update (sku={}). Error: {}.'.format(
                 _LOG_PREFIX, product_to_sync.sku, str(e)
@@ -692,7 +732,7 @@ def _update_product_on_bigcommerce(
 
         try:
             product_response = api_client.update_product(
-                product_id=int(bigcommerce_part.external_id),
+                product_id=product_id,
                 product_data=product_api_data
             )
             external_id = str(product_response.get('id', bigcommerce_part.external_id))
@@ -701,6 +741,89 @@ def _update_product_on_bigcommerce(
                 _LOG_PREFIX, product_to_sync.sku, str(e)
             ))
             return False
+
+        if product_to_sync.images:
+            try:
+                new_image_urls = set()
+                for img in product_to_sync.images:
+                    image_url = img.get('image_url', '').strip()
+                    if image_url:
+                        new_image_urls.add(image_url)
+                
+                existing_image_urls = set()
+                if company_destination_part and company_destination_part.destination_data:
+                    destination_data = company_destination_part.destination_data
+                    existing_images = destination_data.get('images', [])
+                    for existing_img in existing_images:
+                        if isinstance(existing_img, dict):
+                            image_url = existing_img.get('image_url', '').strip()
+                            if image_url:
+                                existing_image_urls.add(image_url)
+                
+                images_to_delete = existing_image_urls - new_image_urls
+                images_to_create = new_image_urls - existing_image_urls
+                
+                if images_to_delete:
+                    existing_images_api = api_client.get_product_images(product_id)
+                    existing_image_map = {}
+                    for existing_image in existing_images_api:
+                        image_id = existing_image.get('id')
+                        if not image_id:
+                            continue
+                        image_url = (
+                            existing_image.get('url_standard') or
+                            existing_image.get('url_thumbnail') or
+                            existing_image.get('url') or
+                            ''
+                        ).strip()
+                        if image_url:
+                            existing_image_map[image_url] = image_id
+                    
+                    for image_url in images_to_delete:
+                        image_id = existing_image_map.get(image_url)
+                        if not image_id:
+                            continue
+                        try:
+                            api_client.delete_product_image(product_id, image_id)
+                            logger.debug('{} Deleted image (sku={}, image_id={}, image_url={}).'.format(
+                                _LOG_PREFIX, product_to_sync.sku, image_id, image_url
+                            ))
+                        except bigcommerce_exceptions.BigCommerceAPIException as e:
+                            logger.warning('{} Error deleting existing image (sku={}, image_id={}). Error: {}.'.format(
+                                _LOG_PREFIX, product_to_sync.sku, image_id, str(e)
+                            ))
+                
+                for img in product_to_sync.images:
+                    image_url = img.get('image_url', '').strip()
+                    if not image_url or image_url not in images_to_create:
+                        continue
+                    try:
+                        api_client.create_product_image(
+                            product_id=product_id,
+                            image_data={
+                                'image_url': image_url,
+                                'is_thumbnail': img.get('is_thumbnail', False),
+                            }
+                        )
+                        logger.debug('{} Created image (sku={}, image_url={}).'.format(
+                            _LOG_PREFIX, product_to_sync.sku, image_url
+                        ))
+                    except bigcommerce_exceptions.BigCommerceAPIException as e:
+                        logger.warning('{} Error creating image (sku={}, image_url={}). Error: {}.'.format(
+                            _LOG_PREFIX, product_to_sync.sku, image_url, str(e)
+                        ))
+                
+                if images_to_delete or images_to_create:
+                    try:
+                        product_response = api_client.get_product(product_id)
+                    except bigcommerce_exceptions.BigCommerceAPIException as e:
+                        logger.warning('{} Error fetching updated product after image changes (sku={}). Error: {}.'.format(
+                            _LOG_PREFIX, product_to_sync.sku, str(e)
+                        ))
+            except Exception as e:
+                logger.warning('{} Error managing images for product (sku={}). Error: {}.'.format(
+                    _LOG_PREFIX, product_to_sync.sku, str(e)
+                ))
 
         company_destination_part = _upsert_company_destination_part(
             product_to_sync=product_to_sync,
@@ -845,7 +968,7 @@ def _mark_history_as_synced(
     ).update(synced=True, execution_run=execution_run)
 
 
-def _transform_bigcommerce_part_to_api_format(part: src_messages.BigCommercePart) -> typing.Dict:
+def _transform_bigcommerce_part_to_api_format(part: src_messages.BigCommercePart, include_images: bool = True) -> typing.Dict:
     price_value = part.default_price
     if isinstance(price_value, (dict, list)):
         price = 0.0
@@ -864,6 +987,24 @@ def _transform_bigcommerce_part_to_api_format(part: src_messages.BigCommercePart
         except (ValueError, TypeError):
             weight = 0.0
 
+    cost_value = part.cost
+    if isinstance(cost_value, (dict, list)):
+        cost = 0.0
+    else:
+        try:
+            cost = float(cost_value) if cost_value is not None else 0.0
+        except (ValueError, TypeError):
+            cost = 0.0
+
+    msrp_value = part.msrp
+    if isinstance(msrp_value, (dict, list)):
+        msrp = 0.0
+    else:
+        try:
+            msrp = float(msrp_value) if msrp_value is not None else 0.0
+        except (ValueError, TypeError):
+            msrp = 0.0
+
     product_data = {
         'name': part.product_title,
         'type': 'physical',
@@ -875,12 +1016,14 @@ def _transform_bigcommerce_part_to_api_format(part: src_messages.BigCommercePart
         'inventory_level': int(part.inventory) if part.inventory else 0,
         'inventory_tracking': 'product',
         'is_visible': bool(part.active),
+        'cost_price': cost,
+        'retail_price': msrp,
     }
 
     if part.mpn:
         product_data['mpn'] = part.mpn
 
-    if part.images:
+    if include_images and part.images:
         product_data['images'] = [
             {
                 'image_url': img.get('image_url', ''),
@@ -889,6 +1032,7 @@ def _transform_bigcommerce_part_to_api_format(part: src_messages.BigCommercePart
             for img in part.images
             if img.get('image_url')
         ]
+
 
     if part.custom_fields:
         product_data['custom_fields'] = part.custom_fields
@@ -985,6 +1129,7 @@ def _convert_bigcommerce_response_to_part_format(bigcommerce_response: typing.Di
                             'image_url': image_url,
                             'is_thumbnail': img.get('is_thumbnail', False),
                         })
+
     elif 'primary_image' in bigcommerce_response and bigcommerce_response['primary_image']:
         primary_img = bigcommerce_response['primary_image']
         if isinstance(primary_img, dict):
@@ -1003,12 +1148,26 @@ def _convert_bigcommerce_response_to_part_format(bigcommerce_response: typing.Di
         if isinstance(custom_fields_data, list):
             custom_fields = custom_fields_data
 
+    cost = 0.0
+    try:
+        cost = float(bigcommerce_response.get('cost_price', 0.0))
+    except (ValueError, TypeError):
+        pass
+
+    msrp = 0.0
+    try:
+        msrp = float(bigcommerce_response.get('retail_price', 0.0))
+    except (ValueError, TypeError):
+        pass
+
     return {
         'brand_id': int(bigcommerce_response.get('brand_id', 0)),
         'product_title': bigcommerce_response.get('name', ''),
         'sku': bigcommerce_response.get('sku', ''),
         'mpn': bigcommerce_response.get('mpn', ''),
         'default_price': float(bigcommerce_response.get('price', 0.0)),
+        'cost': cost,
+        'msrp': msrp,
         'weight': float(bigcommerce_response.get('weight', 0.0)),
         'description': bigcommerce_response.get('description', ''),
         'images': images,
@@ -1024,22 +1183,97 @@ def _compare_bigcommerce_parts(
 ) -> typing.Dict:
     changes = {}
 
-    fields_to_compare = [
-        'brand_id', 'product_title', 'sku', 'mpn', 'default_price',
-        'weight', 'description', 'images', 'inventory', 'custom_fields', 'active'
-    ]
+    old_brand_id = old_data.get('brand_id')
+    new_brand_id = new_data.get('brand_id')
+    if _values_different(old_brand_id, new_brand_id):
+        changes['brand_id'] = new_brand_id
 
-    for field in fields_to_compare:
-        old_value = old_data.get(field)
-        new_value = new_data.get(field)
+    old_product_title = old_data.get('product_title')
+    new_product_title = new_data.get('product_title')
+    if _values_different(old_product_title, new_product_title):
+        changes['product_title'] = new_product_title
 
-        if _values_different(old_value, new_value):
-            changes[field] = {
-                'old': old_value,
-                'new': new_value,
-            }
+    old_sku = old_data.get('sku')
+    new_sku = new_data.get('sku')
+    if _values_different(old_sku, new_sku):
+        changes['sku'] = new_sku
+
+    old_mpn = old_data.get('mpn')
+    new_mpn = new_data.get('mpn')
+    if _values_different(old_mpn, new_mpn):
+        changes['mpn'] = new_mpn
+
+    old_default_price = old_data.get('default_price')
+    new_default_price = new_data.get('default_price')
+    if _values_different(old_default_price, new_default_price):
+        changes['default_price'] = new_default_price
+
+    old_cost = old_data.get('cost')
+    new_cost = new_data.get('cost')
+    if _values_different(old_cost, new_cost):
+        changes['cost'] = new_cost
+
+    old_msrp = old_data.get('msrp')
+    new_msrp = new_data.get('msrp')
+    if _values_different(old_msrp, new_msrp):
+        changes['msrp'] = new_msrp
+
+    old_weight = old_data.get('weight')
+    new_weight = new_data.get('weight')
+    if _values_different(old_weight, new_weight):
+        changes['weight'] = new_weight
+
+    old_description = old_data.get('description')
+    new_description = new_data.get('description')
+    if _values_different(old_description, new_description):
+        changes['description'] = new_description
+
+    # old_images = old_data.get('images')
+    # new_images = new_data.get('images')
+    # if _images_different(old_images, new_images):
+    #     changes['images'] = new_images
+
+    old_inventory = old_data.get('inventory')
+    new_inventory = new_data.get('inventory')
+    if _values_different(old_inventory, new_inventory):
+        changes['inventory'] = new_inventory
+
+    old_custom_fields = old_data.get('custom_fields')
+    new_custom_fields = new_data.get('custom_fields')
+    if _values_different(old_custom_fields, new_custom_fields):
+        changes['custom_fields'] = new_custom_fields
+
+    old_active = old_data.get('active')
+    new_active = new_data.get('active')
+    if _values_different(old_active, new_active):
+        changes['active'] = new_active
 
     return changes
+
+
+def _images_different(old_images: typing.Any, new_images: typing.Any) -> bool:
+    if old_images == new_images:
+        return False
+
+    if old_images is None or new_images is None:
+        return old_images != new_images
+
+    if not isinstance(old_images, list) or not isinstance(new_images, list):
+        return old_images != new_images
+
+    if len(old_images) != len(new_images):
+        return True
+
+    if not old_images and not new_images:
+        return False
+
+    def normalize_image(img: typing.Dict) -> str:
+        return img.get('image_url', '').strip()
+
+    old_normalized = sorted([normalize_image(img) for img in old_images if isinstance(img, dict)])
+    new_normalized = sorted([normalize_image(img) for img in new_images if isinstance(img, dict)])
+
+    return old_normalized != new_normalized
 
 
 def _values_different(old_value: typing.Any, new_value: typing.Any) -> bool:
