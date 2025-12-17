@@ -8,6 +8,8 @@ class BigCommercePart:
     sku: str
     mpn: str
     default_price: float
+    cost: float
+    msrp: float
     weight: float
     description: str
     images: list
