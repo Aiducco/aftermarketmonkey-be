@@ -144,6 +144,10 @@ def fetch_and_save_all_turn_14_brand_items() -> None:
 
     for brand_provider in all_brands:
         brand = brand_provider.brand
+
+        if brand.status_name != src_enums.BrandProviderStatus.ACTIVE.name:
+            logger.info('{} Brand {} status is not active'.format(_LOG_PREFIX, brand.name))
+            continue
         
         brand_mapping = src_models.BrandTurn14BrandMapping.objects.filter(
             brand=brand
@@ -344,7 +348,11 @@ def fetch_and_save_all_turn_14_brand_data() -> None:
 
     for brand_provider in all_brands:
         brand = brand_provider.brand
-        
+
+        if brand.status_name != src_enums.BrandProviderStatus.ACTIVE.name:
+            logger.info('{} Brand {} status is not active'.format(_LOG_PREFIX, brand.name))
+            continue
+
         brand_mapping = src_models.BrandTurn14BrandMapping.objects.filter(
             brand=brand
         ).first()
@@ -506,7 +514,11 @@ def fetch_and_save_all_turn_14_brand_pricing() -> None:
 
     for brand_provider in all_brands:
         brand = brand_provider.brand
-        
+
+        if brand.status_name != src_enums.BrandProviderStatus.ACTIVE.name:
+            logger.info('{} Brand {} status is not active'.format(_LOG_PREFIX, brand.name))
+            continue
+
         brand_mapping = src_models.BrandTurn14BrandMapping.objects.filter(
             brand=brand
         ).first()
@@ -678,7 +690,11 @@ def fetch_and_save_all_turn_14_brand_inventory() -> None:
 
     for brand_provider in all_brands:
         brand = brand_provider.brand
-        
+
+        if brand.status_name != src_enums.BrandProviderStatus.ACTIVE.name:
+            logger.info('{} Brand {} status is not active'.format(_LOG_PREFIX, brand.name))
+            continue
+
         brand_mapping = src_models.BrandTurn14BrandMapping.objects.filter(
             brand=brand
         ).first()
