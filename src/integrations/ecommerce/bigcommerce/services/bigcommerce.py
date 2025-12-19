@@ -2,9 +2,11 @@ import dataclasses
 import logging
 import typing
 import pgbulk
+from urllib.parse import quote, urlparse, urlunparse
 from django.db.models.functions import TruncWeek
 from django.utils import timezone
 
+from src import constants as src_constants
 from src import enums as src_enums
 from src import messages as src_messages
 from src import models as src_models
@@ -480,10 +482,6 @@ def prepare_products_for_syncing_into_bigcommerce(
         brand: src_models.Brands,
         destination: src_models.CompanyDestinations
 ) -> list[src_messages.BigCommercePart]:
-    '''
-        TODO:   BUILD CONFIGURATION BASED ON PREFERENCES
-
-    '''
     brand_providers = src_models.BrandProviders.objects.filter(
         brand=brand
     )
@@ -493,19 +491,522 @@ def prepare_products_for_syncing_into_bigcommerce(
         ))
         raise Exception('{} No brand providers found for brand {}.'.format(_LOG_PREFIX, brand.name))
 
-    brand_parts = {}
+    # Group providers by type (CATALOG vs DISTRIBUTOR)
+    catalog_providers = []
+    distributor_providers = []
+    
     for brand_provider in brand_providers:
-        if brand_provider.provider.kind_name == src_enums.BrandProviderKind.TURN_14.name:
-            try:
-                parts = prepare_turn_14_products_for_bigcommerce(brand=brand)
-            except Exception as e:
-                logger.exception('{} Error while preparing turn14 products for brand {}.'.format(_LOG_PREFIX, brand))
+        provider = brand_provider.provider
+        provider_type = provider.type_name
+        
+        if provider_type == src_enums.BrandProvider.CATALOG.name:
+            catalog_providers.append(brand_provider)
+        elif provider_type == src_enums.BrandProvider.DISTRIBUTOR.name:
+            distributor_providers.append(brand_provider)
+    
+    # Prepare parts from all CATALOG providers (grouped by provider)
+    catalog_parts_by_provider = {}
+    for catalog_provider in catalog_providers:
+        try:
+            parts = _prepare_parts_by_kind(catalog_provider.provider.kind_name, brand)
+            # Store parts by provider
+            catalog_parts_by_provider[catalog_provider] = {part.sku: part for part in parts}
+        except Exception as e:
+            logger.exception('{} Error while preparing catalog products (kind: {}) for brand {}. Error: {}.'.format(
+                _LOG_PREFIX, catalog_provider.provider.kind_name, brand, str(e)
+            ))
+    
+    # Prepare parts from all DISTRIBUTOR providers (grouped by provider)
+    distributor_parts_by_provider = {}
+    for distributor_provider in distributor_providers:
+        try:
+            parts = _prepare_parts_by_kind(distributor_provider.provider.kind_name, brand)
+            # Store parts by provider
+            distributor_parts_by_provider[distributor_provider] = {part.sku: part for part in parts}
+        except Exception as e:
+            logger.exception('{} Error while preparing distributor products (kind: {}) for brand {}. Error: {}.'.format(
+                _LOG_PREFIX, distributor_provider.provider.kind_name, brand, str(e)
+            ))
+    
+    # Use parts from first catalog provider (later we'll add logic to determine which provider to use)
+    catalog_parts = {}
+    if catalog_parts_by_provider and catalog_providers:
+        first_catalog_provider = catalog_providers[0]
+        catalog_parts = catalog_parts_by_provider.get(first_catalog_provider, {})
+    
+    # Use parts from first distributor provider (later we'll add logic to determine which provider to use)
+    distributor_parts = {}
+    if distributor_parts_by_provider and distributor_providers:
+        first_distributor_provider = distributor_providers[0]
+        distributor_parts = distributor_parts_by_provider.get(first_distributor_provider, {})
+    
+    # If no catalog parts, return distributor parts as-is
+    if not catalog_parts:
+        return list(distributor_parts.values())
+    
+    # Merge catalog and distributor parts
+    merged_parts = []
+    
+    # Go through each catalog part and try to find matching distributor part
+    for sku, catalog_part in catalog_parts.items():
+        distributor_part = distributor_parts.get(sku)
+        if distributor_part is None:
+            logger.info('{} Catalog SKU {} not found in distributor parts. Using catalog part only.'.format(
+                _LOG_PREFIX, sku
+            ))
+        merged_part = _merge_catalog_and_distributor_parts(catalog_part, distributor_part)
+        merged_parts.append(merged_part)
+    
+    # Add any distributor parts that don't have a catalog match
+    for sku, distributor_part in distributor_parts.items():
+        if sku not in catalog_parts:
+            merged_parts.append(distributor_part)
+    
+    return merged_parts
+
+
+def _prepare_parts_by_kind(kind_name: str, brand: src_models.Brands) -> list[src_messages.BigCommercePart]:
+    """
+    Prepare parts based on provider kind_name.
+    Routes to the appropriate preparation function.
+    """
+    if kind_name == src_enums.BrandProviderKind.SDC.name:
+        return prepare_sdc_products_for_bigcommerce(brand=brand)
+    elif kind_name == src_enums.BrandProviderKind.TURN_14.name:
+        return prepare_turn_14_products_for_bigcommerce(brand=brand)
+    else:
+        logger.warning('{} Unknown provider kind: {}. Skipping.'.format(_LOG_PREFIX, kind_name))
+        return []
+
+
+def _merge_catalog_and_distributor_parts(
+    catalog_part: src_messages.BigCommercePart,
+    distributor_part: typing.Optional[src_messages.BigCommercePart]
+) -> src_messages.BigCommercePart:
+    """
+    Merge catalog and distributor parts according to field priority rules.
+    If distributor_part is None, returns catalog_part as-is.
+    """
+    if not distributor_part:
+        return catalog_part
+    
+    # Get field priority configuration
+    field_priority = src_constants.BIGCOMMERCE_PART_FIELD_PRIORITY
+    
+    # Build merged part field by field
+    merged_fields = {}
+    
+    # Get all fields from BigCommercePart dataclass
+    for field_name in catalog_part.__dataclass_fields__.keys():
+        primary_source = field_priority.get(field_name, 'CATALOG')  # Default to CATALOG
+        
+        if primary_source == 'CATALOG':
+            # Try catalog first, fallback to distributor
+            catalog_value = getattr(catalog_part, field_name, None)
+            distributor_value = getattr(distributor_part, field_name, None)
+            
+            # Check if value is null/empty
+            if _is_value_empty(catalog_value):
+                merged_fields[field_name] = distributor_value
+            else:
+                merged_fields[field_name] = catalog_value
+        else:  # DISTRIBUTOR
+            # Try distributor first, fallback to catalog
+            distributor_value = getattr(distributor_part, field_name, None)
+            catalog_value = getattr(catalog_part, field_name, None)
+            
+            # Check if value is null/empty
+            if _is_value_empty(distributor_value):
+                merged_fields[field_name] = catalog_value
+            else:
+                merged_fields[field_name] = distributor_value
+    
+    # Create merged BigCommercePart
+    return src_messages.BigCommercePart(**merged_fields)
+
+
+def _is_value_empty(value: typing.Any) -> bool:
+    """
+    Check if a value is considered empty (None, empty string, empty list/dict).
+    Note: 0 is considered a valid value for numeric fields (prices, inventory, etc.).
+    """
+    if value is None:
+        return True
+    if isinstance(value, str) and not value.strip():
+        return True
+    if isinstance(value, (list, dict)) and len(value) == 0:
+        return True
+    return False
+
+def prepare_sdc_products_for_bigcommerce(brand: src_models.Brands) -> list[src_messages.BigCommercePart]:
+    bigcommerce_parts = []
+    sdc_brand = src_models.BrandSDCBrandMapping.objects.get(brand_id=brand.id)
+    sdc_items = src_models.SDCParts.objects.filter(
+        brand_id=sdc_brand.sdc_brand.id
+    )
+    sdc_item_fitments = src_models.SDCPartFitment.objects.filter(
+        brand_id=sdc_brand.sdc_brand.id
+    )
+    bigcommerce_brand = src_models.BigCommerceBrands.objects.get(brand_id=brand.id)
+
+    for sdc_item in sdc_items:
+        default_price, cost, msrp = _get_sdc_prices(sdc_item)
+        width, height, depth = _get_sdc_dimensions(sdc_item)
+        weight = _get_sdc_weight(sdc_item)
+        description = _get_sdc_description(sdc_item)
+        images = _get_sdc_images(sdc_item)
+        inventory = _get_sdc_inventory(sdc_item)
+        
+        # Active only if Life Cycle Status is 'Available To Order'
+        is_active = sdc_item.life_cycle_status == 'Available To Order'
+        
+        bigcommerce_parts.append(
+            src_messages.BigCommercePart(
+                brand_id=int(bigcommerce_brand.external_id),
+                product_title='{} - {}'.format(sdc_item.title or '', sdc_item.part_number),
+                sku=sdc_item.part_number,
+                mpn=sdc_item.part_number,
+                default_price=default_price,
+                cost=cost,
+                msrp=msrp,
+                weight=weight,
+                width=width,
+                height=height,
+                depth=depth,
+                description=description,
+                images=images,
+                inventory=inventory,
+                custom_fields=[],
+                active=is_active,
+            )
+        )
+
+    return bigcommerce_parts
+
+def _get_sdc_prices(sdc_item: src_models.SDCParts) -> typing.Tuple[float, float, float]:
+    """
+    Extract prices from SDC part.
+    Returns: (default_price, cost, msrp)
+    - default_price: MAP if available, otherwise retail, otherwise jobber
+    - cost: jobber_usd (typically the cost price)
+    - msrp: retail_usd (retail/MSRP price)
+    """
+    default_price = 0.0
+    cost = 0.0
+    msrp = 0.0
+    
+    # Convert Decimal to float, handling None values
+    map_price = float(sdc_item.map_usd) if sdc_item.map_usd is not None else None
+    retail_price = float(sdc_item.retail_usd) if sdc_item.retail_usd is not None else None
+    jobber_price = float(sdc_item.jobber_usd) if sdc_item.jobber_usd is not None else None
+    
+    # For default_price: use MAP if available, otherwise Retail, otherwise Jobber
+    default_price = map_price if map_price is not None else (retail_price if retail_price is not None else (jobber_price if jobber_price is not None else 0.0))
+    
+    # Cost is jobber_usd
+    cost = jobber_price if jobber_price is not None else 0.0
+    
+    # MSRP is retail_usd
+    msrp = retail_price if retail_price is not None else 0.0
+    
+    return default_price, cost, msrp
+
+
+def _get_sdc_weight(sdc_item: src_models.SDCParts) -> float:
+    """Get weight from SDC part. Weight is stored in weight_for_case in pounds."""
+    if sdc_item.weight_for_case is not None:
+        try:
+            return float(sdc_item.weight_for_case)
+        except (ValueError, TypeError):
+            pass
+    return 0.0
+
+
+def _get_sdc_dimensions(sdc_item: src_models.SDCParts) -> typing.Tuple[typing.Optional[float], typing.Optional[float], typing.Optional[float]]:
+    """
+    Extract width, height, and depth from SDC part.
+    Returns: (width, height, depth)
+    """
+    width = None
+    height = None
+    depth = None
+    
+    if sdc_item.width_for_case is not None:
+        try:
+            width = float(sdc_item.width_for_case)
+        except (ValueError, TypeError):
+            width = None
+    
+    if sdc_item.height_for_case is not None:
+        try:
+            height = float(sdc_item.height_for_case)
+        except (ValueError, TypeError):
+            height = None
+    
+    if sdc_item.length_for_case is not None:
+        try:
+            depth = float(sdc_item.length_for_case)
+        except (ValueError, TypeError):
+            depth = None
+    
+    return (width, height, depth)
+
+
+def _get_sdc_description(sdc_item: src_models.SDCParts) -> str:
+    """
+    Format SDC descriptions as HTML.
+    Combines long_description, extended_description, marketing_description, and features_and_benefits.
+    """
+    html_parts = []
+    
+    # Add long description or marketing description as overview
+    overview_text = None
+    if sdc_item.marketing_description:
+        overview_text = sdc_item.marketing_description
+    elif sdc_item.extended_description:
+        overview_text = sdc_item.extended_description
+    elif sdc_item.long_description:
+        overview_text = sdc_item.long_description
+    
+    if overview_text:
+        html_parts.append('<p><strong>Overview:</strong></p>')
+        html_parts.append('<p>{}</p>'.format(overview_text))
+    
+    # Add extended description if different from overview
+    if sdc_item.extended_description and sdc_item.extended_description != overview_text:
+        html_parts.append('<p>{}</p>'.format(sdc_item.extended_description))
+    
+    # Add features and benefits - split by semicolons and format as list
+    if sdc_item.features_and_benefits:
+        html_parts.append('<p><strong>Features and Benefits:</strong></p>')
+        # Split by semicolon and strip whitespace from each item
+        features_list = [feature.strip() for feature in sdc_item.features_and_benefits.split(';') if feature.strip()]
+        if features_list:
+            html_parts.append('<ul>')
+            for feature in features_list:
+                html_parts.append('<li>{}</li>'.format(feature))
+            html_parts.append('</ul>')
+    
+    # Add application summary if available
+    if sdc_item.application_summary:
+        html_parts.append('<p><strong>Application Summary:</strong></p>')
+        html_parts.append('<p>{}</p>'.format(sdc_item.application_summary))
+    
+    # Add Quick Specs section if available
+    quick_specs = _get_sdc_quick_specs(sdc_item)
+    if quick_specs:
+        html_parts.append(quick_specs)
+    
+    # Add Important Notes section if available
+    important_notes = _get_sdc_important_notes(sdc_item)
+    if important_notes:
+        html_parts.append('<p><strong>Important Notes:</strong></p>')
+        html_parts.append(important_notes)
+    
+    # Add Instructions section if available
+    instruction_link = _get_sdc_instruction_link(sdc_item)
+    if instruction_link:
+        html_parts.append('<p><strong>Instructions:</strong></p>')
+        html_parts.append('<p>{}</p>'.format(instruction_link))
+    
+    return ''.join(html_parts) if html_parts else ''
+
+
+def _get_sdc_quick_specs(sdc_item: src_models.SDCParts) -> typing.Optional[str]:
+    """
+    Generate Quick Specs section from SDC part data.
+    Returns HTML string or None if no specs are available.
+    """
+    specs = []
+    
+    # Section 1: Product Attributes (split by ';')
+    if sdc_item.product_attributes:
+        # Split by semicolon and format as key: value pairs
+        attributes_list = []
+        for attribute in sdc_item.product_attributes.split(';'):
+            attribute = attribute.strip()
+            if not attribute:
                 continue
+            # Split by colon to separate key and value
+            if ':' in attribute:
+                parts = attribute.split(':', 1)
+                formatted = ': '.join([part.strip() for part in parts])
+            else:
+                formatted = attribute
+            attributes_list.append(formatted)
+        
+        if attributes_list:
+            specs.append('<ul><li>' + '</li><li>'.join(attributes_list) + '</li></ul>')
+    
+    # Section 2: Additional Fields
+    additional_specs = []
+    
+    # Quantity per Application
+    if sdc_item.quantity_per_application:
+        additional_specs.append('<li>Quantity per Application: {}</li>'.format(sdc_item.quantity_per_application))
+    
+    # Country of Origin
+    if sdc_item.country_of_origin:
+        additional_specs.append('<li>Country of Origin: {}</li>'.format(sdc_item.country_of_origin))
+    
+    # Warranty
+    if sdc_item.warranty:
+        additional_specs.append('<li>Warranty: {}</li>'.format(sdc_item.warranty))
+    
+    # Dimensions (Length x Width x Height)
+    dimensions_parts = []
+    if sdc_item.length_for_case is not None:
+        dimensions_parts.append(str(sdc_item.length_for_case))
+    if sdc_item.width_for_case is not None:
+        dimensions_parts.append(str(sdc_item.width_for_case))
+    if sdc_item.height_for_case is not None:
+        dimensions_parts.append(str(sdc_item.height_for_case))
+    
+    if dimensions_parts:
+        dimensions_str = ' x '.join(dimensions_parts)
+        additional_specs.append('<li>Length (EA) x Width (EA) x Height (EA): {}</li>'.format(dimensions_str))
+    
+    # Weight
+    if sdc_item.weight_for_case is not None:
+        additional_specs.append('<li>Weight (lbs): {}</li>'.format(sdc_item.weight_for_case))
+    
+    # Vehicle Specific Fitment - we'll need to query fitments separately
+    # For now, we'll skip this as it requires additional query
+    
+    # Add the additional fields to the specs if not empty
+    if additional_specs:
+        specs.append('<p><strong>Additional Specifications:</strong></p>')
+        specs.append('<ul>' + ''.join(additional_specs) + '</ul>')
+    
+    # Only return content if there are actual specs, and add title at the beginning
+    if specs:
+        specs.insert(0, '<p><strong>Quick Specs:</strong></p>')
+        return ''.join(specs)
+    
+    return None
 
-            brand_parts[src_enums.BrandProviderKind.TURN_14] = parts
+
+def _format_to_list(field_value: typing.Optional[str]) -> typing.Optional[str]:
+    """
+    Format field value as an HTML list.
+    Splits by semicolons and formats as list items.
+    Returns None if field_value is empty or None.
+    """
+    if not field_value or not isinstance(field_value, str):
+        return None
+    
+    field_value = field_value.strip()
+    if not field_value:
+        return None
+    
+    # Split by semicolon and strip whitespace from each item
+    items = [item.strip() for item in field_value.split(';') if item.strip()]
+    
+    if not items:
+        return None
+    
+    # Format as HTML list
+    return '<ul><li>' + '</li><li>'.join(items) + '</li></ul>'
 
 
-    return brand_parts[src_enums.BrandProviderKind.TURN_14]
+def _get_sdc_important_notes(sdc_item: src_models.SDCParts) -> typing.Optional[str]:
+    """
+    Get important notes from SDC part (Associated Comments).
+    Returns formatted HTML list or None if not available.
+    """
+    # Note: "Associated Comments" field may need to be added to SDCParts model
+    # For now, checking if there's a similar field or making it flexible
+    associated_comments = getattr(sdc_item, 'associated_comments', None) or ''
+    return _format_to_list(associated_comments)
+
+
+def _get_sdc_instruction_link(sdc_item: src_models.SDCParts) -> typing.Optional[str]:
+    """
+    Get installation instruction link from SDC part.
+    Returns HTML link if installation_instructions contains a valid URL, otherwise None.
+    """
+    instruction_link = sdc_item.installation_instructions
+    
+    if not instruction_link or not isinstance(instruction_link, str):
+        return None
+    
+    instruction_link = instruction_link.strip()
+    
+    # Check if it contains a URL
+    if 'https' not in instruction_link:
+        return None
+    
+    # Extract filename from URL or use a default
+    # Try to get filename from the URL path
+    try:
+        from urllib.parse import urlparse
+        parsed_url = urlparse(instruction_link)
+        filename = parsed_url.path.split('/')[-1] if parsed_url.path else 'Installation Instructions'
+        # If filename is empty or just a slash, use default
+        if not filename or filename == '/':
+            filename = 'Installation Instructions'
+    except Exception:
+        filename = 'Installation Instructions'
+    
+    return '<a href="{}" target="_blank">{}</a>'.format(instruction_link, filename)
+
+
+def _get_sdc_images(sdc_item: src_models.SDCParts) -> list:
+    """Get images from SDC part. Returns list of image dicts with is_thumbnail and image_url."""
+    images = []
+    
+    def _encode_image_url(url: str) -> str:
+        """URL encode the image URL, preserving the URL structure."""
+        if not url:
+            return url
+        try:
+            # Parse the URL
+            parsed = urlparse(url)
+            # Encode the path component
+            encoded_path = '/'.join(quote(segment, safe='') for segment in parsed.path.split('/'))
+            # Reconstruct the URL with encoded path
+            encoded_url = urlunparse((
+                parsed.scheme,
+                parsed.netloc,
+                encoded_path,
+                parsed.params,
+                parsed.query,
+                parsed.fragment
+            ))
+            return encoded_url
+        except Exception:
+            # If encoding fails, return original URL
+            return url
+    
+    # Primary image is the thumbnail
+    if sdc_item.primary_image:
+        encoded_url = _encode_image_url(sdc_item.primary_image)
+        images.append({
+            'is_thumbnail': True,
+            'image_url': encoded_url,
+            'description': '',
+        })
+    
+    # Additional images
+    if sdc_item.additional_image:
+        encoded_url = _encode_image_url(sdc_item.additional_image)
+        images.append({
+            'is_thumbnail': False,
+            'image_url': encoded_url,
+            'description': '',
+        })
+    
+    return images
+
+
+def _get_sdc_inventory(sdc_item: src_models.SDCParts) -> int:
+    """Get inventory from SDC part."""
+    if sdc_item.inventory is not None:
+        try:
+            return int(sdc_item.inventory)
+        except (ValueError, TypeError):
+            pass
+    return 0
 
 
 def prepare_turn_14_products_for_bigcommerce(brand: src_models.Brands) -> list[src_messages.BigCommercePart]:
@@ -553,8 +1054,8 @@ def prepare_turn_14_products_for_bigcommerce(brand: src_models.Brands) -> list[s
         bigcommerce_parts.append(
             src_messages.BigCommercePart(
                 brand_id=int(bigcommerce_brand.external_id),
-                product_title='{} - {}'.format(turn_14_item.part_description, turn_14_item.part_number),
-                sku=turn_14_item.part_number,
+                product_title='{} - {}'.format(turn_14_item.part_description, turn_14_item.mfr_part_number),
+                sku=turn_14_item.mfr_part_number,
                 mpn=turn_14_item.mfr_part_number,
                 default_price=default_price,
                 cost=cost,
