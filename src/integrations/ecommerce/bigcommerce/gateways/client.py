@@ -231,3 +231,38 @@ class BigCommerceApiClient(object):
         )
         return response.get("data", {})
 
+    def get_product_custom_fields(self, product_id: int) -> typing.List[typing.Dict]:
+        response = simplejson.loads(
+            self._request(
+                endpoint=f"catalog/products/{product_id}/custom-fields",
+                method=common_enums.HttpMethod.GET,
+            ).content
+        )
+        return response.get("data", [])
+
+    def update_product_custom_field(self, product_id: int, custom_field_id: int, custom_field_data: typing.Dict) -> typing.Dict:
+        response = simplejson.loads(
+            self._request(
+                endpoint=f"catalog/products/{product_id}/custom-fields/{custom_field_id}",
+                method=common_enums.HttpMethod.PUT,
+                payload=custom_field_data,
+            ).content
+        )
+        return response.get("data", {})
+
+    def create_product_custom_field(self, product_id: int, custom_field_data: typing.Dict) -> typing.Dict:
+        response = simplejson.loads(
+            self._request(
+                endpoint=f"catalog/products/{product_id}/custom-fields",
+                method=common_enums.HttpMethod.POST,
+                payload=custom_field_data,
+            ).content
+        )
+        return response.get("data", {})
+
+    def delete_product_custom_field(self, product_id: int, custom_field_id: int) -> None:
+        self._request(
+            endpoint=f"catalog/products/{product_id}/custom-fields/{custom_field_id}",
+            method=common_enums.HttpMethod.DELETE,
+        )
+

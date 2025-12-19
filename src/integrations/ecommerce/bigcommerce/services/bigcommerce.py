@@ -542,6 +542,7 @@ def prepare_turn_14_products_for_bigcommerce(brand: src_models.Brands) -> list[s
 
         default_price, msrp = _get_turn_14_prices(turn_14_pricing)
         cost = _get_turn_14_cost(turn_14_pricing)
+        width, height, depth = _get_turn_14_dimensions(turn_14_item=turn_14_item)
         
         bigcommerce_parts.append(
             src_messages.BigCommercePart(
@@ -553,6 +554,9 @@ def prepare_turn_14_products_for_bigcommerce(brand: src_models.Brands) -> list[s
                 cost=cost,
                 msrp=msrp,
                 weight=_get_turn_14_weight(turn_14_item=turn_14_item),
+                width=width,
+                height=height,
+                depth=depth,
                 description=_get_turn_14_description(turn_14_data=turn_14_data),
                 images=_get_turn_14_images(turn_14_item=turn_14_item, turn_14_data=turn_14_data),
                 inventory=_get_turn_14_inventory(turn_14_inventory=turn_14_inventory),
@@ -624,16 +628,90 @@ def _get_turn_14_weight(turn_14_item: src_models.Turn14Items) -> float:
 
     return weight_in_lbs * 16
 
+def _get_turn_14_dimensions(turn_14_item: src_models.Turn14Items) -> typing.Tuple[typing.Optional[float], typing.Optional[float], typing.Optional[float]]:
+    """
+    Extract width, height, and depth (length) from dimensions array.
+    Looks for box_number=1, if not found returns None for all.
+    Returns: (width, height, depth)
+    """
+    if not turn_14_item.dimensions or not isinstance(turn_14_item.dimensions, list):
+        return (None, None, None)
+    
+    # Find dimension with box_number=1
+    dimension_with_box_1 = None
+    for dim in turn_14_item.dimensions:
+        if isinstance(dim, dict) and dim.get('box_number') == 1:
+            dimension_with_box_1 = dim
+            break
+    
+    if not dimension_with_box_1:
+        return (None, None, None)
+    
+    width = dimension_with_box_1.get('width')
+    height = dimension_with_box_1.get('height')
+    length = dimension_with_box_1.get('length')  # length is depth in BigCommerce
+    
+    # Convert to float if they exist, otherwise None
+    try:
+        width = float(width) if width is not None else None
+    except (ValueError, TypeError):
+        width = None
+    
+    try:
+        height = float(height) if height is not None else None
+    except (ValueError, TypeError):
+        height = None
+    
+    try:
+        depth = float(length) if length is not None else None
+    except (ValueError, TypeError):
+        depth = None
+    
+    return (width, height, depth)
+
 def _get_turn_14_description(turn_14_data: src_models.Turn14BrandData) -> str:
-    description = ''
+    """
+    Format descriptions as HTML with Overview section and Features and Benefits list.
+    """
+    if not turn_14_data.descriptions or not isinstance(turn_14_data.descriptions, list):
+        return ''
+    
+    overview_parts = []
+    features_and_benefits = []
+    
     for turn_14_desc in turn_14_data.descriptions:
-        if turn_14_desc.get('type') == 'Market Description':
-            description += turn_14_desc.get('description')
-
-        if turn_14_desc.get('type') == 'Product Description - Extended':
-            description += turn_14_desc.get('description')
-
-    return description
+        if not isinstance(turn_14_desc, dict):
+            continue
+        
+        desc_type = turn_14_desc.get('type', '')
+        desc_text = turn_14_desc.get('description', '')
+        
+        if not desc_text:
+            continue
+        
+        if desc_type == 'Market Description' or desc_type == 'Product Description - Extended':
+            overview_parts.append(desc_text)
+        elif desc_type == 'Features and Benefits':
+            features_and_benefits.append(desc_text)
+    
+    html_parts = []
+    
+    # Add Overview section if we have overview content
+    if overview_parts:
+        overview_html = '<p><strong>Overview:</strong></p>'
+        for overview_text in overview_parts:
+            overview_html += '<p>{}</p>'.format(overview_text)
+        html_parts.append(overview_html)
+    
+    # Add Features and Benefits list if we have any
+    if features_and_benefits:
+        features_html = '<p><strong>Features and Benefits:</strong></p><ul>'
+        for feature_text in features_and_benefits:
+            features_html += '<li>{}</li>'.format(feature_text)
+        features_html += '</ul>'
+        html_parts.append(features_html)
+    
+    return ''.join(html_parts)
 
 def _get_turn_14_images(turn_14_item: src_models.Turn14Items, turn_14_data: src_models.Turn14BrandData) -> list:
     images = []
@@ -676,6 +754,21 @@ def _get_turn_14_inventory(turn_14_inventory: src_models.Turn14BrandInventory) -
     if isinstance(turn_14_inventory.inventory, dict):
         return sum(int(v) for v in turn_14_inventory.inventory.values() if isinstance(v, (int, float, str)))
     return turn_14_inventory.total_inventory or 0
+
+def _get_availability_text(quantity: int) -> str:
+    """
+    Get availability text based on inventory quantity.
+    
+    Rules:
+    - quantity >= 5: "In Stock"
+    - quantity >= 1: "Low (Live-Chat or Call For Stock)"
+    - quantity < 1: "Special Order (Live Chat or Call)"
+    """
+    if quantity >= 5:
+        return "In Stock"
+    if quantity >= 1:
+        return "Low (Live-Chat or Call For Stock)"
+    return "Special Order (Live Chat or Call)"
 
 
 def _categorize_products_for_sync(
@@ -722,8 +815,56 @@ def _update_product_on_bigcommerce(
 
         product_id = int(bigcommerce_part.external_id)
 
+        # Get old and new custom fields for comparison
+        old_custom_fields = []
+        if company_destination_part and company_destination_part.destination_data:
+            old_custom_fields = company_destination_part.destination_data.get('custom_fields', [])
+        
+        new_custom_fields = product_to_sync.custom_fields if product_to_sync.custom_fields else []
+
+        # Build maps for comparison (key by name)
+        old_fields_map = {}
+        for old_field in old_custom_fields:
+            if isinstance(old_field, dict):
+                field_name = old_field.get('name', '').strip()
+                if field_name:
+                    old_fields_map[field_name] = old_field
+        
+        new_fields_map = {}
+        for new_field in new_custom_fields:
+            if isinstance(new_field, dict):
+                field_name = new_field.get('name', '').strip()
+                if field_name:
+                    new_fields_map[field_name] = new_field
+        
+        # Prepare custom fields for update payload
+        # Include fields that exist in new (for create/update via main payload)
+        # Fields that need IDs from old will be merged
+        custom_fields_for_payload = []
+        for field_name, new_field in new_fields_map.items():
+            field_data = {
+                'name': field_name,
+                'value': new_field.get('value', ''),
+            }
+            # If field exists in old, include the ID for update
+            if field_name in old_fields_map:
+                old_field = old_fields_map[field_name]
+                field_id = old_field.get('id')
+                if field_id:
+                    field_data['id'] = field_id
+            custom_fields_for_payload.append(field_data)
+        
+        # Temporarily set custom_fields for the payload
+        original_custom_fields = product_to_sync.custom_fields
+        product_to_sync.custom_fields = custom_fields_for_payload
+
         try:
-            product_api_data = _transform_bigcommerce_part_to_api_format(product_to_sync, include_images=False)
+            # Include custom_fields in the main update payload (for create/update)
+            product_api_data = _transform_bigcommerce_part_to_api_format(
+                product_to_sync, 
+                include_images=False,
+                include_custom_fields=True
+            )
         except Exception as e:
             logger.error('{} Error transforming product data for update (sku={}). Error: {}.'.format(
                 _LOG_PREFIX, product_to_sync.sku, str(e)
@@ -824,6 +965,30 @@ def _update_product_on_bigcommerce(
                 logger.warning('{} Error managing images for product (sku={}). Error: {}.'.format(
                     _LOG_PREFIX, product_to_sync.sku, str(e)
                 ))
+
+        # Restore original custom_fields
+        product_to_sync.custom_fields = original_custom_fields
+        
+        # Handle custom fields deletion separately (only for fields that exist in old but not in new)
+        try:
+            # Delete removed fields (exist only in old)
+            for field_name, old_field in old_fields_map.items():
+                if field_name not in new_fields_map:
+                    field_id = old_field.get('id')
+                    if field_id:
+                        try:
+                            api_client.delete_product_custom_field(product_id, field_id)
+                            logger.debug('{} Deleted custom field (sku={}, field_id={}, name={}).'.format(
+                                _LOG_PREFIX, product_to_sync.sku, field_id, field_name
+                            ))
+                        except bigcommerce_exceptions.BigCommerceAPIException as e:
+                            logger.warning('{} Error deleting custom field (sku={}, field_id={}, name={}). Error: {}.'.format(
+                                _LOG_PREFIX, product_to_sync.sku, field_id, field_name, str(e)
+                            ))
+        except Exception as e:
+            logger.warning('{} Error deleting custom fields for product (sku={}). Error: {}.'.format(
+                _LOG_PREFIX, product_to_sync.sku, str(e)
+            ))
 
         company_destination_part = _upsert_company_destination_part(
             product_to_sync=product_to_sync,
@@ -968,7 +1133,7 @@ def _mark_history_as_synced(
     ).update(synced=True, execution_run=execution_run)
 
 
-def _transform_bigcommerce_part_to_api_format(part: src_messages.BigCommercePart, include_images: bool = True) -> typing.Dict:
+def _transform_bigcommerce_part_to_api_format(part: src_messages.BigCommercePart, include_images: bool = True, include_custom_fields: bool = True) -> typing.Dict:
     price_value = part.default_price
     if isinstance(price_value, (dict, list)):
         price = 0.0
@@ -1005,6 +1170,35 @@ def _transform_bigcommerce_part_to_api_format(part: src_messages.BigCommercePart
         except (ValueError, TypeError):
             msrp = 0.0
 
+    # Extract width, height, depth
+    width_value = part.width
+    width = None
+    if width_value is not None:
+        try:
+            width = float(width_value)
+        except (ValueError, TypeError):
+            width = None
+    
+    height_value = part.height
+    height = None
+    if height_value is not None:
+        try:
+            height = float(height_value)
+        except (ValueError, TypeError):
+            height = None
+    
+    depth_value = part.depth
+    depth = None
+    if depth_value is not None:
+        try:
+            depth = float(depth_value)
+        except (ValueError, TypeError):
+            depth = None
+
+    # Calculate availability description based on inventory
+    inventory_quantity = int(part.inventory) if part.inventory else 0
+    availability_text = _get_availability_text(inventory_quantity)
+
     product_data = {
         'name': part.product_title,
         'type': 'physical',
@@ -1013,12 +1207,21 @@ def _transform_bigcommerce_part_to_api_format(part: src_messages.BigCommercePart
         'weight': weight,
         'price': price,
         'brand_id': int(part.brand_id),
-        'inventory_level': int(part.inventory) if part.inventory else 0,
+        'inventory_level': inventory_quantity,
         'inventory_tracking': 'product',
         'is_visible': bool(part.active),
         'cost_price': cost,
         'retail_price': msrp,
+        'availability_description': availability_text,
     }
+    
+    # Only include width, height, depth if they have values
+    if width is not None:
+        product_data['width'] = width
+    if height is not None:
+        product_data['height'] = height
+    if depth is not None:
+        product_data['depth'] = depth
 
     if part.mpn:
         product_data['mpn'] = part.mpn
@@ -1033,9 +1236,9 @@ def _transform_bigcommerce_part_to_api_format(part: src_messages.BigCommercePart
             if img.get('image_url')
         ]
 
-
-    if part.custom_fields:
-        product_data['custom_fields'] = part.custom_fields
+    # Include custom_fields if requested (skip if we're clearing them via DELETE calls)
+    if include_custom_fields:
+        product_data['custom_fields'] = part.custom_fields if part.custom_fields is not None else []
 
     return product_data
 
@@ -1111,7 +1314,14 @@ def _company_destination_part_changed(
 
 
 def _bigcommerce_part_to_dict(part: src_messages.BigCommercePart) -> typing.Dict:
-    return dataclasses.asdict(part)
+    """
+    Convert BigCommercePart to dictionary, including derived fields like availability_description.
+    """
+    part_dict = dataclasses.asdict(part)
+    # Calculate and add availability_description based on inventory
+    inventory_quantity = int(part.inventory) if part.inventory else 0
+    part_dict['availability_description'] = _get_availability_text(inventory_quantity)
+    return part_dict
 
 
 def _convert_bigcommerce_response_to_part_format(bigcommerce_response: typing.Dict) -> typing.Dict:
@@ -1160,6 +1370,34 @@ def _convert_bigcommerce_response_to_part_format(bigcommerce_response: typing.Di
     except (ValueError, TypeError):
         pass
 
+    # Extract width, height, depth
+    width = None
+    try:
+        width_val = bigcommerce_response.get('width')
+        if width_val is not None:
+            width = float(width_val)
+    except (ValueError, TypeError):
+        pass
+    
+    height = None
+    try:
+        height_val = bigcommerce_response.get('height')
+        if height_val is not None:
+            height = float(height_val)
+    except (ValueError, TypeError):
+        pass
+    
+    depth = None
+    try:
+        depth_val = bigcommerce_response.get('depth')
+        if depth_val is not None:
+            depth = float(depth_val)
+    except (ValueError, TypeError):
+        pass
+
+    inventory_quantity = int(bigcommerce_response.get('inventory_level', 0))
+    availability_text = _get_availability_text(inventory_quantity)
+
     return {
         'brand_id': int(bigcommerce_response.get('brand_id', 0)),
         'product_title': bigcommerce_response.get('name', ''),
@@ -1169,11 +1407,15 @@ def _convert_bigcommerce_response_to_part_format(bigcommerce_response: typing.Di
         'cost': cost,
         'msrp': msrp,
         'weight': float(bigcommerce_response.get('weight', 0.0)),
+        'width': width,
+        'height': height,
+        'depth': depth,
         'description': bigcommerce_response.get('description', ''),
         'images': images,
-        'inventory': int(bigcommerce_response.get('inventory_level', 0)),
+        'inventory': inventory_quantity,
         'custom_fields': custom_fields,
         'active': bool(bigcommerce_response.get('is_visible', False)),
+        'availability_description': availability_text,
     }
 
 
@@ -1186,67 +1428,88 @@ def _compare_bigcommerce_parts(
     old_brand_id = old_data.get('brand_id')
     new_brand_id = new_data.get('brand_id')
     if _values_different(old_brand_id, new_brand_id):
-        changes['brand_id'] = new_brand_id
+        changes['brand_id'] = {'old': old_brand_id, 'new': new_brand_id}
 
     old_product_title = old_data.get('product_title')
     new_product_title = new_data.get('product_title')
     if _values_different(old_product_title, new_product_title):
-        changes['product_title'] = new_product_title
+        changes['product_title'] = {'old': old_product_title, 'new': new_product_title}
 
     old_sku = old_data.get('sku')
     new_sku = new_data.get('sku')
     if _values_different(old_sku, new_sku):
-        changes['sku'] = new_sku
+        changes['sku'] = {'old': old_sku, 'new': new_sku}
 
     old_mpn = old_data.get('mpn')
     new_mpn = new_data.get('mpn')
     if _values_different(old_mpn, new_mpn):
-        changes['mpn'] = new_mpn
+        changes['mpn'] = {'old': old_mpn, 'new': new_mpn}
 
     old_default_price = old_data.get('default_price')
     new_default_price = new_data.get('default_price')
     if _values_different(old_default_price, new_default_price):
-        changes['default_price'] = new_default_price
+        changes['default_price'] = {'old': old_default_price, 'new': new_default_price}
 
     old_cost = old_data.get('cost')
     new_cost = new_data.get('cost')
     if _values_different(old_cost, new_cost):
-        changes['cost'] = new_cost
+        changes['cost'] = {'old': old_cost, 'new': new_cost}
 
     old_msrp = old_data.get('msrp')
     new_msrp = new_data.get('msrp')
     if _values_different(old_msrp, new_msrp):
-        changes['msrp'] = new_msrp
+        changes['msrp'] = {'old': old_msrp, 'new': new_msrp}
 
     old_weight = old_data.get('weight')
     new_weight = new_data.get('weight')
     if _values_different(old_weight, new_weight):
-        changes['weight'] = new_weight
+        changes['weight'] = {'old': old_weight, 'new': new_weight}
+
+    old_width = old_data.get('width')
+    new_width = new_data.get('width')
+    if _values_different(old_width, new_width):
+        changes['width'] = {'old': old_width, 'new': new_width}
+
+    old_height = old_data.get('height')
+    new_height = new_data.get('height')
+    if _values_different(old_height, new_height):
+        changes['height'] = {'old': old_height, 'new': new_height}
+
+    old_depth = old_data.get('depth')
+    new_depth = new_data.get('depth')
+    if _values_different(old_depth, new_depth):
+        changes['depth'] = {'old': old_depth, 'new': new_depth}
 
     old_description = old_data.get('description')
     new_description = new_data.get('description')
     if _values_different(old_description, new_description):
-        changes['description'] = new_description
+        changes['description'] = {'old': old_description, 'new': new_description}
 
     # old_images = old_data.get('images')
     # new_images = new_data.get('images')
     # if _images_different(old_images, new_images):
-    #     changes['images'] = new_images
+    #     changes['images'] = {'old': old_images, 'new': new_images}
 
     old_inventory = old_data.get('inventory')
     new_inventory = new_data.get('inventory')
     if _values_different(old_inventory, new_inventory):
-        changes['inventory'] = new_inventory
+        changes['inventory'] = {'old': old_inventory, 'new': new_inventory}
+    
+    # Availability description is derived from inventory, so compare it too
+    old_availability = old_data.get('availability_description')
+    new_availability = new_data.get('availability_description')
+    if _values_different(old_availability, new_availability):
+        changes['availability_description'] = {'old': old_availability, 'new': new_availability}
 
     old_custom_fields = old_data.get('custom_fields')
     new_custom_fields = new_data.get('custom_fields')
     if _values_different(old_custom_fields, new_custom_fields):
-        changes['custom_fields'] = new_custom_fields
+        changes['custom_fields'] = {'old': old_custom_fields, 'new': new_custom_fields}
 
     old_active = old_data.get('active')
     new_active = new_data.get('active')
     if _values_different(old_active, new_active):
-        changes['active'] = new_active
+        changes['active'] = {'old': old_active, 'new': new_active}
 
     return changes
 

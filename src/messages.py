@@ -1,4 +1,5 @@
 import dataclasses
+import typing
 
 
 @dataclasses.dataclass
@@ -11,6 +12,9 @@ class BigCommercePart:
     cost: float
     msrp: float
     weight: float
+    width: typing.Optional[float]
+    height: typing.Optional[float]
+    depth: typing.Optional[float]
     description: str
     images: list
     inventory: int
