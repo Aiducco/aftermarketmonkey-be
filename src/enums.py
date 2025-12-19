@@ -18,6 +18,7 @@ class BrandProvider(enum.Enum):
 
 class BrandProviderKind(enum.Enum):
     TURN_14 = 1
+    SDC = 2
 
 class BrandProviderStatus(enum.Enum):
     ACTIVE = 1

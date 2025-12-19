@@ -348,6 +348,12 @@ def fetch_and_sync_ecommerce_parts_for_company_brand_to_bigcommerce(
         _LOG_PREFIX, company_brand.destination_id, company_brand.company_brand.brand_id
     ))
 
+    if company_brand.company_brand.brand.status_name != src_enums.CompanyBrandStatus.ACTIVE.name:
+        logger.info('{} Company brand {} is not ACTIVE. Skipping fetching and syncing ecomm parts.'.format(
+            _LOG_PREFIX, company_brand.company_brand.brand.name
+        ))
+        return
+
     execution_run = src_models.CompanyDestinationExecutionRun.objects.create(
         company_brand_destination=company_brand,
         status=src_enums.DestinationExecutionRunStatus.STARTED.value,
@@ -779,17 +785,37 @@ def _categorize_products_for_sync(
     products_to_update = []
     products_to_create = []
 
-    for product_to_sync in products_for_sync:
-        bigcommerce_part = src_models.BigCommerceParts.objects.filter(
-            sku=product_to_sync.sku,
-            company_destination=destination
-        ).first()
+    if not products_for_sync:
+        return products_to_update, products_to_create
 
-        company_destination_part = src_models.CompanyDestinationParts.objects.filter(
-            part_unique_key=product_to_sync.sku,
-            company_destination=destination,
-            brand=brand
-        ).first()
+    # Extract all SKUs for bulk querying
+    all_skus = [product_to_sync.sku for product_to_sync in products_for_sync]
+
+    # Bulk fetch all BigCommerceParts in one query
+    bigcommerce_parts_dict = {
+        part.sku: part
+        for part in src_models.BigCommerceParts.objects.filter(
+            sku__in=all_skus,
+            company_destination=destination
+        )
+    }
+
+    # Bulk fetch all CompanyDestinationParts in one query
+    # Note: Using first() behavior - if multiple exist, we take the first one
+    company_destination_parts_dict = {}
+    for part in src_models.CompanyDestinationParts.objects.filter(
+        part_unique_key__in=all_skus,
+        company_destination=destination,
+        brand=brand
+    ):
+        # Only keep the first occurrence of each SKU (matching original .first() behavior)
+        if part.part_unique_key not in company_destination_parts_dict:
+            company_destination_parts_dict[part.part_unique_key] = part
+
+    # Categorize products using the pre-fetched dictionaries
+    for product_to_sync in products_for_sync:
+        bigcommerce_part = bigcommerce_parts_dict.get(product_to_sync.sku)
+        company_destination_part = company_destination_parts_dict.get(product_to_sync.sku)
 
         if bigcommerce_part:
             products_to_update.append((product_to_sync, bigcommerce_part, company_destination_part))

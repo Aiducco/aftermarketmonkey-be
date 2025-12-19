@@ -340,3 +340,88 @@ class BigCommerceBrands(django_db_models.Model):
     class Meta:
         db_table = "bigcommerce_brands"
         unique_together = ["external_id", "brand", "company_destination"]
+
+class SDCBrands(django_db_models.Model):
+    external_id = django_db_models.CharField(max_length=255)
+    name = django_db_models.TextField(max_length=255)
+    aaia_code = django_db_models.CharField(max_length=255)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "sdc_brands"
+        unique_together = ["external_id", "name"]
+
+
+class SDCPartFitment(django_db_models.Model):
+    sku = django_db_models.TextField(max_length=255)
+    brand = django_db_models.ForeignKey(SDCBrands, on_delete=django_db_models.CASCADE, related_name="fitment_brands")
+    year = django_db_models.IntegerField()
+    make = django_db_models.TextField(max_length=255)
+    model = django_db_models.TextField(max_length=255)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "sdc_part_fitment"
+        unique_together = ["sku", "brand", "year", "make", "model"]
+
+
+class BrandSDCBrandMapping(django_db_models.Model):
+    brand = django_db_models.ForeignKey(Brands, on_delete=django_db_models.CASCADE, related_name="sdc_brand_mappings")
+    sdc_brand = django_db_models.ForeignKey(SDCBrands, on_delete=django_db_models.CASCADE, related_name="brand_mappings")
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "brand_sdc_brand_mapping"
+        unique_together = ["brand", "sdc_brand"]
+
+
+class SDCParts(django_db_models.Model):
+    part_number = django_db_models.CharField(max_length=255)
+    brand = django_db_models.ForeignKey(SDCBrands, on_delete=django_db_models.CASCADE, related_name="parts")
+    brand_label = django_db_models.CharField(max_length=255, null=True)
+    gtin = django_db_models.CharField(max_length=255, null=True)
+    category_pcdb = django_db_models.CharField(max_length=255, null=True)
+    life_cycle_status = django_db_models.CharField(max_length=255, null=True)
+    country_of_origin = django_db_models.CharField(max_length=255, null=True)
+    warranty = django_db_models.TextField(null=True)
+    long_description = django_db_models.TextField(null=True)
+    extended_description = django_db_models.TextField(null=True)
+    application_summary = django_db_models.TextField(null=True)
+    features_and_benefits = django_db_models.TextField(null=True)
+    marketing_description = django_db_models.TextField(null=True)
+    title = django_db_models.CharField(max_length=255, null=True)
+    keywords = django_db_models.TextField(null=True)
+    product_attributes = django_db_models.TextField(null=True)
+    jobber_usd = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
+    retail_usd = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
+    map_usd = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
+    unilateral_usd = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
+    primary_image = django_db_models.TextField(null=True)
+    additional_image = django_db_models.TextField(null=True)
+    installation_instructions = django_db_models.TextField(null=True)
+    logo = django_db_models.TextField(null=True)
+    video_random = django_db_models.TextField(null=True)
+    video_installation = django_db_models.TextField(null=True)
+    length_for_case = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
+    width_for_case = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
+    height_for_case = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
+    weight_for_case = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
+    inventory = django_db_models.IntegerField(null=True)
+    external_brand_id = django_db_models.CharField(max_length=255, null=True)
+    part_terminology_label = django_db_models.CharField(max_length=255, null=True)
+    quantity_per_application = django_db_models.CharField(max_length=255, null=True)
+    hazardous_material = django_db_models.CharField(max_length=255, null=True)
+    condition = django_db_models.CharField(max_length=255, null=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "sdc_parts"
+        unique_together = ["part_number", "brand"]
