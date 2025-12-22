@@ -341,6 +341,21 @@ class BigCommerceBrands(django_db_models.Model):
         db_table = "bigcommerce_brands"
         unique_together = ["external_id", "brand", "company_destination"]
 
+
+class BigCommerceCategories(django_db_models.Model):
+    external_id = django_db_models.IntegerField()
+    name = django_db_models.CharField(max_length=255)
+    parent_id = django_db_models.IntegerField(default=0)
+    tree_id = django_db_models.IntegerField(default=1)
+    company_destination = django_db_models.ForeignKey(CompanyDestinations, on_delete=django_db_models.CASCADE, related_name="bigcommerce_categories")
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "bigcommerce_categories"
+        unique_together = ["external_id", "company_destination", "tree_id"]
+
 class SDCBrands(django_db_models.Model):
     external_id = django_db_models.CharField(max_length=255)
     name = django_db_models.TextField(max_length=255)
@@ -360,6 +375,8 @@ class SDCPartFitment(django_db_models.Model):
     year = django_db_models.IntegerField()
     make = django_db_models.TextField(max_length=255)
     model = django_db_models.TextField(max_length=255)
+    category_pcdb = django_db_models.CharField(max_length=255, null=True)
+    subcategory_pcdb = django_db_models.CharField(max_length=255, null=True)
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)

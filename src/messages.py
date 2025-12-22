@@ -20,4 +20,6 @@ class BigCommercePart:
     inventory: int
     custom_fields: list
     active: bool
+    category: typing.Optional[str] = None
+    subcategory: typing.Optional[str] = None
 

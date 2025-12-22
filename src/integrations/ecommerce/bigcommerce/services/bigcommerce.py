@@ -644,10 +644,18 @@ def prepare_sdc_products_for_bigcommerce(brand: src_models.Brands) -> list[src_m
     sdc_items = src_models.SDCParts.objects.filter(
         brand_id=sdc_brand.sdc_brand.id
     )
-    sdc_item_fitments = src_models.SDCPartFitment.objects.filter(
-        brand_id=sdc_brand.sdc_brand.id
-    )
     bigcommerce_brand = src_models.BigCommerceBrands.objects.get(brand_id=brand.id)
+
+    # Get fitments for all SDC items in bulk
+    all_part_numbers = [item.part_number for item in sdc_items]
+    fitments_dict = {}
+    for fitment in src_models.SDCPartFitment.objects.filter(
+        sku__in=all_part_numbers,
+        brand=sdc_brand.sdc_brand
+    ):
+        # Store first fitment for each SKU
+        if fitment.sku not in fitments_dict:
+            fitments_dict[fitment.sku] = fitment
 
     for sdc_item in sdc_items:
         default_price, cost, msrp = _get_sdc_prices(sdc_item)
@@ -659,6 +667,11 @@ def prepare_sdc_products_for_bigcommerce(brand: src_models.Brands) -> list[src_m
         
         # Active only if Life Cycle Status is 'Available To Order'
         is_active = sdc_item.life_cycle_status == 'Available To Order'
+        
+        # Get category and subcategory from first fitment
+        fitment = fitments_dict.get(sdc_item.part_number)
+        category = fitment.category_pcdb if fitment else None
+        subcategory = fitment.subcategory_pcdb if fitment else None
         
         bigcommerce_parts.append(
             src_messages.BigCommercePart(
@@ -678,6 +691,8 @@ def prepare_sdc_products_for_bigcommerce(brand: src_models.Brands) -> list[src_m
                 inventory=inventory,
                 custom_fields=[],
                 active=is_active,
+                category=category,
+                subcategory=subcategory,
             )
         )
 
@@ -1069,6 +1084,8 @@ def prepare_turn_14_products_for_bigcommerce(brand: src_models.Brands) -> list[s
                 inventory=_get_turn_14_inventory(turn_14_inventory=turn_14_inventory),
                 custom_fields=[],
                 active=turn_14_item.active,
+                category=turn_14_item.category,
+                subcategory=turn_14_item.subcategory,
             )
         )
 
@@ -1318,12 +1335,88 @@ def _categorize_products_for_sync(
         bigcommerce_part = bigcommerce_parts_dict.get(product_to_sync.sku)
         company_destination_part = company_destination_parts_dict.get(product_to_sync.sku)
 
-        if bigcommerce_part:
+        if company_destination_part:
             products_to_update.append((product_to_sync, bigcommerce_part, company_destination_part))
         else:
             products_to_create.append((product_to_sync, company_destination_part))
 
     return products_to_update, products_to_create
+
+
+def _get_or_create_bigcommerce_category(
+    category_name: str,
+    parent_id: int,
+    destination: src_models.CompanyDestinations,
+    api_client: bigcommerce_client.BigCommerceApiClient,
+    tree_id: int = 1
+) -> typing.Optional[int]:
+    """
+    Get or create a BigCommerce category.
+    Returns the category external_id (BigCommerce category ID) or None if creation fails.
+    """
+    if not category_name:
+        return None
+    
+    # Check if category exists in database
+    existing_category = src_models.BigCommerceCategories.objects.filter(
+        name=category_name,
+        parent_id=parent_id,
+        company_destination=destination,
+        tree_id=tree_id
+    ).first()
+    
+    if existing_category:
+        return existing_category.external_id
+    
+    # Category doesn't exist, create it via API
+    try:
+        category_data = [{
+            'name': category_name,
+            'parent_id': parent_id,
+            'tree_id': tree_id,
+            'is_visible': True,
+        }]
+        
+        category_response = api_client.create_category(category_data=category_data)
+        # Response is an array from the 'data' field, get first item
+        if category_response and len(category_response) > 0:
+            category_result = category_response[0]
+            # BigCommerce returns 'category_id' not 'id'
+            external_id = category_result.get('category_id')
+            
+            if external_id:
+                # Extract other fields from response
+                response_name = category_result.get('name', category_name)
+                response_parent_id = category_result.get('parent_id', parent_id)
+                response_tree_id = category_result.get('tree_id', tree_id)
+                
+                # Save to database
+                src_models.BigCommerceCategories.objects.create(
+                    external_id=external_id,
+                    name=response_name,
+                    parent_id=response_parent_id,
+                    tree_id=response_tree_id,
+                    company_destination=destination,
+                )
+                logger.info('{} Created new BigCommerce category: {} (id: {}, parent_id: {})'.format(
+                    _LOG_PREFIX, response_name, external_id, response_parent_id
+                ))
+                return external_id
+            else:
+                logger.error('{} Failed to create BigCommerce category: {}. No category_id returned.'.format(
+                    _LOG_PREFIX, category_name
+                ))
+                return None
+        else:
+            logger.error('{} Failed to create BigCommerce category: {}. Empty response.'.format(
+                _LOG_PREFIX, category_name
+            ))
+            return None
+    except Exception as e:
+        logger.error('{} Error creating BigCommerce category: {}. Error: {}.'.format(
+            _LOG_PREFIX, category_name, str(e)
+        ))
+        return None
 
 
 def _update_product_on_bigcommerce(
@@ -1385,12 +1478,38 @@ def _update_product_on_bigcommerce(
         original_custom_fields = product_to_sync.custom_fields
         product_to_sync.custom_fields = custom_fields_for_payload
 
+        # Get or create categories
+        category_ids = []
+        if product_to_sync.category:
+            category_id = _get_or_create_bigcommerce_category(
+                category_name=product_to_sync.category,
+                parent_id=0,
+                destination=destination,
+                api_client=api_client,
+                tree_id=1
+            )
+            if category_id:
+                category_ids.append(category_id)
+                
+                # If subcategory exists, create it as child of category
+                if product_to_sync.subcategory:
+                    subcategory_id = _get_or_create_bigcommerce_category(
+                        category_name=product_to_sync.subcategory,
+                        parent_id=category_id,
+                        destination=destination,
+                        api_client=api_client,
+                        tree_id=1
+                    )
+                    if subcategory_id:
+                        category_ids.append(subcategory_id)
+
         try:
             # Include custom_fields in the main update payload (for create/update)
             product_api_data = _transform_bigcommerce_part_to_api_format(
                 product_to_sync, 
                 include_images=False,
-                include_custom_fields=True
+                include_custom_fields=True,
+                category_ids=category_ids if category_ids else None
             )
         except Exception as e:
             logger.error('{} Error transforming product data for update (sku={}). Error: {}.'.format(
@@ -1562,8 +1681,36 @@ def _create_product_on_bigcommerce(
             _LOG_PREFIX, product_to_sync.sku
         ))
 
+        # Get or create categories
+        category_ids = []
+        if product_to_sync.category:
+            category_id = _get_or_create_bigcommerce_category(
+                category_name=product_to_sync.category,
+                parent_id=0,
+                destination=destination,
+                api_client=api_client,
+                tree_id=1
+            )
+            if category_id:
+                category_ids.append(category_id)
+                
+                # If subcategory exists, create it as child of category
+                if product_to_sync.subcategory:
+                    subcategory_id = _get_or_create_bigcommerce_category(
+                        category_name=product_to_sync.subcategory,
+                        parent_id=category_id,
+                        destination=destination,
+                        api_client=api_client,
+                        tree_id=1
+                    )
+                    if subcategory_id:
+                        category_ids.append(subcategory_id)
+
         try:
-            product_api_data = _transform_bigcommerce_part_to_api_format(product_to_sync)
+            product_api_data = _transform_bigcommerce_part_to_api_format(
+                product_to_sync,
+                category_ids=category_ids if category_ids else None
+            )
         except Exception as e:
             logger.error('{} Error transforming product data for create (sku={}). Error: {}.'.format(
                 _LOG_PREFIX, product_to_sync.sku, str(e)
@@ -1628,7 +1775,7 @@ def _upsert_company_destination_part(
     external_id: str,
     bigcommerce_response: typing.Dict
 ) -> src_models.CompanyDestinationParts:
-    destination_data = _convert_bigcommerce_response_to_part_format(bigcommerce_response)
+    destination_data = _convert_bigcommerce_response_to_part_format(bigcommerce_response, destination=destination)
     source_data = _get_source_data_for_product(product_to_sync, brand)
 
     if company_destination_part:
@@ -1660,7 +1807,12 @@ def _mark_history_as_synced(
     ).update(synced=True, execution_run=execution_run)
 
 
-def _transform_bigcommerce_part_to_api_format(part: src_messages.BigCommercePart, include_images: bool = True, include_custom_fields: bool = True) -> typing.Dict:
+def _transform_bigcommerce_part_to_api_format(
+    part: src_messages.BigCommercePart,
+    include_images: bool = True,
+    include_custom_fields: bool = True,
+    category_ids: typing.Optional[typing.List[int]] = None
+) -> typing.Dict:
     price_value = part.default_price
     if isinstance(price_value, (dict, list)):
         price = 0.0
@@ -1766,6 +1918,10 @@ def _transform_bigcommerce_part_to_api_format(part: src_messages.BigCommercePart
     # Include custom_fields if requested (skip if we're clearing them via DELETE calls)
     if include_custom_fields:
         product_data['custom_fields'] = part.custom_fields if part.custom_fields is not None else []
+    
+    # Add categories if provided
+    if category_ids:
+        product_data['categories'] = category_ids
 
     return product_data
 
@@ -1800,6 +1956,8 @@ def select_products_for_syncing_into_bigcommerce(
     product_candidates_dict = {product.sku: product for product in products_candidates_for_sync}
 
     for company_destination_part in company_destination_parts:
+        if str(company_destination_part.destination_external_id) == '755':
+            print('755')
         product_candidate = product_candidates_dict.get(company_destination_part.part_unique_key)
         if not product_candidate:
             continue
@@ -1851,7 +2009,10 @@ def _bigcommerce_part_to_dict(part: src_messages.BigCommercePart) -> typing.Dict
     return part_dict
 
 
-def _convert_bigcommerce_response_to_part_format(bigcommerce_response: typing.Dict) -> typing.Dict:
+def _convert_bigcommerce_response_to_part_format(
+    bigcommerce_response: typing.Dict,
+    destination: typing.Optional[src_models.CompanyDestinations] = None
+) -> typing.Dict:
     images = []
     if 'images' in bigcommerce_response:
         images_data = bigcommerce_response['images']
@@ -1925,6 +2086,29 @@ def _convert_bigcommerce_response_to_part_format(bigcommerce_response: typing.Di
     inventory_quantity = int(bigcommerce_response.get('inventory_level', 0))
     availability_text = _get_availability_text(inventory_quantity)
 
+    # Extract categories from response
+    category = None
+    subcategory = None
+    category_ids = bigcommerce_response.get('categories', [])
+    if category_ids and destination:
+        # Look up category names from database
+        # Filter by destination to ensure we get the right categories
+        categories_query = src_models.BigCommerceCategories.objects.filter(
+            external_id__in=category_ids,
+            company_destination=destination
+        )
+        categories_list = list(categories_query.order_by('parent_id'))
+        
+        # Category is the one with parent_id=0, subcategory is the one with parent_id=category_id
+        parent_category = None
+        for cat in categories_list:
+            if cat.parent_id == 0:
+                category = cat.name
+                parent_category = cat
+            elif parent_category and cat.parent_id == parent_category.external_id:
+                # This is a child of the parent category
+                subcategory = cat.name
+
     return {
         'brand_id': int(bigcommerce_response.get('brand_id', 0)),
         'product_title': bigcommerce_response.get('name', ''),
@@ -1943,6 +2127,8 @@ def _convert_bigcommerce_response_to_part_format(bigcommerce_response: typing.Di
         'custom_fields': custom_fields,
         'active': bool(bigcommerce_response.get('is_visible', False)),
         'availability_description': availability_text,
+        'category': category,
+        'subcategory': subcategory,
     }
 
 
@@ -1994,17 +2180,20 @@ def _compare_bigcommerce_parts(
 
     old_width = old_data.get('width')
     new_width = new_data.get('width')
-    if _values_different(old_width, new_width):
+    # Treat None and 0.0 as the same for dimensions
+    if _dimension_values_different(old_width, new_width):
         changes['width'] = {'old': old_width, 'new': new_width}
 
     old_height = old_data.get('height')
     new_height = new_data.get('height')
-    if _values_different(old_height, new_height):
+    # Treat None and 0.0 as the same for dimensions
+    if _dimension_values_different(old_height, new_height):
         changes['height'] = {'old': old_height, 'new': new_height}
 
     old_depth = old_data.get('depth')
     new_depth = new_data.get('depth')
-    if _values_different(old_depth, new_depth):
+    # Treat None and 0.0 as the same for dimensions
+    if _dimension_values_different(old_depth, new_depth):
         changes['depth'] = {'old': old_depth, 'new': new_depth}
 
     old_description = old_data.get('description')
@@ -2037,6 +2226,16 @@ def _compare_bigcommerce_parts(
     new_active = new_data.get('active')
     if _values_different(old_active, new_active):
         changes['active'] = {'old': old_active, 'new': new_active}
+
+    old_category = old_data.get('category')
+    new_category = new_data.get('category')
+    if _values_different(old_category, new_category):
+        changes['category'] = {'old': old_category, 'new': new_category}
+
+    old_subcategory = old_data.get('subcategory')
+    new_subcategory = new_data.get('subcategory')
+    if _values_different(old_subcategory, new_subcategory):
+        changes['subcategory'] = {'old': old_subcategory, 'new': new_subcategory}
 
     return changes
 
@@ -2094,3 +2293,29 @@ def _values_different(old_value: typing.Any, new_value: typing.Any) -> bool:
         return abs(old_value - float(new_value)) > 0.01
 
     return old_value != new_value
+
+
+def _dimension_values_different(old_value: typing.Any, new_value: typing.Any) -> bool:
+    """
+    Compare dimension values (width, height, depth).
+    Treats None and 0.0 as the same since 0.0 effectively means no dimension.
+    """
+    # If both are None, they're the same
+    if old_value is None and new_value is None:
+        return False
+    
+    # If one is None and the other is 0.0 (or vice versa), they're the same
+    if old_value is None:
+        try:
+            return float(new_value) != 0.0
+        except (ValueError, TypeError):
+            return True
+    
+    if new_value is None:
+        try:
+            return float(old_value) != 0.0
+        except (ValueError, TypeError):
+            return True
+    
+    # Both are not None, use standard comparison
+    return _values_different(old_value, new_value)
