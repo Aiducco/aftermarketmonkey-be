@@ -1,4 +1,5 @@
 import dataclasses
+import json
 import logging
 import typing
 import pgbulk
@@ -598,6 +599,34 @@ def _merge_catalog_and_distributor_parts(
     
     # Get all fields from BigCommercePart dataclass
     for field_name in catalog_part.__dataclass_fields__.keys():
+        # Special handling for custom_fields - merge/combine from both sources
+        if field_name == 'custom_fields':
+            catalog_custom_fields = getattr(catalog_part, field_name, None) or []
+            distributor_custom_fields = getattr(distributor_part, field_name, None) or []
+            
+            # Combine custom fields from both sources
+            # Create a map by name to avoid duplicates
+            combined_custom_fields_map = {}
+            
+            # Add catalog custom fields first
+            if isinstance(catalog_custom_fields, list):
+                for field in catalog_custom_fields:
+                    if isinstance(field, dict):
+                        field_name_key = field.get('name', '').strip()
+                        if field_name_key:
+                            combined_custom_fields_map[field_name_key] = field
+            
+            # Add distributor custom fields (will overwrite catalog if same name)
+            if isinstance(distributor_custom_fields, list):
+                for field in distributor_custom_fields:
+                    if isinstance(field, dict):
+                        field_name_key = field.get('name', '').strip()
+                        if field_name_key:
+                            combined_custom_fields_map[field_name_key] = field
+            
+            merged_fields[field_name] = list(combined_custom_fields_map.values())
+            continue
+        
         primary_source = field_priority.get(field_name, 'CATALOG')  # Default to CATALOG
         
         if primary_source == 'CATALOG':
@@ -652,26 +681,35 @@ def prepare_sdc_products_for_bigcommerce(brand: src_models.Brands) -> list[src_m
     for fitment in src_models.SDCPartFitment.objects.filter(
         sku__in=all_part_numbers,
         brand=sdc_brand.sdc_brand
-    ):
-        # Store first fitment for each SKU
+    ).order_by('year', 'make', 'model'):
+        # Store all fitments for each SKU as a list
         if fitment.sku not in fitments_dict:
-            fitments_dict[fitment.sku] = fitment
+            fitments_dict[fitment.sku] = []
+        fitments_dict[fitment.sku].append(fitment)
 
     for sdc_item in sdc_items:
         default_price, cost, msrp = _get_sdc_prices(sdc_item)
         width, height, depth = _get_sdc_dimensions(sdc_item)
         weight = _get_sdc_weight(sdc_item)
-        description = _get_sdc_description(sdc_item)
+        
+        # Get all fitments for this part
+        fitments = fitments_dict.get(sdc_item.part_number, [])
+        
+        # Get category and subcategory from first fitment
+        first_fitment = fitments[0] if fitments else None
+        category = first_fitment.category_pcdb if first_fitment else None
+        subcategory = first_fitment.subcategory_pcdb if first_fitment else None
+        
+        # Get description with fitment table
+        description = _get_sdc_description(sdc_item, fitments=fitments if fitments else None)
         images = _get_sdc_images(sdc_item)
         inventory = _get_sdc_inventory(sdc_item)
         
         # Active only if Life Cycle Status is 'Available To Order'
         is_active = sdc_item.life_cycle_status == 'Available To Order'
         
-        # Get category and subcategory from first fitment
-        fitment = fitments_dict.get(sdc_item.part_number)
-        category = fitment.category_pcdb if fitment else None
-        subcategory = fitment.subcategory_pcdb if fitment else None
+        # Custom fields (fitments not added as custom fields for now)
+        custom_fields = []
         
         bigcommerce_parts.append(
             src_messages.BigCommercePart(
@@ -689,7 +727,7 @@ def prepare_sdc_products_for_bigcommerce(brand: src_models.Brands) -> list[src_m
                 description=description,
                 images=images,
                 inventory=inventory,
-                custom_fields=[],
+                custom_fields=custom_fields,
                 active=is_active,
                 category=category,
                 subcategory=subcategory,
@@ -767,10 +805,11 @@ def _get_sdc_dimensions(sdc_item: src_models.SDCParts) -> typing.Tuple[typing.Op
     return (width, height, depth)
 
 
-def _get_sdc_description(sdc_item: src_models.SDCParts) -> str:
+def _get_sdc_description(sdc_item: src_models.SDCParts, fitments: typing.Optional[typing.List[src_models.SDCPartFitment]] = None) -> str:
     """
     Format SDC descriptions as HTML.
     Combines long_description, extended_description, marketing_description, and features_and_benefits.
+    Adds fitment table at the end if fitments are provided.
     """
     html_parts = []
     
@@ -823,6 +862,12 @@ def _get_sdc_description(sdc_item: src_models.SDCParts) -> str:
     if instruction_link:
         html_parts.append('<p><strong>Instructions:</strong></p>')
         html_parts.append('<p>{}</p>'.format(instruction_link))
+    
+    # Add fitment table at the end if fitments are provided
+    if fitments:
+        fitment_table = _get_sdc_fitment_table(fitments)
+        if fitment_table:
+            html_parts.append(fitment_table)
     
     return ''.join(html_parts) if html_parts else ''
 
@@ -1022,6 +1067,57 @@ def _get_sdc_inventory(sdc_item: src_models.SDCParts) -> int:
         except (ValueError, TypeError):
             pass
     return 0
+
+
+def _get_sdc_fitment_table(fitments: typing.List[src_models.SDCPartFitment]) -> typing.Optional[str]:
+    """
+    Create HTML table from fitment data.
+    Returns HTML string or None if no fitments.
+    """
+    if not fitments:
+        return None
+    
+    html_parts = []
+    html_parts.append('<p><strong>Vehicle Fitment:</strong></p>')
+    html_parts.append('<table border="1" cellpadding="5" cellspacing="0" style="border-collapse: collapse; width: 100%;">')
+    html_parts.append('<thead><tr><th style="text-align: center;">Year</th><th style="text-align: center;">Make</th><th style="text-align: center;">Model</th></tr></thead>')
+    html_parts.append('<tbody>')
+    
+    for fitment in fitments:
+        html_parts.append('<tr>')
+        html_parts.append('<td style="text-align: center;">{}</td>'.format(fitment.year))
+        html_parts.append('<td style="text-align: center;">{}</td>'.format(fitment.make))
+        html_parts.append('<td style="text-align: center;">{}</td>'.format(fitment.model))
+        html_parts.append('</tr>')
+    
+    html_parts.append('</tbody>')
+    html_parts.append('</table>')
+    
+    return ''.join(html_parts)
+
+
+def _get_sdc_fitment_custom_field(fitments: typing.List[src_models.SDCPartFitment]) -> typing.Optional[typing.Dict]:
+    """
+    Create custom field with fitment data as list of dicts (JSON).
+    Returns custom field dict or None if no fitments.
+    """
+    if not fitments:
+        return None
+    
+    # Convert fitments to list of dicts
+    fitment_data = []
+    for fitment in fitments:
+        fitment_data.append({
+            'year': fitment.year,
+            'make': fitment.make,
+            'model': fitment.model,
+        })
+    
+    # Create custom field with fitment data as JSON string
+    return {
+        'name': 'Vehicle Fitment',
+        'value': json.dumps(fitment_data),
+    }
 
 
 def prepare_turn_14_products_for_bigcommerce(brand: src_models.Brands) -> list[src_messages.BigCommercePart]:
@@ -1343,6 +1439,37 @@ def _categorize_products_for_sync(
     return products_to_update, products_to_create
 
 
+def _get_shop_all_category_id(
+    destination: src_models.CompanyDestinations
+) -> typing.Optional[int]:
+    """
+    Get the "Shop All" category ID from the database.
+    Returns None if not found.
+    """
+    try:
+        shop_all_category = src_models.BigCommerceCategories.objects.get(
+            name='Shop All',
+            company_destination=destination,
+            tree_id=1
+        )
+        return shop_all_category.external_id
+    except src_models.BigCommerceCategories.DoesNotExist:
+        logger.warning('{} "Shop All" category not found in database for destination: {}.'.format(
+            _LOG_PREFIX, destination.id
+        ))
+        return None
+    except src_models.BigCommerceCategories.MultipleObjectsReturned:
+        # If multiple exist, take the first one
+        shop_all_category = src_models.BigCommerceCategories.objects.filter(
+            name='Shop All',
+            company_destination=destination,
+            tree_id=1
+        ).first()
+        if shop_all_category:
+            return shop_all_category.external_id
+        return None
+
+
 def _get_or_create_bigcommerce_category(
     category_name: str,
     parent_id: int,
@@ -1502,6 +1629,11 @@ def _update_product_on_bigcommerce(
                     )
                     if subcategory_id:
                         category_ids.append(subcategory_id)
+        
+        # Always add "Shop All" category
+        shop_all_category_id = _get_shop_all_category_id(destination)
+        if shop_all_category_id and shop_all_category_id not in category_ids:
+            category_ids.append(shop_all_category_id)
 
         try:
             # Include custom_fields in the main update payload (for create/update)
@@ -1705,6 +1837,11 @@ def _create_product_on_bigcommerce(
                     )
                     if subcategory_id:
                         category_ids.append(subcategory_id)
+        
+        # Always add "Shop All" category
+        shop_all_category_id = _get_shop_all_category_id(destination)
+        if shop_all_category_id and shop_all_category_id not in category_ids:
+            category_ids.append(shop_all_category_id)
 
         try:
             product_api_data = _transform_bigcommerce_part_to_api_format(
@@ -1956,8 +2093,6 @@ def select_products_for_syncing_into_bigcommerce(
     product_candidates_dict = {product.sku: product for product in products_candidates_for_sync}
 
     for company_destination_part in company_destination_parts:
-        if str(company_destination_part.destination_external_id) == '755':
-            print('755')
         product_candidate = product_candidates_dict.get(company_destination_part.part_unique_key)
         if not product_candidate:
             continue
