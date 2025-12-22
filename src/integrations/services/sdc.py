@@ -408,34 +408,39 @@ def fetch_and_save_all_sdc_brand_fitments() -> None:
                 ))
                 continue
             
-            # Check for duplicates before upsert
-            unique_combinations = set()
-            duplicate_count = 0
+            # Deduplicate fitment_instances before upsert
+            # Keep only the first occurrence of each unique combination
+            unique_combinations = {}
+            deduplicated_instances = []
+            brand_id = None
+            
             for fitment in fitment_instances:
                 # Use brand's id (which will be the same for all instances in this batch)
-                brand_id = fitment.brand.id if fitment.brand else None
+                if brand_id is None:
+                    brand_id = fitment.brand.id if fitment.brand else None
+                
                 key = (fitment.sku, brand_id, fitment.year, fitment.make, fitment.model)
-                if key in unique_combinations:
-                    duplicate_count += 1
-                else:
-                    unique_combinations.add(key)
+                if key not in unique_combinations:
+                    unique_combinations[key] = True
+                    deduplicated_instances.append(fitment)
             
+            duplicate_count = len(fitment_instances) - len(deduplicated_instances)
             if duplicate_count > 0:
-                logger.info('{} Found {} duplicate fitment rows (same sku/brand/year/make/model) out of {} total instances for brand: {} (external_id: {}).'.format(
-                    _LOG_PREFIX, duplicate_count, len(fitment_instances), sdc_brand.name, brand_id
+                logger.info('{} Found {} duplicate fitment rows (same sku/brand/year/make/model) out of {} total instances for brand: {} (external_id: {}). Deduplicated to {} unique instances.'.format(
+                    _LOG_PREFIX, duplicate_count, len(fitment_instances), sdc_brand.name, brand_id, len(deduplicated_instances)
                 ))
             
             try:
                 upserted_fitments = pgbulk.upsert(
                     src_models.SDCPartFitment,
-                    fitment_instances,
+                    deduplicated_instances,
                     unique_fields=['sku', 'brand', 'year', 'make', 'model'],
-                    update_fields=[],
+                    update_fields=['category_pcdb', 'subcategory_pcdb'],
                     returning=True,
                 )
                 
-                logger.info('{} Successfully upserted {} fitments (from {} instances) for brand: {} (external_id: {}).'.format(
-                    _LOG_PREFIX, len(upserted_fitments) if upserted_fitments else 0, len(fitment_instances), sdc_brand.name, brand_id
+                logger.info('{} Successfully upserted {} fitments (from {} deduplicated instances, {} original) for brand: {} (external_id: {}).'.format(
+                    _LOG_PREFIX, len(upserted_fitments) if upserted_fitments else 0, len(deduplicated_instances), len(fitment_instances), sdc_brand.name, brand_id
                 ))
             except Exception as e:
                 logger.error('{} Error during bulk upsert for brand: {} (external_id: {}). Error: {}.'.format(
@@ -529,12 +534,20 @@ def _transform_fitment_data(items_data: typing.List[typing.Dict], sdc_brand: src
                     ))
                 continue
             
+            # Get category_pcdb from "Category (PCDB)" column
+            category_pcdb = get_str(get_value(item_data, 'Category (PCDB)'))
+            
+            # Get subcategory_pcdb from "Part Terminology Label" column
+            subcategory_pcdb = get_str(get_value(item_data, 'Part Terminology Label'))
+            
             fitment_instance = src_models.SDCPartFitment(
                 sku=part_number,
                 brand=sdc_brand,
                 year=year,
                 make=make,
                 model=model,
+                category_pcdb=category_pcdb,
+                subcategory_pcdb=subcategory_pcdb,
             )
             
             fitment_instances.append(fitment_instance)

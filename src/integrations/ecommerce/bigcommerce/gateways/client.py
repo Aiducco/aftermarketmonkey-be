@@ -266,3 +266,13 @@ class BigCommerceApiClient(object):
             method=common_enums.HttpMethod.DELETE,
         )
 
+    def create_category(self, category_data: typing.List[typing.Dict]) -> typing.List[typing.Dict]:
+        response = simplejson.loads(
+            self._request(
+                endpoint="catalog/trees/categories",
+                method=common_enums.HttpMethod.POST,
+                payload=category_data,
+            ).content
+        )
+        return response.get("data", [])
+

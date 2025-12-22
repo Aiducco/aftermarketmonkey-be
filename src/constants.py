@@ -9,7 +9,7 @@ BIGCOMMERCE_PART_FIELD_PRIORITY = {
     'sku': 'CATALOG',
     'mpn': 'CATALOG',
     'description': 'CATALOG',
-    'images': 'CATALOG',
+    'images': 'DISTRIBUTOR',
     'custom_fields': 'CATALOG',
     'active': 'CATALOG',
     'default_price': 'DISTRIBUTOR',
@@ -20,5 +20,7 @@ BIGCOMMERCE_PART_FIELD_PRIORITY = {
     'height': 'DISTRIBUTOR',
     'depth': 'DISTRIBUTOR',
     'inventory': 'DISTRIBUTOR',
+    'category': 'CATALOG',
+    'subcategory': 'CATALOG',
 }
 
