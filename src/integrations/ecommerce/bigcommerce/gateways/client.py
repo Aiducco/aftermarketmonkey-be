@@ -81,7 +81,7 @@ class BigCommerceApiClient(object):
                         )
 
                 if response.status_code not in self.VALID_STATUS_CODES:
-                    msg = f"Invalid API client response (status_code={response.status_code}, data={response.content.decode('utf-8')})"
+                    msg = f"Invalid API client response (status_code={response.status_code}, data={response.json})"
                     logger.error(f"{self.LOG_PREFIX} {msg}.")
                     raise exceptions.BigCommerceAPIBadResponseCodeError(message=msg, code=response.status_code)
 
