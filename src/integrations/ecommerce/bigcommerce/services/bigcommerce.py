@@ -2,10 +2,14 @@ import dataclasses
 import json
 import logging
 import typing
-import pgbulk
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote, urlparse, urlunparse
+from django.db.models import F
 from django.db.models.functions import TruncWeek
 from django.utils import timezone
+import pgbulk
 
 from src import constants as src_constants
 from src import enums as src_enums
@@ -17,6 +21,12 @@ from src.integrations.ecommerce.bigcommerce.gateways import exceptions as bigcom
 logger = logging.getLogger(__name__)
 
 _LOG_PREFIX = '[BIGCOMMERCE-SERVICES]'
+
+# Configuration for parallel processing and retries
+_MAX_WORKERS = 20  # Number of parallel threads
+_MAX_RETRIES = 3  # Maximum number of retry attempts
+_RETRY_BASE_DELAY = 1  # Base delay in seconds for exponential backoff
+_RETRY_MAX_DELAY = 10  # Maximum delay in seconds
 
 
 def fetch_and_save_all_bigcommerce_brands() -> None:
@@ -425,36 +435,70 @@ def fetch_and_sync_ecommerce_parts_for_company_brand_to_bigcommerce(
             brand=brand
         )
 
-        for product_to_sync, bigcommerce_part, company_destination_part in products_to_update:
-            success = _update_product_on_bigcommerce(
-                product_to_sync=product_to_sync,
-                bigcommerce_part=bigcommerce_part,
-                company_destination_part=company_destination_part,
-                destination=destination,
-                brand=brand,
-                api_client=api_client,
-                execution_run=execution_run
-            )
-            execution_run.products_processed += 1
-            if success:
-                execution_run.products_updated += 1
-            else:
-                execution_run.products_failed += 1
+        # Process products in parallel with retry logic
+        total_products = len(products_to_update) + len(products_to_create)
+        logger.info('{} Processing {} products in parallel ({} to update, {} to create) with max {} workers.'.format(
+            _LOG_PREFIX, total_products, len(products_to_update), len(products_to_create), _MAX_WORKERS
+        ))
 
-        for product_to_sync, company_destination_part in products_to_create:
-            success = _create_product_on_bigcommerce(
-                product_to_sync=product_to_sync,
-                company_destination_part=company_destination_part,
-                destination=destination,
-                brand=brand,
-                api_client=api_client,
-                execution_run=execution_run
-            )
-            execution_run.products_processed += 1
-            if success:
-                execution_run.products_created += 1
-            else:
-                execution_run.products_failed += 1
+        # Thread-safe counters
+        counters = {
+            'processed': 0,
+            'created': 0,
+            'updated': 0,
+            'failed': 0,
+            'lock': threading.Lock()
+        }
+
+        # Process updates and creates in parallel
+        with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
+            futures = []
+            
+            # Submit update tasks
+            for product_to_sync, bigcommerce_part, company_destination_part in products_to_update:
+                future = executor.submit(
+                    _process_product_update_with_retry,
+                    product_to_sync=product_to_sync,
+                    bigcommerce_part=bigcommerce_part,
+                    company_destination_part=company_destination_part,
+                    destination=destination,
+                    brand=brand,
+                    api_client=api_client,
+                    execution_run=execution_run,
+                    counters=counters
+                )
+                futures.append(future)
+            
+            # Submit create tasks
+            for product_to_sync, company_destination_part in products_to_create:
+                future = executor.submit(
+                    _process_product_create_with_retry,
+                    product_to_sync=product_to_sync,
+                    company_destination_part=company_destination_part,
+                    destination=destination,
+                    brand=brand,
+                    api_client=api_client,
+                    execution_run=execution_run,
+                    counters=counters
+                )
+                futures.append(future)
+            
+            # Wait for all tasks to complete and log progress
+            completed = 0
+            for future in as_completed(futures):
+                completed += 1
+                if completed % 10 == 0 or completed == total_products:
+                    with counters['lock']:
+                        logger.info('{} Progress: {}/{} products processed (Created: {}, Updated: {}, Failed: {}).'.format(
+                            _LOG_PREFIX, completed, total_products,
+                            counters['created'], counters['updated'], counters['failed']
+                        ))
+        
+        # Update execution_run with final counts
+        execution_run.products_processed = counters['processed']
+        execution_run.products_created = counters['created']
+        execution_run.products_updated = counters['updated']
+        execution_run.products_failed = counters['failed']
 
         message = 'Completed sync run. Processed: {}, Created: {}, Updated: {}, Failed: {}.'.format(
             execution_run.products_processed, execution_run.products_created,
@@ -1439,6 +1483,174 @@ def _categorize_products_for_sync(
     return products_to_update, products_to_create
 
 
+def _is_retryable_error(error: Exception) -> bool:
+    """
+    Determine if an error is retryable (transient errors that might succeed on retry).
+    
+    Args:
+        error: The exception to check
+        
+    Returns:
+        True if the error is retryable, False otherwise
+    """
+    # Check for BigCommerce API exceptions
+    if isinstance(error, bigcommerce_exceptions.BigCommerceAPIException):
+        # Retry on rate limits, server errors (5xx), and timeouts
+        error_str = str(error).lower()
+        if 'rate limit' in error_str or '429' in error_str:
+            return True
+        if 'timeout' in error_str or 'timed out' in error_str:
+            return True
+        if any(code in error_str for code in ['500', '502', '503', '504']):
+            return True
+        # Don't retry on client errors (4xx) except rate limits
+        if '400' in error_str or '401' in error_str or '403' in error_str or '404' in error_str:
+            return False
+    
+    # Retry on connection errors, timeouts, and other transient network issues
+    error_type = type(error).__name__
+    retryable_types = ['ConnectionError', 'TimeoutError', 'HTTPError', 'URLError']
+    if any(retryable_type in error_type for retryable_type in retryable_types):
+        return True
+    
+    # Default to not retryable for unknown errors
+    return False
+
+
+def _process_product_update_with_retry(
+    product_to_sync: src_messages.BigCommercePart,
+    bigcommerce_part: src_models.BigCommerceParts,
+    company_destination_part: typing.Optional[src_models.CompanyDestinationParts],
+    destination: src_models.CompanyDestinations,
+    brand: src_models.Brands,
+    api_client: bigcommerce_client.BigCommerceApiClient,
+    execution_run: src_models.CompanyDestinationExecutionRun,
+    counters: typing.Dict
+) -> bool:
+    """
+    Process product update with retry logic and thread-safe counter updates.
+    Retries on transient API errors (rate limits, timeouts, etc.).
+    """
+    last_exception = None
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            success = _update_product_on_bigcommerce(
+                product_to_sync=product_to_sync,
+                bigcommerce_part=bigcommerce_part,
+                company_destination_part=company_destination_part,
+                destination=destination,
+                brand=brand,
+                api_client=api_client,
+                execution_run=execution_run
+            )
+            
+            # Update counters thread-safely
+            with counters['lock']:
+                counters['processed'] += 1
+                if success:
+                    counters['updated'] += 1
+                else:
+                    counters['failed'] += 1
+            
+            return success
+            
+        except (bigcommerce_exceptions.BigCommerceAPIException, Exception) as e:
+            last_exception = e
+            # Check if error is retryable (rate limit, timeout, server error)
+            is_retryable = _is_retryable_error(e)
+            
+            if attempt < _MAX_RETRIES and is_retryable:
+                delay = min(_RETRY_BASE_DELAY * (2 ** attempt), _RETRY_MAX_DELAY)
+                logger.warning('{} Retry attempt {}/{} for product update (sku={}) after {}s. Error: {}.'.format(
+                    _LOG_PREFIX, attempt + 1, _MAX_RETRIES, product_to_sync.sku, delay, str(e)
+                ))
+                time.sleep(delay)
+            else:
+                # Non-retryable error or max retries exceeded
+                logger.error('{} Failed to update product (sku={}) after {} attempts. Error: {}.'.format(
+                    _LOG_PREFIX, product_to_sync.sku, attempt + 1, str(e)
+                ))
+                with counters['lock']:
+                    counters['processed'] += 1
+                    counters['failed'] += 1
+                return False
+    
+    # Should not reach here, but handle it just in case
+    logger.error('{} Unexpected error in retry loop for product update (sku={}).'.format(
+        _LOG_PREFIX, product_to_sync.sku
+    ))
+    with counters['lock']:
+        counters['processed'] += 1
+        counters['failed'] += 1
+    return False
+
+
+def _process_product_create_with_retry(
+    product_to_sync: src_messages.BigCommercePart,
+    company_destination_part: typing.Optional[src_models.CompanyDestinationParts],
+    destination: src_models.CompanyDestinations,
+    brand: src_models.Brands,
+    api_client: bigcommerce_client.BigCommerceApiClient,
+    execution_run: src_models.CompanyDestinationExecutionRun,
+    counters: typing.Dict
+) -> bool:
+    """
+    Process product create with retry logic and thread-safe counter updates.
+    Retries on transient API errors (rate limits, timeouts, etc.).
+    """
+    last_exception = None
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            success = _create_product_on_bigcommerce(
+                product_to_sync=product_to_sync,
+                company_destination_part=company_destination_part,
+                destination=destination,
+                brand=brand,
+                api_client=api_client,
+                execution_run=execution_run
+            )
+            
+            # Update counters thread-safely
+            with counters['lock']:
+                counters['processed'] += 1
+                if success:
+                    counters['created'] += 1
+                else:
+                    counters['failed'] += 1
+            
+            return success
+            
+        except (bigcommerce_exceptions.BigCommerceAPIException, Exception) as e:
+            last_exception = e
+            # Check if error is retryable (rate limit, timeout, server error)
+            is_retryable = _is_retryable_error(e)
+            
+            if attempt < _MAX_RETRIES and is_retryable:
+                delay = min(_RETRY_BASE_DELAY * (2 ** attempt), _RETRY_MAX_DELAY)
+                logger.warning('{} Retry attempt {}/{} for product create (sku={}) after {}s. Error: {}.'.format(
+                    _LOG_PREFIX, attempt + 1, _MAX_RETRIES, product_to_sync.sku, delay, str(e)
+                ))
+                time.sleep(delay)
+            else:
+                # Non-retryable error or max retries exceeded
+                logger.error('{} Failed to create product (sku={}) after {} attempts. Error: {}.'.format(
+                    _LOG_PREFIX, product_to_sync.sku, attempt + 1, str(e)
+                ))
+                with counters['lock']:
+                    counters['processed'] += 1
+                    counters['failed'] += 1
+                return False
+    
+    # Should not reach here, but handle it just in case
+    logger.error('{} Unexpected error in retry loop for product create (sku={}).'.format(
+        _LOG_PREFIX, product_to_sync.sku
+    ))
+    with counters['lock']:
+        counters['processed'] += 1
+        counters['failed'] += 1
+    return False
+
+
 def _get_shop_all_category_id(
     destination: src_models.CompanyDestinations
 ) -> typing.Optional[int]:
@@ -1668,7 +1880,7 @@ def _update_product_on_bigcommerce(
                     image_url = img.get('image_url', '').strip()
                     if image_url:
                         new_image_urls.add(image_url)
-                
+
                 existing_image_urls = set()
                 if company_destination_part and company_destination_part.destination_data:
                     destination_data = company_destination_part.destination_data
@@ -1678,10 +1890,10 @@ def _update_product_on_bigcommerce(
                             image_url = existing_img.get('image_url', '').strip()
                             if image_url:
                                 existing_image_urls.add(image_url)
-                
+
                 images_to_delete = existing_image_urls - new_image_urls
                 images_to_create = new_image_urls - existing_image_urls
-                
+
                 if images_to_delete:
                     existing_images_api = api_client.get_product_images(product_id)
                     existing_image_map = {}
@@ -1697,7 +1909,7 @@ def _update_product_on_bigcommerce(
                         ).strip()
                         if image_url:
                             existing_image_map[image_url] = image_id
-                    
+
                     for image_url in images_to_delete:
                         image_id = existing_image_map.get(image_url)
                         if not image_id:
@@ -1711,7 +1923,7 @@ def _update_product_on_bigcommerce(
                             logger.warning('{} Error deleting existing image (sku={}, image_id={}). Error: {}.'.format(
                                 _LOG_PREFIX, product_to_sync.sku, image_id, str(e)
                             ))
-                
+
                 for img in product_to_sync.images:
                     image_url = img.get('image_url', '').strip()
                     if not image_url or image_url not in images_to_create:
@@ -1731,7 +1943,7 @@ def _update_product_on_bigcommerce(
                         logger.warning('{} Error creating image (sku={}, image_url={}). Error: {}.'.format(
                             _LOG_PREFIX, product_to_sync.sku, image_url, str(e)
                         ))
-                
+
                 if images_to_delete or images_to_create:
                     try:
                         product_response = api_client.get_product(product_id)
@@ -2238,6 +2450,9 @@ def _convert_bigcommerce_response_to_part_format(
         parent_category = None
         for cat in categories_list:
             if cat.parent_id == 0:
+                if cat.name == 'Shop All':
+                    continue
+
                 category = cat.name
                 parent_category = cat
             elif parent_category and cat.parent_id == parent_category.external_id:
