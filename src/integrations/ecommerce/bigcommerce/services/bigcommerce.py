@@ -4,6 +4,7 @@ import logging
 import typing
 import time
 import threading
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote, urlparse, urlunparse
 from django.db.models import F
@@ -23,10 +24,13 @@ logger = logging.getLogger(__name__)
 _LOG_PREFIX = '[BIGCOMMERCE-SERVICES]'
 
 # Configuration for parallel processing and retries
-_MAX_WORKERS = 20  # Number of parallel threads
+_MAX_WORKERS = 1  # Number of parallel threads
 _MAX_RETRIES = 3  # Maximum number of retry attempts
 _RETRY_BASE_DELAY = 1  # Base delay in seconds for exponential backoff
 _RETRY_MAX_DELAY = 10  # Maximum delay in seconds
+_PARALLEL_REQUEST_DELAY = 0.0  # Base delay in seconds between parallel requests (increased to reduce 500 errors)
+_PARALLEL_REQUEST_DELAY_JITTER = 0.0  # Random jitter to add to delay (0 to this value)
+_SERVER_ERROR_RETRY_DELAY = 2  # Additional delay for 500 errors (in seconds)
 
 
 def fetch_and_save_all_bigcommerce_brands() -> None:
@@ -599,13 +603,15 @@ def prepare_products_for_syncing_into_bigcommerce(
             logger.info('{} Catalog SKU {} not found in distributor parts. Using catalog part only.'.format(
                 _LOG_PREFIX, sku
             ))
+            continue
+
         merged_part = _merge_catalog_and_distributor_parts(catalog_part, distributor_part)
         merged_parts.append(merged_part)
     
-    # Add any distributor parts that don't have a catalog match
-    for sku, distributor_part in distributor_parts.items():
-        if sku not in catalog_parts:
-            merged_parts.append(distributor_part)
+    # # Add any distributor parts that don't have a catalog match
+    # for sku, distributor_part in distributor_parts.items():
+    #     if sku not in catalog_parts:
+    #         merged_parts.append(distributor_part)
     
     return merged_parts
 
@@ -1493,7 +1499,21 @@ def _is_retryable_error(error: Exception) -> bool:
     Returns:
         True if the error is retryable, False otherwise
     """
-    # Check for BigCommerce API exceptions
+    # Check for BigCommerce API exceptions with status codes
+    if isinstance(error, bigcommerce_exceptions.BigCommerceAPIBadResponseCodeError):
+        # Check the status code directly
+        status_code = getattr(error, 'code', None)
+        if status_code:
+            # Retry on server errors (5xx) and rate limits (429)
+            if status_code >= 500 and status_code < 600:
+                return True
+            if status_code == 429:  # Rate limit
+                return True
+            # Don't retry on client errors (4xx) except rate limits
+            if status_code >= 400 and status_code < 500:
+                return False
+    
+    # Check for BigCommerce API exceptions (general)
     if isinstance(error, bigcommerce_exceptions.BigCommerceAPIException):
         # Retry on rate limits, server errors (5xx), and timeouts
         error_str = str(error).lower()
@@ -1531,6 +1551,10 @@ def _process_product_update_with_retry(
     Process product update with retry logic and thread-safe counter updates.
     Retries on transient API errors (rate limits, timeouts, etc.).
     """
+    # Add small delay to stagger parallel requests and avoid rate limiting
+    delay = _PARALLEL_REQUEST_DELAY + random.uniform(0, _PARALLEL_REQUEST_DELAY_JITTER)
+    time.sleep(delay)
+    
     last_exception = None
     for attempt in range(_MAX_RETRIES + 1):
         try:
@@ -1561,6 +1585,13 @@ def _process_product_update_with_retry(
             
             if attempt < _MAX_RETRIES and is_retryable:
                 delay = min(_RETRY_BASE_DELAY * (2 ** attempt), _RETRY_MAX_DELAY)
+                
+                # Add extra delay for 500 errors (server overload)
+                if isinstance(e, bigcommerce_exceptions.BigCommerceAPIBadResponseCodeError):
+                    status_code = getattr(e, 'code', None)
+                    if status_code and status_code >= 500 and status_code < 600:
+                        delay += _SERVER_ERROR_RETRY_DELAY
+                
                 logger.warning('{} Retry attempt {}/{} for product update (sku={}) after {}s. Error: {}.'.format(
                     _LOG_PREFIX, attempt + 1, _MAX_RETRIES, product_to_sync.sku, delay, str(e)
                 ))
@@ -1598,6 +1629,10 @@ def _process_product_create_with_retry(
     Process product create with retry logic and thread-safe counter updates.
     Retries on transient API errors (rate limits, timeouts, etc.).
     """
+    # Add small delay to stagger parallel requests and avoid rate limiting
+    delay = _PARALLEL_REQUEST_DELAY + random.uniform(0, _PARALLEL_REQUEST_DELAY_JITTER)
+    time.sleep(delay)
+    
     last_exception = None
     for attempt in range(_MAX_RETRIES + 1):
         try:
@@ -1627,6 +1662,13 @@ def _process_product_create_with_retry(
             
             if attempt < _MAX_RETRIES and is_retryable:
                 delay = min(_RETRY_BASE_DELAY * (2 ** attempt), _RETRY_MAX_DELAY)
+                
+                # Add extra delay for 500 errors (server overload)
+                if isinstance(e, bigcommerce_exceptions.BigCommerceAPIBadResponseCodeError):
+                    status_code = getattr(e, 'code', None)
+                    if status_code and status_code >= 500 and status_code < 600:
+                        delay += _SERVER_ERROR_RETRY_DELAY
+                
                 logger.warning('{} Retry attempt {}/{} for product create (sku={}) after {}s. Error: {}.'.format(
                     _LOG_PREFIX, attempt + 1, _MAX_RETRIES, product_to_sync.sku, delay, str(e)
                 ))
@@ -1861,124 +1903,124 @@ def _update_product_on_bigcommerce(
             ))
             return False
 
-        try:
-            product_response = api_client.update_product(
-                product_id=product_id,
-                product_data=product_api_data
-            )
-            external_id = str(product_response.get('id', bigcommerce_part.external_id))
-        except bigcommerce_exceptions.BigCommerceAPIException as e:
-            logger.error('{} Error updating product on BigCommerce API (sku={}). Error: {}.'.format(
-                _LOG_PREFIX, product_to_sync.sku, str(e)
-            ))
-            return False
+        # try:
+        product_response = api_client.update_product(
+            product_id=product_id,
+            product_data=product_api_data
+        )
+        external_id = str(product_response.get('id', bigcommerce_part.external_id))
+        # except bigcommerce_exceptions.BigCommerceAPIException as e:
+        #     logger.error('{} Error updating product on BigCommerce API (sku={}). Error: {}.'.format(
+        #         _LOG_PREFIX, product_to_sync.sku, str(e)
+        #     ))
+        #     return False
 
-        if product_to_sync.images:
-            try:
-                new_image_urls = set()
-                for img in product_to_sync.images:
-                    image_url = img.get('image_url', '').strip()
-                    if image_url:
-                        new_image_urls.add(image_url)
-
-                existing_image_urls = set()
-                if company_destination_part and company_destination_part.destination_data:
-                    destination_data = company_destination_part.destination_data
-                    existing_images = destination_data.get('images', [])
-                    for existing_img in existing_images:
-                        if isinstance(existing_img, dict):
-                            image_url = existing_img.get('image_url', '').strip()
-                            if image_url:
-                                existing_image_urls.add(image_url)
-
-                images_to_delete = existing_image_urls - new_image_urls
-                images_to_create = new_image_urls - existing_image_urls
-
-                if images_to_delete:
-                    existing_images_api = api_client.get_product_images(product_id)
-                    existing_image_map = {}
-                    for existing_image in existing_images_api:
-                        image_id = existing_image.get('id')
-                        if not image_id:
-                            continue
-                        image_url = (
-                            existing_image.get('url_standard') or
-                            existing_image.get('url_thumbnail') or
-                            existing_image.get('url') or
-                            ''
-                        ).strip()
-                        if image_url:
-                            existing_image_map[image_url] = image_id
-
-                    for image_url in images_to_delete:
-                        image_id = existing_image_map.get(image_url)
-                        if not image_id:
-                            continue
-                        try:
-                            api_client.delete_product_image(product_id, image_id)
-                            logger.debug('{} Deleted image (sku={}, image_id={}, image_url={}).'.format(
-                                _LOG_PREFIX, product_to_sync.sku, image_id, image_url
-                            ))
-                        except bigcommerce_exceptions.BigCommerceAPIException as e:
-                            logger.warning('{} Error deleting existing image (sku={}, image_id={}). Error: {}.'.format(
-                                _LOG_PREFIX, product_to_sync.sku, image_id, str(e)
-                            ))
-
-                for img in product_to_sync.images:
-                    image_url = img.get('image_url', '').strip()
-                    if not image_url or image_url not in images_to_create:
-                        continue
-                    try:
-                        api_client.create_product_image(
-                            product_id=product_id,
-                            image_data={
-                                'image_url': image_url,
-                                'is_thumbnail': img.get('is_thumbnail', False),
-                            }
-                        )
-                        logger.debug('{} Created image (sku={}, image_url={}).'.format(
-                            _LOG_PREFIX, product_to_sync.sku, image_url
-                        ))
-                    except bigcommerce_exceptions.BigCommerceAPIException as e:
-                        logger.warning('{} Error creating image (sku={}, image_url={}). Error: {}.'.format(
-                            _LOG_PREFIX, product_to_sync.sku, image_url, str(e)
-                        ))
-
-                if images_to_delete or images_to_create:
-                    try:
-                        product_response = api_client.get_product(product_id)
-                    except bigcommerce_exceptions.BigCommerceAPIException as e:
-                        logger.warning('{} Error fetching updated product after image changes (sku={}). Error: {}.'.format(
-                            _LOG_PREFIX, product_to_sync.sku, str(e)
-                        ))
-            except Exception as e:
-                logger.warning('{} Error managing images for product (sku={}). Error: {}.'.format(
-                    _LOG_PREFIX, product_to_sync.sku, str(e)
-                ))
-
-        # Restore original custom_fields
-        product_to_sync.custom_fields = original_custom_fields
-        
-        # Handle custom fields deletion separately (only for fields that exist in old but not in new)
-        try:
-            # Delete removed fields (exist only in old)
-            for field_name, old_field in old_fields_map.items():
-                if field_name not in new_fields_map:
-                    field_id = old_field.get('id')
-                    if field_id:
-                        try:
-                            api_client.delete_product_custom_field(product_id, field_id)
-                            logger.debug('{} Deleted custom field (sku={}, field_id={}, name={}).'.format(
-                                _LOG_PREFIX, product_to_sync.sku, field_id, field_name
-                            ))
-                        except bigcommerce_exceptions.BigCommerceAPIException as e:
-                            logger.warning('{} Error deleting custom field (sku={}, field_id={}, name={}). Error: {}.'.format(
-                                _LOG_PREFIX, product_to_sync.sku, field_id, field_name, str(e)
-                            ))
-        except Exception as e:
-            logger.warning('{} Error deleting custom fields for product (sku={}). Error: {}.'.format(
-                _LOG_PREFIX, product_to_sync.sku, str(e)
-            ))
+        # if product_to_sync.images:
+        #     try:
+        #         new_image_urls = set()
+        #         for img in product_to_sync.images:
+        #             image_url = img.get('image_url', '').strip()
+        #             if image_url:
+        #                 new_image_urls.add(image_url)
+        #
+        #         existing_image_urls = set()
+        #         if company_destination_part and company_destination_part.destination_data:
+        #             destination_data = company_destination_part.destination_data
+        #             existing_images = destination_data.get('images', [])
+        #             for existing_img in existing_images:
+        #                 if isinstance(existing_img, dict):
+        #                     image_url = existing_img.get('image_url', '').strip()
+        #                     if image_url:
+        #                         existing_image_urls.add(image_url)
+        #
+        #         images_to_delete = existing_image_urls - new_image_urls
+        #         images_to_create = new_image_urls - existing_image_urls
+        #
+        #         if images_to_delete:
+        #             existing_images_api = api_client.get_product_images(product_id)
+        #             existing_image_map = {}
+        #             for existing_image in existing_images_api:
+        #                 image_id = existing_image.get('id')
+        #                 if not image_id:
+        #                     continue
+        #                 image_url = (
+        #                     existing_image.get('url_standard') or
+        #                     existing_image.get('url_thumbnail') or
+        #                     existing_image.get('url') or
+        #                     ''
+        #                 ).strip()
+        #                 if image_url:
+        #                     existing_image_map[image_url] = image_id
+        #
+        #             for image_url in images_to_delete:
+        #                 image_id = existing_image_map.get(image_url)
+        #                 if not image_id:
+        #                     continue
+        #                 try:
+        #                     api_client.delete_product_image(product_id, image_id)
+        #                     logger.debug('{} Deleted image (sku={}, image_id={}, image_url={}).'.format(
+        #                         _LOG_PREFIX, product_to_sync.sku, image_id, image_url
+        #                     ))
+        #                 except bigcommerce_exceptions.BigCommerceAPIException as e:
+        #                     logger.warning('{} Error deleting existing image (sku={}, image_id={}). Error: {}.'.format(
+        #                         _LOG_PREFIX, product_to_sync.sku, image_id, str(e)
+        #                     ))
+        #
+        #         for img in product_to_sync.images:
+        #             image_url = img.get('image_url', '').strip()
+        #             if not image_url or image_url not in images_to_create:
+        #                 continue
+        #             try:
+        #                 api_client.create_product_image(
+        #                     product_id=product_id,
+        #                     image_data={
+        #                         'image_url': image_url,
+        #                         'is_thumbnail': img.get('is_thumbnail', False),
+        #                     }
+        #                 )
+        #                 logger.debug('{} Created image (sku={}, image_url={}).'.format(
+        #                     _LOG_PREFIX, product_to_sync.sku, image_url
+        #                 ))
+        #             except bigcommerce_exceptions.BigCommerceAPIException as e:
+        #                 logger.warning('{} Error creating image (sku={}, image_url={}). Error: {}.'.format(
+        #                     _LOG_PREFIX, product_to_sync.sku, image_url, str(e)
+        #                 ))
+        #
+        #         if images_to_delete or images_to_create:
+        #             try:
+        #                 product_response = api_client.get_product(product_id)
+        #             except bigcommerce_exceptions.BigCommerceAPIException as e:
+        #                 logger.warning('{} Error fetching updated product after image changes (sku={}). Error: {}.'.format(
+        #                     _LOG_PREFIX, product_to_sync.sku, str(e)
+        #                 ))
+        #     except Exception as e:
+        #         logger.warning('{} Error managing images for product (sku={}). Error: {}.'.format(
+        #             _LOG_PREFIX, product_to_sync.sku, str(e)
+        #         ))
+        #
+        # # Restore original custom_fields
+        # product_to_sync.custom_fields = original_custom_fields
+        #
+        # # Handle custom fields deletion separately (only for fields that exist in old but not in new)
+        # try:
+        #     # Delete removed fields (exist only in old)
+        #     for field_name, old_field in old_fields_map.items():
+        #         if field_name not in new_fields_map:
+        #             field_id = old_field.get('id')
+        #             if field_id:
+        #                 try:
+        #                     api_client.delete_product_custom_field(product_id, field_id)
+        #                     logger.debug('{} Deleted custom field (sku={}, field_id={}, name={}).'.format(
+        #                         _LOG_PREFIX, product_to_sync.sku, field_id, field_name
+        #                     ))
+        #                 except bigcommerce_exceptions.BigCommerceAPIException as e:
+        #                     logger.warning('{} Error deleting custom field (sku={}, field_id={}, name={}). Error: {}.'.format(
+        #                         _LOG_PREFIX, product_to_sync.sku, field_id, field_name, str(e)
+        #                     ))
+        # except Exception as e:
+        #     logger.warning('{} Error deleting custom fields for product (sku={}). Error: {}.'.format(
+        #         _LOG_PREFIX, product_to_sync.sku, str(e)
+        #     ))
 
         company_destination_part = _upsert_company_destination_part(
             product_to_sync=product_to_sync,
@@ -2066,14 +2108,14 @@ def _create_product_on_bigcommerce(
             ))
             return False
 
-        try:
-            product_response = api_client.create_product(product_data=product_api_data)
-            external_id = str(product_response.get('id', ''))
-        except bigcommerce_exceptions.BigCommerceAPIException as e:
-            logger.error('{} Error creating product on BigCommerce API (sku={}). Error: {}.'.format(
-                _LOG_PREFIX, product_to_sync.sku, str(e)
-            ))
-            return False
+        # try:
+        product_response = api_client.create_product(product_data=product_api_data)
+        external_id = str(product_response.get('id', ''))
+        # except bigcommerce_exceptions.BigCommerceAPIException as e:
+        #     logger.error('{} Error creating product on BigCommerce API (sku={}). Error: {}.'.format(
+        #         _LOG_PREFIX, product_to_sync.sku, str(e)
+        #     ))
+        #     return False
 
         if not external_id:
             logger.error('{} No product ID returned from BigCommerce API (sku={}).'.format(
