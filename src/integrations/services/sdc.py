@@ -3,7 +3,6 @@ import typing
 from decimal import Decimal
 import pandas as pd
 import io
-import csv
 
 import pgbulk
 
@@ -120,21 +119,12 @@ def fetch_and_save_all_sdc_brand_items() -> None:
             # Clean up the DataFrame - remove any rows where all values are empty
             df = df.dropna(how='all')
             
-            # Log column names for debugging
-            logger.debug('{} File columns: {}'.format(_LOG_PREFIX, list(df.columns)[:10]))  # Log first 10 columns
-            
             logger.info('{} Parsed pipe-delimited file with {} rows and {} columns for brand: {} (external_id: {}).'.format(
                 _LOG_PREFIX, len(df), len(df.columns), sdc_brand.name, brand_id
             ))
             
             # Convert DataFrame to list of dictionaries
             items_data = df.to_dict('records')
-            
-            # Log first record structure for debugging
-            if items_data:
-                logger.debug('{} First record has {} keys. Sample keys: {}'.format(
-                    _LOG_PREFIX, len(items_data[0].keys()), list(items_data[0].keys())[:5]
-                ))
             
             part_instances = _transform_product_data(items_data, sdc_brand)
             
@@ -384,21 +374,12 @@ def fetch_and_save_all_sdc_brand_fitments() -> None:
             # Clean up the DataFrame - remove any rows where all values are empty
             df = df.dropna(how='all')
             
-            # Log column names for debugging
-            logger.debug('{} File columns: {}'.format(_LOG_PREFIX, list(df.columns)[:10]))  # Log first 10 columns
-            
             logger.info('{} Parsed pipe-delimited file with {} rows and {} columns for brand: {} (external_id: {}).'.format(
                 _LOG_PREFIX, len(df), len(df.columns), sdc_brand.name, brand_id
             ))
             
             # Convert DataFrame to list of dictionaries
             items_data = df.to_dict('records')
-            
-            # Log first record structure for debugging
-            if items_data:
-                logger.debug('{} First record has {} keys. Sample keys: {}'.format(
-                    _LOG_PREFIX, len(items_data[0].keys()), list(items_data[0].keys())[:5]
-                ))
             
             fitment_instances = _transform_fitment_data(items_data, sdc_brand)
             
@@ -569,4 +550,3 @@ def _transform_fitment_data(items_data: typing.List[typing.Dict], sdc_brand: src
         ))
     
     return fitment_instances
-

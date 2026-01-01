@@ -608,10 +608,9 @@ def prepare_products_for_syncing_into_bigcommerce(
         merged_part = _merge_catalog_and_distributor_parts(catalog_part, distributor_part)
         merged_parts.append(merged_part)
     
-    # # Add any distributor parts that don't have a catalog match
-    # for sku, distributor_part in distributor_parts.items():
-    #     if sku not in catalog_parts:
-    #         merged_parts.append(distributor_part)
+    for sku, distributor_part in distributor_parts.items():
+        if sku not in catalog_parts:
+            merged_parts.append(distributor_part)
     
     return merged_parts
 
@@ -761,6 +760,15 @@ def prepare_sdc_products_for_bigcommerce(brand: src_models.Brands) -> list[src_m
         # Custom fields (fitments not added as custom fields for now)
         custom_fields = []
         
+        # Prepare fitments data for vehicle hierarchy
+        fitments_data = []
+        for fitment in fitments:
+            fitments_data.append({
+                'year': fitment.year,
+                'make': fitment.make,
+                'model': fitment.model,
+            })
+        
         bigcommerce_parts.append(
             src_messages.BigCommercePart(
                 brand_id=int(bigcommerce_brand.external_id),
@@ -781,6 +789,7 @@ def prepare_sdc_products_for_bigcommerce(brand: src_models.Brands) -> list[src_m
                 active=is_active,
                 category=category,
                 subcategory=subcategory,
+                fitments=fitments_data if fitments_data else None,
             )
         )
 
@@ -1170,6 +1179,24 @@ def _get_sdc_fitment_custom_field(fitments: typing.List[src_models.SDCPartFitmen
     }
 
 
+def _map_turn14_to_pcdb_category(
+    turn14_category: typing.Optional[str],
+    turn14_subcategory: typing.Optional[str]
+) -> typing.Tuple[typing.Optional[str], typing.Optional[str]]:
+    if not turn14_category or not turn14_subcategory:
+        return (turn14_category, turn14_subcategory)
+    
+    # Look up in the mapping dictionary
+    mapping_key = (turn14_category, turn14_subcategory)
+    pcdb_mapping = src_constants.TURN14_TO_PCDB_CATEGORY_MAP.get(mapping_key)
+    
+    if pcdb_mapping:
+        return pcdb_mapping
+    
+    # If no mapping found, return original values
+    return (turn14_category, turn14_subcategory)
+
+
 def prepare_turn_14_products_for_bigcommerce(brand: src_models.Brands) -> list[src_messages.BigCommercePart]:
     bigcommerce_parts = []
     turn_14_brand = src_models.BrandTurn14BrandMapping.objects.get(brand_id=brand.id)
@@ -1212,6 +1239,12 @@ def prepare_turn_14_products_for_bigcommerce(brand: src_models.Brands) -> list[s
         cost = _get_turn_14_cost(turn_14_pricing)
         width, height, depth = _get_turn_14_dimensions(turn_14_item=turn_14_item)
         
+        # Map Turn14 categories to PCDB categories
+        pcdb_category, pcdb_subcategory = _map_turn14_to_pcdb_category(
+            turn14_category=turn_14_item.category,
+            turn14_subcategory=turn_14_item.subcategory
+        )
+        
         bigcommerce_parts.append(
             src_messages.BigCommercePart(
                 brand_id=int(bigcommerce_brand.external_id),
@@ -1230,8 +1263,8 @@ def prepare_turn_14_products_for_bigcommerce(brand: src_models.Brands) -> list[s
                 inventory=_get_turn_14_inventory(turn_14_inventory=turn_14_inventory),
                 custom_fields=[],
                 active=turn_14_item.active,
-                category=turn_14_item.category,
-                subcategory=turn_14_item.subcategory,
+                category=pcdb_category,
+                subcategory=pcdb_subcategory,
             )
         )
 
@@ -1724,6 +1757,135 @@ def _get_shop_all_category_id(
         return None
 
 
+def _get_vehicles_category_id(
+    destination: src_models.CompanyDestinations,
+    api_client: bigcommerce_client.BigCommerceApiClient
+) -> typing.Optional[int]:
+    """
+    Get or create the "Vehicles" category (parent category for vehicle hierarchy).
+    Returns the category external_id (BigCommerce category ID) or None if creation fails.
+    """
+    return _get_or_create_bigcommerce_category(
+        category_name='Vehicles',
+        parent_id=0,
+        destination=destination,
+        api_client=api_client,
+        tree_id=1
+    )
+
+
+def _build_vehicle_hierarchy_from_fitments(
+    fitments: typing.List[typing.Dict],
+    destination: src_models.CompanyDestinations,
+    api_client: bigcommerce_client.BigCommerceApiClient
+) -> typing.List[int]:
+    """
+    Build vehicle category hierarchy from fitments and return Model category IDs.
+    
+    Hierarchy: Vehicles -> Year -> Make -> Model
+    Product should be assigned to Model categories (deepest level).
+    
+    Args:
+        fitments: List of fitment dicts with 'year', 'make', 'model' keys
+        destination: Company destination
+        api_client: BigCommerce API client
+        
+    Returns:
+        List of Model category IDs (one for each unique year/make/model combination)
+    """
+    if not fitments:
+        return []
+    
+    # Get or create Vehicles parent category
+    vehicles_category_id = _get_vehicles_category_id(destination, api_client)
+    if not vehicles_category_id:
+        logger.warning('{} Failed to get or create Vehicles category. Skipping fitment hierarchy.'.format(
+            _LOG_PREFIX
+        ))
+        return []
+    
+    model_category_ids = []
+    processed_combinations = set()
+    
+    for fitment in fitments:
+        if not isinstance(fitment, dict):
+            continue
+            
+        year = fitment.get('year')
+        make = fitment.get('make')
+        model = fitment.get('model')
+        
+        # Skip if any required field is missing
+        if not year or not make or not model:
+            continue
+        
+        # Convert to strings and normalize
+        year_str = str(year).strip()
+        make_str = str(make).strip()
+        model_str = str(model).strip()
+        
+        if not year_str or not make_str or not model_str:
+            continue
+        
+        # Create unique key for this combination
+        combination_key = (year_str, make_str, model_str)
+        if combination_key in processed_combinations:
+            continue
+        
+        processed_combinations.add(combination_key)
+        
+        try:
+            # Get or create Year category (child of Vehicles)
+            year_category_id = _get_or_create_bigcommerce_category(
+                category_name=year_str,
+                parent_id=vehicles_category_id,
+                destination=destination,
+                api_client=api_client,
+                tree_id=1
+            )
+            if not year_category_id:
+                logger.warning('{} Failed to get or create Year category: {}. Skipping fitment.'.format(
+                    _LOG_PREFIX, year_str
+                ))
+                continue
+            
+            # Get or create Make category (child of Year)
+            make_category_id = _get_or_create_bigcommerce_category(
+                category_name=make_str,
+                parent_id=year_category_id,
+                destination=destination,
+                api_client=api_client,
+                tree_id=1
+            )
+            if not make_category_id:
+                logger.warning('{} Failed to get or create Make category: {} (Year: {}). Skipping fitment.'.format(
+                    _LOG_PREFIX, make_str, year_str
+                ))
+                continue
+            
+            # Get or create Model category (child of Make) - this is where products are assigned
+            model_category_id = _get_or_create_bigcommerce_category(
+                category_name=model_str,
+                parent_id=make_category_id,
+                destination=destination,
+                api_client=api_client,
+                tree_id=1
+            )
+            if model_category_id:
+                model_category_ids.append(model_category_id)
+            else:
+                logger.warning('{} Failed to get or create Model category: {} (Make: {}, Year: {}). Skipping fitment.'.format(
+                    _LOG_PREFIX, model_str, make_str, year_str
+                ))
+        except Exception as e:
+            logger.warning('{} Error building vehicle hierarchy for fitment (Year: {}, Make: {}, Model: {}). Error: {}. Skipping.'.format(
+                _LOG_PREFIX, year_str, make_str, model_str, str(e)
+            ))
+            continue
+    
+    return model_category_ids
+
+
 def _get_or_create_bigcommerce_category(
     category_name: str,
     parent_id: int,
@@ -1883,6 +2045,17 @@ def _update_product_on_bigcommerce(
                     )
                     if subcategory_id:
                         category_ids.append(subcategory_id)
+        
+        # Build vehicle hierarchy from fitments and add Model category IDs
+        if product_to_sync.fitments:
+            fitment_model_category_ids = _build_vehicle_hierarchy_from_fitments(
+                fitments=product_to_sync.fitments,
+                destination=destination,
+                api_client=api_client
+            )
+            for model_category_id in fitment_model_category_ids:
+                if model_category_id not in category_ids:
+                    category_ids.append(model_category_id)
         
         # Always add "Shop All" category
         shop_all_category_id = _get_shop_all_category_id(destination)
@@ -2092,6 +2265,17 @@ def _create_product_on_bigcommerce(
                     if subcategory_id:
                         category_ids.append(subcategory_id)
         
+        # Build vehicle hierarchy from fitments and add Model category IDs
+        if product_to_sync.fitments:
+            fitment_model_category_ids = _build_vehicle_hierarchy_from_fitments(
+                fitments=product_to_sync.fitments,
+                destination=destination,
+                api_client=api_client
+            )
+            for model_category_id in fitment_model_category_ids:
+                if model_category_id not in category_ids:
+                    category_ids.append(model_category_id)
+        
         # Always add "Shop All" category
         shop_all_category_id = _get_shop_all_category_id(destination)
         if shop_all_category_id and shop_all_category_id not in category_ids:
@@ -2168,6 +2352,11 @@ def _upsert_company_destination_part(
 ) -> src_models.CompanyDestinationParts:
     destination_data = _convert_bigcommerce_response_to_part_format(bigcommerce_response, destination=destination)
     source_data = _get_source_data_for_product(product_to_sync, brand)
+    
+    # Add fitments from source_data to destination_data for comparison purposes
+    # (fitments are not stored in BigCommerce, but we need them in destination_data to compare changes)
+    if 'fitments' in source_data:
+        destination_data['fitments'] = source_data['fitments']
 
     if company_destination_part:
         company_destination_part.destination_data = destination_data
@@ -2629,6 +2818,11 @@ def _compare_bigcommerce_parts(
     if _values_different(old_subcategory, new_subcategory):
         changes['subcategory'] = {'old': old_subcategory, 'new': new_subcategory}
 
+    old_fitments = old_data.get('fitments')
+    new_fitments = new_data.get('fitments')
+    if _values_different(old_fitments, new_fitments):
+        changes['fitments'] = {'old': old_fitments, 'new': new_fitments}
+
     return changes
 
 
@@ -2670,9 +2864,24 @@ def _values_different(old_value: typing.Any, new_value: typing.Any) -> bool:
         if not old_value and not new_value:
             return False
         if old_value and new_value and isinstance(old_value[0], dict) and isinstance(new_value[0], dict):
-            old_sorted = sorted(old_value, key=lambda x: (x.get('image_url', ''), x.get('is_thumbnail', False)))
-            new_sorted = sorted(new_value, key=lambda x: (x.get('image_url', ''), x.get('is_thumbnail', False)))
-            return old_sorted != new_sorted
+            # Check if this is fitments data (has year, make, model keys)
+            first_old = old_value[0]
+            first_new = new_value[0]
+            if 'year' in first_old and 'make' in first_old and 'model' in first_old:
+                # Sort fitments by year, make, model
+                old_sorted = sorted(old_value, key=lambda x: (str(x.get('year', '')), str(x.get('make', '')), str(x.get('model', ''))))
+                new_sorted = sorted(new_value, key=lambda x: (str(x.get('year', '')), str(x.get('make', '')), str(x.get('model', ''))))
+                return old_sorted != new_sorted
+            elif 'image_url' in first_old:
+                # Sort images by image_url and is_thumbnail
+                old_sorted = sorted(old_value, key=lambda x: (x.get('image_url', ''), x.get('is_thumbnail', False)))
+                new_sorted = sorted(new_value, key=lambda x: (x.get('image_url', ''), x.get('is_thumbnail', False)))
+                return old_sorted != new_sorted
+            else:
+                # Generic dict comparison - sort by all keys
+                old_sorted = sorted(old_value, key=lambda x: tuple(sorted(x.items())))
+                new_sorted = sorted(new_value, key=lambda x: tuple(sorted(x.items())))
+                return old_sorted != new_sorted
         return old_value != new_value
 
     if isinstance(old_value, float) and isinstance(new_value, float):
