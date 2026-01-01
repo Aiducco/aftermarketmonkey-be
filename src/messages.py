@@ -22,4 +22,5 @@ class BigCommercePart:
     active: bool
     category: typing.Optional[str] = None
     subcategory: typing.Optional[str] = None
+    fitments: typing.Optional[typing.List[typing.Dict[str, typing.Any]]] = None
 
