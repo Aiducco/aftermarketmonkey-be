@@ -1372,15 +1372,127 @@ def _get_turn_14_dimensions(turn_14_item: src_models.Turn14Items) -> typing.Tupl
     
     return (width, height, depth)
 
+def _get_turn_14_instruction_link(turn_14_data: src_models.Turn14BrandData) -> typing.Optional[str]:
+    """
+    Get installation instruction link from Turn 14 files.
+    Looks for files with type='Other' and media_content in this order:
+    1. 'Installation Instructions'
+    2. 'Illustration Guide'
+    Returns HTML link if found, otherwise None.
+    """
+    if not turn_14_data.files or not isinstance(turn_14_data.files, list):
+        return None
+    
+    # Priority order: Installation Instructions -> Illustration Guide
+    media_content_options = ['Installation Instructions', 'Illustration Guide']
+    
+    for media_content_option in media_content_options:
+        for file in turn_14_data.files:
+            if not isinstance(file, dict):
+                continue
+            
+            file_type = file.get('type', '')
+            media_content = file.get('media_content', '')
+            
+            if file_type == 'Other' and media_content == media_content_option:
+                links = file.get('links', [])
+                if not links or not isinstance(links, list):
+                    continue
+                
+                # Get the first link's URL
+                first_link = links[0] if links else None
+                if not first_link or not isinstance(first_link, dict):
+                    continue
+                
+                instruction_url = first_link.get('url', '').strip()
+                if not instruction_url:
+                    continue
+                
+                return '<a href="{}" target="_blank">Installation Instructions</a>'.format(instruction_url)
+    
+    return None
+
+
+def _get_turn_14_owners_manual_link(turn_14_data: src_models.Turn14BrandData) -> typing.Optional[str]:
+    """
+    Get Owner's Manual link from Turn 14 files.
+    Looks for files with type='Other' and media_content='Owner's Manual'.
+    Returns HTML link if found, otherwise None.
+    """
+    if not turn_14_data.files or not isinstance(turn_14_data.files, list):
+        return None
+    
+    for file in turn_14_data.files:
+        if not isinstance(file, dict):
+            continue
+        
+        file_type = file.get('type', '')
+        media_content = file.get('media_content', '')
+        
+        if file_type == 'Other' and media_content == "Owner's Manual":
+            links = file.get('links', [])
+            if not links or not isinstance(links, list):
+                continue
+            
+            # Get the first link's URL
+            first_link = links[0] if links else None
+            if not first_link or not isinstance(first_link, dict):
+                continue
+            
+            owners_manual_url = first_link.get('url', '').strip()
+            if not owners_manual_url:
+                continue
+            
+            return '<a href="{}" target="_blank">Owner\'s Manual</a>'.format(owners_manual_url)
+    
+    return None
+
+
+def _get_turn_14_warranty_link(turn_14_data: src_models.Turn14BrandData) -> typing.Optional[str]:
+    """
+    Get Warranty link from Turn 14 files.
+    Looks for files with type='Other' and media_content='Warranty'.
+    Returns HTML link if found, otherwise None.
+    """
+    if not turn_14_data.files or not isinstance(turn_14_data.files, list):
+        return None
+    
+    for file in turn_14_data.files:
+        if not isinstance(file, dict):
+            continue
+        
+        file_type = file.get('type', '')
+        media_content = file.get('media_content', '')
+        
+        if file_type == 'Other' and media_content == 'Warranty':
+            links = file.get('links', [])
+            if not links or not isinstance(links, list):
+                continue
+            
+            # Get the first link's URL
+            first_link = links[0] if links else None
+            if not first_link or not isinstance(first_link, dict):
+                continue
+            
+            warranty_url = first_link.get('url', '').strip()
+            if not warranty_url:
+                continue
+            
+            return '<a href="{}" target="_blank">Warranty</a>'.format(warranty_url)
+    
+    return None
+
+
 def _get_turn_14_description(turn_14_data: src_models.Turn14BrandData) -> str:
     """
-    Format descriptions as HTML with Overview section and Features and Benefits list.
+    Format descriptions as HTML with Overview section, Features and Benefits list, Important Notes, Installation Instructions, Owner's Manual, and Warranty.
     """
     if not turn_14_data.descriptions or not isinstance(turn_14_data.descriptions, list):
         return ''
     
     overview_parts = []
     features_and_benefits = []
+    associated_comments = []
     
     for turn_14_desc in turn_14_data.descriptions:
         if not isinstance(turn_14_desc, dict):
@@ -1396,6 +1508,8 @@ def _get_turn_14_description(turn_14_data: src_models.Turn14BrandData) -> str:
             overview_parts.append(desc_text)
         elif desc_type == 'Features and Benefits':
             features_and_benefits.append(desc_text)
+        elif desc_type == 'Associated Comments':
+            associated_comments.append(desc_text)
     
     html_parts = []
     
@@ -1414,6 +1528,52 @@ def _get_turn_14_description(turn_14_data: src_models.Turn14BrandData) -> str:
         features_html += '</ul>'
         html_parts.append(features_html)
     
+    # Add Important Notes section if we have Associated Comments
+    if associated_comments:
+        # Collect all items from all Associated Comments
+        # Each comment can be a separate item, or split by ';' if it contains semicolons
+        important_notes_items = []
+        for comment in associated_comments:
+            if not isinstance(comment, str):
+                continue
+            comment = comment.strip()
+            if not comment:
+                continue
+            
+            # Split by semicolon if present, otherwise treat as single item
+            if ';' in comment:
+                # Split by semicolon and add each item
+                items = [item.strip() for item in comment.split(';') if item.strip()]
+                important_notes_items.extend(items)
+            else:
+                # Single item, add as-is
+                important_notes_items.append(comment)
+        
+        if important_notes_items:
+            important_notes_html = '<p><strong>Important Notes:</strong></p><ul>'
+            for note_item in important_notes_items:
+                important_notes_html += '<li>{}</li>'.format(note_item)
+            important_notes_html += '</ul>'
+            html_parts.append(important_notes_html)
+    
+    # Add Installation Instructions section if available
+    instruction_link = _get_turn_14_instruction_link(turn_14_data)
+    if instruction_link:
+        html_parts.append('<p><strong>Instructions:</strong></p>')
+        html_parts.append('<p>{}</p>'.format(instruction_link))
+    
+    # Add Owner's Manual section if available
+    owners_manual_link = _get_turn_14_owners_manual_link(turn_14_data)
+    if owners_manual_link:
+        html_parts.append('<p><strong>Owner\'s Manual:</strong></p>')
+        html_parts.append('<p>{}</p>'.format(owners_manual_link))
+    
+    # Add Warranty section if available
+    warranty_link = _get_turn_14_warranty_link(turn_14_data)
+    if warranty_link:
+        html_parts.append('<p><strong>Warranty:</strong></p>')
+        html_parts.append('<p>{}</p>'.format(warranty_link))
+    
     return ''.join(html_parts)
 
 def _get_turn_14_images(turn_14_item: src_models.Turn14Items, turn_14_data: src_models.Turn14BrandData) -> list:
@@ -1430,17 +1590,29 @@ def _get_turn_14_images(turn_14_item: src_models.Turn14Items, turn_14_data: src_
     if not turn_14_data.files:
         return images
 
-    count = 0
-    is_thumbnail = False
+    # Excluded media_content types that should NOT be thumbnails
+    excluded_media_content_types = [
+        'Photo - Close Up',
+        'Photo - Mounted',
+        'Photo - Unmounted',
+        'Photo - out of package',
+        'Logo Image'
+    ]
+
     for file in turn_14_data.files:
         if file.get('type') == 'Image':
             if not file.get('links'):
                 continue
 
-            if count == 1:
-                is_thumbnail = True
+            media_content = file.get('media_content', '')
+            
+            # Set is_thumbnail=True if media_content is 'Photo - Primary'
+            # OR if media_content is NOT in the excluded list
+            is_thumbnail = (
+                media_content == 'Photo - Primary' or
+                media_content not in excluded_media_content_types
+            )
 
-            count += 1
             images.append(
                 {
                     'is_thumbnail': is_thumbnail,
