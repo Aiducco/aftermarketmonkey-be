@@ -34,7 +34,7 @@ def decode_jwt_token(token: str) -> dict:
         raise authentication_exceptions.InvalidJWTTokenError(msg)
 
 
-def create_jwt_token(user: auth_models.User) -> dict:
+def create_jwt_token(user: auth_models.User) -> str:
     return jwt.encode(
         payload={
             "user_id": user.id,
