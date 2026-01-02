@@ -1437,7 +1437,7 @@ def _get_turn_14_images(turn_14_item: src_models.Turn14Items, turn_14_data: src_
             if not file.get('links'):
                 continue
 
-            if count == 0:
+            if count == 1:
                 is_thumbnail = True
 
             count += 1
