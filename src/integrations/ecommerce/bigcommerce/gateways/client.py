@@ -276,3 +276,13 @@ class BigCommerceApiClient(object):
         )
         return response.get("data", [])
 
+    def create_brand(self, brand_data: typing.Dict) -> typing.Dict:
+        response = simplejson.loads(
+            self._request(
+                endpoint="catalog/brands",
+                method=common_enums.HttpMethod.POST,
+                payload=brand_data,
+            ).content
+        )
+        return response.get("data", {})
+

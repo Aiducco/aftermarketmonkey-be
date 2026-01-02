@@ -15,3 +15,4 @@ class Command(BaseCommand):
             self.stdout.write(self.style.ERROR(f'Error: {str(e)}'))
             raise
 
+
