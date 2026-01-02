@@ -3,6 +3,7 @@ import typing
 from decimal import Decimal
 import pandas as pd
 import io
+from django.utils import timezone
 
 import pgbulk
 
@@ -147,7 +148,8 @@ def fetch_and_save_all_sdc_brand_items() -> None:
                         'primary_image', 'additional_image', 'installation_instructions', 'logo',
                         'video_random', 'video_installation', 'length_for_case', 'width_for_case',
                 'height_for_case', 'weight_for_case', 'inventory', 'external_brand_id',
-                'part_terminology_label', 'quantity_per_application', 'hazardous_material', 'condition'
+                'part_terminology_label', 'quantity_per_application', 'hazardous_material', 'condition',
+                        'updated_at'
                     ],
                     returning=True,
                 )
@@ -258,6 +260,7 @@ def _transform_product_data(items_data: typing.List[typing.Dict], sdc_brand: src
                 quantity_per_application=get_str(get_value(item_data, 'Quantity per Application')),
                 hazardous_material=get_str(get_value(item_data, 'Hazardous Material')),
                 condition=get_str(get_value(item_data, 'Condition')),
+                updated_at=timezone.now(),  # Explicitly set updated_at for bulk operations
             )
             
             part_instances.append(part_instance)
@@ -416,7 +419,7 @@ def fetch_and_save_all_sdc_brand_fitments() -> None:
                     src_models.SDCPartFitment,
                     deduplicated_instances,
                     unique_fields=['sku', 'brand', 'year', 'make', 'model'],
-                    update_fields=['category_pcdb', 'subcategory_pcdb'],
+                    update_fields=['category_pcdb', 'subcategory_pcdb', 'updated_at'],
                     returning=True,
                 )
                 
@@ -529,6 +532,7 @@ def _transform_fitment_data(items_data: typing.List[typing.Dict], sdc_brand: src
                 model=model,
                 category_pcdb=category_pcdb,
                 subcategory_pcdb=subcategory_pcdb,
+                updated_at=timezone.now(),  # Explicitly set updated_at for bulk operations
             )
             
             fitment_instances.append(fitment_instance)
