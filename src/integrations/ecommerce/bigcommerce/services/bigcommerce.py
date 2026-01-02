@@ -1599,27 +1599,51 @@ def _get_turn_14_images(turn_14_item: src_models.Turn14Items, turn_14_data: src_
         'Logo Image'
     ]
 
+    # First, collect all valid images
+    image_candidates = []
     for file in turn_14_data.files:
         if file.get('type') == 'Image':
             if not file.get('links'):
                 continue
 
             media_content = file.get('media_content', '')
+            image_url = file.get('links', [])[0].get('url', '')
             
-            # Set is_thumbnail=True if media_content is 'Photo - Primary'
-            # OR if media_content is NOT in the excluded list
-            is_thumbnail = (
-                media_content == 'Photo - Primary' or
-                media_content not in excluded_media_content_types
-            )
-
-            images.append(
-                {
-                    'is_thumbnail': is_thumbnail,
-                    'image_url': file.get('links', [])[0].get('url', ''),
-                    'description': '',
-                }
-            )
+            if not image_url:
+                continue
+            
+            image_candidates.append({
+                'image_url': image_url,
+                'media_content': media_content,
+            })
+    
+    # Find the first image that should be thumbnail (priority: Photo - Primary, then non-excluded)
+    thumbnail_index = None
+    
+    # First, try to find 'Photo - Primary'
+    for idx, candidate in enumerate(image_candidates):
+        if candidate['media_content'] == 'Photo - Primary':
+            thumbnail_index = idx
+            break
+    
+    # If no 'Photo - Primary' found, find first non-excluded image
+    if thumbnail_index is None:
+        for idx, candidate in enumerate(image_candidates):
+            if candidate['media_content'] not in excluded_media_content_types:
+                thumbnail_index = idx
+                break
+    
+    # Build images list, setting thumbnail flag only for the first matching image
+    for idx, candidate in enumerate(image_candidates):
+        is_thumbnail = (idx == thumbnail_index) if thumbnail_index is not None else False
+        
+        images.append(
+            {
+                'is_thumbnail': is_thumbnail,
+                'image_url': candidate['image_url'],
+                'description': '',
+            }
+        )
 
     return images
 
