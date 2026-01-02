@@ -1,7 +1,9 @@
 import logging
+import time
 import typing
 from datetime import datetime
 from decimal import Decimal
+from django.utils import timezone
 
 import pgbulk
 
@@ -242,7 +244,7 @@ def fetch_and_save_all_turn_14_brand_items() -> None:
                         'powersports_indicator', 'dropship_controller_id', 'air_freight_prohibited',
                         'not_carb_approved', 'carb_acknowledgement_required', 'ltl_freight_required',
                         'prop_65', 'epa', 'units_per_sku', 'clearance_item', 'thumbnail',
-                        'barcode', 'dimensions', 'warehouse_availability'
+                        'barcode', 'dimensions', 'warehouse_availability', 'updated_at'
                     ],
                     returning=True,
                 )
@@ -316,6 +318,7 @@ def _transform_items_data(items_data: typing.List[typing.Dict], turn_14_brand: s
                 barcode=attributes.get('barcode'),
                 dimensions=attributes.get('dimensions'),
                 warehouse_availability=attributes.get('warehouse_availability'),
+                updated_at=timezone.now(),  # Explicitly set updated_at for bulk operations
             )
             
             item_instances.append(item_instance)
@@ -916,14 +919,66 @@ def fetch_and_save_turn_14_items_updates() -> None:
     days = 1
     total_processed = 0
     total_skipped = 0
+    # Rate limiting is handled at the client level (token caching + rate limit decorators)
+    # Retry logic for 429 errors as a safety measure
+    MAX_RETRIES = 3
+    INITIAL_RETRY_DELAY = 5  # seconds
 
     while page is not None:
-        try:
-            items_updates, next_page = api_client.get_items_updates(page=page, days=days)
-        except turn_14_exceptions.Turn14APIException as e:
-            logger.error('{} Turn 14 API error for items updates, page: {}. Error: {}. Stopping.'.format(
-                _LOG_PREFIX, page, str(e)
-            ))
+        retry_count = 0
+        items_updates = None
+        next_page = None
+        
+        while retry_count <= MAX_RETRIES:
+            try:
+                items_updates, next_page = api_client.get_items_updates(page=page, days=days)
+                break  # Success, exit retry loop
+            except turn_14_exceptions.Turn14APIBadResponseCodeError as e:
+                # Check if it's a rate limit error (429)
+                if e.code == 429:
+                    if retry_count < MAX_RETRIES:
+                        # Exponential backoff: 5s, 10s, 20s
+                        retry_delay = INITIAL_RETRY_DELAY * (2 ** retry_count)
+                        logger.warning(
+                            '{} Rate limit hit (429) for items updates, page: {}. '
+                            'Retrying in {} seconds (attempt {}/{}).'.format(
+                                _LOG_PREFIX, page, retry_delay, retry_count + 1, MAX_RETRIES
+                            )
+                        )
+                        time.sleep(retry_delay)
+                        retry_count += 1
+                        continue
+                    else:
+                        logger.error(
+                            '{} Rate limit exceeded (429) for items updates, page: {}. '
+                            'Max retries reached. Stopping.'.format(_LOG_PREFIX, page)
+                        )
+                        return
+                else:
+                    # Other bad response code, stop
+                    logger.error(
+                        '{} Turn 14 API error for items updates, page: {}. '
+                        'Status code: {}. Error: {}. Stopping.'.format(
+                            _LOG_PREFIX, page, e.code, str(e)
+                        )
+                    )
+                    return
+            except turn_14_exceptions.Turn14APIException as e:
+                # Other API exceptions, stop
+                logger.error(
+                    '{} Turn 14 API error for items updates, page: {}. Error: {}. Stopping.'.format(
+                        _LOG_PREFIX, page, str(e)
+                    )
+                )
+                return
+        
+        if items_updates is None:
+            # Failed after all retries
+            logger.error(
+                '{} Failed to fetch items updates after {} retries, page: {}. Stopping.'.format(
+                    _LOG_PREFIX, MAX_RETRIES, page
+                )
+            )
             break
 
         if not items_updates:
@@ -978,7 +1033,7 @@ def fetch_and_save_turn_14_items_updates() -> None:
                     'powersports_indicator', 'dropship_controller_id', 'air_freight_prohibited',
                     'not_carb_approved', 'carb_acknowledgement_required', 'ltl_freight_required',
                     'prop_65', 'epa', 'units_per_sku', 'clearance_item', 'thumbnail',
-                    'barcode', 'dimensions', 'warehouse_availability'
+                    'barcode', 'dimensions', 'warehouse_availability', 'updated_at'
                 ],
                 returning=True,
             )
@@ -1066,6 +1121,7 @@ def _transform_items_update_data(items_data: typing.List[typing.Dict], brand_id_
                 barcode=attributes.get('barcode'),
                 dimensions=attributes.get('dimensions'),
                 warehouse_availability=attributes.get('warehouse_availability'),
+                updated_at=timezone.now(),  # Explicitly set updated_at for bulk operations
             )
             
             item_instances.append(item_instance)
@@ -1177,7 +1233,7 @@ def fetch_and_save_turn_14_inventory_updates() -> None:
                 inventory_instances,
                 unique_fields=['external_id'],
                 update_fields=[
-                    'type', 'inventory', 'manufacturer', 'eta', 'relationships', 'total_inventory'
+                    'type', 'inventory', 'manufacturer', 'eta', 'relationships', 'total_inventory', 'updated_at'
                 ],
                 returning=True,
             )
@@ -1241,6 +1297,7 @@ def _transform_inventory_update_data(inventory_data: typing.List[typing.Dict]) -
                 eta=eta,
                 relationships=inventory_item.get('relationships'),
                 total_inventory=total_inventory if total_inventory > 0 else None,
+                updated_at=timezone.now(),  # Explicitly set updated_at for bulk operations
             )
 
             inventory_instances.append(inventory_instance)
