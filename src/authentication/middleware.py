@@ -17,6 +17,20 @@ class JWTAuthenticationMiddleware:
 
     def __call__(self, request):
         auth_header = request.headers.get("Authorization")
+        
+        # Log all requests to protected endpoints (those starting with /api/auth/)
+        if request.path.startswith("/api/auth/"):
+            logger.info(
+                f"{_LOG_PREFIX} Processing request: {request.method} {request.path}"
+            )
+            if auth_header:
+                logger.info(
+                    f"{_LOG_PREFIX} Authorization header present: {auth_header[:20]}..."
+                )
+            else:
+                logger.warning(
+                    f"{_LOG_PREFIX} No Authorization header found for {request.method} {request.path}"
+                )
 
         if auth_header:
             try:
@@ -49,8 +63,8 @@ class JWTAuthenticationMiddleware:
                 try:
                     user = User.objects.get(id=user_id)
                     request.user = user
-                    logger.debug(
-                        f"{_LOG_PREFIX} Authenticated user (id={user_id}, email={user.email})"
+                    logger.info(
+                        f"{_LOG_PREFIX} Authenticated user (id={user_id}, email={user.email}) for {request.path}"
                     )
                 except User.DoesNotExist:
                     logger.warning(
