@@ -1,4 +1,5 @@
 import decimal
+import time
 import typing
 import requests
 import logging
@@ -17,6 +18,9 @@ SECOND_LIMIT = 5
 HOUR_LIMIT = 5000
 DAY_LIMIT = 30000
 
+# Token expiration buffer (refresh token 60 seconds before it expires)
+TOKEN_EXPIRATION_BUFFER_SECONDS = 60
+
 
 class Turn14ApiClient(object):
     API_BASE_URL = settings.TURN14_BASE_URL
@@ -30,10 +34,70 @@ class Turn14ApiClient(object):
 
         if not self.client_id or not self.client_secret:
             raise ValueError("Invalid credentials parameter.")
+        
+        # Token caching
+        self._cached_token: typing.Optional[str] = None
+        self._token_expires_at: typing.Optional[float] = None
+
+    def _is_token_valid(self) -> bool:
+        """Check if the cached token is still valid (not expired)."""
+        if self._cached_token is None or self._token_expires_at is None:
+            return False
+        
+        # Check if token expires within the buffer time
+        current_time = time.time()
+        return current_time < (self._token_expires_at - TOKEN_EXPIRATION_BUFFER_SECONDS)
+
+    def _get_valid_token(self) -> str:
+        """
+        Get a valid access token, using cached token if available and not expired.
+        Creates a new token only when necessary.
+        """
+        if self._is_token_valid():
+            logger.debug("{} Using cached authorization token.".format(self.LOG_PREFIX))
+            return self._cached_token
+        
+        # Token is expired or doesn't exist, create a new one
+        logger.debug("{} Creating new authorization token.".format(self.LOG_PREFIX))
+        auth_data = self._create_authorization_token()
+        
+        access_token = auth_data.get('access_token')
+        if not access_token:
+            raise exceptions.Turn14APIException("No access_token in authorization response.")
+        
+        # Cache the token
+        self._cached_token = access_token
+        
+        # Calculate expiration time
+        # expires_in is typically in seconds (OAuth2 standard)
+        expires_in = auth_data.get('expires_in')
+        if expires_in:
+            # Convert to int if it's a Decimal
+            if isinstance(expires_in, decimal.Decimal):
+                expires_in = int(expires_in)
+            self._token_expires_at = time.time() + expires_in
+            logger.debug(
+                "{} Token cached. Expires in {} seconds (at {}).".format(
+                    self.LOG_PREFIX, expires_in, self._token_expires_at
+                )
+            )
+        else:
+            # If expires_in is not provided, assume 1 hour (3600 seconds) as default
+            # This is a common OAuth2 default
+            logger.warning(
+                "{} No expires_in in token response. Assuming 1 hour expiration.".format(self.LOG_PREFIX)
+            )
+            self._token_expires_at = time.time() + 3600
+        
+        return self._cached_token
 
     @sleep_and_retry
     @limits(calls=20, period=60)
-    def create_authorization_token(self) -> typing.Dict:
+    def _create_authorization_token(self) -> typing.Dict:
+        """
+        Internal method to create a new authorization token.
+        This method is rate-limited and should only be called when necessary.
+        """
         try:
             response = requests.request(
                 url=f"{self.API_BASE_URL}/token",
@@ -188,6 +252,12 @@ class Turn14ApiClient(object):
             ).content
         ).get("data", [])
 
+    def _clear_token_cache(self) -> None:
+        """Clear the cached token and expiration time."""
+        self._cached_token = None
+        self._token_expires_at = None
+        logger.debug("{} Cleared cached authorization token.".format(self.LOG_PREFIX))
+
     @sleep_and_retry
     @limits(calls=SECOND_LIMIT, period=1)  # 5 requests per second
     @limits(calls=20, period=60)  # 5 requests per second
@@ -200,6 +270,7 @@ class Turn14ApiClient(object):
             params: typing.Optional[dict] = None,
             payload: typing.Optional[dict] = None,
             include_auth: bool = True,
+            retry_on_401: bool = True,
     ) -> requests.Response:
         url = f"{self.API_BASE_URL}/{endpoint}"
         headers = {
@@ -207,8 +278,8 @@ class Turn14ApiClient(object):
         }
 
         if include_auth:
-            auth_data = self.create_authorization_token()
-            headers["Authorization"] = f"Bearer {auth_data.get('access_token')}"
+            access_token = self._get_valid_token()
+            headers["Authorization"] = f"Bearer {access_token}"
 
         try:
             response = requests.request(
@@ -218,6 +289,24 @@ class Turn14ApiClient(object):
                 json=payload,
                 headers=headers,
             )
+
+            # Handle 401 Unauthorized - token might be invalid
+            if response.status_code == 401 and include_auth and retry_on_401:
+                logger.warning(
+                    "{} Received 401 Unauthorized. Clearing token cache and retrying once (endpoint={}).".format(
+                        self.LOG_PREFIX, endpoint
+                    )
+                )
+                self._clear_token_cache()
+                # Retry once with a fresh token
+                return self._request(
+                    endpoint=endpoint,
+                    method=method,
+                    params=params,
+                    payload=payload,
+                    include_auth=include_auth,
+                    retry_on_401=False,  # Don't retry again to avoid infinite loop
+                )
 
             if response.status_code not in self.VALID_STATUS_CODES:
                 msg = f"Invalid API client response (status_code={response.status_code}, data={response.content.decode('utf-8')})"
