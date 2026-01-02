@@ -47,6 +47,7 @@ MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
     "django.middleware.common.CommonMiddleware",
     #"django.middleware.csrf.CsrfViewMiddleware",
+    "src.authentication.middleware.JWTAuthenticationMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
@@ -97,6 +98,11 @@ WSGI_APPLICATION = "wsgi.application"
 
 # Password validation
 # https://docs.djangoproject.com/en/4.1/ref/settings/#auth-password-validators
+
+AUTHENTICATION_BACKENDS = [
+    "src.authentication.backends.EmailBackend",
+    "django.contrib.auth.backends.ModelBackend",
+]
 
 AUTH_PASSWORD_VALIDATORS = [
     {
