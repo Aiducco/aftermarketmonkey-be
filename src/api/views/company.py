@@ -15,7 +15,13 @@ class CompanyDestinationsView(views.View):
     def get(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
 
         # AUTH CHECK
+        logger.info(
+            f"{_LOG_PREFIX} Auth check - user: {request.user}, is_authenticated: {getattr(request.user, 'is_authenticated', False) if request.user else False}"
+        )
         if not request.user or not request.user.is_authenticated:
+            logger.warning(
+                f"{_LOG_PREFIX} User not authenticated for {request.path}"
+            )
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
                 content=simplejson.dumps({"message": "User not authenticated"}),
