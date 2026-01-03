@@ -1271,46 +1271,69 @@ def prepare_turn_14_products_for_bigcommerce(brand: src_models.Brands) -> list[s
     return bigcommerce_parts
 
 
-def _get_turn_14_prices(turn_14_pricing: src_models.Turn14BrandPricing) -> typing.Tuple[float, float]:
+def _get_turn_14_prices(
+    turn_14_pricing: src_models.Turn14BrandPricing,
+    jobber_markup: float = 0.30,
+) -> typing.Tuple[float, float]:
     default_price = 0.0
     msrp = 0.0
-    
+
     if not turn_14_pricing.pricelists:
         return default_price, msrp
 
     map_price = None
     retail_price = None
     msrp_price = None
-    
+    jobber_price = None
+
     for pricelist_item in turn_14_pricing.pricelists:
         if not isinstance(pricelist_item, dict):
             continue
-            
-        pricelist_name = pricelist_item.get('name')
-        price_value = pricelist_item.get('price')
-        
+
+        pricelist_name = pricelist_item.get("name")
+        price_value = pricelist_item.get("price")
+
         if price_value is None:
             continue
-            
+
         try:
             price_float = float(price_value)
-            
-            if pricelist_name == 'MAP':
+
+            if pricelist_name == "MAP":
                 map_price = price_float
-            elif pricelist_name == 'Retail':
+            elif pricelist_name == "Retail":
                 retail_price = price_float
-            elif pricelist_name == 'MSRP':
+            elif pricelist_name == "MSRP":
                 msrp_price = price_float
+            elif pricelist_name == "Jobber":
+                jobber_price = price_float
+
         except (ValueError, TypeError):
             continue
 
-    # For default_price: use MAP if available, otherwise Retail, otherwise MSRP
-    default_price = map_price if map_price is not None else (retail_price if retail_price is not None else (msrp_price if msrp_price is not None else 0.0))
-    
-    # For retail_price (MSRP): use Retail if available, otherwise MSRP
-    msrp = retail_price if retail_price is not None else (msrp_price if msrp_price is not None else 0.0)
-    
+    # --- DEFAULT PRICE (what you show publicly) ---
+    if map_price is not None:
+        default_price = map_price
+    elif retail_price is not None:
+        default_price = retail_price
+    elif msrp_price is not None:
+        default_price = msrp_price
+    elif jobber_price is not None:
+        # Jobber-only brand → apply markup
+        default_price = round(jobber_price / (1 - jobber_markup), 2)
+    else:
+        default_price = 0.0
+
+    # --- MSRP / COMPARE-AT PRICE ---
+    if retail_price is not None:
+        msrp = retail_price
+    elif msrp_price is not None:
+        msrp = msrp_price
+    else:
+        msrp = 0.0
+
     return default_price, msrp
+
 
 
 def _get_turn_14_cost(turn_14_pricing: src_models.Turn14BrandPricing) -> float:
