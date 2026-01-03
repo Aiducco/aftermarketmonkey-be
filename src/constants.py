@@ -6,7 +6,7 @@
 BIGCOMMERCE_PART_FIELD_PRIORITY = {
     'brand_id': 'CATALOG',
     'product_title': 'CATALOG',
-    'sku': 'CATALOG',
+    'sku': 'DISTRIBUTOR',
     'mpn': 'CATALOG',
     'description': 'CATALOG',
     'images': 'DISTRIBUTOR',
