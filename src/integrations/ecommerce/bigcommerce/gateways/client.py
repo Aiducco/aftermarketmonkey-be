@@ -286,3 +286,22 @@ class BigCommerceApiClient(object):
         )
         return response.get("data", {})
 
+    def delete_products(self, product_ids: typing.List[int]) -> None:
+        """
+        Delete multiple products by their IDs.
+        Uses the id:in query parameter to delete products in bulk.
+        """
+        if not product_ids:
+            return
+        
+        # Format product IDs as comma-separated string
+        ids_str = ','.join(str(pid) for pid in product_ids)
+        
+        self._request(
+            endpoint="catalog/products",
+            method=common_enums.HttpMethod.DELETE,
+            params={
+                "id:in": ids_str,
+            },
+        )
+
