@@ -1505,56 +1505,69 @@ def _get_turn_14_warranty_link(turn_14_data: src_models.Turn14BrandData) -> typi
     
     return None
 
-
 def _get_turn_14_description(turn_14_data: src_models.Turn14BrandData) -> str:
     """
-    Format descriptions as HTML with Overview section, Features and Benefits list, Important Notes, Installation Instructions, Owner's Manual, and Warranty.
+    Format descriptions as HTML with Overview section, Features and Benefits list,
+    Important Notes, Installation Instructions, Owner's Manual, and Warranty.
+
+    Overview precedence:
+    - Market Description (preferred)
+    - Product Description - Extended (fallback)
     """
     if not turn_14_data.descriptions or not isinstance(turn_14_data.descriptions, list):
         return ''
-    
-    overview_parts = []
+
+    market_description = None
+    extended_description = None
     features_and_benefits = []
     associated_comments = []
-    
+
     for turn_14_desc in turn_14_data.descriptions:
         if not isinstance(turn_14_desc, dict):
             continue
-        
-        desc_type = turn_14_desc.get('type', '')
-        desc_text = turn_14_desc.get('description', '')
-        
+
+        desc_type = turn_14_desc.get('type')
+        desc_text = turn_14_desc.get('description')
+
         if not desc_text:
             continue
-        
-        if desc_type == 'Market Description' or desc_type == 'Product Description - Extended':
-            overview_parts.append(desc_text)
+
+        if desc_type == 'Market Description':
+            # take the first one only
+            if market_description is None:
+                market_description = desc_text
+
+        elif desc_type == 'Product Description - Extended':
+            # take the first one only
+            if extended_description is None:
+                extended_description = desc_text
+
         elif desc_type == 'Features and Benefits':
             features_and_benefits.append(desc_text)
+
         elif desc_type == 'Associated Comments':
             associated_comments.append(desc_text)
-    
+
     html_parts = []
-    
-    # Add Overview section if we have overview content
-    if overview_parts:
-        overview_html = '<p><strong>Overview:</strong></p>'
-        for overview_text in overview_parts:
-            overview_html += '<p>{}</p>'.format(overview_text)
-        html_parts.append(overview_html)
-    
-    # Add Features and Benefits list if we have any
+
+    # ✅ Overview: Market Description wins, otherwise Extended
+    overview_text = market_description or extended_description
+    if overview_text:
+        html_parts.append(
+            '<p><strong>Overview:</strong></p>'
+            f'<p>{overview_text}</p>'
+        )
+
+    # Features & Benefits
     if features_and_benefits:
         features_html = '<p><strong>Features and Benefits:</strong></p><ul>'
         for feature_text in features_and_benefits:
-            features_html += '<li>{}</li>'.format(feature_text)
+            features_html += f'<li>{feature_text}</li>'
         features_html += '</ul>'
         html_parts.append(features_html)
-    
-    # Add Important Notes section if we have Associated Comments
+
+    # Important Notes (Associated Comments)
     if associated_comments:
-        # Collect all items from all Associated Comments
-        # Each comment can be a separate item, or split by ';' if it contains semicolons
         important_notes_items = []
         for comment in associated_comments:
             if not isinstance(comment, str):
@@ -1562,41 +1575,39 @@ def _get_turn_14_description(turn_14_data: src_models.Turn14BrandData) -> str:
             comment = comment.strip()
             if not comment:
                 continue
-            
-            # Split by semicolon if present, otherwise treat as single item
+
             if ';' in comment:
-                # Split by semicolon and add each item
-                items = [item.strip() for item in comment.split(';') if item.strip()]
-                important_notes_items.extend(items)
+                important_notes_items.extend(
+                    item.strip() for item in comment.split(';') if item.strip()
+                )
             else:
-                # Single item, add as-is
                 important_notes_items.append(comment)
-        
+
         if important_notes_items:
-            important_notes_html = '<p><strong>Important Notes:</strong></p><ul>'
-            for note_item in important_notes_items:
-                important_notes_html += '<li>{}</li>'.format(note_item)
-            important_notes_html += '</ul>'
-            html_parts.append(important_notes_html)
-    
-    # Add Installation Instructions section if available
+            notes_html = '<p><strong>Important Notes:</strong></p><ul>'
+            for note in important_notes_items:
+                notes_html += f'<li>{note}</li>'
+            notes_html += '</ul>'
+            html_parts.append(notes_html)
+
+    # Instructions
     instruction_link = _get_turn_14_instruction_link(turn_14_data)
     if instruction_link:
         html_parts.append('<p><strong>Instructions:</strong></p>')
-        html_parts.append('<p>{}</p>'.format(instruction_link))
-    
-    # Add Owner's Manual section if available
+        html_parts.append(f'<p>{instruction_link}</p>')
+
+    # Owner's Manual
     owners_manual_link = _get_turn_14_owners_manual_link(turn_14_data)
     if owners_manual_link:
         html_parts.append('<p><strong>Owner\'s Manual:</strong></p>')
-        html_parts.append('<p>{}</p>'.format(owners_manual_link))
-    
-    # Add Warranty section if available
+        html_parts.append(f'<p>{owners_manual_link}</p>')
+
+    # Warranty
     warranty_link = _get_turn_14_warranty_link(turn_14_data)
     if warranty_link:
         html_parts.append('<p><strong>Warranty:</strong></p>')
-        html_parts.append('<p>{}</p>'.format(warranty_link))
-    
+        html_parts.append(f'<p>{warranty_link}</p>')
+
     return ''.join(html_parts)
 
 def _get_turn_14_images(turn_14_item: src_models.Turn14Items, turn_14_data: src_models.Turn14BrandData) -> list:
