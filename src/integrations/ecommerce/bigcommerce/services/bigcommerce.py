@@ -558,8 +558,12 @@ def prepare_products_for_syncing_into_bigcommerce(
     for catalog_provider in catalog_providers:
         try:
             parts = _prepare_parts_by_kind(catalog_provider.provider.kind_name, brand)
-            # Store parts by provider
-            catalog_parts_by_provider[catalog_provider] = {part.sku: part for part in parts}
+            # Store parts by provider, indexed by MPN (fallback to SKU if MPN is empty)
+            # For SDC: MPN = part_number, which is the same as SKU
+            catalog_parts_by_provider[catalog_provider] = {
+                (part.mpn.strip() if part.mpn and part.mpn.strip() else part.sku): part 
+                for part in parts
+            }
         except Exception as e:
             logger.exception('{} Error while preparing catalog products (kind: {}) for brand {}. Error: {}.'.format(
                 _LOG_PREFIX, catalog_provider.provider.kind_name, brand, str(e)
@@ -570,8 +574,12 @@ def prepare_products_for_syncing_into_bigcommerce(
     for distributor_provider in distributor_providers:
         try:
             parts = _prepare_parts_by_kind(distributor_provider.provider.kind_name, brand)
-            # Store parts by provider
-            distributor_parts_by_provider[distributor_provider] = {part.sku: part for part in parts}
+            # Store parts by provider, indexed by MPN (fallback to SKU if MPN is empty)
+            # For Turn14: MPN = mfr_part_number, SKU = part_number (with brand prefix)
+            distributor_parts_by_provider[distributor_provider] = {
+                (part.mpn.strip() if part.mpn and part.mpn.strip() else part.sku): part 
+                for part in parts
+            }
         except Exception as e:
             logger.exception('{} Error while preparing distributor products (kind: {}) for brand {}. Error: {}.'.format(
                 _LOG_PREFIX, distributor_provider.provider.kind_name, brand, str(e)
@@ -596,20 +604,23 @@ def prepare_products_for_syncing_into_bigcommerce(
     # Merge catalog and distributor parts
     merged_parts = []
     
-    # Go through each catalog part and try to find matching distributor part
-    for sku, catalog_part in catalog_parts.items():
-        distributor_part = distributor_parts.get(sku)
+    # Go through each catalog part and try to find matching distributor part by MPN
+    # Match SDC's MPN (part_number) with Turn14's MPN (mfr_part_number)
+    for mpn_key, catalog_part in catalog_parts.items():
+        distributor_part = distributor_parts.get(mpn_key)
         if distributor_part is None:
-            logger.info('{} Catalog SKU {} not found in distributor parts. Using catalog part only.'.format(
-                _LOG_PREFIX, sku
+            logger.info('{} Catalog MPN {} (SKU: {}) not found in distributor parts. Using catalog part only.'.format(
+                _LOG_PREFIX, mpn_key, catalog_part.sku
             ))
+            merged_parts.append(catalog_part)
             continue
 
         merged_part = _merge_catalog_and_distributor_parts(catalog_part, distributor_part)
         merged_parts.append(merged_part)
     
-    for sku, distributor_part in distributor_parts.items():
-        if sku not in catalog_parts:
+    # Add distributor parts that don't have a matching catalog part
+    for mpn_key, distributor_part in distributor_parts.items():
+        if mpn_key not in catalog_parts:
             merged_parts.append(distributor_part)
     
     return merged_parts
@@ -1248,8 +1259,8 @@ def prepare_turn_14_products_for_bigcommerce(brand: src_models.Brands) -> list[s
         bigcommerce_parts.append(
             src_messages.BigCommercePart(
                 brand_id=int(bigcommerce_brand.external_id),
-                product_title='{} - {}'.format(turn_14_item.part_description, turn_14_item.mfr_part_number),
-                sku=turn_14_item.mfr_part_number,
+                product_title='{} - {}'.format(turn_14_item.part_description, turn_14_item.part_number),
+                sku=turn_14_item.part_number,
                 mpn=turn_14_item.mfr_part_number,
                 default_price=default_price,
                 cost=cost,
