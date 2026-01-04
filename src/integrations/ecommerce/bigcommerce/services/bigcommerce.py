@@ -2195,13 +2195,23 @@ def _get_or_create_bigcommerce_category(
     """
     Get or create a BigCommerce category.
     Returns the category external_id (BigCommerce category ID) or None if creation fails.
+    BigCommerce has a 50 character limit for category names, so names are truncated if needed.
     """
     if not category_name:
         return None
     
-    # Check if category exists in database
+    # Truncate category name to 50 characters (BigCommerce API limit)
+    MAX_CATEGORY_NAME_LENGTH = 50
+    truncated_category_name = category_name[:MAX_CATEGORY_NAME_LENGTH] if len(category_name) > MAX_CATEGORY_NAME_LENGTH else category_name
+    
+    if truncated_category_name != category_name:
+        logger.debug('{} Truncated category name from {} to {} characters: "{}" -> "{}"'.format(
+            _LOG_PREFIX, len(category_name), len(truncated_category_name), category_name, truncated_category_name
+        ))
+    
+    # Check if category exists in database (using truncated name)
     existing_category = src_models.BigCommerceCategories.objects.filter(
-        name=category_name,
+        name=truncated_category_name,
         parent_id=parent_id,
         company_destination=destination,
         tree_id=tree_id
@@ -2213,7 +2223,7 @@ def _get_or_create_bigcommerce_category(
     # Category doesn't exist, create it via API
     try:
         category_data = [{
-            'name': category_name,
+            'name': truncated_category_name,
             'parent_id': parent_id,
             'tree_id': tree_id,
             'is_visible': True,
@@ -2228,7 +2238,7 @@ def _get_or_create_bigcommerce_category(
             
             if external_id:
                 # Extract other fields from response
-                response_name = category_result.get('name', category_name)
+                response_name = category_result.get('name', truncated_category_name)
                 response_parent_id = category_result.get('parent_id', parent_id)
                 response_tree_id = category_result.get('tree_id', tree_id)
                 
@@ -2246,17 +2256,17 @@ def _get_or_create_bigcommerce_category(
                 return external_id
             else:
                 logger.error('{} Failed to create BigCommerce category: {}. No category_id returned.'.format(
-                    _LOG_PREFIX, category_name
+                    _LOG_PREFIX, truncated_category_name
                 ))
                 return None
         else:
             logger.error('{} Failed to create BigCommerce category: {}. Empty response.'.format(
-                _LOG_PREFIX, category_name
+                _LOG_PREFIX, truncated_category_name
             ))
             return None
     except Exception as e:
         logger.error('{} Error creating BigCommerce category: {}. Error: {}.'.format(
-            _LOG_PREFIX, category_name, str(e)
+            _LOG_PREFIX, truncated_category_name, str(e)
         ))
         return None
 
