@@ -266,6 +266,25 @@ class BigCommerceApiClient(object):
             method=common_enums.HttpMethod.DELETE,
         )
 
+    def get_categories(self, page: int = 1) -> typing.Tuple[typing.List[typing.Dict], typing.Optional[int]]:
+        response = simplejson.loads(
+            self._request(
+                endpoint="catalog/trees/categories",
+                method=common_enums.HttpMethod.GET,
+                params={
+                    "page": page,
+                },
+            ).content
+        )
+
+        data = response.get("data", [])
+        pagination = response.get("meta", {}).get("pagination", {})
+        total_pages = pagination.get("total_pages", 1)
+        potential_next_page = page + 1
+        next_page = None if page >= total_pages else potential_next_page
+
+        return data, next_page
+
     def create_category(self, category_data: typing.List[typing.Dict]) -> typing.List[typing.Dict]:
         response = simplejson.loads(
             self._request(
