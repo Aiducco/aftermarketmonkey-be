@@ -1644,6 +1644,9 @@ def _get_turn_14_images(turn_14_item: src_models.Turn14Items, turn_14_data: src_
         'Logo Image'
     ]
 
+    # Valid image extensions (case-sensitive)
+    valid_image_extensions = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg', '.PNG', '.JPG', '.JPEG', '.GIF', '.WEBP', '.BMP', '.SVG'}
+
     # First, collect all valid images
     image_candidates = []
     for file in turn_14_data.files:
@@ -1655,6 +1658,23 @@ def _get_turn_14_images(turn_14_item: src_models.Turn14Items, turn_14_data: src_
             image_url = file.get('links', [])[0].get('url', '')
             
             if not image_url:
+                continue
+            
+            # Check if URL has a valid image extension (case-sensitive)
+            # Extract extension from URL (handle query parameters)
+            url_path = urlparse(image_url).path
+            if '.' in url_path:
+                file_extension = '.' + url_path.rsplit('.', 1)[-1]
+                if file_extension not in valid_image_extensions:
+                    logger.debug('{} Skipping image with invalid extension: {} (extension: {})'.format(
+                        _LOG_PREFIX, image_url, file_extension
+                    ))
+                    continue
+            else:
+                # No extension found in URL
+                logger.debug('{} Skipping image with no extension: {}'.format(
+                    _LOG_PREFIX, image_url
+                ))
                 continue
             
             image_candidates.append({
