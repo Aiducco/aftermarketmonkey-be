@@ -1085,6 +1085,9 @@ def _get_sdc_images(sdc_item: src_models.SDCParts) -> list:
     """Get images from SDC part. Returns list of image dicts with is_thumbnail and image_url."""
     images = []
     
+    # Valid image extensions (case-sensitive)
+    valid_image_extensions = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg', '.PNG', '.JPG', '.JPEG', '.GIF', '.WEBP', '.BMP', '.SVG'}
+    
     def _encode_image_url(url: str) -> str:
         """URL encode the image URL, preserving the URL structure."""
         if not url:
@@ -1108,23 +1111,44 @@ def _get_sdc_images(sdc_item: src_models.SDCParts) -> list:
             # If encoding fails, return original URL
             return url
     
+    def _is_valid_image_url(url: str) -> bool:
+        """Check if URL has a valid image extension (case-sensitive)."""
+        if not url:
+            return False
+        # Extract extension from URL (handle query parameters)
+        url_path = urlparse(url).path
+        if '.' in url_path:
+            file_extension = '.' + url_path.rsplit('.', 1)[-1]
+            return file_extension in valid_image_extensions
+        return False
+    
     # Primary image is the thumbnail
     if sdc_item.primary_image:
-        encoded_url = _encode_image_url(sdc_item.primary_image)
-        images.append({
-            'is_thumbnail': True,
-            'image_url': encoded_url,
-            'description': '',
-        })
+        if _is_valid_image_url(sdc_item.primary_image):
+            encoded_url = _encode_image_url(sdc_item.primary_image)
+            images.append({
+                'is_thumbnail': True,
+                'image_url': encoded_url,
+                'description': '',
+            })
+        else:
+            logger.debug('{} Skipping SDC primary image with invalid extension: {}'.format(
+                _LOG_PREFIX, sdc_item.primary_image
+            ))
     
     # Additional images
     if sdc_item.additional_image:
-        encoded_url = _encode_image_url(sdc_item.additional_image)
-        images.append({
-            'is_thumbnail': False,
-            'image_url': encoded_url,
-            'description': '',
-        })
+        if _is_valid_image_url(sdc_item.additional_image):
+            encoded_url = _encode_image_url(sdc_item.additional_image)
+            images.append({
+                'is_thumbnail': False,
+                'image_url': encoded_url,
+                'description': '',
+            })
+        else:
+            logger.debug('{} Skipping SDC additional image with invalid extension: {}'.format(
+                _LOG_PREFIX, sdc_item.additional_image
+            ))
     
     return images
 
