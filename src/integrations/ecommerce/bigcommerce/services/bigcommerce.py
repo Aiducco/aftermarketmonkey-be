@@ -1112,9 +1112,15 @@ def _get_sdc_images(sdc_item: src_models.SDCParts) -> list:
             return url
     
     def _is_valid_image_url(url: str) -> bool:
-        """Check if URL has a valid image extension (case-sensitive)."""
+        """Check if URL is a valid HTTP/HTTPS URL with a valid image extension (case-sensitive)."""
         if not url:
             return False
+        
+        # Check if URL starts with http:// or https://
+        url_lower = url.strip().lower()
+        if not (url_lower.startswith('http://') or url_lower.startswith('https://')):
+            return False
+        
         # Extract extension from URL (handle query parameters)
         url_path = urlparse(url).path
         if '.' in url_path:
@@ -1682,6 +1688,14 @@ def _get_turn_14_images(turn_14_item: src_models.Turn14Items, turn_14_data: src_
             image_url = file.get('links', [])[0].get('url', '')
             
             if not image_url:
+                continue
+            
+            # Check if URL starts with http:// or https://
+            image_url_lower = image_url.strip().lower()
+            if not (image_url_lower.startswith('http://') or image_url_lower.startswith('https://')):
+                logger.debug('{} Skipping image with invalid URL scheme (must be http:// or https://): {}'.format(
+                    _LOG_PREFIX, image_url
+                ))
                 continue
             
             # Check if URL has a valid image extension (case-sensitive)
