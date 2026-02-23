@@ -442,3 +442,73 @@ class SDCParts(django_db_models.Model):
     class Meta:
         db_table = "sdc_parts"
         unique_together = ["part_number", "brand"]
+
+
+class KeystoneBrand(django_db_models.Model):
+    external_id = django_db_models.CharField(max_length=255)
+    name = django_db_models.CharField(max_length=255)
+    aaia_code = django_db_models.CharField(max_length=255, null=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "keystone_brands"
+        unique_together = [["external_id"]]
+
+
+class BrandKeystoneBrandMapping(django_db_models.Model):
+    brand = django_db_models.ForeignKey(Brands, on_delete=django_db_models.CASCADE, related_name="keystone_brand_mappings")
+    keystone_brand = django_db_models.ForeignKey(KeystoneBrand, on_delete=django_db_models.CASCADE, related_name="brand_mappings")
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "brand_keystone_brand_mapping"
+        unique_together = ["brand", "keystone_brand"]
+
+
+class KeystoneParts(django_db_models.Model):
+    vcpn = django_db_models.CharField(max_length=255)
+    brand = django_db_models.ForeignKey(KeystoneBrand, on_delete=django_db_models.CASCADE, related_name="parts")
+    vendor_code = django_db_models.CharField(max_length=255, null=True)
+    part_number = django_db_models.CharField(max_length=255, null=True)
+    manufacturer_part_no = django_db_models.CharField(max_length=255, null=True)
+    long_description = django_db_models.TextField(null=True)
+    jobber_price = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
+    cost = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
+    upsable = django_db_models.BooleanField(default=False)
+    core_charge = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
+    case_qty = django_db_models.IntegerField(null=True)
+    is_non_returnable = django_db_models.BooleanField(default=False)
+    prop65_toxicity = django_db_models.CharField(max_length=255, null=True)
+    upc_code = django_db_models.CharField(max_length=255, null=True)
+    weight = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
+    height = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
+    length = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
+    width = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
+    aaia_code = django_db_models.CharField(max_length=255, null=True)
+    is_hazmat = django_db_models.BooleanField(default=False)
+    is_chemical = django_db_models.BooleanField(default=False)
+    ups_ground_assessorial = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
+    us_ltl = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
+    east_qty = django_db_models.IntegerField(null=True)
+    midwest_qty = django_db_models.IntegerField(null=True)
+    california_qty = django_db_models.IntegerField(null=True)
+    southeast_qty = django_db_models.IntegerField(null=True)
+    pacific_nw_qty = django_db_models.IntegerField(null=True)
+    texas_qty = django_db_models.IntegerField(null=True)
+    great_lakes_qty = django_db_models.IntegerField(null=True)
+    florida_qty = django_db_models.IntegerField(null=True)
+    total_qty = django_db_models.IntegerField(null=True)
+    kit_components = django_db_models.TextField(null=True)
+    is_kit = django_db_models.BooleanField(default=False)
+    raw_data = django_db_models.JSONField(null=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "keystone_parts"
+        unique_together = ["vcpn", "brand"]

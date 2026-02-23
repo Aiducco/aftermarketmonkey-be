@@ -200,3 +200,10 @@ DEFAULT_FROM_EMAIL = "noreply@jsoncargo.com"
 LOGGING_EMAIL_RECIPIENT_LIST = ["hajdukbet@gmail.com"]
 
 TURN14_BASE_URL = 'https://api.turn14.com/v1'
+
+# Keystone FTP (implicit FTPS, port 990)
+KEYSTONE_FTP_HOST = 'ftp.ekeystone.com'
+KEYSTONE_FTP_PORT = 990
+KEYSTONE_FTP_USER = ''  # Set via env or CompanyProviders.credentials
+KEYSTONE_FTP_PASSWORD = ''
+KEYSTONE_INVENTORY_LOCAL_PATH = '/tmp/keystone_inventory.csv'
