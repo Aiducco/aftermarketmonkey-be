@@ -1,5 +1,6 @@
 import logging
 import re
+import time
 import typing
 from decimal import Decimal
 
@@ -8,6 +9,8 @@ import pgbulk
 
 from src import enums as src_enums
 from src import models as src_models
+from django.db import connection
+
 from src.integrations.clients.keystone import client as keystone_client
 from src.integrations.clients.keystone import exceptions as keystone_exceptions
 
@@ -240,29 +243,46 @@ def fetch_and_save_all_keystone_brand_parts() -> None:
         logger.warning("{} No valid part instances created.".format(_LOG_PREFIX))
         return
 
-    try:
-        upserted = pgbulk.upsert(
-            src_models.KeystoneParts,
-            part_instances,
-            unique_fields=["vcpn", "brand"],
-            update_fields=[
-                "vendor_code", "part_number", "manufacturer_part_no", "long_description",
-                "jobber_price", "cost", "upsable", "core_charge", "case_qty",
-                "is_non_returnable", "prop65_toxicity", "upc_code", "weight",
-                "height", "length", "width", "aaia_code", "is_hazmat", "is_chemical",
-                "ups_ground_assessorial", "us_ltl", "east_qty", "midwest_qty",
-                "california_qty", "southeast_qty", "pacific_nw_qty", "texas_qty",
-                "great_lakes_qty", "florida_qty", "total_qty", "kit_components",
-                "is_kit", "raw_data",
-            ],
-            returning=True,
-        )
-        logger.info("{} Successfully upserted {} Keystone parts.".format(
-            _LOG_PREFIX, len(upserted) if upserted else 0
-        ))
-    except Exception as e:
-        logger.error("{} Error during bulk upsert: {}.".format(_LOG_PREFIX, str(e)))
-        raise
+    BATCH_SIZE = 1000
+    BATCH_DELAY_SECONDS = 0.5
+    total_upserted = 0
+    update_fields = [
+        "vendor_code", "part_number", "manufacturer_part_no", "long_description",
+        "jobber_price", "cost", "upsable", "core_charge", "case_qty",
+        "is_non_returnable", "prop65_toxicity", "upc_code", "weight",
+        "height", "length", "width", "aaia_code", "is_hazmat", "is_chemical",
+        "ups_ground_assessorial", "us_ltl", "east_qty", "midwest_qty",
+        "california_qty", "southeast_qty", "pacific_nw_qty", "texas_qty",
+        "great_lakes_qty", "florida_qty", "total_qty", "kit_components",
+        "is_kit", "raw_data",
+    ]
+
+    num_batches = (len(part_instances) + BATCH_SIZE - 1) // BATCH_SIZE
+    for i in range(0, len(part_instances), BATCH_SIZE):
+        batch = part_instances[i : i + BATCH_SIZE]
+        batch_num = (i // BATCH_SIZE) + 1
+        try:
+            pgbulk.upsert(
+                src_models.KeystoneParts,
+                batch,
+                unique_fields=["vcpn", "brand"],
+                update_fields=update_fields,
+                returning=False,
+            )
+            total_upserted += len(batch)
+            logger.info("{} Upserted batch {}/{} ({} parts).".format(
+                _LOG_PREFIX, batch_num, num_batches, len(batch)
+            ))
+        except Exception as e:
+            logger.error("{} Error during bulk upsert batch at offset {}: {}.".format(
+                _LOG_PREFIX, i, str(e)
+            ))
+            raise
+        connection.close()
+        if batch_num < num_batches:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    logger.info("{} Successfully upserted {} Keystone parts total.".format(_LOG_PREFIX, total_upserted))
 
 
 def fetch_and_save_all_keystone_brands_and_parts() -> None:
@@ -337,26 +357,44 @@ def fetch_and_save_all_keystone_brands_and_parts() -> None:
     part_instances = _transform_parts_data(records, keystone_brands)
 
     if part_instances:
-        try:
-            pgbulk.upsert(
-                src_models.KeystoneParts,
-                part_instances,
-                unique_fields=["vcpn", "brand"],
-                update_fields=[
-                    "vendor_code", "part_number", "manufacturer_part_no", "long_description",
-                    "jobber_price", "cost", "upsable", "core_charge", "case_qty",
-                    "is_non_returnable", "prop65_toxicity", "upc_code", "weight",
-                    "height", "length", "width", "aaia_code", "is_hazmat", "is_chemical",
-                    "ups_ground_assessorial", "us_ltl", "east_qty", "midwest_qty",
-                    "california_qty", "southeast_qty", "pacific_nw_qty", "texas_qty",
-                    "great_lakes_qty", "florida_qty", "total_qty", "kit_components",
-                    "is_kit", "raw_data",
-                ],
-            )
-            logger.info("{} Upserted {} Keystone parts.".format(_LOG_PREFIX, len(part_instances)))
-        except Exception as e:
-            logger.error("{} Error during bulk upsert parts: {}.".format(_LOG_PREFIX, str(e)))
-            raise
+        BATCH_SIZE = 1000
+        BATCH_DELAY_SECONDS = 0.5
+        total_upserted = 0
+        update_fields = [
+            "vendor_code", "part_number", "manufacturer_part_no", "long_description",
+            "jobber_price", "cost", "upsable", "core_charge", "case_qty",
+            "is_non_returnable", "prop65_toxicity", "upc_code", "weight",
+            "height", "length", "width", "aaia_code", "is_hazmat", "is_chemical",
+            "ups_ground_assessorial", "us_ltl", "east_qty", "midwest_qty",
+            "california_qty", "southeast_qty", "pacific_nw_qty", "texas_qty",
+            "great_lakes_qty", "florida_qty", "total_qty", "kit_components",
+            "is_kit", "raw_data",
+        ]
+        num_batches = (len(part_instances) + BATCH_SIZE - 1) // BATCH_SIZE
+        for i in range(0, len(part_instances), BATCH_SIZE):
+            batch = part_instances[i : i + BATCH_SIZE]
+            batch_num = (i // BATCH_SIZE) + 1
+            try:
+                pgbulk.upsert(
+                    src_models.KeystoneParts,
+                    batch,
+                    unique_fields=["vcpn", "brand"],
+                    update_fields=update_fields,
+                    returning=False,
+                )
+                total_upserted += len(batch)
+                logger.info("{} Upserted batch {}/{} ({} parts).".format(
+                    _LOG_PREFIX, batch_num, num_batches, len(batch)
+                ))
+            except Exception as e:
+                logger.error("{} Error during bulk upsert parts batch at offset {}: {}.".format(
+                    _LOG_PREFIX, i, str(e)
+                ))
+                raise
+            connection.close()
+            if batch_num < num_batches:
+                time.sleep(BATCH_DELAY_SECONDS)
+        logger.info("{} Upserted {} Keystone parts total.".format(_LOG_PREFIX, total_upserted))
 
     logger.info("{} Completed full Keystone sync.".format(_LOG_PREFIX))
 
