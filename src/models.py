@@ -69,6 +69,7 @@ class Brands(django_db_models.Model):
     name = django_db_models.CharField(max_length=255)
     status = django_db_models.PositiveSmallIntegerField()
     status_name = django_db_models.CharField(max_length=255)
+    aaia_code = django_db_models.CharField(max_length=255, null=True)
 
     data = django_db_models.JSONField(null=True)
 
@@ -512,3 +513,67 @@ class KeystoneParts(django_db_models.Model):
     class Meta:
         db_table = "keystone_parts"
         unique_together = ["vcpn", "brand"]
+
+
+class MasterPart(django_db_models.Model):
+    brand = django_db_models.ForeignKey(Brands, on_delete=django_db_models.CASCADE, related_name="master_parts")
+    part_number = django_db_models.CharField(max_length=255)
+    sku = django_db_models.CharField(max_length=255, null=True)
+    description = django_db_models.TextField(null=True)
+    aaia_code = django_db_models.CharField(max_length=255, null=True)
+    image_url = django_db_models.TextField(null=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "master_parts"
+        unique_together = [["brand", "part_number"]]
+
+
+class ProviderPart(django_db_models.Model):
+    master_part = django_db_models.ForeignKey(MasterPart, on_delete=django_db_models.CASCADE, related_name="provider_parts")
+    provider = django_db_models.ForeignKey(Providers, on_delete=django_db_models.CASCADE, related_name="provider_parts")
+    provider_external_id = django_db_models.CharField(max_length=255)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "provider_parts"
+        unique_together = [["master_part", "provider"]]
+
+
+class ProviderPartInventory(django_db_models.Model):
+    provider_part = django_db_models.OneToOneField(
+        ProviderPart, on_delete=django_db_models.CASCADE, related_name="inventory"
+    )
+    total_qty = django_db_models.IntegerField(default=0)
+    manufacturer_inventory = django_db_models.IntegerField(null=True)
+    warehouse_availability = django_db_models.JSONField(null=True)
+    last_synced_at = django_db_models.DateTimeField(null=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "provider_part_inventory"
+
+
+class ProviderPartCompanyPricing(django_db_models.Model):
+    provider_part = django_db_models.ForeignKey(
+        ProviderPart, on_delete=django_db_models.CASCADE, related_name="company_pricing"
+    )
+    company = django_db_models.ForeignKey(Company, on_delete=django_db_models.CASCADE, related_name="provider_part_pricing")
+    cost = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
+    jobber_price = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
+    map_price = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
+    msrp = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
+    last_synced_at = django_db_models.DateTimeField(null=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "provider_part_company_pricing"
+        unique_together = [["provider_part", "company"]]

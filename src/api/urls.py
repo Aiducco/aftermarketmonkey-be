@@ -3,6 +3,7 @@ from django.urls import path, include
 from src.api.views.authentication import LoginView, ChangePasswordView
 from src.api.views.company import CompanyDestinationsView
 from src.api.views.integrations import CompanyProvidersView, CompanyProviderDetailView, BrandsWithProvidersView, CompanyDestinationsWithBrandsView, CompanyDestinationDetailView, ExecutionRunsView, ExecutionRunPartsHistoryView
+from src.api.views.parts import PartsSearchView, PartDetailView
 
 urlpatterns = [
     path(
@@ -59,5 +60,15 @@ urlpatterns = [
         "execution-runs/<int:execution_run_id>/parts-history/",
         ExecutionRunPartsHistoryView.as_view(),
         name="execution_run_parts_history",
+    ),
+    path(
+        "parts/search/",
+        PartsSearchView.as_view(),
+        name="parts_search",
+    ),
+    path(
+        "parts/<int:id>/",
+        PartDetailView.as_view(),
+        name="part_detail",
     ),
 ]
