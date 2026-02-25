@@ -89,8 +89,9 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
 
         if inv_obj:
             provider_info["inventory"] = {
-                "total_qty": inv_obj.total_qty,
+                "warehouse_total_qty": inv_obj.warehouse_total_qty,
                 "manufacturer_inventory": inv_obj.manufacturer_inventory,
+                "manufacturer_esd": inv_obj.manufacturer_esd.isoformat() if inv_obj.manufacturer_esd else None,
                 "warehouse_availability": inv_obj.warehouse_availability,
                 "last_synced_at": inv_obj.last_synced_at.isoformat() if inv_obj.last_synced_at else None,
             }

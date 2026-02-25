@@ -227,17 +227,17 @@ def fetch_and_save_all_keystone_brand_parts() -> None:
         logger.warning("{} No inventory records returned.".format(_LOG_PREFIX))
         return
 
-    # Filter records to only brands we have mappings for
-    filtered_records = [
-        r for r in records
-        if _clean_csv_value(r.get("VendorName")) in brand_mappings
-    ]
+    # # Filter records to only brands we have mappings for
+    # filtered_records = [
+    #     r for r in records
+    #     if _clean_csv_value(r.get("VendorName")) in brand_mappings
+    # ]
 
     logger.info("{} Filtered to {} records for {} brands.".format(
-        _LOG_PREFIX, len(filtered_records), len(brand_mappings)
+        _LOG_PREFIX, len(records), len(brand_mappings)
     ))
 
-    part_instances = _transform_parts_data(filtered_records, brand_mappings)
+    part_instances = _transform_parts_data(records, brand_mappings)
 
     if not part_instances:
         logger.warning("{} No valid part instances created.".format(_LOG_PREFIX))
@@ -413,6 +413,7 @@ def _transform_parts_data(
 
             keystone_brand = brand_name_to_keystone_brand.get(vendor_name)
             if not keystone_brand:
+                logger.info("{} Skipping row with missing brand - part number: {}".format(_LOG_PREFIX, row.get('PartNumber')))
                 continue
 
             vcpn = _clean_csv_value(row.get("VCPN"))

@@ -138,7 +138,7 @@ def fetch_and_save_all_turn_14_brand_items() -> None:
         return
 
     all_brands = src_models.BrandProviders.objects.filter(
-        provider=turn_14_provider,
+        provider=turn_14_provider, id__gte=1530
     )
     if not all_brands.exists():
         logger.info('{} No brands found for Turn 14 provider.'.format(_LOG_PREFIX))

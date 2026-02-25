@@ -548,8 +548,9 @@ class ProviderPartInventory(django_db_models.Model):
     provider_part = django_db_models.OneToOneField(
         ProviderPart, on_delete=django_db_models.CASCADE, related_name="inventory"
     )
-    total_qty = django_db_models.IntegerField(default=0)
+    warehouse_total_qty = django_db_models.IntegerField(default=0)
     manufacturer_inventory = django_db_models.IntegerField(null=True)
+    manufacturer_esd = django_db_models.DateField(null=True)
     warehouse_availability = django_db_models.JSONField(null=True)
     last_synced_at = django_db_models.DateTimeField(null=True)
 
