@@ -5,9 +5,9 @@ from Turn14 and Keystone provider data.
 import logging
 import time
 import typing
+from datetime import date
 
 from django.db import connection
-from django.db.models import Q
 from django.utils import timezone
 
 import pgbulk
@@ -31,7 +31,7 @@ def _get_brand_for_keystone_brand(keystone_brand: src_models.KeystoneBrand) -> t
 
 
 BATCH_SIZE_MASTER_PARTS = 5000
-BATCH_DELAY_SECONDS = 0.3
+BATCH_DELAY_SECONDS = 0.1  # Reduced from 0.3 - was adding ~30s per 100 batches
 
 
 def sync_master_parts_from_turn14() -> None:
@@ -134,16 +134,24 @@ def sync_master_parts_from_turn14() -> None:
         )
         total_master += len(master_parts)
 
-        conditions = Q()
-        for b, p in seen:
-            conditions |= Q(brand_id=b, part_number=p)
-        brand_part_to_master = {
-            (mp.brand_id, mp.part_number): mp
-            for mp in src_models.MasterPart.objects.filter(conditions)
-        }
+        # Fast lookup: (brand_id, part_number) IN (...) via raw SQL (avoids huge OR query)
+        pairs = list(seen)
+        brand_part_to_master = {}
+        if pairs:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(pairs),),
+                )
+                for row in cur.fetchall():
+                    mp_id, b_id, p_num = row
+                    mp = src_models.MasterPart()
+                    mp.id = mp_id
+                    mp.brand_id = b_id
+                    mp.part_number = p_num
+                    brand_part_to_master[(b_id, p_num)] = mp
 
-        # Dedupe by (master_part, provider) - multiple items can map to same MasterPart
-        provider_parts_seen = {}
+        provider_parts = []
         for row in batch:
             key = item_to_brand_part.get(row["external_id"])
             if not key:
@@ -151,14 +159,13 @@ def sync_master_parts_from_turn14() -> None:
             master_part = brand_part_to_master.get(key)
             if not master_part:
                 continue
-            pp_key = (master_part.id, turn14_provider.id)
-            if pp_key not in provider_parts_seen:
-                provider_parts_seen[pp_key] = src_models.ProviderPart(
+            provider_parts.append(
+                src_models.ProviderPart(
                     master_part=master_part,
                     provider=turn14_provider,
                     provider_external_id=row["external_id"],
                 )
-        provider_parts = list(provider_parts_seen.values())
+            )
 
         if provider_parts:
             pgbulk.upsert(
@@ -281,16 +288,24 @@ def sync_master_parts_from_keystone() -> None:
         )
         total_master += len(master_parts)
 
-        conditions = Q()
-        for b, p in seen:
-            conditions |= Q(brand_id=b, part_number=p)
-        brand_part_to_master = {
-            (mp.brand_id, mp.part_number): mp
-            for mp in src_models.MasterPart.objects.filter(conditions)
-        }
+        # Fast lookup: (brand_id, part_number) IN (...) via raw SQL (avoids huge OR query)
+        pairs = list(seen)
+        brand_part_to_master = {}
+        if pairs:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(pairs),),
+                )
+                for row in cur.fetchall():
+                    mp_id, b_id, p_num = row
+                    mp = src_models.MasterPart()
+                    mp.id = mp_id
+                    mp.brand_id = b_id
+                    mp.part_number = p_num
+                    brand_part_to_master[(b_id, p_num)] = mp
 
-        # Dedupe by (master_part, provider) - multiple parts can map to same MasterPart
-        provider_parts_seen = {}
+        provider_parts = []
         for row in batch:
             key = vcpn_to_brand_part.get(row["vcpn"])
             if not key:
@@ -298,14 +313,13 @@ def sync_master_parts_from_keystone() -> None:
             master_part = brand_part_to_master.get(key)
             if not master_part:
                 continue
-            pp_key = (master_part.id, keystone_provider.id)
-            if pp_key not in provider_parts_seen:
-                provider_parts_seen[pp_key] = src_models.ProviderPart(
+            provider_parts.append(
+                src_models.ProviderPart(
                     master_part=master_part,
                     provider=keystone_provider,
                     provider_external_id=row["vcpn"],
                 )
-        provider_parts = list(provider_parts_seen.values())
+            )
 
         if provider_parts:
             pgbulk.upsert(
@@ -331,6 +345,7 @@ def sync_master_parts_from_keystone() -> None:
 def sync_provider_inventory_from_turn14() -> None:
     """
     Sync ProviderPartInventory from Turn14BrandInventory.
+    Uses bulk upsert instead of get_or_create loop.
     """
     logger.info("{} Syncing provider inventory from Turn14.".format(_LOG_PREFIX))
 
@@ -343,52 +358,91 @@ def sync_provider_inventory_from_turn14() -> None:
 
     provider_parts = {
         pp.provider_external_id: pp
-        for pp in src_models.ProviderPart.objects.filter(provider=turn14_provider).select_related("master_part")
+        for pp in src_models.ProviderPart.objects.filter(provider=turn14_provider)
     }
 
-    inventories = src_models.Turn14BrandInventory.objects.all()
-    to_update = []
+    inventories = list(src_models.Turn14BrandInventory.objects.values("external_id", "manufacturer", "inventory"))
+    now = timezone.now()
+    to_upsert = []
 
     for inv in inventories:
-        provider_part = provider_parts.get(inv.external_id)
+        provider_part = provider_parts.get(inv["external_id"])
         if not provider_part:
             continue
 
         manufacturer_qty = None
-        if isinstance(inv.manufacturer, dict) and "stock" in inv.manufacturer:
-            try:
-                manufacturer_qty = int(inv.manufacturer["stock"])
-            except (TypeError, ValueError):
-                pass
+        manufacturer_esd = None
+        manufacturer = inv.get("manufacturer")
+        if isinstance(manufacturer, dict):
+            if "stock" in manufacturer:
+                try:
+                    manufacturer_qty = int(manufacturer["stock"])
+                except (TypeError, ValueError):
+                    pass
+            if "esd" in manufacturer:
+                try:
+                    esd_val = manufacturer["esd"]
+                    if isinstance(esd_val, str):
+                        manufacturer_esd = date.fromisoformat(esd_val)
+                    elif hasattr(esd_val, "date"):
+                        manufacturer_esd = esd_val.date() if esd_val else None
+                except (TypeError, ValueError):
+                    pass
 
-        inv_obj, created = src_models.ProviderPartInventory.objects.get_or_create(
-            provider_part=provider_part,
-            defaults={
-                "total_qty": inv.total_inventory or 0,
-                "manufacturer_inventory": manufacturer_qty,
-                "warehouse_availability": inv.inventory,
-                "last_synced_at": timezone.now(),
-            },
+        warehouse_total = 0
+        inventory = inv.get("inventory")
+        if isinstance(inventory, dict):
+            for qty in inventory.values():
+                if isinstance(qty, (int, float)):
+                    warehouse_total += int(qty)
+
+        to_upsert.append(
+            src_models.ProviderPartInventory(
+                provider_part=provider_part,
+                warehouse_total_qty=warehouse_total,
+                manufacturer_inventory=manufacturer_qty,
+                manufacturer_esd=manufacturer_esd,
+                warehouse_availability=inv.get("inventory"),
+                last_synced_at=now,
+            )
         )
-        if not created:
-            inv_obj.total_qty = inv.total_inventory or 0
-            inv_obj.manufacturer_inventory = manufacturer_qty
-            inv_obj.warehouse_availability = inv.inventory
-            inv_obj.last_synced_at = timezone.now()
-            to_update.append(inv_obj)
 
-    if to_update:
-        src_models.ProviderPartInventory.objects.bulk_update(
-            to_update,
-            ["total_qty", "manufacturer_inventory", "warehouse_availability", "last_synced_at", "updated_at"],
+    if to_upsert:
+        pgbulk.upsert(
+            src_models.ProviderPartInventory,
+            to_upsert,
+            unique_fields=["provider_part"],
+            update_fields=["warehouse_total_qty", "manufacturer_inventory", "manufacturer_esd", "warehouse_availability", "last_synced_at"],
         )
 
-    logger.info("{} Synced {} Turn14 inventory records.".format(_LOG_PREFIX, len(inventories)))
+    logger.info("{} Synced {} Turn14 inventory records.".format(_LOG_PREFIX, len(to_upsert)))
+
+
+KEYSTONE_WAREHOUSE_QTY_FIELDS = (
+    "east_qty", "midwest_qty", "california_qty", "southeast_qty",
+    "pacific_nw_qty", "texas_qty", "great_lakes_qty", "florida_qty",
+)
+
+
+def _keystone_warehouse_availability(row: typing.Dict) -> typing.Optional[typing.Dict]:
+    if any(row.get(f) for f in KEYSTONE_WAREHOUSE_QTY_FIELDS):
+        return {
+            "east": row.get("east_qty"),
+            "midwest": row.get("midwest_qty"),
+            "california": row.get("california_qty"),
+            "southeast": row.get("southeast_qty"),
+            "pacific_nw": row.get("pacific_nw_qty"),
+            "texas": row.get("texas_qty"),
+            "great_lakes": row.get("great_lakes_qty"),
+            "florida": row.get("florida_qty"),
+        }
+    return None
 
 
 def sync_provider_inventory_from_keystone() -> None:
     """
     Sync ProviderPartInventory from KeystoneParts.
+    Uses bulk upsert instead of get_or_create loop.
     """
     logger.info("{} Syncing provider inventory from Keystone.".format(_LOG_PREFIX))
 
@@ -401,61 +455,66 @@ def sync_provider_inventory_from_keystone() -> None:
 
     provider_parts = {
         pp.provider_external_id: pp
-        for pp in src_models.ProviderPart.objects.filter(provider=keystone_provider).select_related("master_part")
+        for pp in src_models.ProviderPart.objects.filter(provider=keystone_provider)
     }
 
-    to_update = []
-    for kp in src_models.KeystoneParts.objects.all():
-        provider_part = provider_parts.get(kp.vcpn)
+    keystone_parts = list(
+        src_models.KeystoneParts.objects.values(
+            "vcpn", "total_qty",
+            "east_qty", "midwest_qty", "california_qty", "southeast_qty",
+            "pacific_nw_qty", "texas_qty", "great_lakes_qty", "florida_qty",
+        )
+    )
+
+    now = timezone.now()
+    to_upsert = []
+
+    for kp in keystone_parts:
+        provider_part = provider_parts.get(kp["vcpn"])
         if not provider_part:
             continue
 
-        inv_obj, created = src_models.ProviderPartInventory.objects.get_or_create(
-            provider_part=provider_part,
-            defaults={
-                "total_qty": kp.total_qty or 0,
-                "manufacturer_inventory": None,
-                "warehouse_availability": {
-                    "east": kp.east_qty,
-                    "midwest": kp.midwest_qty,
-                    "california": kp.california_qty,
-                    "southeast": kp.southeast_qty,
-                    "pacific_nw": kp.pacific_nw_qty,
-                    "texas": kp.texas_qty,
-                    "great_lakes": kp.great_lakes_qty,
-                    "florida": kp.florida_qty,
-                } if any([kp.east_qty, kp.midwest_qty, kp.california_qty, kp.southeast_qty, kp.pacific_nw_qty, kp.texas_qty, kp.great_lakes_qty, kp.florida_qty]) else None,
-                "last_synced_at": timezone.now(),
-            },
-        )
-        if not created:
-            inv_obj.total_qty = kp.total_qty or 0
-            inv_obj.warehouse_availability = {
-                "east": kp.east_qty,
-                "midwest": kp.midwest_qty,
-                "california": kp.california_qty,
-                "southeast": kp.southeast_qty,
-                "pacific_nw": kp.pacific_nw_qty,
-                "texas": kp.texas_qty,
-                "great_lakes": kp.great_lakes_qty,
-                "florida": kp.florida_qty,
-            } if any([kp.east_qty, kp.midwest_qty, kp.california_qty, kp.southeast_qty, kp.pacific_nw_qty, kp.texas_qty, kp.great_lakes_qty, kp.florida_qty]) else None
-            inv_obj.last_synced_at = timezone.now()
-            to_update.append(inv_obj)
-
-    if to_update:
-        src_models.ProviderPartInventory.objects.bulk_update(
-            to_update,
-            ["total_qty", "warehouse_availability", "last_synced_at", "updated_at"],
+        to_upsert.append(
+            src_models.ProviderPartInventory(
+                provider_part=provider_part,
+                warehouse_total_qty=kp.get("total_qty") or 0,
+                manufacturer_inventory=None,
+                manufacturer_esd=None,
+                warehouse_availability=_keystone_warehouse_availability(kp),
+                last_synced_at=now,
+            )
         )
 
-    logger.info("{} Synced Keystone inventory.".format(_LOG_PREFIX))
+    if to_upsert:
+        pgbulk.upsert(
+            src_models.ProviderPartInventory,
+            to_upsert,
+            unique_fields=["provider_part"],
+            update_fields=["warehouse_total_qty", "manufacturer_inventory", "manufacturer_esd", "warehouse_availability", "last_synced_at"],
+        )
+
+    logger.info("{} Synced {} Keystone inventory records.".format(_LOG_PREFIX, len(to_upsert)))
+
+
+def _extract_turn14_prices(pricelists: typing.Any) -> typing.Tuple[typing.Any, typing.Any, typing.Any]:
+    """Extract jobber_price, map_price, msrp from Turn14 pricelists."""
+    jobber_price = None
+    map_price = None
+    msrp = None
+    if isinstance(pricelists, list) and pricelists:
+        for pl in pricelists:
+            if isinstance(pl, dict):
+                jobber_price = jobber_price or pl.get("jobber_price") or pl.get("jobber")
+                map_price = map_price or pl.get("map_price") or pl.get("map")
+                msrp = msrp or pl.get("msrp") or pl.get("retail_price") or pl.get("retail")
+    return jobber_price, map_price, msrp
 
 
 def sync_provider_pricing_from_turn14() -> None:
     """
     Sync ProviderPartCompanyPricing from Turn14BrandPricing.
     Uses purchase_cost as cost. Creates pricing for each company that has Turn14 CompanyProviders.
+    Uses bulk upsert instead of get_or_create loop.
     """
     logger.info("{} Syncing provider pricing from Turn14.".format(_LOG_PREFIX))
 
@@ -471,66 +530,61 @@ def sync_provider_pricing_from_turn14() -> None:
         for pp in src_models.ProviderPart.objects.filter(provider=turn14_provider)
     }
 
-    companies = list(
+    company_ids = list(
         src_models.CompanyProviders.objects.filter(
             provider=turn14_provider,
             provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
         ).values_list("company_id", flat=True).distinct()
     )
+    companies = {c.id: c for c in src_models.Company.objects.filter(id__in=company_ids)} if company_ids else {}
 
-    pricing_records = src_models.Turn14BrandPricing.objects.all()
-    to_update = []
+    pricing_records = list(
+        src_models.Turn14BrandPricing.objects.values("external_id", "purchase_cost", "pricelists")
+    )
+    now = timezone.now()
+    to_upsert = []
 
     for pr in pricing_records:
-        provider_part = provider_parts.get(pr.external_id)
+        provider_part = provider_parts.get(pr["external_id"])
         if not provider_part:
             continue
 
-        cost = pr.purchase_cost
-        jobber_price = None
-        map_price = None
-        msrp = None
-        if isinstance(pr.pricelists, list) and pr.pricelists:
-            for pl in pr.pricelists:
-                if isinstance(pl, dict):
-                    jobber_price = jobber_price or pl.get("jobber_price") or pl.get("jobber")
-                    map_price = map_price or pl.get("map_price") or pl.get("map")
-                    msrp = msrp or pl.get("msrp") or pl.get("retail_price") or pl.get("retail")
+        cost = pr.get("purchase_cost")
+        jobber_price, map_price, msrp = _extract_turn14_prices(pr.get("pricelists"))
 
-        for company_id in companies:
-            company = src_models.Company.objects.get(id=company_id)
-            obj, created = src_models.ProviderPartCompanyPricing.objects.get_or_create(
-                provider_part=provider_part,
-                company=company,
-                defaults={
-                    "cost": cost,
-                    "jobber_price": jobber_price,
-                    "map_price": map_price,
-                    "msrp": msrp,
-                    "last_synced_at": timezone.now(),
-                },
+        for company_id in company_ids:
+            company = companies.get(company_id)
+            if not company:
+                continue
+
+            to_upsert.append(
+                src_models.ProviderPartCompanyPricing(
+                    provider_part=provider_part,
+                    company=company,
+                    cost=cost,
+                    jobber_price=jobber_price,
+                    map_price=map_price,
+                    msrp=msrp,
+                    last_synced_at=now,
+                )
             )
-            if not created:
-                obj.cost = cost
-                obj.jobber_price = jobber_price
-                obj.map_price = map_price
-                obj.msrp = msrp
-                obj.last_synced_at = timezone.now()
-                to_update.append(obj)
 
-    if to_update:
-        src_models.ProviderPartCompanyPricing.objects.bulk_update(
-            to_update,
-            ["cost", "jobber_price", "map_price", "msrp", "last_synced_at", "updated_at"],
+    if to_upsert:
+        pgbulk.upsert(
+            src_models.ProviderPartCompanyPricing,
+            to_upsert,
+            unique_fields=["provider_part", "company"],
+            update_fields=["cost", "jobber_price", "map_price", "msrp", "last_synced_at"],
         )
 
-    logger.info("{} Synced Turn14 pricing.".format(_LOG_PREFIX))
+    logger.info("{} Synced {} Turn14 pricing records.".format(_LOG_PREFIX, len(to_upsert)))
 
 
 def sync_provider_pricing_from_keystone() -> None:
     """
     Sync ProviderPartCompanyPricing from KeystoneParts.
     Creates pricing for each company that has Keystone CompanyProviders.
+    Uses bulk upsert instead of get_or_create loop.
     """
     logger.info("{} Syncing provider pricing from Keystone.".format(_LOG_PREFIX))
 
@@ -546,45 +600,49 @@ def sync_provider_pricing_from_keystone() -> None:
         for pp in src_models.ProviderPart.objects.filter(provider=keystone_provider)
     }
 
-    companies = list(
+    company_ids = list(
         src_models.CompanyProviders.objects.filter(
             provider=keystone_provider,
             provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
         ).values_list("company_id", flat=True).distinct()
     )
+    companies = {c.id: c for c in src_models.Company.objects.filter(id__in=company_ids)} if company_ids else {}
 
-    to_update = []
-    for kp in src_models.KeystoneParts.objects.all():
-        provider_part = provider_parts.get(kp.vcpn)
+    keystone_parts = list(src_models.KeystoneParts.objects.values("vcpn", "cost", "jobber_price"))
+    now = timezone.now()
+    to_upsert = []
+
+    for kp in keystone_parts:
+        provider_part = provider_parts.get(kp["vcpn"])
         if not provider_part:
             continue
 
-        for company_id in companies:
-            company = src_models.Company.objects.get(id=company_id)
-            obj, created = src_models.ProviderPartCompanyPricing.objects.get_or_create(
-                provider_part=provider_part,
-                company=company,
-                defaults={
-                    "cost": kp.cost,
-                    "jobber_price": kp.jobber_price,
-                    "map_price": None,
-                    "msrp": None,
-                    "last_synced_at": timezone.now(),
-                },
-            )
-            if not created:
-                obj.cost = kp.cost
-                obj.jobber_price = kp.jobber_price
-                obj.last_synced_at = timezone.now()
-                to_update.append(obj)
+        for company_id in company_ids:
+            company = companies.get(company_id)
+            if not company:
+                continue
 
-    if to_update:
-        src_models.ProviderPartCompanyPricing.objects.bulk_update(
-            to_update,
-            ["cost", "jobber_price", "last_synced_at", "updated_at"],
+            to_upsert.append(
+                src_models.ProviderPartCompanyPricing(
+                    provider_part=provider_part,
+                    company=company,
+                    cost=kp.get("cost"),
+                    jobber_price=kp.get("jobber_price"),
+                    map_price=None,
+                    msrp=None,
+                    last_synced_at=now,
+                )
+            )
+
+    if to_upsert:
+        pgbulk.upsert(
+            src_models.ProviderPartCompanyPricing,
+            to_upsert,
+            unique_fields=["provider_part", "company"],
+            update_fields=["cost", "jobber_price", "map_price", "msrp", "last_synced_at"],
         )
 
-    logger.info("{} Synced Keystone pricing.".format(_LOG_PREFIX))
+    logger.info("{} Synced {} Keystone pricing records.".format(_LOG_PREFIX, len(to_upsert)))
 
 
 def sync_all_master_parts() -> None:
