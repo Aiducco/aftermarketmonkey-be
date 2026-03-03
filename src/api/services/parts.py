@@ -10,14 +10,36 @@ logger = logging.getLogger(__name__)
 
 _LOG_PREFIX = "[PARTS-SERVICES]"
 
+# Provider kind_name -> display name for API
+PROVIDER_DISPLAY_NAMES = {
+    "TURN_14": "Turn 14",
+    "KEYSTONE": "Keystone",
+    "SDC": "SDC",
+}
 
-def get_parts_search(sku: str, limit: int = 50) -> typing.List[typing.Dict]:
+# Provider kind_name -> image URL (edit here to add logos)
+PROVIDER_IMAGE_URLS = {
+    "TURN_14": "http://5.161.121.143/uploads/t14_logo.png",
+    "KEYSTONE": "http://5.161.121.143/uploads/keystone.png",
+    "SDC": "",
+}
+
+
+def _get_provider_image_url(kind_name: typing.Optional[str]) -> typing.Optional[str]:
+    """Get provider image URL. Returns None if not configured."""
+    if not kind_name:
+        return None
+    url = PROVIDER_IMAGE_URLS.get(kind_name) or PROVIDER_IMAGE_URLS.get(kind_name.upper())
+    return url if url else None
+
+
+def get_parts_search(sku: str, limit: int = 50) -> typing.Dict:
     """
     Search MasterPart by part_number (case-insensitive contains).
-    Returns MasterPart fields + brand_id.
+    Returns MasterPart fields + brand_id, and provider_image_urls map for frontend.
     """
     if not sku or not str(sku).strip():
-        return []
+        return {"data": [], "provider_image_urls": _get_all_provider_image_urls()}
 
     q = str(sku).strip()
     parts = (
@@ -26,7 +48,7 @@ def get_parts_search(sku: str, limit: int = 50) -> typing.List[typing.Dict]:
         .order_by("brand__name", "part_number")[:limit]
     )
 
-    return [
+    data = [
         {
             "id": p.id,
             "brand_id": p.brand_id,
@@ -40,6 +62,12 @@ def get_parts_search(sku: str, limit: int = 50) -> typing.List[typing.Dict]:
         }
         for p in parts
     ]
+    return {"data": data, "provider_image_urls": _get_all_provider_image_urls()}
+
+
+def _get_all_provider_image_urls() -> typing.Dict[str, typing.Optional[str]]:
+    """Return provider kind_name -> image URL map for all configured providers."""
+    return {k: (v if v else None) for k, v in PROVIDER_IMAGE_URLS.items()}
 
 
 def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None) -> typing.Optional[typing.Dict]:
@@ -78,10 +106,13 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
         except src_models.ProviderPartInventory.DoesNotExist:
             inv_obj = None
 
+        kind_name = pp.provider.kind_name if pp.provider else None
         provider_info = {
             "provider_id": pp.provider_id,
             "provider_name": pp.provider.name if pp.provider else None,
-            "provider_kind_name": pp.provider.kind_name if pp.provider else None,
+            "provider_kind_name": kind_name,
+            "provider_display_name": PROVIDER_DISPLAY_NAMES.get(kind_name, kind_name) if kind_name else None,
+            "provider_image_url": _get_provider_image_url(kind_name),
             "provider_external_id": pp.provider_external_id,
             "inventory": None,
             "pricing": None,

@@ -47,7 +47,7 @@ class PartsSearchView(views.View):
             limit = 50
 
         try:
-            data = parts_services.get_parts_search(sku=sku, limit=limit)
+            result = parts_services.get_parts_search(sku=sku, limit=limit)
         except Exception as e:
             logger.exception("{} Search error: {}".format(_LOG_PREFIX, str(e)))
             return http.HttpResponse(
@@ -58,7 +58,10 @@ class PartsSearchView(views.View):
 
         return http.HttpResponse(
             headers={"Content-Type": "application/json"},
-            content=simplejson.dumps({"data": data}),
+            content=simplejson.dumps({
+                "data": result["data"],
+                "provider_image_urls": result["provider_image_urls"],
+            }),
             status=200,
         )
 

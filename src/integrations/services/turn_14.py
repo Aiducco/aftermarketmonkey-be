@@ -407,8 +407,12 @@ def fetch_and_save_all_turn_14_brand_data() -> None:
         logger.info('{} Fetching brand data for brand: {} (external_id: {}).'.format(
             _LOG_PREFIX, turn_14_brand.name, brand_id
         ))
-        
+
+        counter = 1
         while page is not None:
+            counter += 1
+            if counter < 200:
+                continue
             try:
                 data_items, next_page = api_client.get_brand_media(brand_id=brand_id, page=page)
             except turn_14_exceptions.Turn14APIException as e:
@@ -422,7 +426,7 @@ def fetch_and_save_all_turn_14_brand_data() -> None:
                     _LOG_PREFIX, turn_14_brand.name, brand_id, page
                 ))
                 page = next_page
-                continue
+                break
             
             logger.info('{} Fetched {} brand data items for brand: {} (external_id: {}), page: {}.'.format(
                 _LOG_PREFIX, len(data_items), turn_14_brand.name, brand_id, page
@@ -588,7 +592,7 @@ def fetch_and_save_all_turn_14_brand_pricing() -> None:
                     _LOG_PREFIX, turn_14_brand.name, brand_id, page
                 ))
                 page = next_page
-                continue
+                break
             
             logger.info('{} Fetched {} pricing items for brand: {} (external_id: {}), page: {}.'.format(
                 _LOG_PREFIX, len(pricing_data), turn_14_brand.name, brand_id, page
