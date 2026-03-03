@@ -570,6 +570,7 @@ class ProviderPartCompanyPricing(django_db_models.Model):
     jobber_price = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
     map_price = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
     msrp = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
+    retail_price = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
     last_synced_at = django_db_models.DateTimeField(null=True)
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
