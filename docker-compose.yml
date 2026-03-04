@@ -33,7 +33,18 @@ services:
       - "6385:6379"
     restart: always
 
+  meilisearch:
+    image: getmeili/meilisearch:v1.11
+    volumes:
+      - meilisearch_data:/meili_data
+    ports:
+      - "7700:7700"
+    environment:
+      - MEILI_ENV=development
+    restart: always
+
 
 volumes:
   postgres_data:
   redis_data:
+  meilisearch_data:

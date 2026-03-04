@@ -43,3 +43,4 @@ PyJwt
 django-cors-headers
 ratelimit
 django-pgbulk
+meilisearch
