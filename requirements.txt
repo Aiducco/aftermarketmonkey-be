@@ -96,6 +96,8 @@ isort==5.12.0
     # via -r requirements.in
 marshmallow==3.19.0
     # via -r requirements.in
+meilisearch==0.40.0
+    # via -r requirements.in
 mypy-extensions==1.0.0
     # via black
 numpy==2.1.1
