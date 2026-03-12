@@ -35,13 +35,22 @@ def decode_jwt_token(token: str) -> dict:
 
 
 def create_jwt_token(user: auth_models.User) -> str:
+    company_id = None
+    is_company_admin = False
+    try:
+        profile = user.profile
+        company_id = profile.company_id
+        is_company_admin = getattr(profile, "is_company_admin", False)
+    except src_models.UserProfile.DoesNotExist:
+        pass
     return jwt.encode(
         payload={
             "user_id": user.id,
             "email": user.email,
             "first_name": user.first_name,
             "last_name": user.last_name,
-            "company_id": user.profile.company_id,
+            "company_id": company_id,
+            "is_company_admin": is_company_admin,
             "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=12),
         },
         key=settings.JWT_SECRET,
@@ -61,7 +70,16 @@ def login_user(email: str, password: str) -> dict:
         )
         logger.exception("{} {}.".format(_LOG_PREFIX, msg))
         raise e
-    return {"user_id": user.id, "access_token": create_jwt_token(user=user)}
+    is_company_admin = False
+    try:
+        is_company_admin = user.profile.is_company_admin
+    except (src_models.UserProfile.DoesNotExist, AttributeError):
+        pass
+    return {
+        "user_id": user.id,
+        "access_token": create_jwt_token(user=user),
+        "is_company_admin": is_company_admin,
+    }
 
 
 def user_change_password(user: auth_models.User, current_password: str, new_password: str) -> None:

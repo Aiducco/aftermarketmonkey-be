@@ -8,12 +8,40 @@ class Company(django_db_models.Model):
     status = django_db_models.PositiveSmallIntegerField()
     status_name = django_db_models.CharField(max_length=255)
 
+    # Onboarding / B2B fields (Step 2)
+    business_type = django_db_models.CharField(max_length=64, null=True, blank=True)
+    country = django_db_models.CharField(max_length=64, null=True, blank=True)
+    state_province = django_db_models.CharField(max_length=128, null=True, blank=True)
+    tax_id = django_db_models.CharField(max_length=64, null=True, blank=True)
+
+    # Onboarding progress: 0=not_started, 1=account_created, 2=company_details, 3=personalization, 4=complete
+    onboarding_step = django_db_models.PositiveSmallIntegerField(default=0, null=True, blank=True)
+
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
 
     class Meta:
         db_table = "company"
         unique_together = ["slug"]
+
+
+class CompanyOnboardingPreferences(django_db_models.Model):
+    """
+    Step 3 personalization: preferred distributors, categories, and optional credentials.
+    """
+    company = django_db_models.OneToOneField(
+        Company, on_delete=django_db_models.CASCADE, related_name="onboarding_preferences"
+    )
+    # Provider IDs (e.g. Turn14=1, Keystone=3)
+    preferred_distributor_ids = django_db_models.JSONField(default=list, blank=True)
+    # E.g. ["Suspension/Lift Kits", "Tonneau Covers", "Lighting", "Exterior Armor", "Performance Tuning"]
+    top_categories = django_db_models.JSONField(default=list, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "company_onboarding_preferences"
 
 
 class CompanyDestinations(django_db_models.Model):
@@ -129,8 +157,11 @@ class UserProfile(django_db_models.Model):
     company = django_db_models.ForeignKey(
         Company,
         on_delete=django_db_models.CASCADE,
-        related_name="user_profiles"
+        related_name="user_profiles",
+        null=True,
+        blank=True,
     )
+    is_company_admin = django_db_models.BooleanField(default=False)
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
@@ -151,6 +182,24 @@ class Turn14Brand(django_db_models.Model):
 
     class Meta:
         db_table = "turn14_brands"
+        unique_together = ["external_id"]
+
+
+class Turn14Location(django_db_models.Model):
+    """Turn14 warehouse locations from GET /v1/locations API."""
+    external_id = django_db_models.CharField(max_length=32)
+    name = django_db_models.CharField(max_length=255)
+    street = django_db_models.CharField(max_length=255, blank=True)
+    city = django_db_models.CharField(max_length=255, blank=True)
+    state = django_db_models.CharField(max_length=64, blank=True)
+    country = django_db_models.CharField(max_length=64, blank=True)
+    zip_code = django_db_models.CharField(max_length=32, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "turn14_locations"
         unique_together = ["external_id"]
 
 

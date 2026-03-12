@@ -84,6 +84,82 @@ def fetch_and_save_turn_14_brands() -> None:
     ))
 
 
+def fetch_and_save_turn_14_locations() -> None:
+    """Fetch Turn14 locations from GET /v1/locations and upsert into Turn14Location."""
+    logger.info('{} Started fetching and saving Turn 14 locations.'.format(_LOG_PREFIX))
+
+    primary_provider = src_models.CompanyProviders.objects.filter(
+        provider__kind=src_enums.BrandProviderKind.TURN_14.value,
+        provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
+        primary=True,
+    ).first()
+
+    if not primary_provider:
+        logger.info('{} No Turn 14 active provider found.'.format(_LOG_PREFIX))
+        return
+
+    credentials = primary_provider.credentials
+    try:
+        api_client = turn_14_client.Turn14ApiClient(credentials=credentials)
+    except ValueError as e:
+        logger.error('{} Invalid credentials: {}'.format(_LOG_PREFIX, str(e)))
+        raise
+
+    try:
+        locations_data = api_client.get_locations()
+    except turn_14_exceptions.Turn14APIException as e:
+        logger.error('{} Turn 14 API error: {}'.format(_LOG_PREFIX, str(e)))
+        raise
+
+    if not locations_data:
+        logger.warning('{} No locations returned from Turn 14 API.'.format(_LOG_PREFIX))
+        return
+
+    instances = _transform_locations_data(locations_data)
+    if not instances:
+        logger.warning('{} No valid location instances after transformation.'.format(_LOG_PREFIX))
+        return
+
+    try:
+        pgbulk.upsert(
+            src_models.Turn14Location,
+            instances,
+            unique_fields=['external_id'],
+            update_fields=['name', 'street', 'city', 'state', 'country', 'zip_code'],
+        )
+    except Exception as e:
+        logger.error('{} Error during locations upsert: {}'.format(_LOG_PREFIX, str(e)))
+        raise
+
+    logger.info('{} Successfully upserted {} Turn 14 locations.'.format(_LOG_PREFIX, len(instances)))
+
+
+def _transform_locations_data(locations_data: typing.List[typing.Dict]) -> typing.List[src_models.Turn14Location]:
+    instances = []
+    for item in locations_data:
+        try:
+            external_id = str(item.get('id', '')).strip()
+            if not external_id:
+                continue
+            attrs = item.get('attributes', {}) or {}
+            instances.append(
+                src_models.Turn14Location(
+                    external_id=external_id,
+                    name=str(attrs.get('Name', '')).strip() or external_id,
+                    street=str(attrs.get('Street', '')).strip(),
+                    city=str(attrs.get('City', '')).strip(),
+                    state=str(attrs.get('State', '')).strip(),
+                    country=str(attrs.get('Country', '')).strip(),
+                    zip_code=str(attrs.get('ZipCode', '')).strip(),
+                )
+            )
+        except Exception as e:
+            logger.warning('{} Error transforming location {}: {}. Skipping.'.format(
+                _LOG_PREFIX, item, str(e)
+            ))
+    return instances
+
+
 def _transform_brands_data(brands_data: typing.List[typing.Dict]) -> typing.List[src_models.Turn14Brand]:
     brand_instances = []
     

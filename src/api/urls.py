@@ -3,13 +3,52 @@ from django.urls import path, include
 from src.api.views.authentication import LoginView, ChangePasswordView
 from src.api.views.company import CompanyDestinationsView
 from src.api.views.integrations import CompanyProvidersView, CompanyProviderDetailView, BrandsWithProvidersView, CompanyDestinationsWithBrandsView, CompanyDestinationDetailView, ExecutionRunsView, ExecutionRunPartsHistoryView
+from src.api.views.company_settings import (
+    ProfileView,
+    CompanySettingsView,
+    CompanyTeamView,
+    CompanyTeamMemberView,
+)
+from src.api.views.onboarding import (
+    RegisterView,
+    CompanyDetailsView,
+    PersonalizationView,
+    OnboardingStatusView,
+    DistributorCredentialsInfoView,
+)
 from src.api.views.parts import PartsSearchView, PartDetailView
+from src.api.views.turn14_locations import Turn14LocationsView
 
 urlpatterns = [
     path(
         "auth/login/",
         LoginView.as_view(),
         name="login"
+    ),
+    path(
+        "onboarding/register/",
+        RegisterView.as_view(),
+        name="onboarding_register",
+    ),
+    path(
+        "onboarding/company-details/",
+        CompanyDetailsView.as_view(),
+        name="onboarding_company_details",
+    ),
+    path(
+        "onboarding/personalization/",
+        PersonalizationView.as_view(),
+        name="onboarding_personalization",
+    ),
+    path(
+        "onboarding/status/",
+        OnboardingStatusView.as_view(),
+        name="onboarding_status",
+    ),
+    path(
+        "onboarding/distributor-credentials-info/",
+        DistributorCredentialsInfoView.as_view(),
+        name="onboarding_distributor_credentials_info",
     ),
     path(
         "auth/change-password/",
@@ -70,5 +109,30 @@ urlpatterns = [
         "parts/<int:id>/",
         PartDetailView.as_view(),
         name="part_detail",
+    ),
+    path(
+        "turn14/locations/",
+        Turn14LocationsView.as_view(),
+        name="turn14_locations",
+    ),
+    path(
+        "settings/profile/",
+        ProfileView.as_view(),
+        name="profile",
+    ),
+    path(
+        "settings/company/",
+        CompanySettingsView.as_view(),
+        name="company_settings",
+    ),
+    path(
+        "settings/company/team/",
+        CompanyTeamView.as_view(),
+        name="company_team",
+    ),
+    path(
+        "settings/company/team/<int:user_id>/",
+        CompanyTeamMemberView.as_view(),
+        name="company_team_member",
     ),
 ]

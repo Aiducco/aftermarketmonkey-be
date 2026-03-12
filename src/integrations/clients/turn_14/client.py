@@ -252,6 +252,15 @@ class Turn14ApiClient(object):
             ).content
         ).get("data", [])
 
+    def get_locations(self) -> typing.List[typing.Dict]:
+        """Fetch Turn14 warehouse locations from GET /v1/locations."""
+        return simplejson.loads(
+            self._request(
+                endpoint="locations",
+                method=common_enums.HttpMethod.GET,
+            ).content
+        ).get("data", [])
+
     def _clear_token_cache(self) -> None:
         """Clear the cached token and expiration time."""
         self._cached_token = None
