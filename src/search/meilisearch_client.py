@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 INDEX_NAME = getattr(settings, "MEILISEARCH_INDEX_PARTS", "parts")
 
 # Searchable: what the user types to find results
-SEARCHABLE_ATTRIBUTES = ["part_number", "sku", "description", "aaia_code"]
+SEARCHABLE_ATTRIBUTES = ["part_number", "sku", "description", "aaia_code", "brand_name"]
 
 # Filterable: for sidebar filters (e.g. brand_id)
 FILTERABLE_ATTRIBUTES = ["brand_id"]
@@ -58,11 +58,24 @@ def setup_index() -> bool:
         return False
 
 
+def _get_brand_name(part) -> str:
+    """Get brand name from MasterPart (part.brand -> Brands.name)."""
+    if not part.brand_id:
+        return ""
+    try:
+        brand = part.brand
+        return (brand.name or "").strip() if brand else ""
+    except Exception:
+        return ""
+
+
 def _part_to_document(part) -> typing.Dict:
     """Convert MasterPart instance to Meilisearch document."""
+    brand_name = _get_brand_name(part)
     return {
         "id": part.id,
         "brand_id": part.brand_id,
+        "brand_name": brand_name or "",  # Never None for Meilisearch
         "part_number": part.part_number or "",
         "sku": part.sku or "",
         "description": (part.description or "")[:10000],  # Meilisearch has limits
@@ -103,6 +116,12 @@ def add_documents_in_batches(
     """
     if not is_configured():
         return 0, 0
+
+    # Ensure brand is loaded (MasterPart.brand -> Brands)
+    from src.models import MasterPart
+
+    if queryset.model == MasterPart:
+        queryset = queryset.select_related("brand")
 
     total_ok = 0
     total_fail = 0

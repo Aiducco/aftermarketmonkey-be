@@ -2,11 +2,42 @@
 API services for parts search and detail.
 """
 import logging
+import re
 import typing
 
 from src import models as src_models
 
 logger = logging.getLogger(__name__)
+
+# Turn14 warehouse keys may be "01", "02" or "wh 01", "wh 02" - normalize to external_id
+_TURN14_WH_KEY_RE = re.compile(r"^(?:wh\s+)?(\d+)$", re.IGNORECASE)
+
+
+def _map_turn14_warehouse_availability(
+    warehouse_availability: typing.Optional[typing.Dict],
+) -> typing.Optional[typing.Dict[str, typing.Union[int, float]]]:
+    """
+    Map Turn14 warehouse codes (e.g. "01", "wh 01") to location names from Turn14Location.
+    Returns dict with location name as key, qty as value. Unknown keys keep original.
+    """
+    if not warehouse_availability or not isinstance(warehouse_availability, dict):
+        return warehouse_availability
+
+    locations = {
+        loc.external_id: loc.name
+        for loc in src_models.Turn14Location.objects.all().values("external_id", "name")
+    }
+
+    result = {}
+    for key, qty in warehouse_availability.items():
+        if not isinstance(qty, (int, float)):
+            continue
+        match = _TURN14_WH_KEY_RE.match(str(key).strip())
+        external_id = match.group(1) if match else str(key).strip()
+        display_name = locations.get(external_id) or key
+        result[display_name] = int(qty) if isinstance(qty, float) and qty == int(qty) else qty
+
+    return result if result else None
 
 _LOG_PREFIX = "[PARTS-SERVICES]"
 
@@ -119,11 +150,14 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
         }
 
         if inv_obj:
+            wh_avail = inv_obj.warehouse_availability
+            if kind_name == "TURN_14":
+                wh_avail = _map_turn14_warehouse_availability(wh_avail)
             provider_info["inventory"] = {
                 "warehouse_total_qty": inv_obj.warehouse_total_qty,
                 "manufacturer_inventory": inv_obj.manufacturer_inventory,
                 "manufacturer_esd": inv_obj.manufacturer_esd.isoformat() if inv_obj.manufacturer_esd else None,
-                "warehouse_availability": inv_obj.warehouse_availability,
+                "warehouse_availability": wh_avail,
                 "last_synced_at": inv_obj.last_synced_at.isoformat() if inv_obj.last_synced_at else None,
             }
 
