@@ -9,19 +9,9 @@ services:
     ports:
       - "8005:8000"
     depends_on:
-      - db
       - cache-redis
 
 
-  db:
-    image: postgres:13.0-alpine
-    volumes:
-      - postgres_data:/var/lib/postgresql/data/
-    env_file:
-      - ./.env.db
-    ports:
-      - "54325:5432"
-    restart: always
 
   cache-redis:
     image: redis:7.2-rc1-alpine
@@ -43,6 +33,5 @@ services:
 
 
 volumes:
-  postgres_data:
   redis_data:
   meilisearch_data:
