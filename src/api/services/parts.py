@@ -24,7 +24,7 @@ def _map_turn14_warehouse_availability(
         return warehouse_availability
 
     locations = {
-        loc.external_id: loc.name
+        loc["external_id"]: loc["name"]
         for loc in src_models.Turn14Location.objects.all().values("external_id", "name")
     }
 

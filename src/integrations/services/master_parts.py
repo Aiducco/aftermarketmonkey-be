@@ -421,6 +421,48 @@ def _parse_turn14_inventory(inv: typing.Dict) -> typing.Tuple[typing.Optional[in
     return manufacturer_qty, manufacturer_esd, warehouse_total
 
 
+def _get_turn14_location_map() -> typing.Dict[str, str]:
+    """Load all Turn14Location and return external_id -> name. Supports "01" and "1" via zero-pad."""
+    rows = src_models.Turn14Location.objects.all().values("external_id", "name")
+    result = {}
+    for row in rows:
+        eid = (row.get("external_id") or "").strip()
+        name = (row.get("name") or eid).strip()
+        if not eid:
+            continue
+        result[eid] = name
+        # Allow lookup by zero-padded form (e.g. "1" -> same as "01")
+        if eid.isdigit():
+            result[eid.zfill(2)] = name
+            result[str(int(eid))] = name
+    return result
+
+
+def _map_turn14_inventory_to_location_names(
+    inventory: typing.Optional[typing.Dict],
+    location_map: typing.Dict[str, str],
+) -> typing.Optional[typing.Dict[str, typing.Union[int, float]]]:
+    """
+    Map Turn14 inventory keys (external_id e.g. "01") to location names from turn14_locations.
+    Returns dict with location name as key, qty as value.
+    """
+    if not inventory or not isinstance(inventory, dict) or not location_map:
+        return inventory if isinstance(inventory, dict) else None
+    result = {}
+    for key, qty in inventory.items():
+        if not isinstance(qty, (int, float)):
+            continue
+        key_str = str(key).strip()
+        # Direct lookup; support "1" via zero-pad to match "01" in DB
+        display_name = (
+            location_map.get(key_str)
+            or (location_map.get(key_str.zfill(2)) if key_str.isdigit() else None)
+            or key
+        )
+        result[display_name] = int(qty) if isinstance(qty, float) and qty == int(qty) else qty
+    return result if result else None
+
+
 def sync_provider_inventory_from_turn14() -> None:
     """
     Sync ProviderPartInventory from Turn14BrandInventory.
@@ -439,6 +481,9 @@ def sync_provider_inventory_from_turn14() -> None:
         pp.provider_external_id: pp
         for pp in src_models.ProviderPart.objects.filter(provider=turn14_provider)
     }
+
+    # Load Turn14 locations once: map external_id (e.g. "01") -> name (e.g. "Hatfield")
+    location_map = _get_turn14_location_map()
 
     now = timezone.now()
     total_upserted = 0
@@ -462,14 +507,18 @@ def sync_provider_inventory_from_turn14() -> None:
             if not provider_part:
                 continue
             mfr_qty, mfr_esd, wh_total = _parse_turn14_inventory(inv)
+            warehouse_availability = _map_turn14_inventory_to_location_names(
+                inv.get("inventory"), location_map
+            )
             to_upsert.append(
                 src_models.ProviderPartInventory(
                     provider_part=provider_part,
                     warehouse_total_qty=wh_total,
                     manufacturer_inventory=mfr_qty,
                     manufacturer_esd=mfr_esd,
-                    warehouse_availability=inv.get("inventory"),
+                    warehouse_availability=warehouse_availability,
                     last_synced_at=now,
+                    updated_at=now,
                 )
             )
 
@@ -478,7 +527,7 @@ def sync_provider_inventory_from_turn14() -> None:
                 src_models.ProviderPartInventory,
                 to_upsert,
                 unique_fields=["provider_part"],
-                update_fields=["warehouse_total_qty", "manufacturer_inventory", "manufacturer_esd", "warehouse_availability", "last_synced_at"],
+                update_fields=["warehouse_total_qty", "manufacturer_inventory", "manufacturer_esd", "warehouse_availability", "last_synced_at", "updated_at"],
             )
             total_upserted += len(to_upsert)
 
@@ -497,18 +546,24 @@ KEYSTONE_WAREHOUSE_QTY_FIELDS = (
     "pacific_nw_qty", "texas_qty", "great_lakes_qty", "florida_qty",
 )
 
+# Display names for Keystone warehouse_availability (nice capitalization)
+KEYSTONE_WAREHOUSE_DISPLAY_NAMES = {
+    "east_qty": "East",
+    "midwest_qty": "Midwest",
+    "california_qty": "California",
+    "southeast_qty": "Southeast",
+    "pacific_nw_qty": "Pacific NW",
+    "texas_qty": "Texas",
+    "great_lakes_qty": "Great Lakes",
+    "florida_qty": "Florida",
+}
+
 
 def _keystone_warehouse_availability(row: typing.Dict) -> typing.Optional[typing.Dict]:
     if any(row.get(f) for f in KEYSTONE_WAREHOUSE_QTY_FIELDS):
         return {
-            "east": row.get("east_qty"),
-            "midwest": row.get("midwest_qty"),
-            "california": row.get("california_qty"),
-            "southeast": row.get("southeast_qty"),
-            "pacific_nw": row.get("pacific_nw_qty"),
-            "texas": row.get("texas_qty"),
-            "great_lakes": row.get("great_lakes_qty"),
-            "florida": row.get("florida_qty"),
+            KEYSTONE_WAREHOUSE_DISPLAY_NAMES[field]: row.get(field)
+            for field in KEYSTONE_WAREHOUSE_QTY_FIELDS
         }
     return None
 
@@ -560,6 +615,7 @@ def sync_provider_inventory_from_keystone() -> None:
                 manufacturer_esd=None,
                 warehouse_availability=_keystone_warehouse_availability(kp),
                 last_synced_at=now,
+                updated_at=now,
             )
             for kp in batch
             if kp["vcpn"] in provider_parts
@@ -570,7 +626,7 @@ def sync_provider_inventory_from_keystone() -> None:
                 src_models.ProviderPartInventory,
                 to_upsert,
                 unique_fields=["provider_part"],
-                update_fields=["warehouse_total_qty", "manufacturer_inventory", "manufacturer_esd", "warehouse_availability", "last_synced_at"],
+                update_fields=["warehouse_total_qty", "manufacturer_inventory", "manufacturer_esd", "warehouse_availability", "last_synced_at", "updated_at"],
             )
             total_upserted += len(to_upsert)
 
@@ -585,18 +641,47 @@ def sync_provider_inventory_from_keystone() -> None:
 
 
 def _extract_turn14_prices(pricelists: typing.Any) -> typing.Tuple[typing.Any, typing.Any, typing.Any, typing.Any]:
-    """Extract jobber_price, map_price, msrp, retail_price from Turn14 pricelists."""
+    """Extract jobber_price, map_price, msrp, retail_price from Turn14 pricelists.
+    Supports both key-based items (jobber_price, map_price, ...) and name+price items
+    ([{"name": "MAP", "price": 1344}, {"name": "Jobber", "price": 1291.14}]).
+    """
     jobber_price = None
     map_price = None
     msrp = None
     retail_price = None
-    if isinstance(pricelists, list) and pricelists:
-        for pl in pricelists:
-            if isinstance(pl, dict):
-                jobber_price = jobber_price or pl.get("jobber_price") or pl.get("jobber")
-                map_price = map_price or pl.get("map_price") or pl.get("map")
-                msrp = msrp or pl.get("msrp")
-                retail_price = retail_price or pl.get("retail_price") or pl.get("retail")
+    if not isinstance(pricelists, list) or not pricelists:
+        return jobber_price, map_price, msrp, retail_price
+    for pl in pricelists:
+        if not isinstance(pl, dict):
+            continue
+        # Name + price format (e.g. {"name": "MAP", "price": 1344}, {"name": "Jobber", "price": 1291.14})
+        name = (pl.get("name") or "").strip()
+        price = pl.get("price")
+        if name and price is not None:
+            try:
+                price_val = float(price) if not isinstance(price, (int, float)) else price
+            except (TypeError, ValueError):
+                price_val = None
+            if price_val is not None:
+                name_lower = name.lower()
+                if name_lower == "map" and map_price is None:
+                    map_price = price_val
+                elif name_lower == "jobber" and jobber_price is None:
+                    jobber_price = price_val
+                elif name_lower == "msrp" and msrp is None:
+                    msrp = price_val
+                elif name_lower == "retail" and retail_price is None:
+                    retail_price = price_val
+        else:
+            # Key-based format (legacy)
+            if jobber_price is None:
+                jobber_price = pl.get("jobber_price") or pl.get("jobber")
+            if map_price is None:
+                map_price = pl.get("map_price") or pl.get("map")
+            if msrp is None:
+                msrp = pl.get("msrp")
+            if retail_price is None:
+                retail_price = pl.get("retail_price") or pl.get("retail")
     return jobber_price, map_price, msrp, retail_price
 
 
