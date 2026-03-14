@@ -50,8 +50,8 @@ PROVIDER_DISPLAY_NAMES = {
 
 # Provider kind_name -> image URL (edit here to add logos)
 PROVIDER_IMAGE_URLS = {
-    "TURN_14": "http://5.161.121.143/uploads/t14_logo.png",
-    "KEYSTONE": "http://5.161.121.143/uploads/keystone.png",
+    "TURN_14": "https://api.aftermarketmonkey.com/uploads/t14_logo.png",
+    "KEYSTONE": "https://api.aftermarketmonkey.com/uploads/keystone.png",
     "SDC": "",
 }
 
