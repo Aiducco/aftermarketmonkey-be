@@ -226,6 +226,34 @@ class Turn14ApiClient(object):
 
         return data, next_page
 
+    def get_pricing_changes(
+        self,
+        start_date: str,
+        end_date: str,
+        page: int = 1,
+    ) -> typing.Tuple[typing.List[typing.Dict], typing.Optional[int]]:
+        """
+        GET /v1/pricing/changes?start_date=...&end_date=...&page=...
+        Returns (data, next_page). Each item has id, type 'PricingChange', and attributes.itemcode.
+        """
+        response = simplejson.loads(
+            self._request(
+                endpoint="pricing/changes",
+                method=common_enums.HttpMethod.GET,
+                params={
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "page": page,
+                },
+            ).content
+        )
+
+        data = response.get("data", [])
+        potential_next_page = page + 1
+        next_page = None if page == response.get("meta", {}).get("total_pages", 1) else potential_next_page
+
+        return data, next_page
+
     def get_brand_media(self, brand_id: str, page: int = 1) -> typing.Tuple[
         typing.List[typing.Dict], typing.Optional[int]]:
         response = simplejson.loads(

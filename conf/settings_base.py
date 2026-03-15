@@ -149,12 +149,6 @@ LOGGING = {
             "class": "logging.StreamHandler",
             "formatter": "verbose",
         },
-        "log_file": {
-            "level": "DEBUG",
-            "class": "logging.handlers.RotatingFileHandler",
-            "filename": BASE_DIR / "logs/sinker.log",
-            "formatter": "verbose",
-        },
     },
     "loggers": {
         "": {
