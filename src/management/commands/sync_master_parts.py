@@ -1,5 +1,6 @@
 from django.core.management.base import BaseCommand
 
+from src.audit import scheduled_tasks as audit_scheduled_tasks
 from src.integrations.services import master_parts
 from src.search.meilisearch_client import add_documents_in_batches, is_configured, setup_index
 
@@ -16,6 +17,7 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         self.stdout.write("Starting full master parts sync...")
+        execution = audit_scheduled_tasks.start_scheduled_task_execution("sync_master_parts")
         try:
             master_parts.sync_all_master_parts()
             self.stdout.write(self.style.SUCCESS("Successfully completed master parts sync."))
@@ -30,6 +32,12 @@ class Command(BaseCommand):
                 self.stdout.write(
                     self.style.SUCCESS("Meilisearch: indexed {} parts, failed {}.".format(ok, fail))
                 )
+
+            audit_scheduled_tasks.mark_scheduled_task_completed(
+                execution,
+                message="Successfully completed master parts sync.",
+            )
         except Exception as e:
+            audit_scheduled_tasks.mark_scheduled_task_failed(execution, error_message=str(e))
             self.stdout.write(self.style.ERROR("Error: {}".format(str(e))))
             raise

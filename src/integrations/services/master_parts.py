@@ -30,7 +30,7 @@ def _get_brand_for_keystone_brand(keystone_brand: src_models.KeystoneBrand) -> t
     return mapping.brand if mapping else None
 
 
-BATCH_SIZE_MASTER_PARTS = 5000
+BATCH_SIZE_MASTER_PARTS = 50000
 BATCH_SIZE_INVENTORY = 20000
 BATCH_SIZE_PRICING = 20000
 BATCH_DELAY_SECONDS = 0.1  # Reduced from 0.3 - was adding ~30s per 100 batches
