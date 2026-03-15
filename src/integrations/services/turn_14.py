@@ -1656,6 +1656,7 @@ def fetch_and_save_turn_14_items_updates() -> None:
     days = 1
     total_processed = 0
     total_skipped = 0
+    brands_with_updated_items = {}  # id -> Turn14Brand for brands that had items updated this run
     # Rate limiting is handled at the client level (token caching + rate limit decorators)
     # Retry logic for 429 errors as a safety measure
     MAX_RETRIES = 3
@@ -1777,6 +1778,9 @@ def fetch_and_save_turn_14_items_updates() -> None:
 
             processed_count = len(upserted_items) if upserted_items else 0
             total_processed += processed_count
+            for inst in item_instances:
+                if inst.brand_id and inst.brand:
+                    brands_with_updated_items[inst.brand.id] = inst.brand
 
             logger.info('{} Successfully upserted {} items updates for page: {}.'.format(
                 _LOG_PREFIX, processed_count, page
@@ -1793,6 +1797,18 @@ def fetch_and_save_turn_14_items_updates() -> None:
     logger.info('{} Completed fetching items updates. Processed: {}, Skipped: {}.'.format(
         _LOG_PREFIX, total_processed, total_skipped
     ))
+
+    # if brands_with_updated_items:
+    #     brands_list = list(brands_with_updated_items.values())
+    #     logger.info('{} Syncing brand data, pricing, and inventory for {} brand(s) with updated items.'.format(
+    #         _LOG_PREFIX, len(brands_list)
+    #     ))
+    #     fetch_and_save_turn_14_brand_data_for_turn14_brands(brands_list)
+    #     fetch_and_save_turn_14_brand_pricing_for_turn14_brands(brands_list)
+    #     fetch_and_save_turn_14_brand_inventory_for_turn14_brands(brands_list)
+    #     logger.info('{} Completed sync of brand data, pricing, and inventory for brands with updated items.'.format(
+    #         _LOG_PREFIX
+    #     ))
 
 
 def _transform_items_update_data(items_data: typing.List[typing.Dict], brand_id_to_turn14_brand: typing.Dict[str, src_models.Turn14Brand]) -> typing.List[src_models.Turn14Items]:
@@ -1870,6 +1886,91 @@ def _transform_items_update_data(items_data: typing.List[typing.Dict], brand_id_
             continue
     
     return item_instances
+
+
+def fetch_and_save_turn_14_pricing_changes(start_date: str, end_date: str) -> None:
+    """
+    Fetch pricing changes from GET /v1/pricing/changes for the given date range,
+    collect distinct Turn14Brand for affected items, then sync brand pricing for those brands only.
+    start_date and end_date should be YYYY-MM-DD.
+    """
+    logger.info('{} Fetching Turn 14 pricing changes from {} to {}.'.format(
+        _LOG_PREFIX, start_date, end_date
+    ))
+
+    turn_14_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.TURN_14.value
+    ).first()
+    if not turn_14_provider:
+        logger.info('{} No Turn 14 provider found.'.format(_LOG_PREFIX))
+        return
+
+    primary_provider = src_models.CompanyProviders.objects.filter(
+        provider=turn_14_provider,
+        provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
+        primary=True
+    ).first()
+
+    if not primary_provider:
+        logger.info('{} No turn 14 active primary provider found.'.format(_LOG_PREFIX))
+        return
+
+    credentials = primary_provider.credentials
+    try:
+        api_client = turn_14_client.Turn14ApiClient(credentials=credentials)
+    except ValueError as e:
+        logger.error('{} Invalid credentials or configuration: {}'.format(_LOG_PREFIX, str(e)))
+        raise
+
+    item_ids = set()
+    page = 1
+    while page is not None:
+        try:
+            data, next_page = api_client.get_pricing_changes(
+                start_date=start_date,
+                end_date=end_date,
+                page=page,
+            )
+        except turn_14_exceptions.Turn14APIException as e:
+            logger.error('{} Turn 14 API error for pricing changes, page: {}. Error: {}.'.format(
+                _LOG_PREFIX, page, str(e)
+            ))
+            raise
+
+        for item in data or []:
+            attrs = item.get('attributes', {})
+            # API returns attributes.itemcode (and id) as the item identifier
+            item_id = attrs.get('itemcode') or item.get('id')
+            if item_id is not None:
+                item_ids.add(str(item_id))
+
+        page = next_page
+
+    if not item_ids:
+        logger.info('{} No pricing change item IDs returned for {} to {}. Nothing to sync.'.format(
+            _LOG_PREFIX, start_date, end_date
+        ))
+        return
+
+    logger.info('{} Found {} unique item IDs from pricing changes.'.format(_LOG_PREFIX, len(item_ids)))
+
+    turn14_brands = list(
+        src_models.Turn14Brand.objects.filter(
+            items__external_id__in=item_ids
+        ).distinct()
+    )
+
+    if not turn14_brands:
+        logger.warning('{} No Turn14Brand found in DB for the pricing change item IDs. Skipping sync.'.format(
+            _LOG_PREFIX
+        ))
+        return
+
+    logger.info('{} Syncing brand pricing for {} Turn14 brand(s) with pricing changes.'.format(
+        _LOG_PREFIX, len(turn14_brands)
+    ))
+    fetch_and_save_turn_14_brand_pricing_for_turn14_brands(turn14_brands)
+    logger.info('{} Completed pricing sync for brands with pricing changes.'.format(_LOG_PREFIX))
 
 
 def fetch_and_save_turn_14_inventory_updates() -> None:
