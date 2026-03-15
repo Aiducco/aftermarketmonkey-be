@@ -628,3 +628,23 @@ class ProviderPartCompanyPricing(django_db_models.Model):
     class Meta:
         db_table = "provider_part_company_pricing"
         unique_together = [["provider_part", "company"]]
+
+
+class ScheduledTaskExecution(django_db_models.Model):
+    """
+    Audit table for scheduled task / cron executions (e.g. Turn 14 items updates,
+    inventory updates). Reusable for any named task run on a schedule.
+    """
+    name = django_db_models.CharField(max_length=255)
+    status = django_db_models.PositiveSmallIntegerField()
+    status_name = django_db_models.CharField(max_length=255)
+    message = django_db_models.TextField(null=True, blank=True)
+    error_message = django_db_models.TextField(null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+    completed_at = django_db_models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "scheduled_task_execution"
+        ordering = ["-created_at"]
