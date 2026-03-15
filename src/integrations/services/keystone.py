@@ -148,6 +148,135 @@ def fetch_and_save_keystone_brands() -> None:
         raise
 
 
+def _normalize_aaia_codes(aaia_code: typing.Optional[str]) -> typing.List[str]:
+    """Split aaia_code by comma and return non-empty stripped parts."""
+    if not aaia_code or not str(aaia_code).strip():
+        return []
+    return [p.strip() for p in str(aaia_code).split(",") if p and p.strip()]
+
+
+def _find_brand_for_keystone_brand(
+    keystone_brand: src_models.KeystoneBrand,
+) -> typing.Optional[src_models.Brands]:
+    """
+    Find existing Brand for a KeystoneBrand: first by aaia_code (comma-separated, use first match),
+    then by name (case-insensitive).
+    """
+    aaia_parts = _normalize_aaia_codes(keystone_brand.aaia_code)
+    for code in aaia_parts:
+        brand = src_models.Brands.objects.filter(aaia_code=code).first()
+        if brand:
+            return brand
+    name = (keystone_brand.name or "").strip()
+    if name:
+        return src_models.Brands.objects.filter(name__iexact=name).first()
+    return None
+
+
+def sync_unmapped_keystone_brands_to_brands() -> typing.List[src_models.KeystoneBrand]:
+    """
+    For each KeystoneBrand that does not yet have a BrandKeystoneBrandMapping:
+    find or create a Brand (match by aaia_code then name; create with uppercase name if new),
+    then add BrandKeystoneBrandMapping, BrandProviders (Keystone), and CompanyBrands (TICK_PERFORMANCE).
+    Returns the list of KeystoneBrand instances that were synced.
+    """
+    logger.info("{} Syncing unmapped Keystone brands to Brands.".format(_LOG_PREFIX))
+
+    keystone_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.KEYSTONE.value,
+    ).first()
+    if not keystone_provider:
+        logger.warning("{} Keystone provider not found. Skipping sync.".format(_LOG_PREFIX))
+        return []
+
+    tick_company = src_models.Company.objects.filter(name="TICK_PERFORMANCE").first()
+    if not tick_company:
+        logger.warning("{} Company TICK_PERFORMANCE not found. Skipping sync.".format(_LOG_PREFIX))
+        return []
+
+    mapped_keystone_ids = set(
+        src_models.BrandKeystoneBrandMapping.objects.values_list(
+            "keystone_brand_id", flat=True
+        ).distinct()
+    )
+    unmapped_keystone_brands = list(
+        src_models.KeystoneBrand.objects.exclude(id__in=mapped_keystone_ids).order_by("id")
+    )
+
+    if not unmapped_keystone_brands:
+        logger.info("{} No unmapped Keystone brands. Nothing to sync.".format(_LOG_PREFIX))
+        return []
+
+    logger.info(
+        "{} Found {} unmapped Keystone brands.".format(
+            _LOG_PREFIX, len(unmapped_keystone_brands)
+        )
+    )
+
+    created_mappings = 0
+    created_brand_providers = 0
+    created_company_brands = 0
+    created_brands = 0
+
+    for keystone_brand in unmapped_keystone_brands:
+        brand = _find_brand_for_keystone_brand(keystone_brand)
+        if not brand:
+            name_upper = (keystone_brand.name or "").strip().upper()
+            if not name_upper:
+                name_upper = "BRAND_{}".format(keystone_brand.external_id)
+            aaia_primary = _normalize_aaia_codes(keystone_brand.aaia_code)
+            aaia_code = aaia_primary[0] if aaia_primary else None
+            brand = src_models.Brands.objects.create(
+                name=name_upper,
+                status=src_enums.BrandProviderStatus.ACTIVE.value,
+                status_name=src_enums.BrandProviderStatus.ACTIVE.name,
+                aaia_code=aaia_code,
+            )
+            created_brands += 1
+            logger.info(
+                "{} Created new Brand: name={!r} aaia_code={!r} for KeystoneBrand id={}.".format(
+                    _LOG_PREFIX, name_upper, aaia_code, keystone_brand.id
+                )
+            )
+
+        mapping, mapping_created = src_models.BrandKeystoneBrandMapping.objects.get_or_create(
+            brand=brand,
+            keystone_brand=keystone_brand,
+        )
+        if mapping_created:
+            created_mappings += 1
+
+        bp, bp_created = src_models.BrandProviders.objects.get_or_create(
+            brand=brand,
+            provider=keystone_provider,
+        )
+        if bp_created:
+            created_brand_providers += 1
+
+        cb, cb_created = src_models.CompanyBrands.objects.get_or_create(
+            company=tick_company,
+            brand=brand,
+            defaults={
+                "status": src_enums.CompanyBrandStatus.ACTIVE.value,
+                "status_name": src_enums.CompanyBrandStatus.ACTIVE.name,
+            },
+        )
+        if cb_created:
+            created_company_brands += 1
+
+    logger.info(
+        "{} Sync complete. Brands created: {}, BrandKeystoneBrandMapping: {}, "
+        "BrandProviders: {}, CompanyBrands: {}.".format(
+            _LOG_PREFIX,
+            created_brands,
+            created_mappings,
+            created_brand_providers,
+            created_company_brands,
+        )
+    )
+    return unmapped_keystone_brands
+
+
 # Keystone provider id (use when provider record has id=4)
 KEYSTONE_PROVIDER_ID = 4
 
