@@ -10,8 +10,9 @@ from src.integrations.services import turn_14
 
 class Command(BaseCommand):
     help = (
-        'Fetch and save Turn 14 brands from API, then sync unmapped Turn14 brands '
-        'into Brands (mappings, brand_providers, company_brands for TICK_PERFORMANCE).'
+        'Fetch and save Turn 14 brands from API, sync unmapped Turn14 brands into Brands '
+        '(mappings, brand_providers, company_brands for TICK_PERFORMANCE), then fetch and save '
+        'items, brand data, pricing, and inventory for those newly synced brands.'
     )
 
     def handle(self, *args, **options):
@@ -23,8 +24,30 @@ class Command(BaseCommand):
             self.stdout.write(self.style.SUCCESS('Turn 14 brands fetched and saved.'))
 
             self.stdout.write('Step 2: Syncing unmapped Turn14 brands into Brands flow...')
-            turn_14.sync_unmapped_turn_14_brands_to_brands()
+            synced_turn14_brands = turn_14.sync_unmapped_turn_14_brands_to_brands()
             self.stdout.write(self.style.SUCCESS('Unmapped Turn14 brands synced.'))
+
+            if synced_turn14_brands:
+                n = len(synced_turn14_brands)
+                self.stdout.write('Step 3: Fetching data for {} newly synced Turn14 brand(s)...'.format(n))
+
+                self.stdout.write('  - Items...')
+                turn_14.fetch_and_save_turn_14_items_for_turn14_brands(synced_turn14_brands)
+                self.stdout.write(self.style.SUCCESS('  Items done.'))
+
+                self.stdout.write('  - Brand data (media)...')
+                turn_14.fetch_and_save_turn_14_brand_data_for_turn14_brands(synced_turn14_brands)
+                self.stdout.write(self.style.SUCCESS('  Brand data done.'))
+
+                self.stdout.write('  - Brand pricing...')
+                turn_14.fetch_and_save_turn_14_brand_pricing_for_turn14_brands(synced_turn14_brands)
+                self.stdout.write(self.style.SUCCESS('  Brand pricing done.'))
+
+                self.stdout.write('  - Brand inventory...')
+                turn_14.fetch_and_save_turn_14_brand_inventory_for_turn14_brands(synced_turn14_brands)
+                self.stdout.write(self.style.SUCCESS('  Brand inventory done.'))
+            else:
+                self.stdout.write('Step 3: No newly synced brands; skipping items, brand data, pricing, and inventory fetch.')
 
             audit_scheduled_tasks.mark_scheduled_task_completed(
                 execution,
