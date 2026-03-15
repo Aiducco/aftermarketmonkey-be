@@ -84,6 +84,119 @@ def fetch_and_save_turn_14_brands() -> None:
     ))
 
 
+def _normalize_aaia_codes(aaia_code: typing.Optional[str]) -> typing.List[str]:
+    """Split aaia_code by comma and return non-empty stripped parts."""
+    if not aaia_code or not str(aaia_code).strip():
+        return []
+    return [p.strip() for p in str(aaia_code).split(',') if p and p.strip()]
+
+
+def _find_brand_for_turn14_brand(turn14_brand: src_models.Turn14Brand) -> typing.Optional[src_models.Brands]:
+    """
+    Find existing Brand for a Turn14Brand: first by aaia_code (comma-separated, use first match),
+    then by name (case-insensitive).
+    """
+    aaia_parts = _normalize_aaia_codes(turn14_brand.aaia_code)
+    for code in aaia_parts:
+        brand = src_models.Brands.objects.filter(aaia_code=code).first()
+        if brand:
+            return brand
+    name = (turn14_brand.name or '').strip()
+    if name:
+        return src_models.Brands.objects.filter(name__iexact=name).first()
+    return None
+
+
+def sync_unmapped_turn_14_brands_to_brands() -> None:
+    """
+    For each Turn14Brand that does not yet have a BrandTurn14BrandMapping:
+    find or create a Brand (match by aaia_code then name; create with uppercase name if new),
+    then add BrandTurn14BrandMapping, BrandProviders (Turn 14), and CompanyBrands (TICK_PERFORMANCE).
+    """
+    logger.info('{} Syncing unmapped Turn 14 brands to Brands.'.format(_LOG_PREFIX))
+
+    turn14_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.TURN_14.value,
+    ).first()
+    if not turn14_provider:
+        logger.warning('{} Turn 14 provider not found. Skipping sync.'.format(_LOG_PREFIX))
+        return
+
+    tick_company = src_models.Company.objects.filter(name='TICK_PERFORMANCE').first()
+    if not tick_company:
+        logger.warning('{} Company TICK_PERFORMANCE not found. Skipping sync.'.format(_LOG_PREFIX))
+        return
+
+    mapped_turn14_ids = set(
+        src_models.BrandTurn14BrandMapping.objects.values_list('turn14_brand_id', flat=True).distinct()
+    )
+    unmapped_turn14_brands = list(
+        src_models.Turn14Brand.objects.exclude(id__in=mapped_turn14_ids).order_by('id')
+    )
+
+    if not unmapped_turn14_brands:
+        logger.info('{} No unmapped Turn 14 brands. Nothing to sync.'.format(_LOG_PREFIX))
+        return
+
+    logger.info('{} Found {} unmapped Turn 14 brands.'.format(_LOG_PREFIX, len(unmapped_turn14_brands)))
+
+    created_mappings = 0
+    created_brand_providers = 0
+    created_company_brands = 0
+    created_brands = 0
+
+    for turn14_brand in unmapped_turn14_brands:
+        brand = _find_brand_for_turn14_brand(turn14_brand)
+        if not brand:
+            name_upper = (turn14_brand.name or '').strip().upper()
+            if not name_upper:
+                name_upper = 'BRAND_{}'.format(turn14_brand.external_id)
+            aaia_primary = _normalize_aaia_codes(turn14_brand.aaia_code)
+            aaia_code = aaia_primary[0] if aaia_primary else None
+            brand = src_models.Brands.objects.create(
+                name=name_upper,
+                status=src_enums.BrandProviderStatus.ACTIVE.value,
+                status_name=src_enums.BrandProviderStatus.ACTIVE.name,
+                aaia_code=aaia_code,
+            )
+            created_brands += 1
+            logger.info('{} Created new Brand: name={!r} aaia_code={!r} for Turn14Brand id={}.'.format(
+                _LOG_PREFIX, name_upper, aaia_code, turn14_brand.id
+            ))
+
+        mapping, mapping_created = src_models.BrandTurn14BrandMapping.objects.get_or_create(
+            brand=brand,
+            turn14_brand=turn14_brand,
+        )
+        if mapping_created:
+            created_mappings += 1
+
+        bp, bp_created = src_models.BrandProviders.objects.get_or_create(
+            brand=brand,
+            provider=turn14_provider,
+        )
+        if bp_created:
+            created_brand_providers += 1
+
+        cb, cb_created = src_models.CompanyBrands.objects.get_or_create(
+            company=tick_company,
+            brand=brand,
+            defaults={
+                'status': src_enums.CompanyBrandStatus.ACTIVE.value,
+                'status_name': src_enums.CompanyBrandStatus.ACTIVE.name,
+            },
+        )
+        if cb_created:
+            created_company_brands += 1
+
+    logger.info(
+        '{} Sync complete. Brands created: {}, BrandTurn14BrandMapping: {}, '
+        'BrandProviders: {}, CompanyBrands: {}.'.format(
+            _LOG_PREFIX, created_brands, created_mappings, created_brand_providers, created_company_brands
+        )
+    )
+
+
 def fetch_and_save_turn_14_locations() -> None:
     """Fetch Turn14 locations from GET /v1/locations and upsert into Turn14Location."""
     logger.info('{} Started fetching and saving Turn 14 locations.'.format(_LOG_PREFIX))
@@ -214,7 +327,7 @@ def fetch_and_save_all_turn_14_brand_items() -> None:
         return
 
     all_brands = src_models.BrandProviders.objects.filter(
-        provider=turn_14_provider, id__gte=1530
+        provider=turn_14_provider
     )
     if not all_brands.exists():
         logger.info('{} No brands found for Turn 14 provider.'.format(_LOG_PREFIX))

@@ -33,3 +33,11 @@ class DestinationExecutionRunStatus(enum.Enum):
     STARTED = 1
     COMPLETED = 2
     FAILED = 3
+
+
+class ScheduledTaskExecutionStatus(enum.Enum):
+    """Status for scheduled task / cron execution audit records."""
+    STARTED = 1
+    COMPLETED = 2
+    FAILED = 3
+    SKIPPED = 4  # e.g. early exit when no work to do
