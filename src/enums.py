@@ -20,6 +20,7 @@ class BrandProviderKind(enum.Enum):
     TURN_14 = 1
     SDC = 2
     KEYSTONE = 3
+    ROUGH_COUNTRY = 4
 
 class BrandProviderStatus(enum.Enum):
     ACTIVE = 1

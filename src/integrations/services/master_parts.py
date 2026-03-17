@@ -1,6 +1,6 @@
 """
 Sync MasterPart, ProviderPart, ProviderPartInventory, and ProviderPartCompanyPricing
-from Turn14 and Keystone provider data.
+from Turn14, Keystone, and Rough Country provider data.
 """
 import logging
 import time
@@ -27,6 +27,15 @@ def _get_brand_for_turn14_brand(turn14_brand: src_models.Turn14Brand) -> typing.
 
 def _get_brand_for_keystone_brand(keystone_brand: src_models.KeystoneBrand) -> typing.Optional[src_models.Brands]:
     mapping = src_models.BrandKeystoneBrandMapping.objects.filter(keystone_brand=keystone_brand).first()
+    return mapping.brand if mapping else None
+
+
+def _get_brand_for_rough_country_brand(
+    rc_brand: src_models.RoughCountryBrand,
+) -> typing.Optional[src_models.Brands]:
+    mapping = src_models.BrandRoughCountryBrandMapping.objects.filter(
+        rough_country_brand=rc_brand,
+    ).first()
     return mapping.brand if mapping else None
 
 
@@ -387,6 +396,200 @@ def sync_master_parts_from_keystone() -> None:
             time.sleep(BATCH_DELAY_SECONDS)
 
     logger.info("{} Synced {} master parts and {} provider parts from Keystone total.".format(
+        _LOG_PREFIX, total_master, total_provider
+    ))
+
+
+def _rough_country_provider_external_id(rc_brand_id: int, sku: str) -> str:
+    """Unique per Rough Country provider: rc_brand_id + sku (same sku can exist under different RC brands)."""
+    return "{}_{}".format(rc_brand_id, sku)
+
+
+def sync_master_parts_from_rough_country() -> None:
+    """
+    Create/update MasterPart and ProviderPart from RoughCountryPart.
+    Only processes parts whose RoughCountryBrand has a BrandRoughCountryBrandMapping.
+    Uses cursor-based pagination and two-phase upsert (non-primary: INSERT new, UPDATE existing sku/aaia only).
+    """
+    logger.info("{} Syncing master parts from Rough Country (batched, cursor-based).".format(_LOG_PREFIX))
+
+    rc_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.ROUGH_COUNTRY.value,
+    ).first()
+    if not rc_provider:
+        logger.info("{} No Rough Country provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandRoughCountryBrandMapping.objects.select_related("brand", "rough_country_brand")
+    )
+    rc_brand_to_brand = {m.rough_country_brand_id: m.brand for m in mappings}
+    rc_brand_to_aaia = {
+        m.rough_country_brand_id: (m.rough_country_brand.aaia_code if m.rough_country_brand else None)
+        for m in mappings
+    }
+    if not rc_brand_to_brand:
+        logger.info("{} No BrandRoughCountryBrandMapping found. Nothing to sync.".format(_LOG_PREFIX))
+        return
+
+    mapped_rc_brand_ids = set(rc_brand_to_brand.keys())
+
+    total_master = 0
+    total_provider = 0
+    batch_num = 0
+    last_id = 0
+
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.RoughCountryPart.objects.filter(
+                brand_id__in=mapped_rc_brand_ids,
+                id__gt=last_id,
+            )
+            .order_by("id")
+            .values(
+                "id",
+                "brand_id",
+                "sku",
+                "title",
+                "description",
+                "image_1",
+            )[:BATCH_SIZE_MASTER_PARTS]
+        )
+        if not batch:
+            break
+
+        last_id = batch[-1]["id"]
+        seen = set()
+        master_parts = []
+        rc_external_id_to_brand_part = {}
+
+        for row in batch:
+            brand = rc_brand_to_brand.get(row["brand_id"])
+            if not brand:
+                continue
+
+            part_number = (row.get("sku") or "").strip()
+            if not part_number:
+                continue
+
+            key = (brand.id, part_number)
+            if key not in seen:
+                seen.add(key)
+                aaia = rc_brand_to_aaia.get(row["brand_id"])
+                desc = row.get("title") or row.get("description")
+                master_parts.append(
+                    src_models.MasterPart(
+                        brand=brand,
+                        part_number=part_number,
+                        sku=part_number,
+                        description=desc,
+                        aaia_code=aaia,
+                        image_url=row.get("image_1"),
+                    )
+                )
+            rc_external_id_to_brand_part[_rough_country_provider_external_id(row["brand_id"], row["sku"])] = (
+                brand.id,
+                part_number,
+            )
+
+        if not master_parts:
+            connection.close()
+            if len(batch) == BATCH_SIZE_MASTER_PARTS:
+                time.sleep(BATCH_DELAY_SECONDS)
+            continue
+
+        pairs = list(seen)
+        existing_by_key = {}
+        if pairs:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(pairs),),
+                )
+                for row in cur.fetchall():
+                    mp_id, b_id, p_num = row
+                    existing_by_key[(b_id, p_num)] = mp_id
+
+        new_parts = [mp for mp in master_parts if (mp.brand_id, mp.part_number) not in existing_by_key]
+        existing_keys = [k for k in pairs if k in existing_by_key]
+
+        if new_parts:
+            pgbulk.upsert(
+                src_models.MasterPart,
+                new_parts,
+                unique_fields=["brand", "part_number"],
+                update_fields=[],
+            )
+            total_master += len(new_parts)
+
+        if existing_keys:
+            key_to_mp = {(mp.brand_id, mp.part_number): mp for mp in master_parts}
+            values = [
+                (existing_by_key[k], key_to_mp[k].sku, key_to_mp[k].aaia_code)
+                for k in existing_keys
+            ]
+            placeholders = ", ".join(["(%s::bigint, %s, %s)"] * len(values))
+            params = [x for row in values for x in row]
+            with connection.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE master_parts mp SET sku = v.sku, aaia_code = v.aaia_code
+                    FROM (VALUES {}) AS v(id, sku, aaia_code)
+                    WHERE mp.id = v.id
+                    """.format(placeholders),
+                    params,
+                )
+
+        brand_part_to_master = {}
+        if pairs:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(pairs),),
+                )
+                for row in cur.fetchall():
+                    mp_id, b_id, p_num = row
+                    mp = src_models.MasterPart()
+                    mp.id = mp_id
+                    mp.brand_id = b_id
+                    mp.part_number = p_num
+                    brand_part_to_master[(b_id, p_num)] = mp
+
+        provider_parts_by_key = {}
+        for row in batch:
+            ext_id = _rough_country_provider_external_id(row["brand_id"], row["sku"])
+            key = rc_external_id_to_brand_part.get(ext_id)
+            if not key:
+                continue
+            master_part = brand_part_to_master.get(key)
+            if not master_part:
+                continue
+            pp_key = (master_part.id, rc_provider.id)
+            provider_parts_by_key[pp_key] = src_models.ProviderPart(
+                master_part=master_part,
+                provider=rc_provider,
+                provider_external_id=ext_id,
+            )
+
+        provider_parts = list(provider_parts_by_key.values())
+        if provider_parts:
+            pgbulk.upsert(
+                src_models.ProviderPart,
+                provider_parts,
+                unique_fields=["master_part", "provider"],
+                update_fields=["provider_external_id"],
+            )
+            total_provider += len(provider_parts)
+
+        logger.info("{} Batch {}: {} items -> {} master, {} provider (last_id={})".format(
+            _LOG_PREFIX, batch_num, len(batch), len(master_parts), len(provider_parts), last_id
+        ))
+        connection.close()
+        if len(batch) == BATCH_SIZE_MASTER_PARTS:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    logger.info("{} Synced {} master parts and {} provider parts from Rough Country total.".format(
         _LOG_PREFIX, total_master, total_provider
     ))
 
@@ -855,10 +1058,11 @@ def sync_all_master_parts() -> None:
     Run all master parts syncs in sequence:
     1. Master parts + provider parts from Turn14
     2. Master parts + provider parts from Keystone
-    3. Provider inventory from Turn14
-    4. Provider inventory from Keystone
-    5. Provider pricing from Turn14
-    6. Provider pricing from Keystone
+    3. Master parts + provider parts from Rough Country
+    4. Provider inventory from Turn14
+    5. Provider inventory from Keystone
+    6. Provider pricing from Turn14
+    7. Provider pricing from Keystone
     """
     logger.info("{} Starting full master parts sync.".format(_LOG_PREFIX))
 
@@ -866,6 +1070,9 @@ def sync_all_master_parts() -> None:
     connection.close()
 
     sync_master_parts_from_keystone()
+    connection.close()
+
+    sync_master_parts_from_rough_country()
     connection.close()
 
     sync_provider_inventory_from_turn14()
