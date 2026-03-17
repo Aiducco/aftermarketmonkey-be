@@ -594,6 +594,188 @@ def sync_master_parts_from_rough_country() -> None:
     ))
 
 
+def _rough_country_warehouse_availability(
+    nv_stock: typing.Optional[int], tn_stock: typing.Optional[int]
+) -> typing.Optional[typing.Dict[str, int]]:
+    """Build warehouse_availability from RoughCountryPart NV/TN stock."""
+    if nv_stock is None and tn_stock is None:
+        return None
+    out = {}
+    if nv_stock is not None:
+        out["NV"] = nv_stock
+    if tn_stock is not None:
+        out["TN"] = tn_stock
+    return out if out else None
+
+
+def sync_provider_inventory_from_rough_country() -> None:
+    """
+    Sync ProviderPartInventory from RoughCountryPart (nv_stock, tn_stock).
+    Uses bulk upsert with cursor-based batching.
+    """
+    logger.info("{} Syncing provider inventory from Rough Country.".format(_LOG_PREFIX))
+
+    rc_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.ROUGH_COUNTRY.value,
+    ).first()
+    if not rc_provider:
+        logger.info("{} No Rough Country provider found.".format(_LOG_PREFIX))
+        return
+
+    provider_parts = {
+        pp.provider_external_id: pp
+        for pp in src_models.ProviderPart.objects.filter(provider=rc_provider)
+    }
+
+    now = timezone.now()
+    total_upserted = 0
+    batch_num = 0
+    last_id = 0
+
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.RoughCountryPart.objects.filter(id__gt=last_id)
+            .order_by("id")
+            .values("id", "brand_id", "sku", "nv_stock", "tn_stock")[:BATCH_SIZE_INVENTORY]
+        )
+        if not batch:
+            break
+
+        last_id = batch[-1]["id"]
+        to_upsert = []
+        for row in batch:
+            ext_id = _rough_country_provider_external_id(row["brand_id"], row["sku"])
+            provider_part = provider_parts.get(ext_id)
+            if not provider_part:
+                continue
+            nv = row.get("nv_stock")
+            tn = row.get("tn_stock")
+            total = (nv or 0) + (tn or 0)
+            to_upsert.append(
+                src_models.ProviderPartInventory(
+                    provider_part=provider_part,
+                    warehouse_total_qty=total,
+                    manufacturer_inventory=None,
+                    manufacturer_esd=None,
+                    warehouse_availability=_rough_country_warehouse_availability(nv, tn),
+                    last_synced_at=now,
+                    updated_at=now,
+                )
+            )
+
+        if to_upsert:
+            pgbulk.upsert(
+                src_models.ProviderPartInventory,
+                to_upsert,
+                unique_fields=["provider_part"],
+                update_fields=[
+                    "warehouse_total_qty",
+                    "manufacturer_inventory",
+                    "manufacturer_esd",
+                    "warehouse_availability",
+                    "last_synced_at",
+                    "updated_at",
+                ],
+            )
+            total_upserted += len(to_upsert)
+
+        logger.info("{} Rough Country inventory batch {}: {} records (last_id={})".format(
+            _LOG_PREFIX, batch_num, len(to_upsert), last_id
+        ))
+        connection.close()
+        if len(batch) == BATCH_SIZE_INVENTORY:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    logger.info("{} Synced {} Rough Country inventory records total.".format(_LOG_PREFIX, total_upserted))
+
+
+def sync_provider_pricing_from_rough_country() -> None:
+    """
+    Sync ProviderPartCompanyPricing from RoughCountryPart (cost, price, sale_price).
+    Creates pricing for each company that has Rough Country CompanyProviders.
+    """
+    logger.info("{} Syncing provider pricing from Rough Country.".format(_LOG_PREFIX))
+
+    rc_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.ROUGH_COUNTRY.value,
+    ).first()
+    if not rc_provider:
+        logger.info("{} No Rough Country provider found.".format(_LOG_PREFIX))
+        return
+
+    provider_parts = {
+        pp.provider_external_id: pp
+        for pp in src_models.ProviderPart.objects.filter(provider=rc_provider)
+    }
+
+    company_ids = list(
+        src_models.CompanyProviders.objects.filter(
+            provider=rc_provider,
+            provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
+        ).values_list("company_id", flat=True).distinct()
+    )
+    companies = {c.id: c for c in src_models.Company.objects.filter(id__in=company_ids)} if company_ids else {}
+
+    now = timezone.now()
+    total_upserted = 0
+    batch_num = 0
+    last_id = 0
+
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.RoughCountryPart.objects.filter(id__gt=last_id)
+            .order_by("id")
+            .values("id", "brand_id", "sku", "cost", "price", "sale_price")[:BATCH_SIZE_PRICING]
+        )
+        if not batch:
+            break
+
+        last_id = batch[-1]["id"]
+        companies_list = list(companies.values())
+        to_upsert = []
+        for row in batch:
+            ext_id = _rough_country_provider_external_id(row["brand_id"], row["sku"])
+            provider_part = provider_parts.get(ext_id)
+            if not provider_part:
+                continue
+            cost = row.get("cost")
+            price = row.get("price")
+            sale_price = row.get("sale_price")
+            for company in companies_list:
+                to_upsert.append(
+                    src_models.ProviderPartCompanyPricing(
+                        provider_part=provider_part,
+                        company=company,
+                        cost=cost,
+                        jobber_price=price or sale_price,
+                        map_price=sale_price if (price and sale_price) else None,
+                        msrp=price,
+                        retail_price=sale_price,
+                        last_synced_at=now,
+                    )
+                )
+
+        if to_upsert:
+            pgbulk.upsert(
+                src_models.ProviderPartCompanyPricing,
+                to_upsert,
+                unique_fields=["provider_part", "company"],
+                update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
+            )
+            total_upserted += len(to_upsert)
+
+        logger.info("{} Rough Country pricing batch {}: {} records (last_id={})".format(
+            _LOG_PREFIX, batch_num, len(to_upsert), last_id
+        ))
+        connection.close()
+        if len(batch) == BATCH_SIZE_PRICING:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    logger.info("{} Synced {} Rough Country pricing records total.".format(_LOG_PREFIX, total_upserted))
+
+
 def _parse_turn14_inventory(inv: typing.Dict) -> typing.Tuple[typing.Optional[int], typing.Optional[date], int]:
     """Extract manufacturer_qty, manufacturer_esd, warehouse_total from Turn14 inventory row."""
     manufacturer_qty = None
@@ -1061,8 +1243,10 @@ def sync_all_master_parts() -> None:
     3. Master parts + provider parts from Rough Country
     4. Provider inventory from Turn14
     5. Provider inventory from Keystone
-    6. Provider pricing from Turn14
-    7. Provider pricing from Keystone
+    6. Provider inventory from Rough Country
+    7. Provider pricing from Turn14
+    8. Provider pricing from Keystone
+    9. Provider pricing from Rough Country
     """
     logger.info("{} Starting full master parts sync.".format(_LOG_PREFIX))
 
@@ -1081,9 +1265,15 @@ def sync_all_master_parts() -> None:
     sync_provider_inventory_from_keystone()
     connection.close()
 
+    sync_provider_inventory_from_rough_country()
+    connection.close()
+
     sync_provider_pricing_from_turn14()
     connection.close()
 
     sync_provider_pricing_from_keystone()
+    connection.close()
+
+    sync_provider_pricing_from_rough_country()
 
     logger.info("{} Completed full master parts sync.".format(_LOG_PREFIX))
