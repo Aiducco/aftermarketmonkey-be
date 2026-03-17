@@ -597,14 +597,14 @@ def sync_master_parts_from_rough_country() -> None:
 def _rough_country_warehouse_availability(
     nv_stock: typing.Optional[int], tn_stock: typing.Optional[int]
 ) -> typing.Optional[typing.Dict[str, int]]:
-    """Build warehouse_availability from RoughCountryPart NV/TN stock."""
+    """Build warehouse_availability from RoughCountryPart NV/TN stock with friendly names."""
     if nv_stock is None and tn_stock is None:
         return None
     out = {}
     if nv_stock is not None:
-        out["NV"] = nv_stock
+        out["Nevada"] = nv_stock
     if tn_stock is not None:
-        out["TN"] = tn_stock
+        out["Tennessee"] = tn_stock
     return out if out else None
 
 
