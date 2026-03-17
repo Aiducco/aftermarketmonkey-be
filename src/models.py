@@ -564,6 +564,110 @@ class KeystoneParts(django_db_models.Model):
         unique_together = ["vcpn", "brand"]
 
 
+class RoughCountryBrand(django_db_models.Model):
+    """Single brand from Rough Country feed (e.g. manufacturer 'Rough Country')."""
+    external_id = django_db_models.CharField(max_length=255)
+    name = django_db_models.CharField(max_length=255)
+    aaia_code = django_db_models.CharField(max_length=255, null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "rough_country_brands"
+        unique_together = [["external_id"]]
+
+
+class RoughCountryPart(django_db_models.Model):
+    """Part from Rough Country feed (General tab)."""
+    brand = django_db_models.ForeignKey(
+        RoughCountryBrand,
+        on_delete=django_db_models.CASCADE,
+        related_name="parts",
+    )
+    sku = django_db_models.CharField(max_length=255)
+    title = django_db_models.CharField(max_length=512, null=True, blank=True)
+    description = django_db_models.TextField(null=True, blank=True)
+    price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    sale_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    cost = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    availability = django_db_models.CharField(max_length=255, null=True, blank=True)
+    nv_stock = django_db_models.IntegerField(null=True, blank=True)
+    tn_stock = django_db_models.IntegerField(null=True, blank=True)
+    link = django_db_models.TextField(null=True, blank=True)
+    image_1 = django_db_models.TextField(null=True, blank=True)
+    image_2 = django_db_models.TextField(null=True, blank=True)
+    image_3 = django_db_models.TextField(null=True, blank=True)
+    image_4 = django_db_models.TextField(null=True, blank=True)
+    image_5 = django_db_models.TextField(null=True, blank=True)
+    image_6 = django_db_models.TextField(null=True, blank=True)
+    video = django_db_models.TextField(null=True, blank=True)
+    features = django_db_models.TextField(null=True, blank=True)
+    notes = django_db_models.TextField(null=True, blank=True)
+    category = django_db_models.CharField(max_length=255, null=True, blank=True)
+    manufacturer = django_db_models.CharField(max_length=255, null=True, blank=True)
+    upc = django_db_models.CharField(max_length=255, null=True, blank=True)
+    weight = django_db_models.CharField(max_length=64, null=True, blank=True)
+    height = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    width = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    length = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    added_date = django_db_models.DateField(null=True, blank=True)
+    is_discontinued = django_db_models.BooleanField(default=False)
+    discontinued_date = django_db_models.DateTimeField(null=True, blank=True)
+    replacement_sku = django_db_models.CharField(max_length=255, null=True, blank=True)
+    raw_data = django_db_models.JSONField(null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "rough_country_parts"
+        unique_together = [["brand", "sku"]]
+
+
+class RoughCountryFitment(django_db_models.Model):
+    """Vehicle fitment from Rough Country feed (Vehicle Fitment tab)."""
+    part = django_db_models.ForeignKey(
+        RoughCountryPart,
+        on_delete=django_db_models.CASCADE,
+        related_name="fitments",
+    )
+    start_year = django_db_models.IntegerField(null=True, blank=True)
+    end_year = django_db_models.IntegerField(null=True, blank=True)
+    make = django_db_models.CharField(max_length=128, null=True, blank=True)
+    model = django_db_models.CharField(max_length=128, null=True, blank=True)
+    submodel = django_db_models.CharField(max_length=255, null=True, blank=True)
+    drive = django_db_models.CharField(max_length=64, null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "rough_country_fitment"
+        unique_together = [["part", "start_year", "end_year", "make", "model", "submodel", "drive"]]
+
+
+class BrandRoughCountryBrandMapping(django_db_models.Model):
+    """Maps our Brands to RoughCountryBrand (for master parts sync)."""
+    brand = django_db_models.ForeignKey(
+        Brands,
+        on_delete=django_db_models.CASCADE,
+        related_name="rough_country_brand_mappings",
+    )
+    rough_country_brand = django_db_models.ForeignKey(
+        RoughCountryBrand,
+        on_delete=django_db_models.CASCADE,
+        related_name="brand_mappings",
+    )
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "brand_rough_country_brand_mapping"
+        unique_together = ["brand", "rough_country_brand"]
+
+
 class MasterPart(django_db_models.Model):
     brand = django_db_models.ForeignKey(Brands, on_delete=django_db_models.CASCADE, related_name="master_parts")
     part_number = django_db_models.CharField(max_length=255)
