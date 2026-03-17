@@ -138,6 +138,15 @@ def sync_unmapped_rough_country_brands_to_brands() -> typing.List[src_models.Rou
         logger.warning("{} Company TICK_PERFORMANCE not found. Skipping sync.".format(_LOG_PREFIX))
         return []
 
+    # Ensure TICK_PERFORMANCE has CompanyProviders for Rough Country (needed for pricing sync; no credentials required for public feed)
+    _, cp_created = src_models.CompanyProviders.objects.get_or_create(
+        company=tick_company,
+        provider=rc_provider,
+        defaults={"credentials": {}, "primary": False},
+    )
+    if cp_created:
+        logger.info("{} Created CompanyProviders for TICK_PERFORMANCE + Rough Country.".format(_LOG_PREFIX))
+
     mapped_rc_ids = set(
         src_models.BrandRoughCountryBrandMapping.objects.values_list(
             "rough_country_brand_id", flat=True
@@ -337,7 +346,7 @@ def fetch_and_save_rough_country(
                 part_instances,
                 unique_fields=["brand", "sku"],
                 update_fields=[
-                    "title", "description", "price", "sale_price", "cost",
+                    "title", "description", "price", "sale_price", "cost", "cnd_map", "cnd_price",
                     "availability", "nv_stock", "tn_stock", "link",
                     "image_1", "image_2", "image_3", "image_4", "image_5", "image_6",
                     "video", "features", "notes", "category", "manufacturer", "upc",
@@ -435,6 +444,8 @@ def _row_to_rough_country_part(
     price = _safe_decimal(_row_get(row, "price"))
     sale_price = _safe_decimal(_row_get(row, "sale_price"))
     cost = _safe_decimal(_row_get(row, "cost"))
+    cnd_map = _safe_decimal(_row_get(row, "cnd_map"))
+    cnd_price = _safe_decimal(_row_get(row, "cnd_price"))
     availability = _safe_str(_row_get(row, "availability"), 255)
     nv_stock = _safe_int(_row_get(row, "NV_Stock"))
     tn_stock = _safe_int(_row_get(row, "TN_Stock"))
@@ -468,6 +479,8 @@ def _row_to_rough_country_part(
         price=price,
         sale_price=sale_price,
         cost=cost,
+        cnd_map=cnd_map,
+        cnd_price=cnd_price,
         availability=availability,
         nv_stock=nv_stock,
         tn_stock=tn_stock,

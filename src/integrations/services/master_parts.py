@@ -692,7 +692,8 @@ def sync_provider_inventory_from_rough_country() -> None:
 
 def sync_provider_pricing_from_rough_country() -> None:
     """
-    Sync ProviderPartCompanyPricing from RoughCountryPart (cost, price, sale_price).
+    Sync ProviderPartCompanyPricing from RoughCountryPart.
+    Mapping: cost=price, jobber/map=cnd_map, msrp/retail=cnd_price.
     Creates pricing for each company that has Rough Country CompanyProviders.
     """
     logger.info("{} Syncing provider pricing from Rough Country.".format(_LOG_PREFIX))
@@ -727,7 +728,7 @@ def sync_provider_pricing_from_rough_country() -> None:
         batch = list(
             src_models.RoughCountryPart.objects.filter(id__gt=last_id)
             .order_by("id")
-            .values("id", "brand_id", "sku", "cost", "price", "sale_price")[:BATCH_SIZE_PRICING]
+            .values("id", "brand_id", "sku", "price", "cnd_map", "cnd_price")[:BATCH_SIZE_PRICING]
         )
         if not batch:
             break
@@ -740,19 +741,19 @@ def sync_provider_pricing_from_rough_country() -> None:
             provider_part = provider_parts.get(ext_id)
             if not provider_part:
                 continue
-            cost = row.get("cost")
             price = row.get("price")
-            sale_price = row.get("sale_price")
+            cnd_map = row.get("cnd_map")
+            cnd_price = row.get("cnd_price")
             for company in companies_list:
                 to_upsert.append(
                     src_models.ProviderPartCompanyPricing(
                         provider_part=provider_part,
                         company=company,
-                        cost=cost,
-                        jobber_price=price or sale_price,
-                        map_price=sale_price if (price and sale_price) else None,
-                        msrp=price,
-                        retail_price=sale_price,
+                        cost=price,
+                        jobber_price=cnd_map,
+                        map_price=cnd_map,
+                        msrp=cnd_price,
+                        retail_price=cnd_price,
                         last_synced_at=now,
                     )
                 )
