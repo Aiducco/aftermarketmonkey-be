@@ -648,3 +648,31 @@ class ScheduledTaskExecution(django_db_models.Model):
     class Meta:
         db_table = "scheduled_task_execution"
         ordering = ["-created_at"]
+
+
+class PartRequestAudit(django_db_models.Model):
+    """
+    Audit log for part search and part detail API requests.
+    Used to track company/user request volume (e.g. how many searches or detail views per company/user).
+    """
+    company = django_db_models.ForeignKey(
+        Company,
+        on_delete=django_db_models.CASCADE,
+        related_name="part_request_audits",
+    )
+    user = django_db_models.ForeignKey(
+        auth_models.User,
+        on_delete=django_db_models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="part_request_audits",
+    )
+    action = django_db_models.CharField(max_length=32)  # 'search' | 'detail'
+    search_query = django_db_models.CharField(max_length=512, null=True, blank=True)
+    master_part_id = django_db_models.PositiveIntegerField(null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "part_request_audit"
+        ordering = ["-created_at"]

@@ -5,6 +5,7 @@ import simplejson
 from django import http, views
 
 from src.api.services import parts as parts_services
+from src.audit import parts as audit_parts
 
 logger = logging.getLogger(__name__)
 _LOG_PREFIX = "[PARTS-API]"
@@ -29,7 +30,7 @@ class PartsSearchView(views.View):
     """GET /parts/search/?sku=xxx - Search parts by part_number."""
 
     def get(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
-        err, _ = _auth_check(request)
+        err, company_id = _auth_check(request)
         if err:
             return err
 
@@ -54,6 +55,14 @@ class PartsSearchView(views.View):
                 headers={"Content-Type": "application/json"},
                 content=simplejson.dumps({"message": "Error searching parts"}),
                 status=500,
+            )
+
+        if company_id is not None:
+            audit_parts.record_part_request(
+                company_id=company_id,
+                user_id=request.user.id if request.user else None,
+                action="search",
+                search_query=sku[:512] if sku else None,
             )
 
         return http.HttpResponse(
@@ -97,6 +106,14 @@ class PartDetailView(views.View):
                 headers={"Content-Type": "application/json"},
                 content=simplejson.dumps({"message": "Part not found"}),
                 status=404,
+            )
+
+        if company_id is not None:
+            audit_parts.record_part_request(
+                company_id=company_id,
+                user_id=request.user.id if request.user else None,
+                action="detail",
+                master_part_id=part_id,
             )
 
         return http.HttpResponse(
