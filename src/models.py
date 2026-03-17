@@ -591,6 +591,8 @@ class RoughCountryPart(django_db_models.Model):
     price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     sale_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     cost = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    cnd_map = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    cnd_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     availability = django_db_models.CharField(max_length=255, null=True, blank=True)
     nv_stock = django_db_models.IntegerField(null=True, blank=True)
     tn_stock = django_db_models.IntegerField(null=True, blank=True)
