@@ -45,6 +45,7 @@ _LOG_PREFIX = "[PARTS-SERVICES]"
 PROVIDER_DISPLAY_NAMES = {
     "TURN_14": "Turn 14",
     "KEYSTONE": "Keystone",
+    "ROUGH_COUNTRY": "Rough Country",
     "SDC": "SDC",
 }
 
@@ -52,6 +53,7 @@ PROVIDER_DISPLAY_NAMES = {
 PROVIDER_IMAGE_URLS = {
     "TURN_14": "https://api.aftermarketmonkey.com/uploads/t14_logo.png",
     "KEYSTONE": "https://api.aftermarketmonkey.com/uploads/keystone.png",
+    "ROUGH_COUNTRY": "https://api.aftermarketmonkey.com/uploads/rough_country.png",
     "SDC": "",
 }
 
@@ -161,17 +163,24 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
                 "last_synced_at": inv_obj.last_synced_at.isoformat() if inv_obj.last_synced_at else None,
             }
 
+        # Prefer pricing for request company; if no company_id or no row for that company, use first available
+        all_pricing = list(pp.company_pricing.all())
+        pricing = None
         if company_id:
-            pricings = [p for p in pp.company_pricing.all() if p.company_id == company_id]
-            pricing = pricings[0] if pricings else None
-            if pricing:
-                provider_info["pricing"] = {
-                    "cost": float(pricing.cost) if pricing.cost else None,
-                    "jobber_price": float(pricing.jobber_price) if pricing.jobber_price else None,
-                    "map_price": float(pricing.map_price) if pricing.map_price else None,
-                    "msrp": float(pricing.msrp) if pricing.msrp else None,
-                    "last_synced_at": pricing.last_synced_at.isoformat() if pricing.last_synced_at else None,
-                }
+            for p in all_pricing:
+                if p.company_id == company_id:
+                    pricing = p
+                    break
+        if pricing is None and all_pricing:
+            pricing = all_pricing[0]
+        if pricing:
+            provider_info["pricing"] = {
+                "cost": float(pricing.cost) if pricing.cost else None,
+                "jobber_price": float(pricing.jobber_price) if pricing.jobber_price else None,
+                "map_price": float(pricing.map_price) if pricing.map_price else None,
+                "msrp": float(pricing.msrp) if pricing.msrp else None,
+                "last_synced_at": pricing.last_synced_at.isoformat() if pricing.last_synced_at else None,
+            }
 
         providers_data.append(provider_info)
 
