@@ -34,93 +34,87 @@ class WheelProsSFTPClient:
         require_credentials: bool = True,
     ):
         creds = credentials or {}
-        self.sftp_server = creds.get("sftp_server") or getattr(settings, "WHEELPROS_SFTP_HOST", DEFAULT_SFTP_HOST)
+        self.sftp_server = str(creds.get("sftp_server") or getattr(settings, "WHEELPROS_SFTP_HOST", DEFAULT_SFTP_HOST)).strip()
         self.sftp_port = int(creds.get("sftp_port") or getattr(settings, "WHEELPROS_SFTP_PORT", DEFAULT_SFTP_PORT))
-        self.sftp_user = creds.get("sftp_user") or creds.get("username") or getattr(
+        self.sftp_user = str(creds.get("sftp_user") or creds.get("username") or getattr(
             settings, "WHEELPROS_SFTP_USER", ""
-        )
-        self.sftp_password = creds.get("sftp_password") or creds.get("password") or getattr(
+        ) or "").strip()
+        self.sftp_password = str(creds.get("sftp_password") or creds.get("password") or getattr(
             settings, "WHEELPROS_SFTP_PASSWORD", ""
-        )
-        self.sftp_path = creds.get("sftp_path") or getattr(settings, "WHEELPROS_SFTP_PATH", DEFAULT_SFTP_PATH)
+        ) or "").strip()
+        self.sftp_path = str(creds.get("sftp_path") or getattr(settings, "WHEELPROS_SFTP_PATH", DEFAULT_SFTP_PATH) or "").strip()
         self.local_file_path = local_file_path or getattr(
             settings, "WHEELPROS_INVENTORY_LOCAL_PATH", os.path.join("/tmp", DEFAULT_LOCAL_FILE_NAME)
         )
         self.file_max_age = file_max_age
-        self.auto_add_host_key = getattr(settings, "WHEELPROS_SFTP_AUTO_ADD_HOST_KEY", True)
 
-        if require_credentials and not all([self.sftp_server, self.sftp_user, self.sftp_password, self.sftp_path]):
+        if require_credentials and not all([self.sftp_server, self.sftp_user, self.sftp_password]):
             raise ValueError("Invalid credentials/configuration. Missing required WheelPros SFTP settings.")
 
-        self._ssh_client = None
+        self._transport = None
         self._sftp = None
 
     def _connect(self) -> None:
-        """Establish SFTP connection via SSHClient (supports host key policy)."""
+        """Establish SFTP connection (same pattern as WheelProsAccessoriesProvider)."""
         try:
-            self._ssh_client = paramiko.SSHClient()
-            if self.auto_add_host_key:
-                self._ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            else:
-                self._ssh_client.load_system_host_keys()
-            self._ssh_client.connect(
-                hostname=self.sftp_server,
-                port=self.sftp_port,
-                username=self.sftp_user,
-                password=self.sftp_password,
-                look_for_keys=False,
-                allow_agent=False,
-            )
-            self._sftp = self._ssh_client.open_sftp()
-            logger.debug(
-                "{} Connected to SFTP server {}:{}.".format(_LOG_PREFIX, self.sftp_server, self.sftp_port)
-            )
+            self._transport = paramiko.Transport((self.sftp_server, self.sftp_port))
+            self._transport.connect(username=self.sftp_user, password=self.sftp_password)
+            self._sftp = paramiko.SFTPClient.from_transport(self._transport)
         except Exception as e:
             msg = "Failed to connect to SFTP server. Error: {}".format(str(e))
             logger.error("{} {}".format(_LOG_PREFIX, msg))
             raise exceptions.WheelProsSFTPConnectionError(msg)
 
     def _disconnect(self) -> None:
-        """Close SFTP and SSH connection."""
+        """Close SFTP and Transport connection."""
         try:
             if self._sftp:
                 self._sftp.close()
                 self._sftp = None
-            if self._ssh_client:
-                self._ssh_client.close()
-                self._ssh_client = None
+            if self._transport:
+                self._transport.close()
+                self._transport = None
         except Exception as e:
             logger.warning("{} Error during disconnect: {}.".format(_LOG_PREFIX, str(e)))
             self._sftp = None
-            self._ssh_client = None
+            self._transport = None
 
-    def is_file_outdated(self) -> bool:
-        if not os.path.exists(self.local_file_path):
+    def is_file_outdated(self, local_path: typing.Optional[str] = None) -> bool:
+        path = local_path or self.local_file_path
+        if not os.path.exists(path):
             return True
-        return (time.time() - os.path.getmtime(self.local_file_path)) > self.file_max_age
+        return (time.time() - os.path.getmtime(path)) > self.file_max_age
 
-    def download_feed_file(self, force_download: bool = False) -> str:
+    def download_feed_file(
+        self,
+        force_download: bool = False,
+        sftp_path: typing.Optional[str] = None,
+        local_file_path: typing.Optional[str] = None,
+    ) -> str:
         """
         Download the WheelPros CSV from SFTP to the local file path.
         Returns the local file path.
         """
-        if not force_download and not self.is_file_outdated():
-            logger.info("{} Using cached WheelPros file {}.".format(_LOG_PREFIX, self.local_file_path))
-            return self.local_file_path
+        remote_path = sftp_path or self.sftp_path
+        local_path = local_file_path or self.local_file_path
+        if not remote_path:
+            raise ValueError("SFTP path is required for download.")
 
-        tmp_path = self.local_file_path + ".tmp"
-        sftp = None
+        if not force_download and not self.is_file_outdated(local_path):
+            logger.info("{} Using cached file {}.".format(_LOG_PREFIX, local_path))
+            return local_path
+
+        tmp_path = local_path + ".tmp"
         try:
             self._connect()
-            sftp = self._sftp
-            remote_path = self.sftp_path
-            with open(tmp_path, "wb") as out:
-                sftp.getfo(remote_path, out)
-            os.replace(tmp_path, self.local_file_path)
-            logger.info("{} Downloaded WheelPros CSV to {}.".format(_LOG_PREFIX, self.local_file_path))
-            return self.local_file_path
+            if not remote_path.startswith("/"):
+                remote_path = "/" + remote_path
+            self._sftp.get(remote_path, tmp_path)
+            os.replace(tmp_path, local_path)
+            logger.info("{} Downloaded {} -> {}.".format(_LOG_PREFIX, remote_path, local_path))
+            return local_path
         except FileNotFoundError:
-            msg = "File not found on SFTP server: {}".format(self.sftp_path)
+            msg = "File not found on SFTP server: {}".format(remote_path)
             logger.error("{} {}".format(_LOG_PREFIX, msg))
             raise exceptions.WheelProsFileNotFoundError(msg)
         except Exception as e:
@@ -139,22 +133,29 @@ class WheelProsSFTPClient:
         self,
         force_download: bool = False,
         local_only: bool = False,
+        sftp_path: typing.Optional[str] = None,
+        local_file_path: typing.Optional[str] = None,
     ) -> typing.List[typing.Dict]:
         """
         Download the CSV if needed and return rows as list of dicts.
         When local_only=True, use the local file only (no SFTP connection); raises if file missing.
         """
+        local_path = local_file_path or self.local_file_path
         if local_only:
-            if not os.path.exists(self.local_file_path):
+            if not os.path.exists(local_path):
                 raise exceptions.WheelProsFileNotFoundError(
                     "Local file not found: {}. Use without --no-download to fetch from SFTP.".format(
-                        self.local_file_path
+                        local_path
                     )
                 )
-            path = self.local_file_path
+            path = local_path
             logger.info("{} Using local file only: {}.".format(_LOG_PREFIX, path))
         else:
-            path = self.download_feed_file(force_download=force_download)
+            path = self.download_feed_file(
+                force_download=force_download,
+                sftp_path=sftp_path or self.sftp_path,
+                local_file_path=local_path,
+            )
         try:
             df = None
             for encoding in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
