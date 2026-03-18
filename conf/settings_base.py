@@ -215,11 +215,16 @@ STRIPE_PLANS = {
     "pro": "prod_UAb7rv9k8zoPwE",       # $99/mo
     "growth": "prod_UAb7VPi46dLlIo",    # $199/mo
 }
-# Plan amounts in cents (monthly)
+# Plan amounts in smallest currency unit (cents); currency per plan
 STRIPE_PLAN_AMOUNTS = {
-    "starter": 4900,
+    "starter": 100,   # 1 EUR for test; use 4900 for $49 in production
     "pro": 9900,
     "growth": 19900,
+}
+STRIPE_PLAN_CURRENCIES = {
+    "starter": "eur",
+    "pro": "usd",
+    "growth": "usd",
 }
 
 # Meilisearch (backend: master key for indexing; FE will use a public read-only key)
