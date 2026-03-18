@@ -1,3 +1,4 @@
+import json
 import logging
 import typing
 
@@ -8,6 +9,144 @@ from src.api.services import integrations as integrations_services
 
 logger = logging.getLogger(__name__)
 _LOG_PREFIX = "[INTEGRATIONS]"
+
+
+class ProvidersCatalogView(views.View):
+    """GET /integrations/catalog/ - Returns all providers with connection status for the company."""
+
+    def get(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
+        if not request.user or not request.user.is_authenticated:
+            logger.warning(f"{_LOG_PREFIX} User not authenticated for {request.path}")
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "User not authenticated"}),
+                status=401,
+            )
+
+        company_id = getattr(request, "company_id", None)
+        if not company_id:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "No company found in token"}),
+                status=400,
+            )
+
+        try:
+            result = integrations_services.get_providers_catalog(company_id=company_id)
+        except Exception as e:
+            logger.error(
+                f"{_LOG_PREFIX} Error fetching providers catalog for company_id: {company_id}. Error: {str(e)}"
+            )
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Error fetching providers catalog"}),
+                status=500,
+            )
+
+        return http.HttpResponse(
+            headers={"Content-Type": "application/json"},
+            content=simplejson.dumps(result),
+            status=200,
+        )
+
+
+class ProviderConnectView(views.View):
+    """POST /integrations/catalog/<id>/connect/ - Create CompanyProviders with credentials."""
+
+    def post(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
+        if not request.user or not request.user.is_authenticated:
+            logger.warning(f"{_LOG_PREFIX} User not authenticated for {request.path}")
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "User not authenticated"}),
+                status=401,
+            )
+
+        company_id = getattr(request, "company_id", None)
+        if not company_id:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "No company found in token"}),
+                status=400,
+            )
+
+        provider_id = kwargs.get("id")
+        if not provider_id:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Provider ID is required"}),
+                status=400,
+            )
+
+        try:
+            body = json.loads(request.body) if request.body else {}
+        except json.JSONDecodeError:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Invalid JSON body"}),
+                status=400,
+            )
+
+        credentials = body if isinstance(body, dict) else {}
+        data, err = integrations_services.connect_provider(
+            company_id=company_id,
+            provider_id=provider_id,
+            credentials=credentials,
+        )
+        if err:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": err}),
+                status=400,
+            )
+
+        return http.HttpResponse(
+            headers={"Content-Type": "application/json"},
+            content=simplejson.dumps({"data": data}),
+            status=201,
+        )
+
+
+class ProviderDisconnectView(views.View):
+    """DELETE /integrations/connections/<company_provider_id>/ - Remove CompanyProviders."""
+
+    def delete(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
+        if not request.user or not request.user.is_authenticated:
+            logger.warning(f"{_LOG_PREFIX} User not authenticated for {request.path}")
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "User not authenticated"}),
+                status=401,
+            )
+
+        company_id = getattr(request, "company_id", None)
+        if not company_id:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "No company found in token"}),
+                status=400,
+            )
+
+        company_provider_id = kwargs.get("company_provider_id")
+        if not company_provider_id:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Connection ID is required"}),
+                status=400,
+            )
+
+        success, err = integrations_services.disconnect_provider(
+            company_id=company_id,
+            company_provider_id=company_provider_id,
+        )
+        if not success:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": err or "Connection not found"}),
+                status=404,
+            )
+
+        return http.HttpResponse(status=204)
 
 
 class CompanyProvidersView(views.View):

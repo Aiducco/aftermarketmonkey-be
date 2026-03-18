@@ -1,3 +1,46 @@
+"""
+Provider catalog: list of all available providers for the integrations catalog.
+Used by seed_providers command and catalog endpoint.
+Each provider maps to BrandProviderKind; connection status comes from company_providers.
+"""
+from src import enums
+
+PROVIDER_CATALOG = [
+    {
+        "kind": enums.BrandProviderKind.TURN_14,
+        "name": "Turn 14",
+        "description": "Access real-time inventory, pricing, and product data from Turn 14 Distribution.",
+        "icon_url": "https://api.aftermarketmonkey.com/uploads/t14_logo.png",
+        "category": "Distributors",
+        "connection_required_fields": ["client_id", "client_secret"],
+    },
+    {
+        "kind": enums.BrandProviderKind.KEYSTONE,
+        "name": "Keystone",
+        "description": "Sync inventory and pricing from Keystone Automotive via FTP.",
+        "icon_url": "https://api.aftermarketmonkey.com/uploads/keystone.png",
+        "category": "Distributors",
+        "connection_required_fields": ["ftp_user", "ftp_password"],
+    },
+    {
+        "kind": enums.BrandProviderKind.ROUGH_COUNTRY,
+        "name": "Rough Country",
+        "description": "Sync parts catalog, pricing, and vehicle fitment from Rough Country.",
+        "icon_url": "https://api.aftermarketmonkey.com/uploads/rough_country.png",
+        "category": "Distributors",
+        "connection_required_fields": [],  # Public feed, no credentials required
+    },
+]
+
+# Provider kind_name -> display name for API (e.g. TURN_14 -> "Turn 14")
+PROVIDER_DISPLAY_NAMES = {
+    "TURN_14": "Turn 14",
+    "KEYSTONE": "Keystone",
+    "ROUGH_COUNTRY": "Rough Country",
+    "SDC": "SDC",
+}
+
+
 # Field priority configuration for merging CATALOG and DISTRIBUTOR parts
 # Each field maps to its primary source (CATALOG or DISTRIBUTOR)
 # If field is null/empty in primary source, fallback to the other source
