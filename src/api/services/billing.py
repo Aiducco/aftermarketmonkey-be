@@ -171,18 +171,30 @@ def get_subscription(company_id: int) -> Optional[dict]:
     amounts = getattr(settings, "STRIPE_PLAN_AMOUNTS", {})
     currencies = getattr(settings, "STRIPE_PLAN_CURRENCIES", {})
     product_to_plan = {v: k for k, v in plans.items()}
+    # Include test product so existing subscriptions display correctly
+    product_to_plan["prod_UAc2GCQQHcZwSz"] = "starter"
 
     try:
-        subs = stripe.Subscription.list(
-            api_key=api_key,
-            customer=company.stripe_customer_id,
-            status="active",
-            limit=1,
-        )
-        if not subs.data:
+        # Fetch active, trialing, or past_due subscriptions (Stripe allows one status per call)
+        all_subs = []
+        for sub_status in ("active", "trialing", "past_due"):
+            subs = stripe.Subscription.list(
+                api_key=api_key,
+                customer=company.stripe_customer_id,
+                status=sub_status,
+                limit=10,
+            )
+            all_subs.extend(subs.data)
+        all_subs = [s for s in all_subs if s.get("status") in ("active", "trialing", "past_due")]
+        if not all_subs:
+            logger.info(
+                "No active/trialing subscription for customer %s (company_id=%s)",
+                company.stripe_customer_id,
+                company_id,
+            )
             return None
 
-        sub = subs.data[0]
+        sub = all_subs[0]
         price_obj = sub["items"]["data"][0]["price"]
         product_ref = price_obj.get("product")
         product_id = product_ref if isinstance(product_ref, str) else (product_ref.id if product_ref else None)
@@ -190,10 +202,14 @@ def get_subscription(company_id: int) -> Optional[dict]:
         if not plan_id:
             plan_id = "unknown"
 
-        price_cents = amounts.get(plan_id)
-        currency = currencies.get(plan_id, "usd")
+        # Prefer price from Stripe subscription; fallback to config
+        price_cents = price_obj.get("unit_amount")
+        currency = price_obj.get("currency", "usd")
+        if price_cents is None:
+            price_cents = amounts.get(plan_id)
+            currency = currencies.get(plan_id, "usd")
         symbol = "€" if currency == "eur" else "$"
-        price_display = f"{symbol}{price_cents / 100:.2f}/mo" if price_cents else "—"
+        price_display = f"{symbol}{price_cents / 100:.2f}/mo" if price_cents is not None else "—"
         renewal_ts = sub.get("current_period_end")
         if renewal_ts:
             if isinstance(renewal_ts, int):
