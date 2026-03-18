@@ -55,6 +55,14 @@ PROVIDER_CATALOG = [
         "category": "Distributors",
         "connection_required_fields": [],  # Public feed, no credentials required
     },
+    {
+        "kind": enums.BrandProviderKind.WHEELPROS,
+        "name": "Wheel Pros",
+        "description": "Sync wheels, tires, and accessories inventory and pricing from WheelPros via SFTP.",
+        "icon_url": "https://api.aftermarketmonkey.com/uploads/wheel_pros_logo.png",
+        "category": "Distributors",
+        "connection_required_fields": ["sftp_server", "sftp_user", "sftp_password"],
+    },
 ]
 
 # Field priority configuration for merging CATALOG and DISTRIBUTOR parts
