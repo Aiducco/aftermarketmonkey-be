@@ -567,6 +567,72 @@ class KeystoneParts(django_db_models.Model):
         unique_together = ["vcpn", "brand"]
 
 
+class WheelProsBrand(django_db_models.Model):
+    external_id = django_db_models.CharField(max_length=255)
+    name = django_db_models.CharField(max_length=255)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "wheelpros_brands"
+        unique_together = [["external_id"]]
+
+
+class BrandWheelProsBrandMapping(django_db_models.Model):
+    brand = django_db_models.ForeignKey(
+        Brands,
+        on_delete=django_db_models.CASCADE,
+        related_name="wheelpros_brand_mappings",
+    )
+    wheelpros_brand = django_db_models.ForeignKey(
+        WheelProsBrand,
+        on_delete=django_db_models.CASCADE,
+        related_name="brand_mappings",
+    )
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "brand_wheelpros_brand_mapping"
+        unique_together = [["brand", "wheelpros_brand"]]
+
+
+class WheelProsPart(django_db_models.Model):
+    brand = django_db_models.ForeignKey(
+        WheelProsBrand,
+        on_delete=django_db_models.CASCADE,
+        related_name="parts",
+    )
+    part_number = django_db_models.CharField(max_length=255)
+    part_description = django_db_models.TextField(null=True, blank=True)
+    display_style_no = django_db_models.CharField(max_length=255, null=True, blank=True)
+    finish = django_db_models.CharField(max_length=255, null=True, blank=True)
+    size = django_db_models.CharField(max_length=255, null=True, blank=True)
+    bolt_pattern = django_db_models.CharField(max_length=255, null=True, blank=True)
+    offset = django_db_models.CharField(max_length=255, null=True, blank=True)
+    center_bore = django_db_models.CharField(max_length=255, null=True, blank=True)
+    load_rating = django_db_models.CharField(max_length=255, null=True, blank=True)
+    shipping_weight = django_db_models.DecimalField(max_digits=12, decimal_places=5, null=True, blank=True)
+    image_url = django_db_models.TextField(null=True, blank=True)
+    inv_order_type = django_db_models.CharField(max_length=255, null=True, blank=True)
+    style = django_db_models.CharField(max_length=255, null=True, blank=True)
+    total_qoh = django_db_models.IntegerField(null=True, blank=True)
+    msrp_usd = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    map_usd = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    run_date = django_db_models.DateTimeField(null=True, blank=True)
+    warehouse_availability = django_db_models.JSONField(null=True, blank=True)
+    raw_data = django_db_models.JSONField(null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "wheelpros_parts"
+        unique_together = [["brand", "part_number"]]
+
+
 class RoughCountryBrand(django_db_models.Model):
     """Single brand from Rough Country feed (e.g. manufacturer 'Rough Country')."""
     external_id = django_db_models.CharField(max_length=255)
