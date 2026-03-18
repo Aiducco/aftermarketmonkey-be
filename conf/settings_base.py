@@ -217,12 +217,12 @@ STRIPE_PLANS = {
 }
 # Plan amounts in smallest currency unit (cents); currency per plan
 STRIPE_PLAN_AMOUNTS = {
-    "starter": 100,   # 1 EUR for test; use 4900 for $49 in production
+    "starter": 100,   # $1 for test; use 4900 for $49 in production
     "pro": 9900,
     "growth": 19900,
 }
 STRIPE_PLAN_CURRENCIES = {
-    "starter": "eur",
+    "starter": "usd",
     "pro": "usd",
     "growth": "usd",
 }
