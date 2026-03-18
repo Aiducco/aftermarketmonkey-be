@@ -110,8 +110,10 @@ def create_checkout_session(
 
     plans = getattr(settings, "STRIPE_PLANS", {})
     amounts = getattr(settings, "STRIPE_PLAN_AMOUNTS", {})
+    currencies = getattr(settings, "STRIPE_PLAN_CURRENCIES", {})
     product_id = plans.get(plan_id)
     unit_amount = amounts.get(plan_id)
+    currency = currencies.get(plan_id, "usd")
 
     if not product_id or unit_amount is None:
         logger.error("Invalid plan_id: %s", plan_id)
@@ -133,7 +135,7 @@ def create_checkout_session(
             line_items=[
                 {
                     "price_data": {
-                        "currency": "usd",
+                        "currency": currency,
                         "product": product_id,
                         "unit_amount": unit_amount,
                         "recurring": {"interval": "month"},
@@ -167,6 +169,7 @@ def get_subscription(company_id: int) -> Optional[dict]:
 
     plans = getattr(settings, "STRIPE_PLANS", {})
     amounts = getattr(settings, "STRIPE_PLAN_AMOUNTS", {})
+    currencies = getattr(settings, "STRIPE_PLAN_CURRENCIES", {})
     product_to_plan = {v: k for k, v in plans.items()}
 
     try:
@@ -188,7 +191,9 @@ def get_subscription(company_id: int) -> Optional[dict]:
             plan_id = "unknown"
 
         price_cents = amounts.get(plan_id)
-        price_display = f"${price_cents / 100:.0f}/mo" if price_cents else "—"
+        currency = currencies.get(plan_id, "usd")
+        symbol = "€" if currency == "eur" else "$"
+        price_display = f"{symbol}{price_cents / 100:.2f}/mo" if price_cents else "—"
         renewal_ts = sub.get("current_period_end")
         if renewal_ts:
             if isinstance(renewal_ts, int):
