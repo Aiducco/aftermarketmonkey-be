@@ -55,7 +55,7 @@ def _get_provider_image_url(kind_name: typing.Optional[str]) -> typing.Optional[
     """Get provider image URL. Returns None if not configured."""
     if not kind_name:
         return None
-    url = PROVIDER_IMAGE_URLS.get(kind_name) or PROVIDER_IMAGE_URLS.get(kind_name.upper())
+    url = src_constants.PROVIDER_IMAGE_URLS.get(kind_name) or src_constants.PROVIDER_IMAGE_URLS.get(kind_name.upper())
     return url if url else None
 
 
@@ -93,7 +93,7 @@ def get_parts_search(sku: str, limit: int = 50) -> typing.Dict:
 
 def _get_all_provider_image_urls() -> typing.Dict[str, typing.Optional[str]]:
     """Return provider kind_name -> image URL map for all configured providers."""
-    return {k: (v if v else None) for k, v in PROVIDER_IMAGE_URLS.items()}
+    return {k: (v if v else None) for k, v in src_constants.PROVIDER_IMAGE_URLS.items()}
 
 
 def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None) -> typing.Optional[typing.Dict]:
