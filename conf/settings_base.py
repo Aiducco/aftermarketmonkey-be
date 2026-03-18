@@ -205,6 +205,23 @@ KEYSTONE_INVENTORY_LOCAL_PATH = '/tmp/keystone_inventory.csv'
 # Rough Country jobber feed (Excel). Override ROUGH_COUNTRY_FEED_URL if the default returns 403.
 ROUGH_COUNTRY_FEED_URL = "https://feeds.roughcountry.com/jobber_pc2A.xlsx"
 
+# Stripe (billing portal + checkout)
+STRIPE_SECRET_KEY = ""  # Set via env; required for billing
+BILLING_PORTAL_RETURN_URL = ""  # Optional default return_url when not provided in request
+
+# Plan IDs -> Stripe Product IDs (prod_xxx)
+STRIPE_PLANS = {
+    "starter": "prod_UAb7IngirFX1mo",   # $49/mo
+    "pro": "prod_UAb7rv9k8zoPwE",       # $99/mo
+    "growth": "prod_UAb7VPi46dLlIo",    # $199/mo
+}
+# Plan amounts in cents (monthly)
+STRIPE_PLAN_AMOUNTS = {
+    "starter": 4900,
+    "pro": 9900,
+    "growth": 19900,
+}
+
 # Meilisearch (backend: master key for indexing; FE will use a public read-only key)
 MEILISEARCH_HOST = "http://localhost:7700"
 MEILISEARCH_MASTER_KEY = ""  # Set via env; required for indexing. Create a separate search-only key for FE.

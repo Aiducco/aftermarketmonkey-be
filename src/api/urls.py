@@ -9,6 +9,11 @@ from src.api.views.company_settings import (
     CompanyTeamView,
     CompanyTeamMemberView,
 )
+from src.api.views.billing import (
+    CreatePortalSessionView,
+    CreateCheckoutSessionView,
+    SubscriptionView,
+)
 from src.api.views.onboarding import (
     RegisterView,
     CompanyDetailsView,
@@ -134,5 +139,20 @@ urlpatterns = [
         "settings/company/team/<int:user_id>/",
         CompanyTeamMemberView.as_view(),
         name="company_team_member",
+    ),
+    path(
+        "billing/subscription/",
+        SubscriptionView.as_view(),
+        name="billing_subscription",
+    ),
+    path(
+        "billing/create-portal-session/",
+        CreatePortalSessionView.as_view(),
+        name="billing_create_portal_session",
+    ),
+    path(
+        "billing/create-checkout-session/",
+        CreateCheckoutSessionView.as_view(),
+        name="billing_create_checkout_session",
     ),
 ]

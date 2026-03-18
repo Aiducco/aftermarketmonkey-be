@@ -17,6 +17,9 @@ class Company(django_db_models.Model):
     # Onboarding progress: 0=not_started, 1=account_created, 2=company_details, 3=personalization, 4=complete
     onboarding_step = django_db_models.PositiveSmallIntegerField(default=0, null=True, blank=True)
 
+    # Stripe billing
+    stripe_customer_id = django_db_models.CharField(max_length=255, null=True, blank=True)
+
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
 
