@@ -1,3 +1,28 @@
+# Provider kind_name -> display name (used by parts API)
+PROVIDER_DISPLAY_NAMES = {
+    "TURN_14": "Turn 14",
+    "KEYSTONE": "Keystone",
+    "ROUGH_COUNTRY": "Rough Country",
+    "SDC": "SDC",
+    "WHEELPROS": "Wheel Pros",
+}
+
+# Provider kind_name -> image URL (used by parts API)
+PROVIDER_IMAGE_URLS = {
+    "TURN_14": "https://api.aftermarketmonkey.com/uploads/t14_logo.png",
+    "KEYSTONE": "https://api.aftermarketmonkey.com/uploads/keystone.png",
+    "ROUGH_COUNTRY": "https://api.aftermarketmonkey.com/uploads/rough_country.png",
+    "SDC": "",
+    "WHEELPROS": "https://api.aftermarketmonkey.com/uploads/wheel_pros_logo.png",
+}
+
+# WheelPros SFTP feed paths (relative; leading / added by client when downloading)
+WHEELPROS_FEED_PATHS = {
+    "wheel": "CommonFeed/USD/WHEEL/wheelInvPriceData.csv",
+    "tire": "CommonFeed/USD/TIRE/tireInvPriceData.csv",
+    "accessories": "CommonFeed/USD/ACCESSORIES/accessoriesInvPriceData.csv",
+}
+
 """
 Provider catalog: list of all available providers for the integrations catalog.
 Used by seed_providers command and catalog endpoint.
@@ -31,15 +56,6 @@ PROVIDER_CATALOG = [
         "connection_required_fields": [],  # Public feed, no credentials required
     },
 ]
-
-# Provider kind_name -> display name for API (e.g. TURN_14 -> "Turn 14")
-PROVIDER_DISPLAY_NAMES = {
-    "TURN_14": "Turn 14",
-    "KEYSTONE": "Keystone",
-    "ROUGH_COUNTRY": "Rough Country",
-    "SDC": "SDC",
-}
-
 
 # Field priority configuration for merging CATALOG and DISTRIBUTOR parts
 # Each field maps to its primary source (CATALOG or DISTRIBUTOR)
