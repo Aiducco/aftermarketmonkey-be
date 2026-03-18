@@ -211,7 +211,7 @@ BILLING_PORTAL_RETURN_URL = ""  # Optional default return_url when not provided 
 
 # Plan IDs -> Stripe Product IDs (prod_xxx)
 STRIPE_PLANS = {
-    "starter": "prod_UAb7IngirFX1mo",   # $49/mo
+    "starter": "prod_UAc2GCQQHcZwSz",   # $49/mo (test)
     "pro": "prod_UAb7rv9k8zoPwE",       # $99/mo
     "growth": "prod_UAb7VPi46dLlIo",    # $199/mo
 }
