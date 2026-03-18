@@ -5,6 +5,7 @@ import logging
 import re
 import typing
 
+from src import constants as src_constants
 from src import models as src_models
 
 logger = logging.getLogger(__name__)
@@ -40,14 +41,6 @@ def _map_turn14_warehouse_availability(
     return result if result else None
 
 _LOG_PREFIX = "[PARTS-SERVICES]"
-
-# Provider kind_name -> display name for API
-PROVIDER_DISPLAY_NAMES = {
-    "TURN_14": "Turn 14",
-    "KEYSTONE": "Keystone",
-    "ROUGH_COUNTRY": "Rough Country",
-    "SDC": "SDC",
-}
 
 # Provider kind_name -> image URL (edit here to add logos)
 PROVIDER_IMAGE_URLS = {
@@ -144,7 +137,7 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
             "provider_id": pp.provider_id,
             "provider_name": pp.provider.name if pp.provider else None,
             "provider_kind_name": kind_name,
-            "provider_display_name": PROVIDER_DISPLAY_NAMES.get(kind_name, kind_name) if kind_name else None,
+            "provider_display_name": src_constants.PROVIDER_DISPLAY_NAMES.get(kind_name, kind_name) if kind_name else None,
             "provider_image_url": _get_provider_image_url(kind_name),
             "provider_external_id": pp.provider_external_id,
             "inventory": None,

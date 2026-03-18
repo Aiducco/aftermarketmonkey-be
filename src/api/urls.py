@@ -2,7 +2,18 @@ from django.contrib import admin
 from django.urls import path, include
 from src.api.views.authentication import LoginView, ChangePasswordView
 from src.api.views.company import CompanyDestinationsView
-from src.api.views.integrations import CompanyProvidersView, CompanyProviderDetailView, BrandsWithProvidersView, CompanyDestinationsWithBrandsView, CompanyDestinationDetailView, ExecutionRunsView, ExecutionRunPartsHistoryView
+from src.api.views.integrations import (
+    ProvidersCatalogView,
+    ProviderConnectView,
+    ProviderDisconnectView,
+    CompanyProvidersView,
+    CompanyProviderDetailView,
+    BrandsWithProvidersView,
+    CompanyDestinationsWithBrandsView,
+    CompanyDestinationDetailView,
+    ExecutionRunsView,
+    ExecutionRunPartsHistoryView,
+)
 from src.api.views.company_settings import (
     ProfileView,
     CompanySettingsView,
@@ -64,6 +75,21 @@ urlpatterns = [
         "auth/company/destinations/",
         CompanyDestinationsView.as_view(),
         name="company_destinations",
+    ),
+    path(
+        "integrations/catalog/",
+        ProvidersCatalogView.as_view(),
+        name="providers_catalog",
+    ),
+    path(
+        "integrations/catalog/<int:id>/connect/",
+        ProviderConnectView.as_view(),
+        name="provider_connect",
+    ),
+    path(
+        "integrations/connections/<int:company_provider_id>/",
+        ProviderDisconnectView.as_view(),
+        name="provider_disconnect",
     ),
     path(
         "company-providers/",

@@ -3,11 +3,165 @@ import typing
 
 from django.core.paginator import Paginator
 
+from src import constants as src_constants
 from src import models as src_models
 
 logger = logging.getLogger(__name__)
 
 _LOG_PREFIX = '[INTEGRATIONS-SERVICES]'
+
+
+def get_providers_catalog(company_id: int) -> typing.Dict:
+    """
+    Get integrations catalog: all providers with connection status for the company.
+    Matches the catalog UI: name, description, icon_url, category, connected, required_fields.
+    Connected status is determined from company_providers table.
+    """
+    logger.info('{} Fetching providers catalog for company_id: {}.'.format(
+        _LOG_PREFIX, company_id
+    ))
+
+    # Get company's connected provider IDs
+    connected_provider_ids = set(
+        src_models.CompanyProviders.objects.filter(
+            company_id=company_id
+        ).values_list('provider_id', flat=True)
+    )
+
+    # Get all providers from DB (by kind)
+    providers_by_kind = {
+        p.kind: p for p in src_models.Providers.objects.all()
+    }
+
+    catalog = []
+    for entry in src_constants.PROVIDER_CATALOG:
+        kind_value = entry["kind"].value
+        provider = providers_by_kind.get(kind_value)
+        if not provider:
+            continue
+
+        connected = provider.id in connected_provider_ids
+        company_provider = None
+        if connected:
+            cp = src_models.CompanyProviders.objects.filter(
+                company_id=company_id,
+                provider_id=provider.id
+            ).first()
+            company_provider = cp
+
+        kind_name = provider.kind_name or ""
+        display_name = src_constants.PROVIDER_DISPLAY_NAMES.get(
+            kind_name, kind_name
+        ) or provider.name
+
+        catalog.append({
+            "id": provider.id,
+            "name": provider.name,
+            "display_name": display_name,
+            "description": entry.get("description", ""),
+            "icon_url": entry.get("icon_url") or None,
+            "category": entry.get("category", ""),
+            "connection_required_fields": entry.get("connection_required_fields", []),
+            "connected": connected,
+            "company_provider_id": company_provider.id if company_provider else None,
+            "kind": kind_value,
+            "kind_name": kind_name,
+        })
+
+    logger.info('{} Found {} providers in catalog for company_id: {}.'.format(
+        _LOG_PREFIX, len(catalog), company_id
+    ))
+
+    return {
+        "data": catalog,
+        "categories": list(dict.fromkeys(
+            e.get("category", "") for e in src_constants.PROVIDER_CATALOG if e.get("category")
+        )),
+    }
+
+
+def _get_catalog_entry_for_provider(provider_id: int) -> typing.Optional[typing.Dict]:
+    """Get PROVIDER_CATALOG entry for a provider by id."""
+    provider = src_models.Providers.objects.filter(id=provider_id).first()
+    if not provider:
+        return None
+    for entry in src_constants.PROVIDER_CATALOG:
+        if entry["kind"].value == provider.kind:
+            return entry
+    return None
+
+
+def connect_provider(
+    company_id: int,
+    provider_id: int,
+    credentials: typing.Dict[str, typing.Any],
+) -> typing.Tuple[typing.Optional[typing.Dict], typing.Optional[str]]:
+    """
+    Create CompanyProviders for a provider. Validates required fields from catalog.
+    Returns (company_provider_data, error_message). On success error_message is None.
+    """
+    provider = src_models.Providers.objects.filter(id=provider_id).first()
+    if not provider:
+        return None, "Provider not found"
+
+    catalog_entry = _get_catalog_entry_for_provider(provider_id)
+    if not catalog_entry:
+        return None, "Provider not found in catalog"
+
+    required = catalog_entry.get("connection_required_fields", [])
+    if required:
+        missing = [f for f in required if not (credentials.get(f) or "").strip()]
+        if missing:
+            return None, f"Missing required fields: {', '.join(missing)}"
+
+    # Build credentials dict from required fields only
+    creds = {k: credentials.get(k) for k in required} if required else {}
+
+    # Check if already connected
+    existing = src_models.CompanyProviders.objects.filter(
+        company_id=company_id,
+        provider_id=provider_id,
+    ).first()
+    if existing:
+        existing.credentials = creds
+        existing.save()
+        cp = existing
+    else:
+        cp = src_models.CompanyProviders.objects.create(
+            company_id=company_id,
+            provider_id=provider_id,
+            credentials=creds,
+            primary=False,
+        )
+
+    return {
+        "id": cp.id,
+        "company_id": cp.company_id,
+        "provider_id": cp.provider_id,
+        "provider_name": provider.name,
+        "credentials": cp.credentials,
+        "primary": cp.primary,
+        "created_at": cp.created_at.isoformat() if cp.created_at else None,
+        "updated_at": cp.updated_at.isoformat() if cp.updated_at else None,
+    }, None
+
+
+def disconnect_provider(
+    company_id: int,
+    company_provider_id: int,
+) -> typing.Tuple[bool, typing.Optional[str]]:
+    """
+    Delete CompanyProviders record. Must belong to company.
+    Returns (success, error_message). On success error_message is None.
+    """
+    cp = src_models.CompanyProviders.objects.filter(
+        id=company_provider_id,
+        company_id=company_id,
+    ).first()
+    if not cp:
+        return False, "Connection not found"
+    cp.delete()
+    return True, None
 
 
 def get_company_providers(company_id: int) -> typing.List[typing.Dict]:
