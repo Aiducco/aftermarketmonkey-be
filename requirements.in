@@ -26,6 +26,7 @@ requests
 requests-oauthlib
 rsa
 simplejson
+stripe
 six
 sqlparse
 uritemplate

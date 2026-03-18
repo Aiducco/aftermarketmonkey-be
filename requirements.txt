@@ -173,6 +173,8 @@ rsa==4.9
     #   google-auth
 simplejson==3.18.3
     # via -r requirements.in
+stripe==8.0.0
+    # via -r requirements.in
 six==1.16.0
     # via
     #   -r requirements.in
