@@ -13,7 +13,7 @@ PROVIDER_IMAGE_URLS = {
     "KEYSTONE": "https://api.aftermarketmonkey.com/uploads/keystone.png",
     "ROUGH_COUNTRY": "https://api.aftermarketmonkey.com/uploads/rough_country.png",
     "SDC": "",
-    "WHEELPROS": "https://api.aftermarketmonkey.com/uploads/wheelpros.png",
+    "WHEELPROS": "https://api.aftermarketmonkey.com/uploads/wheel_pros_logo.png",
 }
 
 # WheelPros SFTP feed paths (relative; leading / added by client when downloading)
