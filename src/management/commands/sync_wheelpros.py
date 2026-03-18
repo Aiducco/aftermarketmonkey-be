@@ -26,18 +26,30 @@ class Command(BaseCommand):
             default=None,
             help="Path to local CSV file. Overrides default path. With --no-download, uses this file without SFTP.",
         )
+        parser.add_argument(
+            "--feed-type",
+            type=str,
+            default="all",
+            choices=["wheel", "tire", "accessories", "all"],
+            help="Feed to sync: wheel, tire, accessories, or all (default).",
+        )
 
     def handle(self, *args, **options):
         self.stdout.write("Starting WheelPros fetch and sync...")
         execution = audit_scheduled_tasks.start_scheduled_task_execution("sync_wheelpros")
+        feed_type = options.get("feed_type", "all")
+        feeds = ["wheel", "tire", "accessories"] if feed_type == "all" else [feed_type]
         try:
-            self.stdout.write("Step 1: Fetching and saving WheelPros brands and parts from CSV...")
-            wheelpros.fetch_and_save_wheelpros(
-                local_file_path=options.get("local_file"),
-                download=not options.get("no_download", False),
-                local_only=options.get("no_download", False),
-            )
-            self.stdout.write(self.style.SUCCESS("WheelPros brands and parts fetched and saved."))
+            local_file = options.get("local_file")
+            for ft in feeds:
+                self.stdout.write("Step 1: Fetching and saving WheelPros {} feed...".format(ft))
+                wheelpros.fetch_and_save_wheelpros(
+                    local_file_path=local_file if len(feeds) == 1 else None,
+                    download=not options.get("no_download", False),
+                    local_only=options.get("no_download", False),
+                    feed_type=ft,
+                )
+                self.stdout.write(self.style.SUCCESS("WheelPros {} feed fetched and saved.".format(ft)))
 
             self.stdout.write("Step 2: Syncing unmapped WheelPros brands into Brands flow...")
             wheelpros.sync_unmapped_wheelpros_brands_to_brands()

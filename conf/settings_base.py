@@ -235,6 +235,8 @@ WHEELPROS_SFTP_USER = os.environ.get("WHEELPROS_SFTP_USER", "")
 WHEELPROS_SFTP_PASSWORD = os.environ.get("WHEELPROS_SFTP_PASSWORD", "")
 WHEELPROS_SFTP_PATH = os.environ.get("WHEELPROS_SFTP_PATH", "CommonFeed/USD/WHEEL/wheelInvPriceData.csv")
 WHEELPROS_INVENTORY_LOCAL_PATH = os.environ.get("WHEELPROS_INVENTORY_LOCAL_PATH", "/tmp/wheelpros_wheel_inventory.csv")
+WHEELPROS_TIRE_LOCAL_PATH = os.environ.get("WHEELPROS_TIRE_LOCAL_PATH", "/tmp/wheelpros_tire_inventory.csv")
+WHEELPROS_ACCESSORIES_LOCAL_PATH = os.environ.get("WHEELPROS_ACCESSORIES_LOCAL_PATH", "/tmp/wheelpros_accessories_inventory.csv")
 # Set to False to verify host keys against ~/.ssh/known_hosts (recommended for production).
 WHEELPROS_SFTP_AUTO_ADD_HOST_KEY = os.environ.get("WHEELPROS_SFTP_AUTO_ADD_HOST_KEY", "true").lower() in ("true", "1", "yes")
 

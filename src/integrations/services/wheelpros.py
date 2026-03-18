@@ -10,6 +10,9 @@ from decimal import Decimal
 
 import pgbulk
 
+from django.conf import settings
+
+from src import constants as src_constants
 from src import enums as src_enums
 from src import models as src_models
 from src.integrations.clients.wheelpros import client as wheelpros_client
@@ -213,6 +216,14 @@ _KNOWN_FEED_COLUMNS = frozenset(
         "MSRP_USD",
         "MAP_USD",
         "RunDate",
+        # Tire feed
+        "CapHardwareDescription",
+        "CapScrewQuantity",
+        "CapWrench",
+        "CapStyleDescription",
+        # Accessories feed
+        "ManufacturerPartNumber",
+        "Division",
     )
 )
 
@@ -309,31 +320,57 @@ def _get_wheelpros_credentials() -> typing.Optional[typing.Dict]:
     return cp.credentials
 
 
+def _get_local_path_for_feed(feed_type: str) -> str:
+    """Get local file path for feed type."""
+    if feed_type == "wheel":
+        return getattr(settings, "WHEELPROS_INVENTORY_LOCAL_PATH", "/tmp/wheelpros_wheel_inventory.csv")
+    if feed_type == "tire":
+        return getattr(settings, "WHEELPROS_TIRE_LOCAL_PATH", "/tmp/wheelpros_tire_inventory.csv")
+    if feed_type == "accessories":
+        return getattr(settings, "WHEELPROS_ACCESSORIES_LOCAL_PATH", "/tmp/wheelpros_accessories_inventory.csv")
+    return "/tmp/wheelpros_{}_inventory.csv".format(feed_type)
+
+
 def fetch_and_save_wheelpros(
     local_file_path: typing.Optional[str] = None,
     download: bool = True,
     local_only: bool = False,
+    feed_type: str = "wheel",
 ) -> None:
     """
     Fetch the WheelPros CSV and upsert WheelProsBrand and WheelProsPart rows.
+    feed_type: "wheel" | "tire" | "accessories"
     Uses CompanyProviders credentials when available; otherwise falls back to settings.
     """
-    logger.info("{} Starting WheelPros feed sync.".format(_LOG_PREFIX))
+    sftp_path = src_constants.WHEELPROS_FEED_PATHS.get(feed_type)
+    if not sftp_path:
+        raise ValueError("Unknown feed_type: {}. Use wheel, tire, or accessories.".format(feed_type))
+
+    local_path = local_file_path or _get_local_path_for_feed(feed_type)
+    logger.info("{} Starting WheelPros {} feed sync (path={}).".format(_LOG_PREFIX, feed_type, sftp_path))
 
     credentials = _get_wheelpros_credentials() if not local_only else None
+    credentials = dict(credentials or {})
+    credentials["sftp_path"] = sftp_path
+
     client = wheelpros_client.WheelProsSFTPClient(
         credentials=credentials,
-        local_file_path=local_file_path,
+        local_file_path=local_path,
         require_credentials=not local_only,
     )
     try:
-        records = client.get_feed_records(force_download=download, local_only=local_only)
+        records = client.get_feed_records(
+            force_download=download,
+            local_only=local_only,
+            sftp_path=sftp_path,
+            local_file_path=local_path,
+        )
     except wheelpros_exceptions.WheelProsException as e:
-        logger.error("{} WheelPros feed error: {}.".format(_LOG_PREFIX, str(e)))
+        logger.error("{} WheelPros {} feed error: {}.".format(_LOG_PREFIX, feed_type, str(e)))
         raise
 
     if not records:
-        logger.warning("{} No rows returned from WheelPros feed.".format(_LOG_PREFIX))
+        logger.warning("{} No rows returned from WheelPros {} feed.".format(_LOG_PREFIX, feed_type))
         return
 
     brand_names = set()
@@ -417,4 +454,4 @@ def fetch_and_save_wheelpros(
         logger.error("{} Error upserting WheelPros parts: {}.".format(_LOG_PREFIX, str(e)))
         raise
 
-    logger.info("{} WheelPros feed sync complete.".format(_LOG_PREFIX))
+    logger.info("{} WheelPros {} feed sync complete.".format(_LOG_PREFIX, feed_type))

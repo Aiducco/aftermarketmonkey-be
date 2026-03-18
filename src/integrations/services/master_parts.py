@@ -39,6 +39,15 @@ def _get_brand_for_rough_country_brand(
     return mapping.brand if mapping else None
 
 
+def _get_brand_for_wheelpros_brand(
+    wp_brand: src_models.WheelProsBrand,
+) -> typing.Optional[src_models.Brands]:
+    mapping = src_models.BrandWheelProsBrandMapping.objects.filter(
+        wheelpros_brand=wp_brand,
+    ).first()
+    return mapping.brand if mapping else None
+
+
 BATCH_SIZE_MASTER_PARTS = 5000
 BATCH_SIZE_INVENTORY = 20000
 BATCH_SIZE_PRICING = 20000
@@ -777,6 +786,378 @@ def sync_provider_pricing_from_rough_country() -> None:
     logger.info("{} Synced {} Rough Country pricing records total.".format(_LOG_PREFIX, total_upserted))
 
 
+def _wheelpros_provider_external_id(wp_brand_id: int, part_number: str) -> str:
+    """Unique per WheelPros provider: wp_brand_id + part_number."""
+    return "{}_{}".format(wp_brand_id, part_number)
+
+
+def sync_master_parts_from_wheelpros() -> None:
+    """
+    Create/update MasterPart and ProviderPart from WheelProsPart (wheels, tires, accessories).
+    Only processes parts whose WheelProsBrand has a BrandWheelProsBrandMapping.
+    """
+    logger.info("{} Syncing master parts from WheelPros (batched, cursor-based).".format(_LOG_PREFIX))
+
+    wp_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.WHEELPROS.value,
+    ).first()
+    if not wp_provider:
+        logger.info("{} No WheelPros provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandWheelProsBrandMapping.objects.select_related("brand", "wheelpros_brand")
+    )
+    wp_brand_to_brand = {m.wheelpros_brand_id: m.brand for m in mappings}
+    wp_brand_to_aaia = {
+        m.wheelpros_brand_id: (m.brand.aaia_code if m.brand else None)
+        for m in mappings
+    }
+    if not wp_brand_to_brand:
+        logger.info("{} No BrandWheelProsBrandMapping found. Nothing to sync.".format(_LOG_PREFIX))
+        return
+
+    mapped_wp_brand_ids = set(wp_brand_to_brand.keys())
+
+    total_master = 0
+    total_provider = 0
+    batch_num = 0
+    last_id = 0
+
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.WheelProsPart.objects.filter(
+                brand_id__in=mapped_wp_brand_ids,
+                id__gt=last_id,
+            )
+            .order_by("id")
+            .values(
+                "id",
+                "brand_id",
+                "part_number",
+                "part_description",
+                "image_url",
+            )[:BATCH_SIZE_MASTER_PARTS]
+        )
+        if not batch:
+            break
+
+        last_id = batch[-1]["id"]
+        seen = set()
+        master_parts = []
+        wp_external_id_to_brand_part = {}
+
+        for row in batch:
+            brand = wp_brand_to_brand.get(row["brand_id"])
+            if not brand:
+                continue
+
+            part_number = (row.get("part_number") or "").strip()
+            if not part_number:
+                continue
+
+            key = (brand.id, part_number)
+            if key not in seen:
+                seen.add(key)
+                aaia = wp_brand_to_aaia.get(row["brand_id"])
+                master_parts.append(
+                    src_models.MasterPart(
+                        brand=brand,
+                        part_number=part_number,
+                        sku=part_number,
+                        description=row.get("part_description"),
+                        aaia_code=aaia,
+                        image_url=row.get("image_url"),
+                    )
+                )
+            wp_external_id_to_brand_part[_wheelpros_provider_external_id(row["brand_id"], part_number)] = (
+                brand.id,
+                part_number,
+            )
+
+        if not master_parts:
+            connection.close()
+            if len(batch) == BATCH_SIZE_MASTER_PARTS:
+                time.sleep(BATCH_DELAY_SECONDS)
+            continue
+
+        pairs = list(seen)
+        existing_by_key = {}
+        if pairs:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(pairs),),
+                )
+                for row in cur.fetchall():
+                    mp_id, b_id, p_num = row
+                    existing_by_key[(b_id, p_num)] = mp_id
+
+        new_parts = [mp for mp in master_parts if (mp.brand_id, mp.part_number) not in existing_by_key]
+        existing_keys = [k for k in pairs if k in existing_by_key]
+
+        if new_parts:
+            pgbulk.upsert(
+                src_models.MasterPart,
+                new_parts,
+                unique_fields=["brand", "part_number"],
+                update_fields=[],
+            )
+            total_master += len(new_parts)
+
+        if existing_keys:
+            key_to_mp = {(mp.brand_id, mp.part_number): mp for mp in master_parts}
+            values = [
+                (existing_by_key[k], key_to_mp[k].sku, key_to_mp[k].aaia_code)
+                for k in existing_keys
+            ]
+            placeholders = ", ".join(["(%s::bigint, %s, %s)"] * len(values))
+            params = [x for row in values for x in row]
+            with connection.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE master_parts mp SET sku = v.sku, aaia_code = v.aaia_code
+                    FROM (VALUES {}) AS v(id, sku, aaia_code)
+                    WHERE mp.id = v.id
+                    """.format(placeholders),
+                    params,
+                )
+
+        brand_part_to_master = {}
+        if pairs:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(pairs),),
+                )
+                for row in cur.fetchall():
+                    mp_id, b_id, p_num = row
+                    mp = src_models.MasterPart()
+                    mp.id = mp_id
+                    mp.brand_id = b_id
+                    mp.part_number = p_num
+                    brand_part_to_master[(b_id, p_num)] = mp
+
+        provider_parts_by_key = {}
+        for row in batch:
+            part_number = (row.get("part_number") or "").strip()
+            if not part_number:
+                continue
+            ext_id = _wheelpros_provider_external_id(row["brand_id"], part_number)
+            key = wp_external_id_to_brand_part.get(ext_id)
+            if not key:
+                continue
+            master_part = brand_part_to_master.get(key)
+            if not master_part:
+                continue
+            pp_key = (master_part.id, wp_provider.id)
+            provider_parts_by_key[pp_key] = src_models.ProviderPart(
+                master_part=master_part,
+                provider=wp_provider,
+                provider_external_id=ext_id,
+            )
+
+        provider_parts = list(provider_parts_by_key.values())
+        if provider_parts:
+            pgbulk.upsert(
+                src_models.ProviderPart,
+                provider_parts,
+                unique_fields=["master_part", "provider"],
+                update_fields=["provider_external_id"],
+            )
+            total_provider += len(provider_parts)
+
+        logger.info("{} WheelPros batch {}: {} items -> {} master, {} provider (last_id={})".format(
+            _LOG_PREFIX, batch_num, len(batch), len(master_parts), len(provider_parts), last_id
+        ))
+        connection.close()
+        if len(batch) == BATCH_SIZE_MASTER_PARTS:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    logger.info("{} Synced {} master parts and {} provider parts from WheelPros total.".format(
+        _LOG_PREFIX, total_master, total_provider
+    ))
+
+
+def sync_provider_inventory_from_wheelpros() -> None:
+    """
+    Sync ProviderPartInventory from WheelProsPart (total_qoh, warehouse_availability).
+    """
+    logger.info("{} Syncing provider inventory from WheelPros.".format(_LOG_PREFIX))
+
+    wp_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.WHEELPROS.value,
+    ).first()
+    if not wp_provider:
+        logger.info("{} No WheelPros provider found.".format(_LOG_PREFIX))
+        return
+
+    provider_parts = {
+        pp.provider_external_id: pp
+        for pp in src_models.ProviderPart.objects.filter(provider=wp_provider)
+    }
+
+    now = timezone.now()
+    total_upserted = 0
+    batch_num = 0
+    last_id = 0
+
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.WheelProsPart.objects.filter(id__gt=last_id)
+            .order_by("id")
+            .values("id", "brand_id", "part_number", "total_qoh", "warehouse_availability")[:BATCH_SIZE_INVENTORY]
+        )
+        if not batch:
+            break
+
+        last_id = batch[-1]["id"]
+        to_upsert = []
+        for row in batch:
+            part_number = (row.get("part_number") or "").strip()
+            if not part_number:
+                continue
+            ext_id = _wheelpros_provider_external_id(row["brand_id"], part_number)
+            provider_part = provider_parts.get(ext_id)
+            if not provider_part:
+                continue
+            total_qoh = row.get("total_qoh") or 0
+            wh_avail = row.get("warehouse_availability")
+            if isinstance(wh_avail, dict):
+                try:
+                    wh_avail = {str(k): int(float(v)) if v is not None else 0 for k, v in wh_avail.items()}
+                except (TypeError, ValueError):
+                    wh_avail = None
+            else:
+                wh_avail = None
+            to_upsert.append(
+                src_models.ProviderPartInventory(
+                    provider_part=provider_part,
+                    warehouse_total_qty=total_qoh,
+                    manufacturer_inventory=None,
+                    manufacturer_esd=None,
+                    warehouse_availability=wh_avail if wh_avail else None,
+                    last_synced_at=now,
+                    updated_at=now,
+                )
+            )
+
+        if to_upsert:
+            pgbulk.upsert(
+                src_models.ProviderPartInventory,
+                to_upsert,
+                unique_fields=["provider_part"],
+                update_fields=[
+                    "warehouse_total_qty",
+                    "manufacturer_inventory",
+                    "manufacturer_esd",
+                    "warehouse_availability",
+                    "last_synced_at",
+                    "updated_at",
+                ],
+            )
+            total_upserted += len(to_upsert)
+
+        logger.info("{} WheelPros inventory batch {}: {} records (last_id={})".format(
+            _LOG_PREFIX, batch_num, len(to_upsert), last_id
+        ))
+        connection.close()
+        if len(batch) == BATCH_SIZE_INVENTORY:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    logger.info("{} Synced {} WheelPros inventory records total.".format(_LOG_PREFIX, total_upserted))
+
+
+def sync_provider_pricing_from_wheelpros() -> None:
+    """
+    Sync ProviderPartCompanyPricing from WheelProsPart (msrp_usd, map_usd).
+    Creates pricing for each company that has WheelPros CompanyProviders.
+    """
+    logger.info("{} Syncing provider pricing from WheelPros.".format(_LOG_PREFIX))
+
+    wp_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.WHEELPROS.value,
+    ).first()
+    if not wp_provider:
+        logger.info("{} No WheelPros provider found.".format(_LOG_PREFIX))
+        return
+
+    provider_parts = {
+        pp.provider_external_id: pp
+        for pp in src_models.ProviderPart.objects.filter(provider=wp_provider)
+    }
+
+    company_ids = list(
+        src_models.CompanyProviders.objects.filter(
+            provider=wp_provider,
+            provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
+        ).values_list("company_id", flat=True).distinct()
+    )
+    companies = {c.id: c for c in src_models.Company.objects.filter(id__in=company_ids)} if company_ids else {}
+
+    now = timezone.now()
+    total_upserted = 0
+    batch_num = 0
+    last_id = 0
+
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.WheelProsPart.objects.filter(id__gt=last_id)
+            .order_by("id")
+            .values("id", "brand_id", "part_number", "msrp_usd", "map_usd")[:BATCH_SIZE_PRICING]
+        )
+        if not batch:
+            break
+
+        last_id = batch[-1]["id"]
+        companies_list = list(companies.values())
+        to_upsert = []
+        for row in batch:
+            part_number = (row.get("part_number") or "").strip()
+            if not part_number:
+                continue
+            ext_id = _wheelpros_provider_external_id(row["brand_id"], part_number)
+            provider_part = provider_parts.get(ext_id)
+            if not provider_part:
+                continue
+            msrp = row.get("msrp_usd")
+            map_price = row.get("map_usd")
+            for company in companies_list:
+                to_upsert.append(
+                    src_models.ProviderPartCompanyPricing(
+                        provider_part=provider_part,
+                        company=company,
+                        cost=None,
+                        jobber_price=map_price,
+                        map_price=map_price,
+                        msrp=msrp,
+                        retail_price=msrp,
+                        last_synced_at=now,
+                    )
+                )
+
+        if to_upsert:
+            pgbulk.upsert(
+                src_models.ProviderPartCompanyPricing,
+                to_upsert,
+                unique_fields=["provider_part", "company"],
+                update_fields=["jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
+            )
+            total_upserted += len(to_upsert)
+
+        logger.info("{} WheelPros pricing batch {}: {} records (last_id={})".format(
+            _LOG_PREFIX, batch_num, len(to_upsert), last_id
+        ))
+        connection.close()
+        if len(batch) == BATCH_SIZE_PRICING:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    logger.info("{} Synced {} WheelPros pricing records total.".format(_LOG_PREFIX, total_upserted))
+
+
 def _parse_turn14_inventory(inv: typing.Dict) -> typing.Tuple[typing.Optional[int], typing.Optional[date], int]:
     """Extract manufacturer_qty, manufacturer_esd, warehouse_total from Turn14 inventory row."""
     manufacturer_qty = None
@@ -1242,12 +1623,15 @@ def sync_all_master_parts() -> None:
     1. Master parts + provider parts from Turn14
     2. Master parts + provider parts from Keystone
     3. Master parts + provider parts from Rough Country
-    4. Provider inventory from Turn14
-    5. Provider inventory from Keystone
-    6. Provider inventory from Rough Country
-    7. Provider pricing from Turn14
-    8. Provider pricing from Keystone
-    9. Provider pricing from Rough Country
+    4. Master parts + provider parts from WheelPros (wheels, tires, accessories)
+    5. Provider inventory from Turn14
+    6. Provider inventory from Keystone
+    7. Provider inventory from Rough Country
+    8. Provider inventory from WheelPros
+    9. Provider pricing from Turn14
+    10. Provider pricing from Keystone
+    11. Provider pricing from Rough Country
+    12. Provider pricing from WheelPros
     """
     logger.info("{} Starting full master parts sync.".format(_LOG_PREFIX))
 
@@ -1260,6 +1644,9 @@ def sync_all_master_parts() -> None:
     sync_master_parts_from_rough_country()
     connection.close()
 
+    sync_master_parts_from_wheelpros()
+    connection.close()
+
     sync_provider_inventory_from_turn14()
     connection.close()
 
@@ -1269,6 +1656,9 @@ def sync_all_master_parts() -> None:
     sync_provider_inventory_from_rough_country()
     connection.close()
 
+    sync_provider_inventory_from_wheelpros()
+    connection.close()
+
     sync_provider_pricing_from_turn14()
     connection.close()
 
@@ -1276,5 +1666,8 @@ def sync_all_master_parts() -> None:
     connection.close()
 
     sync_provider_pricing_from_rough_country()
+    connection.close()
+
+    sync_provider_pricing_from_wheelpros()
 
     logger.info("{} Completed full master parts sync.".format(_LOG_PREFIX))
