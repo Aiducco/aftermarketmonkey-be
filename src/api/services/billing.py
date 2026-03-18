@@ -175,27 +175,39 @@ def get_subscription(company_id: int) -> Optional[dict]:
     product_to_plan["prod_UAc2GCQQHcZwSz"] = "starter"
 
     try:
-        # Fetch active, trialing, or past_due subscriptions (Stripe allows one status per call)
-        all_subs = []
-        for sub_status in ("active", "trialing", "past_due"):
-            subs = stripe.Subscription.list(
-                api_key=api_key,
-                customer=company.stripe_customer_id,
-                status=sub_status,
-                limit=10,
-            )
-            all_subs.extend(subs.data)
-        all_subs = [s for s in all_subs if s.get("status") in ("active", "trialing", "past_due")]
+        # Fetch all subscriptions (status=all) then filter for displayable ones
+        # expand ensures we get items.data.price (list may not include nested by default)
+        subs = stripe.Subscription.list(
+            api_key=api_key,
+            customer=company.stripe_customer_id,
+            status="all",
+            limit=20,
+            expand=["data.items.data.price"],
+        )
+        all_subs = [
+            s for s in subs.data
+            if s.get("status") in ("active", "trialing", "past_due")
+        ]
+        # Log: subscriptions exist in Live OR Test mode - STRIPE_SECRET_KEY must match
+        stripe_mode = "live" if (api_key or "").startswith("sk_live_") else "test"
+        logger.info(
+            "Subscription fetch: customer=%s company_id=%s total=%d displayable=%d statuses=%s stripe_mode=%s",
+            company.stripe_customer_id,
+            company_id,
+            len(subs.data),
+            len(all_subs),
+            [s.get("status") for s in subs.data],
+            stripe_mode,
+        )
         if not all_subs:
-            logger.info(
-                "No active/trialing subscription for customer %s (company_id=%s)",
-                company.stripe_customer_id,
-                company_id,
-            )
             return None
 
         sub = all_subs[0]
-        price_obj = sub["items"]["data"][0]["price"]
+        items = sub.get("items", {}).get("data", [])
+        if not items:
+            logger.warning("Subscription %s has no line items", sub.get("id"))
+            return None
+        price_obj = items[0].get("price")
         product_ref = price_obj.get("product")
         product_id = product_ref if isinstance(product_ref, str) else (product_ref.id if product_ref else None)
         plan_id = product_to_plan.get(product_id) if product_id else None
@@ -210,7 +222,7 @@ def get_subscription(company_id: int) -> Optional[dict]:
             currency = currencies.get(plan_id, "usd")
         symbol = "€" if currency == "eur" else "$"
         price_display = f"{symbol}{price_cents / 100:.2f}/mo" if price_cents is not None else "—"
-        renewal_ts = sub.get("current_period_end")
+        renewal_ts = sub.get("current_period_end") or items[0].get("current_period_end")
         if renewal_ts:
             if isinstance(renewal_ts, int):
                 renewal_date = datetime.utcfromtimestamp(renewal_ts).strftime("%Y-%m-%d")
