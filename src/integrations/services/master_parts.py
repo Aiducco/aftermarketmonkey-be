@@ -921,29 +921,34 @@ def sync_master_parts_from_wheelpros() -> None:
             continue
 
         pairs = list(seen)
-        # Find existing MasterPart: first by (brand_id, sku=part_number), then by (brand_id, part_number)
+        # Single query: find existing by (brand_id, sku) OR (brand_id, part_number); prefer sku match.
+        # Build existing_by_key and id_to_mp from same result to avoid extra round-trip.
         existing_by_key = {}
+        id_to_mp = {}
         if pairs:
-            existing_by_sku = {}
             with connection.cursor() as cur:
                 cur.execute(
-                    "SELECT id, brand_id, sku FROM master_parts WHERE (brand_id, sku) IN %s",
-                    (tuple(pairs),),
+                    """
+                    SELECT id, brand_id, part_number, sku FROM master_parts
+                    WHERE (brand_id, sku) IN %s OR (brand_id, part_number) IN %s
+                    """,
+                    (tuple(pairs), tuple(pairs)),
                 )
+                existing_by_sku = {}
+                existing_by_part = {}
                 for row in cur.fetchall():
-                    mp_id, b_id, sku_val = row
-                    existing_by_sku[(b_id, sku_val)] = mp_id
-            existing_by_part = {}
-            with connection.cursor() as cur:
-                cur.execute(
-                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
-                    (tuple(pairs),),
-                )
-                for row in cur.fetchall():
-                    mp_id, b_id, p_num = row
-                    existing_by_part[(b_id, p_num)] = mp_id
-            for (b_id, p_num) in pairs:
-                existing_by_key[(b_id, p_num)] = existing_by_sku.get((b_id, p_num)) or existing_by_part.get((b_id, p_num))
+                    mp_id, b_id, p_num, sku_val = row
+                    mp = src_models.MasterPart()
+                    mp.id = mp_id
+                    mp.brand_id = b_id
+                    mp.part_number = p_num
+                    id_to_mp[mp_id] = mp
+                    if sku_val is not None and (b_id, (sku_val or "").strip()) not in existing_by_sku:
+                        existing_by_sku[(b_id, (sku_val or "").strip())] = mp_id
+                    if (b_id, p_num) not in existing_by_part:
+                        existing_by_part[(b_id, p_num)] = mp_id
+                for (b_id, p_num) in pairs:
+                    existing_by_key[(b_id, p_num)] = existing_by_sku.get((b_id, p_num)) or existing_by_part.get((b_id, p_num))
 
         new_parts = [mp for mp in master_parts if (mp.brand_id, mp.part_number) not in existing_by_key]
         existing_keys = [k for k in pairs if k in existing_by_key]
@@ -975,25 +980,10 @@ def sync_master_parts_from_wheelpros() -> None:
                     params,
                 )
 
-        # Build (brand_id, part_number) -> MasterPart; when matched by sku, part_number in DB may differ
+        # (brand_id, part_number) -> MasterPart; id_to_mp already filled from the single lookup above
         brand_part_to_master = {}
-        if existing_by_key:
-            existing_ids = set(existing_by_key.values())
-            with connection.cursor() as cur:
-                cur.execute(
-                    "SELECT id, brand_id, part_number FROM master_parts WHERE id IN %s",
-                    (tuple(existing_ids),),
-                )
-                id_to_mp = {}
-                for row in cur.fetchall():
-                    mp_id, b_id, p_num = row
-                    mp = src_models.MasterPart()
-                    mp.id = mp_id
-                    mp.brand_id = b_id
-                    mp.part_number = p_num
-                    id_to_mp[mp_id] = mp
-                for (b_id, p_num), mp_id in existing_by_key.items():
-                    brand_part_to_master[(b_id, p_num)] = id_to_mp[mp_id]
+        for (b_id, p_num), mp_id in existing_by_key.items():
+            brand_part_to_master[(b_id, p_num)] = id_to_mp[mp_id]
         new_pairs = [(b_id, p_num) for (b_id, p_num) in pairs if (b_id, p_num) not in existing_by_key]
         if new_pairs:
             with connection.cursor() as cur:
