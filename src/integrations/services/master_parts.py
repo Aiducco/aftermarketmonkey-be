@@ -115,6 +115,7 @@ def sync_master_parts_from_turn14() -> None:
 
         last_id = batch[-1]["id"]
         seen = set()
+        duplicates_seen = []
         master_parts = []
         item_to_brand_part = {}
 
@@ -123,13 +124,17 @@ def sync_master_parts_from_turn14() -> None:
             if not brand:
                 continue
 
-            part_number = (
-                (row.get("mfr_part_number") or row.get("part_number") or row.get("external_id") or "")
-            )
+            # part_number always from mfr_part_number; sku always from part_number
+            part_number = row.get("mfr_part_number") or ""
             if isinstance(part_number, str):
                 part_number = part_number.strip()
             else:
                 part_number = str(part_number or "").strip()
+            sku = row.get("part_number") or ""
+            if isinstance(sku, str):
+                sku = sku.strip().upper()
+            else:
+                sku = str(sku or "").strip().upper()
             if not part_number:
                 continue
 
@@ -140,15 +145,27 @@ def sync_master_parts_from_turn14() -> None:
                     src_models.MasterPart(
                         brand=brand,
                         part_number=part_number,
-                        sku=row["external_id"],
+                        sku=sku,
                         description=row.get("part_description"),
                         aaia_code=t14_brand_to_aaia.get(row["brand_id"]),
                         image_url=row.get("thumbnail"),
                     )
                 )
+            else:
+                duplicates_seen.append({
+                    "brand": brand.name,
+                    "part_number": part_number,
+                    "external_id": row.get("external_id"),
+                    "mfr_part_number": row.get("mfr_part_number"),
+                    "part_number_t14": row.get("part_number"),
+                })
             item_to_brand_part[row["external_id"]] = (brand.id, part_number)
 
         if not master_parts:
+            if duplicates_seen:
+                logger.info("{} Batch {}: {} duplicate keys (brand, part_number) skipped: {}".format(
+                    _LOG_PREFIX, batch_num, len(duplicates_seen), duplicates_seen
+                ))
             connection.close()
             if len(batch) == BATCH_SIZE_MASTER_PARTS:
                 time.sleep(BATCH_DELAY_SECONDS)
@@ -208,6 +225,10 @@ def sync_master_parts_from_turn14() -> None:
         logger.info("{} Batch {}: {} items -> {} master, {} provider (last_id={})".format(
             _LOG_PREFIX, batch_num, len(batch), len(master_parts), len(provider_parts), last_id
         ))
+        if duplicates_seen:
+            logger.info("{} Batch {}: {} duplicate keys (brand, part_number) skipped: {}".format(
+                _LOG_PREFIX, batch_num, len(duplicates_seen), duplicates_seen
+            ))
         connection.close()
         if len(batch) == BATCH_SIZE_MASTER_PARTS:
             time.sleep(BATCH_DELAY_SECONDS)
@@ -277,9 +298,8 @@ def sync_master_parts_from_keystone() -> None:
             if not brand:
                 continue
 
-            part_number = (
-                row.get("manufacturer_part_no") or row.get("part_number") or row.get("vcpn") or ""
-            )
+            # part_number always from manufacturer_part_no; sku from vcpn
+            part_number = row.get("manufacturer_part_no") or ""
             if isinstance(part_number, str):
                 part_number = part_number.strip()
             else:
@@ -791,6 +811,24 @@ def _wheelpros_provider_external_id(wp_brand_id: int, part_number: str) -> str:
     return "{}_{}".format(wp_brand_id, part_number)
 
 
+def _wheelpros_provider_part_lookup(wp_provider):
+    """
+    Build two lookups for WheelPros ProviderPart: by provider_external_id, and by (brand_id, sku).
+    Use ext_id first, then (brand_id, sku) so inventory/pricing resolve like master parts (sku then part_number).
+    """
+    provider_parts_list = list(
+        src_models.ProviderPart.objects.filter(provider=wp_provider).select_related("master_part")
+    )
+    by_ext_id = {pp.provider_external_id: pp for pp in provider_parts_list}
+    by_brand_sku = {}
+    for pp in provider_parts_list:
+        if pp.master_part and pp.master_part.sku:
+            key = (pp.master_part.brand_id, (pp.master_part.sku or "").strip())
+            if key not in by_brand_sku:
+                by_brand_sku[key] = pp
+    return by_ext_id, by_brand_sku
+
+
 def sync_master_parts_from_wheelpros() -> None:
     """
     Create/update MasterPart and ProviderPart from WheelProsPart (wheels, tires, accessories).
@@ -883,8 +921,19 @@ def sync_master_parts_from_wheelpros() -> None:
             continue
 
         pairs = list(seen)
+        # Find existing MasterPart: first by (brand_id, sku=part_number), then by (brand_id, part_number)
         existing_by_key = {}
         if pairs:
+            existing_by_sku = {}
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, sku FROM master_parts WHERE (brand_id, sku) IN %s",
+                    (tuple(pairs),),
+                )
+                for row in cur.fetchall():
+                    mp_id, b_id, sku_val = row
+                    existing_by_sku[(b_id, sku_val)] = mp_id
+            existing_by_part = {}
             with connection.cursor() as cur:
                 cur.execute(
                     "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
@@ -892,7 +941,9 @@ def sync_master_parts_from_wheelpros() -> None:
                 )
                 for row in cur.fetchall():
                     mp_id, b_id, p_num = row
-                    existing_by_key[(b_id, p_num)] = mp_id
+                    existing_by_part[(b_id, p_num)] = mp_id
+            for (b_id, p_num) in pairs:
+                existing_by_key[(b_id, p_num)] = existing_by_sku.get((b_id, p_num)) or existing_by_part.get((b_id, p_num))
 
         new_parts = [mp for mp in master_parts if (mp.brand_id, mp.part_number) not in existing_by_key]
         existing_keys = [k for k in pairs if k in existing_by_key]
@@ -924,12 +975,31 @@ def sync_master_parts_from_wheelpros() -> None:
                     params,
                 )
 
+        # Build (brand_id, part_number) -> MasterPart; when matched by sku, part_number in DB may differ
         brand_part_to_master = {}
-        if pairs:
+        if existing_by_key:
+            existing_ids = set(existing_by_key.values())
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE id IN %s",
+                    (tuple(existing_ids),),
+                )
+                id_to_mp = {}
+                for row in cur.fetchall():
+                    mp_id, b_id, p_num = row
+                    mp = src_models.MasterPart()
+                    mp.id = mp_id
+                    mp.brand_id = b_id
+                    mp.part_number = p_num
+                    id_to_mp[mp_id] = mp
+                for (b_id, p_num), mp_id in existing_by_key.items():
+                    brand_part_to_master[(b_id, p_num)] = id_to_mp[mp_id]
+        new_pairs = [(b_id, p_num) for (b_id, p_num) in pairs if (b_id, p_num) not in existing_by_key]
+        if new_pairs:
             with connection.cursor() as cur:
                 cur.execute(
                     "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
-                    (tuple(pairs),),
+                    (tuple(new_pairs),),
                 )
                 for row in cur.fetchall():
                     mp_id, b_id, p_num = row
@@ -983,6 +1053,7 @@ def sync_master_parts_from_wheelpros() -> None:
 def sync_provider_inventory_from_wheelpros() -> None:
     """
     Sync ProviderPartInventory from WheelProsPart (total_qoh, warehouse_availability).
+    Resolves ProviderPart by provider_external_id first, then by (brand_id, sku) to align with master parts lookup.
     """
     logger.info("{} Syncing provider inventory from WheelPros.".format(_LOG_PREFIX))
 
@@ -993,10 +1064,7 @@ def sync_provider_inventory_from_wheelpros() -> None:
         logger.info("{} No WheelPros provider found.".format(_LOG_PREFIX))
         return
 
-    provider_parts = {
-        pp.provider_external_id: pp
-        for pp in src_models.ProviderPart.objects.filter(provider=wp_provider)
-    }
+    provider_parts_by_ext_id, provider_parts_by_brand_sku = _wheelpros_provider_part_lookup(wp_provider)
 
     now = timezone.now()
     total_upserted = 0
@@ -1020,7 +1088,9 @@ def sync_provider_inventory_from_wheelpros() -> None:
             if not part_number:
                 continue
             ext_id = _wheelpros_provider_external_id(row["brand_id"], part_number)
-            provider_part = provider_parts.get(ext_id)
+            provider_part = provider_parts_by_ext_id.get(ext_id) or provider_parts_by_brand_sku.get(
+                (row["brand_id"], part_number)
+            )
             if not provider_part:
                 continue
             total_qoh = row.get("total_qoh") or 0
@@ -1074,6 +1144,7 @@ def sync_provider_pricing_from_wheelpros() -> None:
     """
     Sync ProviderPartCompanyPricing from WheelProsPart (msrp_usd, map_usd).
     Creates pricing for each company that has WheelPros CompanyProviders.
+    Resolves ProviderPart by provider_external_id first, then by (brand_id, sku) to align with master parts lookup.
     """
     logger.info("{} Syncing provider pricing from WheelPros.".format(_LOG_PREFIX))
 
@@ -1084,10 +1155,7 @@ def sync_provider_pricing_from_wheelpros() -> None:
         logger.info("{} No WheelPros provider found.".format(_LOG_PREFIX))
         return
 
-    provider_parts = {
-        pp.provider_external_id: pp
-        for pp in src_models.ProviderPart.objects.filter(provider=wp_provider)
-    }
+    provider_parts_by_ext_id, provider_parts_by_brand_sku = _wheelpros_provider_part_lookup(wp_provider)
 
     company_ids = list(
         src_models.CompanyProviders.objects.filter(
@@ -1120,7 +1188,9 @@ def sync_provider_pricing_from_wheelpros() -> None:
             if not part_number:
                 continue
             ext_id = _wheelpros_provider_external_id(row["brand_id"], part_number)
-            provider_part = provider_parts.get(ext_id)
+            provider_part = provider_parts_by_ext_id.get(ext_id) or provider_parts_by_brand_sku.get(
+                (row["brand_id"], part_number)
+            )
             if not provider_part:
                 continue
             msrp = row.get("msrp_usd")
