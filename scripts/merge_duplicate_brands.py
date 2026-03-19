@@ -1,65 +1,47 @@
 """
-One-time script to merge duplicate brands.
-Paste into Python interpreter (with Django env activated, from project root).
+Auxiliary script to merge duplicate brands.
+Paste into Django shell: python manage.py shell, then exec(open("scripts/merge_duplicate_brands.py").read())
 
-Steps per pair:
-  1. CompanyBrands - delete records for brand being removed
-  2. BrandProviders - swap brand_id or delete if duplicate
-  3. BrandTurn14BrandMapping - swap brand_id or delete if duplicate
-  4. BrandKeystoneBrandMapping - swap brand_id or delete if duplicate
-  5. MasterPart - update brand_id
-  6. CompanyDestinationParts - update brand_id
-  7. BigCommerceBrands, BrandSDCBrandMapping - if any
-  8. Delete the merged brand
-
-Usage:
-  cd /path/to/aftermarketmonkey-be
-  python manage.py shell
-  >>> exec(open("scripts/merge_duplicate_brands.py").read())
-  # or paste the entire script
+Flow per pair:
+  1. Search turn14_brands, keystone_brands, wheelpros_brands, rough_country_brands by name or code
+  2. If found in at least 2 provider tables -> find Brands, ask which to keep
+  3. Update mappings (wheelpros, keystone, turn14, rough_country), brand_providers
+  4. Delete CompanyBrands for merge brand, then delete merge brand
+  (Every action asks for confirmation)
 """
 import os
 import sys
 
-# Django setup (if not already in shell)
 if "django" not in sys.modules:
     os.environ.setdefault("DJANGO_SETTINGS_MODULE", "settings")
     import django
     django.setup()
 
+from django.db import models as django_models
 from src import models as src_models
 
-# Duplicate brand pairs: (display_name, [name1, name2, ...]) - names to search in brands/turn14/keystone
-DUPLICATE_PAIRS = [
-    ("Accel", ["ACCEL", "ACCEL PLUGS"]),
-    ("Alcon", ["Alcon", "ALCON BRAKE"]),
-    ("Brembo", ["BREMBO", "Brembo OE", "Brembo OE Powersports"]),
-    ("Camco", ["CAMCO", "CAMCO MARINE"]),
-    ("Coleman", ["COLEMAN CO.", "COLEMAN RVP"]),
-    ("Dexter", ["DEXTER AXLE", "DEXTER GROUP", "DEXTR MARINE"]),
-    ("Dometic", ["DOMETIC", "DOMETIC CPV", "DOMETIC OUTD"]),
-    ("EBC", ["EBC BRAKES", "EBC Powersports"]),
-    ("Edelbrock", ["EDELBROCK", "EDEL.CYLHEAD"]),
-    ("FOX", ["FOX SHOX", "FOX Powersports"]),
-    ("Garmin", ["GARMIN CARTO", "GARMIN ELEC."]),
-    ("Hella", ["HELLA", "HELLA LIGHTS"]),
-    ("King", ["KING", "KING SHOCKS", "KING BEARING"]),
-    ("KYB", ["KYB SHOCKS", "KYB Powersports"]),
-    ("Mahle", ["Mahle", "Mahle OE"]),
-    ("Method", ["Method Wheels", "METHOD RACE"]),
-    ("Mickey Thompson", ["M.T. DRAG", "M.T. STREET", "M.T. WHEEL"]),
-    ("Peterson", ["PETERSON MFG", "PETERSN MOLD", "Peterson Fluid Systems"]),
-    ("Progress", ["Progress Technology", "Progress LT"]),
-    ("Ranch Hand", ["RANCH HAND", "RANCH HAND M"]),
-    ("Rockford Fosgate", ["Rockford Fosgate", "Rockford Fosgate UTV"]),
-    ("Turn 14", ["Turn 14 Distribution", "Turn 14 HR"]),
-    ("Walker", ["WALKER EXHST", "WALKER PROD."]),
-    ("Wix Filters", ["WIX FILTR HD", "WIX FILTR LD"]),
+# Pairs to check: (label, [brand_name_or_id, ...])
+# Use brand names for search; IDs in comments for reference
+PAIRS_TO_CHECK = [
+    ("BAK IND / BAKFLIP", ["BAK IND", "BAKFLIP"]),  # 118, 1537
+    ("KING SHOCKS / KING", ["KING SHOCKS", "KING"]),  # 25, 549
+    ("KYB SHOCKS / KYB Powersports", ["KYB SHOCKS", "KYB Powersports"]),  # 561, 1348
+    ("WELD RACING / Weld", ["WELD RACING", "Weld"]),  # 1108, 1333
+    ("AMP RESEARCH / AMP", ["AMP RESEARCH", "AMP"]),  # 13, 1535
+    ("ARTEC INDUST / Artec Industries", ["ARTEC INDUST", "Artec Industries"]),  # 92, 1401
+    ("CARLI / CARLI SUSPEN", ["Carli", "CARLI SUSPEN"]),  # 1379, 1455
+    ("GORILLA / GORILLA AUTOMOTIVE", ["GORILLA AUTOMOTIVE", "GORILLA"]),  # 1541, 434
+    ("READYLIFT variants", ["READYLIFT", "READYLIFT SUSPENSION", "READYLIFT PREMIUM SHOCKS"]),  # 808, 1549, 1548
+    ("KMC / KMC POWERSPORTS", ["KMC", "KMC POWERSPORTS"]),  # 1495, 1496
+    ("IRONMAN / IRONMAN 4X4", ["IRONMAN", "IRONMAN 4X4"]),  # 1463, 513
+    ("MORIMOTO variants", ["MORIMOTO", "MORIMOTO OFFROAD", "MORIMOTO - NON XB"]),  # 649, 1544, 1543
+    ("RUGGED variants", ["RUGGED", "RUGGED LINER", "RUGGED OFFR", "RUGGED RADIO", "RUGGED RIDGE"]),  # may be different companies
+    ("JR PRODUCTS / JRV PRODUCTS", ["JR PRODUCTS", "JRV PRODUCTS"]),  # 532, 533
+    ("SUSPENS PRO / SUSPENSN PRO", ["SUSPENS PRO", "SUSPENSN PRO"]),  # 972, 974
 ]
 
 
-def _confirm(msg: str, default_no: bool = True) -> bool:
-    """Ask for confirmation. Returns True if user confirms."""
+def _confirm(msg, default_no=True):
     prompt = "{} [y/N]: ".format(msg) if default_no else "{} [Y/n]: ".format(msg)
     r = input(prompt).strip().lower()
     if default_no:
@@ -67,33 +49,63 @@ def _confirm(msg: str, default_no: bool = True) -> bool:
     return r not in ("n", "no")
 
 
-def _find_brands_by_names(names: list) -> list:
-    """Find Brands records by exact name match. Returns unique brands by id."""
+def _search_provider_brands(name_or_code):
+    """Search name/code in turn14, keystone, wheelpros, rough_country. Returns dict of provider -> list of matches."""
+    q = (name_or_code or "").strip()
+    if not q:
+        return {}
+    results = {}
+    Q = django_models.Q
+    t14 = list(src_models.Turn14Brand.objects.filter(
+        Q(name__icontains=q) | Q(aaia_code__iexact=q) | Q(external_id__iexact=q)
+    ).values("id", "name", "aaia_code", "external_id"))
+    if t14:
+        results["turn14"] = t14
+    ks = list(src_models.KeystoneBrand.objects.filter(
+        Q(name__icontains=q) | Q(aaia_code__iexact=q) | Q(external_id__iexact=q)
+    ).values("id", "name", "aaia_code", "external_id"))
+    if ks:
+        results["keystone"] = ks
+    wp = list(src_models.WheelProsBrand.objects.filter(
+        Q(name__icontains=q) | Q(external_id__iexact=q)
+    ).values("id", "name", "external_id"))
+    if wp:
+        results["wheelpros"] = wp
+    rc = list(src_models.RoughCountryBrand.objects.filter(
+        Q(name__icontains=q) | Q(aaia_code__iexact=q) | Q(external_id__iexact=q)
+    ).values("id", "name", "aaia_code", "external_id"))
+    if rc:
+        results["rough_country"] = rc
+    return results
+
+
+def _find_brands_by_names(names):
+    """Find Brands by name (case-insensitive)."""
     seen = {}
     for name in names:
         b = src_models.Brands.objects.filter(name__iexact=name).first()
         if b and b.id not in seen:
             seen[b.id] = b
+        # Also try icontains for partial
+        if not b:
+            for b2 in src_models.Brands.objects.filter(name__icontains=name):
+                if b2.id not in seen:
+                    seen[b2.id] = b2
     return list(seen.values())
 
 
-def _find_turn14_brand_by_name(name: str):
-    return src_models.Turn14Brand.objects.filter(name__iexact=name).first()
-
-
-def _find_keystone_brand_by_name(name: str):
-    return src_models.KeystoneBrand.objects.filter(name__iexact=name).first()
-
-
-def _get_brand_provider_source(brand) -> str:
-    """Return 'turn14', 'keystone', or None."""
-    t14 = src_models.BrandTurn14BrandMapping.objects.filter(brand=brand).first()
-    if t14:
-        return "turn14"
-    ks = src_models.BrandKeystoneBrandMapping.objects.filter(brand=brand).first()
-    if ks:
-        return "keystone"
-    return None
+def _get_mappings_for_brand(brand):
+    """Return which provider mappings this brand has."""
+    out = []
+    if src_models.BrandTurn14BrandMapping.objects.filter(brand=brand).exists():
+        out.append("turn14")
+    if src_models.BrandKeystoneBrandMapping.objects.filter(brand=brand).exists():
+        out.append("keystone")
+    if src_models.BrandWheelProsBrandMapping.objects.filter(brand=brand).exists():
+        out.append("wheelpros")
+    if src_models.BrandRoughCountryBrandMapping.objects.filter(brand=brand).exists():
+        out.append("rough_country")
+    return out
 
 
 def merge_brands(brand_to_keep, brand_to_delete):
@@ -101,216 +113,206 @@ def merge_brands(brand_to_keep, brand_to_delete):
     keep_id = brand_to_keep.id
     delete_id = brand_to_delete.id
 
-    print("\n--- Step 1: CompanyBrands (delete records for brand to delete) ---")
-    cb_count = src_models.CompanyBrands.objects.filter(brand_id=delete_id).count()
-    print("  CompanyBrands to delete (brand_id={}): {}".format(delete_id, cb_count))
-    if cb_count:
-        if _confirm("  Confirm DELETE {} CompanyBrands for '{}'?".format(cb_count, brand_to_delete.name)):
-            src_models.CompanyBrands.objects.filter(brand_id=delete_id).delete()
-            print("  [OK] Deleted {} CompanyBrands.".format(cb_count))
-        else:
-            print("  [SKIP] User declined.")
-            return False
-    else:
-        print("  (none to delete)")
-
-    print("\n--- Step 2: BrandProviders (swap or delete) ---")
-    bp_list = list(src_models.BrandProviders.objects.filter(brand_id=delete_id).select_related("provider"))
-    print("  BrandProviders to process (brand_id={}): {}".format(delete_id, len(bp_list)))
-    for bp in bp_list:
-        existing = src_models.BrandProviders.objects.filter(brand_id=keep_id, provider=bp.provider).first()
+    # 1. BrandWheelProsBrandMapping
+    wp_list = list(src_models.BrandWheelProsBrandMapping.objects.filter(brand_id=delete_id).select_related("wheelpros_brand"))
+    print("\n--- BrandWheelProsBrandMapping: {} to process ---".format(len(wp_list)))
+    for m in wp_list:
+        existing = src_models.BrandWheelProsBrandMapping.objects.filter(brand_id=keep_id, wheelpros_brand=m.wheelpros_brand).first()
         if existing:
-            if _confirm("    Delete BrandProviders id={} (brand={}, provider={})? Duplicate exists for keep brand.".format(bp.id, brand_to_delete.name, bp.provider.kind_name)):
-                bp.delete()
-                print("    [OK] Deleted.")
-        else:
-            if _confirm("    Update BrandProviders id={} brand_id {} -> {}?".format(bp.id, delete_id, keep_id)):
-                bp.brand_id = keep_id
-                bp.save()
-                print("    [OK] Updated.")
-
-    print("\n--- Step 3: BrandTurn14BrandMapping (swap or delete) ---")
-    t14_list = list(src_models.BrandTurn14BrandMapping.objects.filter(brand_id=delete_id).select_related("turn14_brand"))
-    print("  BrandTurn14BrandMapping to process: {}".format(len(t14_list)))
-    for m in t14_list:
-        existing = src_models.BrandTurn14BrandMapping.objects.filter(brand_id=keep_id, turn14_brand=m.turn14_brand).first()
-        if existing:
-            if _confirm("    Delete mapping id={} (turn14_brand={})? Keep brand already has mapping.".format(m.id, m.turn14_brand.name)):
+            if _confirm("  Delete mapping id={} (wheelpros_brand={})? Keep already has.".format(m.id, m.wheelpros_brand.name)):
                 m.delete()
-                print("    [OK] Deleted.")
         else:
-            if _confirm("    Update mapping id={} brand_id {} -> {} (turn14_brand={})?".format(m.id, delete_id, keep_id, m.turn14_brand.name)):
+            if _confirm("  Update mapping id={} brand_id {} -> {} (wheelpros_brand={})?".format(m.id, delete_id, keep_id, m.wheelpros_brand.name)):
                 m.brand_id = keep_id
                 m.save()
-                print("    [OK] Updated.")
 
-    print("\n--- Step 4: BrandKeystoneBrandMapping (swap or delete) ---")
+    # 2. BrandKeystoneBrandMapping
     ks_list = list(src_models.BrandKeystoneBrandMapping.objects.filter(brand_id=delete_id).select_related("keystone_brand"))
-    print("  BrandKeystoneBrandMapping to process: {}".format(len(ks_list)))
+    print("\n--- BrandKeystoneBrandMapping: {} to process ---".format(len(ks_list)))
     for m in ks_list:
         existing = src_models.BrandKeystoneBrandMapping.objects.filter(brand_id=keep_id, keystone_brand=m.keystone_brand).first()
         if existing:
-            if _confirm("    Delete mapping id={} (keystone_brand={})? Keep brand already has mapping.".format(m.id, m.keystone_brand.name)):
+            if _confirm("  Delete mapping id={} (keystone_brand={})? Keep already has.".format(m.id, m.keystone_brand.name)):
                 m.delete()
-                print("    [OK] Deleted.")
         else:
-            if _confirm("    Update mapping id={} brand_id {} -> {} (keystone_brand={})?".format(m.id, delete_id, keep_id, m.keystone_brand.name)):
+            if _confirm("  Update mapping id={} brand_id {} -> {} (keystone_brand={})?".format(m.id, delete_id, keep_id, m.keystone_brand.name)):
                 m.brand_id = keep_id
                 m.save()
-                print("    [OK] Updated.")
 
-    print("\n--- Step 5: MasterPart (swap brand, handle duplicates) ---")
-    mp_list = list(src_models.MasterPart.objects.filter(brand_id=delete_id).select_related("brand"))
-    mp_count = len(mp_list)
-    print("  MasterPart to process (brand_id={} -> {}): {}".format(delete_id, keep_id, mp_count))
-    if mp_count:
-        conflicts = 0
-        for mp in mp_list:
-            existing = src_models.MasterPart.objects.filter(brand_id=keep_id, part_number=mp.part_number).first()
-            if existing:
-                conflicts += 1
-        if conflicts:
-            print("  WARNING: {} conflicts (keep brand already has same part_number). Will merge/delete.".format(conflicts))
-        if _confirm("  Confirm process {} MasterPart records ({} simple updates, {} merge/delete)?".format(mp_count, mp_count - conflicts, conflicts)):
+    # 3. BrandTurn14BrandMapping
+    t14_list = list(src_models.BrandTurn14BrandMapping.objects.filter(brand_id=delete_id).select_related("turn14_brand"))
+    print("\n--- BrandTurn14BrandMapping: {} to process ---".format(len(t14_list)))
+    for m in t14_list:
+        existing = src_models.BrandTurn14BrandMapping.objects.filter(brand_id=keep_id, turn14_brand=m.turn14_brand).first()
+        if existing:
+            if _confirm("  Delete mapping id={} (turn14_brand={})? Keep already has.".format(m.id, m.turn14_brand.name)):
+                m.delete()
+        else:
+            if _confirm("  Update mapping id={} brand_id {} -> {} (turn14_brand={})?".format(m.id, delete_id, keep_id, m.turn14_brand.name)):
+                m.brand_id = keep_id
+                m.save()
+
+    # 4. BrandRoughCountryBrandMapping
+    rc_list = list(src_models.BrandRoughCountryBrandMapping.objects.filter(brand_id=delete_id).select_related("rough_country_brand"))
+    print("\n--- BrandRoughCountryBrandMapping: {} to process ---".format(len(rc_list)))
+    for m in rc_list:
+        existing = src_models.BrandRoughCountryBrandMapping.objects.filter(brand_id=keep_id, rough_country_brand=m.rough_country_brand).first()
+        if existing:
+            if _confirm("  Delete mapping id={} (rough_country_brand={})? Keep already has.".format(m.id, m.rough_country_brand.name)):
+                m.delete()
+        else:
+            if _confirm("  Update mapping id={} brand_id {} -> {} (rough_country_brand={})?".format(m.id, delete_id, keep_id, m.rough_country_brand.name)):
+                m.brand_id = keep_id
+                m.save()
+
+    # 5. BrandProviders
+    bp_list = list(src_models.BrandProviders.objects.filter(brand_id=delete_id).select_related("provider"))
+    print("\n--- BrandProviders: {} to process ---".format(len(bp_list)))
+    for bp in bp_list:
+        existing = src_models.BrandProviders.objects.filter(brand_id=keep_id, provider=bp.provider).first()
+        if existing:
+            if _confirm("  Delete BrandProviders id={} (provider={})? Keep already has.".format(bp.id, bp.provider.kind_name)):
+                bp.delete()
+        else:
+            if _confirm("  Update BrandProviders id={} brand_id {} -> {} (provider={})?".format(bp.id, delete_id, keep_id, bp.provider.kind_name)):
+                bp.brand_id = keep_id
+                bp.save()
+
+    # 6. MasterPart (update brand_id, handle duplicates)
+    mp_list = list(src_models.MasterPart.objects.filter(brand_id=delete_id))
+    print("\n--- MasterPart: {} to process ---".format(len(mp_list)))
+    if mp_list:
+        conflicts = sum(1 for mp in mp_list if src_models.MasterPart.objects.filter(brand_id=keep_id, part_number=mp.part_number).exists())
+        print("  ({} conflicts with keep brand)".format(conflicts))
+        if _confirm("  Process {} MasterPart records?".format(len(mp_list))):
             from django.db import transaction
-            updated = 0
-            merged = 0
             with transaction.atomic():
                 for mp in mp_list:
                     existing = src_models.MasterPart.objects.filter(brand_id=keep_id, part_number=mp.part_number).first()
                     if existing:
-                        # Keep brand already has this part_number: reassign ProviderParts, then delete duplicate
-                        for pp in src_models.ProviderPart.objects.filter(master_part=mp).select_related("provider"):
-                            keep_pp = src_models.ProviderPart.objects.filter(master_part=existing, provider=pp.provider).first()
-                            if keep_pp:
-                                pp.delete()  # duplicate provider_part, keep the one on existing
+                        for pp in src_models.ProviderPart.objects.filter(master_part=mp):
+                            kp = src_models.ProviderPart.objects.filter(master_part=existing, provider=pp.provider).first()
+                            if kp:
+                                pp.delete()
                             else:
                                 pp.master_part = existing
                                 pp.save()
                         mp.delete()
-                        merged += 1
                     else:
                         mp.brand_id = keep_id
                         mp.save()
-                        updated += 1
-            print("  [OK] Updated {} MasterPart, merged/deleted {} duplicates.".format(updated, merged))
-        else:
-            print("  [SKIP] User declined.")
-            return False
-    else:
-        print("  (none to update)")
 
-    print("\n--- Step 6: CompanyDestinationParts (swap brand) ---")
+    # 7. CompanyDestinationParts
     cdp_count = src_models.CompanyDestinationParts.objects.filter(brand_id=delete_id).count()
-    print("  CompanyDestinationParts to update: {}".format(cdp_count))
     if cdp_count:
-        if _confirm("  Confirm UPDATE {} CompanyDestinationParts?".format(cdp_count)):
+        if _confirm("  Update {} CompanyDestinationParts brand_id {} -> {}?".format(cdp_count, delete_id, keep_id)):
             src_models.CompanyDestinationParts.objects.filter(brand_id=delete_id).update(brand_id=keep_id)
-            print("  [OK] Updated {} CompanyDestinationParts.".format(cdp_count))
-        else:
-            print("  [SKIP] User declined.")
-            return False
-    else:
-        print("  (none to update)")
 
-    # BigCommerceBrands, BrandSDCBrandMapping if they exist
-    bbc_count = src_models.BigCommerceBrands.objects.filter(brand_id=delete_id).count()
-    if bbc_count:
-        print("\n--- BigCommerceBrands to update: {} ---".format(bbc_count))
-        if _confirm("  Confirm UPDATE {} BigCommerceBrands?".format(bbc_count)):
-            src_models.BigCommerceBrands.objects.filter(brand_id=delete_id).update(brand_id=keep_id)
-            print("  [OK] Updated.")
+    # 8. CompanyBrands - delete for merge brand
+    cb_count = src_models.CompanyBrands.objects.filter(brand_id=delete_id).count()
+    print("\n--- CompanyBrands: {} to delete (brand_id={}) ---".format(cb_count, delete_id))
+    if cb_count:
+        if _confirm("  Delete {} CompanyBrands for '{}'?".format(cb_count, brand_to_delete.name)):
+            src_models.CompanyBrands.objects.filter(brand_id=delete_id).delete()
 
-    sdc_count = src_models.BrandSDCBrandMapping.objects.filter(brand_id=delete_id).count()
-    if sdc_count:
-        print("\n--- BrandSDCBrandMapping to process: {} ---".format(sdc_count))
-        sdc_list = list(src_models.BrandSDCBrandMapping.objects.filter(brand_id=delete_id).select_related("sdc_brand"))
-        for m in sdc_list:
-            existing = src_models.BrandSDCBrandMapping.objects.filter(brand_id=keep_id, sdc_brand=m.sdc_brand).first()
-            if existing:
-                if _confirm("    Delete BrandSDCBrandMapping id={}?".format(m.id)):
+    # 9. BigCommerceBrands, BrandSDCBrandMapping if any
+    bbc = src_models.BigCommerceBrands.objects.filter(brand_id=delete_id)
+    if bbc.exists():
+        if _confirm("  Update {} BigCommerceBrands?".format(bbc.count())):
+            bbc.update(brand_id=keep_id)
+    sdc = src_models.BrandSDCBrandMapping.objects.filter(brand_id=delete_id)
+    if sdc.exists():
+        for m in sdc:
+            ex = src_models.BrandSDCBrandMapping.objects.filter(brand_id=keep_id, sdc_brand=m.sdc_brand).first()
+            if ex:
+                if _confirm("  Delete BrandSDCBrandMapping id={}?".format(m.id)):
                     m.delete()
             else:
-                if _confirm("    Update BrandSDCBrandMapping id={} brand_id -> {}?".format(m.id, keep_id)):
+                if _confirm("  Update BrandSDCBrandMapping id={}?".format(m.id)):
                     m.brand_id = keep_id
                     m.save()
 
-    print("\n--- Step 7: Delete brand '{}' (id={}) ---".format(brand_to_delete.name, delete_id))
-    if _confirm("  Confirm DELETE brand '{}' (id={})?".format(brand_to_delete.name, delete_id)):
+    # 10. Delete brand
+    print("\n--- Delete brand '{}' (id={}) ---".format(brand_to_delete.name, delete_id))
+    if _confirm("  Confirm DELETE brand '{}'?".format(brand_to_delete.name)):
         brand_to_delete.delete()
-        print("  [OK] Brand deleted.")
-        return True
+        print("  [OK] Done.")
     else:
-        print("  [SKIP] User declined. Brand NOT deleted.")
-        return False
+        print("  [SKIP] Brand NOT deleted.")
 
 
-def process_pair(display_name: str, names: list):
-    """Process one duplicate pair."""
+def process_pair(label, names):
+    """Process one pair: search providers, find brands, ask which to keep, merge."""
     print("\n" + "=" * 60)
-    print("Processing: {} -> names: {}".format(display_name, names))
+    print("Processing: {}".format(label))
+    print("  Names: {}".format(names))
     print("=" * 60)
 
+    provider_hits = {}
+    all_providers_with_hits = set()
+    for name in names:
+        hits = _search_provider_brands(name)
+        provider_hits[name] = hits
+        for k in hits:
+            all_providers_with_hits.add(k)
+
+    print("\n[1] Provider brand tables search:")
+    for name in names:
+        h = provider_hits.get(name, {})
+        print("  '{}' -> {}".format(name, list(h.keys()) if h else "(none)"))
+    print("  Found in {} provider tables (need >= 2): {}".format(len(all_providers_with_hits), sorted(all_providers_with_hits)))
+
+    if len(all_providers_with_hits) < 2:
+        print("  [SKIP] Found in fewer than 2 provider tables. Skipping.")
+        return
+
     brands_found = _find_brands_by_names(names)
-    print("\n[1] Brands found: {} (need exactly 2)".format(len(brands_found)))
+    print("\n[2] Brands found: {}".format(len(brands_found)))
     for b in brands_found:
-        src = _get_brand_provider_source(b)
-        print("    - id={} name='{}' source={}".format(b.id, b.name, src or "none"))
+        mappings = _get_mappings_for_brand(b)
+        print("    - id={} name='{}' aaia={} mappings={}".format(b.id, b.name, b.aaia_code or "(none)", mappings))
 
-    if len(brands_found) != 2:
-        print("  [SKIP] Need exactly 2 brands. Found {}. Skipping pair.".format(len(brands_found)))
+    if len(brands_found) < 2:
+        print("  [SKIP] Need at least 2 Brands to merge. Found {}. Skipping.".format(len(brands_found)))
         return
 
-    # Check one in Turn14, one in Keystone
-    sources = [_get_brand_provider_source(b) for b in brands_found]
-    has_t14 = "turn14" in sources
-    has_ks = "keystone" in sources
-    if not (has_t14 and has_ks):
-        print("  [SKIP] Must have one brand from Turn14 and one from Keystone. Sources: {}. Skipping.".format(sources))
+    print("\n[3] Which brand to KEEP? (merge the others into this one)")
+    for i, b in enumerate(brands_found, 1):
+        print("    {} = id={} name='{}'".format(i, b.id, b.name))
+    choice = input("    Enter number (1-{}): ".format(len(brands_found))).strip()
+    try:
+        idx = int(choice)
+        if 1 <= idx <= len(brands_found):
+            brand_to_keep = brands_found[idx - 1]
+            brands_to_delete = [b for i, b in enumerate(brands_found, 1) if i != idx]
+        else:
+            print("  [SKIP] Invalid choice.")
+            return
+    except ValueError:
+        print("  [SKIP] Invalid input.")
         return
 
-    # Determine which is Turn14 and which is Keystone
-    b_t14 = next((b for b in brands_found if _get_brand_provider_source(b) == "turn14"), None)
-    b_ks = next((b for b in brands_found if _get_brand_provider_source(b) == "keystone"), None)
-
-    print("\n[2] Turn14 brand: id={} name='{}'".format(b_t14.id, b_t14.name))
-    print("    Keystone brand: id={} name='{}'".format(b_ks.id, b_ks.name))
-
-    print("\n[3] Which brand to KEEP? (merge the other into this one)")
-    print("    1 = {} (id={}) [Turn14]".format(b_t14.name, b_t14.id))
-    print("    2 = {} (id={}) [Keystone]".format(b_ks.name, b_ks.id))
-    choice = input("    Enter 1 or 2: ").strip()
-    if choice == "1":
-        brand_to_keep = b_t14
-        brand_to_delete = b_ks
-    elif choice == "2":
-        brand_to_keep = b_ks
-        brand_to_delete = b_t14
-    else:
-        print("  [SKIP] Invalid choice. Skipping pair.")
-        return
-
-    print("\n  KEEP: id={} name='{}'".format(brand_to_keep.id, brand_to_keep.name))
-    print("  DELETE (merge into keep): id={} name='{}'".format(brand_to_delete.id, brand_to_delete.name))
-
-    if not _confirm("\n  Confirm merge/delete for this pair?", default_no=True):
-        print("  [SKIP] User declined.")
-        return
-
-    merge_brands(brand_to_keep, brand_to_delete)
+    if len(brands_to_delete) > 1:
+        print("  Multiple brands to merge. Will merge one at a time.")
+    for brand_to_delete in brands_to_delete:
+        print("\n  KEEP: id={} name='{}'".format(brand_to_keep.id, brand_to_keep.name))
+        print("  MERGE INTO KEEP (then delete): id={} name='{}'".format(brand_to_delete.id, brand_to_delete.name))
+        if not _confirm("  Proceed with this merge?", default_no=True):
+            print("  [SKIP] User declined.")
+            continue
+        merge_brands(brand_to_keep, brand_to_delete)
 
 
 def run():
-    """Run the merge script for all pairs."""
     print("Duplicate brand merge script")
-    print("Each pair will prompt for confirmation at each step.")
+    print("For each pair: search turn14/keystone/wheelpros/rough_country; if found in >=2, find Brands, choose keep, merge.")
     print("")
 
-    for display_name, names in DUPLICATE_PAIRS:
+    for label, names in PAIRS_TO_CHECK:
         try:
-            process_pair(display_name, names)
+            process_pair(label, names)
         except Exception as e:
-            print("\n[ERROR] Exception for {}: {}".format(display_name, e))
+            print("\n[ERROR] {}: {}".format(label, e))
             import traceback
             traceback.print_exc()
             if not _confirm("  Continue to next pair?"):
@@ -320,7 +322,6 @@ def run():
     print("Done.")
 
 
-# Run when pasted or executed
 if __name__ == "__main__":
     import pathlib
     root = pathlib.Path(__file__).resolve().parent.parent
