@@ -371,8 +371,8 @@ def sync_master_parts_from_keystone() -> None:
             with connection.cursor() as cur:
                 cur.execute(
                     """
-                    UPDATE master_parts mp SET sku = v.sku, aaia_code = v.aaia_code
-                    FROM (VALUES {}) AS v(id, sku, aaia_code)
+                    UPDATE master_parts mp SET aaia_code = v.aaia_code
+                    FROM (VALUES {}) AS v(id, aaia_code)
                     WHERE mp.id = v.id
                     """.format(placeholders),
                     params,

@@ -2,7 +2,7 @@ from django.core.management.base import BaseCommand
 
 from src.audit import scheduled_tasks as audit_scheduled_tasks
 from src.integrations.services import master_parts
-from src.search.meilisearch_client import add_documents_in_batches, is_configured, setup_index
+from src.search.meilisearch_client import add_documents_in_batches, delete_all_documents, is_configured, setup_index
 
 
 class Command(BaseCommand):
@@ -25,6 +25,7 @@ class Command(BaseCommand):
             if options.get("reindex_meilisearch") and is_configured():
                 self.stdout.write("Reindexing Meilisearch...")
                 setup_index()
+                delete_all_documents()
                 from src import models as src_models
 
                 queryset = src_models.MasterPart.objects.select_related("brand").order_by("id")
