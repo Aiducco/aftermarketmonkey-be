@@ -753,6 +753,9 @@ class MasterPart(django_db_models.Model):
     class Meta:
         db_table = "master_parts"
         unique_together = [["brand", "part_number"]]
+        indexes = [
+            django_db_models.Index(fields=["brand", "sku"], name="master_parts_brand_sku_idx"),
+        ]
 
 
 class ProviderPart(django_db_models.Model):
