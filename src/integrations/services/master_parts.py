@@ -902,6 +902,7 @@ def sync_master_parts_from_wheelpros() -> None:
             if key not in seen:
                 seen.add(key)
                 aaia = wp_brand_to_aaia.get(row["brand_id"])
+                # New parts: full data from feed. Existing parts: Phase 2 only updates sku, aaia_code (never description/image_url).
                 master_parts.append(
                     src_models.MasterPart(
                         brand=brand,
@@ -925,9 +926,10 @@ def sync_master_parts_from_wheelpros() -> None:
         pairs = list(seen)
         # Find existing by (brand_id, sku) then (brand_id, part_number). Two separate queries per chunk
         # (no OR) to avoid PostgreSQL stack depth limit; prefer sku match.
+        # When multiple master_parts share same sku, prefer the one whose part_number matches (avoids wrong link).
         existing_by_key = {}
         id_to_mp = {}
-        existing_by_sku = {}
+        existing_by_sku = {}  # (b_id, sku) -> [(mp_id, part_number), ...] for disambiguation
         existing_by_part = {}
         if pairs:
             for i in range(0, len(pairs), WHEELPROS_LOOKUP_CHUNK):
@@ -945,8 +947,11 @@ def sync_master_parts_from_wheelpros() -> None:
                             mp.brand_id = b_id
                             mp.part_number = p_num
                             id_to_mp[mp_id] = mp
-                        if sku_val is not None and (b_id, (sku_val or "").strip()) not in existing_by_sku:
-                            existing_by_sku[(b_id, (sku_val or "").strip())] = mp_id
+                        if sku_val is not None:
+                            key = (b_id, (sku_val or "").strip())
+                            if key not in existing_by_sku:
+                                existing_by_sku[key] = []
+                            existing_by_sku[key].append((mp_id, p_num))
                 with connection.cursor() as cur:
                     cur.execute(
                         "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
@@ -963,11 +968,17 @@ def sync_master_parts_from_wheelpros() -> None:
                         if (b_id, p_num) not in existing_by_part:
                             existing_by_part[(b_id, p_num)] = mp_id
             for (b_id, p_num) in pairs:
-                existing_by_key[(b_id, p_num)] = existing_by_sku.get((b_id, p_num)) or existing_by_part.get((b_id, p_num))
+                sku_candidates = existing_by_sku.get((b_id, p_num)) or []
+                # Prefer master part whose part_number matches p_num (e.g. AMP74604-01A vs 74604-01A)
+                sku_match = next((mp_id for mp_id, pn in sku_candidates if pn == p_num), None)
+                if sku_match is None and sku_candidates:
+                    sku_match = sku_candidates[0][0]
+                existing_by_key[(b_id, p_num)] = sku_match or existing_by_part.get((b_id, p_num))
 
         new_parts = [mp for mp in master_parts if existing_by_key.get((mp.brand_id, mp.part_number)) is None]
         existing_keys = [k for k in pairs if existing_by_key.get(k) is not None]
 
+        # Phase 1: INSERT new parts only (full data). DO NOTHING on conflict. Same as Keystone.
         if new_parts:
             pgbulk.upsert(
                 src_models.MasterPart,
@@ -977,6 +988,8 @@ def sync_master_parts_from_wheelpros() -> None:
             )
             total_master += len(new_parts)
 
+        # Phase 2: UPDATE existing parts with ONLY sku, aaia_code via raw SQL (never description/image_url).
+        # Keeps existing description and image_url from primary source (e.g. Turn14, catalog). Same as Keystone.
         if existing_keys:
             key_to_mp = {(mp.brand_id, mp.part_number): mp for mp in master_parts}
             for i in range(0, len(existing_keys), WHEELPROS_LOOKUP_CHUNK):
