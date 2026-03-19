@@ -49,6 +49,9 @@ def _get_brand_for_wheelpros_brand(
 
 
 BATCH_SIZE_MASTER_PARTS = 5000
+BATCH_SIZE_MASTER_PARTS_WHEELPROS = 10000  # Larger batches = fewer round-trips
+# Max tuples per IN clause to avoid PostgreSQL stack depth limit (StatementTooComplex)
+WHEELPROS_LOOKUP_CHUNK = 200
 BATCH_SIZE_INVENTORY = 20000
 BATCH_SIZE_PRICING = 20000
 BATCH_DELAY_SECONDS = 0.1  # Reduced from 0.3 - was adding ~30s per 100 batches
@@ -876,7 +879,7 @@ def sync_master_parts_from_wheelpros() -> None:
                 "part_number",
                 "part_description",
                 "image_url",
-            )[:BATCH_SIZE_MASTER_PARTS]
+            )[:BATCH_SIZE_MASTER_PARTS_WHEELPROS]
         )
         if not batch:
             break
@@ -915,43 +918,55 @@ def sync_master_parts_from_wheelpros() -> None:
             )
 
         if not master_parts:
-            connection.close()
-            if len(batch) == BATCH_SIZE_MASTER_PARTS:
+            if len(batch) == BATCH_SIZE_MASTER_PARTS_WHEELPROS:
                 time.sleep(BATCH_DELAY_SECONDS)
             continue
 
         pairs = list(seen)
-        # Single query: find existing by (brand_id, sku) OR (brand_id, part_number); prefer sku match.
-        # Build existing_by_key and id_to_mp from same result to avoid extra round-trip.
+        # Find existing by (brand_id, sku) then (brand_id, part_number). Two separate queries per chunk
+        # (no OR) to avoid PostgreSQL stack depth limit; prefer sku match.
         existing_by_key = {}
         id_to_mp = {}
+        existing_by_sku = {}
+        existing_by_part = {}
         if pairs:
-            with connection.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT id, brand_id, part_number, sku FROM master_parts
-                    WHERE (brand_id, sku) IN %s OR (brand_id, part_number) IN %s
-                    """,
-                    (tuple(pairs), tuple(pairs)),
-                )
-                existing_by_sku = {}
-                existing_by_part = {}
-                for row in cur.fetchall():
-                    mp_id, b_id, p_num, sku_val = row
-                    mp = src_models.MasterPart()
-                    mp.id = mp_id
-                    mp.brand_id = b_id
-                    mp.part_number = p_num
-                    id_to_mp[mp_id] = mp
-                    if sku_val is not None and (b_id, (sku_val or "").strip()) not in existing_by_sku:
-                        existing_by_sku[(b_id, (sku_val or "").strip())] = mp_id
-                    if (b_id, p_num) not in existing_by_part:
-                        existing_by_part[(b_id, p_num)] = mp_id
-                for (b_id, p_num) in pairs:
-                    existing_by_key[(b_id, p_num)] = existing_by_sku.get((b_id, p_num)) or existing_by_part.get((b_id, p_num))
+            for i in range(0, len(pairs), WHEELPROS_LOOKUP_CHUNK):
+                chunk = pairs[i : i + WHEELPROS_LOOKUP_CHUNK]
+                with connection.cursor() as cur:
+                    cur.execute(
+                        "SELECT id, brand_id, part_number, sku FROM master_parts WHERE (brand_id, sku) IN %s",
+                        (tuple(chunk),),
+                    )
+                    for row in cur.fetchall():
+                        mp_id, b_id, p_num, sku_val = row
+                        if mp_id not in id_to_mp:
+                            mp = src_models.MasterPart()
+                            mp.id = mp_id
+                            mp.brand_id = b_id
+                            mp.part_number = p_num
+                            id_to_mp[mp_id] = mp
+                        if sku_val is not None and (b_id, (sku_val or "").strip()) not in existing_by_sku:
+                            existing_by_sku[(b_id, (sku_val or "").strip())] = mp_id
+                with connection.cursor() as cur:
+                    cur.execute(
+                        "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                        (tuple(chunk),),
+                    )
+                    for row in cur.fetchall():
+                        mp_id, b_id, p_num = row
+                        if mp_id not in id_to_mp:
+                            mp = src_models.MasterPart()
+                            mp.id = mp_id
+                            mp.brand_id = b_id
+                            mp.part_number = p_num
+                            id_to_mp[mp_id] = mp
+                        if (b_id, p_num) not in existing_by_part:
+                            existing_by_part[(b_id, p_num)] = mp_id
+            for (b_id, p_num) in pairs:
+                existing_by_key[(b_id, p_num)] = existing_by_sku.get((b_id, p_num)) or existing_by_part.get((b_id, p_num))
 
-        new_parts = [mp for mp in master_parts if (mp.brand_id, mp.part_number) not in existing_by_key]
-        existing_keys = [k for k in pairs if k in existing_by_key]
+        new_parts = [mp for mp in master_parts if existing_by_key.get((mp.brand_id, mp.part_number)) is None]
+        existing_keys = [k for k in pairs if existing_by_key.get(k) is not None]
 
         if new_parts:
             pgbulk.upsert(
@@ -964,40 +979,45 @@ def sync_master_parts_from_wheelpros() -> None:
 
         if existing_keys:
             key_to_mp = {(mp.brand_id, mp.part_number): mp for mp in master_parts}
-            values = [
-                (existing_by_key[k], key_to_mp[k].sku, key_to_mp[k].aaia_code)
-                for k in existing_keys
-            ]
-            placeholders = ", ".join(["(%s::bigint, %s, %s)"] * len(values))
-            params = [x for row in values for x in row]
-            with connection.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE master_parts mp SET sku = v.sku, aaia_code = v.aaia_code
-                    FROM (VALUES {}) AS v(id, sku, aaia_code)
-                    WHERE mp.id = v.id
-                    """.format(placeholders),
-                    params,
-                )
+            for i in range(0, len(existing_keys), WHEELPROS_LOOKUP_CHUNK):
+                chunk_keys = existing_keys[i : i + WHEELPROS_LOOKUP_CHUNK]
+                values = [
+                    (existing_by_key[k], key_to_mp[k].sku, key_to_mp[k].aaia_code)
+                    for k in chunk_keys
+                ]
+                placeholders = ", ".join(["(%s::bigint, %s, %s)"] * len(values))
+                params = [x for row in values for x in row]
+                with connection.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE master_parts mp SET sku = v.sku, aaia_code = v.aaia_code
+                        FROM (VALUES {}) AS v(id, sku, aaia_code)
+                        WHERE mp.id = v.id
+                        """.format(placeholders),
+                        params,
+                    )
 
-        # (brand_id, part_number) -> MasterPart; id_to_mp already filled from the single lookup above
+        # (brand_id, part_number) -> MasterPart; id_to_mp already filled from lookup above
         brand_part_to_master = {}
         for (b_id, p_num), mp_id in existing_by_key.items():
-            brand_part_to_master[(b_id, p_num)] = id_to_mp[mp_id]
-        new_pairs = [(b_id, p_num) for (b_id, p_num) in pairs if (b_id, p_num) not in existing_by_key]
+            if mp_id is not None and mp_id in id_to_mp:
+                brand_part_to_master[(b_id, p_num)] = id_to_mp[mp_id]
+        new_pairs = [(b_id, p_num) for (b_id, p_num) in pairs if (b_id, p_num) not in brand_part_to_master]
         if new_pairs:
-            with connection.cursor() as cur:
-                cur.execute(
-                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
-                    (tuple(new_pairs),),
-                )
-                for row in cur.fetchall():
-                    mp_id, b_id, p_num = row
-                    mp = src_models.MasterPart()
-                    mp.id = mp_id
-                    mp.brand_id = b_id
-                    mp.part_number = p_num
-                    brand_part_to_master[(b_id, p_num)] = mp
+            for i in range(0, len(new_pairs), WHEELPROS_LOOKUP_CHUNK):
+                chunk = new_pairs[i : i + WHEELPROS_LOOKUP_CHUNK]
+                with connection.cursor() as cur:
+                    cur.execute(
+                        "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                        (tuple(chunk),),
+                    )
+                    for row in cur.fetchall():
+                        mp_id, b_id, p_num = row
+                        mp = src_models.MasterPart()
+                        mp.id = mp_id
+                        mp.brand_id = b_id
+                        mp.part_number = p_num
+                        brand_part_to_master[(b_id, p_num)] = mp
 
         provider_parts_by_key = {}
         for row in batch:
@@ -1031,8 +1051,7 @@ def sync_master_parts_from_wheelpros() -> None:
         logger.info("{} WheelPros batch {}: {} items -> {} master, {} provider (last_id={})".format(
             _LOG_PREFIX, batch_num, len(batch), len(master_parts), len(provider_parts), last_id
         ))
-        connection.close()
-        if len(batch) == BATCH_SIZE_MASTER_PARTS:
+        if len(batch) == BATCH_SIZE_MASTER_PARTS_WHEELPROS:
             time.sleep(BATCH_DELAY_SECONDS)
 
     logger.info("{} Synced {} master parts and {} provider parts from WheelPros total.".format(
