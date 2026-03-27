@@ -2,6 +2,7 @@
 PROVIDER_DISPLAY_NAMES = {
     "TURN_14": "Turn 14",
     "KEYSTONE": "Keystone",
+    "MEYER": "Meyer",
     "ROUGH_COUNTRY": "Rough Country",
     "SDC": "SDC",
     "WHEELPROS": "Wheel Pros",
@@ -11,6 +12,7 @@ PROVIDER_DISPLAY_NAMES = {
 PROVIDER_IMAGE_URLS = {
     "TURN_14": "https://api.aftermarketmonkey.com/uploads/t14_logo.png",
     "KEYSTONE": "https://api.aftermarketmonkey.com/uploads/keystone.png",
+    "MEYER": "https://api.aftermarketmonkey.com/uploads/meyer.png",
     "ROUGH_COUNTRY": "https://api.aftermarketmonkey.com/uploads/rough_country.png",
     "SDC": "",
     "WHEELPROS": "https://api.aftermarketmonkey.com/uploads/wheel_pros_logo.png",
@@ -62,6 +64,14 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketmonkey.com/uploads/wheel_pros_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["sftp_server", "sftp_user", "sftp_password"],
+    },
+    {
+        "kind": enums.BrandProviderKind.MEYER,
+        "name": "Meyer",
+        "description": "Sync pricing and inventory from Meyer Distributing via SFTP (Meyer Pricing + Meyer Inventory files).",
+        "icon_url": "https://api.aftermarketmonkey.com/uploads/meyer.png",
+        "category": "Distributors",
+        "connection_required_fields": ["sftp_user", "sftp_password"],
     },
 ]
 

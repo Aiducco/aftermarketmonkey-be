@@ -567,6 +567,77 @@ class KeystoneParts(django_db_models.Model):
         unique_together = ["vcpn", "brand"]
 
 
+class MeyerBrand(django_db_models.Model):
+    """Manufacturer / brand label from Meyer pricing feed (MFG column)."""
+    external_id = django_db_models.CharField(max_length=512)
+    name = django_db_models.CharField(max_length=512)
+    aaia_code = django_db_models.CharField(max_length=255, null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "meyer_brands"
+        unique_together = [["external_id"]]
+
+
+class BrandMeyerBrandMapping(django_db_models.Model):
+    brand = django_db_models.ForeignKey(
+        Brands, on_delete=django_db_models.CASCADE, related_name="meyer_brand_mappings"
+    )
+    meyer_brand = django_db_models.ForeignKey(
+        MeyerBrand, on_delete=django_db_models.CASCADE, related_name="brand_mappings"
+    )
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "brand_meyer_brand_mapping"
+        unique_together = ["brand", "meyer_brand"]
+
+
+class MeyerParts(django_db_models.Model):
+    """
+    Meyer catalog row: pricing from Meyer Pricing file; availability from Meyer Inventory
+    (joined on Meyer Part / Item Number per brand).
+    """
+    brand = django_db_models.ForeignKey(
+        MeyerBrand, on_delete=django_db_models.CASCADE, related_name="parts"
+    )
+    meyer_part = django_db_models.CharField(max_length=255)
+    mfg_item_number = django_db_models.CharField(max_length=255, null=True, blank=True)
+    description = django_db_models.TextField(null=True, blank=True)
+    jobber_price = django_db_models.DecimalField(max_digits=14, decimal_places=5, null=True, blank=True)
+    cost = django_db_models.DecimalField(max_digits=14, decimal_places=5, null=True, blank=True)
+    core_charge = django_db_models.DecimalField(max_digits=14, decimal_places=5, null=True, blank=True)
+    upc = django_db_models.CharField(max_length=64, null=True, blank=True)
+    map_price = django_db_models.DecimalField(max_digits=14, decimal_places=5, null=True, blank=True)
+    length = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    width = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    height = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    weight = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    category = django_db_models.CharField(max_length=255, null=True, blank=True)
+    sub_category = django_db_models.CharField(max_length=255, null=True, blank=True)
+    is_ltl = django_db_models.BooleanField(default=False)
+    is_discontinued = django_db_models.BooleanField(default=False)
+    is_oversize = django_db_models.BooleanField(default=False)
+    addtl_handling_charge = django_db_models.BooleanField(default=False)
+    available_qty = django_db_models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
+    mfg_qty_available = django_db_models.IntegerField(null=True, blank=True)
+    inventory_ltl = django_db_models.IntegerField(null=True, blank=True)
+    is_stocking = django_db_models.BooleanField(default=False)
+    is_special_order = django_db_models.BooleanField(default=False)
+    raw_data = django_db_models.JSONField(null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "meyer_parts"
+        unique_together = ["meyer_part", "brand"]
+
+
 class WheelProsBrand(django_db_models.Model):
     external_id = django_db_models.CharField(max_length=255)
     name = django_db_models.CharField(max_length=255)

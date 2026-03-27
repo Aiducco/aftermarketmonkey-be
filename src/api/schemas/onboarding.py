@@ -61,6 +61,16 @@ class KeystoneCredentialsSchema(Schema):
     ftp_password = fields.String(required=True)
 
 
+class MeyerCredentialsSchema(Schema):
+    """Meyer Distributing SFTP credentials."""
+    sftp_user = fields.String(required=True)
+    sftp_password = fields.String(required=True)
+    sftp_server = fields.String(required=False, allow_none=True)
+    sftp_directory = fields.String(required=False, allow_none=True)
+    pricing_remote_file = fields.String(required=False, allow_none=True)
+    inventory_remote_file = fields.String(required=False, allow_none=True)
+
+
 class PersonalizationSchema(Schema):
     """Step 3: Tool personalization."""
     preferred_distributor_ids = fields.List(
@@ -73,7 +83,7 @@ class PersonalizationSchema(Schema):
         required=False,
         load_default=list,
     )
-    # Optional: credentials per distributor. Keys: turn_14, keystone
+    # Optional: credentials per distributor. Keys: turn_14, keystone, meyer
     distributor_credentials = fields.Dict(
         required=False,
         allow_none=True,

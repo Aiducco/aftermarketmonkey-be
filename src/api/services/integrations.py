@@ -11,6 +11,22 @@ logger = logging.getLogger(__name__)
 _LOG_PREFIX = '[INTEGRATIONS-SERVICES]'
 
 
+def _provider_ui_metadata(provider: src_models.Providers) -> typing.Dict[str, typing.Optional[str]]:
+    """Display name and icon for catalog / connections UI (same sources as integrations catalog)."""
+    kind_name = (provider.kind_name or "").strip()
+    display = src_constants.PROVIDER_DISPLAY_NAMES.get(kind_name) or provider.name
+    icon = src_constants.PROVIDER_IMAGE_URLS.get(kind_name)
+    if not icon:
+        for entry in src_constants.PROVIDER_CATALOG:
+            if entry["kind"].value == provider.kind:
+                icon = entry.get("icon_url") or ""
+                break
+    return {
+        "provider_display_name": display,
+        "provider_icon_url": icon or None,
+    }
+
+
 def get_providers_catalog(company_id: int) -> typing.Dict:
     """
     Get integrations catalog: all providers with connection status for the company.
@@ -186,7 +202,7 @@ def get_company_providers(company_id: int) -> typing.List[typing.Dict]:
     data = []
     for cp in company_providers:
         provider = cp.provider
-        data.append({
+        row = {
             "id": cp.id,
             "company_id": cp.company_id,
             "provider_id": cp.provider_id,
@@ -201,7 +217,10 @@ def get_company_providers(company_id: int) -> typing.List[typing.Dict]:
             "primary": cp.primary,
             "created_at": cp.created_at.isoformat() if cp.created_at else None,
             "updated_at": cp.updated_at.isoformat() if cp.updated_at else None,
-        })
+        }
+        if provider:
+            row.update(_provider_ui_metadata(provider))
+        data.append(row)
     
     logger.info('{} Found {} company providers for company_id: {}.'.format(
         _LOG_PREFIX, len(data), company_id
@@ -255,6 +274,8 @@ def get_company_provider_by_id(company_id: int, provider_id: int) -> typing.Opti
             "created_at": company_provider.created_at.isoformat() if company_provider.created_at else None,
             "updated_at": company_provider.updated_at.isoformat() if company_provider.updated_at else None,
         }
+        if provider:
+            data.update(_provider_ui_metadata(provider))
         
         logger.info('{} Found company provider with id: {} for company_id: {}.'.format(
             _LOG_PREFIX, provider_id, company_id
