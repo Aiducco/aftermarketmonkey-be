@@ -46,7 +46,9 @@ _LOG_PREFIX = "[PARTS-SERVICES]"
 PROVIDER_IMAGE_URLS = {
     "TURN_14": "https://api.aftermarketmonkey.com/uploads/t14_logo.png",
     "KEYSTONE": "https://api.aftermarketmonkey.com/uploads/keystone.png",
+    "MEYER": "https://api.aftermarketmonkey.com/uploads/meyer.png",
     "ROUGH_COUNTRY": "https://api.aftermarketmonkey.com/uploads/rough_country.png",
+    "WHEELPROS": "https://api.aftermarketmonkey.com/uploads/wheel_pros_logo.png",
     "SDC": "",
 }
 

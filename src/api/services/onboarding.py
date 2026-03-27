@@ -10,6 +10,7 @@ import uuid
 from django.contrib.auth import models as auth_models
 from django.db import transaction
 
+from src import constants as src_constants
 from src import enums as src_enums
 from src import models as src_models
 
@@ -162,7 +163,8 @@ def save_personalization(
     distributor_credentials format:
     {
         "turn_14": {"client_id": "...", "client_secret": "..."},
-        "keystone": {"ftp_user": "...", "ftp_password": "..."}
+        "keystone": {"ftp_user": "...", "ftp_password": "..."},
+        "meyer": {"sftp_user": "...", "sftp_password": "...", "sftp_server": "optional"}
     }
     """
     company = src_models.Company.objects.get(id=company_id)
@@ -237,6 +239,35 @@ def _upsert_company_providers(company: src_models.Company, credentials: dict) ->
                     },
                 )
 
+    # Meyer: kind=6 (MEYER), SFTP feeds
+    if "meyer" in credentials:
+        creds = credentials["meyer"]
+        if creds.get("sftp_user") and creds.get("sftp_password"):
+            provider = src_models.Providers.objects.filter(
+                kind=src_enums.BrandProviderKind.MEYER.value
+            ).first()
+            if provider:
+                cred_dict = {
+                    "sftp_user": creds["sftp_user"],
+                    "sftp_password": creds["sftp_password"],
+                }
+                if creds.get("sftp_server"):
+                    cred_dict["sftp_server"] = creds["sftp_server"]
+                if creds.get("sftp_directory"):
+                    cred_dict["sftp_directory"] = creds["sftp_directory"]
+                if creds.get("pricing_remote_file"):
+                    cred_dict["pricing_remote_file"] = creds["pricing_remote_file"]
+                if creds.get("inventory_remote_file"):
+                    cred_dict["inventory_remote_file"] = creds["inventory_remote_file"]
+                src_models.CompanyProviders.objects.update_or_create(
+                    company=company,
+                    provider=provider,
+                    defaults={
+                        "credentials": cred_dict,
+                        "primary": False,
+                    },
+                )
+
 
 def get_onboarding_status(company_id: int) -> dict:
     """Get current onboarding status and available options."""
@@ -245,13 +276,19 @@ def get_onboarding_status(company_id: int) -> dict:
     except src_models.Company.DoesNotExist:
         return {"onboarding_step": 0, "company_id": None}
 
-    # Get available distributors (Turn14, Keystone)
-    providers = src_models.Providers.objects.filter(
-        kind__in=[
-            src_enums.BrandProviderKind.TURN_14.value,
-            src_enums.BrandProviderKind.KEYSTONE.value,
-        ]
-    ).values("id", "name", "kind_name")
+    # Integrations catalog providers available during onboarding (same kinds as full catalog subset)
+    catalog_kinds = [e["kind"].value for e in src_constants.PROVIDER_CATALOG]
+    providers = src_models.Providers.objects.filter(kind__in=catalog_kinds).values(
+        "id", "name", "kind_name", "kind"
+    )
+    available_distributors = []
+    for p in providers:
+        row = dict(p)
+        kn = row.get("kind_name") or ""
+        row["display_name"] = src_constants.PROVIDER_DISPLAY_NAMES.get(kn, row.get("name"))
+        icon = src_constants.PROVIDER_IMAGE_URLS.get(kn) or ""
+        row["icon_url"] = icon if icon else None
+        available_distributors.append(row)
 
     try:
         prefs = company.onboarding_preferences
@@ -270,7 +307,7 @@ def get_onboarding_status(company_id: int) -> dict:
         "state_province": company.state_province,
         "preferred_distributor_ids": preferred_ids,
         "top_categories": top_cats,
-        "available_distributors": list(providers),
+        "available_distributors": available_distributors,
         "business_types": BUSINESS_TYPES,
         "categories_options": TOP_CATEGORIES,
     }
@@ -282,9 +319,32 @@ def get_distributor_credentials_info() -> dict:
         "turn_14": {
             "required": ["client_id", "client_secret"],
             "description": "OAuth2 credentials from Turn 14 API access",
+            "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("TURN_14", "Turn 14"),
+            "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("TURN_14") or None,
         },
         "keystone": {
             "required": ["ftp_user", "ftp_password"],
             "description": "FTP credentials for Keystone inventory access",
+            "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("KEYSTONE", "Keystone"),
+            "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("KEYSTONE") or None,
+        },
+        "rough_country": {
+            "required": [],
+            "description": "Rough Country public feed (no credentials required)",
+            "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("ROUGH_COUNTRY", "Rough Country"),
+            "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("ROUGH_COUNTRY") or None,
+        },
+        "wheelpros": {
+            "required": ["sftp_server", "sftp_user", "sftp_password"],
+            "description": "SFTP credentials for Wheel Pros inventory feeds",
+            "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("WHEELPROS", "Wheel Pros"),
+            "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("WHEELPROS") or None,
+        },
+        "meyer": {
+            "required": ["sftp_user", "sftp_password"],
+            "optional": ["sftp_server", "sftp_directory", "pricing_remote_file", "inventory_remote_file"],
+            "description": "SFTP credentials for Meyer Distributing (Meyer Pricing + Meyer Inventory CSVs)",
+            "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("MEYER", "Meyer"),
+            "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("MEYER") or None,
         },
     }

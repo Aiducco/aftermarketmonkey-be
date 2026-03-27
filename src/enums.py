@@ -22,6 +22,7 @@ class BrandProviderKind(enum.Enum):
     KEYSTONE = 3
     ROUGH_COUNTRY = 4
     WHEELPROS = 5
+    MEYER = 6
 
 class BrandProviderStatus(enum.Enum):
     ACTIVE = 1

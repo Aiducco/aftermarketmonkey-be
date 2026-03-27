@@ -1,6 +1,6 @@
 """
 Sync MasterPart, ProviderPart, ProviderPartInventory, and ProviderPartCompanyPricing
-from Turn14, Keystone, and Rough Country provider data.
+from Turn14, Keystone, Meyer, Rough Country, and WheelPros provider data.
 """
 import logging
 import time
@@ -428,6 +428,261 @@ def sync_master_parts_from_keystone() -> None:
             time.sleep(BATCH_DELAY_SECONDS)
 
     logger.info("{} Synced {} master parts and {} provider parts from Keystone total.".format(
+        _LOG_PREFIX, total_master, total_provider
+    ))
+
+
+def sync_master_parts_from_meyer() -> None:
+    """
+    Create/update MasterPart and ProviderPart from MeyerParts (Meyer Pricing + Inventory feeds).
+    Only processes rows whose MeyerBrand has a BrandMeyerBrandMapping.
+
+    Existing master part resolution (same idea as WheelPros): prefer (brand_id, sku) where sku
+    equals Meyer ``meyer_part``, else (brand_id, part_number) where part_number is ``mfg_item_number``.
+    New rows: INSERT with part_number=mfg_item_number, sku=meyer_part; existing: UPDATE sku/aaia only.
+    """
+    logger.info("{} Syncing master parts from Meyer (batched, cursor-based).".format(_LOG_PREFIX))
+
+    meyer_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.MEYER.value,
+    ).first()
+    if not meyer_provider:
+        logger.info("{} No Meyer provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandMeyerBrandMapping.objects.select_related("brand", "meyer_brand")
+    )
+    my_brand_to_brand = {m.meyer_brand_id: m.brand for m in mappings}
+    my_brand_to_aaia = {
+        m.meyer_brand_id: (m.brand.aaia_code if m.brand else None)
+        for m in mappings
+    }
+    if not my_brand_to_brand:
+        logger.info("{} No BrandMeyerBrandMapping found. Nothing to sync.".format(_LOG_PREFIX))
+        return
+
+    mapped_ids = set(my_brand_to_brand.keys())
+
+    total_master = 0
+    total_provider = 0
+    batch_num = 0
+    last_id = 0
+
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.MeyerParts.objects.filter(
+                brand_id__in=mapped_ids,
+                id__gt=last_id,
+            )
+            .order_by("id")
+            .values(
+                "id",
+                "meyer_part",
+                "brand_id",
+                "mfg_item_number",
+                "description",
+            )[:BATCH_SIZE_MASTER_PARTS]
+        )
+        if not batch:
+            break
+
+        last_id = batch[-1]["id"]
+        seen = set()
+        master_parts_list = []
+        meyer_part_to_brand_part = {}
+        part_to_sku = {}
+
+        for row in batch:
+            brand = my_brand_to_brand.get(row["brand_id"])
+            if not brand:
+                continue
+
+            part_number = row.get("mfg_item_number") or ""
+            if isinstance(part_number, str):
+                part_number = part_number.strip()
+            else:
+                part_number = str(part_number or "").strip()
+            if not part_number:
+                continue
+
+            meyer_part = row.get("meyer_part") or ""
+            if isinstance(meyer_part, str):
+                meyer_part = meyer_part.strip()
+            else:
+                meyer_part = str(meyer_part or "").strip()
+            if not meyer_part:
+                continue
+
+            key = (brand.id, part_number)
+            if key not in seen:
+                seen.add(key)
+                aaia = my_brand_to_aaia.get(row["brand_id"])
+                master_parts_list.append(
+                    src_models.MasterPart(
+                        brand=brand,
+                        part_number=part_number,
+                        sku=meyer_part,
+                        description=row.get("description"),
+                        aaia_code=aaia,
+                        image_url=None,
+                    )
+                )
+            part_to_sku[key] = meyer_part
+            meyer_part_to_brand_part[meyer_part] = (brand.id, part_number)
+
+        if not master_parts_list:
+            connection.close()
+            if len(batch) == BATCH_SIZE_MASTER_PARTS:
+                time.sleep(BATCH_DELAY_SECONDS)
+            continue
+
+        pairs = list(seen)
+        existing_by_key = {}
+        id_to_mp = {}
+        existing_by_sku = {}
+        existing_by_part = {}
+        if pairs:
+            for i in range(0, len(pairs), WHEELPROS_LOOKUP_CHUNK):
+                chunk_pairs = pairs[i : i + WHEELPROS_LOOKUP_CHUNK]
+                chunk_sku_pairs = list(
+                    {(b_id, part_to_sku[(b_id, pn)]) for (b_id, pn) in chunk_pairs}
+                )
+                with connection.cursor() as cur:
+                    cur.execute(
+                        "SELECT id, brand_id, part_number, sku FROM master_parts WHERE (brand_id, sku) IN %s",
+                        (tuple(chunk_sku_pairs),),
+                    )
+                    for row in cur.fetchall():
+                        mp_id, b_id, p_num, sku_val = row
+                        if mp_id not in id_to_mp:
+                            mp = src_models.MasterPart()
+                            mp.id = mp_id
+                            mp.brand_id = b_id
+                            mp.part_number = p_num
+                            id_to_mp[mp_id] = mp
+                        if sku_val is not None:
+                            sk_key = (b_id, (sku_val or "").strip())
+                            if sk_key not in existing_by_sku:
+                                existing_by_sku[sk_key] = []
+                            existing_by_sku[sk_key].append((mp_id, p_num))
+                with connection.cursor() as cur:
+                    cur.execute(
+                        "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                        (tuple(chunk_pairs),),
+                    )
+                    for row in cur.fetchall():
+                        mp_id, b_id, p_num = row
+                        if mp_id not in id_to_mp:
+                            mp = src_models.MasterPart()
+                            mp.id = mp_id
+                            mp.brand_id = b_id
+                            mp.part_number = p_num
+                            id_to_mp[mp_id] = mp
+                        if (b_id, p_num) not in existing_by_part:
+                            existing_by_part[(b_id, p_num)] = mp_id
+            for (b_id, p_num) in pairs:
+                feed_sku = part_to_sku[(b_id, p_num)]
+                sku_candidates = existing_by_sku.get((b_id, feed_sku)) or []
+                sku_match = next((mp_id for mp_id, pn in sku_candidates if pn == p_num), None)
+                if sku_match is None and sku_candidates:
+                    sku_match = sku_candidates[0][0]
+                existing_by_key[(b_id, p_num)] = sku_match or existing_by_part.get((b_id, p_num))
+
+        new_parts = [
+            mp for mp in master_parts_list if existing_by_key.get((mp.brand_id, mp.part_number)) is None
+        ]
+        existing_keys = [k for k in pairs if existing_by_key.get(k) is not None]
+
+        if new_parts:
+            pgbulk.upsert(
+                src_models.MasterPart,
+                new_parts,
+                unique_fields=["brand", "part_number"],
+                update_fields=[],
+            )
+            total_master += len(new_parts)
+
+        if existing_keys:
+            key_to_mp = {(mp.brand_id, mp.part_number): mp for mp in master_parts_list}
+            for i in range(0, len(existing_keys), WHEELPROS_LOOKUP_CHUNK):
+                chunk_keys = existing_keys[i : i + WHEELPROS_LOOKUP_CHUNK]
+                values = [
+                    (existing_by_key[k], key_to_mp[k].sku, key_to_mp[k].aaia_code)
+                    for k in chunk_keys
+                ]
+                placeholders = ", ".join(["(%s::bigint, %s, %s)"] * len(values))
+                params = [x for row_vals in values for x in row_vals]
+                with connection.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE master_parts mp SET sku = v.sku, aaia_code = v.aaia_code
+                        FROM (VALUES {}) AS v(id, sku, aaia_code)
+                        WHERE mp.id = v.id
+                        """.format(placeholders),
+                        params,
+                    )
+
+        brand_part_to_master = {}
+        for (b_id, p_num), mp_id in existing_by_key.items():
+            if mp_id is not None and mp_id in id_to_mp:
+                brand_part_to_master[(b_id, p_num)] = id_to_mp[mp_id]
+        new_pairs = [(b_id, p_num) for (b_id, p_num) in pairs if (b_id, p_num) not in brand_part_to_master]
+        if new_pairs:
+            for i in range(0, len(new_pairs), WHEELPROS_LOOKUP_CHUNK):
+                chunk = new_pairs[i : i + WHEELPROS_LOOKUP_CHUNK]
+                with connection.cursor() as cur:
+                    cur.execute(
+                        "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                        (tuple(chunk),),
+                    )
+                    for row in cur.fetchall():
+                        mp_id, b_id, p_num = row
+                        mp = src_models.MasterPart()
+                        mp.id = mp_id
+                        mp.brand_id = b_id
+                        mp.part_number = p_num
+                        brand_part_to_master[(b_id, p_num)] = mp
+
+        provider_parts_by_key = {}
+        for row in batch:
+            mp_ext = row.get("meyer_part")
+            if isinstance(mp_ext, str):
+                mp_ext = mp_ext.strip()
+            else:
+                mp_ext = str(mp_ext or "").strip()
+            key_bp = meyer_part_to_brand_part.get(mp_ext)
+            if not key_bp:
+                continue
+            master_part = brand_part_to_master.get(key_bp)
+            if not master_part:
+                continue
+            pp_key = (master_part.id, meyer_provider.id)
+            provider_parts_by_key[pp_key] = src_models.ProviderPart(
+                master_part=master_part,
+                provider=meyer_provider,
+                provider_external_id=mp_ext,
+            )
+
+        provider_parts = list(provider_parts_by_key.values())
+        if provider_parts:
+            pgbulk.upsert(
+                src_models.ProviderPart,
+                provider_parts,
+                unique_fields=["master_part", "provider"],
+                update_fields=["provider_external_id"],
+            )
+            total_provider += len(provider_parts)
+
+        logger.info("{} Meyer batch {}: {} items -> {} master, {} provider (last_id={})".format(
+            _LOG_PREFIX, batch_num, len(batch), len(master_parts_list), len(provider_parts), last_id
+        ))
+        connection.close()
+        if len(batch) == BATCH_SIZE_MASTER_PARTS:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    logger.info("{} Synced {} master parts and {} provider parts from Meyer total.".format(
         _LOG_PREFIX, total_master, total_provider
     ))
 
@@ -1499,6 +1754,112 @@ def sync_provider_inventory_from_keystone() -> None:
     logger.info("{} Synced {} Keystone inventory records total.".format(_LOG_PREFIX, total_upserted))
 
 
+def _meyer_warehouse_availability(row: typing.Dict) -> typing.Optional[typing.Dict]:
+    out = {}
+    if row.get("is_stocking") is not None:
+        out["stocking"] = bool(row.get("is_stocking"))
+    if row.get("is_special_order") is not None:
+        out["special_order"] = bool(row.get("is_special_order"))
+    if row.get("inventory_ltl") is not None:
+        out["ltl"] = row.get("inventory_ltl")
+    return out if out else None
+
+
+def sync_provider_inventory_from_meyer() -> None:
+    """Sync ProviderPartInventory from MeyerParts (Available + manufacturer qty)."""
+    logger.info("{} Syncing provider inventory from Meyer.".format(_LOG_PREFIX))
+
+    meyer_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.MEYER.value,
+    ).first()
+    if not meyer_provider:
+        logger.info("{} No Meyer provider found.".format(_LOG_PREFIX))
+        return
+
+    provider_parts = {
+        pp.provider_external_id: pp
+        for pp in src_models.ProviderPart.objects.filter(provider=meyer_provider)
+    }
+
+    now = timezone.now()
+    total_upserted = 0
+    batch_num = 0
+    last_id = 0
+
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.MeyerParts.objects.filter(id__gt=last_id)
+            .order_by("id")
+            .values(
+                "id",
+                "meyer_part",
+                "available_qty",
+                "mfg_qty_available",
+                "is_stocking",
+                "is_special_order",
+                "inventory_ltl",
+            )[:BATCH_SIZE_INVENTORY]
+        )
+        if not batch:
+            break
+
+        last_id = batch[-1]["id"]
+        to_upsert = []
+        for mp in batch:
+            ext = mp.get("meyer_part")
+            if isinstance(ext, str):
+                ext = ext.strip()
+            else:
+                ext = str(ext or "").strip()
+            pp = provider_parts.get(ext)
+            if not pp:
+                continue
+            avail = mp.get("available_qty")
+            wh_total = 0
+            if avail is not None:
+                try:
+                    wh_total = int(float(avail))
+                except (TypeError, ValueError):
+                    wh_total = 0
+            to_upsert.append(
+                src_models.ProviderPartInventory(
+                    provider_part=pp,
+                    warehouse_total_qty=wh_total,
+                    manufacturer_inventory=mp.get("mfg_qty_available"),
+                    manufacturer_esd=None,
+                    warehouse_availability=_meyer_warehouse_availability(mp),
+                    last_synced_at=now,
+                    updated_at=now,
+                )
+            )
+
+        if to_upsert:
+            pgbulk.upsert(
+                src_models.ProviderPartInventory,
+                to_upsert,
+                unique_fields=["provider_part"],
+                update_fields=[
+                    "warehouse_total_qty",
+                    "manufacturer_inventory",
+                    "manufacturer_esd",
+                    "warehouse_availability",
+                    "last_synced_at",
+                    "updated_at",
+                ],
+            )
+            total_upserted += len(to_upsert)
+
+        logger.info("{} Meyer inventory batch {}: {} records (last_id={})".format(
+            _LOG_PREFIX, batch_num, len(to_upsert), last_id
+        ))
+        connection.close()
+        if len(batch) == BATCH_SIZE_INVENTORY:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    logger.info("{} Synced {} Meyer inventory records total.".format(_LOG_PREFIX, total_upserted))
+
+
 def _extract_turn14_prices(pricelists: typing.Any) -> typing.Tuple[typing.Any, typing.Any, typing.Any, typing.Any]:
     """Extract jobber_price, map_price, msrp, retail_price from Turn14 pricelists.
     Supports both key-based items (jobber_price, map_price, ...) and name+price items
@@ -1709,21 +2070,113 @@ def sync_provider_pricing_from_keystone() -> None:
     logger.info("{} Synced {} Keystone pricing records total.".format(_LOG_PREFIX, total_upserted))
 
 
+def sync_provider_pricing_from_meyer() -> None:
+    """
+    Sync ProviderPartCompanyPricing from MeyerParts (Your Price = cost, Jobber, MAP).
+    """
+    logger.info("{} Syncing provider pricing from Meyer.".format(_LOG_PREFIX))
+
+    meyer_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.MEYER.value,
+    ).first()
+    if not meyer_provider:
+        logger.info("{} No Meyer provider found.".format(_LOG_PREFIX))
+        return
+
+    provider_parts = {
+        pp.provider_external_id: pp
+        for pp in src_models.ProviderPart.objects.filter(provider=meyer_provider)
+    }
+
+    company_ids = list(
+        src_models.CompanyProviders.objects.filter(
+            provider=meyer_provider,
+            provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
+        ).values_list("company_id", flat=True).distinct()
+    )
+    companies = {c.id: c for c in src_models.Company.objects.filter(id__in=company_ids)} if company_ids else {}
+
+    now = timezone.now()
+    total_upserted = 0
+    batch_num = 0
+    last_id = 0
+
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.MeyerParts.objects.filter(id__gt=last_id)
+            .order_by("id")
+            .values("id", "meyer_part", "cost", "jobber_price", "map_price")[:BATCH_SIZE_PRICING]
+        )
+        if not batch:
+            break
+
+        last_id = batch[-1]["id"]
+        companies_list = list(companies.values())
+        to_upsert = []
+        for mp in batch:
+            ext = mp.get("meyer_part")
+            if isinstance(ext, str):
+                ext = ext.strip()
+            else:
+                ext = str(ext or "").strip()
+            pp = provider_parts.get(ext)
+            if not pp:
+                continue
+            cost = mp.get("cost")
+            jobber = mp.get("jobber_price")
+            map_p = mp.get("map_price")
+            for company in companies_list:
+                to_upsert.append(
+                    src_models.ProviderPartCompanyPricing(
+                        provider_part=pp,
+                        company=company,
+                        cost=cost,
+                        jobber_price=jobber,
+                        map_price=map_p,
+                        msrp=None,
+                        retail_price=None,
+                        last_synced_at=now,
+                    )
+                )
+
+        if to_upsert:
+            pgbulk.upsert(
+                src_models.ProviderPartCompanyPricing,
+                to_upsert,
+                unique_fields=["provider_part", "company"],
+                update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
+            )
+            total_upserted += len(to_upsert)
+
+        logger.info("{} Meyer pricing batch {}: {} records (last_id={})".format(
+            _LOG_PREFIX, batch_num, len(to_upsert), last_id
+        ))
+        connection.close()
+        if len(batch) == BATCH_SIZE_PRICING:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    logger.info("{} Synced {} Meyer pricing records total.".format(_LOG_PREFIX, total_upserted))
+
+
 def sync_all_master_parts() -> None:
     """
     Run all master parts syncs in sequence:
     1. Master parts + provider parts from Turn14
     2. Master parts + provider parts from Keystone
-    3. Master parts + provider parts from Rough Country
-    4. Master parts + provider parts from WheelPros (wheels, tires, accessories)
-    5. Provider inventory from Turn14
-    6. Provider inventory from Keystone
-    7. Provider inventory from Rough Country
-    8. Provider inventory from WheelPros
-    9. Provider pricing from Turn14
-    10. Provider pricing from Keystone
-    11. Provider pricing from Rough Country
-    12. Provider pricing from WheelPros
+    3. Master parts + provider parts from Meyer
+    4. Master parts + provider parts from Rough Country
+    5. Master parts + provider parts from WheelPros (wheels, tires, accessories)
+    6. Provider inventory from Turn14
+    7. Provider inventory from Keystone
+    8. Provider inventory from Meyer
+    9. Provider inventory from Rough Country
+    10. Provider inventory from WheelPros
+    11. Provider pricing from Turn14
+    12. Provider pricing from Keystone
+    13. Provider pricing from Meyer
+    14. Provider pricing from Rough Country
+    15. Provider pricing from WheelPros
     """
     logger.info("{} Starting full master parts sync.".format(_LOG_PREFIX))
 
@@ -1731,6 +2184,9 @@ def sync_all_master_parts() -> None:
     connection.close()
 
     sync_master_parts_from_keystone()
+    connection.close()
+
+    sync_master_parts_from_meyer()
     connection.close()
 
     sync_master_parts_from_rough_country()
@@ -1745,6 +2201,9 @@ def sync_all_master_parts() -> None:
     sync_provider_inventory_from_keystone()
     connection.close()
 
+    sync_provider_inventory_from_meyer()
+    connection.close()
+
     sync_provider_inventory_from_rough_country()
     connection.close()
 
@@ -1755,6 +2214,9 @@ def sync_all_master_parts() -> None:
     connection.close()
 
     sync_provider_pricing_from_keystone()
+    connection.close()
+
+    sync_provider_pricing_from_meyer()
     connection.close()
 
     sync_provider_pricing_from_rough_country()

@@ -240,6 +240,17 @@ WHEELPROS_ACCESSORIES_LOCAL_PATH = os.environ.get("WHEELPROS_ACCESSORIES_LOCAL_P
 # Set to False to verify host keys against ~/.ssh/known_hosts (recommended for production).
 WHEELPROS_SFTP_AUTO_ADD_HOST_KEY = os.environ.get("WHEELPROS_SFTP_AUTO_ADD_HOST_KEY", "true").lower() in ("true", "1", "yes")
 
+# Meyer Distributing SFTP (Meyer Pricing.csv + Meyer Inventory.csv under uploads/). Credentials via env or CompanyProviders.
+MEYER_SFTP_HOST = os.environ.get("MEYER_SFTP_HOST", "54.145.82.238")
+MEYER_SFTP_PORT = int(os.environ.get("MEYER_SFTP_PORT", "22"))
+MEYER_SFTP_USER = os.environ.get("MEYER_SFTP_USER", "")
+MEYER_SFTP_PASSWORD = os.environ.get("MEYER_SFTP_PASSWORD", "")
+MEYER_SFTP_DIRECTORY = os.environ.get("MEYER_SFTP_DIRECTORY", "uploads")
+MEYER_PRICING_REMOTE_FILE = os.environ.get("MEYER_PRICING_REMOTE_FILE", "Meyer Pricing.csv")
+MEYER_INVENTORY_REMOTE_FILE = os.environ.get("MEYER_INVENTORY_REMOTE_FILE", "Meyer Inventory.csv")
+MEYER_PRICING_LOCAL_PATH = os.environ.get("MEYER_PRICING_LOCAL_PATH", "/tmp/meyer_pricing.csv")
+MEYER_INVENTORY_LOCAL_PATH = os.environ.get("MEYER_INVENTORY_LOCAL_PATH", "/tmp/meyer_inventory.csv")
+
 # Meilisearch (backend: master key for indexing; FE will use a public read-only key)
 MEILISEARCH_HOST = "http://localhost:7700"
 MEILISEARCH_MASTER_KEY = ""  # Set via env; required for indexing. Create a separate search-only key for FE.
