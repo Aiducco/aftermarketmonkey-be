@@ -62,13 +62,23 @@ class KeystoneCredentialsSchema(Schema):
 
 
 class MeyerCredentialsSchema(Schema):
-    """Meyer Distributing SFTP credentials."""
+    """Meyer Distributing SFTP credentials (aligned with MeyerSFTPClient / integrations catalog)."""
+    sftp_server = fields.String(required=True)
     sftp_user = fields.String(required=True)
     sftp_password = fields.String(required=True)
-    sftp_server = fields.String(required=False, allow_none=True)
+    sftp_port = fields.String(required=False, allow_none=True)
     sftp_directory = fields.String(required=False, allow_none=True)
     pricing_remote_file = fields.String(required=False, allow_none=True)
     inventory_remote_file = fields.String(required=False, allow_none=True)
+
+
+class WheelProsCredentialsSchema(Schema):
+    """Wheel Pros SFTP credentials (aligned with WheelProsSFTPClient / integrations catalog)."""
+    sftp_server = fields.String(required=True)
+    sftp_user = fields.String(required=True)
+    sftp_password = fields.String(required=True)
+    sftp_port = fields.String(required=False, allow_none=True)
+    sftp_path = fields.String(required=False, allow_none=True)
 
 
 class PersonalizationSchema(Schema):
@@ -83,7 +93,7 @@ class PersonalizationSchema(Schema):
         required=False,
         load_default=list,
     )
-    # Optional: credentials per distributor. Keys: turn_14, keystone, meyer
+    # Optional: credentials per distributor. Keys: turn_14, keystone, meyer, wheelpros
     distributor_credentials = fields.Dict(
         required=False,
         allow_none=True,

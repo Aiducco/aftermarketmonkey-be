@@ -12,7 +12,7 @@ PROVIDER_DISPLAY_NAMES = {
 PROVIDER_IMAGE_URLS = {
     "TURN_14": "https://api.aftermarketmonkey.com/uploads/t14_logo.png",
     "KEYSTONE": "https://api.aftermarketmonkey.com/uploads/keystone.png",
-    "MEYER": "https://api.aftermarketmonkey.com/uploads/meyer.png",
+    "MEYER": "https://api.aftermarketmonkey.com/uploads/meyer_logo.png",
     "ROUGH_COUNTRY": "https://api.aftermarketmonkey.com/uploads/rough_country.png",
     "SDC": "",
     "WHEELPROS": "https://api.aftermarketmonkey.com/uploads/wheel_pros_logo.png",
@@ -64,14 +64,22 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketmonkey.com/uploads/wheel_pros_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["sftp_server", "sftp_user", "sftp_password"],
+        # Remote CSV path per feed (wheel/tire/accessories); defaults in settings if omitted
+        "connection_optional_fields": ["sftp_port", "sftp_path"],
     },
     {
         "kind": enums.BrandProviderKind.MEYER,
         "name": "Meyer",
         "description": "Sync pricing and inventory from Meyer Distributing via SFTP (Meyer Pricing + Meyer Inventory files).",
-        "icon_url": "https://api.aftermarketmonkey.com/uploads/meyer.png",
+        "icon_url": "https://api.aftermarketmonkey.com/uploads/meyer_logo.png",
         "category": "Distributors",
-        "connection_required_fields": ["sftp_user", "sftp_password"],
+        "connection_required_fields": ["sftp_server", "sftp_user", "sftp_password"],
+        "connection_optional_fields": [
+            "sftp_port",
+            "sftp_directory",
+            "pricing_remote_file",
+            "inventory_remote_file",
+        ],
     },
 ]
 

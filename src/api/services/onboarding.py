@@ -164,7 +164,22 @@ def save_personalization(
     {
         "turn_14": {"client_id": "...", "client_secret": "..."},
         "keystone": {"ftp_user": "...", "ftp_password": "..."},
-        "meyer": {"sftp_user": "...", "sftp_password": "...", "sftp_server": "optional"}
+        "meyer": {
+            "sftp_server": "...",
+            "sftp_user": "...",
+            "sftp_password": "...",
+            "sftp_port": "optional",
+            "sftp_directory": "optional",
+            "pricing_remote_file": "optional",
+            "inventory_remote_file": "optional",
+        },
+        "wheelpros": {
+            "sftp_server": "...",
+            "sftp_user": "...",
+            "sftp_password": "...",
+            "sftp_port": "optional",
+            "sftp_path": "optional remote CSV path",
+        },
     }
     """
     company = src_models.Company.objects.get(id=company_id)
@@ -239,26 +254,54 @@ def _upsert_company_providers(company: src_models.Company, credentials: dict) ->
                     },
                 )
 
-    # Meyer: kind=6 (MEYER), SFTP feeds
+    # Meyer: kind=6 (MEYER), SFTP feeds (same keys as integrations catalog / MeyerSFTPClient)
     if "meyer" in credentials:
         creds = credentials["meyer"]
-        if creds.get("sftp_user") and creds.get("sftp_password"):
+        if creds.get("sftp_server") and creds.get("sftp_user") and creds.get("sftp_password"):
             provider = src_models.Providers.objects.filter(
                 kind=src_enums.BrandProviderKind.MEYER.value
             ).first()
             if provider:
                 cred_dict = {
-                    "sftp_user": creds["sftp_user"],
-                    "sftp_password": creds["sftp_password"],
+                    "sftp_server": str(creds["sftp_server"]).strip(),
+                    "sftp_user": str(creds["sftp_user"]).strip(),
+                    "sftp_password": str(creds["sftp_password"]).strip(),
                 }
-                if creds.get("sftp_server"):
-                    cred_dict["sftp_server"] = creds["sftp_server"]
-                if creds.get("sftp_directory"):
-                    cred_dict["sftp_directory"] = creds["sftp_directory"]
-                if creds.get("pricing_remote_file"):
-                    cred_dict["pricing_remote_file"] = creds["pricing_remote_file"]
-                if creds.get("inventory_remote_file"):
-                    cred_dict["inventory_remote_file"] = creds["inventory_remote_file"]
+                for opt in (
+                    "sftp_port",
+                    "sftp_directory",
+                    "pricing_remote_file",
+                    "inventory_remote_file",
+                ):
+                    v = creds.get(opt)
+                    if v is not None and str(v).strip():
+                        cred_dict[opt] = str(v).strip()
+                src_models.CompanyProviders.objects.update_or_create(
+                    company=company,
+                    provider=provider,
+                    defaults={
+                        "credentials": cred_dict,
+                        "primary": False,
+                    },
+                )
+
+    # Wheel Pros: SFTP (same keys as WheelProsSFTPClient)
+    if "wheelpros" in credentials:
+        creds = credentials["wheelpros"]
+        if creds.get("sftp_server") and creds.get("sftp_user") and creds.get("sftp_password"):
+            provider = src_models.Providers.objects.filter(
+                kind=src_enums.BrandProviderKind.WHEELPROS.value
+            ).first()
+            if provider:
+                cred_dict = {
+                    "sftp_server": str(creds["sftp_server"]).strip(),
+                    "sftp_user": str(creds["sftp_user"]).strip(),
+                    "sftp_password": str(creds["sftp_password"]).strip(),
+                }
+                for opt in ("sftp_port", "sftp_path"):
+                    v = creds.get(opt)
+                    if v is not None and str(v).strip():
+                        cred_dict[opt] = str(v).strip()
                 src_models.CompanyProviders.objects.update_or_create(
                     company=company,
                     provider=provider,
@@ -336,14 +379,20 @@ def get_distributor_credentials_info() -> dict:
         },
         "wheelpros": {
             "required": ["sftp_server", "sftp_user", "sftp_password"],
-            "description": "SFTP credentials for Wheel Pros inventory feeds",
+            "optional": ["sftp_port", "sftp_path"],
+            "description": "SFTP credentials for Wheel Pros (optional sftp_path = remote CSV path per feed)",
             "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("WHEELPROS", "Wheel Pros"),
             "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("WHEELPROS") or None,
         },
         "meyer": {
-            "required": ["sftp_user", "sftp_password"],
-            "optional": ["sftp_server", "sftp_directory", "pricing_remote_file", "inventory_remote_file"],
-            "description": "SFTP credentials for Meyer Distributing (Meyer Pricing + Meyer Inventory CSVs)",
+            "required": ["sftp_server", "sftp_user", "sftp_password"],
+            "optional": [
+                "sftp_port",
+                "sftp_directory",
+                "pricing_remote_file",
+                "inventory_remote_file",
+            ],
+            "description": "SFTP credentials for Meyer Distributing (remote directory + pricing/inventory filenames optional)",
             "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("MEYER", "Meyer"),
             "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("MEYER") or None,
         },

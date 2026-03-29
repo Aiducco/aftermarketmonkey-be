@@ -11,6 +11,42 @@ logger = logging.getLogger(__name__)
 _LOG_PREFIX = '[INTEGRATIONS-SERVICES]'
 
 
+def _normalize_credential_value(value: typing.Any) -> typing.Optional[typing.Any]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and value != value:
+            return None
+        return value
+    s = str(value).strip()
+    return s if s else None
+
+
+def _build_credentials_from_catalog_entry(
+    catalog_entry: typing.Dict[str, typing.Any],
+    credentials: typing.Dict[str, typing.Any],
+) -> typing.Tuple[typing.Optional[typing.Dict[str, typing.Any]], typing.Optional[str]]:
+    """
+    Validate connection_required_fields and merge optional non-empty values from connection_optional_fields.
+    """
+    required = catalog_entry.get("connection_required_fields", []) or []
+    optional = catalog_entry.get("connection_optional_fields", []) or []
+    if required:
+        missing = [f for f in required if not _normalize_credential_value(credentials.get(f))]
+        if missing:
+            return None, "Missing required fields: {}".format(", ".join(missing))
+    creds: typing.Dict[str, typing.Any] = {}
+    for k in required:
+        v = _normalize_credential_value(credentials.get(k))
+        if v is not None:
+            creds[k] = v
+    for k in optional:
+        v = _normalize_credential_value(credentials.get(k))
+        if v is not None:
+            creds[k] = v
+    return creds, None
+
+
 def _provider_ui_metadata(provider: src_models.Providers) -> typing.Dict[str, typing.Optional[str]]:
     """Display name and icon for catalog / connections UI (same sources as integrations catalog)."""
     kind_name = (provider.kind_name or "").strip()
@@ -78,6 +114,7 @@ def get_providers_catalog(company_id: int) -> typing.Dict:
             "icon_url": entry.get("icon_url") or None,
             "category": entry.get("category", ""),
             "connection_required_fields": entry.get("connection_required_fields", []),
+            "connection_optional_fields": entry.get("connection_optional_fields", []),
             "connected": connected,
             "company_provider_id": company_provider.id if company_provider else None,
             "kind": kind_value,
@@ -124,14 +161,9 @@ def connect_provider(
     if not catalog_entry:
         return None, "Provider not found in catalog"
 
-    required = catalog_entry.get("connection_required_fields", [])
-    if required:
-        missing = [f for f in required if not (credentials.get(f) or "").strip()]
-        if missing:
-            return None, f"Missing required fields: {', '.join(missing)}"
-
-    # Build credentials dict from required fields only
-    creds = {k: credentials.get(k) for k in required} if required else {}
+    creds, err = _build_credentials_from_catalog_entry(catalog_entry, credentials)
+    if err:
+        return None, err
 
     # Check if already connected
     existing = src_models.CompanyProviders.objects.filter(
