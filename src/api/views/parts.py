@@ -76,7 +76,7 @@ class PartsSearchView(views.View):
 
 
 class PartDetailView(views.View):
-    """GET /parts/<id>/ - Get detailed info for one part (MasterPart + per-provider inventory/pricing)."""
+    """GET /parts/<id>/ - MasterPart plus per-provider rows; inventory/pricing only if company integrates that provider."""
 
     def get(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
         err, company_id = _auth_check(request)

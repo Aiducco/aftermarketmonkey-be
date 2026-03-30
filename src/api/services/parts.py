@@ -6,6 +6,7 @@ import re
 import typing
 
 from src import constants as src_constants
+from src import enums as src_enums
 from src import models as src_models
 
 logger = logging.getLogger(__name__)
@@ -101,7 +102,10 @@ def _get_all_provider_image_urls() -> typing.Dict[str, typing.Optional[str]]:
 def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None) -> typing.Optional[typing.Dict]:
     """
     Get detailed info for one MasterPart.
-    Returns MasterPart + per provider: inventory, pricing (per company if company_id given).
+
+    Inventory and pricing are returned only when the request ``company_id`` has an active
+    ``CompanyProviders`` row for that distributor. Otherwise those fields are null and
+    ``company_integration.connected`` is false.
     """
     try:
         part = src_models.MasterPart.objects.select_related("brand").get(id=master_part_id)
@@ -121,6 +125,15 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
         "updated_at": part.updated_at.isoformat() if part.updated_at else None,
     }
 
+    connected_provider_ids: typing.Set[int] = set()
+    if company_id is not None:
+        connected_provider_ids = set(
+            src_models.CompanyProviders.objects.filter(
+                company_id=company_id,
+                provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
+            ).values_list("provider_id", flat=True)
+        )
+
     provider_parts = (
         src_models.ProviderPart.objects.filter(master_part=part)
         .select_related("provider")
@@ -135,6 +148,11 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
             inv_obj = None
 
         kind_name = pp.provider.kind_name if pp.provider else None
+        integrated = (
+            company_id is not None
+            and pp.provider_id is not None
+            and pp.provider_id in connected_provider_ids
+        )
         provider_info = {
             "provider_id": pp.provider_id,
             "provider_name": pp.provider.name if pp.provider else None,
@@ -142,40 +160,43 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
             "provider_display_name": src_constants.PROVIDER_DISPLAY_NAMES.get(kind_name, kind_name) if kind_name else None,
             "provider_image_url": _get_provider_image_url(kind_name),
             "provider_external_id": pp.provider_external_id,
+            "company_integration": {"connected": integrated},
             "inventory": None,
             "pricing": None,
         }
 
-        if inv_obj:
-            wh_avail = inv_obj.warehouse_availability
-            if kind_name == "TURN_14":
-                wh_avail = _map_turn14_warehouse_availability(wh_avail)
-            provider_info["inventory"] = {
-                "warehouse_total_qty": inv_obj.warehouse_total_qty,
-                "manufacturer_inventory": inv_obj.manufacturer_inventory,
-                "manufacturer_esd": inv_obj.manufacturer_esd.isoformat() if inv_obj.manufacturer_esd else None,
-                "warehouse_availability": wh_avail,
-                "last_synced_at": inv_obj.last_synced_at.isoformat() if inv_obj.last_synced_at else None,
-            }
+        if integrated:
+            if inv_obj:
+                wh_avail = inv_obj.warehouse_availability
+                if kind_name == "TURN_14":
+                    wh_avail = _map_turn14_warehouse_availability(wh_avail)
+                provider_info["inventory"] = {
+                    "warehouse_total_qty": inv_obj.warehouse_total_qty,
+                    "manufacturer_inventory": inv_obj.manufacturer_inventory,
+                    "manufacturer_esd": inv_obj.manufacturer_esd.isoformat() if inv_obj.manufacturer_esd else None,
+                    "warehouse_availability": wh_avail,
+                    "last_synced_at": inv_obj.last_synced_at.isoformat() if inv_obj.last_synced_at else None,
+                }
 
-        # Prefer pricing for request company; if no company_id or no row for that company, use first available
-        all_pricing = list(pp.company_pricing.all())
-        pricing = None
-        if company_id:
-            for p in all_pricing:
-                if p.company_id == company_id:
-                    pricing = p
-                    break
-        if pricing is None and all_pricing:
-            pricing = all_pricing[0]
-        if pricing:
-            provider_info["pricing"] = {
-                "cost": float(pricing.cost) if pricing.cost else None,
-                "jobber_price": float(pricing.jobber_price) if pricing.jobber_price else None,
-                "map_price": float(pricing.map_price) if pricing.map_price else None,
-                "msrp": float(pricing.msrp) if pricing.msrp else None,
-                "last_synced_at": pricing.last_synced_at.isoformat() if pricing.last_synced_at else None,
-            }
+            pricing_row = None
+            if company_id is not None:
+                for p in pp.company_pricing.all():
+                    if p.company_id == company_id:
+                        pricing_row = p
+                        break
+            if pricing_row:
+                provider_info["pricing"] = {
+                    "cost": float(pricing_row.cost) if pricing_row.cost else None,
+                    "jobber_price": float(pricing_row.jobber_price) if pricing_row.jobber_price else None,
+                    "map_price": float(pricing_row.map_price) if pricing_row.map_price else None,
+                    "msrp": float(pricing_row.msrp) if pricing_row.msrp else None,
+                    "retail_price": (
+                        float(pricing_row.retail_price) if pricing_row.retail_price else None
+                    ),
+                    "last_synced_at": (
+                        pricing_row.last_synced_at.isoformat() if pricing_row.last_synced_at else None
+                    ),
+                }
 
         providers_data.append(provider_info)
 
