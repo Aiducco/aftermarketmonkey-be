@@ -2082,7 +2082,7 @@ def sync_provider_pricing_from_keystone() -> None:
 
 def sync_provider_pricing_from_meyer() -> None:
     """
-    Sync ProviderPartCompanyPricing from MeyerParts (Your Price = cost, Jobber, MAP).
+    Sync ProviderPartCompanyPricing from MeyerCompanyPricing (per-company SFTP pricing).
     """
     logger.info("{} Syncing provider pricing from Meyer.".format(_LOG_PREFIX))
 
@@ -2098,14 +2098,6 @@ def sync_provider_pricing_from_meyer() -> None:
         for pp in src_models.ProviderPart.objects.filter(provider=meyer_provider)
     }
 
-    company_ids = list(
-        src_models.CompanyProviders.objects.filter(
-            provider=meyer_provider,
-            provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
-        ).values_list("company_id", flat=True).distinct()
-    )
-    companies = {c.id: c for c in src_models.Company.objects.filter(id__in=company_ids)} if company_ids else {}
-
     now = timezone.now()
     total_upserted = 0
     batch_num = 0
@@ -2114,18 +2106,29 @@ def sync_provider_pricing_from_meyer() -> None:
     while True:
         batch_num += 1
         batch = list(
-            src_models.MeyerParts.objects.filter(id__gt=last_id)
+            src_models.MeyerCompanyPricing.objects.filter(id__gt=last_id)
             .order_by("id")
-            .values("id", "meyer_part", "cost", "jobber_price", "map_price")[:BATCH_SIZE_PRICING]
+            .values(
+                "id",
+                "company_id",
+                "cost",
+                "jobber_price",
+                "map_price",
+                "part__meyer_part",
+            )[:BATCH_SIZE_PRICING]
         )
         if not batch:
             break
 
         last_id = batch[-1]["id"]
-        companies_list = list(companies.values())
+        batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
+        companies_by_id = {
+            c.id: c
+            for c in src_models.Company.objects.filter(id__in=batch_company_ids)
+        }
         to_upsert = []
-        for mp in batch:
-            ext = mp.get("meyer_part")
+        for row in batch:
+            ext = row.get("part__meyer_part")
             if isinstance(ext, str):
                 ext = ext.strip()
             else:
@@ -2133,22 +2136,21 @@ def sync_provider_pricing_from_meyer() -> None:
             pp = provider_parts.get(ext)
             if not pp:
                 continue
-            cost = mp.get("cost")
-            jobber = mp.get("jobber_price")
-            map_p = mp.get("map_price")
-            for company in companies_list:
-                to_upsert.append(
-                    src_models.ProviderPartCompanyPricing(
-                        provider_part=pp,
-                        company=company,
-                        cost=cost,
-                        jobber_price=jobber,
-                        map_price=map_p,
-                        msrp=None,
-                        retail_price=None,
-                        last_synced_at=now,
-                    )
+            company = companies_by_id.get(row.get("company_id"))
+            if not company:
+                continue
+            to_upsert.append(
+                src_models.ProviderPartCompanyPricing(
+                    provider_part=pp,
+                    company=company,
+                    cost=row.get("cost"),
+                    jobber_price=row.get("jobber_price"),
+                    map_price=row.get("map_price"),
+                    msrp=None,
+                    retail_price=None,
+                    last_synced_at=now,
                 )
+            )
 
         if to_upsert:
             pgbulk.upsert(
