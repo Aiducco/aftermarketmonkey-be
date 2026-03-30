@@ -664,6 +664,35 @@ class MeyerParts(django_db_models.Model):
         unique_together = ["meyer_part", "brand"]
 
 
+class MeyerCompanyPricing(django_db_models.Model):
+    """
+    Per-company Meyer pricing for a catalog row (MeyerParts).
+    Catalog/non-price fields live on MeyerParts; prices come from each company's SFTP pricing file.
+    """
+
+    part = django_db_models.ForeignKey(
+        MeyerParts,
+        on_delete=django_db_models.CASCADE,
+        related_name="company_pricing",
+    )
+    company = django_db_models.ForeignKey(
+        Company,
+        on_delete=django_db_models.CASCADE,
+        related_name="meyer_company_pricing",
+    )
+    jobber_price = django_db_models.DecimalField(max_digits=14, decimal_places=5, null=True, blank=True)
+    cost = django_db_models.DecimalField(max_digits=14, decimal_places=5, null=True, blank=True)
+    core_charge = django_db_models.DecimalField(max_digits=14, decimal_places=5, null=True, blank=True)
+    map_price = django_db_models.DecimalField(max_digits=14, decimal_places=5, null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "meyer_company_pricing"
+        unique_together = [["part", "company"]]
+
+
 class WheelProsBrand(django_db_models.Model):
     external_id = django_db_models.CharField(max_length=255)
     name = django_db_models.CharField(max_length=255)

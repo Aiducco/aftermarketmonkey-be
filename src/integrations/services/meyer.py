@@ -23,6 +23,8 @@ logger = logging.getLogger(__name__)
 
 _LOG_PREFIX = "[MEYER-SERVICES]"
 
+MEYER_PRICING_UPSERT_BATCH = 2000
+
 _EXCEL_FORMULA_PATTERN = re.compile(r'^="?([^"]*)"?$|^=(\d+(?:\.\d+)?)$')
 
 
@@ -97,12 +99,16 @@ def _records_from_csv(path: str) -> typing.List[typing.Dict]:
     return out
 
 
-def _primary_meyer_company_provider() -> typing.Optional[src_models.CompanyProviders]:
-    """Prefer primary=True; otherwise any active Meyer CompanyProviders (same pattern as WheelPros)."""
-    base = src_models.CompanyProviders.objects.filter(
+def _active_meyer_company_providers_queryset():
+    return src_models.CompanyProviders.objects.filter(
         provider__kind=src_enums.BrandProviderKind.MEYER.value,
         provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
-    ).select_related("provider")
+    ).select_related("company", "provider")
+
+
+def _primary_meyer_company_provider() -> typing.Optional[src_models.CompanyProviders]:
+    """Prefer primary=True; otherwise first active Meyer CompanyProvider (catalog + default SFTP)."""
+    base = _active_meyer_company_providers_queryset()
     cp = base.filter(primary=True).first()
     if cp:
         return cp
@@ -806,6 +812,9 @@ PRICING_UPDATE_FIELDS = [
     "raw_data",
 ]
 
+# Catalog upsert clears list prices on MeyerParts (always null from primary CSV); amounts live on MeyerCompanyPricing.
+CATALOG_FROM_PRICING_UPDATE_FIELDS = PRICING_UPDATE_FIELDS
+
 INVENTORY_UPDATE_FIELDS = [
     "available_qty",
     "mfg_qty_available",
@@ -826,6 +835,7 @@ def _brand_map_for_names(names: typing.Collection[str]) -> typing.Dict[str, src_
 def _part_from_pricing_row(
     row: typing.Dict,
     brand_by_mfg: typing.Dict[str, src_models.MeyerBrand],
+    include_pricing: bool = True,
 ) -> typing.Optional[src_models.MeyerParts]:
     mfg = _meyer_brand_key(row.get("MFG"))
     meyer_part = _clean_csv_value(row.get("Meyer Part"))
@@ -834,16 +844,26 @@ def _part_from_pricing_row(
     brand = brand_by_mfg.get(mfg)
     if not brand:
         return None
+    if include_pricing:
+        jobber_price = _safe_decimal(row.get("Jobber Price"))
+        cost = _safe_decimal(row.get("Your Price"))
+        core_charge = _safe_decimal(row.get("Core-Charge"))
+        map_price = _safe_decimal(row.get("MAP"))
+    else:
+        jobber_price = None
+        cost = None
+        core_charge = None
+        map_price = None
     return src_models.MeyerParts(
         brand=brand,
         meyer_part=meyer_part,
         mfg_item_number=_clean_csv_value(row.get("MFG Item Number")),
         description=_clean_csv_value(row.get("Description")),
-        jobber_price=_safe_decimal(row.get("Jobber Price")),
-        cost=_safe_decimal(row.get("Your Price")),
-        core_charge=_safe_decimal(row.get("Core-Charge")),
+        jobber_price=jobber_price,
+        cost=cost,
+        core_charge=core_charge,
         upc=_clean_csv_value(row.get("UPC")),
-        map_price=_safe_decimal(row.get("MAP")),
+        map_price=map_price,
         length=_safe_decimal(row.get("LENGTH")),
         width=_safe_decimal(row.get("WIDTH")),
         height=_safe_decimal(row.get("HEIGHT")),
@@ -856,6 +876,50 @@ def _part_from_pricing_row(
         addtl_handling_charge=_truthy(row.get("Addtl Handling Charge")),
         raw_data={k: row.get(k) for k in row.keys()},
     )
+
+
+def _meyer_pricing_map_from_records(
+    records: typing.List[typing.Dict],
+    brand_by_mfg: typing.Dict[str, src_models.MeyerBrand],
+) -> typing.Dict[typing.Tuple[int, str], typing.Dict[str, typing.Any]]:
+    """Last row per (brand_id, meyer_part sku) wins."""
+    out: typing.Dict[typing.Tuple[int, str], typing.Dict[str, typing.Any]] = {}
+    for row in records:
+        mfg = _meyer_brand_key(row.get("MFG"))
+        meyer_part = _clean_csv_value(row.get("Meyer Part"))
+        if not mfg or not meyer_part:
+            continue
+        brand = brand_by_mfg.get(mfg)
+        if not brand:
+            continue
+        sku = meyer_part.strip()
+        out[(brand.id, sku)] = {
+            "jobber_price": _safe_decimal(row.get("Jobber Price")),
+            "cost": _safe_decimal(row.get("Your Price")),
+            "core_charge": _safe_decimal(row.get("Core-Charge")),
+            "map_price": _safe_decimal(row.get("MAP")),
+        }
+    return out
+
+
+def _ensure_meyer_brands_for_mfgs(
+    mfg_names: typing.Collection[str],
+    brand_by_mfg: typing.Dict[str, src_models.MeyerBrand],
+) -> None:
+    missing = {n for n in mfg_names if n and n not in brand_by_mfg}
+    if not missing:
+        return
+    extra = [
+        src_models.MeyerBrand(external_id=n, name=n, aaia_code=None)
+        for n in sorted(missing)
+    ]
+    pgbulk.upsert(
+        src_models.MeyerBrand,
+        extra,
+        unique_fields=["external_id"],
+        update_fields=["name"],
+    )
+    brand_by_mfg.update(_brand_map_for_names(missing))
 
 
 def _part_from_inventory_row(
@@ -905,17 +969,34 @@ def _dedupe_meyer_parts_for_upsert(
 
 def fetch_and_save_meyer_catalog_and_inventory(force_download: bool = False) -> None:
     """
-    Download Meyer Pricing + Meyer Inventory from SFTP, upsert brands, parts (pricing),
-    then overlay availability from inventory (same Meyer Part / Item Number + MFG).
-    """
-    logger.info("{} Starting Meyer pricing + inventory ingest.".format(_LOG_PREFIX))
+    Download Meyer Pricing + Meyer Inventory from the primary CompanyProvider SFTP, upsert brands
+    and MeyerParts catalog (no list prices on parts — those are per company).
 
-    primary_provider = _primary_meyer_company_provider()
-    if not primary_provider:
-        logger.info("{} No active primary Meyer CompanyProviders. Skipping.".format(_LOG_PREFIX))
+    Then for each active Meyer CompanyProvider, download that company's pricing CSV and upsert
+    MeyerCompanyPricing (same pattern as WheelPros).
+
+    Finally overlay inventory from the primary inventory feed.
+    """
+    logger.info("{} Starting Meyer catalog + per-company pricing + inventory ingest.".format(_LOG_PREFIX))
+
+    catalog_cp = _primary_meyer_company_provider()
+    if not catalog_cp:
+        logger.info("{} No active Meyer CompanyProviders. Skipping.".format(_LOG_PREFIX))
         return
 
-    credentials = primary_provider.credentials
+    meyer_kind = src_enums.BrandProviderKind.MEYER.value
+    meyer_provider_row = src_models.Providers.objects.filter(kind=meyer_kind).first()
+    pricing_cps: typing.List[src_models.CompanyProviders] = []
+    if meyer_provider_row:
+        pricing_cps = list(
+            _active_meyer_company_providers_queryset().filter(provider=meyer_provider_row)
+        )
+    if meyer_provider_row and not pricing_cps:
+        logger.warning(
+            "{} No active Meyer company providers; ingest may be incomplete.".format(_LOG_PREFIX)
+        )
+
+    credentials = catalog_cp.credentials
     try:
         sftp = meyer_client.MeyerSFTPClient(credentials=credentials)
     except ValueError as e:
@@ -965,17 +1046,19 @@ def fetch_and_save_meyer_catalog_and_inventory(force_download: bool = False) -> 
 
     BATCH = 10000
     DELAY = 0.3
+    catalog_deduped_parts: typing.List[src_models.MeyerParts] = []
 
     if pricing_records:
         parts_raw: typing.List[src_models.MeyerParts] = []
         for row in pricing_records:
-            p = _part_from_pricing_row(row, brand_by_mfg)
+            p = _part_from_pricing_row(row, brand_by_mfg, include_pricing=False)
             if p:
                 parts_raw.append(p)
         parts = _dedupe_meyer_parts_for_upsert(parts_raw)
+        catalog_deduped_parts = parts
         if len(parts) < len(parts_raw):
             logger.info(
-                "{} Pricing: {} duplicate (brand, meyer_part) rows in feed; kept {}.".format(
+                "{} Catalog from pricing: {} duplicate (brand, meyer_part) rows; kept {}.".format(
                     _LOG_PREFIX, len(parts_raw) - len(parts), len(parts),
                 )
             )
@@ -985,12 +1068,125 @@ def fetch_and_save_meyer_catalog_and_inventory(force_download: bool = False) -> 
                 src_models.MeyerParts,
                 batch,
                 unique_fields=["meyer_part", "brand"],
-                update_fields=PRICING_UPDATE_FIELDS,
+                update_fields=CATALOG_FROM_PRICING_UPDATE_FIELDS,
             )
             connection.close()
             if i + BATCH < len(parts):
                 time.sleep(DELAY)
-        logger.info("{} Upserted {} rows from pricing.".format(_LOG_PREFIX, len(parts)))
+        logger.info("{} Upserted {} MeyerParts catalog rows from primary pricing (no list prices).".format(
+            _LOG_PREFIX, len(parts),
+        ))
+
+    if pricing_cps and catalog_deduped_parts:
+        _pair_keys: typing.List[typing.Tuple[int, str]] = []
+        for p in catalog_deduped_parts:
+            sku = (p.meyer_part or "").strip()
+            if not sku:
+                continue
+            bid = p.brand_id
+            if bid is None and p.brand is not None:
+                bid = p.brand.pk
+            if bid is None:
+                continue
+            _pair_keys.append((int(bid), sku))
+        pairs = list({tuple(t) for t in _pair_keys})
+
+        id_by_brand_sku: typing.Dict[typing.Tuple[int, str], int] = {}
+        chunk_size = 3000
+        for i in range(0, len(pairs), chunk_size):
+            chunk = pairs[i : i + chunk_size]
+            if not chunk:
+                continue
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, meyer_part FROM meyer_parts WHERE (brand_id, meyer_part) IN %s",
+                    (tuple(chunk),),
+                )
+                for pid, bid, pn in cur.fetchall():
+                    id_by_brand_sku[(bid, (pn or "").strip())] = pid
+
+        total_company_pricing = 0
+        for cp in pricing_cps:
+            logger.info(
+                "{} Meyer pricing feed for company_id={} (primary={}).".format(
+                    _LOG_PREFIX,
+                    cp.company_id,
+                    cp.primary,
+                )
+            )
+            creds = dict(cp.credentials or {})
+            if not str(creds.get("local_pricing_path") or "").strip():
+                creds["local_pricing_path"] = "/tmp/meyer_pricing_company_{}.csv".format(cp.company_id)
+            try:
+                pc = meyer_client.MeyerSFTPClient(credentials=creds)
+            except ValueError as e:
+                logger.error("{} company_id={}: {}".format(_LOG_PREFIX, cp.company_id, str(e)))
+                raise
+            try:
+                company_pricing_path = pc.download_pricing_file(force_download=force_download)
+            except meyer_exceptions.MeyerException as e:
+                logger.error(
+                    "{} Meyer pricing download error company_id={}: {}.".format(
+                        _LOG_PREFIX, cp.company_id, str(e),
+                    )
+                )
+                raise
+            company_records = _records_from_csv(company_pricing_path)
+            mfgs_c: typing.Set[str] = set()
+            for row in company_records:
+                m = _meyer_brand_key(row.get("MFG"))
+                if m:
+                    mfgs_c.add(m)
+            _ensure_meyer_brands_for_mfgs(mfgs_c, brand_by_mfg)
+            pmap = _meyer_pricing_map_from_records(company_records, brand_by_mfg)
+            pricing_to_upsert: typing.List[src_models.MeyerCompanyPricing] = []
+            for (bid, sku), pdata in pmap.items():
+                part_id = id_by_brand_sku.get((bid, sku))
+                if not part_id:
+                    continue
+                pricing_to_upsert.append(
+                    src_models.MeyerCompanyPricing(
+                        part_id=part_id,
+                        company=cp.company,
+                        jobber_price=pdata.get("jobber_price"),
+                        cost=pdata.get("cost"),
+                        core_charge=pdata.get("core_charge"),
+                        map_price=pdata.get("map_price"),
+                    )
+                )
+            batch_total = 0
+            for j in range(0, len(pricing_to_upsert), MEYER_PRICING_UPSERT_BATCH):
+                batch = pricing_to_upsert[j : j + MEYER_PRICING_UPSERT_BATCH]
+                pgbulk.upsert(
+                    src_models.MeyerCompanyPricing,
+                    batch,
+                    unique_fields=["part", "company"],
+                    update_fields=["jobber_price", "cost", "core_charge", "map_price", "updated_at"],
+                    returning=False,
+                )
+                batch_total += len(batch)
+                connection.close()
+            total_company_pricing += batch_total
+            logger.info(
+                "{} Upserted {} MeyerCompanyPricing rows for company_id={}.".format(
+                    _LOG_PREFIX,
+                    batch_total,
+                    cp.company_id,
+                )
+            )
+        logger.info(
+            "{} Meyer per-company pricing done: {} rows across {} companies.".format(
+                _LOG_PREFIX,
+                total_company_pricing,
+                len(pricing_cps),
+            )
+        )
+    elif pricing_cps:
+        logger.warning(
+            "{} Skipping per-company Meyer pricing (no catalog parts from primary pricing CSV).".format(
+                _LOG_PREFIX,
+            )
+        )
 
     if inventory_records:
         overlay_raw: typing.List[src_models.MeyerParts] = []
