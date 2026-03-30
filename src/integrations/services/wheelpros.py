@@ -1,6 +1,7 @@
 """
 WheelPros feed integration: SFTP CSV feed with brand, part, pricing, and warehouse inventory.
-Syncs WheelProsBrand, WheelProsPart, and BrandWheelProsBrandMapping.
+Syncs WheelProsBrand, WheelProsPart, WheelProsCompanyPricing, and BrandWheelProsBrandMapping.
+Catalog uses the primary CompanyProvider (or first active); pricing loads per company SFTP.
 """
 import logging
 import math
@@ -11,16 +12,63 @@ from decimal import Decimal
 import pgbulk
 
 from django.conf import settings
+from django.db import connection
+from django.db.models.functions import Upper
 
 from src import constants as src_constants
 from src import enums as src_enums
 from src import models as src_models
 from src.integrations.clients.wheelpros import client as wheelpros_client
 from src.integrations.clients.wheelpros import exceptions as wheelpros_exceptions
+from src.integrations.utils.brand_matching import (
+    best_fuzzy_brand_match,
+    brands_by_first_token_upper,
+    normalize_upper_words,
+)
 
 logger = logging.getLogger(__name__)
 
 _LOG_PREFIX = "[WHEELPROS-SERVICES]"
+
+WP_PRICING_UPSERT_BATCH = 2000
+
+
+def _normalize_wheelpros_brand_key(raw: typing.Optional[str]) -> str:
+    return (raw or "").strip().upper()
+
+
+def _active_wheelpros_company_providers_queryset():
+    return src_models.CompanyProviders.objects.filter(
+        provider__kind=src_enums.BrandProviderKind.WHEELPROS.value,
+        provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
+    ).select_related("company", "provider")
+
+
+def _catalog_wheelpros_company_provider(
+    wp_provider: typing.Optional[src_models.Providers],
+) -> typing.Optional[src_models.CompanyProviders]:
+    if not wp_provider:
+        return None
+    base = _active_wheelpros_company_providers_queryset().filter(provider=wp_provider)
+    primary = base.filter(primary=True).first()
+    if primary:
+        return primary
+    fallback = base.order_by("id").first()
+    if fallback:
+        logger.info(
+            "{} No primary WheelPros company provider; using company_id={} for catalog.".format(
+                _LOG_PREFIX,
+                fallback.company_id,
+            )
+        )
+    return fallback
+
+
+def _wp_brand_name_upper_for_sync(wp_brand: src_models.WheelProsBrand) -> str:
+    name_upper = (wp_brand.name or "").strip().upper()
+    if not name_upper:
+        name_upper = "BRAND_{}".format(wp_brand.external_id)
+    return name_upper
 
 
 def _safe_decimal(value: typing.Any) -> typing.Optional[Decimal]:
@@ -89,20 +137,20 @@ def _row_key(row: typing.Dict, *keys: str) -> typing.Optional[str]:
     return _safe_str(value) if value is not None else None
 
 
-def _find_brand_for_wheelpros_brand(wheelpros_brand: src_models.WheelProsBrand) -> typing.Optional[src_models.Brands]:
-    name = (wheelpros_brand.name or "").strip()
-    if name:
-        return src_models.Brands.objects.filter(name__iexact=name).first()
-    return None
-
-
-def sync_unmapped_wheelpros_brands_to_brands() -> typing.List[src_models.WheelProsBrand]:
+def sync_unmapped_wheelpros_brands_to_brands(dry_run: bool = False) -> typing.List[src_models.WheelProsBrand]:
     """
     For each WheelProsBrand that does not yet have a BrandWheelProsBrandMapping:
-    find or create a Brand by name; then add BrandWheelProsBrandMapping,
-    BrandProviders (WheelPros), and CompanyBrands (TICK_PERFORMANCE).
+    resolve Brand by exact name (uppercase), then fuzzy word-prefix match (shared util with Keystone/Rough Country);
+    otherwise create. Upserts mapping, BrandProviders, CompanyBrands for TICK_PERFORMANCE.
+
+    If dry_run is True, no database writes; logs only WheelPros brands that matched an existing Brand (exact or fuzzy).
     """
-    logger.info("{} Syncing unmapped WheelPros brands to Brands.".format(_LOG_PREFIX))
+    logger.info(
+        "{} Syncing unmapped WheelPros brands to Brands{}.".format(
+            _LOG_PREFIX,
+            " (dry run)" if dry_run else "",
+        )
+    )
 
     wheelpros_provider = src_models.Providers.objects.filter(
         kind=src_enums.BrandProviderKind.WHEELPROS.value,
@@ -116,13 +164,14 @@ def sync_unmapped_wheelpros_brands_to_brands() -> typing.List[src_models.WheelPr
         logger.warning("{} Company TICK_PERFORMANCE not found. Skipping sync.".format(_LOG_PREFIX))
         return []
 
-    _, cp_created = src_models.CompanyProviders.objects.get_or_create(
-        company=tick_company,
-        provider=wheelpros_provider,
-        defaults={"credentials": {}, "primary": False},
-    )
-    if cp_created:
-        logger.info("{} Created CompanyProviders for TICK_PERFORMANCE + WheelPros.".format(_LOG_PREFIX))
+    if not dry_run:
+        _, cp_created = src_models.CompanyProviders.objects.get_or_create(
+            company=tick_company,
+            provider=wheelpros_provider,
+            defaults={"credentials": {}, "primary": False},
+        )
+        if cp_created:
+            logger.info("{} Created CompanyProviders for TICK_PERFORMANCE + WheelPros.".format(_LOG_PREFIX))
 
     mapped_ids = set(
         src_models.BrandWheelProsBrandMapping.objects.values_list("wheelpros_brand_id", flat=True).distinct()
@@ -134,45 +183,158 @@ def sync_unmapped_wheelpros_brands_to_brands() -> typing.List[src_models.WheelPr
         logger.info("{} No unmapped WheelPros brands. Nothing to sync.".format(_LOG_PREFIX))
         return []
 
-    created_mappings = 0
-    created_brand_providers = 0
-    created_company_brands = 0
-    created_brands = 0
+    name_upper_keys: typing.Set[str] = set()
+    for wb in unmapped_wheelpros_brands:
+        if (wb.name or "").strip():
+            name_upper_keys.add((wb.name or "").strip().upper())
 
-    for wheelpros_brand in unmapped_wheelpros_brands:
-        brand = _find_brand_for_wheelpros_brand(wheelpros_brand)
-        if not brand:
-            name_upper = (wheelpros_brand.name or "").strip().upper()
-            if not name_upper:
-                name_upper = "BRAND_{}".format(wheelpros_brand.external_id)
-            brand = src_models.Brands.objects.create(
-                name=name_upper,
+    brands_by_upper_name: typing.Dict[str, src_models.Brands] = {}
+    if name_upper_keys:
+        for b in (
+            src_models.Brands.objects.annotate(_name_u=Upper("name"))
+            .filter(_name_u__in=name_upper_keys)
+            .order_by("id")
+        ):
+            key = (b.name or "").strip().upper()
+            if key not in brands_by_upper_name:
+                brands_by_upper_name[key] = b
+
+    resolved_by_wp_id: typing.Dict[int, src_models.Brands] = {}
+    exact_matched_wp_ids: typing.Set[int] = set()
+    for wb in sorted(unmapped_wheelpros_brands, key=lambda x: x.id):
+        nm = (wb.name or "").strip().upper()
+        if nm:
+            brand = brands_by_upper_name.get(nm)
+            if brand:
+                resolved_by_wp_id[wb.id] = brand
+                exact_matched_wp_ids.add(wb.id)
+
+    unresolved_after_exact = [
+        wb for wb in unmapped_wheelpros_brands if wb.id not in resolved_by_wp_id
+    ]
+    brands_first_index = brands_by_first_token_upper() if unresolved_after_exact else {}
+    all_brands_fallback: typing.Optional[typing.List[src_models.Brands]] = None
+    fuzzy_matches = 0
+    fuzzy_matched_wp_ids: typing.Set[int] = set()
+    for wb in unresolved_after_exact:
+        parts = normalize_upper_words(wb.name or "").split()
+        candidates: typing.List[src_models.Brands] = []
+        if parts:
+            candidates = list(brands_first_index.get(parts[0], ()))
+        if not candidates:
+            if all_brands_fallback is None:
+                all_brands_fallback = list(
+                    src_models.Brands.objects.only("id", "name", "aaia_code").order_by("id")
+                )
+            candidates = all_brands_fallback
+        brand = best_fuzzy_brand_match(wb.name or "", candidates)
+        if brand:
+            resolved_by_wp_id[wb.id] = brand
+            fuzzy_matched_wp_ids.add(wb.id)
+            fuzzy_matches += 1
+            if not dry_run:
+                logger.debug(
+                    "{} Fuzzy-matched WheelPros brand {!r} to Brand id={} name={!r}.".format(
+                        _LOG_PREFIX,
+                        wb.name,
+                        brand.id,
+                        brand.name,
+                    )
+                )
+
+    if dry_run:
+        for wb in sorted(unmapped_wheelpros_brands, key=lambda x: x.id):
+            if wb.id not in resolved_by_wp_id:
+                continue
+            brand = resolved_by_wp_id[wb.id]
+            how = "exact" if wb.id in exact_matched_wp_ids else "fuzzy"
+            logger.info(
+                "{} [dry-run] match ({}) WheelProsBrand id={} external_id={!r} name={!r} "
+                "-> Brand id={} name={!r}".format(
+                    _LOG_PREFIX,
+                    how,
+                    wb.id,
+                    wb.external_id,
+                    wb.name,
+                    brand.id,
+                    brand.name,
+                )
+            )
+        would_create = [wb for wb in unmapped_wheelpros_brands if wb.id not in resolved_by_wp_id]
+        logger.info(
+            "{} [dry-run] Summary: {} exact matches, {} fuzzy matches, {} unmatched (would create Brand). "
+            "No writes performed.".format(
+                _LOG_PREFIX,
+                len(exact_matched_wp_ids),
+                len(fuzzy_matched_wp_ids),
+                len(would_create),
+            )
+        )
+        return unmapped_wheelpros_brands
+
+    new_brand_specs: typing.Set[str] = set()
+    for wb in sorted(unmapped_wheelpros_brands, key=lambda x: x.id):
+        if wb.id in resolved_by_wp_id:
+            continue
+        new_brand_specs.add(_wp_brand_name_upper_for_sync(wb))
+
+    created_brands = 0
+    if new_brand_specs:
+        existing_names = set(
+            src_models.Brands.objects.filter(name__in=list(new_brand_specs)).values_list("name", flat=True)
+        )
+        new_brand_rows = [
+            src_models.Brands(
+                name=name,
                 status=src_enums.BrandProviderStatus.ACTIVE.value,
                 status_name=src_enums.BrandProviderStatus.ACTIVE.name,
                 aaia_code=None,
             )
-            created_brands += 1
-            logger.info(
-                "{} Created new Brand: name={!r} for WheelProsBrand id={}.".format(
-                    _LOG_PREFIX, name_upper, wheelpros_brand.id
-                )
-            )
+            for name in new_brand_specs
+            if name not in existing_names
+        ]
+        if new_brand_rows:
+            src_models.Brands.objects.bulk_create(new_brand_rows, ignore_conflicts=True)
+            created_brands = len(new_brand_rows)
+        by_name = {
+            b.name: b
+            for b in src_models.Brands.objects.filter(name__in=list(new_brand_specs))
+        }
+        for wb in unmapped_wheelpros_brands:
+            if wb.id not in resolved_by_wp_id:
+                nu = _wp_brand_name_upper_for_sync(wb)
+                resolved_by_wp_id[wb.id] = by_name[nu]
 
-        mapping, mapping_created = src_models.BrandWheelProsBrandMapping.objects.get_or_create(
-            brand=brand,
-            wheelpros_brand=wheelpros_brand,
+    mapping_models = [
+        src_models.BrandWheelProsBrandMapping(
+            brand_id=resolved_by_wp_id[wb.id].id,
+            wheelpros_brand_id=wb.id,
         )
-        if mapping_created:
-            created_mappings += 1
+        for wb in unmapped_wheelpros_brands
+    ]
+    try:
+        pgbulk.upsert(
+            src_models.BrandWheelProsBrandMapping,
+            mapping_models,
+            unique_fields=["brand", "wheelpros_brand"],
+            update_fields=[],
+            returning=False,
+        )
+    except Exception as e:
+        logger.error("{} Error upserting BrandWheelProsBrandMapping: {}.".format(_LOG_PREFIX, str(e)))
+        raise
 
-        bp, bp_created = src_models.BrandProviders.objects.get_or_create(
+    created_brand_providers = 0
+    created_company_brands = 0
+    for wb in unmapped_wheelpros_brands:
+        brand = resolved_by_wp_id[wb.id]
+        _, bp_created = src_models.BrandProviders.objects.get_or_create(
             brand=brand,
             provider=wheelpros_provider,
         )
         if bp_created:
             created_brand_providers += 1
-
-        cb, cb_created = src_models.CompanyBrands.objects.get_or_create(
+        _, cb_created = src_models.CompanyBrands.objects.get_or_create(
             company=tick_company,
             brand=brand,
             defaults={
@@ -184,10 +346,12 @@ def sync_unmapped_wheelpros_brands_to_brands() -> typing.List[src_models.WheelPr
             created_company_brands += 1
 
     logger.info(
-        "{} Sync complete. Brands created: {}, BrandWheelProsBrandMapping: {}, BrandProviders: {}, CompanyBrands: {}.".format(
+        "{} Sync complete. Brands created: {}, fuzzy name matches: {}, "
+        "BrandWheelProsBrandMapping upserted: {}, BrandProviders: {}, CompanyBrands: {}.".format(
             _LOG_PREFIX,
             created_brands,
-            created_mappings,
+            fuzzy_matches,
+            len(mapping_models),
             created_brand_providers,
             created_company_brands,
         )
@@ -247,7 +411,11 @@ def _warehouse_inventory_from_row(row: typing.Dict) -> typing.Optional[typing.Di
     return out or None
 
 
-def _row_to_wheelpros_part(row: typing.Dict, brand: src_models.WheelProsBrand) -> src_models.WheelProsPart:
+def _row_to_wheelpros_part(
+    row: typing.Dict,
+    brand: src_models.WheelProsBrand,
+    include_pricing: bool = True,
+) -> src_models.WheelProsPart:
     part_number = _row_key(row, "PartNumber") or ""
     part_description = _safe_str(_row_get(row, "PartDescription"))
     display_style_no = _safe_str(_row_get(row, "DisplayStyleNo"), 255)
@@ -262,8 +430,12 @@ def _row_to_wheelpros_part(row: typing.Dict, brand: src_models.WheelProsBrand) -
     inv_order_type = _safe_str(_row_get(row, "InvOrderType"), 255)
     style = _safe_str(_row_get(row, "Style"), 255)
     total_qoh = _safe_int(_row_get(row, "TotalQOH"))
-    msrp_usd = _safe_decimal(_row_get(row, "MSRP_USD"))
-    map_usd = _safe_decimal(_row_get(row, "MAP_USD"))
+    if include_pricing:
+        msrp_usd = _safe_decimal(_row_get(row, "MSRP_USD"))
+        map_usd = _safe_decimal(_row_get(row, "MAP_USD"))
+    else:
+        msrp_usd = None
+        map_usd = None
     run_date = _safe_datetime(_row_get(row, "RunDate"))
     warehouse_availability = _warehouse_inventory_from_row(row)
     raw_data = {
@@ -320,6 +492,37 @@ def _get_wheelpros_credentials() -> typing.Optional[typing.Dict]:
     return cp.credentials
 
 
+def _wheelpros_credentials_for_catalog(
+    wp_provider: typing.Optional[src_models.Providers],
+) -> typing.Dict:
+    """Prefer primary / first active WheelPros CompanyProvider; else TICK_PERFORMANCE legacy lookup."""
+    cp = _catalog_wheelpros_company_provider(wp_provider)
+    if cp and cp.credentials:
+        return dict(cp.credentials)
+    return dict(_get_wheelpros_credentials() or {})
+
+
+def _wheelpros_pricing_map_from_records(
+    records: typing.List[typing.Dict],
+    brand_by_external_id: typing.Dict[str, src_models.WheelProsBrand],
+) -> typing.Dict[typing.Tuple[int, str], typing.Dict[str, typing.Any]]:
+    """Last row per (brand_id, part_number) wins."""
+    out: typing.Dict[typing.Tuple[int, str], typing.Dict[str, typing.Any]] = {}
+    for row in records:
+        pn = (_row_key(row, "PartNumber") or "").strip()
+        bkey = _normalize_wheelpros_brand_key(_row_key(row, "Brand"))
+        if not pn or not bkey:
+            continue
+        brand = brand_by_external_id.get(bkey)
+        if not brand:
+            continue
+        out[(brand.id, pn)] = {
+            "msrp_usd": _safe_decimal(_row_get(row, "MSRP_USD")),
+            "map_usd": _safe_decimal(_row_get(row, "MAP_USD")),
+        }
+    return out
+
+
 def _get_local_path_for_feed(feed_type: str) -> str:
     """Get local file path for feed type."""
     if feed_type == "wheel":
@@ -338,9 +541,9 @@ def fetch_and_save_wheelpros(
     feed_type: str = "wheel",
 ) -> None:
     """
-    Fetch the WheelPros CSV and upsert WheelProsBrand and WheelProsPart rows.
+    Fetch the WheelPros CSV and upsert WheelProsBrand and WheelProsPart (catalog).
+    Company pricing is loaded per active CompanyProvider using each row's SFTP credentials.
     feed_type: "wheel" | "tire" | "accessories"
-    Uses CompanyProviders credentials when available; otherwise falls back to settings.
     """
     sftp_path = src_constants.WHEELPROS_FEED_PATHS.get(feed_type)
     if not sftp_path:
@@ -349,12 +552,35 @@ def fetch_and_save_wheelpros(
     local_path = local_file_path or _get_local_path_for_feed(feed_type)
     logger.info("{} Starting WheelPros {} feed sync (path={}).".format(_LOG_PREFIX, feed_type, sftp_path))
 
-    credentials = _get_wheelpros_credentials() if not local_only else None
-    credentials = dict(credentials or {})
-    credentials["sftp_path"] = sftp_path
+    wp_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.WHEELPROS.value,
+    ).first()
+    pricing_cps: typing.List[src_models.CompanyProviders] = []
+    if wp_provider:
+        pricing_cps = list(_active_wheelpros_company_providers_queryset().filter(provider=wp_provider))
+    if wp_provider and not pricing_cps:
+        logger.warning(
+            "{} No active WheelPros company providers; catalog will sync but not company pricing.".format(
+                _LOG_PREFIX
+            )
+        )
+
+    catalog_creds = _wheelpros_credentials_for_catalog(wp_provider) if not local_only else {}
+    catalog_creds = dict(catalog_creds)
+    catalog_creds["sftp_path"] = sftp_path
+
+    catalog_cp = _catalog_wheelpros_company_provider(wp_provider)
+    if catalog_cp:
+        logger.info(
+            "{} Catalog feed using company_id={} (primary={}).".format(
+                _LOG_PREFIX,
+                catalog_cp.company_id,
+                catalog_cp.primary,
+            )
+        )
 
     client = wheelpros_client.WheelProsSFTPClient(
-        credentials=credentials,
+        credentials=catalog_creds,
         local_file_path=local_path,
         require_credentials=not local_only,
     )
@@ -377,7 +603,7 @@ def fetch_and_save_wheelpros(
     for row in records:
         name = _row_key(row, "Brand")
         if name:
-            brand_names.add(name)
+            brand_names.add(_normalize_wheelpros_brand_key(name))
 
     brand_instances = []
     for name in sorted(brand_names):
@@ -402,20 +628,20 @@ def fetch_and_save_wheelpros(
             raise
 
     brand_to_model = {
-        b.name: b
+        b.external_id: b
         for b in src_models.WheelProsBrand.objects.filter(external_id__in=brand_names)
     }
 
     seen_by_key = {}
     for row in records:
-        part_number = _row_key(row, "PartNumber")
-        brand_name = _row_key(row, "Brand")
+        part_number = (_row_key(row, "PartNumber") or "").strip()
+        brand_name = _normalize_wheelpros_brand_key(_row_key(row, "Brand"))
         if not part_number or not brand_name:
             continue
         brand = brand_to_model.get(brand_name)
         if not brand:
             continue
-        seen_by_key[(brand.id, part_number)] = _row_to_wheelpros_part(row, brand)
+        seen_by_key[(brand.id, part_number)] = _row_to_wheelpros_part(row, brand, include_pricing=False)
 
     part_instances = list(seen_by_key.values())
     if not part_instances:
@@ -441,8 +667,6 @@ def fetch_and_save_wheelpros(
                 "inv_order_type",
                 "style",
                 "total_qoh",
-                "msrp_usd",
-                "map_usd",
                 "run_date",
                 "warehouse_availability",
                 "raw_data",
@@ -453,5 +677,97 @@ def fetch_and_save_wheelpros(
     except Exception as e:
         logger.error("{} Error upserting WheelPros parts: {}.".format(_LOG_PREFIX, str(e)))
         raise
+
+    if pricing_cps:
+        pairs = list({(p.brand_id, (p.part_number or "").strip()) for p in part_instances})
+        id_by_brand_pn: typing.Dict[typing.Tuple[int, str], int] = {}
+        chunk_size = 3000
+        for i in range(0, len(pairs), chunk_size):
+            chunk = pairs[i : i + chunk_size]
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM wheelpros_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(chunk),),
+                )
+                for pid, bid, pn in cur.fetchall():
+                    id_by_brand_pn[(bid, (pn or "").strip())] = pid
+
+        brand_by_external = {
+            b.external_id: b
+            for b in src_models.WheelProsBrand.objects.filter(external_id__in=brand_names)
+        }
+        total_pricing = 0
+        for cp in pricing_cps:
+            logger.info(
+                "{} Pricing feed for company_id={} (primary={}).".format(
+                    _LOG_PREFIX,
+                    cp.company_id,
+                    cp.primary,
+                )
+            )
+            creds = dict(cp.credentials or {})
+            creds["sftp_path"] = sftp_path
+            pc = wheelpros_client.WheelProsSFTPClient(
+                credentials=creds,
+                local_file_path=local_path,
+                require_credentials=not local_only,
+            )
+            try:
+                price_records = pc.get_feed_records(
+                    force_download=download,
+                    local_only=local_only,
+                    sftp_path=sftp_path,
+                    local_file_path=local_path,
+                )
+            except wheelpros_exceptions.WheelProsException as e:
+                logger.error(
+                    "{} WheelPros pricing feed error company_id={}: {}.".format(
+                        _LOG_PREFIX,
+                        cp.company_id,
+                        str(e),
+                    )
+                )
+                raise
+            pmap = _wheelpros_pricing_map_from_records(price_records, brand_by_external)
+            pricing_to_upsert = []
+            for (bid, pn), pdata in pmap.items():
+                part_id = id_by_brand_pn.get((bid, pn))
+                if not part_id:
+                    continue
+                pricing_to_upsert.append(
+                    src_models.WheelProsCompanyPricing(
+                        part_id=part_id,
+                        company=cp.company,
+                        msrp_usd=pdata.get("msrp_usd"),
+                        map_usd=pdata.get("map_usd"),
+                    )
+                )
+            batch_total = 0
+            for j in range(0, len(pricing_to_upsert), WP_PRICING_UPSERT_BATCH):
+                batch = pricing_to_upsert[j : j + WP_PRICING_UPSERT_BATCH]
+                pgbulk.upsert(
+                    src_models.WheelProsCompanyPricing,
+                    batch,
+                    unique_fields=["part", "company"],
+                    update_fields=["msrp_usd", "map_usd", "updated_at"],
+                    returning=False,
+                )
+                batch_total += len(batch)
+                connection.close()
+            total_pricing += batch_total
+            logger.info(
+                "{} Upserted {} WheelPros company pricing rows for company_id={}.".format(
+                    _LOG_PREFIX,
+                    batch_total,
+                    cp.company_id,
+                )
+            )
+        logger.info(
+            "{} WheelPros pricing finished: {} rows across {} companies.".format(
+                _LOG_PREFIX,
+                total_pricing,
+                len(pricing_cps),
+            )
+        )
 
     logger.info("{} WheelPros {} feed sync complete.".format(_LOG_PREFIX, feed_type))

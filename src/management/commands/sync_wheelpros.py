@@ -33,6 +33,11 @@ class Command(BaseCommand):
             choices=["wheel", "tire", "accessories", "all"],
             help="Feed to sync: wheel, tire, accessories, or all (default).",
         )
+        parser.add_argument(
+            "--dry-run-brands",
+            action="store_true",
+            help="Step 2 only: log WheelPros brands that would match an existing Brand (exact/fuzzy); no writes.",
+        )
 
     def handle(self, *args, **options):
         self.stdout.write("Starting WheelPros fetch and sync...")
@@ -51,9 +56,18 @@ class Command(BaseCommand):
                 )
                 self.stdout.write(self.style.SUCCESS("WheelPros {} feed fetched and saved.".format(ft)))
 
-            self.stdout.write("Step 2: Syncing unmapped WheelPros brands into Brands flow...")
-            wheelpros.sync_unmapped_wheelpros_brands_to_brands()
-            self.stdout.write(self.style.SUCCESS("Unmapped WheelPros brands synced."))
+            dry_run_brands = options.get("dry_run_brands", False)
+            self.stdout.write(
+                "Step 2: Syncing unmapped WheelPros brands into Brands flow{}...".format(
+                    " (dry run — matched only in logs)" if dry_run_brands else ""
+                )
+            )
+            wheelpros.sync_unmapped_wheelpros_brands_to_brands(dry_run=dry_run_brands)
+            self.stdout.write(
+                self.style.SUCCESS(
+                    "Unmapped WheelPros brands {}.".format("dry-run complete (see logs)" if dry_run_brands else "synced")
+                )
+            )
 
             audit_scheduled_tasks.mark_scheduled_task_completed(
                 execution,

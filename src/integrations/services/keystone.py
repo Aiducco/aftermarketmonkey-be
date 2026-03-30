@@ -7,12 +7,19 @@ from decimal import Decimal
 import pandas as pd
 import pgbulk
 
+from django.db.models.functions import Upper
+
 from src import enums as src_enums
 from src import models as src_models
 from django.db import connection
 
 from src.integrations.clients.keystone import client as keystone_client
 from src.integrations.clients.keystone import exceptions as keystone_exceptions
+from src.integrations.utils.brand_matching import (
+    best_fuzzy_brand_match,
+    brands_by_first_token_upper,
+    normalize_upper_words,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +144,7 @@ def fetch_and_save_keystone_brands() -> None:
             src_models.KeystoneBrand,
             brand_instances,
             unique_fields=["external_id"],
-            update_fields=["name", "aaia_code"],
+            update_fields=["name", "aaia_code", "updated_at"],
             returning=True,
         )
         logger.info("{} Successfully upserted {} Keystone brands.".format(
@@ -155,29 +162,20 @@ def _normalize_aaia_codes(aaia_code: typing.Optional[str]) -> typing.List[str]:
     return [p.strip() for p in str(aaia_code).split(",") if p and p.strip()]
 
 
-def _find_brand_for_keystone_brand(
-    keystone_brand: src_models.KeystoneBrand,
-) -> typing.Optional[src_models.Brands]:
-    """
-    Find existing Brand for a KeystoneBrand: first by aaia_code (comma-separated, use first match),
-    then by name (case-insensitive).
-    """
-    aaia_parts = _normalize_aaia_codes(keystone_brand.aaia_code)
-    for code in aaia_parts:
-        brand = src_models.Brands.objects.filter(aaia_code=code).first()
-        if brand:
-            return brand
-    name = (keystone_brand.name or "").strip()
-    if name:
-        return src_models.Brands.objects.filter(name__iexact=name).first()
-    return None
+def _keystone_brand_name_upper_for_sync(keystone_brand: src_models.KeystoneBrand) -> str:
+    name_upper = (keystone_brand.name or "").strip().upper()
+    if not name_upper:
+        name_upper = "BRAND_{}".format(keystone_brand.external_id)
+    return name_upper
 
 
 def sync_unmapped_keystone_brands_to_brands() -> typing.List[src_models.KeystoneBrand]:
     """
     For each KeystoneBrand that does not yet have a BrandKeystoneBrandMapping:
-    find or create a Brand (match by aaia_code then name; create with uppercase name if new),
-    then add BrandKeystoneBrandMapping, BrandProviders (Keystone), and CompanyBrands (TICK_PERFORMANCE).
+    resolve Brand by aaia_code (comma-separated), then exact name (case-insensitive), then fuzzy
+    word-prefix match with truncation on either side (e.g. BAK IND ↔ BAK INDUSTRIES,
+    DIRTY LIFE ↔ DIRTY LIFE WHEELS); otherwise create.
+    Bulk-upsert BrandKeystoneBrandMapping, bulk BrandProviders and CompanyBrands for TICK_PERFORMANCE.
     Returns the list of KeystoneBrand instances that were synced.
     """
     logger.info("{} Syncing unmapped Keystone brands to Brands.".format(_LOG_PREFIX))
@@ -213,63 +211,180 @@ def sync_unmapped_keystone_brands_to_brands() -> typing.List[src_models.Keystone
         )
     )
 
-    created_mappings = 0
-    created_brand_providers = 0
-    created_company_brands = 0
-    created_brands = 0
+    all_aaia: typing.Set[str] = set()
+    for kb in unmapped_keystone_brands:
+        for code in _normalize_aaia_codes(kb.aaia_code):
+            all_aaia.add(code)
 
-    for keystone_brand in unmapped_keystone_brands:
-        brand = _find_brand_for_keystone_brand(keystone_brand)
+    aaia_to_brand: typing.Dict[str, src_models.Brands] = {}
+    if all_aaia:
+        for b in src_models.Brands.objects.filter(aaia_code__in=all_aaia).order_by("id"):
+            if b.aaia_code and b.aaia_code not in aaia_to_brand:
+                aaia_to_brand[b.aaia_code] = b
+
+    name_upper_keys: typing.Set[str] = set()
+    for kb in unmapped_keystone_brands:
+        hit = False
+        for code in _normalize_aaia_codes(kb.aaia_code):
+            if code in aaia_to_brand:
+                hit = True
+                break
+        if not hit and (kb.name or "").strip():
+            name_upper_keys.add((kb.name or "").strip().upper())
+
+    brands_by_upper_name: typing.Dict[str, src_models.Brands] = {}
+    if name_upper_keys:
+        for b in (
+            src_models.Brands.objects.annotate(_name_u=Upper("name"))
+            .filter(_name_u__in=name_upper_keys)
+            .order_by("id")
+        ):
+            key = (b.name or "").strip().upper()
+            if key not in brands_by_upper_name:
+                brands_by_upper_name[key] = b
+
+    resolved_by_keystone_id: typing.Dict[int, src_models.Brands] = {}
+    for kb in sorted(unmapped_keystone_brands, key=lambda x: x.id):
+        brand = None
+        for code in _normalize_aaia_codes(kb.aaia_code):
+            brand = aaia_to_brand.get(code)
+            if brand:
+                break
         if not brand:
-            name_upper = (keystone_brand.name or "").strip().upper()
-            if not name_upper:
-                name_upper = "BRAND_{}".format(keystone_brand.external_id)
-            aaia_primary = _normalize_aaia_codes(keystone_brand.aaia_code)
-            aaia_code = aaia_primary[0] if aaia_primary else None
-            brand = src_models.Brands.objects.create(
-                name=name_upper,
-                status=src_enums.BrandProviderStatus.ACTIVE.value,
-                status_name=src_enums.BrandProviderStatus.ACTIVE.name,
-                aaia_code=aaia_code,
-            )
-            created_brands += 1
-            logger.info(
-                "{} Created new Brand: name={!r} aaia_code={!r} for KeystoneBrand id={}.".format(
-                    _LOG_PREFIX, name_upper, aaia_code, keystone_brand.id
+            nm = (kb.name or "").strip().upper()
+            if nm:
+                brand = brands_by_upper_name.get(nm)
+        if brand:
+            resolved_by_keystone_id[kb.id] = brand
+
+    unresolved_after_exact = [kb for kb in unmapped_keystone_brands if kb.id not in resolved_by_keystone_id]
+    brands_first_index = (
+        brands_by_first_token_upper() if unresolved_after_exact else {}
+    )
+    all_brands_fallback: typing.Optional[typing.List[src_models.Brands]] = None
+    fuzzy_matches = 0
+    for kb in unresolved_after_exact:
+        parts = normalize_upper_words(kb.name or "").split()
+        candidates: typing.List[src_models.Brands] = []
+        if parts:
+            candidates = list(brands_first_index.get(parts[0], ()))
+        if not candidates:
+            if all_brands_fallback is None:
+                all_brands_fallback = list(
+                    src_models.Brands.objects.only("id", "name", "aaia_code").order_by("id")
+                )
+            candidates = all_brands_fallback
+        brand = best_fuzzy_brand_match(kb.name or "", candidates)
+        if brand:
+            resolved_by_keystone_id[kb.id] = brand
+            fuzzy_matches += 1
+            logger.debug(
+                "{} Fuzzy-matched Keystone {!r} to Brand id={} name={!r}.".format(
+                    _LOG_PREFIX, kb.name, brand.id, brand.name
                 )
             )
 
-        mapping, mapping_created = src_models.BrandKeystoneBrandMapping.objects.get_or_create(
-            brand=brand,
-            keystone_brand=keystone_brand,
-        )
-        if mapping_created:
-            created_mappings += 1
+    new_brand_specs: typing.Dict[str, typing.Optional[str]] = {}
+    for kb in sorted(unmapped_keystone_brands, key=lambda x: x.id):
+        if kb.id in resolved_by_keystone_id:
+            continue
+        nu = _keystone_brand_name_upper_for_sync(kb)
+        if nu not in new_brand_specs:
+            parts = _normalize_aaia_codes(kb.aaia_code)
+            new_brand_specs[nu] = parts[0] if parts else None
 
-        bp, bp_created = src_models.BrandProviders.objects.get_or_create(
-            brand=brand,
+    created_brands = 0
+    if new_brand_specs:
+        existing_names = set(
+            src_models.Brands.objects.filter(name__in=list(new_brand_specs.keys())).values_list(
+                "name", flat=True
+            )
+        )
+        new_brand_rows = [
+            src_models.Brands(
+                name=name,
+                status=src_enums.BrandProviderStatus.ACTIVE.value,
+                status_name=src_enums.BrandProviderStatus.ACTIVE.name,
+                aaia_code=aaia_val,
+            )
+            for name, aaia_val in new_brand_specs.items()
+            if name not in existing_names
+        ]
+        if new_brand_rows:
+            src_models.Brands.objects.bulk_create(new_brand_rows, ignore_conflicts=True)
+            created_brands = len(new_brand_rows)
+        by_name = {
+            b.name: b
+            for b in src_models.Brands.objects.filter(name__in=list(new_brand_specs.keys()))
+        }
+        for kb in unmapped_keystone_brands:
+            if kb.id not in resolved_by_keystone_id:
+                nu = _keystone_brand_name_upper_for_sync(kb)
+                resolved_by_keystone_id[kb.id] = by_name[nu]
+
+    mapping_models = [
+        src_models.BrandKeystoneBrandMapping(
+            brand_id=resolved_by_keystone_id[kb.id].id,
+            keystone_brand_id=kb.id,
+        )
+        for kb in unmapped_keystone_brands
+    ]
+    try:
+        pgbulk.upsert(
+            src_models.BrandKeystoneBrandMapping,
+            mapping_models,
+            unique_fields=["brand", "keystone_brand"],
+            update_fields=["updated_at"],
+        )
+    except Exception as e:
+        logger.error("{} Error upserting BrandKeystoneBrandMapping: {}.".format(_LOG_PREFIX, str(e)))
+        raise
+
+    brand_ids = {resolved_by_keystone_id[kb.id].id for kb in unmapped_keystone_brands}
+    existing_bp_ids = set(
+        src_models.BrandProviders.objects.filter(
             provider=keystone_provider,
-        )
-        if bp_created:
-            created_brand_providers += 1
+            brand_id__in=brand_ids,
+        ).values_list("brand_id", flat=True)
+    )
+    bp_to_create = [
+        src_models.BrandProviders(brand_id=bid, provider_id=keystone_provider.id)
+        for bid in brand_ids
+        if bid not in existing_bp_ids
+    ]
+    if bp_to_create:
+        src_models.BrandProviders.objects.bulk_create(bp_to_create, ignore_conflicts=True)
+    created_brand_providers = len(bp_to_create)
 
-        cb, cb_created = src_models.CompanyBrands.objects.get_or_create(
+    existing_cb_ids = set(
+        src_models.CompanyBrands.objects.filter(
             company=tick_company,
-            brand=brand,
-            defaults={
-                "status": src_enums.CompanyBrandStatus.ACTIVE.value,
-                "status_name": src_enums.CompanyBrandStatus.ACTIVE.name,
-            },
+            brand_id__in=brand_ids,
+        ).values_list("brand_id", flat=True)
+    )
+    active_val = src_enums.CompanyBrandStatus.ACTIVE.value
+    active_name = src_enums.CompanyBrandStatus.ACTIVE.name
+    cb_to_create = [
+        src_models.CompanyBrands(
+            company_id=tick_company.id,
+            brand_id=bid,
+            status=active_val,
+            status_name=active_name,
         )
-        if cb_created:
-            created_company_brands += 1
+        for bid in brand_ids
+        if bid not in existing_cb_ids
+    ]
+    if cb_to_create:
+        src_models.CompanyBrands.objects.bulk_create(cb_to_create, ignore_conflicts=True)
+    created_company_brands = len(cb_to_create)
 
     logger.info(
-        "{} Sync complete. Brands created: {}, BrandKeystoneBrandMapping: {}, "
-        "BrandProviders: {}, CompanyBrands: {}.".format(
+        "{} Sync complete. Brands created: {}, fuzzy name matches: {}, "
+        "BrandKeystoneBrandMapping upserted: {}, BrandProviders: {}, CompanyBrands: {}.".format(
             _LOG_PREFIX,
             created_brands,
-            created_mappings,
+            fuzzy_matches,
+            len(mapping_models),
             created_brand_providers,
             created_company_brands,
         )
@@ -279,6 +394,75 @@ def sync_unmapped_keystone_brands_to_brands() -> typing.List[src_models.Keystone
 
 # Keystone provider id (use when provider record has id=4)
 KEYSTONE_PROVIDER_ID = 4
+
+KEYSTONE_PARTS_UPDATE_FIELDS = [
+    "vendor_code", "part_number", "manufacturer_part_no", "long_description",
+    "upsable", "case_qty",
+    "is_non_returnable", "prop65_toxicity", "upc_code", "weight",
+    "height", "length", "width", "aaia_code", "is_hazmat", "is_chemical",
+    "ups_ground_assessorial", "us_ltl", "east_qty", "midwest_qty",
+    "california_qty", "southeast_qty", "pacific_nw_qty", "texas_qty",
+    "great_lakes_qty", "florida_qty", "total_qty", "kit_components",
+    "is_kit", "raw_data",
+]
+
+
+def _pgbulk_upsert_keystone_parts_batches(
+    part_instances: typing.List[src_models.KeystoneParts],
+    batch_size: int,
+    batch_delay_seconds: float,
+) -> int:
+    if not part_instances:
+        return 0
+    num_batches = (len(part_instances) + batch_size - 1) // batch_size
+    total = 0
+    for i in range(0, len(part_instances), batch_size):
+        batch = part_instances[i : i + batch_size]
+        batch_num = (i // batch_size) + 1
+        pgbulk.upsert(
+            src_models.KeystoneParts,
+            batch,
+            unique_fields=["vcpn", "brand"],
+            update_fields=KEYSTONE_PARTS_UPDATE_FIELDS,
+            returning=False,
+        )
+        total += len(batch)
+        logger.info("{} Upserted Keystone parts batch {}/{} ({} rows).".format(
+            _LOG_PREFIX, batch_num, num_batches, len(batch),
+        ))
+        connection.close()
+        if batch_num < num_batches:
+            time.sleep(batch_delay_seconds)
+    return total
+
+
+def _pgbulk_upsert_keystone_company_pricing_batches(
+    pricing_instances: typing.List[src_models.KeystoneCompanyPricing],
+    batch_size: int,
+    batch_delay_seconds: float,
+) -> int:
+    if not pricing_instances:
+        return 0
+    num_batches = (len(pricing_instances) + batch_size - 1) // batch_size
+    total = 0
+    for i in range(0, len(pricing_instances), batch_size):
+        batch = pricing_instances[i : i + batch_size]
+        batch_num = (i // batch_size) + 1
+        pgbulk.upsert(
+            src_models.KeystoneCompanyPricing,
+            batch,
+            unique_fields=["part", "company"],
+            update_fields=["jobber_price", "cost", "core_charge", "updated_at"],
+            returning=False,
+        )
+        total += len(batch)
+        logger.info("{} Upserted KeystoneCompanyPricing batch {}/{} ({} rows).".format(
+            _LOG_PREFIX, batch_num, num_batches, len(batch),
+        ))
+        connection.close()
+        if batch_num < num_batches:
+            time.sleep(batch_delay_seconds)
+    return total
 
 
 def fetch_and_save_all_keystone_brand_parts() -> None:
@@ -329,208 +513,199 @@ def fetch_and_save_all_keystone_brand_parts() -> None:
         logger.warning("{} No brand mappings found. Skipping parts fetch.".format(_LOG_PREFIX))
         return
 
-    primary_provider = src_models.CompanyProviders.objects.filter(
-        provider=keystone_provider,
-        provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
-        primary=True,
-    ).first()
-
-    if not primary_provider:
-        logger.warning("{} No Keystone active primary provider found. Skipping.".format(_LOG_PREFIX))
-        return
-
-    credentials = primary_provider.credentials
-    try:
-        ftp_client = keystone_client.KeystoneFTPClient(credentials=credentials)
-    except ValueError as e:
-        logger.error("{} Invalid credentials: {}.".format(_LOG_PREFIX, str(e)))
-        raise
-
-    try:
-        records = ftp_client.get_inventory_records()
-    except keystone_exceptions.KeystoneException as e:
-        logger.error("{} Keystone error: {}.".format(_LOG_PREFIX, str(e)))
-        raise
-
-    if not records:
-        logger.warning("{} No inventory records returned.".format(_LOG_PREFIX))
-        return
-
-    # # Filter records to only brands we have mappings for
-    # filtered_records = [
-    #     r for r in records
-    #     if _clean_csv_value(r.get("VendorName")) in brand_mappings
-    # ]
-
-    logger.info("{} Filtered to {} records for {} brands.".format(
-        _LOG_PREFIX, len(records), len(brand_mappings)
-    ))
-
-    part_instances = _transform_parts_data(records, brand_mappings)
-
-    if not part_instances:
-        logger.warning("{} No valid part instances created.".format(_LOG_PREFIX))
+    company_providers = list(
+        src_models.CompanyProviders.objects.filter(
+            provider=keystone_provider,
+            provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
+        ).select_related("company")
+    )
+    if not company_providers:
+        logger.warning("{} No active Keystone company providers found. Skipping.".format(_LOG_PREFIX))
         return
 
     BATCH_SIZE = 1000
     BATCH_DELAY_SECONDS = 0.5
-    total_upserted = 0
-    update_fields = [
-        "vendor_code", "part_number", "manufacturer_part_no", "long_description",
-        "jobber_price", "cost", "upsable", "core_charge", "case_qty",
-        "is_non_returnable", "prop65_toxicity", "upc_code", "weight",
-        "height", "length", "width", "aaia_code", "is_hazmat", "is_chemical",
-        "ups_ground_assessorial", "us_ltl", "east_qty", "midwest_qty",
-        "california_qty", "southeast_qty", "pacific_nw_qty", "texas_qty",
-        "great_lakes_qty", "florida_qty", "total_qty", "kit_components",
-        "is_kit", "raw_data",
-    ]
+    total_parts = 0
+    total_pricing = 0
 
-    num_batches = (len(part_instances) + BATCH_SIZE - 1) // BATCH_SIZE
-    for i in range(0, len(part_instances), BATCH_SIZE):
-        batch = part_instances[i : i + BATCH_SIZE]
-        batch_num = (i // BATCH_SIZE) + 1
+    for company_provider in company_providers:
+        company = company_provider.company
         try:
-            pgbulk.upsert(
-                src_models.KeystoneParts,
-                batch,
-                unique_fields=["vcpn", "brand"],
-                update_fields=update_fields,
-                returning=False,
-            )
-            total_upserted += len(batch)
-            logger.info("{} Upserted batch {}/{} ({} parts).".format(
-                _LOG_PREFIX, batch_num, num_batches, len(batch)
+            ftp_client = keystone_client.KeystoneFTPClient(credentials=company_provider.credentials)
+        except ValueError as e:
+            logger.error("{} Invalid Keystone credentials company={}: {}.".format(
+                _LOG_PREFIX, company.name, str(e),
             ))
+            continue
+
+        try:
+            records = ftp_client.get_inventory_records()
+        except keystone_exceptions.KeystoneException as e:
+            logger.error("{} Keystone error company={}: {}.".format(_LOG_PREFIX, company.name, str(e)))
+            continue
+
+        if not records:
+            logger.warning("{} No inventory records company={}.".format(_LOG_PREFIX, company.name))
+            continue
+
+        logger.info("{} company={}: {} CSV rows, {} mapped brands.".format(
+            _LOG_PREFIX, company.name, len(records), len(brand_mappings),
+        ))
+
+        part_instances = _transform_parts_data(records, brand_mappings, omit_pricing_for_parts=True)
+        if not part_instances:
+            logger.warning("{} No part instances company={}.".format(_LOG_PREFIX, company.name))
+            continue
+
+        try:
+            total_parts += _pgbulk_upsert_keystone_parts_batches(
+                part_instances, BATCH_SIZE, BATCH_DELAY_SECONDS
+            )
         except Exception as e:
-            logger.error("{} Error during bulk upsert batch at offset {}: {}.".format(
-                _LOG_PREFIX, i, str(e)
+            logger.error("{} Keystone parts upsert failed company={}: {}.".format(
+                _LOG_PREFIX, company.name, str(e),
             ))
             raise
-        connection.close()
-        if batch_num < num_batches:
-            time.sleep(BATCH_DELAY_SECONDS)
 
-    logger.info("{} Successfully upserted {} Keystone parts total.".format(_LOG_PREFIX, total_upserted))
+        part_lookup = _vcpn_brand_id_lookup_for_records(records, brand_mappings)
+        pricing_instances = _build_keystone_company_pricing_instances(
+            records, brand_mappings, company, part_lookup,
+        )
+        try:
+            total_pricing += _pgbulk_upsert_keystone_company_pricing_batches(
+                pricing_instances, BATCH_SIZE, BATCH_DELAY_SECONDS
+            )
+        except Exception as e:
+            logger.error("{} KeystoneCompanyPricing upsert failed company={}: {}.".format(
+                _LOG_PREFIX, company.name, str(e),
+            ))
+            raise
+
+    logger.info(
+        "{} Finished Keystone brand parts sync: {} part row upserts (batched), {} company-pricing upserts (batched).".format(
+            _LOG_PREFIX, total_parts, total_pricing,
+        )
+    )
 
 
 def fetch_and_save_all_keystone_brands_and_parts() -> None:
     """
-    Fetch the Keystone inventory CSV and upsert all brands and all parts.
-    Use this when you want to sync the full inventory regardless of brand mappings.
+    Fetch the Keystone inventory CSV per company (credentials) and upsert all brands and parts.
+    Catalog fields on KeystoneParts; prices on KeystoneCompanyPricing per company.
     """
-    logger.info("{} Started full Keystone brands and parts sync.".format(_LOG_PREFIX))
+    logger.info("{} Started full Keystone brands and parts sync (per company).".format(_LOG_PREFIX))
 
-    primary_provider = src_models.CompanyProviders.objects.filter(
-        provider__kind=src_enums.BrandProviderKind.KEYSTONE.value,
-        provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
-        primary=True,
-    ).first()
-
-    if not primary_provider:
-        logger.info("{} No Keystone active primary provider found.".format(_LOG_PREFIX))
+    company_providers = list(
+        src_models.CompanyProviders.objects.filter(
+            provider__kind=src_enums.BrandProviderKind.KEYSTONE.value,
+            provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
+        ).select_related("company")
+    )
+    if not company_providers:
+        logger.info("{} No active Keystone company providers found.".format(_LOG_PREFIX))
         return
 
-    credentials = primary_provider.credentials
-    try:
-        ftp_client = keystone_client.KeystoneFTPClient(credentials=credentials)
-    except ValueError as e:
-        logger.error("{} Invalid credentials: {}.".format(_LOG_PREFIX, str(e)))
-        raise
+    BATCH_SIZE = 1000
+    BATCH_DELAY_SECONDS = 0.5
+    brands_synced_once = False
+    total_parts = 0
+    total_pricing = 0
 
-    try:
-        records = ftp_client.get_inventory_records()
-    except keystone_exceptions.KeystoneException as e:
-        logger.error("{} Keystone error: {}.".format(_LOG_PREFIX, str(e)))
-        raise
-
-    if not records:
-        logger.warning("{} No inventory records returned.".format(_LOG_PREFIX))
-        return
-
-    # Extract unique brands
-    brand_data = {}
-    for row in records:
-        name = _clean_csv_value(row.get("VendorName"))
-        if name and name not in brand_data:
-            brand_data[name] = _clean_csv_value(row.get("AAIACode"))
-
-    brand_instances = [
-        src_models.KeystoneBrand(
-            external_id=name,
-            name=name,
-            aaia_code=brand_data.get(name) or "",
-        )
-        for name in sorted(brand_data.keys())
-    ]
-
-    if brand_instances:
+    for company_provider in company_providers:
+        company = company_provider.company
         try:
-            pgbulk.upsert(
-                src_models.KeystoneBrand,
-                brand_instances,
-                unique_fields=["external_id"],
-                update_fields=["name", "aaia_code"],
-            )
-            logger.info("{} Upserted {} Keystone brands.".format(_LOG_PREFIX, len(brand_instances)))
-        except Exception as e:
-            logger.error("{} Error during bulk upsert brands: {}.".format(_LOG_PREFIX, str(e)))
-            raise
+            ftp_client = keystone_client.KeystoneFTPClient(credentials=company_provider.credentials)
+        except ValueError as e:
+            logger.error("{} Invalid Keystone credentials company={}: {}.".format(
+                _LOG_PREFIX, company.name, str(e),
+            ))
+            continue
 
-    # Build VendorName -> KeystoneBrand (from DB)
-    keystone_brands = {
-        b.name: b
-        for b in src_models.KeystoneBrand.objects.filter(external_id__in=brand_data.keys())
-    }
+        try:
+            records = ftp_client.get_inventory_records()
+        except keystone_exceptions.KeystoneException as e:
+            logger.error("{} Keystone error company={}: {}.".format(_LOG_PREFIX, company.name, str(e)))
+            continue
 
-    part_instances = _transform_parts_data(records, keystone_brands)
+        if not records:
+            logger.warning("{} No inventory records company={}.".format(_LOG_PREFIX, company.name))
+            continue
 
-    if part_instances:
-        BATCH_SIZE = 1000
-        BATCH_DELAY_SECONDS = 0.5
-        total_upserted = 0
-        update_fields = [
-            "vendor_code", "part_number", "manufacturer_part_no", "long_description",
-            "jobber_price", "cost", "upsable", "core_charge", "case_qty",
-            "is_non_returnable", "prop65_toxicity", "upc_code", "weight",
-            "height", "length", "width", "aaia_code", "is_hazmat", "is_chemical",
-            "ups_ground_assessorial", "us_ltl", "east_qty", "midwest_qty",
-            "california_qty", "southeast_qty", "pacific_nw_qty", "texas_qty",
-            "great_lakes_qty", "florida_qty", "total_qty", "kit_components",
-            "is_kit", "raw_data",
-        ]
-        num_batches = (len(part_instances) + BATCH_SIZE - 1) // BATCH_SIZE
-        for i in range(0, len(part_instances), BATCH_SIZE):
-            batch = part_instances[i : i + BATCH_SIZE]
-            batch_num = (i // BATCH_SIZE) + 1
+        brand_data = {}
+        for row in records:
+            name = _clean_csv_value(row.get("VendorName"))
+            if name and name not in brand_data:
+                brand_data[name] = _clean_csv_value(row.get("AAIACode"))
+
+        if not brands_synced_once and brand_data:
+            brand_instances = [
+                src_models.KeystoneBrand(
+                    external_id=name,
+                    name=name,
+                    aaia_code=brand_data.get(name) or "",
+                )
+                for name in sorted(brand_data.keys())
+            ]
             try:
                 pgbulk.upsert(
-                    src_models.KeystoneParts,
-                    batch,
-                    unique_fields=["vcpn", "brand"],
-                    update_fields=update_fields,
+                    src_models.KeystoneBrand,
+                    brand_instances,
+                    unique_fields=["external_id"],
+                    update_fields=["name", "aaia_code", "updated_at"],
                     returning=False,
                 )
-                total_upserted += len(batch)
-                logger.info("{} Upserted batch {}/{} ({} parts).".format(
-                    _LOG_PREFIX, batch_num, num_batches, len(batch)
+                logger.info("{} Upserted {} Keystone brands (from first successful company feed).".format(
+                    _LOG_PREFIX, len(brand_instances),
                 ))
             except Exception as e:
-                logger.error("{} Error during bulk upsert parts batch at offset {}: {}.".format(
-                    _LOG_PREFIX, i, str(e)
-                ))
+                logger.error("{} Error upserting Keystone brands: {}.".format(_LOG_PREFIX, str(e)))
                 raise
-            connection.close()
-            if batch_num < num_batches:
-                time.sleep(BATCH_DELAY_SECONDS)
-        logger.info("{} Upserted {} Keystone parts total.".format(_LOG_PREFIX, total_upserted))
+            brands_synced_once = True
 
-    logger.info("{} Completed full Keystone sync.".format(_LOG_PREFIX))
+        keystone_brands = {
+            b.name: b
+            for b in src_models.KeystoneBrand.objects.filter(external_id__in=brand_data.keys())
+        }
+
+        part_instances = _transform_parts_data(records, keystone_brands, omit_pricing_for_parts=True)
+        if not part_instances:
+            continue
+
+        try:
+            total_parts += _pgbulk_upsert_keystone_parts_batches(
+                part_instances, BATCH_SIZE, BATCH_DELAY_SECONDS
+            )
+        except Exception as e:
+            logger.error("{} Keystone parts upsert failed company={}: {}.".format(
+                _LOG_PREFIX, company.name, str(e),
+            ))
+            raise
+
+        part_lookup = _vcpn_brand_id_lookup_for_records(records, keystone_brands)
+        pricing_instances = _build_keystone_company_pricing_instances(
+            records, keystone_brands, company, part_lookup,
+        )
+        try:
+            total_pricing += _pgbulk_upsert_keystone_company_pricing_batches(
+                pricing_instances, BATCH_SIZE, BATCH_DELAY_SECONDS
+            )
+        except Exception as e:
+            logger.error("{} KeystoneCompanyPricing upsert failed company={}: {}.".format(
+                _LOG_PREFIX, company.name, str(e),
+            ))
+            raise
+
+    logger.info(
+        "{} Completed full Keystone sync: parts upserts={}, company pricing upserts={}.".format(
+            _LOG_PREFIX, total_parts, total_pricing,
+        )
+    )
 
 
 def _transform_parts_data(
     records: typing.List[typing.Dict],
     brand_name_to_keystone_brand: typing.Dict[str, src_models.KeystoneBrand],
+    omit_pricing_for_parts: bool = False,
 ) -> typing.List[src_models.KeystoneParts]:
     part_instances = []
 
@@ -550,6 +725,15 @@ def _transform_parts_data(
                 logger.warning("{} Skipping row with missing VCPN: {}.".format(_LOG_PREFIX, row))
                 continue
 
+            if omit_pricing_for_parts:
+                jobber_price = None
+                cost = None
+                core_charge = None
+            else:
+                jobber_price = _safe_decimal(row.get("JobberPrice"))
+                cost = _safe_decimal(row.get("Cost"))
+                core_charge = _safe_decimal(row.get("CoreCharge"))
+
             part_instance = src_models.KeystoneParts(
                 vcpn=vcpn,
                 brand=keystone_brand,
@@ -557,10 +741,10 @@ def _transform_parts_data(
                 part_number=_clean_csv_value(row.get("PartNumber")),
                 manufacturer_part_no=_clean_csv_value(row.get("ManufacturerPartNo")),
                 long_description=_clean_csv_value(row.get("LongDescription")),
-                jobber_price=_safe_decimal(row.get("JobberPrice")),
-                cost=_safe_decimal(row.get("Cost")),
+                jobber_price=jobber_price,
+                cost=cost,
                 upsable=_safe_bool(row.get("UPSable")),
-                core_charge=_safe_decimal(row.get("CoreCharge")),
+                core_charge=core_charge,
                 case_qty=_safe_int(row.get("CaseQty")),
                 is_non_returnable=_safe_bool(row.get("IsNonReturnable")),
                 prop65_toxicity=_clean_csv_value(row.get("Prop65Toxicity")),
@@ -599,3 +783,62 @@ def _transform_parts_data(
             continue
 
     return part_instances
+
+
+def _vcpn_brand_id_lookup_for_records(
+    records: typing.List[typing.Dict],
+    brand_name_to_keystone_brand: typing.Dict[str, src_models.KeystoneBrand],
+) -> typing.Dict[typing.Tuple[str, int], int]:
+    """Map (vcpn, keystone_brand.id) -> KeystoneParts.id for rows that resolve to a known brand."""
+    vcpns: typing.Set[str] = set()
+    brand_ids: typing.Set[int] = set()
+    for row in records:
+        vendor_name = _clean_csv_value(row.get("VendorName"))
+        kb = brand_name_to_keystone_brand.get(vendor_name or "")
+        if not kb:
+            continue
+        vcpn = _clean_csv_value(row.get("VCPN"))
+        if not vcpn:
+            continue
+        vcpns.add(vcpn)
+        brand_ids.add(kb.id)
+    if not vcpns or not brand_ids:
+        return {}
+    lookup: typing.Dict[typing.Tuple[str, int], int] = {}
+    for p in (
+        src_models.KeystoneParts.objects.filter(vcpn__in=vcpns, brand_id__in=brand_ids)
+        .only("id", "vcpn", "brand_id")
+        .iterator(chunk_size=5000)
+    ):
+        lookup[(p.vcpn, p.brand_id)] = p.id
+    return lookup
+
+
+def _build_keystone_company_pricing_instances(
+    records: typing.List[typing.Dict],
+    brand_name_to_keystone_brand: typing.Dict[str, src_models.KeystoneBrand],
+    company: src_models.Company,
+    part_id_by_vcpn_brand: typing.Dict[typing.Tuple[str, int], int],
+) -> typing.List[src_models.KeystoneCompanyPricing]:
+    instances = []
+    for row in records:
+        vendor_name = _clean_csv_value(row.get("VendorName"))
+        kb = brand_name_to_keystone_brand.get(vendor_name or "")
+        if not kb:
+            continue
+        vcpn = _clean_csv_value(row.get("VCPN"))
+        if not vcpn:
+            continue
+        part_id = part_id_by_vcpn_brand.get((vcpn, kb.id))
+        if not part_id:
+            continue
+        instances.append(
+            src_models.KeystoneCompanyPricing(
+                part_id=part_id,
+                company=company,
+                jobber_price=_safe_decimal(row.get("JobberPrice")),
+                cost=_safe_decimal(row.get("Cost")),
+                core_charge=_safe_decimal(row.get("CoreCharge")),
+            )
+        )
+    return instances

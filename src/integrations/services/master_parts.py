@@ -979,9 +979,8 @@ def sync_provider_inventory_from_rough_country() -> None:
 
 def sync_provider_pricing_from_rough_country() -> None:
     """
-    Sync ProviderPartCompanyPricing from RoughCountryPart.
+    Sync ProviderPartCompanyPricing from RoughCountryCompanyPricing (per-company rows).
     Mapping: cost=cost or price or sale_price (first available), jobber/map=cnd_map, msrp/retail=cnd_price.
-    Creates pricing for each company that has Rough Country CompanyProviders.
     """
     logger.info("{} Syncing provider pricing from Rough Country.".format(_LOG_PREFIX))
 
@@ -997,14 +996,6 @@ def sync_provider_pricing_from_rough_country() -> None:
         for pp in src_models.ProviderPart.objects.filter(provider=rc_provider)
     }
 
-    company_ids = list(
-        src_models.CompanyProviders.objects.filter(
-            provider=rc_provider,
-            provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
-        ).values_list("company_id", flat=True).distinct()
-    )
-    companies = {c.id: c for c in src_models.Company.objects.filter(id__in=company_ids)} if company_ids else {}
-
     now = timezone.now()
     total_upserted = 0
     batch_num = 0
@@ -1013,37 +1004,53 @@ def sync_provider_pricing_from_rough_country() -> None:
     while True:
         batch_num += 1
         batch = list(
-            src_models.RoughCountryPart.objects.filter(id__gt=last_id)
+            src_models.RoughCountryCompanyPricing.objects.filter(id__gt=last_id)
             .order_by("id")
-            .values("id", "brand_id", "sku", "cost", "price", "sale_price", "cnd_map", "cnd_price")[:BATCH_SIZE_PRICING]
+            .values(
+                "id",
+                "company_id",
+                "cost",
+                "price",
+                "sale_price",
+                "cnd_map",
+                "cnd_price",
+                "part__brand_id",
+                "part__sku",
+            )[:BATCH_SIZE_PRICING]
         )
         if not batch:
             break
 
         last_id = batch[-1]["id"]
-        companies_list = list(companies.values())
+        batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
+        companies_by_id = {
+            c.id: c
+            for c in src_models.Company.objects.filter(id__in=batch_company_ids)
+        }
         to_upsert = []
         for row in batch:
-            ext_id = _rough_country_provider_external_id(row["brand_id"], row["sku"])
+            ext_id = _rough_country_provider_external_id(row["part__brand_id"], row["part__sku"])
             provider_part = provider_parts.get(ext_id)
             if not provider_part:
+                continue
+            company = companies_by_id.get(row.get("company_id"))
+            if not company:
                 continue
             cost = row.get("cost") or row.get("price") or row.get("sale_price")
             cnd_map = row.get("cnd_map")
             cnd_price = row.get("cnd_price")
-            for company in companies_list:
-                to_upsert.append(
-                    src_models.ProviderPartCompanyPricing(
-                        provider_part=provider_part,
-                        company=company,
-                        cost=cost,
-                        jobber_price=cnd_map,
-                        map_price=cnd_map,
-                        msrp=cnd_price,
-                        retail_price=cnd_price,
-                        last_synced_at=now,
-                    )
+            to_upsert.append(
+                src_models.ProviderPartCompanyPricing(
+                    provider_part=provider_part,
+                    company=company,
+                    cost=cost,
+                    jobber_price=cnd_map,
+                    map_price=cnd_map,
+                    msrp=cnd_price,
+                    retail_price=cnd_price,
+                    last_synced_at=now,
                 )
+            )
 
         if to_upsert:
             pgbulk.upsert(
@@ -1419,8 +1426,7 @@ def sync_provider_inventory_from_wheelpros() -> None:
 
 def sync_provider_pricing_from_wheelpros() -> None:
     """
-    Sync ProviderPartCompanyPricing from WheelProsPart (msrp_usd, map_usd).
-    Creates pricing for each company that has WheelPros CompanyProviders.
+    Sync ProviderPartCompanyPricing from WheelProsCompanyPricing (per-company SFTP pricing).
     Resolves ProviderPart by provider_external_id first, then by (brand_id, sku) to align with master parts lookup.
     """
     logger.info("{} Syncing provider pricing from WheelPros.".format(_LOG_PREFIX))
@@ -1434,14 +1440,6 @@ def sync_provider_pricing_from_wheelpros() -> None:
 
     provider_parts_by_ext_id, provider_parts_by_brand_sku = _wheelpros_provider_part_lookup(wp_provider)
 
-    company_ids = list(
-        src_models.CompanyProviders.objects.filter(
-            provider=wp_provider,
-            provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
-        ).values_list("company_id", flat=True).distinct()
-    )
-    companies = {c.id: c for c in src_models.Company.objects.filter(id__in=company_ids)} if company_ids else {}
-
     now = timezone.now()
     total_upserted = 0
     batch_num = 0
@@ -1450,41 +1448,54 @@ def sync_provider_pricing_from_wheelpros() -> None:
     while True:
         batch_num += 1
         batch = list(
-            src_models.WheelProsPart.objects.filter(id__gt=last_id)
+            src_models.WheelProsCompanyPricing.objects.filter(id__gt=last_id)
             .order_by("id")
-            .values("id", "brand_id", "part_number", "msrp_usd", "map_usd")[:BATCH_SIZE_PRICING]
+            .values(
+                "id",
+                "company_id",
+                "msrp_usd",
+                "map_usd",
+                "part__brand_id",
+                "part__part_number",
+            )[:BATCH_SIZE_PRICING]
         )
         if not batch:
             break
 
         last_id = batch[-1]["id"]
-        companies_list = list(companies.values())
+        batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
+        companies_by_id = {
+            c.id: c
+            for c in src_models.Company.objects.filter(id__in=batch_company_ids)
+        }
         to_upsert = []
         for row in batch:
-            part_number = (row.get("part_number") or "").strip()
+            part_number = (row.get("part__part_number") or "").strip()
             if not part_number:
                 continue
-            ext_id = _wheelpros_provider_external_id(row["brand_id"], part_number)
+            ext_id = _wheelpros_provider_external_id(row["part__brand_id"], part_number)
             provider_part = provider_parts_by_ext_id.get(ext_id) or provider_parts_by_brand_sku.get(
-                (row["brand_id"], part_number)
+                (row["part__brand_id"], part_number)
             )
             if not provider_part:
                 continue
+            company = companies_by_id.get(row.get("company_id"))
+            if not company:
+                continue
             msrp = row.get("msrp_usd")
             map_price = row.get("map_usd")
-            for company in companies_list:
-                to_upsert.append(
-                    src_models.ProviderPartCompanyPricing(
-                        provider_part=provider_part,
-                        company=company,
-                        cost=None,
-                        jobber_price=map_price,
-                        map_price=map_price,
-                        msrp=msrp,
-                        retail_price=msrp,
-                        last_synced_at=now,
-                    )
+            to_upsert.append(
+                src_models.ProviderPartCompanyPricing(
+                    provider_part=provider_part,
+                    company=company,
+                    cost=None,
+                    jobber_price=map_price,
+                    map_price=map_price,
+                    msrp=msrp,
+                    retail_price=msrp,
+                    last_synced_at=now,
                 )
+            )
 
         if to_upsert:
             pgbulk.upsert(
@@ -1908,8 +1919,8 @@ def _extract_turn14_prices(pricelists: typing.Any) -> typing.Tuple[typing.Any, t
 def sync_provider_pricing_from_turn14() -> None:
     """
     Sync ProviderPartCompanyPricing from Turn14BrandPricing.
-    Uses purchase_cost as cost. Creates pricing for each company that has Turn14 CompanyProviders.
-    Uses bulk upsert instead of get_or_create loop.
+    Each Turn14BrandPricing row is scoped to a company; one ProviderPartCompanyPricing row per
+    (provider_part, company) using that row's costs for that company only.
     """
     logger.info("{} Syncing provider pricing from Turn14.".format(_LOG_PREFIX))
 
@@ -1925,14 +1936,6 @@ def sync_provider_pricing_from_turn14() -> None:
         for pp in src_models.ProviderPart.objects.filter(provider=turn14_provider)
     }
 
-    company_ids = list(
-        src_models.CompanyProviders.objects.filter(
-            provider=turn14_provider,
-            provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
-        ).values_list("company_id", flat=True).distinct()
-    )
-    companies = {c.id: c for c in src_models.Company.objects.filter(id__in=company_ids)} if company_ids else {}
-
     now = timezone.now()
     total_upserted = 0
     batch_num = 0
@@ -1943,33 +1946,40 @@ def sync_provider_pricing_from_turn14() -> None:
         batch = list(
             src_models.Turn14BrandPricing.objects.filter(id__gt=last_id)
             .order_by("id")
-            .values("id", "external_id", "purchase_cost", "pricelists")[:BATCH_SIZE_PRICING]
+            .values("id", "external_id", "purchase_cost", "pricelists", "company_id")[:BATCH_SIZE_PRICING]
         )
         if not batch:
             break
 
         last_id = batch[-1]["id"]
-        # Build (provider_part, company) records via itertools - no nested manual loops
+        batch_company_ids = {pr["company_id"] for pr in batch if pr.get("company_id")}
+        companies_by_id = {
+            c.id: c
+            for c in src_models.Company.objects.filter(id__in=batch_company_ids)
+        }
         to_upsert = []
         for pr in batch:
             provider_part = provider_parts.get(pr["external_id"])
             if not provider_part:
                 continue
+            company_id = pr.get("company_id")
+            company = companies_by_id.get(company_id) if company_id else None
+            if not company:
+                continue
             cost = pr.get("purchase_cost")
             jobber_price, map_price, msrp, retail_price = _extract_turn14_prices(pr.get("pricelists"))
-            for company in companies.values():
-                to_upsert.append(
-                    src_models.ProviderPartCompanyPricing(
-                        provider_part=provider_part,
-                        company=company,
-                        cost=cost,
-                        jobber_price=jobber_price,
-                        map_price=map_price,
-                        msrp=msrp,
-                        retail_price=retail_price,
-                        last_synced_at=now,
-                    )
+            to_upsert.append(
+                src_models.ProviderPartCompanyPricing(
+                    provider_part=provider_part,
+                    company=company,
+                    cost=cost,
+                    jobber_price=jobber_price,
+                    map_price=map_price,
+                    msrp=msrp,
+                    retail_price=retail_price,
+                    last_synced_at=now,
                 )
+            )
 
         if to_upsert:
             pgbulk.upsert(
@@ -1992,9 +2002,7 @@ def sync_provider_pricing_from_turn14() -> None:
 
 def sync_provider_pricing_from_keystone() -> None:
     """
-    Sync ProviderPartCompanyPricing from KeystoneParts.
-    Creates pricing for each company that has Keystone CompanyProviders.
-    Uses bulk upsert instead of get_or_create loop.
+    Sync ProviderPartCompanyPricing from KeystoneCompanyPricing (per-company FTP pricing).
     """
     logger.info("{} Syncing provider pricing from Keystone.".format(_LOG_PREFIX))
 
@@ -2010,14 +2018,6 @@ def sync_provider_pricing_from_keystone() -> None:
         for pp in src_models.ProviderPart.objects.filter(provider=keystone_provider)
     }
 
-    company_ids = list(
-        src_models.CompanyProviders.objects.filter(
-            provider=keystone_provider,
-            provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
-        ).values_list("company_id", flat=True).distinct()
-    )
-    companies = {c.id: c for c in src_models.Company.objects.filter(id__in=company_ids)} if company_ids else {}
-
     now = timezone.now()
     total_upserted = 0
     batch_num = 0
@@ -2026,30 +2026,40 @@ def sync_provider_pricing_from_keystone() -> None:
     while True:
         batch_num += 1
         batch = list(
-            src_models.KeystoneParts.objects.filter(id__gt=last_id)
+            src_models.KeystoneCompanyPricing.objects.filter(id__gt=last_id)
             .order_by("id")
-            .values("id", "vcpn", "cost", "jobber_price")[:BATCH_SIZE_PRICING]
+            .values("id", "company_id", "cost", "jobber_price", "part__vcpn")[:BATCH_SIZE_PRICING]
         )
         if not batch:
             break
 
         last_id = batch[-1]["id"]
-        companies_list = list(companies.values())
-        to_upsert = [
-            src_models.ProviderPartCompanyPricing(
-                provider_part=provider_parts[kp["vcpn"]],
-                company=company,
-                cost=kp.get("cost"),
-                jobber_price=kp.get("jobber_price"),
-                map_price=None,
-                msrp=None,
-                retail_price=None,
-                last_synced_at=now,
+        batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
+        companies_by_id = {
+            c.id: c
+            for c in src_models.Company.objects.filter(id__in=batch_company_ids)
+        }
+        to_upsert = []
+        for row in batch:
+            vcpn = row.get("part__vcpn")
+            provider_part = provider_parts.get(vcpn) if vcpn else None
+            if not provider_part:
+                continue
+            company = companies_by_id.get(row.get("company_id"))
+            if not company:
+                continue
+            to_upsert.append(
+                src_models.ProviderPartCompanyPricing(
+                    provider_part=provider_part,
+                    company=company,
+                    cost=row.get("cost"),
+                    jobber_price=row.get("jobber_price"),
+                    map_price=None,
+                    msrp=None,
+                    retail_price=None,
+                    last_synced_at=now,
+                )
             )
-            for kp in batch
-            if kp["vcpn"] in provider_parts
-            for company in companies_list
-        ]
 
         if to_upsert:
             pgbulk.upsert(

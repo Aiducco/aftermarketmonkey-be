@@ -2,6 +2,8 @@
 Client for Rough Country jobber feed (Excel).
 Downloads jobber_pc2A.xlsx and parses General, Vehicle Fitment, and Discontinued sheets.
 Uses a browser-like User-Agent to avoid 403. Configure ROUGH_COUNTRY_FEED_URL in settings if needed.
+Per-company feed URL is stored in CompanyProviders.credentials as feed_url
+(see src.constants.ROUGH_COUNTRY_CREDENTIALS_FEED_URL).
 """
 import logging
 import typing

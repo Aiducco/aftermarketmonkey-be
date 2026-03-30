@@ -62,14 +62,21 @@ class KeystoneCredentialsSchema(Schema):
 
 
 class MeyerCredentialsSchema(Schema):
-    """Meyer Distributing SFTP credentials (aligned with MeyerSFTPClient / integrations catalog)."""
+    """
+    Meyer Distributing SFTP — all remote settings are required (no env fallbacks in the client).
+
+    ``sftp_server`` may be a hostname or a URL (``sftp://`` / ``https://``); only the host is used.
+    """
+
     sftp_server = fields.String(required=True)
+    sftp_port = fields.Integer(required=True)
     sftp_user = fields.String(required=True)
     sftp_password = fields.String(required=True)
-    sftp_port = fields.String(required=False, allow_none=True)
-    sftp_directory = fields.String(required=False, allow_none=True)
-    pricing_remote_file = fields.String(required=False, allow_none=True)
-    inventory_remote_file = fields.String(required=False, allow_none=True)
+    sftp_directory = fields.String(required=True)
+    pricing_remote_file = fields.String(required=True)
+    inventory_remote_file = fields.String(required=True)
+    local_pricing_path = fields.String(required=False, allow_none=True)
+    local_inventory_path = fields.String(required=False, allow_none=True)
 
 
 class WheelProsCredentialsSchema(Schema):

@@ -23,7 +23,12 @@ class Command(BaseCommand):
         parser.add_argument(
             "--dry-run",
             action="store_true",
-            help="Do not fetch or write. Only log what sync_unmapped_meyer_brands_to_brands would do.",
+            help="Do not fetch or write. Only log matched unmapped Meyer brands (dry run), same as brand step.",
+        )
+        parser.add_argument(
+            "--dry-run-brands",
+            action="store_true",
+            help="Step 2 only: log Meyer brands that would match an existing Brand (exact/fuzzy); no brand writes.",
         )
         parser.add_argument(
             "--force-download",
@@ -56,9 +61,20 @@ class Command(BaseCommand):
             )
             self.stdout.write(self.style.SUCCESS("Meyer catalog and inventory saved."))
 
-            self.stdout.write("Step 2: Syncing unmapped Meyer brands into Brands flow...")
-            meyer.sync_unmapped_meyer_brands_to_brands()
-            self.stdout.write(self.style.SUCCESS("Unmapped Meyer brands synced."))
+            dry_run_brands = options.get("dry_run_brands", False)
+            self.stdout.write(
+                "Step 2: Syncing unmapped Meyer brands into Brands flow{}...".format(
+                    " (dry run — matched only in logs)" if dry_run_brands else ""
+                )
+            )
+            meyer.sync_unmapped_meyer_brands_to_brands(dry_run=dry_run_brands)
+            self.stdout.write(
+                self.style.SUCCESS(
+                    "Unmapped Meyer brands {}.".format(
+                        "dry-run complete (see logs)" if dry_run_brands else "synced"
+                    )
+                )
+            )
 
             audit_scheduled_tasks.mark_scheduled_task_completed(
                 execution,

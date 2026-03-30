@@ -1,11 +1,26 @@
 """
 Auxiliary script to merge duplicate brands.
-Paste into Django shell: python manage.py shell, then exec(open("scripts/merge_duplicate_brands.py").read())
 
-Flow per pair:
+There is no ``manage.py`` subcommand; load this file from the Django shell.
+
+**One-off merge by brand id** (e.g. keep FOX ``3017``, merge **FOX POWERSPORTS** ``3288`` into it)::
+
+    python manage.py shell
+    >>> import runpy
+    >>> ns = runpy.run_path("scripts/merge_duplicate_brands.py", run_name="merge_loader")
+    >>> from src import models as m
+    >>> ns["merge_brands"](m.Brands.objects.get(pk=3017), m.Brands.objects.get(pk=3288))
+
+Use ``run_name=...`` (not ``__main__``) so the script does not start the interactive ``PAIRS_TO_CHECK`` runner.
+
+**Interactive duplicate scan** (Turn14/Keystone/WheelPros/Rough Country heuristics): run as a module::
+
+    python scripts/merge_duplicate_brands.py
+
+Flow per pair (``run()``):
   1. Search turn14_brands, keystone_brands, wheelpros_brands, rough_country_brands by name or code
   2. If found in at least 2 provider tables -> find Brands, ask which to keep
-  3. Update mappings (wheelpros, keystone, turn14, rough_country), brand_providers
+  3. Update mappings (wheelpros, keystone, turn14, rough_country, meyer), brand_providers
   4. Delete CompanyBrands for merge brand, then delete merge brand
   (Every action asks for confirmation)
 """
@@ -20,24 +35,10 @@ if "django" not in sys.modules:
 from django.db import models as django_models
 from src import models as src_models
 
-# Pairs to check: (label, [brand_name_or_id, ...])
-# Use brand names for search; IDs in comments for reference
+# Pairs to check: (label, [brand names for search])
+# Interactive run merges into the brand you choose to KEEP (typically FOX); FOX POWERSPORTS is merged in then deleted.
 PAIRS_TO_CHECK = [
-    ("BAK IND / BAKFLIP", ["BAK IND", "BAKFLIP"]),  # 118, 1537
-    ("KING SHOCKS / KING", ["KING SHOCKS", "KING"]),  # 25, 549
-    ("KYB SHOCKS / KYB Powersports", ["KYB SHOCKS", "KYB Powersports"]),  # 561, 1348
-    ("WELD RACING / Weld", ["WELD RACING", "Weld"]),  # 1108, 1333
-    ("AMP RESEARCH / AMP", ["AMP RESEARCH", "AMP"]),  # 13, 1535
-    ("ARTEC INDUST / Artec Industries", ["ARTEC INDUST", "Artec Industries"]),  # 92, 1401
-    ("CARLI / CARLI SUSPEN", ["Carli", "CARLI SUSPEN"]),  # 1379, 1455
-    ("GORILLA / GORILLA AUTOMOTIVE", ["GORILLA AUTOMOTIVE", "GORILLA"]),  # 1541, 434
-    ("READYLIFT variants", ["READYLIFT", "READYLIFT SUSPENSION", "READYLIFT PREMIUM SHOCKS"]),  # 808, 1549, 1548
-    ("KMC / KMC POWERSPORTS", ["KMC", "KMC POWERSPORTS"]),  # 1495, 1496
-    ("IRONMAN / IRONMAN 4X4", ["IRONMAN", "IRONMAN 4X4"]),  # 1463, 513
-    ("MORIMOTO variants", ["MORIMOTO", "MORIMOTO OFFROAD", "MORIMOTO - NON XB"]),  # 649, 1544, 1543
-    ("RUGGED variants", ["RUGGED", "RUGGED LINER", "RUGGED OFFR", "RUGGED RADIO", "RUGGED RIDGE"]),  # may be different companies
-    ("JR PRODUCTS / JRV PRODUCTS", ["JR PRODUCTS", "JRV PRODUCTS"]),  # 532, 533
-    ("SUSPENS PRO / SUSPENSN PRO", ["SUSPENS PRO", "SUSPENSN PRO"]),  # 972, 974
+    ("FOX / FOX POWERSPORTS", ["FOX", "FOX POWERSPORTS"]),  # e.g. 3017, 3288
 ]
 
 
@@ -105,6 +106,8 @@ def _get_mappings_for_brand(brand):
         out.append("wheelpros")
     if src_models.BrandRoughCountryBrandMapping.objects.filter(brand=brand).exists():
         out.append("rough_country")
+    if src_models.BrandMeyerBrandMapping.objects.filter(brand=brand).exists():
+        out.append("meyer")
     return out
 
 
@@ -165,7 +168,30 @@ def merge_brands(brand_to_keep, brand_to_delete):
                 m.brand_id = keep_id
                 m.save()
 
-    # 5. BrandProviders
+    # 5. BrandMeyerBrandMapping
+    meyer_list = list(
+        src_models.BrandMeyerBrandMapping.objects.filter(brand_id=delete_id).select_related("meyer_brand")
+    )
+    print("\n--- BrandMeyerBrandMapping: {} to process ---".format(len(meyer_list)))
+    for m in meyer_list:
+        existing = src_models.BrandMeyerBrandMapping.objects.filter(
+            brand_id=keep_id, meyer_brand=m.meyer_brand
+        ).first()
+        if existing:
+            if _confirm(
+                "  Delete mapping id={} (meyer_brand={})? Keep already has.".format(m.id, m.meyer_brand.name)
+            ):
+                m.delete()
+        else:
+            if _confirm(
+                "  Update mapping id={} brand_id {} -> {} (meyer_brand={})?".format(
+                    m.id, delete_id, keep_id, m.meyer_brand.name
+                )
+            ):
+                m.brand_id = keep_id
+                m.save()
+
+    # 6. BrandProviders
     bp_list = list(src_models.BrandProviders.objects.filter(brand_id=delete_id).select_related("provider"))
     print("\n--- BrandProviders: {} to process ---".format(len(bp_list)))
     for bp in bp_list:
@@ -178,7 +204,7 @@ def merge_brands(brand_to_keep, brand_to_delete):
                 bp.brand_id = keep_id
                 bp.save()
 
-    # 6. MasterPart (update brand_id, handle duplicates)
+    # 7. MasterPart (update brand_id, handle duplicates)
     mp_list = list(src_models.MasterPart.objects.filter(brand_id=delete_id))
     print("\n--- MasterPart: {} to process ---".format(len(mp_list)))
     if mp_list:
@@ -202,20 +228,20 @@ def merge_brands(brand_to_keep, brand_to_delete):
                         mp.brand_id = keep_id
                         mp.save()
 
-    # 7. CompanyDestinationParts
+    # 8. CompanyDestinationParts
     cdp_count = src_models.CompanyDestinationParts.objects.filter(brand_id=delete_id).count()
     if cdp_count:
         if _confirm("  Update {} CompanyDestinationParts brand_id {} -> {}?".format(cdp_count, delete_id, keep_id)):
             src_models.CompanyDestinationParts.objects.filter(brand_id=delete_id).update(brand_id=keep_id)
 
-    # 8. CompanyBrands - delete for merge brand
+    # 9. CompanyBrands - delete for merge brand
     cb_count = src_models.CompanyBrands.objects.filter(brand_id=delete_id).count()
     print("\n--- CompanyBrands: {} to delete (brand_id={}) ---".format(cb_count, delete_id))
     if cb_count:
         if _confirm("  Delete {} CompanyBrands for '{}'?".format(cb_count, brand_to_delete.name)):
             src_models.CompanyBrands.objects.filter(brand_id=delete_id).delete()
 
-    # 9. BigCommerceBrands, BrandSDCBrandMapping if any
+    # 10. BigCommerceBrands, BrandSDCBrandMapping if any
     bbc = src_models.BigCommerceBrands.objects.filter(brand_id=delete_id)
     if bbc.exists():
         if _confirm("  Update {} BigCommerceBrands?".format(bbc.count())):
@@ -232,7 +258,7 @@ def merge_brands(brand_to_keep, brand_to_delete):
                     m.brand_id = keep_id
                     m.save()
 
-    # 10. Delete brand
+    # 11. Delete brand
     print("\n--- Delete brand '{}' (id={}) ---".format(brand_to_delete.name, delete_id))
     if _confirm("  Confirm DELETE brand '{}'?".format(brand_to_delete.name)):
         brand_to_delete.delete()
@@ -321,10 +347,10 @@ def run():
     print("\n" + "=" * 60)
     print("Done.")
 
-
-if __name__ == "__main__":
-    import pathlib
-    root = pathlib.Path(__file__).resolve().parent.parent
-    if str(root) not in sys.path:
-        sys.path.insert(0, str(root))
-run()
+#
+# if __name__ == "__main__":
+#     import pathlib
+#     root = pathlib.Path(__file__).resolve().parent.parent
+#     if str(root) not in sys.path:
+#         sys.path.insert(0, str(root))
+# run()
