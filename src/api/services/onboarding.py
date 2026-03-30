@@ -165,13 +165,13 @@ def save_personalization(
         "turn_14": {"client_id": "...", "client_secret": "..."},
         "keystone": {"ftp_user": "...", "ftp_password": "..."},
         "meyer": {
-            "sftp_server": "...",
+            "sftp_server": "... (host or URL)",
+            "sftp_port": 22,
             "sftp_user": "...",
             "sftp_password": "...",
-            "sftp_port": "optional",
-            "sftp_directory": "optional",
-            "pricing_remote_file": "optional",
-            "inventory_remote_file": "optional",
+            "sftp_directory": "uploads",
+            "pricing_remote_file": "Meyer Pricing.csv",
+            "inventory_remote_file": "Meyer Inventory.csv",
         },
         "wheelpros": {
             "sftp_server": "...",
@@ -254,25 +254,48 @@ def _upsert_company_providers(company: src_models.Company, credentials: dict) ->
                     },
                 )
 
-    # Meyer: kind=6 (MEYER), SFTP feeds (same keys as integrations catalog / MeyerSFTPClient)
+    # Meyer: kind=6 (MEYER) — full SFTP settings stored in credentials (MeyerSFTPClient; no remote defaults)
     if "meyer" in credentials:
         creds = credentials["meyer"]
-        if creds.get("sftp_server") and creds.get("sftp_user") and creds.get("sftp_password"):
+        host_raw = (
+            creds.get("sftp_server")
+            or creds.get("sftp_host")
+            or creds.get("server_url")
+            or ""
+        )
+        try:
+            port = int(creds.get("sftp_port"))
+        except (TypeError, ValueError):
+            port = None
+        dir_ok = str(creds.get("sftp_directory") or "").strip()
+        pricing_ok = str(creds.get("pricing_remote_file") or "").strip()
+        inv_ok = str(creds.get("inventory_remote_file") or "").strip()
+        user_ok = str(creds.get("sftp_user") or "").strip()
+        pass_ok = str(creds.get("sftp_password") or "").strip()
+        if (
+            str(host_raw).strip()
+            and user_ok
+            and pass_ok
+            and dir_ok
+            and pricing_ok
+            and inv_ok
+            and port is not None
+            and 1 <= port <= 65535
+        ):
             provider = src_models.Providers.objects.filter(
                 kind=src_enums.BrandProviderKind.MEYER.value
             ).first()
             if provider:
                 cred_dict = {
-                    "sftp_server": str(creds["sftp_server"]).strip(),
-                    "sftp_user": str(creds["sftp_user"]).strip(),
-                    "sftp_password": str(creds["sftp_password"]).strip(),
+                    "sftp_server": str(host_raw).strip(),
+                    "sftp_port": port,
+                    "sftp_user": user_ok,
+                    "sftp_password": pass_ok,
+                    "sftp_directory": dir_ok,
+                    "pricing_remote_file": pricing_ok,
+                    "inventory_remote_file": inv_ok,
                 }
-                for opt in (
-                    "sftp_port",
-                    "sftp_directory",
-                    "pricing_remote_file",
-                    "inventory_remote_file",
-                ):
+                for opt in ("local_pricing_path", "local_inventory_path"):
                     v = creds.get(opt)
                     if v is not None and str(v).strip():
                         cred_dict[opt] = str(v).strip()
@@ -372,8 +395,11 @@ def get_distributor_credentials_info() -> dict:
             "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("KEYSTONE") or None,
         },
         "rough_country": {
-            "required": [],
-            "description": "Rough Country public feed (no credentials required)",
+            "required": [src_constants.ROUGH_COUNTRY_CREDENTIALS_FEED_URL],
+            "description": (
+                "Rough Country jobber Excel URL (feed_url) per company. "
+                "Catalog uses the primary connection; pricing loads each company's feed_url."
+            ),
             "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("ROUGH_COUNTRY", "Rough Country"),
             "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("ROUGH_COUNTRY") or None,
         },
@@ -385,14 +411,20 @@ def get_distributor_credentials_info() -> dict:
             "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("WHEELPROS") or None,
         },
         "meyer": {
-            "required": ["sftp_server", "sftp_user", "sftp_password"],
-            "optional": [
+            "required": [
+                "sftp_server",
                 "sftp_port",
+                "sftp_user",
+                "sftp_password",
                 "sftp_directory",
                 "pricing_remote_file",
                 "inventory_remote_file",
             ],
-            "description": "SFTP credentials for Meyer Distributing (remote directory + pricing/inventory filenames optional)",
+            "optional": ["local_pricing_path", "local_inventory_path"],
+            "description": (
+                "Meyer Distributing SFTP: server (hostname or URL), port, user, password, remote directory, "
+                "and both CSV filenames (pricing + inventory). Optional local cache paths for downloads."
+            ),
             "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("MEYER", "Meyer"),
             "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("MEYER") or None,
         },

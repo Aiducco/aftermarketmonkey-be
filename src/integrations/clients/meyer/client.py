@@ -2,6 +2,7 @@ import logging
 import os
 import time
 import typing
+from urllib.parse import urlparse
 
 import paramiko
 from django.conf import settings
@@ -12,14 +13,20 @@ logger = logging.getLogger(__name__)
 
 _LOG_PREFIX = "[MEYER-SFTP-CLIENT]"
 
-DEFAULT_SFTP_HOST = "54.145.82.238"
-DEFAULT_SFTP_PORT = 22
-DEFAULT_SFTP_DIRECTORY = "uploads"
-DEFAULT_PRICING_FILENAME = "Meyer Pricing.csv"
-DEFAULT_INVENTORY_FILENAME = "Meyer Inventory.csv"
 DEFAULT_LOCAL_PRICING = "/tmp/meyer_pricing.csv"
 DEFAULT_LOCAL_INVENTORY = "/tmp/meyer_inventory.csv"
 DEFAULT_FILE_MAX_AGE_SECONDS = 6 * 60 * 60
+
+
+def _normalize_sftp_server(value: typing.Any) -> str:
+    """Hostname, or URL (sftp/https) — host part only."""
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    if "://" in s:
+        parsed = urlparse(s)
+        return (parsed.hostname or "").strip()
+    return s
 
 
 def _remote_join(directory: str, filename: str) -> str:
@@ -29,11 +36,38 @@ def _remote_join(directory: str, filename: str) -> str:
     return path
 
 
+def _require_non_empty_str(creds: typing.Dict, *keys: str) -> typing.Tuple[typing.List[str], typing.Dict[str, str]]:
+    """Return (missing_keys, normalized_key -> value) for required string fields."""
+    out: typing.Dict[str, str] = {}
+    missing: typing.List[str] = []
+    for k in keys:
+        v = creds.get(k)
+        s = str(v).strip() if v is not None else ""
+        if not s:
+            missing.append(k)
+        else:
+            out[k] = s
+    return missing, out
+
+
 class MeyerSFTPClient:
     """
     SFTP client for Meyer Distributing pricing + inventory CSV feeds.
-    Credentials: sftp_server, sftp_user, sftp_password, optional sftp_directory,
-    pricing_remote_file, inventory_remote_file (see MEYER_* settings fallbacks).
+
+    All connection settings must be supplied in ``credentials`` (no Django settings fallbacks
+    for host, port, auth, remote directory, or filenames).
+
+    Required keys:
+      - ``sftp_server`` (hostname, or ``sftp://`` / ``https://`` URL — only host is used),
+        aliases: ``sftp_host``, ``server_url``
+      - ``sftp_port`` (int or numeric string)
+      - ``sftp_user``, ``sftp_password``
+      - ``sftp_directory`` — remote folder (e.g. ``uploads``; no leading slash required)
+      - ``pricing_remote_file`` — CSV filename under that directory
+      - ``inventory_remote_file`` — CSV filename under that directory
+
+    Optional:
+      - ``local_pricing_path``, ``local_inventory_path`` — local cache paths (else ``MEYER_*_LOCAL_PATH`` settings or /tmp defaults)
     """
 
     def __init__(
@@ -44,50 +78,61 @@ class MeyerSFTPClient:
         file_max_age: int = DEFAULT_FILE_MAX_AGE_SECONDS,
         require_credentials: bool = True,
     ):
-        creds = credentials or {}
-        self.sftp_server = str(
+        creds = dict(credentials or {})
+
+        raw_server = (
             creds.get("sftp_server")
             or creds.get("sftp_host")
-            or getattr(settings, "MEYER_SFTP_HOST", DEFAULT_SFTP_HOST)
-        ).strip()
-        self.sftp_port = int(
-            creds.get("sftp_port") or getattr(settings, "MEYER_SFTP_PORT", DEFAULT_SFTP_PORT)
-        )
-        self.sftp_user = str(
-            creds.get("sftp_user")
-            or creds.get("username")
-            or getattr(settings, "MEYER_SFTP_USER", "")
+            or creds.get("server_url")
             or ""
-        ).strip()
-        self.sftp_password = str(
-            creds.get("sftp_password")
-            or creds.get("password")
-            or getattr(settings, "MEYER_SFTP_PASSWORD", "")
-            or ""
-        ).strip()
-        self.sftp_directory = str(
-            creds.get("sftp_directory")
-            or getattr(settings, "MEYER_SFTP_DIRECTORY", DEFAULT_SFTP_DIRECTORY)
-            or DEFAULT_SFTP_DIRECTORY
-        ).strip()
-        self.pricing_remote_file = str(
-            creds.get("pricing_remote_file")
-            or getattr(settings, "MEYER_PRICING_REMOTE_FILE", DEFAULT_PRICING_FILENAME)
-        ).strip()
-        self.inventory_remote_file = str(
-            creds.get("inventory_remote_file")
-            or getattr(settings, "MEYER_INVENTORY_REMOTE_FILE", DEFAULT_INVENTORY_FILENAME)
-        ).strip()
-        self.local_pricing_path = local_pricing_path or getattr(
-            settings, "MEYER_PRICING_LOCAL_PATH", DEFAULT_LOCAL_PRICING
         )
-        self.local_inventory_path = local_inventory_path or getattr(
-            settings, "MEYER_INVENTORY_LOCAL_PATH", DEFAULT_LOCAL_INVENTORY
+        self.sftp_server = _normalize_sftp_server(raw_server)
+
+        try:
+            self.sftp_port = int(creds.get("sftp_port"))
+        except (TypeError, ValueError):
+            self.sftp_port = 0
+
+        missing: typing.List[str] = []
+        if not self.sftp_server:
+            missing.append("sftp_server (or sftp_host / server_url)")
+        if not self.sftp_port or self.sftp_port < 1 or self.sftp_port > 65535:
+            missing.append("sftp_port (1–65535)")
+
+        m_str, str_fields = _require_non_empty_str(
+            creds,
+            "sftp_user",
+            "sftp_password",
+            "sftp_directory",
+            "pricing_remote_file",
+            "inventory_remote_file",
+        )
+        missing.extend(m_str)
+
+        self.sftp_user = str_fields.get("sftp_user", "")
+        self.sftp_password = str_fields.get("sftp_password", "")
+        self.sftp_directory = str_fields.get("sftp_directory", "")
+        self.pricing_remote_file = str_fields.get("pricing_remote_file", "")
+        self.inventory_remote_file = str_fields.get("inventory_remote_file", "")
+
+        self.local_pricing_path = (
+            str(creds.get("local_pricing_path") or "").strip()
+            or local_pricing_path
+            or getattr(settings, "MEYER_PRICING_LOCAL_PATH", DEFAULT_LOCAL_PRICING)
+        )
+        self.local_inventory_path = (
+            str(creds.get("local_inventory_path") or "").strip()
+            or local_inventory_path
+            or getattr(settings, "MEYER_INVENTORY_LOCAL_PATH", DEFAULT_LOCAL_INVENTORY)
         )
         self.file_max_age = file_max_age
 
-        if require_credentials and not all([self.sftp_server, self.sftp_user, self.sftp_password]):
-            raise ValueError("Invalid Meyer SFTP configuration: host, user, and password are required.")
+        if require_credentials and missing:
+            raise ValueError(
+                "Invalid Meyer SFTP configuration — required in credentials: {}.".format(
+                    ", ".join(missing)
+                )
+            )
 
         self._transport = None
         self._sftp = None

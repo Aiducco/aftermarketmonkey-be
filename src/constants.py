@@ -18,6 +18,9 @@ PROVIDER_IMAGE_URLS = {
     "WHEELPROS": "https://api.aftermarketmonkey.com/uploads/wheel_pros_logo.png",
 }
 
+# CompanyProviders.credentials JSON key for Rough Country: jobber Excel URL (required per connection).
+ROUGH_COUNTRY_CREDENTIALS_FEED_URL = "feed_url"
+
 # WheelPros SFTP feed paths (relative; leading / added by client when downloading)
 WHEELPROS_FEED_PATHS = {
     "wheel": "CommonFeed/USD/WHEEL/wheelInvPriceData.csv",
@@ -52,10 +55,13 @@ PROVIDER_CATALOG = [
     {
         "kind": enums.BrandProviderKind.ROUGH_COUNTRY,
         "name": "Rough Country",
-        "description": "Sync parts catalog, pricing, and vehicle fitment from Rough Country.",
+        "description": (
+            "Sync parts catalog, pricing, and vehicle fitment from Rough Country jobber Excel. "
+            "Each company supplies feed_url; mark one connection primary for shared catalog/fitment."
+        ),
         "icon_url": "https://api.aftermarketmonkey.com/uploads/rough_country.png",
         "category": "Distributors",
-        "connection_required_fields": [],  # Public feed, no credentials required
+        "connection_required_fields": [ROUGH_COUNTRY_CREDENTIALS_FEED_URL],
     },
     {
         "kind": enums.BrandProviderKind.WHEELPROS,
@@ -73,13 +79,16 @@ PROVIDER_CATALOG = [
         "description": "Sync pricing and inventory from Meyer Distributing via SFTP (Meyer Pricing + Meyer Inventory files).",
         "icon_url": "https://api.aftermarketmonkey.com/uploads/meyer_logo.png",
         "category": "Distributors",
-        "connection_required_fields": ["sftp_server", "sftp_user", "sftp_password"],
-        "connection_optional_fields": [
+        "connection_required_fields": [
+            "sftp_server",
             "sftp_port",
+            "sftp_user",
+            "sftp_password",
             "sftp_directory",
             "pricing_remote_file",
             "inventory_remote_file",
         ],
+        "connection_optional_fields": ["local_pricing_path", "local_inventory_path"],
     },
 ]
 

@@ -3,6 +3,7 @@ import time
 import typing
 from datetime import datetime
 from decimal import Decimal
+from django.db.models.functions import Upper
 from django.utils import timezone
 
 import pgbulk
@@ -72,7 +73,7 @@ def fetch_and_save_turn_14_brands() -> None:
             src_models.Turn14Brand,
             brand_instances,
             unique_fields=['external_id'],
-            update_fields=['name', 'dropship', 'price_groups', 'logo', 'aaia_code'],
+            update_fields=['name', 'dropship', 'price_groups', 'logo', 'aaia_code', 'updated_at'],
             returning=True,
         )
     except Exception as e:
@@ -91,20 +92,11 @@ def _normalize_aaia_codes(aaia_code: typing.Optional[str]) -> typing.List[str]:
     return [p.strip() for p in str(aaia_code).split(',') if p and p.strip()]
 
 
-def _find_brand_for_turn14_brand(turn14_brand: src_models.Turn14Brand) -> typing.Optional[src_models.Brands]:
-    """
-    Find existing Brand for a Turn14Brand: first by aaia_code (comma-separated, use first match),
-    then by name (case-insensitive).
-    """
-    aaia_parts = _normalize_aaia_codes(turn14_brand.aaia_code)
-    for code in aaia_parts:
-        brand = src_models.Brands.objects.filter(aaia_code=code).first()
-        if brand:
-            return brand
-    name = (turn14_brand.name or '').strip()
-    if name:
-        return src_models.Brands.objects.filter(name__iexact=name).first()
-    return None
+def _turn14_brand_name_upper_for_sync(turn14_brand: src_models.Turn14Brand) -> str:
+    name_upper = (turn14_brand.name or '').strip().upper()
+    if not name_upper:
+        name_upper = 'BRAND_{}'.format(turn14_brand.external_id)
+    return name_upper
 
 
 def sync_unmapped_turn_14_brands_to_brands() -> typing.List[src_models.Turn14Brand]:
@@ -141,59 +133,147 @@ def sync_unmapped_turn_14_brands_to_brands() -> typing.List[src_models.Turn14Bra
 
     logger.info('{} Found {} unmapped Turn 14 brands.'.format(_LOG_PREFIX, len(unmapped_turn14_brands)))
 
-    created_mappings = 0
-    created_brand_providers = 0
-    created_company_brands = 0
-    created_brands = 0
+    all_aaia: typing.Set[str] = set()
+    for t14 in unmapped_turn14_brands:
+        for code in _normalize_aaia_codes(t14.aaia_code):
+            all_aaia.add(code)
 
-    for turn14_brand in unmapped_turn14_brands:
-        brand = _find_brand_for_turn14_brand(turn14_brand)
+    aaia_to_brand: typing.Dict[str, src_models.Brands] = {}
+    if all_aaia:
+        for b in src_models.Brands.objects.filter(aaia_code__in=all_aaia).order_by('id'):
+            if b.aaia_code and b.aaia_code not in aaia_to_brand:
+                aaia_to_brand[b.aaia_code] = b
+
+    name_upper_keys: typing.Set[str] = set()
+    for t14 in unmapped_turn14_brands:
+        hit = False
+        for code in _normalize_aaia_codes(t14.aaia_code):
+            if code in aaia_to_brand:
+                hit = True
+                break
+        if not hit and (t14.name or '').strip():
+            name_upper_keys.add((t14.name or '').strip().upper())
+
+    brands_by_upper_name: typing.Dict[str, src_models.Brands] = {}
+    if name_upper_keys:
+        for b in (
+            src_models.Brands.objects.annotate(_name_u=Upper('name'))
+            .filter(_name_u__in=name_upper_keys)
+            .order_by('id')
+        ):
+            key = (b.name or '').strip().upper()
+            if key not in brands_by_upper_name:
+                brands_by_upper_name[key] = b
+
+    resolved_by_turn14_id: typing.Dict[int, src_models.Brands] = {}
+    new_brand_specs: typing.Dict[str, typing.Optional[str]] = {}
+    for t14 in sorted(unmapped_turn14_brands, key=lambda x: x.id):
+        brand = None
+        for code in _normalize_aaia_codes(t14.aaia_code):
+            brand = aaia_to_brand.get(code)
+            if brand:
+                break
         if not brand:
-            name_upper = (turn14_brand.name or '').strip().upper()
-            if not name_upper:
-                name_upper = 'BRAND_{}'.format(turn14_brand.external_id)
-            aaia_primary = _normalize_aaia_codes(turn14_brand.aaia_code)
-            aaia_code = aaia_primary[0] if aaia_primary else None
-            brand = src_models.Brands.objects.create(
-                name=name_upper,
+            nm = (t14.name or '').strip().upper()
+            if nm:
+                brand = brands_by_upper_name.get(nm)
+        if brand:
+            resolved_by_turn14_id[t14.id] = brand
+            continue
+        nu = _turn14_brand_name_upper_for_sync(t14)
+        if nu not in new_brand_specs:
+            parts = _normalize_aaia_codes(t14.aaia_code)
+            new_brand_specs[nu] = parts[0] if parts else None
+
+    created_brands = 0
+    if new_brand_specs:
+        existing_names = set(
+            src_models.Brands.objects.filter(
+                name__in=list(new_brand_specs.keys()),
+            ).values_list('name', flat=True)
+        )
+        new_brand_rows = [
+            src_models.Brands(
+                name=name,
                 status=src_enums.BrandProviderStatus.ACTIVE.value,
                 status_name=src_enums.BrandProviderStatus.ACTIVE.name,
-                aaia_code=aaia_code,
+                aaia_code=aaia_val,
             )
-            created_brands += 1
-            logger.info('{} Created new Brand: name={!r} aaia_code={!r} for Turn14Brand id={}.'.format(
-                _LOG_PREFIX, name_upper, aaia_code, turn14_brand.id
-            ))
+            for name, aaia_val in new_brand_specs.items()
+            if name not in existing_names
+        ]
+        if new_brand_rows:
+            src_models.Brands.objects.bulk_create(new_brand_rows, ignore_conflicts=True)
+            created_brands = len(new_brand_rows)
+        by_name = {
+            b.name: b
+            for b in src_models.Brands.objects.filter(name__in=list(new_brand_specs.keys()))
+        }
+        for t14 in unmapped_turn14_brands:
+            if t14.id not in resolved_by_turn14_id:
+                nu = _turn14_brand_name_upper_for_sync(t14)
+                resolved_by_turn14_id[t14.id] = by_name[nu]
 
-        mapping, mapping_created = src_models.BrandTurn14BrandMapping.objects.get_or_create(
-            brand=brand,
-            turn14_brand=turn14_brand,
+    mapping_models = [
+        src_models.BrandTurn14BrandMapping(
+            brand_id=resolved_by_turn14_id[t14.id].id,
+            turn14_brand_id=t14.id,
         )
-        if mapping_created:
-            created_mappings += 1
+        for t14 in unmapped_turn14_brands
+    ]
+    try:
+        pgbulk.upsert(
+            src_models.BrandTurn14BrandMapping,
+            mapping_models,
+            unique_fields=['brand', 'turn14_brand'],
+            update_fields=['updated_at'],
+        )
+    except Exception as e:
+        logger.error('{} Error upserting BrandTurn14BrandMapping: {}'.format(_LOG_PREFIX, str(e)))
+        raise
 
-        bp, bp_created = src_models.BrandProviders.objects.get_or_create(
-            brand=brand,
+    brand_ids = {resolved_by_turn14_id[t14.id].id for t14 in unmapped_turn14_brands}
+    existing_bp_ids = set(
+        src_models.BrandProviders.objects.filter(
             provider=turn14_provider,
-        )
-        if bp_created:
-            created_brand_providers += 1
+            brand_id__in=brand_ids,
+        ).values_list('brand_id', flat=True)
+    )
+    bp_to_create = [
+        src_models.BrandProviders(brand_id=bid, provider_id=turn14_provider.id)
+        for bid in brand_ids
+        if bid not in existing_bp_ids
+    ]
+    if bp_to_create:
+        src_models.BrandProviders.objects.bulk_create(bp_to_create, ignore_conflicts=True)
+    created_brand_providers = len(bp_to_create)
 
-        cb, cb_created = src_models.CompanyBrands.objects.get_or_create(
+    existing_cb_ids = set(
+        src_models.CompanyBrands.objects.filter(
             company=tick_company,
-            brand=brand,
-            defaults={
-                'status': src_enums.CompanyBrandStatus.ACTIVE.value,
-                'status_name': src_enums.CompanyBrandStatus.ACTIVE.name,
-            },
+            brand_id__in=brand_ids,
+        ).values_list('brand_id', flat=True)
+    )
+    active_val = src_enums.CompanyBrandStatus.ACTIVE.value
+    active_name = src_enums.CompanyBrandStatus.ACTIVE.name
+    cb_to_create = [
+        src_models.CompanyBrands(
+            company_id=tick_company.id,
+            brand_id=bid,
+            status=active_val,
+            status_name=active_name,
         )
-        if cb_created:
-            created_company_brands += 1
+        for bid in brand_ids
+        if bid not in existing_cb_ids
+    ]
+    if cb_to_create:
+        src_models.CompanyBrands.objects.bulk_create(cb_to_create, ignore_conflicts=True)
+    created_company_brands = len(cb_to_create)
 
     logger.info(
-        '{} Sync complete. Brands created: {}, BrandTurn14BrandMapping: {}, '
+        '{} Sync complete. Brands created: {}, BrandTurn14BrandMapping: upserted {}, '
         'BrandProviders: {}, CompanyBrands: {}.'.format(
-            _LOG_PREFIX, created_brands, created_mappings, created_brand_providers, created_company_brands
+            _LOG_PREFIX, created_brands, len(mapping_models), created_brand_providers, created_company_brands
         )
     )
     return unmapped_turn14_brands
@@ -240,7 +320,7 @@ def fetch_and_save_turn_14_locations() -> None:
             src_models.Turn14Location,
             instances,
             unique_fields=['external_id'],
-            update_fields=['name', 'street', 'city', 'state', 'country', 'zip_code'],
+            update_fields=['name', 'street', 'city', 'state', 'country', 'zip_code', 'updated_at'],
         )
     except Exception as e:
         logger.error('{} Error during locations upsert: {}'.format(_LOG_PREFIX, str(e)))
@@ -290,7 +370,9 @@ def _transform_brands_data(brands_data: typing.List[typing.Dict]) -> typing.List
             
             attributes = brand_data.get('attributes', {})
             
-            name = str(attributes.get('name', '')).strip() or f'Brand {external_id}'
+            name = (
+                str(attributes.get('name', '')).strip() or f'Brand {external_id}'
+            ).upper()
             dropship = bool(attributes.get('dropship', False))
             price_groups = attributes.get('pricegroups') if attributes.get('pricegroups') else None
             logo = attributes.get('logo') if attributes.get('logo') else None
@@ -778,7 +860,7 @@ def fetch_and_save_all_turn_14_brand_data() -> None:
                     data_instances,
                     unique_fields=['external_id'],
                     update_fields=[
-                        'brand', 'type', 'files', 'descriptions', 'relationships'
+                        'brand', 'type', 'files', 'descriptions', 'relationships', 'updated_at',
                     ],
                     returning=True,
                 )
@@ -910,7 +992,7 @@ def fetch_and_save_turn_14_brand_data_for_turn14_brands(
                     data_instances,
                     unique_fields=['external_id'],
                     update_fields=[
-                        'brand', 'type', 'files', 'descriptions', 'relationships'
+                        'brand', 'type', 'files', 'descriptions', 'relationships', 'updated_at',
                     ],
                     returning=True,
                 )
@@ -968,7 +1050,7 @@ def _transform_brand_data(data_items: typing.List[typing.Dict], turn_14_brand: s
 
 
 def fetch_and_save_all_turn_14_brand_pricing() -> None:
-    logger.info('{} Fetching all Turn 14 brand pricing.'.format(_LOG_PREFIX))
+    logger.info('{} Fetching all Turn 14 brand pricing (per company credentials).'.format(_LOG_PREFIX))
 
     turn_14_provider = src_models.Providers.objects.filter(
         kind=src_enums.BrandProviderKind.TURN_14.value
@@ -977,127 +1059,127 @@ def fetch_and_save_all_turn_14_brand_pricing() -> None:
         logger.info('{} No Turn 14 provider found.'.format(_LOG_PREFIX))
         return
 
+    company_providers = src_models.CompanyProviders.objects.filter(
+        provider=turn_14_provider,
+        provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
+    ).select_related('company')
+
+    if not company_providers.exists():
+        logger.info('{} No active Turn 14 company providers found.'.format(_LOG_PREFIX))
+        return
+
     all_brands = src_models.BrandProviders.objects.filter(
         provider=turn_14_provider,
-    )
+    ).select_related('brand')
     if not all_brands.exists():
         logger.info('{} No brands found for Turn 14 provider.'.format(_LOG_PREFIX))
         return
 
-    for brand_provider in all_brands:
-        brand = brand_provider.brand
-
-        if brand.status_name != src_enums.BrandProviderStatus.ACTIVE.name:
-            logger.info('{} Brand {} status is not active'.format(_LOG_PREFIX, brand.name))
-            continue
-
-        brand_mapping = src_models.BrandTurn14BrandMapping.objects.filter(
-            brand=brand
-        ).first()
-        
-        if not brand_mapping:
-            logger.warning('{} No Turn14Brand mapping found for brand: {}. Skipping.'.format(
-                _LOG_PREFIX, brand.name
-            ))
-            continue
-        
-        turn_14_brand = brand_mapping.turn14_brand
-        
-        company_brand = src_models.CompanyBrands.objects.filter(
-            brand=brand
-        ).first()
-        
-        if not company_brand:
-            logger.warning('{} No company found for brand: {}. Skipping.'.format(
-                _LOG_PREFIX, turn_14_brand.name
-            ))
-            continue
-        
-        company = company_brand.company
-        
-        company_provider = src_models.CompanyProviders.objects.filter(
-            company=company,
-            provider=turn_14_provider
-        ).first()
-        
-        if not company_provider:
-            logger.warning('{} No company provider found for company: {} and brand: {}. Skipping.'.format(
-                _LOG_PREFIX, company.name, turn_14_brand.name
-            ))
-            continue
-        
-        credentials = company_provider.credentials
-        
+    for company_provider in company_providers:
+        company = company_provider.company
         try:
-            api_client = turn_14_client.Turn14ApiClient(credentials=credentials)
+            api_client = turn_14_client.Turn14ApiClient(credentials=company_provider.credentials)
         except ValueError as e:
-            logger.error('{} Invalid credentials for company: {} and brand: {}. Error: {}. Skipping.'.format(
-                _LOG_PREFIX, company.name, turn_14_brand.name, str(e)
+            logger.error('{} Invalid Turn 14 credentials for company: {}. Error: {}. Skipping company.'.format(
+                _LOG_PREFIX, company.name, str(e)
             ))
             continue
-        
-        brand_id = int(turn_14_brand.external_id)
-        page = 1
-        
-        logger.info('{} Fetching brand pricing for brand: {} (external_id: {}).'.format(
-            _LOG_PREFIX, turn_14_brand.name, brand_id
-        ))
-        
-        while page is not None:
-            try:
-                pricing_data, next_page = api_client.get_pricelists(brand_id=brand_id, page=page)
-            except turn_14_exceptions.Turn14APIException as e:
-                logger.error('{} Turn 14 API error for brand: {} (external_id: {}), page: {}. Error: {}. Skipping brand.'.format(
-                    _LOG_PREFIX, turn_14_brand.name, brand_id, page, str(e)
+
+        for brand_provider in all_brands:
+            brand = brand_provider.brand
+
+            if brand.status_name != src_enums.BrandProviderStatus.ACTIVE.name:
+                logger.info('{} Brand {} status is not active'.format(_LOG_PREFIX, brand.name))
+                continue
+
+            if not src_models.CompanyBrands.objects.filter(
+                company=company,
+                brand=brand,
+                status_name=src_enums.CompanyBrandStatus.ACTIVE.name,
+            ).exists():
+                continue
+
+            brand_mapping = src_models.BrandTurn14BrandMapping.objects.filter(
+                brand=brand
+            ).first()
+
+            if not brand_mapping:
+                logger.warning('{} No Turn14Brand mapping for brand: {} (company: {}). Skipping.'.format(
+                    _LOG_PREFIX, brand.name, company.name
                 ))
-                break
-            
-            if not pricing_data:
-                logger.warning('{} No pricing data returned for brand: {} (external_id: {}), page: {}.'.format(
-                    _LOG_PREFIX, turn_14_brand.name, brand_id, page
-                ))
-                page = next_page
-                break
-            
-            logger.info('{} Fetched {} pricing items for brand: {} (external_id: {}), page: {}.'.format(
-                _LOG_PREFIX, len(pricing_data), turn_14_brand.name, brand_id, page
+                continue
+
+            turn_14_brand = brand_mapping.turn14_brand
+
+            brand_id = int(turn_14_brand.external_id)
+            page = 1
+
+            logger.info('{} Fetching brand pricing company={} brand: {} (external_id: {}).'.format(
+                _LOG_PREFIX, company.name, turn_14_brand.name, brand_id
             ))
-            
-            pricing_instances = _transform_pricing_data(pricing_data, turn_14_brand)
-            
-            if not pricing_instances:
-                logger.warning('{} No valid pricing instances created for brand: {} (external_id: {}), page: {}.'.format(
-                    _LOG_PREFIX, turn_14_brand.name, brand_id, page
+
+            while page is not None:
+                try:
+                    pricing_data, next_page = api_client.get_pricelists(brand_id=brand_id, page=page)
+                except turn_14_exceptions.Turn14APIException as e:
+                    logger.error('{} Turn 14 API error company={} brand: {} (external_id: {}), page: {}. Error: {}.'.format(
+                        _LOG_PREFIX, company.name, turn_14_brand.name, brand_id, page, str(e)
+                    ))
+                    break
+
+                if not pricing_data:
+                    logger.warning('{} No pricing data company={} brand: {} (external_id: {}), page: {}.'.format(
+                        _LOG_PREFIX, company.name, turn_14_brand.name, brand_id, page
+                    ))
+                    page = next_page
+                    break
+
+                logger.info('{} Fetched {} pricing items company={} brand: {} (external_id: {}), page: {}.'.format(
+                    _LOG_PREFIX, len(pricing_data), company.name, turn_14_brand.name, brand_id, page
                 ))
+
+                pricing_instances = _transform_pricing_data(pricing_data, turn_14_brand, company)
+
+                if not pricing_instances:
+                    logger.warning('{} No valid pricing instances company={} brand: {} (external_id: {}), page: {}.'.format(
+                        _LOG_PREFIX, company.name, turn_14_brand.name, brand_id, page
+                    ))
+                    page = next_page
+                    continue
+
+                try:
+                    upserted_pricing = pgbulk.upsert(
+                        src_models.Turn14BrandPricing,
+                        pricing_instances,
+                        unique_fields=['company', 'external_id'],
+                        update_fields=[
+                            'brand',
+                            'type',
+                            'purchase_cost',
+                            'has_map',
+                            'can_purchase',
+                            'pricelists',
+                            'updated_at',
+                        ],
+                        returning=True,
+                    )
+
+                    logger.info('{} Upserted {} pricing rows company={} brand: {} page: {}.'.format(
+                        _LOG_PREFIX, len(upserted_pricing) if upserted_pricing else 0,
+                        company.name, turn_14_brand.name, page,
+                    ))
+                except Exception as e:
+                    logger.error('{} Bulk upsert error company={} brand: {} page: {}. Error: {}.'.format(
+                        _LOG_PREFIX, company.name, turn_14_brand.name, page, str(e)
+                    ))
+                    page = next_page
+                    continue
+
                 page = next_page
-                continue
-            
-            try:
-                upserted_pricing = pgbulk.upsert(
-                    src_models.Turn14BrandPricing,
-                    pricing_instances,
-                    unique_fields=['external_id'],
-                    update_fields=[
-                        'brand', 'type', 'purchase_cost', 'has_map', 'can_purchase', 'pricelists'
-                    ],
-                    returning=True,
-                )
-                
-                logger.info('{} Successfully upserted {} pricing items for brand: {} (external_id: {}), page: {}.'.format(
-                    _LOG_PREFIX, len(upserted_pricing) if upserted_pricing else 0, turn_14_brand.name, brand_id, page
-                ))
-            except Exception as e:
-                logger.error('{} Error during bulk upsert for brand: {} (external_id: {}), page: {}. Error: {}.'.format(
-                    _LOG_PREFIX, turn_14_brand.name, brand_id, page, str(e)
-                ))
-                page = next_page
-                continue
-            
-            page = next_page
-        
-        logger.info('{} Completed fetching pricing for brand: {} (external_id: {}).'.format(
-            _LOG_PREFIX, turn_14_brand.name, brand_id
-        ))
+
+            logger.info('{} Completed pricing for company={} brand: {} (external_id: {}).'.format(
+                _LOG_PREFIX, company.name, turn_14_brand.name, brand_id
+            ))
 
 
 def fetch_and_save_turn_14_brand_pricing_for_turn14_brands(
@@ -1119,9 +1201,13 @@ def fetch_and_save_turn_14_brand_pricing_for_turn14_brands(
         logger.warning('{} No Turn 14 provider found. Skipping.'.format(_LOG_PREFIX))
         return
 
-    tick_company = src_models.Company.objects.filter(name='TICK_PERFORMANCE').first()
-    if not tick_company:
-        logger.warning('{} Company TICK_PERFORMANCE not found. Skipping.'.format(_LOG_PREFIX))
+    company_providers = src_models.CompanyProviders.objects.filter(
+        provider=turn_14_provider,
+        provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
+    ).select_related('company')
+
+    if not company_providers.exists():
+        logger.warning('{} No active Turn 14 company providers. Skipping.'.format(_LOG_PREFIX))
         return
 
     for turn_14_brand in turn14_brands:
@@ -1139,102 +1225,98 @@ def fetch_and_save_turn_14_brand_pricing_for_turn14_brands(
             logger.info('{} Brand {} status is not active. Skipping.'.format(_LOG_PREFIX, brand.name))
             continue
 
-        company_brand = src_models.CompanyBrands.objects.filter(
-            company=tick_company,
-            brand=brand,
-        ).first()
-        if not company_brand:
-            logger.warning('{} No CompanyBrands (TICK_PERFORMANCE) for brand: {}. Skipping.'.format(
-                _LOG_PREFIX, turn_14_brand.name
-            ))
-            continue
-
-        company_provider = src_models.CompanyProviders.objects.filter(
-            company=tick_company,
-            provider=turn_14_provider,
-        ).first()
-        if not company_provider:
-            logger.warning('{} No CompanyProviders for TICK_PERFORMANCE and Turn 14. Skipping brand: {}.'.format(
-                _LOG_PREFIX, turn_14_brand.name
-            ))
-            continue
-
-        credentials = company_provider.credentials
-        try:
-            api_client = turn_14_client.Turn14ApiClient(credentials=credentials)
-        except ValueError as e:
-            logger.error('{} Invalid credentials for company: {} and brand: {}. Error: {}. Skipping.'.format(
-                _LOG_PREFIX, tick_company.name, turn_14_brand.name, str(e)
-            ))
-            continue
-
         brand_id = int(turn_14_brand.external_id)
-        page = 1
 
-        logger.info('{} Fetching brand pricing for brand: {} (external_id: {}).'.format(
-            _LOG_PREFIX, turn_14_brand.name, brand_id
-        ))
+        for company_provider in company_providers:
+            company = company_provider.company
+            if not src_models.CompanyBrands.objects.filter(
+                company=company,
+                brand=brand,
+                status_name=src_enums.CompanyBrandStatus.ACTIVE.name,
+            ).exists():
+                continue
 
-        while page is not None:
             try:
-                pricing_data, next_page = api_client.get_pricelists(brand_id=brand_id, page=page)
-            except turn_14_exceptions.Turn14APIException as e:
-                logger.error('{} Turn 14 API error for brand: {} (external_id: {}), page: {}. Error: {}. Skipping brand.'.format(
-                    _LOG_PREFIX, turn_14_brand.name, brand_id, page, str(e)
+                api_client = turn_14_client.Turn14ApiClient(credentials=company_provider.credentials)
+            except ValueError as e:
+                logger.error('{} Invalid Turn 14 credentials company={} brand: {}. Error: {}. Skipping.'.format(
+                    _LOG_PREFIX, company.name, turn_14_brand.name, str(e)
                 ))
-                break
+                continue
 
-            if not pricing_data:
-                logger.warning('{} No pricing data returned for brand: {} (external_id: {}), page: {}.'.format(
-                    _LOG_PREFIX, turn_14_brand.name, brand_id, page
-                ))
-                page = next_page
-                break
-
-            logger.info('{} Fetched {} pricing items for brand: {} (external_id: {}), page: {}.'.format(
-                _LOG_PREFIX, len(pricing_data), turn_14_brand.name, brand_id, page
+            page = 1
+            logger.info('{} Fetching pricing company={} brand: {} (external_id: {}).'.format(
+                _LOG_PREFIX, company.name, turn_14_brand.name, brand_id
             ))
 
-            pricing_instances = _transform_pricing_data(pricing_data, turn_14_brand)
+            while page is not None:
+                try:
+                    pricing_data, next_page = api_client.get_pricelists(brand_id=brand_id, page=page)
+                except turn_14_exceptions.Turn14APIException as e:
+                    logger.error('{} Turn 14 API error company={} brand: {} page: {}. Error: {}.'.format(
+                        _LOG_PREFIX, company.name, turn_14_brand.name, page, str(e)
+                    ))
+                    break
 
-            if not pricing_instances:
-                logger.warning('{} No valid pricing instances created for brand: {} (external_id: {}), page: {}.'.format(
-                    _LOG_PREFIX, turn_14_brand.name, brand_id, page
+                if not pricing_data:
+                    logger.warning('{} No pricing data company={} brand: {} page: {}.'.format(
+                        _LOG_PREFIX, company.name, turn_14_brand.name, page
+                    ))
+                    page = next_page
+                    break
+
+                logger.info('{} Fetched {} pricing rows company={} brand: {} page: {}.'.format(
+                    _LOG_PREFIX, len(pricing_data), company.name, turn_14_brand.name, page
                 ))
+
+                pricing_instances = _transform_pricing_data(pricing_data, turn_14_brand, company)
+
+                if not pricing_instances:
+                    page = next_page
+                    continue
+
+                try:
+                    upserted_pricing = pgbulk.upsert(
+                        src_models.Turn14BrandPricing,
+                        pricing_instances,
+                        unique_fields=['company', 'external_id'],
+                        update_fields=[
+                            'brand',
+                            'type',
+                            'purchase_cost',
+                            'has_map',
+                            'can_purchase',
+                            'pricelists',
+                            'updated_at',
+                        ],
+                        returning=True,
+                    )
+
+                    logger.info('{} Upserted {} pricing rows company={} brand: {} page: {}.'.format(
+                        _LOG_PREFIX, len(upserted_pricing) if upserted_pricing else 0,
+                        company.name, turn_14_brand.name, page,
+                    ))
+                except Exception as e:
+                    logger.error('{} Bulk upsert company={} brand: {} page: {}. Error: {}.'.format(
+                        _LOG_PREFIX, company.name, turn_14_brand.name, page, str(e)
+                    ))
+                    page = next_page
+                    continue
+
                 page = next_page
-                continue
 
-            try:
-                upserted_pricing = pgbulk.upsert(
-                    src_models.Turn14BrandPricing,
-                    pricing_instances,
-                    unique_fields=['external_id'],
-                    update_fields=[
-                        'brand', 'type', 'purchase_cost', 'has_map', 'can_purchase', 'pricelists'
-                    ],
-                    returning=True,
-                )
-
-                logger.info('{} Successfully upserted {} pricing items for brand: {} (external_id: {}), page: {}.'.format(
-                    _LOG_PREFIX, len(upserted_pricing) if upserted_pricing else 0, turn_14_brand.name, brand_id, page
-                ))
-            except Exception as e:
-                logger.error('{} Error during bulk upsert for brand: {} (external_id: {}), page: {}. Error: {}.'.format(
-                    _LOG_PREFIX, turn_14_brand.name, brand_id, page, str(e)
-                ))
-                page = next_page
-                continue
-
-            page = next_page
-
-        logger.info('{} Completed fetching pricing for brand: {} (external_id: {}).'.format(
-            _LOG_PREFIX, turn_14_brand.name, brand_id
-        ))
+            logger.info('{} Completed pricing company={} brand: {} (external_id: {}).'.format(
+                _LOG_PREFIX, company.name, turn_14_brand.name, brand_id
+            ))
 
     logger.info('{} Completed fetching brand pricing for {} Turn 14 brand(s).'.format(_LOG_PREFIX, len(turn14_brands)))
 
 
-def _transform_pricing_data(pricing_data: typing.List[typing.Dict], turn_14_brand: src_models.Turn14Brand) -> typing.List[src_models.Turn14BrandPricing]:
+def _transform_pricing_data(
+    pricing_data: typing.List[typing.Dict],
+    turn_14_brand: src_models.Turn14Brand,
+    company: src_models.Company,
+) -> typing.List[src_models.Turn14BrandPricing]:
     pricing_instances = []
     
     for pricing_item in pricing_data:
@@ -1259,6 +1341,7 @@ def _transform_pricing_data(pricing_data: typing.List[typing.Dict], turn_14_bran
             pricing_instance = src_models.Turn14BrandPricing(
                 external_id=external_id,
                 brand=turn_14_brand,
+                company=company,
                 type=pricing_item.get('type'),
                 purchase_cost=purchase_cost,
                 has_map=bool(attributes.get('has_map', False)),
@@ -1388,7 +1471,14 @@ def fetch_and_save_all_turn_14_brand_inventory() -> None:
                     inventory_instances,
                     unique_fields=['external_id'],
                     update_fields=[
-                        'brand', 'type', 'inventory', 'manufacturer', 'eta', 'relationships', 'total_inventory'
+                        'brand',
+                        'type',
+                        'inventory',
+                        'manufacturer',
+                        'eta',
+                        'relationships',
+                        'total_inventory',
+                        'updated_at',
                     ],
                     returning=True,
                 )
@@ -1520,7 +1610,14 @@ def fetch_and_save_turn_14_brand_inventory_for_turn14_brands(
                     inventory_instances,
                     unique_fields=['external_id'],
                     update_fields=[
-                        'brand', 'type', 'inventory', 'manufacturer', 'eta', 'relationships', 'total_inventory'
+                        'brand',
+                        'type',
+                        'inventory',
+                        'manufacturer',
+                        'eta',
+                        'relationships',
+                        'total_inventory',
+                        'updated_at',
                     ],
                     returning=True,
                 )
@@ -1905,46 +2002,46 @@ def fetch_and_save_turn_14_pricing_changes(start_date: str, end_date: str) -> No
         logger.info('{} No Turn 14 provider found.'.format(_LOG_PREFIX))
         return
 
-    primary_provider = src_models.CompanyProviders.objects.filter(
+    company_providers = src_models.CompanyProviders.objects.filter(
         provider=turn_14_provider,
         provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
-        primary=True
-    ).first()
+    ).select_related('company')
 
-    if not primary_provider:
-        logger.info('{} No turn 14 active primary provider found.'.format(_LOG_PREFIX))
+    if not company_providers.exists():
+        logger.info('{} No active Turn 14 company providers found.'.format(_LOG_PREFIX))
         return
 
-    credentials = primary_provider.credentials
-    try:
-        api_client = turn_14_client.Turn14ApiClient(credentials=credentials)
-    except ValueError as e:
-        logger.error('{} Invalid credentials or configuration: {}'.format(_LOG_PREFIX, str(e)))
-        raise
-
     item_ids = set()
-    page = 1
-    while page is not None:
+    for company_provider in company_providers:
         try:
-            data, next_page = api_client.get_pricing_changes(
-                start_date=start_date,
-                end_date=end_date,
-                page=page,
-            )
-        except turn_14_exceptions.Turn14APIException as e:
-            logger.error('{} Turn 14 API error for pricing changes, page: {}. Error: {}.'.format(
-                _LOG_PREFIX, page, str(e)
+            api_client = turn_14_client.Turn14ApiClient(credentials=company_provider.credentials)
+        except ValueError as e:
+            logger.warning('{} Invalid Turn 14 credentials for company {}: {}. Skipping for pricing changes discovery.'.format(
+                _LOG_PREFIX, company_provider.company.name, str(e)
             ))
-            raise
+            continue
 
-        for item in data or []:
-            attrs = item.get('attributes', {})
-            # API returns attributes.itemcode (and id) as the item identifier
-            item_id = attrs.get('itemcode') or item.get('id')
-            if item_id is not None:
-                item_ids.add(str(item_id))
+        page = 1
+        while page is not None:
+            try:
+                data, next_page = api_client.get_pricing_changes(
+                    start_date=start_date,
+                    end_date=end_date,
+                    page=page,
+                )
+            except turn_14_exceptions.Turn14APIException as e:
+                logger.error('{} Turn 14 pricing changes API error company={} page: {}. Error: {}.'.format(
+                    _LOG_PREFIX, company_provider.company.name, page, str(e)
+                ))
+                raise
 
-        page = next_page
+            for item in data or []:
+                attrs = item.get('attributes', {})
+                item_id = attrs.get('itemcode') or item.get('id')
+                if item_id is not None:
+                    item_ids.add(str(item_id))
+
+            page = next_page
 
     if not item_ids:
         logger.info('{} No pricing change item IDs returned for {} to {}. Nothing to sync.'.format(

@@ -557,7 +557,7 @@ def prepare_products_for_syncing_into_bigcommerce(
     catalog_parts_by_provider = {}
     for catalog_provider in catalog_providers:
         try:
-            parts = _prepare_parts_by_kind(catalog_provider.provider.kind_name, brand)
+            parts = _prepare_parts_by_kind(catalog_provider.provider.kind_name, brand, company)
             # Store parts by provider, indexed by MPN (fallback to SKU if MPN is empty)
             # For SDC: MPN = part_number, which is the same as SKU
             catalog_parts_by_provider[catalog_provider] = {
@@ -573,7 +573,7 @@ def prepare_products_for_syncing_into_bigcommerce(
     distributor_parts_by_provider = {}
     for distributor_provider in distributor_providers:
         try:
-            parts = _prepare_parts_by_kind(distributor_provider.provider.kind_name, brand)
+            parts = _prepare_parts_by_kind(distributor_provider.provider.kind_name, brand, company)
             # Store parts by provider, indexed by MPN (fallback to SKU if MPN is empty)
             # For Turn14: MPN = mfr_part_number, SKU = part_number (with brand prefix)
             distributor_parts_by_provider[distributor_provider] = {
@@ -626,7 +626,11 @@ def prepare_products_for_syncing_into_bigcommerce(
     return merged_parts
 
 
-def _prepare_parts_by_kind(kind_name: str, brand: src_models.Brands) -> list[src_messages.BigCommercePart]:
+def _prepare_parts_by_kind(
+    kind_name: str,
+    brand: src_models.Brands,
+    company: typing.Optional[src_models.Company] = None,
+) -> list[src_messages.BigCommercePart]:
     """
     Prepare parts based on provider kind_name.
     Routes to the appropriate preparation function.
@@ -634,7 +638,10 @@ def _prepare_parts_by_kind(kind_name: str, brand: src_models.Brands) -> list[src
     if kind_name == src_enums.BrandProviderKind.SDC.name:
         return prepare_sdc_products_for_bigcommerce(brand=brand)
     elif kind_name == src_enums.BrandProviderKind.TURN_14.name:
-        return prepare_turn_14_products_for_bigcommerce(brand=brand)
+        if company is None:
+            logger.error('{} Turn 14 parts require company context for pricing.'.format(_LOG_PREFIX))
+            return []
+        return prepare_turn_14_products_for_bigcommerce(brand=brand, company=company)
     else:
         logger.warning('{} Unknown provider kind: {}. Skipping.'.format(_LOG_PREFIX, kind_name))
         return []
@@ -1238,7 +1245,10 @@ def _map_turn14_to_pcdb_category(
     return (turn14_category, turn14_subcategory)
 
 
-def prepare_turn_14_products_for_bigcommerce(brand: src_models.Brands) -> list[src_messages.BigCommercePart]:
+def prepare_turn_14_products_for_bigcommerce(
+    brand: src_models.Brands,
+    company: src_models.Company,
+) -> list[src_messages.BigCommercePart]:
     bigcommerce_parts = []
     turn_14_brand = src_models.BrandTurn14BrandMapping.objects.get(brand_id=brand.id)
     turn_14_items = src_models.Turn14Items.objects.filter(
@@ -1254,7 +1264,11 @@ def prepare_turn_14_products_for_bigcommerce(brand: src_models.Brands) -> list[s
         item_data.external_id: item_data for item_data in src_models.Turn14BrandData.objects.filter(brand_id=turn_14_brand.turn14_brand_id)
     }
     turn_14_item_pricing = {
-        item_data.external_id: item_data for item_data in src_models.Turn14BrandPricing.objects.filter(brand_id=turn_14_brand.turn14_brand_id)
+        item_data.external_id: item_data
+        for item_data in src_models.Turn14BrandPricing.objects.filter(
+            brand_id=turn_14_brand.turn14_brand_id,
+            company_id=company.id,
+        )
     }
     turn_14_item_inventory = {
         item_data.external_id: item_data for item_data in src_models.Turn14BrandInventory.objects.filter(brand_id=turn_14_brand.turn14_brand_id)

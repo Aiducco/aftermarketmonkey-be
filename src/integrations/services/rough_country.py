@@ -1,6 +1,8 @@
 """
 Rough Country feed integration: Excel jobber file (General, Vehicle Fitment, Discontinued).
-Syncs RoughCountryBrand, RoughCountryPart, RoughCountryFitment; applies discontinued status.
+Syncs RoughCountryBrand, RoughCountryPart, RoughCountryCompanyPricing, RoughCountryFitment;
+applies discontinued status.
+Catalog and fitment use the primary CompanyProvider (or first active); pricing loads per company.
 """
 import logging
 import math
@@ -9,18 +11,115 @@ from datetime import datetime
 from decimal import Decimal
 
 import pgbulk
+from django.db import connection
+from django.db.models.functions import Upper
 
+from src import constants as src_constants
 from src import enums as src_enums
 from src import models as src_models
 from src.integrations.clients.rough_country import client as rough_country_client
 from src.integrations.clients.rough_country import exceptions as rough_country_exceptions
+from src.integrations.utils.brand_matching import (
+    best_fuzzy_brand_match,
+    brands_by_first_token_upper,
+    normalize_upper_words,
+)
 
 logger = logging.getLogger(__name__)
 
 _LOG_PREFIX = "[ROUGH-COUNTRY-SERVICES]"
 
-# Default brand name from manufacturer column
-DEFAULT_RC_BRAND_NAME = "Rough Country"
+# Default manufacturer / RoughCountryBrand name + external_id (stored uppercase)
+DEFAULT_RC_BRAND_NAME = "ROUGH COUNTRY"
+
+RC_PRICING_UPSERT_BATCH = 2000
+
+
+def _normalize_rc_manufacturer_external_id(raw: typing.Optional[str]) -> str:
+    """Normalize feed manufacturer to RoughCountryBrand.external_id / name (uppercase)."""
+    s = (raw or "").strip().upper()
+    return s if s else DEFAULT_RC_BRAND_NAME
+
+
+def _rc_brand_name_upper_for_sync(rc_brand: src_models.RoughCountryBrand) -> str:
+    name_upper = (rc_brand.name or "").strip().upper()
+    if not name_upper:
+        name_upper = "BRAND_{}".format(rc_brand.external_id)
+    return name_upper
+
+
+def _rough_country_feed_client_for_credentials(
+    credentials: typing.Optional[typing.Dict],
+    file_url_override: typing.Optional[str],
+    local_file_path_override: typing.Optional[str],
+    local_file_name_override: typing.Optional[str],
+) -> rough_country_client.RoughCountryFeedClient:
+    """
+    Build client from CompanyProviders.credentials (feed_url) plus optional CLI overrides.
+    CLI file_url and local_file_path are for management-command / dev use only.
+    """
+    creds = credentials or {}
+    url = file_url_override
+    if url is None:
+        raw_url = creds.get(src_constants.ROUGH_COUNTRY_CREDENTIALS_FEED_URL)
+        url = raw_url.strip() if isinstance(raw_url, str) and raw_url.strip() else None
+    else:
+        url = url.strip() if url.strip() else None
+    path = local_file_path_override
+    if path is not None:
+        path = path.strip() if path.strip() else None
+    return rough_country_client.RoughCountryFeedClient(
+        file_url=url,
+        local_file_name=local_file_name_override,
+        local_file_path=path,
+    )
+
+
+def _active_rough_country_company_providers_queryset():
+    return src_models.CompanyProviders.objects.filter(
+        provider__kind=src_enums.BrandProviderKind.ROUGH_COUNTRY.value,
+        provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
+    ).select_related("company", "provider")
+
+
+def _catalog_company_provider(
+    rc_provider: typing.Optional[src_models.Providers],
+) -> typing.Optional[src_models.CompanyProviders]:
+    """Primary Rough Country connection for shared catalog; else first active by id."""
+    if not rc_provider:
+        return None
+    base = _active_rough_country_company_providers_queryset().filter(provider=rc_provider)
+    primary = base.filter(primary=True).first()
+    if primary:
+        return primary
+    fallback = base.order_by("id").first()
+    if fallback:
+        logger.info(
+            "{} No primary Rough Country company provider; using company_id={} for catalog/fitment.".format(
+                _LOG_PREFIX,
+                fallback.company_id,
+            )
+        )
+    return fallback
+
+
+def _deduped_pricing_by_brand_sku_from_general(
+    general: typing.List[typing.Dict],
+    manufacturer_to_brand: typing.Dict[str, src_models.RoughCountryBrand],
+) -> typing.Dict[typing.Tuple[int, str], typing.Dict[str, typing.Any]]:
+    """Match catalog sku dedupe: last General row per sku wins."""
+    pricing_by_brand_sku = {}
+    seen_by_sku = {}
+    for row in general:
+        sku = _row_key(row, "sku")
+        if not sku:
+            continue
+        m_key = _normalize_rc_manufacturer_external_id(_row_key(row, "manufacturer"))
+        brand = manufacturer_to_brand.get(m_key) or manufacturer_to_brand.get(DEFAULT_RC_BRAND_NAME)
+        seen_by_sku[sku] = (brand, _row_pricing_from_general_row(row))
+    for sku, (brand, pdata) in seen_by_sku.items():
+        pricing_by_brand_sku[(brand.id, sku)] = pdata
+    return pricing_by_brand_sku
 
 
 def _safe_decimal(value: typing.Any) -> typing.Optional[Decimal]:
@@ -99,30 +198,12 @@ def _normalize_aaia_codes(aaia_code: typing.Optional[str]) -> typing.List[str]:
     return [p.strip() for p in str(aaia_code).split(",") if p and p.strip()]
 
 
-def _find_brand_for_rough_country_brand(
-    rc_brand: src_models.RoughCountryBrand,
-) -> typing.Optional[src_models.Brands]:
-    """
-    Find existing Brand for a RoughCountryBrand: first by aaia_code (comma-separated, use first match),
-    then by name (case-insensitive).
-    """
-    aaia_parts = _normalize_aaia_codes(rc_brand.aaia_code)
-    for code in aaia_parts:
-        brand = src_models.Brands.objects.filter(aaia_code=code).first()
-        if brand:
-            return brand
-    name = (rc_brand.name or "").strip()
-    if name:
-        return src_models.Brands.objects.filter(name__iexact=name).first()
-    return None
-
-
 def sync_unmapped_rough_country_brands_to_brands() -> typing.List[src_models.RoughCountryBrand]:
     """
     For each RoughCountryBrand that does not yet have a BrandRoughCountryBrandMapping:
-    find or create a Brand (match by aaia_code then name; create with uppercase name if new),
-    then add BrandRoughCountryBrandMapping, BrandProviders (Rough Country), and CompanyBrands (TICK_PERFORMANCE).
-    Returns the list of RoughCountryBrand instances that were synced.
+    resolve Brand by aaia_code (comma-separated), then exact name (uppercase match), then fuzzy
+    word-prefix match (same rules as Keystone); otherwise create (uppercase name).
+    Upserts BrandRoughCountryBrandMapping, BrandProviders, and CompanyBrands for TICK_PERFORMANCE.
     """
     logger.info("{} Syncing unmapped Rough Country brands to Brands.".format(_LOG_PREFIX))
 
@@ -138,7 +219,7 @@ def sync_unmapped_rough_country_brands_to_brands() -> typing.List[src_models.Rou
         logger.warning("{} Company TICK_PERFORMANCE not found. Skipping sync.".format(_LOG_PREFIX))
         return []
 
-    # Ensure TICK_PERFORMANCE has CompanyProviders for Rough Country (needed for pricing sync; no credentials required for public feed)
+    # Ensure TICK_PERFORMANCE has CompanyProviders for Rough Country (needed for pricing sync)
     _, cp_created = src_models.CompanyProviders.objects.get_or_create(
         company=tick_company,
         provider=rc_provider,
@@ -164,47 +245,144 @@ def sync_unmapped_rough_country_brands_to_brands() -> typing.List[src_models.Rou
         "{} Found {} unmapped Rough Country brands.".format(_LOG_PREFIX, len(unmapped_rc_brands))
     )
 
-    created_mappings = 0
-    created_brand_providers = 0
-    created_company_brands = 0
-    created_brands = 0
+    all_aaia: typing.Set[str] = set()
+    for rb in unmapped_rc_brands:
+        for code in _normalize_aaia_codes(rb.aaia_code):
+            all_aaia.add(code)
 
-    for rc_brand in unmapped_rc_brands:
-        brand = _find_brand_for_rough_country_brand(rc_brand)
+    aaia_to_brand: typing.Dict[str, src_models.Brands] = {}
+    if all_aaia:
+        for b in src_models.Brands.objects.filter(aaia_code__in=all_aaia).order_by("id"):
+            if b.aaia_code and b.aaia_code not in aaia_to_brand:
+                aaia_to_brand[b.aaia_code] = b
+
+    name_upper_keys: typing.Set[str] = set()
+    for rb in unmapped_rc_brands:
+        hit = any(c in aaia_to_brand for c in _normalize_aaia_codes(rb.aaia_code))
+        if not hit and (rb.name or "").strip():
+            name_upper_keys.add((rb.name or "").strip().upper())
+
+    brands_by_upper_name: typing.Dict[str, src_models.Brands] = {}
+    if name_upper_keys:
+        for b in (
+            src_models.Brands.objects.annotate(_name_u=Upper("name"))
+            .filter(_name_u__in=name_upper_keys)
+            .order_by("id")
+        ):
+            key = (b.name or "").strip().upper()
+            if key not in brands_by_upper_name:
+                brands_by_upper_name[key] = b
+
+    resolved_by_rc_id: typing.Dict[int, src_models.Brands] = {}
+    for rb in sorted(unmapped_rc_brands, key=lambda x: x.id):
+        brand = None
+        for code in _normalize_aaia_codes(rb.aaia_code):
+            brand = aaia_to_brand.get(code)
+            if brand:
+                break
         if not brand:
-            name_upper = (rc_brand.name or "").strip().upper()
-            if not name_upper:
-                name_upper = "BRAND_{}".format(rc_brand.external_id)
-            aaia_primary = _normalize_aaia_codes(rc_brand.aaia_code)
-            aaia_code = aaia_primary[0] if aaia_primary else None
-            brand = src_models.Brands.objects.create(
-                name=name_upper,
-                status=src_enums.BrandProviderStatus.ACTIVE.value,
-                status_name=src_enums.BrandProviderStatus.ACTIVE.name,
-                aaia_code=aaia_code,
-            )
-            created_brands += 1
-            logger.info(
-                "{} Created new Brand: name={!r} aaia_code={!r} for RoughCountryBrand id={}.".format(
-                    _LOG_PREFIX, name_upper, aaia_code, rc_brand.id
+            nm = (rb.name or "").strip().upper()
+            if nm:
+                brand = brands_by_upper_name.get(nm)
+        if brand:
+            resolved_by_rc_id[rb.id] = brand
+
+    unresolved_after_exact = [rb for rb in unmapped_rc_brands if rb.id not in resolved_by_rc_id]
+    brands_first_index = brands_by_first_token_upper() if unresolved_after_exact else {}
+    all_brands_fallback: typing.Optional[typing.List[src_models.Brands]] = None
+    fuzzy_matches = 0
+    for rb in unresolved_after_exact:
+        parts = normalize_upper_words(rb.name or "").split()
+        candidates: typing.List[src_models.Brands] = []
+        if parts:
+            candidates = list(brands_first_index.get(parts[0], ()))
+        if not candidates:
+            if all_brands_fallback is None:
+                all_brands_fallback = list(
+                    src_models.Brands.objects.only("id", "name", "aaia_code").order_by("id")
+                )
+            candidates = all_brands_fallback
+        brand = best_fuzzy_brand_match(rb.name or "", candidates)
+        if brand:
+            resolved_by_rc_id[rb.id] = brand
+            fuzzy_matches += 1
+            logger.debug(
+                "{} Fuzzy-matched Rough Country brand {!r} to Brand id={} name={!r}.".format(
+                    _LOG_PREFIX,
+                    rb.name,
+                    brand.id,
+                    brand.name,
                 )
             )
 
-        mapping, mapping_created = src_models.BrandRoughCountryBrandMapping.objects.get_or_create(
-            brand=brand,
-            rough_country_brand=rc_brand,
-        )
-        if mapping_created:
-            created_mappings += 1
+    new_brand_specs: typing.Dict[str, typing.Optional[str]] = {}
+    for rb in sorted(unmapped_rc_brands, key=lambda x: x.id):
+        if rb.id in resolved_by_rc_id:
+            continue
+        nu = _rc_brand_name_upper_for_sync(rb)
+        if nu not in new_brand_specs:
+            aaia_parts = _normalize_aaia_codes(rb.aaia_code)
+            new_brand_specs[nu] = aaia_parts[0] if aaia_parts else None
 
-        bp, bp_created = src_models.BrandProviders.objects.get_or_create(
+    created_brands = 0
+    if new_brand_specs:
+        existing_names = set(
+            src_models.Brands.objects.filter(name__in=list(new_brand_specs.keys())).values_list(
+                "name", flat=True
+            )
+        )
+        new_brand_rows = [
+            src_models.Brands(
+                name=name,
+                status=src_enums.BrandProviderStatus.ACTIVE.value,
+                status_name=src_enums.BrandProviderStatus.ACTIVE.name,
+                aaia_code=aaia_val,
+            )
+            for name, aaia_val in new_brand_specs.items()
+            if name not in existing_names
+        ]
+        if new_brand_rows:
+            src_models.Brands.objects.bulk_create(new_brand_rows, ignore_conflicts=True)
+            created_brands = len(new_brand_rows)
+        by_name = {
+            b.name: b
+            for b in src_models.Brands.objects.filter(name__in=list(new_brand_specs.keys()))
+        }
+        for rb in unmapped_rc_brands:
+            if rb.id not in resolved_by_rc_id:
+                nu = _rc_brand_name_upper_for_sync(rb)
+                resolved_by_rc_id[rb.id] = by_name[nu]
+
+    mapping_models = [
+        src_models.BrandRoughCountryBrandMapping(
+            brand_id=resolved_by_rc_id[rb.id].id,
+            rough_country_brand_id=rb.id,
+        )
+        for rb in unmapped_rc_brands
+    ]
+    try:
+        pgbulk.upsert(
+            src_models.BrandRoughCountryBrandMapping,
+            mapping_models,
+            unique_fields=["brand", "rough_country_brand"],
+            update_fields=[],
+            returning=False,
+        )
+    except Exception as e:
+        logger.error("{} Error upserting BrandRoughCountryBrandMapping: {}.".format(_LOG_PREFIX, str(e)))
+        raise
+
+    created_brand_providers = 0
+    created_company_brands = 0
+    for rb in unmapped_rc_brands:
+        brand = resolved_by_rc_id[rb.id]
+        _, bp_created = src_models.BrandProviders.objects.get_or_create(
             brand=brand,
             provider=rc_provider,
         )
         if bp_created:
             created_brand_providers += 1
-
-        cb, cb_created = src_models.CompanyBrands.objects.get_or_create(
+        _, cb_created = src_models.CompanyBrands.objects.get_or_create(
             company=tick_company,
             brand=brand,
             defaults={
@@ -216,11 +394,12 @@ def sync_unmapped_rough_country_brands_to_brands() -> typing.List[src_models.Rou
             created_company_brands += 1
 
     logger.info(
-        "{} Sync complete. Brands created: {}, BrandRoughCountryBrandMapping: {}, "
-        "BrandProviders: {}, CompanyBrands: {}.".format(
+        "{} Sync complete. Brands created: {}, fuzzy name matches: {}, "
+        "BrandRoughCountryBrandMapping upserted: {}, BrandProviders: {}, CompanyBrands: {}.".format(
             _LOG_PREFIX,
             created_brands,
-            created_mappings,
+            fuzzy_matches,
+            len(mapping_models),
             created_brand_providers,
             created_company_brands,
         )
@@ -249,17 +428,16 @@ def _ensure_rough_country_brands_from_manufacturers(
 ) -> typing.Dict[str, src_models.RoughCountryBrand]:
     """
     Collect unique manufacturer values from General rows and get_or_create
-    a RoughCountryBrand for each. Returns mapping manufacturer -> RoughCountryBrand.
-    Ensures DEFAULT_RC_BRAND_NAME exists for rows with missing manufacturer.
+    a RoughCountryBrand for each. external_id and name are stored uppercase.
+    Returns mapping normalized manufacturer key -> RoughCountryBrand.
     """
     manufacturers = set()
     for row in general:
         m = _row_key(row, "manufacturer")
         if m:
-            manufacturers.add(m)
+            manufacturers.add(_normalize_rc_manufacturer_external_id(m))
     if not manufacturers:
         manufacturers.add(DEFAULT_RC_BRAND_NAME)
-    # Ensure default exists so we can fall back for empty manufacturer
     manufacturers.add(DEFAULT_RC_BRAND_NAME)
 
     out = {}
@@ -268,6 +446,9 @@ def _ensure_rough_country_brands_from_manufacturers(
             external_id=m,
             defaults={"name": m, "aaia_code": None},
         )
+        if not created and (brand.name or "").strip().upper() != m:
+            brand.name = m
+            brand.save(update_fields=["name", "updated_at"])
         out[m] = brand
         if created:
             logger.info("{} Created RoughCountryBrand: external_id={!r}.".format(_LOG_PREFIX, m))
@@ -283,16 +464,40 @@ def fetch_and_save_rough_country(
 ) -> None:
     """
     Fetch Excel feed, upsert brand, parts (General), apply Discontinued, upsert Fitment.
+    Catalog and fitment use the primary Rough Country CompanyProvider's credentials (or first active).
+    Pricing runs once per active CompanyProvider using that row's feed_url.
     """
     logger.info("{} Starting Rough Country feed sync.".format(_LOG_PREFIX))
 
-    client = rough_country_client.RoughCountryFeedClient(
-        file_url=file_url,
-        local_file_name=local_file_name,
-        local_file_path=local_file_path,
+    rc_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.ROUGH_COUNTRY.value,
+    ).first()
+    pricing_cps = []
+    if rc_provider:
+        pricing_cps = list(_active_rough_country_company_providers_queryset().filter(provider=rc_provider))
+    if rc_provider and not pricing_cps:
+        logger.warning(
+            "{} No active Rough Country company providers; catalog will sync but not company pricing.".format(
+                _LOG_PREFIX
+            )
+        )
+
+    catalog_cp = _catalog_company_provider(rc_provider)
+    catalog_creds = (catalog_cp.credentials if catalog_cp else {}) or {}
+    if catalog_cp:
+        logger.info(
+            "{} Catalog feed using company_id={} (primary={}).".format(
+                _LOG_PREFIX, catalog_cp.company_id, catalog_cp.primary,
+            )
+        )
+    catalog_client = _rough_country_feed_client_for_credentials(
+        catalog_creds,
+        file_url,
+        local_file_path,
+        local_file_name,
     )
     try:
-        data = client.get_feed_data(download_if_missing=download)
+        data = catalog_client.get_feed_data(download_if_missing=download)
     except rough_country_exceptions.RoughCountryException as e:
         logger.error("{} Feed error: {}.".format(_LOG_PREFIX, str(e)))
         raise
@@ -323,10 +528,8 @@ def fetch_and_save_rough_country(
         sku = _row_key(row, "sku")
         if not sku:
             continue
-        manufacturer = _row_key(row, "manufacturer") or DEFAULT_RC_BRAND_NAME
-        brand = manufacturer_to_brand.get(manufacturer) or manufacturer_to_brand.get(
-            DEFAULT_RC_BRAND_NAME
-        )
+        m_key = _normalize_rc_manufacturer_external_id(_row_key(row, "manufacturer"))
+        brand = manufacturer_to_brand.get(m_key) or manufacturer_to_brand.get(DEFAULT_RC_BRAND_NAME)
         disc = discontinued_by_sku.get(sku) or {}
         seen_by_sku[sku] = _row_to_rough_country_part(row, brand, disc)
     part_instances = list(seen_by_sku.values())
@@ -346,12 +549,32 @@ def fetch_and_save_rough_country(
                 part_instances,
                 unique_fields=["brand", "sku"],
                 update_fields=[
-                    "title", "description", "price", "sale_price", "cost", "cnd_map", "cnd_price",
-                    "availability", "nv_stock", "tn_stock", "link",
-                    "image_1", "image_2", "image_3", "image_4", "image_5", "image_6",
-                    "video", "features", "notes", "category", "manufacturer", "upc",
-                    "weight", "height", "width", "length", "added_date",
-                    "is_discontinued", "discontinued_date", "replacement_sku",
+                    "title",
+                    "description",
+                    "availability",
+                    "nv_stock",
+                    "tn_stock",
+                    "link",
+                    "image_1",
+                    "image_2",
+                    "image_3",
+                    "image_4",
+                    "image_5",
+                    "image_6",
+                    "video",
+                    "features",
+                    "notes",
+                    "category",
+                    "manufacturer",
+                    "upc",
+                    "weight",
+                    "height",
+                    "width",
+                    "length",
+                    "added_date",
+                    "is_discontinued",
+                    "discontinued_date",
+                    "replacement_sku",
                     "raw_data",
                 ],
                 returning=False,
@@ -360,6 +583,93 @@ def fetch_and_save_rough_country(
         except Exception as e:
             logger.error("{} Error upserting parts: {}.".format(_LOG_PREFIX, str(e)))
             raise
+
+        if pricing_cps:
+            pairs = list({(p.brand_id, p.sku) for p in part_instances})
+            id_by_brand_sku = {}
+            chunk_size = 3000
+            for i in range(0, len(pairs), chunk_size):
+                chunk = pairs[i : i + chunk_size]
+                with connection.cursor() as cur:
+                    cur.execute(
+                        "SELECT id, brand_id, sku FROM rough_country_parts WHERE (brand_id, sku) IN %s",
+                        (tuple(chunk),),
+                    )
+                    for pid, bid, psku in cur.fetchall():
+                        id_by_brand_sku[(bid, psku)] = pid
+
+            total_pricing_all = 0
+            for cp in pricing_cps:
+                logger.info(
+                    "{} Pricing feed for company_id={} (primary={}).".format(
+                        _LOG_PREFIX,
+                        cp.company_id,
+                        cp.primary,
+                    )
+                )
+                price_client = _rough_country_feed_client_for_credentials(
+                    cp.credentials or {},
+                    file_url,
+                    local_file_path,
+                    local_file_name,
+                )
+                try:
+                    price_data = price_client.get_feed_data(download_if_missing=download)
+                except rough_country_exceptions.RoughCountryException as e:
+                    logger.error(
+                        "{} Pricing feed error company_id={}: {}.".format(
+                            _LOG_PREFIX,
+                            cp.company_id,
+                            str(e),
+                        )
+                    )
+                    raise
+                g = price_data.get("general") or []
+                m2b = _ensure_rough_country_brands_from_manufacturers(g)
+                pmap = _deduped_pricing_by_brand_sku_from_general(g, m2b)
+                pricing_to_upsert = []
+                for (bid, sku), pdata in pmap.items():
+                    part_id = id_by_brand_sku.get((bid, sku))
+                    if not part_id:
+                        continue
+                    pricing_to_upsert.append(
+                        src_models.RoughCountryCompanyPricing(
+                            part_id=part_id,
+                            company=cp.company,
+                            price=pdata.get("price"),
+                            sale_price=pdata.get("sale_price"),
+                            cost=pdata.get("cost"),
+                            cnd_map=pdata.get("cnd_map"),
+                            cnd_price=pdata.get("cnd_price"),
+                        )
+                    )
+                total_cp = 0
+                for j in range(0, len(pricing_to_upsert), RC_PRICING_UPSERT_BATCH):
+                    batch = pricing_to_upsert[j : j + RC_PRICING_UPSERT_BATCH]
+                    pgbulk.upsert(
+                        src_models.RoughCountryCompanyPricing,
+                        batch,
+                        unique_fields=["part", "company"],
+                        update_fields=["price", "sale_price", "cost", "cnd_map", "cnd_price", "updated_at"],
+                        returning=False,
+                    )
+                    total_cp += len(batch)
+                    connection.close()
+                total_pricing_all += total_cp
+                logger.info(
+                    "{} Upserted {} Rough Country company pricing rows for company_id={}.".format(
+                        _LOG_PREFIX,
+                        total_cp,
+                        cp.company_id,
+                    )
+                )
+            logger.info(
+                "{} Rough Country pricing finished: {} rows across {} companies.".format(
+                    _LOG_PREFIX,
+                    total_pricing_all,
+                    len(pricing_cps),
+                )
+            )
 
     # Apply discontinued for skus that are in Discontinued but not in General (edge case: set existing parts)
     if discontinued_by_sku:
@@ -432,20 +742,26 @@ def fetch_and_save_rough_country(
     logger.info("{} Rough Country feed sync complete.".format(_LOG_PREFIX))
 
 
+def _row_pricing_from_general_row(row: typing.Dict) -> typing.Dict[str, typing.Any]:
+    """Feed price fields for RoughCountryCompanyPricing."""
+    return {
+        "price": _safe_decimal(_row_get(row, "price")),
+        "sale_price": _safe_decimal(_row_get(row, "sale_price")),
+        "cost": _safe_decimal(_row_get(row, "cost")),
+        "cnd_map": _safe_decimal(_row_get(row, "cnd_map")),
+        "cnd_price": _safe_decimal(_row_get(row, "cnd_price")),
+    }
+
+
 def _row_to_rough_country_part(
     row: typing.Dict,
     brand: src_models.RoughCountryBrand,
     discontinued: typing.Dict,
 ) -> src_models.RoughCountryPart:
-    """Build RoughCountryPart from General row and discontinued info."""
+    """Build RoughCountryPart from General row and discontinued info (catalog only; pricing is per-company)."""
     sku = _row_key(row, "sku") or ""
     title = _safe_str(_row_get(row, "title"), 512)
     description = _safe_str(_row_get(row, "description"))
-    price = _safe_decimal(_row_get(row, "price"))
-    sale_price = _safe_decimal(_row_get(row, "sale_price"))
-    cost = _safe_decimal(_row_get(row, "cost"))
-    cnd_map = _safe_decimal(_row_get(row, "cnd_map"))
-    cnd_price = _safe_decimal(_row_get(row, "cnd_price"))
     availability = _safe_str(_row_get(row, "availability"), 255)
     nv_stock = _safe_int(_row_get(row, "NV_Stock"))
     tn_stock = _safe_int(_row_get(row, "TN_Stock"))
@@ -476,11 +792,6 @@ def _row_to_rough_country_part(
         sku=sku,
         title=title,
         description=description,
-        price=price,
-        sale_price=sale_price,
-        cost=cost,
-        cnd_map=cnd_map,
-        cnd_price=cnd_price,
         availability=availability,
         nv_stock=nv_stock,
         tn_stock=tn_stock,

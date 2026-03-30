@@ -1,6 +1,4 @@
-import difflib
 import logging
-import os
 import re
 import time
 import typing
@@ -9,19 +7,21 @@ from decimal import Decimal
 import pandas as pd
 import pgbulk
 from django.db import connection, transaction
-from django.db.models.functions import Lower
+from django.db.models.functions import Lower, Upper
 
 from src import enums as src_enums
 from src import models as src_models
 from src.integrations.clients.meyer import client as meyer_client
 from src.integrations.clients.meyer import exceptions as meyer_exceptions
+from src.integrations.utils.brand_matching import (
+    best_fuzzy_brand_match,
+    brands_by_first_token_upper,
+    normalize_upper_words,
+)
 
 logger = logging.getLogger(__name__)
 
 _LOG_PREFIX = "[MEYER-SERVICES]"
-
-# difflib.get_close_matches cutoff (0–1). Lower = more permissive. Override: MEYER_BRAND_FUZZY_CUTOFF=0.78
-MEYER_BRAND_FUZZY_CUTOFF = float(os.environ.get("MEYER_BRAND_FUZZY_CUTOFF", "0.82"))
 
 _EXCEL_FORMULA_PATTERN = re.compile(r'^="?([^"]*)"?$|^=(\d+(?:\.\d+)?)$')
 
@@ -44,6 +44,13 @@ def _meyer_brand_key(value: typing.Any) -> typing.Optional[str]:
     if not raw:
         return None
     return raw.upper()
+
+
+def _meyer_brand_name_upper_for_sync(meyer_brand: src_models.MeyerBrand) -> str:
+    name_upper = (meyer_brand.name or "").strip().upper()
+    if not name_upper:
+        name_upper = "BRAND_{}".format(meyer_brand.external_id)
+    return name_upper
 
 
 def _safe_decimal(value: typing.Any) -> typing.Optional[Decimal]:
@@ -160,51 +167,26 @@ def normalize_brand_match_key(value: typing.Optional[str]) -> str:
     return s
 
 
-def build_brands_fuzzy_match_index() -> typing.Tuple[typing.List[str], typing.Dict[str, src_models.Brands]]:
-    """
-    All canonical Brands keyed by normalized name (first wins if duplicates).
-    brand_keys is the list passed to difflib.get_close_matches.
-    """
-    norm_to_brand: typing.Dict[str, src_models.Brands] = {}
-    for b in src_models.Brands.objects.only("id", "name").iterator():
-        key = normalize_brand_match_key(b.name)
-        if not key:
+# MeyerBrand name or external_id (after normalize_brand_match_key) -> exact catalog ``Brands.name``.
+# Fuzzy matching prefers the *longest* catalog name, so FOX-adjacent feed labels would otherwise
+# map to FOX POWERSPORTS instead of the parent FOX row unless we pin them here.
+_MEYER_UNMAPPED_SYNC_CANONICAL_BRAND: typing.Dict[str, str] = {
+    normalize_brand_match_key("FOX POWERSPORTS/FOX FACTORY POWERSPORTS"): "FOX",
+    normalize_brand_match_key("FOX SHOCKS"): "FOX",
+}
+
+
+def _meyer_unmapped_sync_canonical_brand_name(
+    mb: src_models.MeyerBrand,
+) -> typing.Optional[str]:
+    for raw in (mb.external_id, mb.name):
+        k = normalize_brand_match_key(raw)
+        if not k:
             continue
-        norm_to_brand.setdefault(key, b)
-    keys = sorted(norm_to_brand.keys())
-    return keys, norm_to_brand
-
-
-def resolve_meyer_brand_to_existing_brand(
-    meyer_brand: src_models.MeyerBrand,
-    brand_keys: typing.Sequence[str],
-    norm_to_brand: typing.Dict[str, src_models.Brands],
-    cutoff: typing.Optional[float] = None,
-) -> typing.Tuple[typing.Optional[src_models.Brands], str]:
-    """
-    Match MeyerBrand to an existing Brands row: exact normalized name first, then difflib fuzzy.
-    Returns (brand_or_none, 'exact'|'fuzzy'|'') — empty string if no match.
-    """
-    c = MEYER_BRAND_FUZZY_CUTOFF if cutoff is None else float(cutoff)
-    query = normalize_brand_match_key(meyer_brand.name)
-    if not query:
-        return None, ""
-
-    exact = norm_to_brand.get(query)
-    if exact is not None:
-        return exact, "exact"
-
-    if not brand_keys:
-        return None, ""
-
-    matches = difflib.get_close_matches(query, brand_keys, n=1, cutoff=c)
-    if not matches:
-        return None, ""
-
-    found = norm_to_brand.get(matches[0])
-    if found is None:
-        return None, ""
-    return found, "fuzzy"
+        target = _MEYER_UNMAPPED_SYNC_CANONICAL_BRAND.get(k)
+        if target:
+            return target
+    return None
 
 
 def _mapping_csv_scalar(value: typing.Any) -> str:
@@ -541,10 +523,17 @@ def apply_meyer_brand_mappings_from_csv(
 
 
 def sync_unmapped_meyer_brands_to_brands(dry_run: bool = False) -> typing.List[src_models.MeyerBrand]:
-    """Map unmapped MeyerBrand to Brands (exact then fuzzy name match; create Brand if needed)."""
+    """
+    For each MeyerBrand without BrandMeyerBrandMapping: resolve Brand by exact name (uppercase),
+    then fuzzy word-prefix match (shared util with WheelPros / Keystone / Rough Country); otherwise create.
+    Upserts mapping, BrandProviders, CompanyBrands for TICK_PERFORMANCE.
+
+    If dry_run is True, no database writes; logs only Meyer brands that matched an existing Brand (exact or fuzzy).
+    """
     logger.info(
-        "{} {}unmapped Meyer brands to Brands.".format(
-            _LOG_PREFIX, "[DRY RUN] Would sync " if dry_run else "Syncing ",
+        "{} Syncing unmapped Meyer brands to Brands{}.".format(
+            _LOG_PREFIX,
+            " (dry run)" if dry_run else "",
         )
     )
 
@@ -560,6 +549,15 @@ def sync_unmapped_meyer_brands_to_brands(dry_run: bool = False) -> typing.List[s
         logger.warning("{} Company TICK_PERFORMANCE not found. Skipping.".format(_LOG_PREFIX))
         return []
 
+    if not dry_run:
+        _, cp_created = src_models.CompanyProviders.objects.get_or_create(
+            company=tick_company,
+            provider=meyer_provider,
+            defaults={"credentials": {}, "primary": False},
+        )
+        if cp_created:
+            logger.info("{} Created CompanyProviders for TICK_PERFORMANCE + Meyer.".format(_LOG_PREFIX))
+
     mapped_ids = set(
         src_models.BrandMeyerBrandMapping.objects.values_list("meyer_brand_id", flat=True).distinct()
     )
@@ -570,103 +568,197 @@ def sync_unmapped_meyer_brands_to_brands(dry_run: bool = False) -> typing.List[s
         logger.info("{} No unmapped Meyer brands.".format(_LOG_PREFIX))
         return []
 
-    brand_keys, norm_to_brand = build_brands_fuzzy_match_index()
-    logger.info(
-        "{} Meyer brand matching: {} catalog brands indexed, fuzzy cutoff={}.".format(
-            _LOG_PREFIX, len(norm_to_brand), MEYER_BRAND_FUZZY_CUTOFF
-        )
-    )
+    name_upper_keys: typing.Set[str] = set()
+    for mb in unmapped:
+        if (mb.name or "").strip():
+            name_upper_keys.add((mb.name or "").strip().upper())
+
+    brands_by_upper_name: typing.Dict[str, src_models.Brands] = {}
+    if name_upper_keys:
+        for b in (
+            src_models.Brands.objects.annotate(_name_u=Upper("name"))
+            .filter(_name_u__in=name_upper_keys)
+            .order_by("id")
+        ):
+            key = (b.name or "").strip().upper()
+            if key not in brands_by_upper_name:
+                brands_by_upper_name[key] = b
+
+    canonical_targets_upper: typing.Set[str] = set()
+    for mb in unmapped:
+        t = _meyer_unmapped_sync_canonical_brand_name(mb)
+        if t:
+            canonical_targets_upper.add(t.strip().upper())
+
+    brands_by_upper_for_canonical: typing.Dict[str, src_models.Brands] = {}
+    if canonical_targets_upper:
+        for b in (
+            src_models.Brands.objects.annotate(_name_u=Upper("name"))
+            .filter(_name_u__in=canonical_targets_upper)
+            .order_by("id")
+        ):
+            ku = (b.name or "").strip().upper()
+            if ku not in brands_by_upper_for_canonical:
+                brands_by_upper_for_canonical[ku] = b
+
+    resolved_by_meyer_id: typing.Dict[int, src_models.Brands] = {}
+    canonical_matched_ids: typing.Set[int] = set()
+    exact_matched_ids: typing.Set[int] = set()
+    for mb in sorted(unmapped, key=lambda x: x.id):
+        canon_name = _meyer_unmapped_sync_canonical_brand_name(mb)
+        if canon_name:
+            b = brands_by_upper_for_canonical.get(canon_name.strip().upper())
+            if b:
+                resolved_by_meyer_id[mb.id] = b
+                canonical_matched_ids.add(mb.id)
+            else:
+                logger.warning(
+                    "{} Meyer canonical brand override {!r} -> {!r} but no Brands row with that name.".format(
+                        _LOG_PREFIX,
+                        mb.name or mb.external_id,
+                        canon_name,
+                    )
+                )
+
+    for mb in sorted(unmapped, key=lambda x: x.id):
+        if mb.id in resolved_by_meyer_id:
+            continue
+        nm = (mb.name or "").strip().upper()
+        if nm:
+            brand = brands_by_upper_name.get(nm)
+            if brand:
+                resolved_by_meyer_id[mb.id] = brand
+                exact_matched_ids.add(mb.id)
+
+    unresolved_after_exact = [mb for mb in unmapped if mb.id not in resolved_by_meyer_id]
+    brands_first_index = brands_by_first_token_upper() if unresolved_after_exact else {}
+    all_brands_fallback: typing.Optional[typing.List[src_models.Brands]] = None
+    fuzzy_matches = 0
+    fuzzy_matched_ids: typing.Set[int] = set()
+    for mb in unresolved_after_exact:
+        parts = normalize_upper_words(mb.name or "").split()
+        candidates: typing.List[src_models.Brands] = []
+        if parts:
+            candidates = list(brands_first_index.get(parts[0], ()))
+        if not candidates:
+            if all_brands_fallback is None:
+                all_brands_fallback = list(
+                    src_models.Brands.objects.only("id", "name", "aaia_code").order_by("id")
+                )
+            candidates = all_brands_fallback
+        brand = best_fuzzy_brand_match(mb.name or "", candidates)
+        if brand:
+            resolved_by_meyer_id[mb.id] = brand
+            fuzzy_matched_ids.add(mb.id)
+            fuzzy_matches += 1
+            if not dry_run:
+                logger.debug(
+                    "{} Fuzzy-matched Meyer brand {!r} to Brand id={} name={!r}.".format(
+                        _LOG_PREFIX,
+                        mb.name,
+                        brand.id,
+                        brand.name,
+                    )
+                )
 
     if dry_run:
-        matched_exact = 0
-        matched_fuzzy = 0
-        would_create_labels: typing.Set[str] = set()
-        for mb in unmapped:
-            brand, match_kind = resolve_meyer_brand_to_existing_brand(
-                mb, brand_keys, norm_to_brand
+        for mb in sorted(unmapped, key=lambda x: x.id):
+            if mb.id not in resolved_by_meyer_id:
+                continue
+            brand = resolved_by_meyer_id[mb.id]
+            if mb.id in canonical_matched_ids:
+                how = "canonical_override"
+            elif mb.id in exact_matched_ids:
+                how = "exact"
+            else:
+                how = "fuzzy"
+            logger.info(
+                "{} [dry-run] match ({}) MeyerBrand id={} external_id={!r} name={!r} "
+                "-> Brand id={} name={!r}".format(
+                    _LOG_PREFIX,
+                    how,
+                    mb.id,
+                    mb.external_id,
+                    mb.name,
+                    brand.id,
+                    brand.name,
+                )
             )
-            if match_kind == "exact":
-                matched_exact += 1
-            elif match_kind == "fuzzy":
-                matched_fuzzy += 1
-                logger.info(
-                    "{} [DRY RUN] Fuzzy: MeyerBrand id={} {!r} -> Brands id={} {!r}".format(
-                        _LOG_PREFIX, mb.id, mb.name, brand.id if brand else None, brand.name if brand else None
-                    )
-                )
-            if not brand:
-                lbl = (
-                    (mb.name or "").strip().upper()
-                    or "BRAND_{}".format(mb.external_id)
-                )
-                would_create_labels.add(lbl)
-                logger.info(
-                    "{} [DRY RUN] Would create Brand {!r} for MeyerBrand id={} external_id={!r}".format(
-                        _LOG_PREFIX, lbl, mb.id, mb.external_id
-                    )
-                )
-
-        need_catalog = len(unmapped) - matched_exact - matched_fuzzy
+        would_create = [mb for mb in unmapped if mb.id not in resolved_by_meyer_id]
         logger.info(
-            "{} [DRY RUN] Summary — unmapped: {}, match exact: {}, match fuzzy: {}, "
-            "no catalog match (would create new Brand name(s)): {} ({} unique name(s)).".format(
+            "{} [dry-run] Summary: {} canonical overrides, {} exact matches, {} fuzzy matches, "
+            "{} unmatched (would create Brand). No writes performed.".format(
                 _LOG_PREFIX,
-                len(unmapped),
-                matched_exact,
-                matched_fuzzy,
-                need_catalog,
-                len(would_create_labels),
+                len(canonical_matched_ids),
+                len(exact_matched_ids),
+                len(fuzzy_matched_ids),
+                len(would_create),
             )
         )
         return unmapped
 
-    created_brands = 0
-    created_mappings = 0
-    created_bp = 0
-    created_cb = 0
-    matched_exact = 0
-    matched_fuzzy = 0
+    new_brand_specs: typing.Set[str] = set()
+    for mb in sorted(unmapped, key=lambda x: x.id):
+        if mb.id in resolved_by_meyer_id:
+            continue
+        new_brand_specs.add(_meyer_brand_name_upper_for_sync(mb))
 
-    for mb in unmapped:
-        brand, match_kind = resolve_meyer_brand_to_existing_brand(mb, brand_keys, norm_to_brand)
-        if match_kind == "exact":
-            matched_exact += 1
-        elif match_kind == "fuzzy":
-            matched_fuzzy += 1
-            logger.info(
-                "{} Fuzzy-matched MeyerBrand id={} {!r} -> Brands id={} {!r}.".format(
-                    _LOG_PREFIX, mb.id, mb.name, brand.id, brand.name
-                )
-            )
-        if not brand:
-            name_upper = (mb.name or "").strip().upper() or "BRAND_{}".format(mb.external_id)
-            brand = src_models.Brands.objects.create(
-                name=name_upper,
+    created_brands = 0
+    if new_brand_specs:
+        existing_names = set(
+            src_models.Brands.objects.filter(name__in=list(new_brand_specs)).values_list("name", flat=True)
+        )
+        new_brand_rows = [
+            src_models.Brands(
+                name=name,
                 status=src_enums.BrandProviderStatus.ACTIVE.value,
                 status_name=src_enums.BrandProviderStatus.ACTIVE.name,
                 aaia_code=None,
             )
-            created_brands += 1
-            # New Brand: add to index so later unmapped rows in this run can exact-match it
-            nk = normalize_brand_match_key(brand.name)
-            if nk and nk not in norm_to_brand:
-                norm_to_brand[nk] = brand
-                brand_keys = sorted(norm_to_brand.keys())
+            for name in new_brand_specs
+            if name not in existing_names
+        ]
+        if new_brand_rows:
+            src_models.Brands.objects.bulk_create(new_brand_rows, ignore_conflicts=True)
+            created_brands = len(new_brand_rows)
+        by_name = {
+            b.name: b
+            for b in src_models.Brands.objects.filter(name__in=list(new_brand_specs))
+        }
+        for mb in unmapped:
+            if mb.id not in resolved_by_meyer_id:
+                nu = _meyer_brand_name_upper_for_sync(mb)
+                resolved_by_meyer_id[mb.id] = by_name[nu]
 
-        _, mc = src_models.BrandMeyerBrandMapping.objects.get_or_create(
-            brand=brand,
-            meyer_brand=mb,
+    mapping_models = [
+        src_models.BrandMeyerBrandMapping(
+            brand_id=resolved_by_meyer_id[mb.id].id,
+            meyer_brand_id=mb.id,
         )
-        if mc:
-            created_mappings += 1
+        for mb in unmapped
+    ]
+    try:
+        pgbulk.upsert(
+            src_models.BrandMeyerBrandMapping,
+            mapping_models,
+            unique_fields=["brand", "meyer_brand"],
+            update_fields=[],
+            returning=False,
+        )
+    except Exception as e:
+        logger.error("{} Error upserting BrandMeyerBrandMapping: {}.".format(_LOG_PREFIX, str(e)))
+        raise
 
+    created_bp = 0
+    created_cb = 0
+    for mb in unmapped:
+        brand = resolved_by_meyer_id[mb.id]
         _, bpc = src_models.BrandProviders.objects.get_or_create(
             brand=brand,
             provider=meyer_provider,
         )
         if bpc:
             created_bp += 1
-
         _, cbc = src_models.CompanyBrands.objects.get_or_create(
             company=tick_company,
             brand=brand,
@@ -679,13 +771,13 @@ def sync_unmapped_meyer_brands_to_brands(dry_run: bool = False) -> typing.List[s
             created_cb += 1
 
     logger.info(
-        "{} Meyer brand sync done. Matched exact: {}, fuzzy: {}. New Brands: {}, mappings: {}, "
-        "BrandProviders: {}, CompanyBrands: {}.".format(
+        "{} Meyer brand sync done. Canonical overrides: {}, brands created: {}, fuzzy name matches: {}, "
+        "BrandMeyerBrandMapping upserted: {}, BrandProviders: {}, CompanyBrands: {}.".format(
             _LOG_PREFIX,
-            matched_exact,
-            matched_fuzzy,
+            len(canonical_matched_ids),
             created_brands,
-            created_mappings,
+            fuzzy_matches,
+            len(mapping_models),
             created_bp,
             created_cb,
         )

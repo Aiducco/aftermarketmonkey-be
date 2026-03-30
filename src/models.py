@@ -334,6 +334,9 @@ class Turn14BrandData(django_db_models.Model):
 class Turn14BrandPricing(django_db_models.Model):
     external_id = django_db_models.CharField(max_length=255)
     brand = django_db_models.ForeignKey(Turn14Brand, on_delete=django_db_models.CASCADE, related_name="brand_pricing")
+    company = django_db_models.ForeignKey(
+        Company, on_delete=django_db_models.CASCADE, related_name="turn14_brand_pricing"
+    )
     type = django_db_models.CharField(max_length=255, null=True)
     purchase_cost = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
     has_map = django_db_models.BooleanField(default=False)
@@ -345,7 +348,7 @@ class Turn14BrandPricing(django_db_models.Model):
 
     class Meta:
         db_table = "turn14_brand_pricing"
-        unique_together = ["external_id"]
+        unique_together = ["company", "external_id"]
 
 
 class Turn14BrandInventory(django_db_models.Model):
@@ -567,6 +570,29 @@ class KeystoneParts(django_db_models.Model):
         unique_together = ["vcpn", "brand"]
 
 
+class KeystoneCompanyPricing(django_db_models.Model):
+    """
+    Per-company Keystone FTP pricing for a catalog row (KeystoneParts).
+    Catalog fields live on KeystoneParts; cost/jobber/core come from each company's inventory file.
+    """
+    part = django_db_models.ForeignKey(
+        KeystoneParts, on_delete=django_db_models.CASCADE, related_name="company_pricing"
+    )
+    company = django_db_models.ForeignKey(
+        Company, on_delete=django_db_models.CASCADE, related_name="keystone_company_pricing"
+    )
+    jobber_price = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
+    cost = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
+    core_charge = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "keystone_company_pricing"
+        unique_together = ["part", "company"]
+
+
 class MeyerBrand(django_db_models.Model):
     """Manufacturer / brand label from Meyer pricing feed (MFG column)."""
     external_id = django_db_models.CharField(max_length=512)
@@ -704,6 +730,32 @@ class WheelProsPart(django_db_models.Model):
         unique_together = [["brand", "part_number"]]
 
 
+class WheelProsCompanyPricing(django_db_models.Model):
+    """
+    Per-company Wheel Pros pricing for a catalog row (WheelProsPart).
+    Catalog/inventory fields live on WheelProsPart; msrp/map come from each company's SFTP feed.
+    """
+    part = django_db_models.ForeignKey(
+        WheelProsPart,
+        on_delete=django_db_models.CASCADE,
+        related_name="company_pricing",
+    )
+    company = django_db_models.ForeignKey(
+        Company,
+        on_delete=django_db_models.CASCADE,
+        related_name="wheelpros_company_pricing",
+    )
+    msrp_usd = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    map_usd = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "wheelpros_company_pricing"
+        unique_together = [["part", "company"]]
+
+
 class RoughCountryBrand(django_db_models.Model):
     """Single brand from Rough Country feed (e.g. manufacturer 'Rough Country')."""
     external_id = django_db_models.CharField(max_length=255)
@@ -765,6 +817,36 @@ class RoughCountryPart(django_db_models.Model):
     class Meta:
         db_table = "rough_country_parts"
         unique_together = [["brand", "sku"]]
+
+
+class RoughCountryCompanyPricing(django_db_models.Model):
+    """
+    Per-company Rough Country pricing for a catalog row (RoughCountryPart).
+    Catalog/non-price fields live on RoughCountryPart; feed prices are stored per company
+    so ProviderPartCompanyPricing sync keys off (part, company) like other providers.
+    """
+    part = django_db_models.ForeignKey(
+        RoughCountryPart,
+        on_delete=django_db_models.CASCADE,
+        related_name="company_pricing",
+    )
+    company = django_db_models.ForeignKey(
+        Company,
+        on_delete=django_db_models.CASCADE,
+        related_name="rough_country_company_pricing",
+    )
+    price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    sale_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    cost = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    cnd_map = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    cnd_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "rough_country_company_pricing"
+        unique_together = [["part", "company"]]
 
 
 class RoughCountryFitment(django_db_models.Model):
