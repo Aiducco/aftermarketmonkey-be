@@ -1516,6 +1516,438 @@ def sync_provider_pricing_from_wheelpros() -> None:
     logger.info("{} Synced {} WheelPros pricing records total.".format(_LOG_PREFIX, total_upserted))
 
 
+def sync_provider_pricing_from_turn14_for_company(company_id: int) -> None:
+    """Like sync_provider_pricing_from_turn14 but only rows for one company_id."""
+    logger.info("{} Syncing Turn14 provider pricing for company_id={}.".format(_LOG_PREFIX, company_id))
+
+    turn14_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.TURN_14.value,
+    ).first()
+    if not turn14_provider:
+        logger.info("{} No Turn14 provider found.".format(_LOG_PREFIX))
+        return
+
+    provider_parts = {
+        pp.provider_external_id: pp
+        for pp in src_models.ProviderPart.objects.filter(provider=turn14_provider)
+    }
+
+    now = timezone.now()
+    total_upserted = 0
+    batch_num = 0
+    last_id = 0
+
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.Turn14BrandPricing.objects.filter(id__gt=last_id, company_id=company_id)
+            .order_by("id")
+            .values("id", "external_id", "purchase_cost", "pricelists", "company_id")[:BATCH_SIZE_PRICING]
+        )
+        if not batch:
+            break
+
+        last_id = batch[-1]["id"]
+        batch_company_ids = {pr["company_id"] for pr in batch if pr.get("company_id")}
+        companies_by_id = {
+            c.id: c
+            for c in src_models.Company.objects.filter(id__in=batch_company_ids)
+        }
+        to_upsert = []
+        for pr in batch:
+            provider_part = provider_parts.get(pr["external_id"])
+            if not provider_part:
+                continue
+            comp_id = pr.get("company_id")
+            company = companies_by_id.get(comp_id) if comp_id else None
+            if not company:
+                continue
+            cost = pr.get("purchase_cost")
+            jobber_price, map_price, msrp, retail_price = _extract_turn14_prices(pr.get("pricelists"))
+            to_upsert.append(
+                src_models.ProviderPartCompanyPricing(
+                    provider_part=provider_part,
+                    company=company,
+                    cost=cost,
+                    jobber_price=jobber_price,
+                    map_price=map_price,
+                    msrp=msrp,
+                    retail_price=retail_price,
+                    last_synced_at=now,
+                )
+            )
+
+        if to_upsert:
+            pgbulk.upsert(
+                src_models.ProviderPartCompanyPricing,
+                to_upsert,
+                unique_fields=["provider_part", "company"],
+                update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
+            )
+            total_upserted += len(to_upsert)
+
+        logger.info("{} Turn14 pricing company={} batch {}: {} records (last_id={})".format(
+            _LOG_PREFIX, company_id, batch_num, len(to_upsert), last_id
+        ))
+        connection.close()
+        if len(batch) == BATCH_SIZE_PRICING:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    logger.info("{} Synced {} Turn14 pricing records for company_id={}.".format(
+        _LOG_PREFIX, total_upserted, company_id,
+    ))
+
+
+def sync_provider_pricing_from_keystone_for_company(company_id: int) -> None:
+    logger.info("{} Syncing Keystone provider pricing for company_id={}.".format(_LOG_PREFIX, company_id))
+
+    keystone_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.KEYSTONE.value,
+    ).first()
+    if not keystone_provider:
+        logger.info("{} No Keystone provider found.".format(_LOG_PREFIX))
+        return
+
+    provider_parts = {
+        pp.provider_external_id: pp
+        for pp in src_models.ProviderPart.objects.filter(provider=keystone_provider)
+    }
+
+    now = timezone.now()
+    total_upserted = 0
+    batch_num = 0
+    last_id = 0
+
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.KeystoneCompanyPricing.objects.filter(id__gt=last_id, company_id=company_id)
+            .order_by("id")
+            .values("id", "company_id", "cost", "jobber_price", "part__vcpn")[:BATCH_SIZE_PRICING]
+        )
+        if not batch:
+            break
+
+        last_id = batch[-1]["id"]
+        batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
+        companies_by_id = {
+            c.id: c
+            for c in src_models.Company.objects.filter(id__in=batch_company_ids)
+        }
+        to_upsert = []
+        for row in batch:
+            vcpn = row.get("part__vcpn")
+            provider_part = provider_parts.get(vcpn) if vcpn else None
+            if not provider_part:
+                continue
+            company = companies_by_id.get(row.get("company_id"))
+            if not company:
+                continue
+            to_upsert.append(
+                src_models.ProviderPartCompanyPricing(
+                    provider_part=provider_part,
+                    company=company,
+                    cost=row.get("cost"),
+                    jobber_price=row.get("jobber_price"),
+                    map_price=None,
+                    msrp=None,
+                    retail_price=None,
+                    last_synced_at=now,
+                )
+            )
+
+        if to_upsert:
+            pgbulk.upsert(
+                src_models.ProviderPartCompanyPricing,
+                to_upsert,
+                unique_fields=["provider_part", "company"],
+                update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
+            )
+            total_upserted += len(to_upsert)
+
+        logger.info("{} Keystone pricing company={} batch {}: {} records (last_id={})".format(
+            _LOG_PREFIX, company_id, batch_num, len(to_upsert), last_id
+        ))
+        connection.close()
+        if len(batch) == BATCH_SIZE_PRICING:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    logger.info("{} Synced {} Keystone pricing records for company_id={}.".format(
+        _LOG_PREFIX, total_upserted, company_id,
+    ))
+
+
+def sync_provider_pricing_from_meyer_for_company(company_id: int) -> None:
+    logger.info("{} Syncing Meyer provider pricing for company_id={}.".format(_LOG_PREFIX, company_id))
+
+    meyer_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.MEYER.value,
+    ).first()
+    if not meyer_provider:
+        logger.info("{} No Meyer provider found.".format(_LOG_PREFIX))
+        return
+
+    provider_parts = {
+        pp.provider_external_id: pp
+        for pp in src_models.ProviderPart.objects.filter(provider=meyer_provider)
+    }
+
+    now = timezone.now()
+    total_upserted = 0
+    batch_num = 0
+    last_id = 0
+
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.MeyerCompanyPricing.objects.filter(id__gt=last_id, company_id=company_id)
+            .order_by("id")
+            .values(
+                "id",
+                "company_id",
+                "cost",
+                "jobber_price",
+                "map_price",
+                "part__meyer_part",
+            )[:BATCH_SIZE_PRICING]
+        )
+        if not batch:
+            break
+
+        last_id = batch[-1]["id"]
+        batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
+        companies_by_id = {
+            c.id: c
+            for c in src_models.Company.objects.filter(id__in=batch_company_ids)
+        }
+        pricing_by_pp_company: typing.Dict[typing.Tuple[int, int], src_models.ProviderPartCompanyPricing] = {}
+        for row in batch:
+            ext = row.get("part__meyer_part")
+            if isinstance(ext, str):
+                ext = ext.strip()
+            else:
+                ext = str(ext or "").strip()
+            pp = provider_parts.get(ext)
+            if not pp:
+                continue
+            company = companies_by_id.get(row.get("company_id"))
+            if not company:
+                continue
+            pricing_by_pp_company[(pp.id, company.id)] = src_models.ProviderPartCompanyPricing(
+                provider_part=pp,
+                company=company,
+                cost=row.get("cost"),
+                jobber_price=row.get("jobber_price"),
+                map_price=row.get("map_price"),
+                msrp=None,
+                retail_price=None,
+                last_synced_at=now,
+            )
+
+        to_upsert = list(pricing_by_pp_company.values())
+        if to_upsert:
+            pgbulk.upsert(
+                src_models.ProviderPartCompanyPricing,
+                to_upsert,
+                unique_fields=["provider_part", "company"],
+                update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
+            )
+            total_upserted += len(to_upsert)
+
+        logger.info("{} Meyer pricing company={} batch {}: {} records (last_id={})".format(
+            _LOG_PREFIX, company_id, batch_num, len(to_upsert), last_id
+        ))
+        connection.close()
+        if len(batch) == BATCH_SIZE_PRICING:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    logger.info("{} Synced {} Meyer pricing records for company_id={}.".format(
+        _LOG_PREFIX, total_upserted, company_id,
+    ))
+
+
+def sync_provider_pricing_from_rough_country_for_company(company_id: int) -> None:
+    logger.info("{} Syncing Rough Country provider pricing for company_id={}.".format(_LOG_PREFIX, company_id))
+
+    rc_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.ROUGH_COUNTRY.value,
+    ).first()
+    if not rc_provider:
+        logger.info("{} No Rough Country provider found.".format(_LOG_PREFIX))
+        return
+
+    provider_parts = {
+        pp.provider_external_id: pp
+        for pp in src_models.ProviderPart.objects.filter(provider=rc_provider)
+    }
+
+    now = timezone.now()
+    total_upserted = 0
+    batch_num = 0
+    last_id = 0
+
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.RoughCountryCompanyPricing.objects.filter(id__gt=last_id, company_id=company_id)
+            .order_by("id")
+            .values(
+                "id",
+                "company_id",
+                "cost",
+                "price",
+                "sale_price",
+                "cnd_map",
+                "cnd_price",
+                "part__brand_id",
+                "part__sku",
+            )[:BATCH_SIZE_PRICING]
+        )
+        if not batch:
+            break
+
+        last_id = batch[-1]["id"]
+        batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
+        companies_by_id = {
+            c.id: c
+            for c in src_models.Company.objects.filter(id__in=batch_company_ids)
+        }
+        to_upsert = []
+        for row in batch:
+            ext_id = _rough_country_provider_external_id(row["part__brand_id"], row["part__sku"])
+            provider_part = provider_parts.get(ext_id)
+            if not provider_part:
+                continue
+            company = companies_by_id.get(row.get("company_id"))
+            if not company:
+                continue
+            cost = row.get("cost") or row.get("price") or row.get("sale_price")
+            cnd_map = row.get("cnd_map")
+            cnd_price = row.get("cnd_price")
+            to_upsert.append(
+                src_models.ProviderPartCompanyPricing(
+                    provider_part=provider_part,
+                    company=company,
+                    cost=cost,
+                    jobber_price=cnd_map,
+                    map_price=cnd_map,
+                    msrp=cnd_price,
+                    retail_price=cnd_price,
+                    last_synced_at=now,
+                )
+            )
+
+        if to_upsert:
+            pgbulk.upsert(
+                src_models.ProviderPartCompanyPricing,
+                to_upsert,
+                unique_fields=["provider_part", "company"],
+                update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
+            )
+            total_upserted += len(to_upsert)
+
+        logger.info("{} Rough Country pricing company={} batch {}: {} records (last_id={})".format(
+            _LOG_PREFIX, company_id, batch_num, len(to_upsert), last_id
+        ))
+        connection.close()
+        if len(batch) == BATCH_SIZE_PRICING:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    logger.info("{} Synced {} Rough Country pricing records for company_id={}.".format(
+        _LOG_PREFIX, total_upserted, company_id,
+    ))
+
+
+def sync_provider_pricing_from_wheelpros_for_company(company_id: int) -> None:
+    logger.info("{} Syncing WheelPros provider pricing for company_id={}.".format(_LOG_PREFIX, company_id))
+
+    wp_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.WHEELPROS.value,
+    ).first()
+    if not wp_provider:
+        logger.info("{} No WheelPros provider found.".format(_LOG_PREFIX))
+        return
+
+    provider_parts_by_ext_id, provider_parts_by_brand_sku = _wheelpros_provider_part_lookup(wp_provider)
+
+    now = timezone.now()
+    total_upserted = 0
+    batch_num = 0
+    last_id = 0
+
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.WheelProsCompanyPricing.objects.filter(id__gt=last_id, company_id=company_id)
+            .order_by("id")
+            .values(
+                "id",
+                "company_id",
+                "msrp_usd",
+                "map_usd",
+                "part__brand_id",
+                "part__part_number",
+            )[:BATCH_SIZE_PRICING]
+        )
+        if not batch:
+            break
+
+        last_id = batch[-1]["id"]
+        batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
+        companies_by_id = {
+            c.id: c
+            for c in src_models.Company.objects.filter(id__in=batch_company_ids)
+        }
+        to_upsert = []
+        for row in batch:
+            part_number = (row.get("part__part_number") or "").strip()
+            if not part_number:
+                continue
+            ext_id = _wheelpros_provider_external_id(row["part__brand_id"], part_number)
+            provider_part = provider_parts_by_ext_id.get(ext_id) or provider_parts_by_brand_sku.get(
+                (row["part__brand_id"], part_number)
+            )
+            if not provider_part:
+                continue
+            company = companies_by_id.get(row.get("company_id"))
+            if not company:
+                continue
+            msrp = row.get("msrp_usd")
+            map_price = row.get("map_usd")
+            to_upsert.append(
+                src_models.ProviderPartCompanyPricing(
+                    provider_part=provider_part,
+                    company=company,
+                    cost=None,
+                    jobber_price=map_price,
+                    map_price=map_price,
+                    msrp=msrp,
+                    retail_price=msrp,
+                    last_synced_at=now,
+                )
+            )
+
+        if to_upsert:
+            pgbulk.upsert(
+                src_models.ProviderPartCompanyPricing,
+                to_upsert,
+                unique_fields=["provider_part", "company"],
+                update_fields=["jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
+            )
+            total_upserted += len(to_upsert)
+
+        logger.info("{} WheelPros pricing company={} batch {}: {} records (last_id={})".format(
+            _LOG_PREFIX, company_id, batch_num, len(to_upsert), last_id
+        ))
+        connection.close()
+        if len(batch) == BATCH_SIZE_PRICING:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    logger.info("{} Synced {} WheelPros pricing records for company_id={}.".format(
+        _LOG_PREFIX, total_upserted, company_id,
+    ))
+
+
 def _parse_turn14_inventory(inv: typing.Dict) -> typing.Tuple[typing.Optional[int], typing.Optional[date], int]:
     """Extract manufacturer_qty, manufacturer_esd, warehouse_total from Turn14 inventory row."""
     manufacturer_qty = None

@@ -44,3 +44,11 @@ class ScheduledTaskExecutionStatus(enum.Enum):
     COMPLETED = 2
     FAILED = 3
     SKIPPED = 4  # e.g. early exit when no work to do
+
+
+class IntegrationPricingSyncJobStatus(enum.Enum):
+    """Queue status for per-company-provider pricing sync jobs (cron-processed)."""
+    OPEN = 1
+    RUNNING = 2
+    COMPLETED = 3
+    FAILED = 4

@@ -771,3 +771,138 @@ def fetch_and_save_wheelpros(
         )
 
     logger.info("{} WheelPros {} feed sync complete.".format(_LOG_PREFIX, feed_type))
+
+
+def sync_wheelpros_company_pricing_for_company_provider(
+    company_provider_id: int,
+    download: bool = True,
+    local_only: bool = False,
+) -> None:
+    """
+    For one CompanyProviders row, download each WheelPros SFTP pricing feed (wheel, tire, accessories)
+    and upsert WheelProsCompanyPricing. Parts must already exist for (brand, part_number).
+    """
+    wp_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.WHEELPROS.value,
+    ).first()
+    if not wp_provider:
+        logger.warning("{} No WheelPros provider. Skipping.".format(_LOG_PREFIX))
+        return
+
+    cp = (
+        src_models.CompanyProviders.objects.filter(
+            id=company_provider_id,
+            provider_id=wp_provider.id,
+            provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
+        )
+        .select_related("company")
+        .first()
+    )
+    if not cp:
+        logger.warning(
+            "{} No active WheelPros CompanyProviders id={}. Skipping.".format(_LOG_PREFIX, company_provider_id)
+        )
+        return
+
+    total_all = 0
+    for feed_type in ("wheel", "tire", "accessories"):
+        sftp_path = src_constants.WHEELPROS_FEED_PATHS.get(feed_type)
+        if not sftp_path:
+            continue
+        local_path = "/tmp/wheelpros_{}_cp_{}.csv".format(feed_type, company_provider_id)
+
+        creds = dict(cp.credentials or {})
+        creds["sftp_path"] = sftp_path
+        pc = wheelpros_client.WheelProsSFTPClient(
+            credentials=creds,
+            local_file_path=local_path,
+            require_credentials=not local_only,
+        )
+        try:
+            price_records = pc.get_feed_records(
+                force_download=download,
+                local_only=local_only,
+                sftp_path=sftp_path,
+                local_file_path=local_path,
+            )
+        except wheelpros_exceptions.WheelProsException as e:
+            logger.error(
+                "{} WheelPros {} pricing feed error company_provider id={}: {}.".format(
+                    _LOG_PREFIX, feed_type, company_provider_id, str(e),
+                )
+            )
+            raise
+
+        if not price_records:
+            logger.warning(
+                "{} No rows for WheelPros {} pricing company_provider id={}.".format(
+                    _LOG_PREFIX, feed_type, company_provider_id,
+                )
+            )
+            continue
+
+        brand_names = set()
+        for row in price_records:
+            name = _row_key(row, "Brand")
+            if name:
+                brand_names.add(_normalize_wheelpros_brand_key(name))
+        brand_by_external = {
+            b.external_id: b
+            for b in src_models.WheelProsBrand.objects.filter(external_id__in=brand_names)
+        }
+        pmap = _wheelpros_pricing_map_from_records(price_records, brand_by_external)
+        if not pmap:
+            continue
+
+        pairs = list(pmap.keys())
+        id_by_brand_pn: typing.Dict[typing.Tuple[int, str], int] = {}
+        chunk_size = 3000
+        for i in range(0, len(pairs), chunk_size):
+            chunk = pairs[i : i + chunk_size]
+            if not chunk:
+                continue
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM wheelpros_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(chunk),),
+                )
+                for pid, bid, pn in cur.fetchall():
+                    id_by_brand_pn[(bid, (pn or "").strip())] = pid
+
+        pricing_to_upsert = []
+        for (bid, pn), pdata in pmap.items():
+            part_id = id_by_brand_pn.get((bid, pn))
+            if not part_id:
+                continue
+            pricing_to_upsert.append(
+                src_models.WheelProsCompanyPricing(
+                    part_id=part_id,
+                    company=cp.company,
+                    msrp_usd=pdata.get("msrp_usd"),
+                    map_usd=pdata.get("map_usd"),
+                )
+            )
+        batch_total = 0
+        for j in range(0, len(pricing_to_upsert), WP_PRICING_UPSERT_BATCH):
+            batch = pricing_to_upsert[j : j + WP_PRICING_UPSERT_BATCH]
+            pgbulk.upsert(
+                src_models.WheelProsCompanyPricing,
+                batch,
+                unique_fields=["part", "company"],
+                update_fields=["msrp_usd", "map_usd", "updated_at"],
+                returning=False,
+            )
+            batch_total += len(batch)
+            connection.close()
+        total_all += batch_total
+        logger.info(
+            "{} WheelPros {} company pricing: {} rows for company_provider id={}.".format(
+                _LOG_PREFIX, feed_type, batch_total, company_provider_id,
+            )
+        )
+
+    logger.info(
+        "{} WheelPros company pricing total {} rows for company_provider id={}.".format(
+            _LOG_PREFIX, total_all, company_provider_id,
+        )
+    )

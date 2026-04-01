@@ -818,3 +818,104 @@ def _row_to_rough_country_part(
         replacement_sku=repl_sku,
         raw_data=None,
     )
+
+
+def sync_rough_country_company_pricing_for_company_provider(
+    company_provider_id: int,
+    file_url: typing.Optional[str] = None,
+    local_file_path: typing.Optional[str] = None,
+    local_file_name: typing.Optional[str] = None,
+    download: bool = True,
+) -> None:
+    """
+    Fetch this company's Rough Country feed and upsert RoughCountryCompanyPricing only.
+    Parts must already exist (sku + brand) for rows to apply.
+    """
+    cp = (
+        src_models.CompanyProviders.objects.filter(
+            id=company_provider_id,
+            provider__kind=src_enums.BrandProviderKind.ROUGH_COUNTRY.value,
+            provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
+        )
+        .select_related("company")
+        .first()
+    )
+    if not cp:
+        logger.warning(
+            "{} No active Rough Country CompanyProviders id={}. Skipping.".format(_LOG_PREFIX, company_provider_id)
+        )
+        return
+
+    price_client = _rough_country_feed_client_for_credentials(
+        cp.credentials or {},
+        file_url,
+        local_file_path,
+        local_file_name,
+    )
+    try:
+        price_data = price_client.get_feed_data(download_if_missing=download)
+    except rough_country_exceptions.RoughCountryException as e:
+        logger.error(
+            "{} Pricing feed error company_provider id={}: {}.".format(_LOG_PREFIX, company_provider_id, str(e))
+        )
+        raise
+
+    g = price_data.get("general") or []
+    if not g:
+        logger.warning("{} No General rows for company_provider id={}.".format(_LOG_PREFIX, company_provider_id))
+        return
+
+    m2b = _ensure_rough_country_brands_from_manufacturers(g)
+    pmap = _deduped_pricing_by_brand_sku_from_general(g, m2b)
+    if not pmap:
+        logger.warning("{} No pricing map for company_provider id={}.".format(_LOG_PREFIX, company_provider_id))
+        return
+
+    pairs = list(pmap.keys())
+    id_by_brand_sku: typing.Dict[typing.Tuple[int, str], int] = {}
+    chunk_size = 3000
+    for i in range(0, len(pairs), chunk_size):
+        chunk = pairs[i : i + chunk_size]
+        if not chunk:
+            continue
+        with connection.cursor() as cur:
+            cur.execute(
+                "SELECT id, brand_id, sku FROM rough_country_parts WHERE (brand_id, sku) IN %s",
+                (tuple(chunk),),
+            )
+            for pid, bid, psku in cur.fetchall():
+                id_by_brand_sku[(bid, psku)] = pid
+
+    pricing_to_upsert = []
+    for (bid, sku), pdata in pmap.items():
+        part_id = id_by_brand_sku.get((bid, sku))
+        if not part_id:
+            continue
+        pricing_to_upsert.append(
+            src_models.RoughCountryCompanyPricing(
+                part_id=part_id,
+                company=cp.company,
+                price=pdata.get("price"),
+                sale_price=pdata.get("sale_price"),
+                cost=pdata.get("cost"),
+                cnd_map=pdata.get("cnd_map"),
+                cnd_price=pdata.get("cnd_price"),
+            )
+        )
+    total_cp = 0
+    for j in range(0, len(pricing_to_upsert), RC_PRICING_UPSERT_BATCH):
+        batch = pricing_to_upsert[j : j + RC_PRICING_UPSERT_BATCH]
+        pgbulk.upsert(
+            src_models.RoughCountryCompanyPricing,
+            batch,
+            unique_fields=["part", "company"],
+            update_fields=["price", "sale_price", "cost", "cnd_map", "cnd_price", "updated_at"],
+            returning=False,
+        )
+        total_cp += len(batch)
+        connection.close()
+    logger.info(
+        "{} RoughCountryCompanyPricing upserted {} rows for company_provider id={}.".format(
+            _LOG_PREFIX, total_cp, company_provider_id,
+        )
+    )
