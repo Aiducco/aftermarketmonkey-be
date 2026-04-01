@@ -1235,3 +1235,106 @@ def fetch_and_save_meyer_catalog_and_inventory(force_download: bool = False) -> 
         logger.info("{} Upserted {} inventory overlays.".format(_LOG_PREFIX, len(overlay)))
 
     logger.info("{} Meyer ingest complete.".format(_LOG_PREFIX))
+
+
+def sync_meyer_company_pricing_for_company_provider(
+    company_provider_id: int,
+    force_download: bool = True,
+) -> None:
+    """
+    Download Meyer pricing CSV for one CompanyProviders row and upsert MeyerCompanyPricing.
+    Expects MeyerParts catalog to already exist for SKUs in the file.
+    """
+    cp = (
+        src_models.CompanyProviders.objects.filter(
+            id=company_provider_id,
+            provider__kind=src_enums.BrandProviderKind.MEYER.value,
+            provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
+        )
+        .select_related("company", "provider")
+        .first()
+    )
+    if not cp:
+        logger.warning(
+            "{} No active Meyer CompanyProviders id={}. Skipping.".format(_LOG_PREFIX, company_provider_id)
+        )
+        return
+
+    creds = dict(cp.credentials or {})
+    if not str(creds.get("local_pricing_path") or "").strip():
+        creds["local_pricing_path"] = "/tmp/meyer_pricing_company_{}.csv".format(cp.company_id)
+    try:
+        pc = meyer_client.MeyerSFTPClient(credentials=creds)
+    except ValueError as e:
+        logger.error("{} company_id={}: {}".format(_LOG_PREFIX, cp.company_id, str(e)))
+        raise
+    try:
+        company_pricing_path = pc.download_pricing_file(force_download=force_download)
+    except meyer_exceptions.MeyerException as e:
+        logger.error(
+            "{} Meyer pricing download error company_id={}: {}.".format(
+                _LOG_PREFIX, cp.company_id, str(e),
+            )
+        )
+        raise
+
+    company_records = _records_from_csv(company_pricing_path)
+    mfgs_c: typing.Set[str] = set()
+    for row in company_records:
+        m = _meyer_brand_key(row.get("MFG"))
+        if m:
+            mfgs_c.add(m)
+    brand_by_mfg = _brand_map_for_names(mfgs_c)
+    _ensure_meyer_brands_for_mfgs(mfgs_c, brand_by_mfg)
+    pmap = _meyer_pricing_map_from_records(company_records, brand_by_mfg)
+    if not pmap:
+        logger.warning("{} No pricing rows parsed for company_provider id={}.".format(_LOG_PREFIX, company_provider_id))
+        return
+
+    pairs = list(pmap.keys())
+    id_by_brand_sku: typing.Dict[typing.Tuple[int, str], int] = {}
+    chunk_size = 3000
+    for i in range(0, len(pairs), chunk_size):
+        chunk = pairs[i : i + chunk_size]
+        if not chunk:
+            continue
+        with connection.cursor() as cur:
+            cur.execute(
+                "SELECT id, brand_id, meyer_part FROM meyer_parts WHERE (brand_id, meyer_part) IN %s",
+                (tuple(chunk),),
+            )
+            for pid, bid, pn in cur.fetchall():
+                id_by_brand_sku[(bid, (pn or "").strip())] = pid
+
+    pricing_to_upsert: typing.List[src_models.MeyerCompanyPricing] = []
+    for (bid, sku), pdata in pmap.items():
+        part_id = id_by_brand_sku.get((bid, sku))
+        if not part_id:
+            continue
+        pricing_to_upsert.append(
+            src_models.MeyerCompanyPricing(
+                part_id=part_id,
+                company=cp.company,
+                jobber_price=pdata.get("jobber_price"),
+                cost=pdata.get("cost"),
+                core_charge=pdata.get("core_charge"),
+                map_price=pdata.get("map_price"),
+            )
+        )
+    batch_total = 0
+    for j in range(0, len(pricing_to_upsert), MEYER_PRICING_UPSERT_BATCH):
+        batch = pricing_to_upsert[j : j + MEYER_PRICING_UPSERT_BATCH]
+        pgbulk.upsert(
+            src_models.MeyerCompanyPricing,
+            batch,
+            unique_fields=["part", "company"],
+            update_fields=["jobber_price", "cost", "core_charge", "map_price", "updated_at"],
+            returning=False,
+        )
+        batch_total += len(batch)
+        connection.close()
+    logger.info(
+        "{} MeyerCompanyPricing upserted {} rows for company_provider id={}.".format(
+            _LOG_PREFIX, batch_total, company_provider_id,
+        )
+    )

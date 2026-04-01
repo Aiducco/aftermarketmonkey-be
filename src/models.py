@@ -990,6 +990,32 @@ class ProviderPartCompanyPricing(django_db_models.Model):
         unique_together = [["provider_part", "company"]]
 
 
+class IntegrationPricingSyncJob(django_db_models.Model):
+    """
+    Queue row processed by a cron management command: after integration credentials
+    are saved, enqueue one job per CompanyProviders to pull distributor company
+    pricing and fan out ProviderPartCompanyPricing for that company.
+    """
+    company_provider = django_db_models.ForeignKey(
+        CompanyProviders,
+        on_delete=django_db_models.CASCADE,
+        related_name="pricing_sync_jobs",
+    )
+    status = django_db_models.PositiveSmallIntegerField()
+    status_name = django_db_models.CharField(max_length=64)
+    message = django_db_models.TextField(null=True, blank=True)
+    error_message = django_db_models.TextField(null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+    started_at = django_db_models.DateTimeField(null=True, blank=True)
+    completed_at = django_db_models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "integration_pricing_sync_job"
+        ordering = ["id"]
+
+
 class ScheduledTaskExecution(django_db_models.Model):
     """
     Audit table for scheduled task / cron executions (e.g. Turn 14 items updates,

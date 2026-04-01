@@ -13,6 +13,7 @@ from django.db import transaction
 from src import constants as src_constants
 from src import enums as src_enums
 from src import models as src_models
+from src.integrations.services import integration_pricing_sync_jobs
 
 logger = logging.getLogger(__name__)
 
@@ -222,7 +223,7 @@ def _upsert_company_providers(company: src_models.Company, credentials: dict) ->
                 kind=src_enums.BrandProviderKind.TURN_14.value
             ).first()
             if provider:
-                src_models.CompanyProviders.objects.update_or_create(
+                cp, _ = src_models.CompanyProviders.objects.update_or_create(
                     company=company,
                     provider=provider,
                     defaults={
@@ -233,6 +234,7 @@ def _upsert_company_providers(company: src_models.Company, credentials: dict) ->
                         "primary": True,
                     },
                 )
+                integration_pricing_sync_jobs.enqueue_company_provider_pricing_sync(cp.id)
 
     # Keystone: kind=3 (KEYSTONE)
     if "keystone" in credentials:
@@ -242,7 +244,7 @@ def _upsert_company_providers(company: src_models.Company, credentials: dict) ->
                 kind=src_enums.BrandProviderKind.KEYSTONE.value
             ).first()
             if provider:
-                src_models.CompanyProviders.objects.update_or_create(
+                cp, _ = src_models.CompanyProviders.objects.update_or_create(
                     company=company,
                     provider=provider,
                     defaults={
@@ -253,6 +255,7 @@ def _upsert_company_providers(company: src_models.Company, credentials: dict) ->
                         "primary": False,
                     },
                 )
+                integration_pricing_sync_jobs.enqueue_company_provider_pricing_sync(cp.id)
 
     # Meyer: kind=6 (MEYER) — full SFTP settings stored in credentials (MeyerSFTPClient; no remote defaults)
     if "meyer" in credentials:
@@ -299,7 +302,7 @@ def _upsert_company_providers(company: src_models.Company, credentials: dict) ->
                     v = creds.get(opt)
                     if v is not None and str(v).strip():
                         cred_dict[opt] = str(v).strip()
-                src_models.CompanyProviders.objects.update_or_create(
+                cp, _ = src_models.CompanyProviders.objects.update_or_create(
                     company=company,
                     provider=provider,
                     defaults={
@@ -307,6 +310,7 @@ def _upsert_company_providers(company: src_models.Company, credentials: dict) ->
                         "primary": False,
                     },
                 )
+                integration_pricing_sync_jobs.enqueue_company_provider_pricing_sync(cp.id)
 
     # Wheel Pros: SFTP (same keys as WheelProsSFTPClient)
     if "wheelpros" in credentials:
@@ -325,7 +329,7 @@ def _upsert_company_providers(company: src_models.Company, credentials: dict) ->
                     v = creds.get(opt)
                     if v is not None and str(v).strip():
                         cred_dict[opt] = str(v).strip()
-                src_models.CompanyProviders.objects.update_or_create(
+                cp, _ = src_models.CompanyProviders.objects.update_or_create(
                     company=company,
                     provider=provider,
                     defaults={
@@ -333,6 +337,7 @@ def _upsert_company_providers(company: src_models.Company, credentials: dict) ->
                         "primary": False,
                     },
                 )
+                integration_pricing_sync_jobs.enqueue_company_provider_pricing_sync(cp.id)
 
 
 def get_onboarding_status(company_id: int) -> dict:

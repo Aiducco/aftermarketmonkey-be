@@ -5,6 +5,7 @@ from django.core.paginator import Paginator
 
 from src import constants as src_constants
 from src import models as src_models
+from src.integrations.services import integration_pricing_sync_jobs
 
 logger = logging.getLogger(__name__)
 
@@ -181,6 +182,9 @@ def connect_provider(
             credentials=creds,
             primary=False,
         )
+
+    if integration_pricing_sync_jobs.should_enqueue_pricing_sync(provider.kind):
+        integration_pricing_sync_jobs.enqueue_company_provider_pricing_sync(cp.id)
 
     return {
         "id": cp.id,

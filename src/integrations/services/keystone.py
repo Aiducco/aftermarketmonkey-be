@@ -842,3 +842,97 @@ def _build_keystone_company_pricing_instances(
             )
         )
     return instances
+
+
+def sync_keystone_catalog_and_company_pricing_for_company_provider(company_provider_id: int) -> None:
+    """
+    One company's Keystone CSV ingest: brands, parts, and KeystoneCompanyPricing (FTP credentials row).
+    """
+    company_provider = (
+        src_models.CompanyProviders.objects.filter(
+            id=company_provider_id,
+            provider__kind=src_enums.BrandProviderKind.KEYSTONE.value,
+            provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
+        )
+        .select_related("company")
+        .first()
+    )
+    if not company_provider:
+        logger.warning(
+            "{} No active Keystone CompanyProviders id={}. Skipping.".format(_LOG_PREFIX, company_provider_id)
+        )
+        return
+
+    company = company_provider.company
+    BATCH_SIZE = 1000
+    BATCH_DELAY_SECONDS = 0.5
+
+    try:
+        ftp_client = keystone_client.KeystoneFTPClient(credentials=company_provider.credentials)
+    except ValueError as e:
+        logger.error("{} Invalid Keystone credentials company={}: {}.".format(
+            _LOG_PREFIX, company.name, str(e),
+        ))
+        raise
+
+    try:
+        records = ftp_client.get_inventory_records()
+    except keystone_exceptions.KeystoneException as e:
+        logger.error("{} Keystone error company={}: {}.".format(_LOG_PREFIX, company.name, str(e)))
+        raise
+
+    if not records:
+        logger.warning("{} No inventory records company={}.".format(_LOG_PREFIX, company.name))
+        return
+
+    brand_data = {}
+    for row in records:
+        name = _clean_csv_value(row.get("VendorName"))
+        if name and name not in brand_data:
+            brand_data[name] = _clean_csv_value(row.get("AAIACode"))
+
+    if brand_data:
+        brand_instances = [
+            src_models.KeystoneBrand(
+                external_id=name,
+                name=name,
+                aaia_code=brand_data.get(name) or "",
+            )
+            for name in sorted(brand_data.keys())
+        ]
+        pgbulk.upsert(
+            src_models.KeystoneBrand,
+            brand_instances,
+            unique_fields=["external_id"],
+            update_fields=["name", "aaia_code", "updated_at"],
+            returning=False,
+        )
+        logger.info("{} Upserted {} Keystone brands (company={}).".format(
+            _LOG_PREFIX, len(brand_instances), company.name,
+        ))
+
+    keystone_brands = {
+        b.name: b
+        for b in src_models.KeystoneBrand.objects.filter(external_id__in=brand_data.keys())
+    }
+
+    part_instances = _transform_parts_data(records, keystone_brands, omit_pricing_for_parts=True)
+    if not part_instances:
+        logger.warning("{} No part instances company={}.".format(_LOG_PREFIX, company.name))
+        return
+
+    total_parts = _pgbulk_upsert_keystone_parts_batches(
+        part_instances, BATCH_SIZE, BATCH_DELAY_SECONDS
+    )
+    part_lookup = _vcpn_brand_id_lookup_for_records(records, keystone_brands)
+    pricing_instances = _build_keystone_company_pricing_instances(
+        records, keystone_brands, company, part_lookup,
+    )
+    total_pricing = _pgbulk_upsert_keystone_company_pricing_batches(
+        pricing_instances, BATCH_SIZE, BATCH_DELAY_SECONDS
+    )
+    logger.info(
+        "{} Keystone sync for company_provider id={}: parts upserts={}, company pricing upserts={}.".format(
+            _LOG_PREFIX, company_provider_id, total_parts, total_pricing,
+        )
+    )
