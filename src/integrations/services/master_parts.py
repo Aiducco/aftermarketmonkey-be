@@ -1816,7 +1816,9 @@ def sync_provider_inventory_from_meyer() -> None:
             break
 
         last_id = batch[-1]["id"]
-        to_upsert = []
+        # Last row per ProviderPart wins: same meyer_part SKU can exist on multiple MeyerParts (different brands)
+        # but maps to one ProviderPart — PostgreSQL rejects duplicate constrained keys in one INSERT.
+        inv_by_provider_part_id: typing.Dict[int, src_models.ProviderPartInventory] = {}
         for mp in batch:
             ext = mp.get("meyer_part")
             if isinstance(ext, str):
@@ -1833,18 +1835,17 @@ def sync_provider_inventory_from_meyer() -> None:
                     wh_total = int(float(avail))
                 except (TypeError, ValueError):
                     wh_total = 0
-            to_upsert.append(
-                src_models.ProviderPartInventory(
-                    provider_part=pp,
-                    warehouse_total_qty=wh_total,
-                    manufacturer_inventory=mp.get("mfg_qty_available"),
-                    manufacturer_esd=None,
-                    warehouse_availability=_meyer_warehouse_availability(mp),
-                    last_synced_at=now,
-                    updated_at=now,
-                )
+            inv_by_provider_part_id[pp.id] = src_models.ProviderPartInventory(
+                provider_part=pp,
+                warehouse_total_qty=wh_total,
+                manufacturer_inventory=mp.get("mfg_qty_available"),
+                manufacturer_esd=None,
+                warehouse_availability=_meyer_warehouse_availability(mp),
+                last_synced_at=now,
+                updated_at=now,
             )
 
+        to_upsert = list(inv_by_provider_part_id.values())
         if to_upsert:
             pgbulk.upsert(
                 src_models.ProviderPartInventory,
@@ -2126,7 +2127,8 @@ def sync_provider_pricing_from_meyer() -> None:
             c.id: c
             for c in src_models.Company.objects.filter(id__in=batch_company_ids)
         }
-        to_upsert = []
+        # Last row per (ProviderPart, Company): duplicate meyer_part across MeyerParts brands collapses to one pp.
+        pricing_by_pp_company: typing.Dict[typing.Tuple[int, int], src_models.ProviderPartCompanyPricing] = {}
         for row in batch:
             ext = row.get("part__meyer_part")
             if isinstance(ext, str):
@@ -2139,19 +2141,18 @@ def sync_provider_pricing_from_meyer() -> None:
             company = companies_by_id.get(row.get("company_id"))
             if not company:
                 continue
-            to_upsert.append(
-                src_models.ProviderPartCompanyPricing(
-                    provider_part=pp,
-                    company=company,
-                    cost=row.get("cost"),
-                    jobber_price=row.get("jobber_price"),
-                    map_price=row.get("map_price"),
-                    msrp=None,
-                    retail_price=None,
-                    last_synced_at=now,
-                )
+            pricing_by_pp_company[(pp.id, company.id)] = src_models.ProviderPartCompanyPricing(
+                provider_part=pp,
+                company=company,
+                cost=row.get("cost"),
+                jobber_price=row.get("jobber_price"),
+                map_price=row.get("map_price"),
+                msrp=None,
+                retail_price=None,
+                last_synced_at=now,
             )
 
+        to_upsert = list(pricing_by_pp_company.values())
         if to_upsert:
             pgbulk.upsert(
                 src_models.ProviderPartCompanyPricing,
