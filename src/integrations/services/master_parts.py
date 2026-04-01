@@ -991,10 +991,13 @@ def sync_provider_pricing_from_rough_country() -> None:
         logger.info("{} No Rough Country provider found.".format(_LOG_PREFIX))
         return
 
-    provider_parts = {
-        pp.provider_external_id: pp
-        for pp in src_models.ProviderPart.objects.filter(provider=rc_provider)
-    }
+    mappings = list(
+        src_models.BrandRoughCountryBrandMapping.objects.select_related("brand", "rough_country_brand")
+    )
+    rc_brand_to_brand = {m.rough_country_brand_id: m.brand for m in mappings}
+    if not rc_brand_to_brand:
+        logger.info("{} No BrandRoughCountryBrandMapping found. Nothing to price.".format(_LOG_PREFIX))
+        return
 
     now = timezone.now()
     total_upserted = 0
@@ -1027,10 +1030,34 @@ def sync_provider_pricing_from_rough_country() -> None:
             c.id: c
             for c in src_models.Company.objects.filter(id__in=batch_company_ids)
         }
+        master_keys = []
+        for row in batch:
+            brand = rc_brand_to_brand.get(row.get("part__brand_id"))
+            if not brand:
+                continue
+            sku = row.get("part__sku")
+            if isinstance(sku, str):
+                sku = sku.strip()
+            else:
+                sku = str(sku or "").strip()
+            if not sku:
+                continue
+            master_keys.append((brand.id, sku))
+        pp_by_key = _provider_parts_by_master_brand_and_part_number(rc_provider, master_keys)
+
         to_upsert = []
         for row in batch:
-            ext_id = _rough_country_provider_external_id(row["part__brand_id"], row["part__sku"])
-            provider_part = provider_parts.get(ext_id)
+            brand = rc_brand_to_brand.get(row.get("part__brand_id"))
+            if not brand:
+                continue
+            sku = row.get("part__sku")
+            if isinstance(sku, str):
+                sku = sku.strip()
+            else:
+                sku = str(sku or "").strip()
+            if not sku:
+                continue
+            provider_part = pp_by_key.get((brand.id, sku))
             if not provider_part:
                 continue
             company = companies_by_id.get(row.get("company_id"))
@@ -1092,6 +1119,171 @@ def _wheelpros_provider_part_lookup(wp_provider):
             if key not in by_brand_sku:
                 by_brand_sku[key] = pp
     return by_ext_id, by_brand_sku
+
+
+def _provider_parts_by_master_brand_and_part_number(
+    provider: src_models.Providers,
+    keys: typing.Collection[typing.Tuple[int, str]],
+) -> typing.Dict[typing.Tuple[int, str], src_models.ProviderPart]:
+    """
+    Map (internal Brands.id, MasterPart.part_number) -> ProviderPart for this distributor.
+    This is the join path sync_master_parts_from_* uses (unique_together master_part + provider).
+    """
+    out: typing.Dict[typing.Tuple[int, str], src_models.ProviderPart] = {}
+    normalized: typing.List[typing.Tuple[int, str]] = []
+    for b_id, pn in keys:
+        pn_s = (pn or "").strip() if pn is not None else ""
+        if not pn_s:
+            continue
+        normalized.append((int(b_id), pn_s))
+    if not normalized:
+        return out
+    uniq: typing.List[typing.Tuple[int, str]] = list(dict.fromkeys(normalized))
+    for i in range(0, len(uniq), WHEELPROS_LOOKUP_CHUNK):
+        chunk_list = uniq[i : i + WHEELPROS_LOOKUP_CHUNK]
+        chunk_set = set(chunk_list)
+        brand_ids = {b for b, _ in chunk_list}
+        part_numbers = {pn for _, pn in chunk_list}
+        for pp in (
+            src_models.ProviderPart.objects.filter(
+                provider=provider,
+                master_part__brand_id__in=brand_ids,
+                master_part__part_number__in=part_numbers,
+            ).select_related("master_part")
+        ):
+            mp = pp.master_part
+            if not mp:
+                continue
+            k = (mp.brand_id, (mp.part_number or "").strip())
+            if k in chunk_set and k not in out:
+                out[k] = pp
+    return out
+
+
+def _turn14_pricing_batch_external_id_to_master_keys(
+    batch: typing.List[typing.Dict],
+    t14_brand_to_brand: typing.Dict[int, src_models.Brands],
+    mapped_t14_brand_ids: typing.Set[int],
+) -> typing.Dict[str, typing.Tuple[int, str]]:
+    """
+    Turn14BrandPricing.external_id -> (internal brand id, MasterPart.part_number) via Turn14Items,
+    matching sync_master_parts_from_turn14 (mfr_part_number + BrandTurn14BrandMapping).
+    """
+    ext_ids_raw = []
+    for pr in batch:
+        eid = pr.get("external_id")
+        if eid is None or eid == "":
+            continue
+        ext_ids_raw.append(str(eid).strip())
+    if not ext_ids_raw:
+        return {}
+    ext_ids = list(dict.fromkeys(ext_ids_raw))
+    result: typing.Dict[str, typing.Tuple[int, str]] = {}
+    scan_chunk = 500
+    for i in range(0, len(ext_ids), scan_chunk):
+        part = ext_ids[i : i + scan_chunk]
+        for row in (
+            src_models.Turn14Items.objects.filter(
+                external_id__in=part,
+                brand_id__in=mapped_t14_brand_ids,
+            ).values("external_id", "brand_id", "mfr_part_number")
+        ):
+            brand = t14_brand_to_brand.get(row["brand_id"])
+            if not brand:
+                continue
+            pn = row.get("mfr_part_number") or ""
+            if isinstance(pn, str):
+                pn = pn.strip()
+            else:
+                pn = str(pn or "").strip()
+            if not pn:
+                continue
+            eid_key = str(row["external_id"]).strip()
+            result[eid_key] = (brand.id, pn)
+    return result
+
+
+def _meyer_company_pricing_batch_row_id_to_provider_part(
+    batch: typing.List[typing.Dict],
+    meyer_provider: src_models.Providers,
+    my_brand_to_brand: typing.Dict[int, src_models.Brands],
+) -> typing.Dict[int, src_models.ProviderPart]:
+    """
+    MeyerCompanyPricing row id -> ProviderPart using (brand, mfg_item_number) as in
+    sync_master_parts_from_meyer, with sku=meyer_part fallback on MasterPart.
+    """
+    row_id_to_pp: typing.Dict[int, src_models.ProviderPart] = {}
+    keys: typing.List[typing.Tuple[int, str]] = []
+    row_primary_key: typing.Dict[int, typing.Tuple[int, str]] = {}
+    sku_only_rows: typing.Dict[int, typing.Tuple[int, str]] = {}
+
+    for row in batch:
+        rid = row["id"]
+        brand = my_brand_to_brand.get(row.get("part__brand_id"))
+        if not brand:
+            continue
+        mfg = row.get("part__mfg_item_number")
+        if isinstance(mfg, str):
+            mfg = mfg.strip()
+        else:
+            mfg = str(mfg or "").strip()
+        mp_ext = row.get("part__meyer_part")
+        if isinstance(mp_ext, str):
+            mp_ext = mp_ext.strip()
+        else:
+            mp_ext = str(mp_ext or "").strip()
+        if mfg:
+            k = (brand.id, mfg)
+            keys.append(k)
+            row_primary_key[rid] = k
+        elif mp_ext:
+            sku_only_rows[rid] = (brand.id, mp_ext)
+
+    pp_by_key = _provider_parts_by_master_brand_and_part_number(meyer_provider, keys)
+    for rid, k in row_primary_key.items():
+        pp = pp_by_key.get(k)
+        if pp:
+            row_id_to_pp[rid] = pp
+
+    def _pp_via_master_sku(b_id: int, sku: str) -> typing.Optional[src_models.ProviderPart]:
+        mp = (
+            src_models.MasterPart.objects.filter(brand_id=b_id, sku=sku)
+            .only("id")
+            .first()
+        )
+        if not mp:
+            return None
+        return (
+            src_models.ProviderPart.objects.filter(
+                master_part_id=mp.id,
+                provider=meyer_provider,
+            )
+            .first()
+        )
+
+    for rid, (bid, sku) in sku_only_rows.items():
+        pp = _pp_via_master_sku(bid, sku)
+        if pp:
+            row_id_to_pp[rid] = pp
+
+    for rid, k in row_primary_key.items():
+        if rid in row_id_to_pp:
+            continue
+        row = next((r for r in batch if r["id"] == rid), None)
+        if not row:
+            continue
+        mp_ext = row.get("part__meyer_part")
+        if isinstance(mp_ext, str):
+            mp_ext = mp_ext.strip()
+        else:
+            mp_ext = str(mp_ext or "").strip()
+        if not mp_ext:
+            continue
+        pp = _pp_via_master_sku(k[0], mp_ext)
+        if pp:
+            row_id_to_pp[rid] = pp
+
+    return row_id_to_pp
 
 
 def sync_master_parts_from_wheelpros() -> None:
@@ -1427,7 +1619,7 @@ def sync_provider_inventory_from_wheelpros() -> None:
 def sync_provider_pricing_from_wheelpros() -> None:
     """
     Sync ProviderPartCompanyPricing from WheelProsCompanyPricing (per-company SFTP pricing).
-    Resolves ProviderPart by provider_external_id first, then by (brand_id, sku) to align with master parts lookup.
+    Resolves ProviderPart via (internal brand id, MasterPart.part_number) like sync_master_parts_from_wheelpros.
     """
     logger.info("{} Syncing provider pricing from WheelPros.".format(_LOG_PREFIX))
 
@@ -1438,7 +1630,13 @@ def sync_provider_pricing_from_wheelpros() -> None:
         logger.info("{} No WheelPros provider found.".format(_LOG_PREFIX))
         return
 
-    provider_parts_by_ext_id, provider_parts_by_brand_sku = _wheelpros_provider_part_lookup(wp_provider)
+    mappings = list(
+        src_models.BrandWheelProsBrandMapping.objects.select_related("brand", "wheelpros_brand")
+    )
+    wp_brand_to_brand = {m.wheelpros_brand_id: m.brand for m in mappings}
+    if not wp_brand_to_brand:
+        logger.info("{} No BrandWheelProsBrandMapping found. Nothing to price.".format(_LOG_PREFIX))
+        return
 
     now = timezone.now()
     total_upserted = 0
@@ -1468,15 +1666,26 @@ def sync_provider_pricing_from_wheelpros() -> None:
             c.id: c
             for c in src_models.Company.objects.filter(id__in=batch_company_ids)
         }
-        to_upsert = []
+        master_keys = []
         for row in batch:
+            wb = wp_brand_to_brand.get(row.get("part__brand_id"))
+            if not wb:
+                continue
             part_number = (row.get("part__part_number") or "").strip()
             if not part_number:
                 continue
-            ext_id = _wheelpros_provider_external_id(row["part__brand_id"], part_number)
-            provider_part = provider_parts_by_ext_id.get(ext_id) or provider_parts_by_brand_sku.get(
-                (row["part__brand_id"], part_number)
-            )
+            master_keys.append((wb.id, part_number))
+        pp_by_key = _provider_parts_by_master_brand_and_part_number(wp_provider, master_keys)
+
+        to_upsert = []
+        for row in batch:
+            wb = wp_brand_to_brand.get(row.get("part__brand_id"))
+            if not wb:
+                continue
+            part_number = (row.get("part__part_number") or "").strip()
+            if not part_number:
+                continue
+            provider_part = pp_by_key.get((wb.id, part_number))
             if not provider_part:
                 continue
             company = companies_by_id.get(row.get("company_id"))
@@ -1527,10 +1736,14 @@ def sync_provider_pricing_from_turn14_for_company(company_id: int) -> None:
         logger.info("{} No Turn14 provider found.".format(_LOG_PREFIX))
         return
 
-    provider_parts = {
-        pp.provider_external_id: pp
-        for pp in src_models.ProviderPart.objects.filter(provider=turn14_provider)
-    }
+    mappings = list(
+        src_models.BrandTurn14BrandMapping.objects.select_related("brand", "turn14_brand")
+    )
+    t14_brand_to_brand = {m.turn14_brand_id: m.brand for m in mappings}
+    mapped_t14_brand_ids = set(t14_brand_to_brand.keys())
+    if not t14_brand_to_brand:
+        logger.info("{} No BrandTurn14BrandMapping found. Nothing to price.".format(_LOG_PREFIX))
+        return
 
     now = timezone.now()
     total_upserted = 0
@@ -1553,9 +1766,18 @@ def sync_provider_pricing_from_turn14_for_company(company_id: int) -> None:
             c.id: c
             for c in src_models.Company.objects.filter(id__in=batch_company_ids)
         }
+        ext_to_key = _turn14_pricing_batch_external_id_to_master_keys(
+            batch, t14_brand_to_brand, mapped_t14_brand_ids
+        )
+        pp_by_key = _provider_parts_by_master_brand_and_part_number(turn14_provider, ext_to_key.values())
+
         to_upsert = []
         for pr in batch:
-            provider_part = provider_parts.get(pr["external_id"])
+            eid = str(pr.get("external_id") or "").strip()
+            key = ext_to_key.get(eid)
+            if not key:
+                continue
+            provider_part = pp_by_key.get(key)
             if not provider_part:
                 continue
             comp_id = pr.get("company_id")
@@ -1608,10 +1830,13 @@ def sync_provider_pricing_from_keystone_for_company(company_id: int) -> None:
         logger.info("{} No Keystone provider found.".format(_LOG_PREFIX))
         return
 
-    provider_parts = {
-        pp.provider_external_id: pp
-        for pp in src_models.ProviderPart.objects.filter(provider=keystone_provider)
-    }
+    mappings = list(
+        src_models.BrandKeystoneBrandMapping.objects.select_related("brand", "keystone_brand")
+    )
+    ks_brand_to_brand = {m.keystone_brand_id: m.brand for m in mappings}
+    if not ks_brand_to_brand:
+        logger.info("{} No BrandKeystoneBrandMapping found. Nothing to price.".format(_LOG_PREFIX))
+        return
 
     now = timezone.now()
     total_upserted = 0
@@ -1623,7 +1848,14 @@ def sync_provider_pricing_from_keystone_for_company(company_id: int) -> None:
         batch = list(
             src_models.KeystoneCompanyPricing.objects.filter(id__gt=last_id, company_id=company_id)
             .order_by("id")
-            .values("id", "company_id", "cost", "jobber_price", "part__vcpn")[:BATCH_SIZE_PRICING]
+            .values(
+                "id",
+                "company_id",
+                "cost",
+                "jobber_price",
+                "part__brand_id",
+                "part__manufacturer_part_no",
+            )[:BATCH_SIZE_PRICING]
         )
         if not batch:
             break
@@ -1634,10 +1866,34 @@ def sync_provider_pricing_from_keystone_for_company(company_id: int) -> None:
             c.id: c
             for c in src_models.Company.objects.filter(id__in=batch_company_ids)
         }
+        master_keys = []
+        for row in batch:
+            brand = ks_brand_to_brand.get(row.get("part__brand_id"))
+            if not brand:
+                continue
+            pn = row.get("part__manufacturer_part_no") or ""
+            if isinstance(pn, str):
+                pn = pn.strip()
+            else:
+                pn = str(pn or "").strip()
+            if not pn:
+                continue
+            master_keys.append((brand.id, pn))
+        pp_by_key = _provider_parts_by_master_brand_and_part_number(keystone_provider, master_keys)
+
         to_upsert = []
         for row in batch:
-            vcpn = row.get("part__vcpn")
-            provider_part = provider_parts.get(vcpn) if vcpn else None
+            brand = ks_brand_to_brand.get(row.get("part__brand_id"))
+            if not brand:
+                continue
+            pn = row.get("part__manufacturer_part_no") or ""
+            if isinstance(pn, str):
+                pn = pn.strip()
+            else:
+                pn = str(pn or "").strip()
+            if not pn:
+                continue
+            provider_part = pp_by_key.get((brand.id, pn))
             if not provider_part:
                 continue
             company = companies_by_id.get(row.get("company_id"))
@@ -1687,10 +1943,13 @@ def sync_provider_pricing_from_meyer_for_company(company_id: int) -> None:
         logger.info("{} No Meyer provider found.".format(_LOG_PREFIX))
         return
 
-    provider_parts = {
-        pp.provider_external_id: pp
-        for pp in src_models.ProviderPart.objects.filter(provider=meyer_provider)
-    }
+    mappings = list(
+        src_models.BrandMeyerBrandMapping.objects.select_related("brand", "meyer_brand")
+    )
+    my_brand_to_brand = {m.meyer_brand_id: m.brand for m in mappings}
+    if not my_brand_to_brand:
+        logger.info("{} No BrandMeyerBrandMapping found. Nothing to price.".format(_LOG_PREFIX))
+        return
 
     now = timezone.now()
     total_upserted = 0
@@ -1708,7 +1967,9 @@ def sync_provider_pricing_from_meyer_for_company(company_id: int) -> None:
                 "cost",
                 "jobber_price",
                 "map_price",
+                "part__brand_id",
                 "part__meyer_part",
+                "part__mfg_item_number",
             )[:BATCH_SIZE_PRICING]
         )
         if not batch:
@@ -1720,14 +1981,12 @@ def sync_provider_pricing_from_meyer_for_company(company_id: int) -> None:
             c.id: c
             for c in src_models.Company.objects.filter(id__in=batch_company_ids)
         }
+        row_id_to_pp = _meyer_company_pricing_batch_row_id_to_provider_part(
+            batch, meyer_provider, my_brand_to_brand
+        )
         pricing_by_pp_company: typing.Dict[typing.Tuple[int, int], src_models.ProviderPartCompanyPricing] = {}
         for row in batch:
-            ext = row.get("part__meyer_part")
-            if isinstance(ext, str):
-                ext = ext.strip()
-            else:
-                ext = str(ext or "").strip()
-            pp = provider_parts.get(ext)
+            pp = row_id_to_pp.get(row["id"])
             if not pp:
                 continue
             company = companies_by_id.get(row.get("company_id"))
@@ -1776,10 +2035,13 @@ def sync_provider_pricing_from_rough_country_for_company(company_id: int) -> Non
         logger.info("{} No Rough Country provider found.".format(_LOG_PREFIX))
         return
 
-    provider_parts = {
-        pp.provider_external_id: pp
-        for pp in src_models.ProviderPart.objects.filter(provider=rc_provider)
-    }
+    mappings = list(
+        src_models.BrandRoughCountryBrandMapping.objects.select_related("brand", "rough_country_brand")
+    )
+    rc_brand_to_brand = {m.rough_country_brand_id: m.brand for m in mappings}
+    if not rc_brand_to_brand:
+        logger.info("{} No BrandRoughCountryBrandMapping found. Nothing to price.".format(_LOG_PREFIX))
+        return
 
     now = timezone.now()
     total_upserted = 0
@@ -1812,10 +2074,34 @@ def sync_provider_pricing_from_rough_country_for_company(company_id: int) -> Non
             c.id: c
             for c in src_models.Company.objects.filter(id__in=batch_company_ids)
         }
+        master_keys = []
+        for row in batch:
+            brand = rc_brand_to_brand.get(row.get("part__brand_id"))
+            if not brand:
+                continue
+            sku = row.get("part__sku")
+            if isinstance(sku, str):
+                sku = sku.strip()
+            else:
+                sku = str(sku or "").strip()
+            if not sku:
+                continue
+            master_keys.append((brand.id, sku))
+        pp_by_key = _provider_parts_by_master_brand_and_part_number(rc_provider, master_keys)
+
         to_upsert = []
         for row in batch:
-            ext_id = _rough_country_provider_external_id(row["part__brand_id"], row["part__sku"])
-            provider_part = provider_parts.get(ext_id)
+            brand = rc_brand_to_brand.get(row.get("part__brand_id"))
+            if not brand:
+                continue
+            sku = row.get("part__sku")
+            if isinstance(sku, str):
+                sku = sku.strip()
+            else:
+                sku = str(sku or "").strip()
+            if not sku:
+                continue
+            provider_part = pp_by_key.get((brand.id, sku))
             if not provider_part:
                 continue
             company = companies_by_id.get(row.get("company_id"))
@@ -1868,7 +2154,13 @@ def sync_provider_pricing_from_wheelpros_for_company(company_id: int) -> None:
         logger.info("{} No WheelPros provider found.".format(_LOG_PREFIX))
         return
 
-    provider_parts_by_ext_id, provider_parts_by_brand_sku = _wheelpros_provider_part_lookup(wp_provider)
+    mappings = list(
+        src_models.BrandWheelProsBrandMapping.objects.select_related("brand", "wheelpros_brand")
+    )
+    wp_brand_to_brand = {m.wheelpros_brand_id: m.brand for m in mappings}
+    if not wp_brand_to_brand:
+        logger.info("{} No BrandWheelProsBrandMapping found. Nothing to price.".format(_LOG_PREFIX))
+        return
 
     now = timezone.now()
     total_upserted = 0
@@ -1898,15 +2190,26 @@ def sync_provider_pricing_from_wheelpros_for_company(company_id: int) -> None:
             c.id: c
             for c in src_models.Company.objects.filter(id__in=batch_company_ids)
         }
-        to_upsert = []
+        master_keys = []
         for row in batch:
+            wb = wp_brand_to_brand.get(row.get("part__brand_id"))
+            if not wb:
+                continue
             part_number = (row.get("part__part_number") or "").strip()
             if not part_number:
                 continue
-            ext_id = _wheelpros_provider_external_id(row["part__brand_id"], part_number)
-            provider_part = provider_parts_by_ext_id.get(ext_id) or provider_parts_by_brand_sku.get(
-                (row["part__brand_id"], part_number)
-            )
+            master_keys.append((wb.id, part_number))
+        pp_by_key = _provider_parts_by_master_brand_and_part_number(wp_provider, master_keys)
+
+        to_upsert = []
+        for row in batch:
+            wb = wp_brand_to_brand.get(row.get("part__brand_id"))
+            if not wb:
+                continue
+            part_number = (row.get("part__part_number") or "").strip()
+            if not part_number:
+                continue
+            provider_part = pp_by_key.get((wb.id, part_number))
             if not provider_part:
                 continue
             company = companies_by_id.get(row.get("company_id"))
@@ -2364,10 +2667,14 @@ def sync_provider_pricing_from_turn14() -> None:
         logger.info("{} No Turn14 provider found.".format(_LOG_PREFIX))
         return
 
-    provider_parts = {
-        pp.provider_external_id: pp
-        for pp in src_models.ProviderPart.objects.filter(provider=turn14_provider)
-    }
+    mappings = list(
+        src_models.BrandTurn14BrandMapping.objects.select_related("brand", "turn14_brand")
+    )
+    t14_brand_to_brand = {m.turn14_brand_id: m.brand for m in mappings}
+    mapped_t14_brand_ids = set(t14_brand_to_brand.keys())
+    if not t14_brand_to_brand:
+        logger.info("{} No BrandTurn14BrandMapping found. Nothing to price.".format(_LOG_PREFIX))
+        return
 
     now = timezone.now()
     total_upserted = 0
@@ -2390,9 +2697,18 @@ def sync_provider_pricing_from_turn14() -> None:
             c.id: c
             for c in src_models.Company.objects.filter(id__in=batch_company_ids)
         }
+        ext_to_key = _turn14_pricing_batch_external_id_to_master_keys(
+            batch, t14_brand_to_brand, mapped_t14_brand_ids
+        )
+        pp_by_key = _provider_parts_by_master_brand_and_part_number(turn14_provider, ext_to_key.values())
+
         to_upsert = []
         for pr in batch:
-            provider_part = provider_parts.get(pr["external_id"])
+            eid = str(pr.get("external_id") or "").strip()
+            key = ext_to_key.get(eid)
+            if not key:
+                continue
+            provider_part = pp_by_key.get(key)
             if not provider_part:
                 continue
             company_id = pr.get("company_id")
@@ -2446,10 +2762,13 @@ def sync_provider_pricing_from_keystone() -> None:
         logger.info("{} No Keystone provider found.".format(_LOG_PREFIX))
         return
 
-    provider_parts = {
-        pp.provider_external_id: pp
-        for pp in src_models.ProviderPart.objects.filter(provider=keystone_provider)
-    }
+    mappings = list(
+        src_models.BrandKeystoneBrandMapping.objects.select_related("brand", "keystone_brand")
+    )
+    ks_brand_to_brand = {m.keystone_brand_id: m.brand for m in mappings}
+    if not ks_brand_to_brand:
+        logger.info("{} No BrandKeystoneBrandMapping found. Nothing to price.".format(_LOG_PREFIX))
+        return
 
     now = timezone.now()
     total_upserted = 0
@@ -2461,7 +2780,14 @@ def sync_provider_pricing_from_keystone() -> None:
         batch = list(
             src_models.KeystoneCompanyPricing.objects.filter(id__gt=last_id)
             .order_by("id")
-            .values("id", "company_id", "cost", "jobber_price", "part__vcpn")[:BATCH_SIZE_PRICING]
+            .values(
+                "id",
+                "company_id",
+                "cost",
+                "jobber_price",
+                "part__brand_id",
+                "part__manufacturer_part_no",
+            )[:BATCH_SIZE_PRICING]
         )
         if not batch:
             break
@@ -2472,10 +2798,34 @@ def sync_provider_pricing_from_keystone() -> None:
             c.id: c
             for c in src_models.Company.objects.filter(id__in=batch_company_ids)
         }
+        master_keys = []
+        for row in batch:
+            brand = ks_brand_to_brand.get(row.get("part__brand_id"))
+            if not brand:
+                continue
+            pn = row.get("part__manufacturer_part_no") or ""
+            if isinstance(pn, str):
+                pn = pn.strip()
+            else:
+                pn = str(pn or "").strip()
+            if not pn:
+                continue
+            master_keys.append((brand.id, pn))
+        pp_by_key = _provider_parts_by_master_brand_and_part_number(keystone_provider, master_keys)
+
         to_upsert = []
         for row in batch:
-            vcpn = row.get("part__vcpn")
-            provider_part = provider_parts.get(vcpn) if vcpn else None
+            brand = ks_brand_to_brand.get(row.get("part__brand_id"))
+            if not brand:
+                continue
+            pn = row.get("part__manufacturer_part_no") or ""
+            if isinstance(pn, str):
+                pn = pn.strip()
+            else:
+                pn = str(pn or "").strip()
+            if not pn:
+                continue
+            provider_part = pp_by_key.get((brand.id, pn))
             if not provider_part:
                 continue
             company = companies_by_id.get(row.get("company_id"))
@@ -2526,10 +2876,13 @@ def sync_provider_pricing_from_meyer() -> None:
         logger.info("{} No Meyer provider found.".format(_LOG_PREFIX))
         return
 
-    provider_parts = {
-        pp.provider_external_id: pp
-        for pp in src_models.ProviderPart.objects.filter(provider=meyer_provider)
-    }
+    mappings = list(
+        src_models.BrandMeyerBrandMapping.objects.select_related("brand", "meyer_brand")
+    )
+    my_brand_to_brand = {m.meyer_brand_id: m.brand for m in mappings}
+    if not my_brand_to_brand:
+        logger.info("{} No BrandMeyerBrandMapping found. Nothing to price.".format(_LOG_PREFIX))
+        return
 
     now = timezone.now()
     total_upserted = 0
@@ -2547,7 +2900,9 @@ def sync_provider_pricing_from_meyer() -> None:
                 "cost",
                 "jobber_price",
                 "map_price",
+                "part__brand_id",
                 "part__meyer_part",
+                "part__mfg_item_number",
             )[:BATCH_SIZE_PRICING]
         )
         if not batch:
@@ -2559,15 +2914,12 @@ def sync_provider_pricing_from_meyer() -> None:
             c.id: c
             for c in src_models.Company.objects.filter(id__in=batch_company_ids)
         }
-        # Last row per (ProviderPart, Company): duplicate meyer_part across MeyerParts brands collapses to one pp.
+        row_id_to_pp = _meyer_company_pricing_batch_row_id_to_provider_part(
+            batch, meyer_provider, my_brand_to_brand
+        )
         pricing_by_pp_company: typing.Dict[typing.Tuple[int, int], src_models.ProviderPartCompanyPricing] = {}
         for row in batch:
-            ext = row.get("part__meyer_part")
-            if isinstance(ext, str):
-                ext = ext.strip()
-            else:
-                ext = str(ext or "").strip()
-            pp = provider_parts.get(ext)
+            pp = row_id_to_pp.get(row["id"])
             if not pp:
                 continue
             company = companies_by_id.get(row.get("company_id"))
