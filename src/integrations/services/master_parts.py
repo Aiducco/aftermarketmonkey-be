@@ -2742,15 +2742,36 @@ def sync_provider_inventory_from_keystone() -> None:
     logger.info("{} Synced {} Keystone inventory records total.".format(_LOG_PREFIX, total_upserted))
 
 
-def _meyer_warehouse_availability(row: typing.Dict) -> typing.Optional[typing.Dict]:
-    out = {}
-    if row.get("is_stocking") is not None:
-        out["stocking"] = bool(row.get("is_stocking"))
-    if row.get("is_special_order") is not None:
-        out["special_order"] = bool(row.get("is_special_order"))
-    if row.get("inventory_ltl") is not None:
-        out["ltl"] = row.get("inventory_ltl")
-    return out if out else None
+def _meyer_warehouse_availability(row: typing.Dict) -> typing.Dict:
+    """Meyer inventory flags + quantities for ProviderPartInventory.warehouse_availability JSON."""
+    inv = 0
+    avail = row.get("available_qty")
+    if avail is not None:
+        try:
+            inv = int(float(avail))
+        except (TypeError, ValueError):
+            inv = 0
+    mfg_out = 0
+    mfg_inv = row.get("mfg_qty_available")
+    if mfg_inv is not None:
+        try:
+            mfg_out = int(mfg_inv)
+        except (TypeError, ValueError):
+            mfg_out = 0
+    ltl_out = 0
+    inv_ltl = row.get("inventory_ltl")
+    if inv_ltl is not None:
+        try:
+            ltl_out = int(inv_ltl)
+        except (TypeError, ValueError):
+            ltl_out = 0
+    return {
+        "inventory": inv,
+        "manufacturer_inventory": mfg_out,
+        "ltl_inventory": ltl_out,
+        "stocking": bool(row.get("is_stocking")),
+        "special_order": bool(row.get("is_special_order")),
+    }
 
 
 def sync_provider_inventory_from_meyer() -> None:
