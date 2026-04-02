@@ -33,6 +33,25 @@ _LOG_PREFIX = "[WHEELPROS-SERVICES]"
 WP_PRICING_UPSERT_BATCH = 2000
 
 
+def _dedupe_wheelpros_part_instances(
+    parts: typing.List[src_models.WheelProsPart],
+) -> typing.List[src_models.WheelProsPart]:
+    """
+    One instance per (brand_id, part_number), last wins.
+    Avoids PostgreSQL: ON CONFLICT DO UPDATE cannot affect row a second time.
+    """
+    by_key: typing.Dict[typing.Tuple[int, str], src_models.WheelProsPart] = {}
+    for p in parts:
+        bid = p.brand_id
+        if bid is None and p.brand is not None:
+            bid = p.brand.pk
+        pn = (p.part_number or "").strip()
+        if not bid or not pn:
+            continue
+        by_key[(int(bid), pn)] = p
+    return list(by_key.values())
+
+
 def _normalize_wheelpros_brand_key(raw: typing.Optional[str]) -> str:
     return (raw or "").strip().upper()
 
@@ -643,7 +662,7 @@ def fetch_and_save_wheelpros(
             continue
         seen_by_key[(brand.id, part_number)] = _row_to_wheelpros_part(row, brand, include_pricing=False)
 
-    part_instances = list(seen_by_key.values())
+    part_instances = _dedupe_wheelpros_part_instances(list(seen_by_key.values()))
     if not part_instances:
         logger.warning("{} No WheelPros part instances created.".format(_LOG_PREFIX))
         return
@@ -729,19 +748,22 @@ def fetch_and_save_wheelpros(
                 )
                 raise
             pmap = _wheelpros_pricing_map_from_records(price_records, brand_by_external)
-            pricing_to_upsert = []
+            # Collapse by catalog part_id so one INSERT row per (part, company); last pmap row wins.
+            pricing_by_part_id: typing.Dict[int, typing.Dict[str, typing.Any]] = {}
             for (bid, pn), pdata in pmap.items():
                 part_id = id_by_brand_pn.get((bid, pn))
                 if not part_id:
                     continue
-                pricing_to_upsert.append(
-                    src_models.WheelProsCompanyPricing(
-                        part_id=part_id,
-                        company=cp.company,
-                        msrp_usd=pdata.get("msrp_usd"),
-                        map_usd=pdata.get("map_usd"),
-                    )
+                pricing_by_part_id[int(part_id)] = pdata
+            pricing_to_upsert = [
+                src_models.WheelProsCompanyPricing(
+                    part_id=pid,
+                    company=cp.company,
+                    msrp_usd=pdata.get("msrp_usd"),
+                    map_usd=pdata.get("map_usd"),
                 )
+                for pid, pdata in pricing_by_part_id.items()
+            ]
             batch_total = 0
             for j in range(0, len(pricing_to_upsert), WP_PRICING_UPSERT_BATCH):
                 batch = pricing_to_upsert[j : j + WP_PRICING_UPSERT_BATCH]
@@ -869,19 +891,21 @@ def sync_wheelpros_company_pricing_for_company_provider(
                 for pid, bid, pn in cur.fetchall():
                     id_by_brand_pn[(bid, (pn or "").strip())] = pid
 
-        pricing_to_upsert = []
+        pricing_by_part_id: typing.Dict[int, typing.Dict[str, typing.Any]] = {}
         for (bid, pn), pdata in pmap.items():
             part_id = id_by_brand_pn.get((bid, pn))
             if not part_id:
                 continue
-            pricing_to_upsert.append(
-                src_models.WheelProsCompanyPricing(
-                    part_id=part_id,
-                    company=cp.company,
-                    msrp_usd=pdata.get("msrp_usd"),
-                    map_usd=pdata.get("map_usd"),
-                )
+            pricing_by_part_id[int(part_id)] = pdata
+        pricing_to_upsert = [
+            src_models.WheelProsCompanyPricing(
+                part_id=pid,
+                company=cp.company,
+                msrp_usd=pdata.get("msrp_usd"),
+                map_usd=pdata.get("map_usd"),
             )
+            for pid, pdata in pricing_by_part_id.items()
+        ]
         batch_total = 0
         for j in range(0, len(pricing_to_upsert), WP_PRICING_UPSERT_BATCH):
             batch = pricing_to_upsert[j : j + WP_PRICING_UPSERT_BATCH]

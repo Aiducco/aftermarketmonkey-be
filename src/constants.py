@@ -43,6 +43,18 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketmonkey.com/uploads/t14_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["client_id", "client_secret"],
+        "installation_instructions_html": (
+            "<p>Turn 14 connections use OAuth2. Your <strong>client ID</strong> and <strong>client secret</strong> "
+            "are shown on Turn 14's API settings page.</p>"
+            "<ul>"
+            "<li>Sign in to your Turn 14 account and open "
+            "<a href=\"https://www.turn14.com/api_settings.php\" target=\"_blank\" rel=\"noopener noreferrer\">"
+            "https://www.turn14.com/api_settings.php</a>.</li>"
+            "<li>Copy the <strong>client ID</strong> and <strong>client secret</strong> from that page.</li>"
+            "<li>Paste them into the fields below and save. aftermarketmonkey uses them only to call Turn 14 on your behalf.</li>"
+            "</ul>"
+            "<p>If you cannot access that page or the credentials are missing, contact Turn 14 support or your account manager.</p>"
+        ),
     },
     {
         "kind": enums.BrandProviderKind.KEYSTONE,
@@ -51,44 +63,85 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketmonkey.com/uploads/keystone.png",
         "category": "Distributors",
         "connection_required_fields": ["ftp_user", "ftp_password"],
+        "installation_instructions_html": (
+            "<p><strong>Keystone</strong> data is loaded from their FTP inventory feed using your account credentials.</p>"
+            "<ol>"
+            "<li>Obtain your Keystone FTP <strong>username</strong> and <strong>password</strong> "
+            "(from Keystone onboarding or your rep).</li>"
+            "<li>Enter them exactly as provided—no <code>ftp://</code> prefix in the username field.</li>"
+            "<li>Save the connection. We will pull inventory and pricing from the standard Keystone CSV layouts.</li>"
+            "</ol>"
+        ),
     },
     {
         "kind": enums.BrandProviderKind.ROUGH_COUNTRY,
         "name": "Rough Country",
         "description": (
-            "Sync parts catalog, pricing, and vehicle fitment from Rough Country jobber Excel. "
-            "Each company supplies feed_url; mark one connection primary for shared catalog/fitment."
+            "Sync parts catalog, pricing, and vehicle fitment from Rough Country via jobber Excel feed."
         ),
         "icon_url": "https://api.aftermarketmonkey.com/uploads/rough_country.png",
         "category": "Distributors",
         "connection_required_fields": [ROUGH_COUNTRY_CREDENTIALS_FEED_URL],
+        "installation_instructions_html": (
+            "<p><strong>Rough Country</strong> uses a downloadable Excel jobber feed URL per dealer account.</p>"
+            "<ol>"
+            "<li>In your Rough Country jobber portal, <strong>locate the feed</strong> (or download link) for "
+            "the full catalog (General, Fitment, Discontinued). Copy the <strong>full HTTPS URL</strong>—the "
+            "complete link starting with <code>https://</code>.</li>"
+            "<li>Paste that URL into <strong>feed_url</strong> below and save the connection.</li>"
+            "</ol>"
+        ),
     },
     {
         "kind": enums.BrandProviderKind.WHEELPROS,
         "name": "Wheel Pros",
-        "description": "Sync wheels, tires, and accessories inventory and pricing from WheelPros via SFTP.",
+        "description": (
+            "Sync wheels, tires, and accessories inventory and pricing from WheelPros via SFTP."
+        ),
         "icon_url": "https://api.aftermarketmonkey.com/uploads/wheel_pros_logo.png",
         "category": "Distributors",
-        "connection_required_fields": ["sftp_server", "sftp_user", "sftp_password"],
+        "connection_required_fields": ["sftp_user", "sftp_password"],
         # Remote CSV path per feed (wheel/tire/accessories); defaults in settings if omitted
-        "connection_optional_fields": ["sftp_port", "sftp_path"],
+        "connection_optional_fields": ["sftp_path"],
+        "installation_instructions_html": (
+            "<p><strong>Wheel Pros</strong> inventory and pricing CSVs (wheels, tires, accessories) are on Wheel "
+            "Pros&rsquo; SFTP server (<code>sftp.wheelpros.com</code>, port 22). AftermarketMonkey connects there "
+            "automatically; you only enter the account credentials Wheel Pros gives you.</p>"
+            "<ol>"
+            "<li>Request your SFTP <strong>username</strong> and <strong>password</strong> from Wheel Pros.</li>"
+            "<li>Enter <strong>sftp_user</strong> and <strong>sftp_password</strong> below. If your agreement uses "
+            "non-default remote paths, set optional <strong>sftp_path</strong>; otherwise defaults apply per feed.</li>"
+            "<li>Save the connection. Company-specific pricing is read from SFTP after catalog sync.</li>"
+            "</ol>"
+        ),
     },
     {
         "kind": enums.BrandProviderKind.MEYER,
         "name": "Meyer",
-        "description": "Sync pricing and inventory from Meyer Distributing via SFTP (Meyer Pricing + Meyer Inventory files).",
+        "description": (
+            "Sync Meyer pricing and inventory from AftermarketMonkey's SFTP relay (Meyer Pricing + Meyer Inventory CSVs)."
+        ),
         "icon_url": "https://api.aftermarketmonkey.com/uploads/meyer_logo.png",
         "category": "Distributors",
-        "connection_required_fields": [
-            "sftp_server",
-            "sftp_port",
-            "sftp_user",
-            "sftp_password",
-            "sftp_directory",
-            "pricing_remote_file",
-            "inventory_remote_file",
-        ],
-        "connection_optional_fields": ["local_pricing_path", "local_inventory_path"],
+        "connection_required_fields": ["sftp_user", "sftp_password"],
+        "connection_optional_fields": [],
+        "installation_instructions_html": (
+            "<p>Email <a href=\"mailto:info@aftermarketmonkey.com\">info@aftermarketmonkey.com</a> so we can "
+            "create a unique SFTP account for you and send a <strong>username</strong> and <strong>password</strong>. "
+            "Meyer Distributing delivers the data feed to AftermarketMonkey&rsquo;s SFTP relay; ask your Meyer account "
+            "representative to set up the feed to connect to <strong>our</strong> SFTP endpoint using the details below.</p>"
+            "<p><strong>Endpoint for your Meyer rep</strong></p>"
+            "<ul>"
+            "<li><strong>SFTP:</strong> <code>54.145.82.238</code></li>"
+            "<li><strong>Port:</strong> <code>22</code></li>"
+            "<li><strong>Folder:</strong> <code>uploads</code></li>"
+            "<li><strong>Files:</strong> <code>Meyer Pricing.csv</code>, <code>Meyer Inventory.csv</code></li>"
+            "<li><strong>User / password:</strong> we provide these after you email us</li>"
+            "</ul>"
+            "<p>When you have your login, enter <strong>sftp_user</strong> and <strong>sftp_password</strong> below "
+            "and save the connection. For help, contact "
+            "<a href=\"mailto:info@aftermarketmonkey.com\">info@aftermarketmonkey.com</a>.</p>"
+        ),
     },
 ]
 

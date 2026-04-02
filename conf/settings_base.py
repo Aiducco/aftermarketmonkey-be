@@ -228,7 +228,8 @@ STRIPE_PLAN_CURRENCIES = {
     "growth": "usd",
 }
 
-# WheelPros SFTP feed (wheelInvPriceData.csv). Credentials via env or CompanyProviders.credentials.
+# WheelPros SFTP: host/port for all connections (override via env). Per-company user/password in
+# CompanyProviders.credentials; optional WHEELPROS_SFTP_USER/PASSWORD for local/dev sync only.
 WHEELPROS_SFTP_HOST = os.environ.get("WHEELPROS_SFTP_HOST", "sftp.wheelpros.com")
 WHEELPROS_SFTP_PORT = int(os.environ.get("WHEELPROS_SFTP_PORT", "22"))
 WHEELPROS_SFTP_USER = os.environ.get("WHEELPROS_SFTP_USER", "")
@@ -240,8 +241,19 @@ WHEELPROS_ACCESSORIES_LOCAL_PATH = os.environ.get("WHEELPROS_ACCESSORIES_LOCAL_P
 # Set to False to verify host keys against ~/.ssh/known_hosts (recommended for production).
 WHEELPROS_SFTP_AUTO_ADD_HOST_KEY = os.environ.get("WHEELPROS_SFTP_AUTO_ADD_HOST_KEY", "true").lower() in ("true", "1", "yes")
 
-# Meyer Distributing: SFTP host/port/user/password/remote dir and filenames live in CompanyProviders.credentials
-# (see MeyerSFTPClient). Only default local download paths here (optional override in credentials).
+# Meyer relay SFTP: AftermarketMonkey-hosted server; per-company sftp_user/sftp_password in CompanyProviders.
+# Env vars (all optional — sensible defaults if unset; use `or` below so empty string does not clear defaults):
+#   MEYER_SFTP_HOST, MEYER_SFTP_PORT, MEYER_SFTP_DIRECTORY,
+#   MEYER_PRICING_REMOTE_FILE, MEYER_INVENTORY_REMOTE_FILE
+try:
+    _meyer_port = int(os.environ.get("MEYER_SFTP_PORT") or "22")
+except ValueError:
+    _meyer_port = 22
+MEYER_SFTP_HOST = os.environ.get("MEYER_SFTP_HOST") or "54.145.82.238"
+MEYER_SFTP_PORT = _meyer_port if 1 <= _meyer_port <= 65535 else 22
+MEYER_SFTP_DIRECTORY = os.environ.get("MEYER_SFTP_DIRECTORY") or "uploads"
+MEYER_PRICING_REMOTE_FILE = os.environ.get("MEYER_PRICING_REMOTE_FILE") or "Meyer Pricing.csv"
+MEYER_INVENTORY_REMOTE_FILE = os.environ.get("MEYER_INVENTORY_REMOTE_FILE") or "Meyer Inventory.csv"
 MEYER_PRICING_LOCAL_PATH = os.environ.get("MEYER_PRICING_LOCAL_PATH", "/tmp/meyer_pricing.csv")
 MEYER_INVENTORY_LOCAL_PATH = os.environ.get("MEYER_INVENTORY_LOCAL_PATH", "/tmp/meyer_inventory.csv")
 

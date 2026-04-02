@@ -23,7 +23,10 @@ DEFAULT_FILE_MAX_AGE_SECONDS = 6 * 60 * 60
 class WheelProsSFTPClient:
     """
     SFTP client for WheelPros CSV feed.
-    Credentials from dict (e.g. CompanyProviders.credentials) or from settings.
+
+    Host and port always come from Django settings (``WHEELPROS_SFTP_HOST`` /
+    ``WHEELPROS_SFTP_PORT``); per-company credentials only supply username and password
+    (``sftp_user`` / ``sftp_password`` or ``username`` / ``password``).
     """
 
     def __init__(
@@ -34,8 +37,10 @@ class WheelProsSFTPClient:
         require_credentials: bool = True,
     ):
         creds = credentials or {}
-        self.sftp_server = str(creds.get("sftp_server") or getattr(settings, "WHEELPROS_SFTP_HOST", DEFAULT_SFTP_HOST)).strip()
-        self.sftp_port = int(creds.get("sftp_port") or getattr(settings, "WHEELPROS_SFTP_PORT", DEFAULT_SFTP_PORT))
+        self.sftp_server = str(
+            getattr(settings, "WHEELPROS_SFTP_HOST", DEFAULT_SFTP_HOST) or DEFAULT_SFTP_HOST
+        ).strip()
+        self.sftp_port = int(getattr(settings, "WHEELPROS_SFTP_PORT", DEFAULT_SFTP_PORT))
         self.sftp_user = str(creds.get("sftp_user") or creds.get("username") or getattr(
             settings, "WHEELPROS_SFTP_USER", ""
         ) or "").strip()
@@ -48,8 +53,8 @@ class WheelProsSFTPClient:
         )
         self.file_max_age = file_max_age
 
-        if require_credentials and not all([self.sftp_server, self.sftp_user, self.sftp_password]):
-            raise ValueError("Invalid credentials/configuration. Missing required WheelPros SFTP settings.")
+        if require_credentials and not all([self.sftp_user, self.sftp_password]):
+            raise ValueError("Invalid credentials/configuration. Missing required WheelPros SFTP user/password.")
 
         self._transport = None
         self._sftp = None

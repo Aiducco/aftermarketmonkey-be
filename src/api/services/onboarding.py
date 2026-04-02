@@ -165,20 +165,10 @@ def save_personalization(
     {
         "turn_14": {"client_id": "...", "client_secret": "..."},
         "keystone": {"ftp_user": "...", "ftp_password": "..."},
-        "meyer": {
-            "sftp_server": "... (host or URL)",
-            "sftp_port": 22,
-            "sftp_user": "...",
-            "sftp_password": "...",
-            "sftp_directory": "uploads",
-            "pricing_remote_file": "Meyer Pricing.csv",
-            "inventory_remote_file": "Meyer Inventory.csv",
-        },
+        "meyer": {"sftp_user": "...", "sftp_password": "..."},
         "wheelpros": {
-            "sftp_server": "...",
             "sftp_user": "...",
             "sftp_password": "...",
-            "sftp_port": "optional",
             "sftp_path": "optional remote CSV path",
         },
     }
@@ -257,51 +247,20 @@ def _upsert_company_providers(company: src_models.Company, credentials: dict) ->
                 )
                 integration_pricing_sync_jobs.enqueue_company_provider_pricing_sync(cp.id)
 
-    # Meyer: kind=6 (MEYER) — full SFTP settings stored in credentials (MeyerSFTPClient; no remote defaults)
+    # Meyer: kind=6 (MEYER) — user/password; host/port/dir/files default from MEYER_SFTP_* settings in MeyerSFTPClient
     if "meyer" in credentials:
         creds = credentials["meyer"]
-        host_raw = (
-            creds.get("sftp_server")
-            or creds.get("sftp_host")
-            or creds.get("server_url")
-            or ""
-        )
-        try:
-            port = int(creds.get("sftp_port"))
-        except (TypeError, ValueError):
-            port = None
-        dir_ok = str(creds.get("sftp_directory") or "").strip()
-        pricing_ok = str(creds.get("pricing_remote_file") or "").strip()
-        inv_ok = str(creds.get("inventory_remote_file") or "").strip()
         user_ok = str(creds.get("sftp_user") or "").strip()
         pass_ok = str(creds.get("sftp_password") or "").strip()
-        if (
-            str(host_raw).strip()
-            and user_ok
-            and pass_ok
-            and dir_ok
-            and pricing_ok
-            and inv_ok
-            and port is not None
-            and 1 <= port <= 65535
-        ):
+        if user_ok and pass_ok:
             provider = src_models.Providers.objects.filter(
                 kind=src_enums.BrandProviderKind.MEYER.value
             ).first()
             if provider:
                 cred_dict = {
-                    "sftp_server": str(host_raw).strip(),
-                    "sftp_port": port,
                     "sftp_user": user_ok,
                     "sftp_password": pass_ok,
-                    "sftp_directory": dir_ok,
-                    "pricing_remote_file": pricing_ok,
-                    "inventory_remote_file": inv_ok,
                 }
-                for opt in ("local_pricing_path", "local_inventory_path"):
-                    v = creds.get(opt)
-                    if v is not None and str(v).strip():
-                        cred_dict[opt] = str(v).strip()
                 cp, _ = src_models.CompanyProviders.objects.update_or_create(
                     company=company,
                     provider=provider,
@@ -312,23 +271,21 @@ def _upsert_company_providers(company: src_models.Company, credentials: dict) ->
                 )
                 integration_pricing_sync_jobs.enqueue_company_provider_pricing_sync(cp.id)
 
-    # Wheel Pros: SFTP (same keys as WheelProsSFTPClient)
+    # Wheel Pros: SFTP user/password only; host/port from settings (WHEELPROS_SFTP_HOST / PORT).
     if "wheelpros" in credentials:
         creds = credentials["wheelpros"]
-        if creds.get("sftp_server") and creds.get("sftp_user") and creds.get("sftp_password"):
+        if creds.get("sftp_user") and creds.get("sftp_password"):
             provider = src_models.Providers.objects.filter(
                 kind=src_enums.BrandProviderKind.WHEELPROS.value
             ).first()
             if provider:
                 cred_dict = {
-                    "sftp_server": str(creds["sftp_server"]).strip(),
                     "sftp_user": str(creds["sftp_user"]).strip(),
                     "sftp_password": str(creds["sftp_password"]).strip(),
                 }
-                for opt in ("sftp_port", "sftp_path"):
-                    v = creds.get(opt)
-                    if v is not None and str(v).strip():
-                        cred_dict[opt] = str(v).strip()
+                v = creds.get("sftp_path")
+                if v is not None and str(v).strip():
+                    cred_dict["sftp_path"] = str(v).strip()
                 cp, _ = src_models.CompanyProviders.objects.update_or_create(
                     company=company,
                     provider=provider,
@@ -409,26 +366,21 @@ def get_distributor_credentials_info() -> dict:
             "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("ROUGH_COUNTRY") or None,
         },
         "wheelpros": {
-            "required": ["sftp_server", "sftp_user", "sftp_password"],
-            "optional": ["sftp_port", "sftp_path"],
-            "description": "SFTP credentials for Wheel Pros (optional sftp_path = remote CSV path per feed)",
+            "required": ["sftp_user", "sftp_password"],
+            "optional": ["sftp_path"],
+            "description": (
+                "Wheel Pros SFTP username and password (host sftp.wheelpros.com is fixed). "
+                "Optional sftp_path overrides default remote CSV paths per feed."
+            ),
             "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("WHEELPROS", "Wheel Pros"),
             "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("WHEELPROS") or None,
         },
         "meyer": {
-            "required": [
-                "sftp_server",
-                "sftp_port",
-                "sftp_user",
-                "sftp_password",
-                "sftp_directory",
-                "pricing_remote_file",
-                "inventory_remote_file",
-            ],
-            "optional": ["local_pricing_path", "local_inventory_path"],
+            "required": ["sftp_user", "sftp_password"],
             "description": (
-                "Meyer Distributing SFTP: server (hostname or URL), port, user, password, remote directory, "
-                "and both CSV filenames (pricing + inventory). Optional local cache paths for downloads."
+                "Email info@aftermarketmonkey.com for SFTP credentials, then enter sftp_user and sftp_password. "
+                "Meyer data is delivered to AftermarketMonkey's relay; your rep uses host 54.145.82.238, port 22, "
+                "folder uploads, files Meyer Pricing.csv and Meyer Inventory.csv."
             ),
             "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("MEYER", "Meyer"),
             "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("MEYER") or None,

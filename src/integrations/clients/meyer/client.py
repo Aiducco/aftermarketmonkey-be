@@ -17,6 +17,32 @@ DEFAULT_LOCAL_PRICING = "/tmp/meyer_pricing.csv"
 DEFAULT_LOCAL_INVENTORY = "/tmp/meyer_inventory.csv"
 DEFAULT_FILE_MAX_AGE_SECONDS = 6 * 60 * 60
 
+# If Django settings omit MEYER_SFTP_* (older deploys) or values are blank, use relay defaults.
+_DEFAULT_MEYER_RELAY_HOST = "54.145.82.238"
+_DEFAULT_MEYER_RELAY_PORT = 22
+_DEFAULT_MEYER_RELAY_DIRECTORY = "uploads"
+_DEFAULT_MEYER_PRICING_REMOTE_FILE = "Meyer Pricing.csv"
+_DEFAULT_MEYER_INVENTORY_REMOTE_FILE = "Meyer Inventory.csv"
+
+
+def _setting_str(name: str, fallback: str) -> str:
+    raw = getattr(settings, name, None)
+    s = str(raw).strip() if raw is not None else ""
+    return s if s else fallback
+
+
+def _setting_int_port(name: str, fallback: int) -> int:
+    raw = getattr(settings, name, None)
+    if raw is None:
+        return fallback
+    try:
+        p = int(raw)
+    except (TypeError, ValueError):
+        return fallback
+    if 1 <= p <= 65535:
+        return p
+    return fallback
+
 
 def _normalize_sftp_server(value: typing.Any) -> str:
     """Hostname, or URL (sftp/https) — host part only."""
@@ -50,24 +76,25 @@ def _require_non_empty_str(creds: typing.Dict, *keys: str) -> typing.Tuple[typin
     return missing, out
 
 
+def _coalesce_nonempty_str(creds: typing.Dict, key: str, fallback: str) -> str:
+    v = creds.get(key)
+    if v is not None and str(v).strip():
+        return str(v).strip()
+    return str(fallback or "").strip()
+
+
 class MeyerSFTPClient:
     """
     SFTP client for Meyer Distributing pricing + inventory CSV feeds.
 
-    All connection settings must be supplied in ``credentials`` (no Django settings fallbacks
-    for host, port, auth, remote directory, or filenames).
-
-    Required keys:
-      - ``sftp_server`` (hostname, or ``sftp://`` / ``https://`` URL — only host is used),
-        aliases: ``sftp_host``, ``server_url``
-      - ``sftp_port`` (int or numeric string)
-      - ``sftp_user``, ``sftp_password``
-      - ``sftp_directory`` — remote folder (e.g. ``uploads``; no leading slash required)
-      - ``pricing_remote_file`` — CSV filename under that directory
-      - ``inventory_remote_file`` — CSV filename under that directory
+    Defaults host, port, remote directory, and CSV filenames from Django settings
+    (``MEYER_SFTP_*``, ``MEYER_PRICING_REMOTE_FILE``, ``MEYER_INVENTORY_REMOTE_FILE``)—the
+    AftermarketMonkey relay SFTP. Per-company ``credentials`` must include ``sftp_user`` and
+    ``sftp_password``. Optional overrides: ``sftp_server`` (or ``sftp_host`` / ``server_url``),
+    ``sftp_port``, ``sftp_directory``, ``pricing_remote_file``, ``inventory_remote_file``.
 
     Optional:
-      - ``local_pricing_path``, ``local_inventory_path`` — local cache paths (else ``MEYER_*_LOCAL_PATH`` settings or /tmp defaults)
+      - ``local_pricing_path``, ``local_inventory_path`` — local cache paths (else ``MEYER_*_LOCAL_PATH`` settings)
     """
 
     def __init__(
@@ -86,34 +113,54 @@ class MeyerSFTPClient:
             or creds.get("server_url")
             or ""
         )
-        self.sftp_server = _normalize_sftp_server(raw_server)
+        if str(raw_server or "").strip():
+            self.sftp_server = _normalize_sftp_server(raw_server)
+        else:
+            self.sftp_server = _normalize_sftp_server(
+                _setting_str("MEYER_SFTP_HOST", _DEFAULT_MEYER_RELAY_HOST)
+            )
 
-        try:
-            self.sftp_port = int(creds.get("sftp_port"))
-        except (TypeError, ValueError):
-            self.sftp_port = 0
-
-        missing: typing.List[str] = []
-        if not self.sftp_server:
-            missing.append("sftp_server (or sftp_host / server_url)")
+        port_raw = creds.get("sftp_port")
+        self.sftp_port = 0
+        if port_raw is not None and str(port_raw).strip() != "":
+            try:
+                self.sftp_port = int(port_raw)
+            except (TypeError, ValueError):
+                self.sftp_port = 0
         if not self.sftp_port or self.sftp_port < 1 or self.sftp_port > 65535:
-            missing.append("sftp_port (1–65535)")
+            self.sftp_port = _setting_int_port("MEYER_SFTP_PORT", _DEFAULT_MEYER_RELAY_PORT)
 
-        m_str, str_fields = _require_non_empty_str(
-            creds,
-            "sftp_user",
-            "sftp_password",
-            "sftp_directory",
-            "pricing_remote_file",
-            "inventory_remote_file",
-        )
-        missing.extend(m_str)
+        m_auth, str_fields = _require_non_empty_str(creds, "sftp_user", "sftp_password")
+        missing: typing.List[str] = list(m_auth)
 
         self.sftp_user = str_fields.get("sftp_user", "")
         self.sftp_password = str_fields.get("sftp_password", "")
-        self.sftp_directory = str_fields.get("sftp_directory", "")
-        self.pricing_remote_file = str_fields.get("pricing_remote_file", "")
-        self.inventory_remote_file = str_fields.get("inventory_remote_file", "")
+        self.sftp_directory = _coalesce_nonempty_str(
+            creds,
+            "sftp_directory",
+            _setting_str("MEYER_SFTP_DIRECTORY", _DEFAULT_MEYER_RELAY_DIRECTORY),
+        )
+        self.pricing_remote_file = _coalesce_nonempty_str(
+            creds,
+            "pricing_remote_file",
+            _setting_str("MEYER_PRICING_REMOTE_FILE", _DEFAULT_MEYER_PRICING_REMOTE_FILE),
+        )
+        self.inventory_remote_file = _coalesce_nonempty_str(
+            creds,
+            "inventory_remote_file",
+            _setting_str("MEYER_INVENTORY_REMOTE_FILE", _DEFAULT_MEYER_INVENTORY_REMOTE_FILE),
+        )
+
+        if not self.sftp_server:
+            missing.append(
+                "MEYER_SFTP_HOST (env) or sftp_server in credentials — relay host is not configured"
+            )
+        if not self.sftp_directory:
+            missing.append("MEYER_SFTP_DIRECTORY (env) or sftp_directory in credentials")
+        if not self.pricing_remote_file:
+            missing.append("MEYER_PRICING_REMOTE_FILE (env) or pricing_remote_file in credentials")
+        if not self.inventory_remote_file:
+            missing.append("MEYER_INVENTORY_REMOTE_FILE (env) or inventory_remote_file in credentials")
 
         self.local_pricing_path = (
             str(creds.get("local_pricing_path") or "").strip()
@@ -129,9 +176,10 @@ class MeyerSFTPClient:
 
         if require_credentials and missing:
             raise ValueError(
-                "Invalid Meyer SFTP configuration — required in credentials: {}.".format(
-                    ", ".join(missing)
-                )
+                "Invalid Meyer SFTP configuration — missing: {}. "
+                "Company credentials must include sftp_user and sftp_password. "
+                "Relay host, port, folder, and CSV names come from Django settings "
+                "(MEYER_SFTP_* env vars) unless overridden in credentials.".format(", ".join(missing))
             )
 
         self._transport = None
