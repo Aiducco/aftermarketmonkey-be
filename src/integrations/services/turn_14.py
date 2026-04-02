@@ -1069,13 +1069,6 @@ def _fetch_and_save_turn_14_brand_pricing_for_company_provider(
             logger.info('{} Brand {} status is not active'.format(_LOG_PREFIX, brand.name))
             continue
 
-        if not src_models.CompanyBrands.objects.filter(
-            company=company,
-            brand=brand,
-            status_name=src_enums.CompanyBrandStatus.ACTIVE.name,
-        ).exists():
-            continue
-
         brand_mapping = src_models.BrandTurn14BrandMapping.objects.filter(
             brand=brand
         ).first()
@@ -1272,12 +1265,6 @@ def fetch_and_save_turn_14_brand_pricing_for_turn14_brands(
 
         for company_provider in company_providers:
             company = company_provider.company
-            if not src_models.CompanyBrands.objects.filter(
-                company=company,
-                brand=brand,
-                status_name=src_enums.CompanyBrandStatus.ACTIVE.name,
-            ).exists():
-                continue
 
             try:
                 api_client = turn_14_client.Turn14ApiClient(credentials=company_provider.credentials)
