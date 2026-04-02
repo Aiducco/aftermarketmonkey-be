@@ -6,8 +6,8 @@ from src.integrations.services import meyer
 class Command(BaseCommand):
     help = (
         "Download Meyer Pricing + Meyer Inventory from SFTP and upsert MeyerBrand / MeyerParts "
-        "(requires CompanyProviders.credentials for Meyer: sftp_server, sftp_port, sftp_user, sftp_password, "
-        "sftp_directory, pricing_remote_file, inventory_remote_file)."
+        "(requires CompanyProviders.credentials for Meyer: sftp_user, sftp_password; optional filename overrides). "
+        "SFTP host/path defaults from MEYER_SFTP_* settings."
     )
 
     def add_arguments(self, parser):

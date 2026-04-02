@@ -67,7 +67,8 @@ def _provider_ui_metadata(provider: src_models.Providers) -> typing.Dict[str, ty
 def get_providers_catalog(company_id: int) -> typing.Dict:
     """
     Get integrations catalog: all providers with connection status for the company.
-    Matches the catalog UI: name, description, icon_url, category, connected, required_fields.
+    Matches the catalog UI: name, description, icon_url, category, connected, required_fields,
+    installation_instructions_html (HTML snippet for setup guidance).
     Connected status is determined from company_providers table.
     """
     logger.info('{} Fetching providers catalog for company_id: {}.'.format(
@@ -116,6 +117,7 @@ def get_providers_catalog(company_id: int) -> typing.Dict:
             "category": entry.get("category", ""),
             "connection_required_fields": entry.get("connection_required_fields", []),
             "connection_optional_fields": entry.get("connection_optional_fields", []),
+            "installation_instructions_html": entry.get("installation_instructions_html") or None,
             "connected": connected,
             "company_provider_id": company_provider.id if company_provider else None,
             "kind": kind_value,
