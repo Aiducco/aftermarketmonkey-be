@@ -395,6 +395,10 @@ def sync_unmapped_keystone_brands_to_brands() -> typing.List[src_models.Keystone
 # Keystone provider id (use when provider record has id=4)
 KEYSTONE_PROVIDER_ID = 4
 
+# pgbulk upsert chunk size (larger = fewer round-trips; tune for DB load / memory).
+KEYSTONE_PGBULK_BATCH_SIZE = 5000
+KEYSTONE_PGBULK_BATCH_DELAY_SECONDS = 0.5
+
 KEYSTONE_PARTS_UPDATE_FIELDS = [
     "vendor_code", "part_number", "manufacturer_part_no", "long_description",
     "upsable", "case_qty",
@@ -470,6 +474,12 @@ def fetch_and_save_all_keystone_brand_parts() -> None:
     Fetch the Keystone inventory CSV and upsert parts for each brand that has
     BrandKeystoneBrandMapping (similar to Turn 14 flow).
     Uses BrandKeystoneBrandMapping as source of truth; BrandProviders is optional.
+
+    When a Keystone CompanyProviders row is marked ``primary=True``, shared catalog rows
+    (:class:`~src.models.KeystoneParts`) are upserted only for that company’s FTP pull.
+    Every active company still upserts :class:`~src.models.KeystoneCompanyPricing` for
+    its own credentials. If no primary is set, catalog upserts run for every company
+    (legacy behaviour).
     """
     logger.info("{} Fetching all Keystone brand parts.".format(_LOG_PREFIX))
 
@@ -523,13 +533,35 @@ def fetch_and_save_all_keystone_brand_parts() -> None:
         logger.warning("{} No active Keystone company providers found. Skipping.".format(_LOG_PREFIX))
         return
 
-    BATCH_SIZE = 1000
-    BATCH_DELAY_SECONDS = 0.5
+    has_keystone_primary = any(cp.primary for cp in company_providers)
+    primary_count = sum(1 for cp in company_providers if cp.primary)
+    if primary_count > 1:
+        logger.warning(
+            "{} Multiple Keystone CompanyProviders have primary=True (count={}); "
+            "KeystoneParts upserts will run for each primary.".format(_LOG_PREFIX, primary_count)
+        )
+    if has_keystone_primary:
+        logger.info(
+            "{} KeystoneParts (shared catalog) upserts: only primary CompanyProvider; "
+            "KeystoneCompanyPricing: every active company.".format(_LOG_PREFIX)
+        )
+    else:
+        logger.warning(
+            "{} No Keystone CompanyProviders with primary=True; upserting KeystoneParts "
+            "for every company (set one primary to ingest the catalog once).".format(_LOG_PREFIX)
+        )
+
+    company_providers_ordered = sorted(
+        company_providers,
+        key=lambda cp: (not cp.primary, (cp.company.name or "")),
+    )
+
     total_parts = 0
     total_pricing = 0
 
-    for company_provider in company_providers:
+    for company_provider in company_providers_ordered:
         company = company_provider.company
+        should_upsert_keystone_parts = company_provider.primary or not has_keystone_primary
         try:
             ftp_client = keystone_client.KeystoneFTPClient(credentials=company_provider.credentials)
         except ValueError as e:
@@ -552,20 +584,29 @@ def fetch_and_save_all_keystone_brand_parts() -> None:
             _LOG_PREFIX, company.name, len(records), len(brand_mappings),
         ))
 
-        part_instances = _transform_parts_data(records, brand_mappings, omit_pricing_for_parts=True)
-        if not part_instances:
-            logger.warning("{} No part instances company={}.".format(_LOG_PREFIX, company.name))
-            continue
+        if should_upsert_keystone_parts:
+            part_instances = _transform_parts_data(records, brand_mappings, omit_pricing_for_parts=True)
+            if not part_instances:
+                logger.warning("{} No part instances company={}.".format(_LOG_PREFIX, company.name))
+                continue
 
-        try:
-            total_parts += _pgbulk_upsert_keystone_parts_batches(
-                part_instances, BATCH_SIZE, BATCH_DELAY_SECONDS
+            try:
+                total_parts += _pgbulk_upsert_keystone_parts_batches(
+                    part_instances,
+                    KEYSTONE_PGBULK_BATCH_SIZE,
+                    KEYSTONE_PGBULK_BATCH_DELAY_SECONDS,
+                )
+            except Exception as e:
+                logger.error("{} Keystone parts upsert failed company={}: {}.".format(
+                    _LOG_PREFIX, company.name, str(e),
+                ))
+                raise
+        else:
+            logger.info(
+                "{} Skipping KeystoneParts upsert for company={} (non-primary; catalog from primary only).".format(
+                    _LOG_PREFIX, company.name,
+                )
             )
-        except Exception as e:
-            logger.error("{} Keystone parts upsert failed company={}: {}.".format(
-                _LOG_PREFIX, company.name, str(e),
-            ))
-            raise
 
         part_lookup = _vcpn_brand_id_lookup_for_records(records, brand_mappings)
         pricing_instances = _build_keystone_company_pricing_instances(
@@ -573,7 +614,9 @@ def fetch_and_save_all_keystone_brand_parts() -> None:
         )
         try:
             total_pricing += _pgbulk_upsert_keystone_company_pricing_batches(
-                pricing_instances, BATCH_SIZE, BATCH_DELAY_SECONDS
+                pricing_instances,
+                KEYSTONE_PGBULK_BATCH_SIZE,
+                KEYSTONE_PGBULK_BATCH_DELAY_SECONDS,
             )
         except Exception as e:
             logger.error("{} KeystoneCompanyPricing upsert failed company={}: {}.".format(
@@ -592,6 +635,10 @@ def fetch_and_save_all_keystone_brands_and_parts() -> None:
     """
     Fetch the Keystone inventory CSV per company (credentials) and upsert all brands and parts.
     Catalog fields on KeystoneParts; prices on KeystoneCompanyPricing per company.
+
+    Shared KeystoneParts rows are upserted only from the ``primary=True`` CompanyProvider when
+    one exists; each company still gets KeystoneCompanyPricing from its own feed. With no primary,
+    catalog upserts run for every company (legacy).
     """
     logger.info("{} Started full Keystone brands and parts sync (per company).".format(_LOG_PREFIX))
 
@@ -605,13 +652,34 @@ def fetch_and_save_all_keystone_brands_and_parts() -> None:
         logger.info("{} No active Keystone company providers found.".format(_LOG_PREFIX))
         return
 
-    BATCH_SIZE = 1000
-    BATCH_DELAY_SECONDS = 0.5
+    has_keystone_primary = any(cp.primary for cp in company_providers)
+    primary_count = sum(1 for cp in company_providers if cp.primary)
+    if primary_count > 1:
+        logger.warning(
+            "{} Multiple Keystone CompanyProviders have primary=True (count={}); "
+            "KeystoneParts upserts will run for each primary.".format(_LOG_PREFIX, primary_count)
+        )
+    if has_keystone_primary:
+        logger.info(
+            "{} KeystoneParts upserts: primary CompanyProvider only; "
+            "KeystoneCompanyPricing: every company.".format(_LOG_PREFIX)
+        )
+    else:
+        logger.warning(
+            "{} No Keystone CompanyProviders with primary=True; upserting KeystoneParts "
+            "for every company (set one primary to ingest the catalog once).".format(_LOG_PREFIX)
+        )
+
+    company_providers_ordered = sorted(
+        company_providers,
+        key=lambda cp: (not cp.primary, (cp.company.name or "")),
+    )
+
     brands_synced_once = False
     total_parts = 0
     total_pricing = 0
 
-    for company_provider in company_providers:
+    for company_provider in company_providers_ordered:
         company = company_provider.company
         try:
             ftp_client = keystone_client.KeystoneFTPClient(credentials=company_provider.credentials)
@@ -667,19 +735,30 @@ def fetch_and_save_all_keystone_brands_and_parts() -> None:
             for b in src_models.KeystoneBrand.objects.filter(external_id__in=brand_data.keys())
         }
 
-        part_instances = _transform_parts_data(records, keystone_brands, omit_pricing_for_parts=True)
-        if not part_instances:
-            continue
+        should_upsert_keystone_parts = company_provider.primary or not has_keystone_primary
 
-        try:
-            total_parts += _pgbulk_upsert_keystone_parts_batches(
-                part_instances, BATCH_SIZE, BATCH_DELAY_SECONDS
+        if should_upsert_keystone_parts:
+            part_instances = _transform_parts_data(records, keystone_brands, omit_pricing_for_parts=True)
+            if not part_instances:
+                continue
+
+            try:
+                total_parts += _pgbulk_upsert_keystone_parts_batches(
+                    part_instances,
+                    KEYSTONE_PGBULK_BATCH_SIZE,
+                    KEYSTONE_PGBULK_BATCH_DELAY_SECONDS,
+                )
+            except Exception as e:
+                logger.error("{} Keystone parts upsert failed company={}: {}.".format(
+                    _LOG_PREFIX, company.name, str(e),
+                ))
+                raise
+        else:
+            logger.info(
+                "{} Skipping KeystoneParts upsert for company={} (non-primary; catalog from primary only).".format(
+                    _LOG_PREFIX, company.name,
+                )
             )
-        except Exception as e:
-            logger.error("{} Keystone parts upsert failed company={}: {}.".format(
-                _LOG_PREFIX, company.name, str(e),
-            ))
-            raise
 
         part_lookup = _vcpn_brand_id_lookup_for_records(records, keystone_brands)
         pricing_instances = _build_keystone_company_pricing_instances(
@@ -687,7 +766,9 @@ def fetch_and_save_all_keystone_brands_and_parts() -> None:
         )
         try:
             total_pricing += _pgbulk_upsert_keystone_company_pricing_batches(
-                pricing_instances, BATCH_SIZE, BATCH_DELAY_SECONDS
+                pricing_instances,
+                KEYSTONE_PGBULK_BATCH_SIZE,
+                KEYSTONE_PGBULK_BATCH_DELAY_SECONDS,
             )
         except Exception as e:
             logger.error("{} KeystoneCompanyPricing upsert failed company={}: {}.".format(
@@ -864,8 +945,6 @@ def sync_keystone_catalog_and_company_pricing_for_company_provider(company_provi
         return
 
     company = company_provider.company
-    BATCH_SIZE = 1000
-    BATCH_DELAY_SECONDS = 0.5
 
     try:
         ftp_client = keystone_client.KeystoneFTPClient(credentials=company_provider.credentials)
@@ -922,14 +1001,18 @@ def sync_keystone_catalog_and_company_pricing_for_company_provider(company_provi
         return
 
     total_parts = _pgbulk_upsert_keystone_parts_batches(
-        part_instances, BATCH_SIZE, BATCH_DELAY_SECONDS
+        part_instances,
+        KEYSTONE_PGBULK_BATCH_SIZE,
+        KEYSTONE_PGBULK_BATCH_DELAY_SECONDS,
     )
     part_lookup = _vcpn_brand_id_lookup_for_records(records, keystone_brands)
     pricing_instances = _build_keystone_company_pricing_instances(
         records, keystone_brands, company, part_lookup,
     )
     total_pricing = _pgbulk_upsert_keystone_company_pricing_batches(
-        pricing_instances, BATCH_SIZE, BATCH_DELAY_SECONDS
+        pricing_instances,
+        KEYSTONE_PGBULK_BATCH_SIZE,
+        KEYSTONE_PGBULK_BATCH_DELAY_SECONDS,
     )
     logger.info(
         "{} Keystone sync for company_provider id={}: parts upserts={}, company pricing upserts={}.".format(
