@@ -56,6 +56,158 @@ BATCH_SIZE_INVENTORY = 20000
 BATCH_SIZE_PRICING = 20000
 BATCH_DELAY_SECONDS = 0.1  # Reduced from 0.3 - was adding ~30s per 100 batches
 
+
+def _dedupe_provider_part_inventory_for_upsert(
+    rows: typing.List[src_models.ProviderPartInventory],
+    context: str = "",
+) -> typing.List[src_models.ProviderPartInventory]:
+    """
+    One row per provider_part_id; last wins.
+    PostgreSQL rejects INSERT .. ON CONFLICT when the same conflict key appears twice in one batch.
+    """
+    by_pp: typing.Dict[int, src_models.ProviderPartInventory] = {}
+    skipped_no_pp = 0
+    merged_dup_rows = 0
+    dup_pp_ids_order: typing.List[int] = []
+    for r in rows:
+        pp_id = r.provider_part_id
+        if pp_id is None and r.provider_part is not None:
+            pp_id = r.provider_part_id
+        if pp_id is None:
+            skipped_no_pp += 1
+            continue
+        k = int(pp_id)
+        if k in by_pp:
+            merged_dup_rows += 1
+            dup_pp_ids_order.append(k)
+        by_pp[k] = r
+    out = list(by_pp.values())
+    if merged_dup_rows or skipped_no_pp:
+        sample_pp: typing.List[int] = []
+        seen_pp: typing.Set[int] = set()
+        for k in dup_pp_ids_order:
+            if k not in seen_pp:
+                seen_pp.add(k)
+                sample_pp.append(k)
+            if len(sample_pp) >= 10:
+                break
+        ctx = " {}".format(context) if context else ""
+        logger.info(
+            "{} Upsert dedupe ProviderPartInventory{}: input_rows={} unique_keys={} "
+            "merged_duplicate_rows={} skipped_missing_provider_part_id={}; "
+            "sample provider_part_id with duplicate rows: {}".format(
+                _LOG_PREFIX,
+                ctx,
+                len(rows),
+                len(out),
+                merged_dup_rows,
+                skipped_no_pp,
+                sample_pp,
+            )
+        )
+    return out
+
+
+def _dedupe_provider_part_company_pricing_for_upsert(
+    rows: typing.List[src_models.ProviderPartCompanyPricing],
+    context: str = "",
+) -> typing.List[src_models.ProviderPartCompanyPricing]:
+    """One row per (provider_part_id, company_id); last wins."""
+    out: typing.Dict[typing.Tuple[int, int], src_models.ProviderPartCompanyPricing] = {}
+    skipped = 0
+    merged = 0
+    dup_keys_order: typing.List[typing.Tuple[int, int]] = []
+    for r in rows:
+        pp_id = r.provider_part_id
+        if pp_id is None and r.provider_part is not None:
+            pp_id = r.provider_part_id
+        co_id = r.company_id
+        if co_id is None and r.company is not None:
+            co_id = r.company_id
+        if pp_id is None or co_id is None:
+            skipped += 1
+            continue
+        k = (int(pp_id), int(co_id))
+        if k in out:
+            merged += 1
+            dup_keys_order.append(k)
+        out[k] = r
+    result = list(out.values())
+    if merged or skipped:
+        sample: typing.List[typing.Tuple[int, int]] = []
+        seen_k: typing.Set[typing.Tuple[int, int]] = set()
+        for k in dup_keys_order:
+            if k not in seen_k:
+                seen_k.add(k)
+                sample.append(k)
+            if len(sample) >= 10:
+                break
+        ctx = " {}".format(context) if context else ""
+        logger.info(
+            "{} Upsert dedupe ProviderPartCompanyPricing{}: input_rows={} unique_keys={} "
+            "merged_duplicate_rows={} skipped_missing_fk={}; "
+            "sample (provider_part_id, company_id): {}".format(
+                _LOG_PREFIX,
+                ctx,
+                len(rows),
+                len(result),
+                merged,
+                skipped,
+                sample,
+            )
+        )
+    return result
+
+
+def _dedupe_master_parts_for_upsert(
+    parts: typing.List[src_models.MasterPart],
+    context: str = "",
+) -> typing.List[src_models.MasterPart]:
+    """One row per (brand_id, part_number); last wins."""
+    by_key: typing.Dict[typing.Tuple[int, str], src_models.MasterPart] = {}
+    skipped = 0
+    merged = 0
+    dup_keys_order: typing.List[typing.Tuple[int, str]] = []
+    for mp in parts:
+        bid = mp.brand_id
+        if bid is None and mp.brand is not None:
+            bid = mp.brand_id
+        pn = (mp.part_number or "").strip()
+        if bid is None or not pn:
+            skipped += 1
+            continue
+        k = (int(bid), pn)
+        if k in by_key:
+            merged += 1
+            dup_keys_order.append(k)
+        by_key[k] = mp
+    result = list(by_key.values())
+    if merged or skipped:
+        sample: typing.List[typing.Tuple[int, str]] = []
+        seen_k: typing.Set[typing.Tuple[int, str]] = set()
+        for k in dup_keys_order:
+            if k not in seen_k:
+                seen_k.add(k)
+                sample.append(k)
+            if len(sample) >= 8:
+                break
+        ctx = " {}".format(context) if context else ""
+        logger.info(
+            "{} Upsert dedupe MasterPart{}: input_rows={} unique_keys={} "
+            "merged_duplicate_rows={} skipped_missing_brand_or_part_number={}; "
+            "sample (brand_id, part_number): {}".format(
+                _LOG_PREFIX,
+                ctx,
+                len(parts),
+                len(result),
+                merged,
+                skipped,
+                sample,
+            )
+        )
+    return result
+
+
 # Master part field priority: Turn14 is primary for description, image_url.
 # Other providers (Keystone, etc.) only update sku, aaia_code on existing parts.
 # We use a two-phase approach for non-primary providers: INSERT new, UPDATE existing (sku/aaia only).
@@ -174,6 +326,9 @@ def sync_master_parts_from_turn14() -> None:
                 time.sleep(BATCH_DELAY_SECONDS)
             continue
 
+        master_parts = _dedupe_master_parts_for_upsert(
+            master_parts, context="Turn14 master_parts batch={}".format(batch_num)
+        )
         pgbulk.upsert(
             src_models.MasterPart,
             master_parts,
@@ -351,6 +506,9 @@ def sync_master_parts_from_keystone() -> None:
 
         # Phase 1: INSERT new parts only (full data). DO NOTHING on conflict.
         if new_parts:
+            new_parts = _dedupe_master_parts_for_upsert(
+                new_parts, context="Keystone new_parts batch={}".format(batch_num)
+            )
             pgbulk.upsert(
                 src_models.MasterPart,
                 new_parts,
@@ -596,6 +754,9 @@ def sync_master_parts_from_meyer() -> None:
         existing_keys = [k for k in pairs if existing_by_key.get(k) is not None]
 
         if new_parts:
+            new_parts = _dedupe_master_parts_for_upsert(
+                new_parts, context="Meyer new_parts batch={}".format(batch_num)
+            )
             pgbulk.upsert(
                 src_models.MasterPart,
                 new_parts,
@@ -802,6 +963,9 @@ def sync_master_parts_from_rough_country() -> None:
         existing_keys = [k for k in pairs if k in existing_by_key]
 
         if new_parts:
+            new_parts = _dedupe_master_parts_for_upsert(
+                new_parts, context="Rough Country new_parts batch={}".format(batch_num)
+            )
             pgbulk.upsert(
                 src_models.MasterPart,
                 new_parts,
@@ -952,6 +1116,9 @@ def sync_provider_inventory_from_rough_country() -> None:
             )
 
         if to_upsert:
+            to_upsert = _dedupe_provider_part_inventory_for_upsert(
+                to_upsert, context="Rough Country inventory batch={}".format(batch_num)
+            )
             pgbulk.upsert(
                 src_models.ProviderPartInventory,
                 to_upsert,
@@ -1080,6 +1247,9 @@ def sync_provider_pricing_from_rough_country() -> None:
             )
 
         if to_upsert:
+            to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                to_upsert, context="Rough Country pricing batch={}".format(batch_num)
+            )
             pgbulk.upsert(
                 src_models.ProviderPartCompanyPricing,
                 to_upsert,
@@ -1160,6 +1330,63 @@ def _provider_parts_by_master_brand_and_part_number(
     return out
 
 
+def _meyer_provider_parts_by_brand_sku_first(
+    provider: src_models.Providers,
+    keys: typing.Collection[typing.Tuple[int, str]],
+) -> typing.Dict[typing.Tuple[int, str], src_models.ProviderPart]:
+    """
+    (brand_id, MasterPart.sku) -> ProviderPart: lowest MasterPart.id per (brand, sku) that has a
+    Meyer ProviderPart. Uses PostgreSQL DISTINCT ON + join per chunk (one tight round-trip, then
+    one ProviderPart IN per chunk) so duplicate skus do not inflate rows read from master_parts.
+    """
+    out: typing.Dict[typing.Tuple[int, str], src_models.ProviderPart] = {}
+    sku_by_brand: typing.Dict[int, typing.Set[str]] = {}
+    for b_id, sku in keys:
+        sku_s = (sku or "").strip() if sku is not None else ""
+        if not sku_s:
+            continue
+        bid = int(b_id)
+        if bid not in sku_by_brand:
+            sku_by_brand[bid] = set()
+        sku_by_brand[bid].add(sku_s)
+
+    provider_id = provider.id
+    sql = """
+        SELECT DISTINCT ON (mp.brand_id, mp.sku)
+            pp.id,
+            mp.brand_id,
+            mp.sku
+        FROM master_parts mp
+        INNER JOIN provider_parts pp
+            ON pp.master_part_id = mp.id AND pp.provider_id = %s
+        WHERE mp.brand_id = %s AND mp.sku IN %s
+        ORDER BY mp.brand_id, mp.sku, mp.id
+        """
+
+    key_by_pp_id: typing.Dict[int, typing.Tuple[int, str]] = {}
+    for b_id, skus in sku_by_brand.items():
+        sku_list = list(skus)
+        for i in range(0, len(sku_list), WHEELPROS_LOOKUP_CHUNK):
+            chunk = tuple(sku_list[i : i + WHEELPROS_LOOKUP_CHUNK])
+            with connection.cursor() as cur:
+                cur.execute(sql, (provider_id, b_id, chunk))
+                for pp_id, mp_brand_id, mp_sku in cur.fetchall():
+                    k = (int(mp_brand_id), (mp_sku or "").strip())
+                    key_by_pp_id[int(pp_id)] = k
+
+    if not key_by_pp_id:
+        return out
+
+    for pp in (
+        src_models.ProviderPart.objects.filter(id__in=key_by_pp_id.keys())
+        .select_related("master_part")
+    ):
+        k = key_by_pp_id.get(pp.id)
+        if k:
+            out[k] = pp
+    return out
+
+
 def _turn14_pricing_batch_external_id_to_master_keys(
     batch: typing.List[typing.Dict],
     t14_brand_to_brand: typing.Dict[int, src_models.Brands],
@@ -1209,13 +1436,12 @@ def _meyer_company_pricing_batch_row_id_to_provider_part(
     my_brand_to_brand: typing.Dict[int, src_models.Brands],
 ) -> typing.Dict[int, src_models.ProviderPart]:
     """
-    MeyerCompanyPricing row id -> ProviderPart using (brand, mfg_item_number) as in
-    sync_master_parts_from_meyer, with sku=meyer_part fallback on MasterPart.
+    MeyerCompanyPricing row id -> ProviderPart: (brand, meyer_part) -> first MasterPart.sku match,
+    then (brand, mfg_item_number) -> MasterPart.part_number. All lookups batched per batch.
     """
     row_id_to_pp: typing.Dict[int, src_models.ProviderPart] = {}
-    keys: typing.List[typing.Tuple[int, str]] = []
-    row_primary_key: typing.Dict[int, typing.Tuple[int, str]] = {}
-    sku_only_rows: typing.Dict[int, typing.Tuple[int, str]] = {}
+    row_meta: typing.Dict[int, typing.Tuple[src_models.Brands, str, str]] = {}
+    sku_lookup_keys: typing.List[typing.Tuple[int, str]] = []
 
     for row in batch:
         rid = row["id"]
@@ -1232,56 +1458,42 @@ def _meyer_company_pricing_batch_row_id_to_provider_part(
             mp_ext = mp_ext.strip()
         else:
             mp_ext = str(mp_ext or "").strip()
-        if mfg:
-            k = (brand.id, mfg)
-            keys.append(k)
-            row_primary_key[rid] = k
-        elif mp_ext:
-            sku_only_rows[rid] = (brand.id, mp_ext)
-
-    pp_by_key = _provider_parts_by_master_brand_and_part_number(meyer_provider, keys)
-    for rid, k in row_primary_key.items():
-        pp = pp_by_key.get(k)
-        if pp:
-            row_id_to_pp[rid] = pp
-
-    def _pp_via_master_sku(b_id: int, sku: str) -> typing.Optional[src_models.ProviderPart]:
-        mp = (
-            src_models.MasterPart.objects.filter(brand_id=b_id, sku=sku)
-            .only("id")
-            .first()
-        )
-        if not mp:
-            return None
-        return (
-            src_models.ProviderPart.objects.filter(
-                master_part_id=mp.id,
-                provider=meyer_provider,
-            )
-            .first()
-        )
-
-    for rid, (bid, sku) in sku_only_rows.items():
-        pp = _pp_via_master_sku(bid, sku)
-        if pp:
-            row_id_to_pp[rid] = pp
-
-    for rid, k in row_primary_key.items():
-        if rid in row_id_to_pp:
+        if not mfg and not mp_ext:
             continue
-        row = next((r for r in batch if r["id"] == rid), None)
-        if not row:
-            continue
-        mp_ext = row.get("part__meyer_part")
-        if isinstance(mp_ext, str):
-            mp_ext = mp_ext.strip()
-        else:
-            mp_ext = str(mp_ext or "").strip()
+        row_meta[rid] = (brand, mfg, mp_ext)
+        if mp_ext:
+            sku_lookup_keys.append((brand.id, mp_ext))
+
+    pp_by_sku = _meyer_provider_parts_by_brand_sku_first(
+        meyer_provider,
+        list(dict.fromkeys(sku_lookup_keys)),
+    )
+    for rid, (brand, _, mp_ext) in row_meta.items():
         if not mp_ext:
             continue
-        pp = _pp_via_master_sku(k[0], mp_ext)
+        pp = pp_by_sku.get((brand.id, mp_ext))
         if pp:
             row_id_to_pp[rid] = pp
+
+    part_fallback_keys: typing.List[typing.Tuple[int, str]] = []
+    for rid, (brand, mfg, _mp_ext) in row_meta.items():
+        if rid in row_id_to_pp or not mfg:
+            continue
+        part_fallback_keys.append((brand.id, mfg))
+
+    if part_fallback_keys:
+        pp_by_pn = _provider_parts_by_master_brand_and_part_number(
+            meyer_provider,
+            list(dict.fromkeys(part_fallback_keys)),
+        )
+        for rid, (brand, mfg, _mp_ext) in row_meta.items():
+            if rid in row_id_to_pp:
+                continue
+            if not mfg:
+                continue
+            pp = pp_by_pn.get((brand.id, mfg))
+            if pp:
+                row_id_to_pp[rid] = pp
 
     return row_id_to_pp
 
@@ -1434,6 +1646,9 @@ def sync_master_parts_from_wheelpros() -> None:
 
         # Phase 1: INSERT new parts only (full data). DO NOTHING on conflict. Same as Keystone.
         if new_parts:
+            new_parts = _dedupe_master_parts_for_upsert(
+                new_parts, context="WheelPros new_parts batch={}".format(batch_num)
+            )
             pgbulk.upsert(
                 src_models.MasterPart,
                 new_parts,
@@ -1591,6 +1806,9 @@ def sync_provider_inventory_from_wheelpros() -> None:
             )
 
         if to_upsert:
+            to_upsert = _dedupe_provider_part_inventory_for_upsert(
+                to_upsert, context="WheelPros inventory batch={}".format(batch_num)
+            )
             pgbulk.upsert(
                 src_models.ProviderPartInventory,
                 to_upsert,
@@ -1707,6 +1925,9 @@ def sync_provider_pricing_from_wheelpros() -> None:
             )
 
         if to_upsert:
+            to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                to_upsert, context="WheelPros pricing batch={}".format(batch_num)
+            )
             pgbulk.upsert(
                 src_models.ProviderPartCompanyPricing,
                 to_upsert,
@@ -1800,6 +2021,9 @@ def sync_provider_pricing_from_turn14_for_company(company_id: int) -> None:
             )
 
         if to_upsert:
+            to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                to_upsert, context="Turn14 pricing company={} batch={}".format(company_id, batch_num)
+            )
             pgbulk.upsert(
                 src_models.ProviderPartCompanyPricing,
                 to_upsert,
@@ -1913,6 +2137,9 @@ def sync_provider_pricing_from_keystone_for_company(company_id: int) -> None:
             )
 
         if to_upsert:
+            to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                to_upsert, context="Keystone pricing company={} batch={}".format(company_id, batch_num)
+            )
             pgbulk.upsert(
                 src_models.ProviderPartCompanyPricing,
                 to_upsert,
@@ -2005,6 +2232,9 @@ def sync_provider_pricing_from_meyer_for_company(company_id: int) -> None:
 
         to_upsert = list(pricing_by_pp_company.values())
         if to_upsert:
+            to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                to_upsert, context="Meyer pricing company={} batch={}".format(company_id, batch_num)
+            )
             pgbulk.upsert(
                 src_models.ProviderPartCompanyPricing,
                 to_upsert,
@@ -2124,6 +2354,9 @@ def sync_provider_pricing_from_rough_country_for_company(company_id: int) -> Non
             )
 
         if to_upsert:
+            to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                to_upsert, context="Rough Country pricing company={} batch={}".format(company_id, batch_num)
+            )
             pgbulk.upsert(
                 src_models.ProviderPartCompanyPricing,
                 to_upsert,
@@ -2231,6 +2464,9 @@ def sync_provider_pricing_from_wheelpros_for_company(company_id: int) -> None:
             )
 
         if to_upsert:
+            to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                to_upsert, context="WheelPros pricing company={} batch={}".format(company_id, batch_num)
+            )
             pgbulk.upsert(
                 src_models.ProviderPartCompanyPricing,
                 to_upsert,
@@ -2383,6 +2619,9 @@ def sync_provider_inventory_from_turn14() -> None:
             )
 
         if to_upsert:
+            to_upsert = _dedupe_provider_part_inventory_for_upsert(
+                to_upsert, context="Turn14 inventory batch={}".format(batch_num)
+            )
             pgbulk.upsert(
                 src_models.ProviderPartInventory,
                 to_upsert,
@@ -2482,6 +2721,9 @@ def sync_provider_inventory_from_keystone() -> None:
         ]
 
         if to_upsert:
+            to_upsert = _dedupe_provider_part_inventory_for_upsert(
+                to_upsert, context="Keystone inventory batch={}".format(batch_num)
+            )
             pgbulk.upsert(
                 src_models.ProviderPartInventory,
                 to_upsert,
@@ -2582,6 +2824,9 @@ def sync_provider_inventory_from_meyer() -> None:
 
         to_upsert = list(inv_by_provider_part_id.values())
         if to_upsert:
+            to_upsert = _dedupe_provider_part_inventory_for_upsert(
+                to_upsert, context="Meyer inventory batch={}".format(batch_num)
+            )
             pgbulk.upsert(
                 src_models.ProviderPartInventory,
                 to_upsert,
@@ -2731,6 +2976,9 @@ def sync_provider_pricing_from_turn14() -> None:
             )
 
         if to_upsert:
+            to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                to_upsert, context="Turn14 pricing batch={}".format(batch_num)
+            )
             pgbulk.upsert(
                 src_models.ProviderPartCompanyPricing,
                 to_upsert,
@@ -2845,6 +3093,9 @@ def sync_provider_pricing_from_keystone() -> None:
             )
 
         if to_upsert:
+            to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                to_upsert, context="Keystone pricing batch={}".format(batch_num)
+            )
             pgbulk.upsert(
                 src_models.ProviderPartCompanyPricing,
                 to_upsert,
@@ -2938,6 +3189,9 @@ def sync_provider_pricing_from_meyer() -> None:
 
         to_upsert = list(pricing_by_pp_company.values())
         if to_upsert:
+            to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                to_upsert, context="Meyer pricing batch={}".format(batch_num)
+            )
             pgbulk.upsert(
                 src_models.ProviderPartCompanyPricing,
                 to_upsert,
