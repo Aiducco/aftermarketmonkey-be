@@ -4,6 +4,7 @@ API services for parts search and detail.
 import logging
 import re
 import typing
+from urllib.parse import quote
 
 from src import constants as src_constants
 from src import enums as src_enums
@@ -99,6 +100,36 @@ def _get_all_provider_image_urls() -> typing.Dict[str, typing.Optional[str]]:
     return {k: (v if v else None) for k, v in src_constants.PROVIDER_IMAGE_URLS.items()}
 
 
+def _provider_go_to_link(
+    kind_name: typing.Optional[str],
+    master_part: src_models.MasterPart,
+    provider_external_id: str,
+    turn14_vmm_part: typing.Optional[str] = None,
+) -> typing.Optional[str]:
+    """
+    Public web URL for this row's part on the distributor site, when we can derive it.
+    Uses distributor-specific identifiers (not only MasterPart.sku, which may reflect another source).
+    """
+    ext = (provider_external_id or "").strip()
+    if kind_name == "KEYSTONE":
+        if not ext:
+            return None
+        return "https://wwwsc.ekeystone.com/Search/Detail?pid={}".format(quote(ext, safe=""))
+    if kind_name == "TURN_14":
+        slug_src = turn14_vmm_part or master_part.sku or master_part.part_number or ""
+        slug = str(slug_src).strip()
+        if not slug:
+            return None
+        return "https://www.turn14.com/search/index.php?vmmPart={}".format(quote(slug.lower(), safe=""))
+    if kind_name == "MEYER":
+        if not ext:
+            return None
+        return "https://online.meyerdistributing.com/parts/details/{}".format(quote(ext, safe=""))
+    if kind_name == "WHEELPROS":
+        return None
+    return None
+
+
 def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None) -> typing.Optional[typing.Dict]:
     """
     Get detailed info for one MasterPart.
@@ -134,11 +165,31 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
             ).values_list("provider_id", flat=True)
         )
 
-    provider_parts = (
+    provider_parts = list(
         src_models.ProviderPart.objects.filter(master_part=part)
         .select_related("provider")
         .prefetch_related("inventory", "company_pricing")
     )
+
+    t14_eid_to_part_number: typing.Dict[str, str] = {}
+    t14_external_ids = [
+        pp.provider_external_id
+        for pp in provider_parts
+        if pp.provider
+        and pp.provider.kind_name == "TURN_14"
+        and (pp.provider_external_id or "").strip()
+    ]
+    if t14_external_ids:
+        for row in src_models.Turn14Items.objects.filter(external_id__in=t14_external_ids).values(
+            "external_id", "part_number"
+        ):
+            pn = row.get("part_number")
+            if isinstance(pn, str):
+                pn = pn.strip()
+            else:
+                pn = str(pn or "").strip()
+            if pn:
+                t14_eid_to_part_number[row["external_id"]] = pn
 
     providers_data = []
     for pp in provider_parts:
@@ -153,6 +204,11 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
             and pp.provider_id is not None
             and pp.provider_id in connected_provider_ids
         )
+        turn14_vmm = (
+            t14_eid_to_part_number.get(pp.provider_external_id)
+            if kind_name == "TURN_14" and pp.provider_external_id
+            else None
+        )
         provider_info = {
             "provider_id": pp.provider_id,
             "provider_name": pp.provider.name if pp.provider else None,
@@ -160,6 +216,12 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
             "provider_display_name": src_constants.PROVIDER_DISPLAY_NAMES.get(kind_name, kind_name) if kind_name else None,
             "provider_image_url": _get_provider_image_url(kind_name),
             "provider_external_id": pp.provider_external_id,
+            "provider_go_to_link": _provider_go_to_link(
+                kind_name,
+                part,
+                pp.provider_external_id or "",
+                turn14_vmm,
+            ),
             "company_integration": {"connected": integrated},
             "inventory": None,
             "pricing": None,
