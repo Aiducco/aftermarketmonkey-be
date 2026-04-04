@@ -57,6 +57,88 @@ BATCH_SIZE_PRICING = 20000
 BATCH_DELAY_SECONDS = 0.1  # Reduced from 0.3 - was adding ~30s per 100 batches
 
 
+# Wheel Pros feed uses numeric warehouse columns; map to "CITY, ST" for ProviderPartInventory JSON.
+# When two codes share the same city/state, labels include " (code)" so quantities are not merged.
+_WHEELPROS_WAREHOUSE_RAW: typing.List[typing.Tuple[str, str, str]] = [
+    ("1009", "SAN ANTONIO", "TX"),
+    ("1086", "GRAND PRAIRIE", "TX"),
+    ("1088", "ATLANTA", "GA"),
+    ("1002", "DALLAS", "TX"),
+    ("1003", "HOUSTON", "TX"),
+    ("1005", "NEW ORLEANS", "LA"),
+    ("1007", "OKLAHOMA CITY", "OK"),
+    ("1085", "BUENA PARK", "CA"),
+    ("1001", "DENVER", "CO"),
+    ("1004", "KANSAS CITY", "MO"),
+    ("1006", "PHOENIX", "AZ"),
+    ("1008", "SACRAMENTO", "CA"),
+    ("1011", "LOS ANGELES", "CA"),
+    ("1013", "SEATTLE", "WA"),
+    ("1014", "ATLANTA", "GA"),
+    ("1015", "CHICAGO", "IL"),
+    ("1016", "ORLANDO", "FL"),
+    ("1018", "MIAMI", "FL"),
+    ("1019", "CLEVELAND", "OH"),
+    ("1020", "CINCINNATI", "OH"),
+    ("1021", "CHARLOTTE", "NC"),
+    ("1022", "CRANBURY", "NJ"),
+    ("1024", "NASHVILLE", "TN"),
+    ("1025", "SALT LAKE", "UT"),
+    ("1026", "HARTFORD", "CT"),
+    ("1027", "BUENA PARK", "CA"),
+    ("1028", "MINNEAPOLIS", "MN"),
+    ("1030", "RICHMOND", "VA"),
+    ("1031", "RIVERSIDE", "CA"),
+    ("1032", "PORTLAND", "OR"),
+    ("1034", "BALTIMORE", "MD"),
+    ("1036", "DETROIT", "MI"),
+    ("1041", "HONOLULU", "HI"),
+    ("1042", "NEW YORK", "NY"),
+    ("1053", "CORONA", "CA"),
+    ("1054", "YORK", "SC"),
+    ("1055", "OGDEN", "UT"),
+    ("1057", "SALT LAKE CITY", "UT"),
+    ("1060", "ARLINGTON", "TX"),
+    ("1072", "OGDEN", "UT"),
+    ("1421", "GREENSBORO", "NC"),
+]
+
+
+def _wheelpros_warehouse_code_to_label() -> typing.Dict[str, str]:
+    label_codes: typing.Dict[str, typing.List[str]] = {}
+    for code, city, st in _WHEELPROS_WAREHOUSE_RAW:
+        lbl = "{}, {}".format(city, st)
+        label_codes.setdefault(lbl, []).append(code)
+    out: typing.Dict[str, str] = {}
+    for code, city, st in _WHEELPROS_WAREHOUSE_RAW:
+        lbl = "{}, {}".format(city, st)
+        if len(label_codes[lbl]) > 1:
+            out[code] = "{} ({})".format(lbl, code)
+        else:
+            out[code] = lbl
+    return out
+
+
+_WHEELPROS_WAREHOUSE_CODE_TO_LABEL = _wheelpros_warehouse_code_to_label()
+
+
+def _map_wheelpros_warehouse_availability(
+    wh_avail: typing.Optional[typing.Dict[str, int]],
+) -> typing.Optional[typing.Dict[str, int]]:
+    """
+    Replace numeric warehouse keys with location labels for API/display.
+    Unknown codes keep a readable fallback so new feed columns still surface.
+    """
+    if not wh_avail:
+        return None
+    out: typing.Dict[str, int] = {}
+    for k, v in wh_avail.items():
+        code = str(k).strip()
+        label = _WHEELPROS_WAREHOUSE_CODE_TO_LABEL.get(code, "WH {}".format(code))
+        out[label] = int(v)
+    return out if out else None
+
+
 def _dedupe_provider_part_inventory_for_upsert(
     rows: typing.List[src_models.ProviderPartInventory],
     context: str = "",
@@ -1793,6 +1875,8 @@ def sync_provider_inventory_from_wheelpros() -> None:
                     wh_avail = None
             else:
                 wh_avail = None
+            if wh_avail:
+                wh_avail = _map_wheelpros_warehouse_availability(wh_avail)
             to_upsert.append(
                 src_models.ProviderPartInventory(
                     provider_part=provider_part,
