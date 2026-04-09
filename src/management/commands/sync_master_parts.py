@@ -6,7 +6,7 @@ from src.search.meilisearch_client import add_documents_in_batches, delete_all_d
 
 
 class Command(BaseCommand):
-    help = "Sync MasterPart, ProviderPart, ProviderPartInventory, ProviderPartCompanyPricing from Turn14, Keystone, Meyer, Rough Country, DLG, and WheelPros"
+    help = "Sync MasterPart, ProviderPart, ProviderPartInventory, ProviderPartCompanyPricing from Turn14, Keystone, Meyer, A-Tech, Rough Country, DLG, and WheelPros"
 
     def add_arguments(self, parser):
         parser.add_argument(

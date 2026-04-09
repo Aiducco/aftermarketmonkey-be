@@ -139,3 +139,6 @@ settings.py
 
 *.pickle
 *.pkl
+
+# Local secrets (Summit Racing cookie for backfill_atech_summit_image_urls)
+summit_racing_cookie.local.txt

@@ -59,6 +59,7 @@ ATECH_PARTS_UPDATE_FIELDS = [
     "fee_handling_ground",
     "fee_handling_air",
     "gtin",
+    "image_url",
     "raw_data",
     "updated_at",
 ]
@@ -295,6 +296,7 @@ def _part_from_feed_row(
         fee_handling_ground=_safe_decimal(row.get("fee_handling_ground")),
         fee_handling_air=_safe_decimal(row.get("fee_handling_air")),
         gtin=_clean_csv_value(row.get("gtin")),
+        image_url=_clean_csv_value(row.get("image_url")),
         raw_data=_json_safe_row(row) if row else None,
     )
 

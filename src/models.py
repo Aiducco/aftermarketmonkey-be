@@ -757,7 +757,7 @@ class AtechPrefixBrand(django_db_models.Model):
 
 class AtechParts(django_db_models.Model):
     """
-    Row from A-Tech combined feed (atechfile.txt): pricing, per-DC amounts, fees, GTIN.
+    Row from A-Tech combined relay feed: pricing, per-DC amounts, fees, GTIN.
     ``feed_part_number`` is the full distributor line (e.g. ACC-35370); ``part_number`` and
     ``mfr_part_number`` store the suffix after the known prefix and hyphen (e.g. 35370).
     ``brand`` may be null when no ``AtechPrefixBrand`` mapping exists yet; ``brand_prefix`` is
@@ -789,6 +789,7 @@ class AtechParts(django_db_models.Model):
     fee_handling_ground = django_db_models.DecimalField(max_digits=14, decimal_places=5, null=True, blank=True)
     fee_handling_air = django_db_models.DecimalField(max_digits=14, decimal_places=5, null=True, blank=True)
     gtin = django_db_models.CharField(max_length=64, null=True, blank=True)
+    image_url = django_db_models.TextField(null=True, blank=True)
     raw_data = django_db_models.JSONField(null=True, blank=True)
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)

@@ -69,7 +69,7 @@ class MeyerCredentialsSchema(Schema):
 
 
 class AtechCredentialsSchema(Schema):
-    """A-Tech relay SFTP — credentials from info@aftermarketmonkey.com; combined feed filename from settings (atechfile.txt)."""
+    """A-Tech relay SFTP — credentials from info@aftermarketmonkey.com; combined catalog, multi-DC inventory, and pricing feed (remote name configurable via settings or credentials)."""
 
     sftp_user = fields.String(required=True)
     sftp_password = fields.String(required=True)

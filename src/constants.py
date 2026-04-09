@@ -151,8 +151,9 @@ PROVIDER_CATALOG = [
         "kind": enums.BrandProviderKind.ATECH,
         "name": "A-Tech",
         "description": (
-            "Sync A-Tech catalog, multi-location inventory, and pricing from AftermarketMonkey's SFTP relay "
-            "(single feed file <code>atechfile.txt</code>)."
+            "Ingest A-Tech catalog, four-warehouse inventory, and price tiers from AftermarketMonkey&rsquo;s SFTP relay. "
+            "One combined distributor feed supplies part lines, multi-location stock, cost/retail/jobber, fees, and GTIN; "
+            "your company connection unlocks catalog sync plus per-account pricing snapshots on the same layout."
         ),
         "icon_url": "https://api.aftermarketmonkey.com/uploads/atech_logo.png",
         "category": "Distributors",
@@ -160,21 +161,32 @@ PROVIDER_CATALOG = [
         "connection_optional_fields": [],
         "installation_instructions_html": (
             "<p>Email <a href=\"mailto:info@aftermarketmonkey.com\">info@aftermarketmonkey.com</a> so we can "
-            "create a unique SFTP account for you and send a <strong>username</strong> and <strong>password</strong>. "
-            "A-Tech delivers one combined feed to AftermarketMonkey&rsquo;s SFTP relay; ask your A-Tech account "
-            "representative to set up the feed to connect to <strong>our</strong> SFTP endpoint using the details below.</p>"
-            "<p><strong>Endpoint for your A-Tech rep</strong></p>"
+            "provision a dedicated SFTP login (<strong>username</strong> and <strong>password</strong>) on "
+            "AftermarketMonkey&rsquo;s relay. Ask your A-Tech representative to deliver their standard "
+            "combined catalog and pricing extract to <strong>our</strong> endpoint so a single drop updates your data."
+            "</p>"
+            "<p><strong>Relay endpoint (for your A-Tech rep)</strong></p>"
             "<ul>"
-            "<li><strong>SFTP:</strong> <code>54.145.82.238</code></li>"
+            "<li><strong>Host:</strong> <code>54.145.82.238</code> (SFTP)</li>"
             "<li><strong>Port:</strong> <code>22</code></li>"
-            "<li><strong>Folder:</strong> <code>uploads</code></li>"
-            "<li><strong>File:</strong> <code>atechfile.txt</code> (pricing, warehouse quantities, fees, GTIN)</li>"
-            "<li><strong>User / password:</strong> we provide these after you email us</li>"
+            "<li><strong>Directory:</strong> <code>uploads</code></li>"
+            "<li><strong>Credentials:</strong> we send you the SFTP user and password after onboarding</li>"
             "</ul>"
-            "<p><strong>Warehouse quantity columns</strong> (by DC): Tallmadge OH, Sparks NV, McDonough GA, Arlington TX.</p>"
-            "<p>When you have your login, enter <strong>sftp_user</strong> and <strong>sftp_password</strong> below "
-            "and save the connection. For help, contact "
-            "<a href=\"mailto:info@aftermarketmonkey.com\">info@aftermarketmonkey.com</a>.</p>"
+            "<p><strong>What we sync from their combined feed</strong></p>"
+            "<ul>"
+            "<li><strong>Catalog:</strong> distributor part numbers, manufacturer references, descriptions, and brand "
+            "mapping hooks (prefix-based) so parts line up with your aftermarket catalog.</li>"
+            "<li><strong>Multi-location inventory:</strong> separate on-hand quantities for each A-Tech DC&mdash;"
+            "Tallmadge (OH), Sparks (NV), McDonough (GA), and Arlington (TX)&mdash;surfaced as regional availability "
+            "in your integration layer.</li>"
+            "<li><strong>Pricing:</strong> cost, retail, and jobber columns from the relay feed; per-company pulls "
+            "reuse the same field layout so your negotiated prices stay aligned when reps refresh your file.</li>"
+            "<li><strong>Extras:</strong> core and freight-related fee columns, hazmat / handling flags where present, "
+            "and GTIN when the supplier includes it.</li>"
+            "</ul>"
+            "<p>After we send your SFTP details, enter <strong>sftp_user</strong> and <strong>sftp_password</strong> "
+            "below and save. Saving also schedules a pricing refresh for your company where supported. "
+            "Questions: <a href=\"mailto:info@aftermarketmonkey.com\">info@aftermarketmonkey.com</a>.</p>"
         ),
     },
     {
