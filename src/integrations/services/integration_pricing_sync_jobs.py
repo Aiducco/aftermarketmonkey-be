@@ -12,6 +12,8 @@ from src import enums as src_enums
 from src import models as src_models
 from src.integrations.services import keystone as keystone_services
 from src.integrations.services import master_parts
+from src.integrations.services import atech as atech_services
+from src.integrations.services import dlg as dlg_services
 from src.integrations.services import meyer as meyer_services
 from src.integrations.services import rough_country as rough_country_services
 from src.integrations.services import turn_14 as turn_14_services
@@ -28,6 +30,8 @@ _PRICING_SYNC_KINDS = frozenset(
         src_enums.BrandProviderKind.ROUGH_COUNTRY.value,
         src_enums.BrandProviderKind.WHEELPROS.value,
         src_enums.BrandProviderKind.MEYER.value,
+        src_enums.BrandProviderKind.ATECH.value,
+        src_enums.BrandProviderKind.DLG.value,
     }
 )
 
@@ -68,12 +72,18 @@ def _sync_distributor_tables_then_master_parts(cp: src_models.CompanyProviders) 
     elif kind == src_enums.BrandProviderKind.MEYER.value:
         meyer_services.sync_meyer_company_pricing_for_company_provider(cp.id)
         master_parts.sync_provider_pricing_from_meyer_for_company(company_id)
+    elif kind == src_enums.BrandProviderKind.ATECH.value:
+        atech_services.sync_atech_company_pricing_for_company_provider(cp.id)
+        master_parts.sync_provider_pricing_from_atech_for_company(company_id)
     elif kind == src_enums.BrandProviderKind.ROUGH_COUNTRY.value:
         rough_country_services.sync_rough_country_company_pricing_for_company_provider(cp.id)
         master_parts.sync_provider_pricing_from_rough_country_for_company(company_id)
     elif kind == src_enums.BrandProviderKind.WHEELPROS.value:
         wheelpros_services.sync_wheelpros_company_pricing_for_company_provider(cp.id)
         master_parts.sync_provider_pricing_from_wheelpros_for_company(company_id)
+    elif kind == src_enums.BrandProviderKind.DLG.value:
+        dlg_services.sync_dlg_company_pricing_for_company_provider(cp.id)
+        master_parts.sync_provider_pricing_from_dlg_for_company(company_id)
     else:
         raise ValueError("Unsupported provider kind for pricing sync: {}".format(kind))
 

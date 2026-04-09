@@ -1,6 +1,6 @@
 """
 Seed providers table from PROVIDER_CATALOG constants.
-Creates or updates Providers for Turn 14, Keystone, Meyer, SDC, Rough Country, Wheel Pros.
+Creates or updates Providers for Turn 14, Keystone, Meyer, A-Tech, DLG, SDC, Rough Country, Wheel Pros.
 Run: python manage.py seed_providers
 """
 from django.core.management.base import BaseCommand

@@ -49,6 +49,8 @@ PROVIDER_IMAGE_URLS = {
     "TURN_14": "https://api.aftermarketmonkey.com/uploads/t14_logo.png",
     "KEYSTONE": "https://api.aftermarketmonkey.com/uploads/keystone.png",
     "MEYER": "https://api.aftermarketmonkey.com/uploads/meyer_logo.png",
+    "ATECH": "https://api.aftermarketmonkey.com/uploads/atech_logo.png",
+    "DLG": "https://api.aftermarketmonkey.com/uploads/dlg_logo.png",
     "ROUGH_COUNTRY": "https://api.aftermarketmonkey.com/uploads/rough_country.png",
     "WHEELPROS": "https://api.aftermarketmonkey.com/uploads/wheel_pros_logo.png",
     "SDC": "",
@@ -209,12 +211,14 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
             if kind_name == "TURN_14" and pp.provider_external_id
             else None
         )
+        distributor_logo_image_url = _get_provider_image_url(kind_name)
         provider_info = {
             "provider_id": pp.provider_id,
             "provider_name": pp.provider.name if pp.provider else None,
             "provider_kind_name": kind_name,
             "provider_display_name": src_constants.PROVIDER_DISPLAY_NAMES.get(kind_name, kind_name) if kind_name else None,
-            "provider_image_url": _get_provider_image_url(kind_name),
+            "provider_image_url": distributor_logo_image_url,
+            "distributor_logo_image_url": distributor_logo_image_url,
             "provider_external_id": pp.provider_external_id,
             "provider_go_to_link": _provider_go_to_link(
                 kind_name,
@@ -262,5 +266,6 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
 
         providers_data.append(provider_info)
 
+    base["provider_image_urls"] = _get_all_provider_image_urls()
     base["providers"] = providers_data
     return base

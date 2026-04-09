@@ -166,6 +166,8 @@ def save_personalization(
         "turn_14": {"client_id": "...", "client_secret": "..."},
         "keystone": {"ftp_user": "...", "ftp_password": "..."},
         "meyer": {"sftp_user": "...", "sftp_password": "..."},
+        "atech": {"sftp_user": "...", "sftp_password": "..."},
+        "dlg": {"sftp_user": "...", "sftp_password": "...", "dlg_inventory_remote_file": "dlg_inventory.csv"},
         "wheelpros": {
             "sftp_user": "...",
             "sftp_password": "...",
@@ -255,6 +257,54 @@ def _upsert_company_providers(company: src_models.Company, credentials: dict) ->
         if user_ok and pass_ok:
             provider = src_models.Providers.objects.filter(
                 kind=src_enums.BrandProviderKind.MEYER.value
+            ).first()
+            if provider:
+                cred_dict = {
+                    "sftp_user": user_ok,
+                    "sftp_password": pass_ok,
+                }
+                cp, _ = src_models.CompanyProviders.objects.update_or_create(
+                    company=company,
+                    provider=provider,
+                    defaults={
+                        "credentials": cred_dict,
+                        "primary": False,
+                    },
+                )
+                integration_pricing_sync_jobs.enqueue_company_provider_pricing_sync(cp.id)
+
+    # A-Tech: kind=7 (ATECH) — user/password; host/port/dir/feed file from ATECH_SFTP_* / ATECH_FEED_REMOTE_FILE
+    if "atech" in credentials:
+        creds = credentials["atech"]
+        user_ok = str(creds.get("sftp_user") or "").strip()
+        pass_ok = str(creds.get("sftp_password") or "").strip()
+        if user_ok and pass_ok:
+            provider = src_models.Providers.objects.filter(
+                kind=src_enums.BrandProviderKind.ATECH.value
+            ).first()
+            if provider:
+                cred_dict = {
+                    "sftp_user": user_ok,
+                    "sftp_password": pass_ok,
+                }
+                cp, _ = src_models.CompanyProviders.objects.update_or_create(
+                    company=company,
+                    provider=provider,
+                    defaults={
+                        "credentials": cred_dict,
+                        "primary": False,
+                    },
+                )
+                integration_pricing_sync_jobs.enqueue_company_provider_pricing_sync(cp.id)
+
+    # DLG: kind=8 — relay SFTP; inventory + per-company Base Price -> DlgCompanyPricing + integration job.
+    if "dlg" in credentials:
+        creds = credentials["dlg"]
+        user_ok = str(creds.get("sftp_user") or "").strip()
+        pass_ok = str(creds.get("sftp_password") or "").strip()
+        if user_ok and pass_ok:
+            provider = src_models.Providers.objects.filter(
+                kind=src_enums.BrandProviderKind.DLG.value
             ).first()
             if provider:
                 cred_dict = {
@@ -384,5 +434,27 @@ def get_distributor_credentials_info() -> dict:
             ),
             "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("MEYER", "Meyer"),
             "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("MEYER") or None,
+        },
+        "atech": {
+            "required": ["sftp_user", "sftp_password"],
+            "description": (
+                "Email info@aftermarketmonkey.com for SFTP credentials, then enter sftp_user and sftp_password. "
+                "A-Tech delivers one file (atechfile.txt) to AftermarketMonkey's relay — host 54.145.82.238, port 22, "
+                "folder uploads — with part data, Cost/Retail/Jobber, DC quantities (Tallmadge OH, Sparks NV, "
+                "McDonough GA, Arlington TX), core and shipping-related fees, and GTIN."
+            ),
+            "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("ATECH", "A-Tech"),
+            "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("ATECH") or None,
+        },
+        "dlg": {
+            "required": ["sftp_user", "sftp_password"],
+            "description": (
+                "DLG inventory CSV (default remote name dlg_inventory.csv) on AftermarketMonkey's SFTP relay — Brand, Name, "
+                "Display Name, Available On Hand, Units, Base Price. Host 54.145.82.238, port 22, folder uploads by default. "
+                "Optional credentials: dlg_inventory_remote_file or feed_remote_file if the filename differs. "
+                "Do not reuse Meyer credentials keys as-is (Meyer uses inventory_remote_file for Meyer Inventory.csv)."
+            ),
+            "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("DLG", "DLG"),
+            "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("DLG") or None,
         },
     }

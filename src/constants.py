@@ -3,6 +3,8 @@ PROVIDER_DISPLAY_NAMES = {
     "TURN_14": "Turn 14",
     "KEYSTONE": "Keystone",
     "MEYER": "Meyer",
+    "ATECH": "A-Tech",
+    "DLG": "DLG",
     "ROUGH_COUNTRY": "Rough Country",
     "SDC": "SDC",
     "WHEELPROS": "Wheel Pros",
@@ -13,6 +15,8 @@ PROVIDER_IMAGE_URLS = {
     "TURN_14": "https://api.aftermarketmonkey.com/uploads/t14_logo.png",
     "KEYSTONE": "https://api.aftermarketmonkey.com/uploads/keystone.png",
     "MEYER": "https://api.aftermarketmonkey.com/uploads/meyer_logo.png",
+    "ATECH": "https://api.aftermarketmonkey.com/uploads/atech_logo.png",
+    "DLG": "https://api.aftermarketmonkey.com/uploads/dlg_logo.png",
     "ROUGH_COUNTRY": "https://api.aftermarketmonkey.com/uploads/rough_country.png",
     "SDC": "",
     "WHEELPROS": "https://api.aftermarketmonkey.com/uploads/wheel_pros_logo.png",
@@ -141,6 +145,60 @@ PROVIDER_CATALOG = [
             "<p>When you have your login, enter <strong>sftp_user</strong> and <strong>sftp_password</strong> below "
             "and save the connection. For help, contact "
             "<a href=\"mailto:info@aftermarketmonkey.com\">info@aftermarketmonkey.com</a>.</p>"
+        ),
+    },
+    {
+        "kind": enums.BrandProviderKind.ATECH,
+        "name": "A-Tech",
+        "description": (
+            "Sync A-Tech catalog, multi-location inventory, and pricing from AftermarketMonkey's SFTP relay "
+            "(single feed file <code>atechfile.txt</code>)."
+        ),
+        "icon_url": "https://api.aftermarketmonkey.com/uploads/atech_logo.png",
+        "category": "Distributors",
+        "connection_required_fields": ["sftp_user", "sftp_password"],
+        "connection_optional_fields": [],
+        "installation_instructions_html": (
+            "<p>Email <a href=\"mailto:info@aftermarketmonkey.com\">info@aftermarketmonkey.com</a> so we can "
+            "create a unique SFTP account for you and send a <strong>username</strong> and <strong>password</strong>. "
+            "A-Tech delivers one combined feed to AftermarketMonkey&rsquo;s SFTP relay; ask your A-Tech account "
+            "representative to set up the feed to connect to <strong>our</strong> SFTP endpoint using the details below.</p>"
+            "<p><strong>Endpoint for your A-Tech rep</strong></p>"
+            "<ul>"
+            "<li><strong>SFTP:</strong> <code>54.145.82.238</code></li>"
+            "<li><strong>Port:</strong> <code>22</code></li>"
+            "<li><strong>Folder:</strong> <code>uploads</code></li>"
+            "<li><strong>File:</strong> <code>atechfile.txt</code> (pricing, warehouse quantities, fees, GTIN)</li>"
+            "<li><strong>User / password:</strong> we provide these after you email us</li>"
+            "</ul>"
+            "<p><strong>Warehouse quantity columns</strong> (by DC): Tallmadge OH, Sparks NV, McDonough GA, Arlington TX.</p>"
+            "<p>When you have your login, enter <strong>sftp_user</strong> and <strong>sftp_password</strong> below "
+            "and save the connection. For help, contact "
+            "<a href=\"mailto:info@aftermarketmonkey.com\">info@aftermarketmonkey.com</a>.</p>"
+        ),
+    },
+    {
+        "kind": enums.BrandProviderKind.DLG,
+        "name": "DLG",
+        "description": (
+            "Sync DLG inventory from AftermarketMonkey's SFTP relay (dlg_inventory.csv: brand, SKU, description, qty, price)."
+        ),
+        "icon_url": "https://api.aftermarketmonkey.com/uploads/dlg_logo.png",
+        "category": "Distributors",
+        "connection_required_fields": ["sftp_user", "sftp_password"],
+        "connection_optional_fields": [],
+        "installation_instructions_html": (
+            "<p>Email <a href=\"mailto:info@aftermarketmonkey.com\">info@aftermarketmonkey.com</a> for SFTP credentials. "
+            "DLG inventory is delivered to AftermarketMonkey&rsquo;s relay as <code>dlg_inventory.csv</code> "
+            "(Brand, Name, Display Name, Available On Hand, Units, Base Price).</p>"
+            "<p><strong>Endpoint</strong></p>"
+            "<ul>"
+            "<li><strong>SFTP:</strong> <code>54.145.82.238</code></li>"
+            "<li><strong>Port:</strong> <code>22</code></li>"
+            "<li><strong>Folder:</strong> <code>uploads</code></li>"
+            "<li><strong>File:</strong> <code>dlg_inventory.csv</code></li>"
+            "</ul>"
+            "<p>Enter <strong>sftp_user</strong> and <strong>sftp_password</strong> below and save.</p>"
         ),
     },
 ]
