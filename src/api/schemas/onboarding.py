@@ -68,6 +68,20 @@ class MeyerCredentialsSchema(Schema):
     sftp_password = fields.String(required=True)
 
 
+class AtechCredentialsSchema(Schema):
+    """A-Tech relay SFTP — credentials from info@aftermarketmonkey.com; combined feed filename from settings (atechfile.txt)."""
+
+    sftp_user = fields.String(required=True)
+    sftp_password = fields.String(required=True)
+
+
+class DlgCredentialsSchema(Schema):
+    """DLG relay SFTP — inventory CSV dlg_inventory.csv from settings / relay."""
+
+    sftp_user = fields.String(required=True)
+    sftp_password = fields.String(required=True)
+
+
 class WheelProsCredentialsSchema(Schema):
     """Wheel Pros SFTP: user/password only; host/port from Django settings."""
 
@@ -88,7 +102,7 @@ class PersonalizationSchema(Schema):
         required=False,
         load_default=list,
     )
-    # Optional: credentials per distributor. Keys: turn_14, keystone, meyer, wheelpros
+    # Optional: credentials per distributor. Keys: turn_14, keystone, meyer, atech, dlg, wheelpros
     distributor_credentials = fields.Dict(
         required=False,
         allow_none=True,

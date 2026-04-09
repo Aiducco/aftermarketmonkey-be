@@ -5,7 +5,7 @@ from src.integrations.services import master_parts
 
 class Command(BaseCommand):
     help = (
-        "Sync ProviderPartCompanyPricing from Turn14, Keystone, Meyer, Rough Country, and WheelPros"
+        "Sync ProviderPartCompanyPricing from Turn14, Keystone, Meyer, Rough Country, DLG, and WheelPros"
     )
 
     def handle(self, *args, **options):
@@ -15,6 +15,7 @@ class Command(BaseCommand):
             master_parts.sync_provider_pricing_from_keystone()
             master_parts.sync_provider_pricing_from_meyer()
             master_parts.sync_provider_pricing_from_rough_country()
+            master_parts.sync_provider_pricing_from_dlg()
             master_parts.sync_provider_pricing_from_wheelpros()
             self.stdout.write(self.style.SUCCESS("Done."))
         except Exception as e:

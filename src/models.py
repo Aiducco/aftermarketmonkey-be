@@ -693,6 +693,232 @@ class MeyerCompanyPricing(django_db_models.Model):
         unique_together = [["part", "company"]]
 
 
+class AtechBrand(django_db_models.Model):
+    """Distributor brand for A-Tech (linked from SKU prefix via AtechPrefixBrand)."""
+
+    external_id = django_db_models.CharField(max_length=512)
+    name = django_db_models.CharField(max_length=512)
+    aaia_code = django_db_models.CharField(max_length=255, null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "atech_brands"
+        unique_together = [["external_id"]]
+
+
+class BrandAtechBrandMapping(django_db_models.Model):
+    """Links catalog ``Brands`` to ``AtechBrand`` (for master parts and company pricing fan-out)."""
+
+    brand = django_db_models.ForeignKey(
+        Brands,
+        on_delete=django_db_models.CASCADE,
+        related_name="atech_brand_mappings",
+    )
+    atech_brand = django_db_models.ForeignKey(
+        AtechBrand,
+        on_delete=django_db_models.CASCADE,
+        related_name="brand_mappings",
+    )
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "brand_atech_brand_mapping"
+        unique_together = [["brand", "atech_brand"]]
+
+
+class AtechPrefixBrand(django_db_models.Model):
+    """
+    Manual mapping: SKU prefix (part number segment before '-', stored uppercase) -> AtechBrand.
+    Example: prefix ACC for ACC-35370 -> AtechBrand whose ``name`` is the catalog label you want.
+    """
+
+    prefix = django_db_models.CharField(max_length=64)
+    atech_brand = django_db_models.ForeignKey(
+        AtechBrand,
+        on_delete=django_db_models.CASCADE,
+        related_name="prefix_mappings",
+    )
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    def save(self, *args, **kwargs):
+        self.prefix = (self.prefix or "").strip().upper()
+        super().save(*args, **kwargs)
+
+    class Meta:
+        db_table = "atech_prefix_brand"
+        unique_together = [["prefix"]]
+
+
+class AtechParts(django_db_models.Model):
+    """
+    Row from A-Tech combined feed (atechfile.txt): pricing, per-DC amounts, fees, GTIN.
+    ``feed_part_number`` is the full distributor line (e.g. ACC-35370); ``part_number`` and
+    ``mfr_part_number`` store the suffix after the known prefix and hyphen (e.g. 35370).
+    ``brand`` may be null when no ``AtechPrefixBrand`` mapping exists yet; ``brand_prefix`` is
+    always the token before the first hyphen in the feed line (e.g. ACC).
+    """
+
+    brand = django_db_models.ForeignKey(
+        AtechBrand,
+        on_delete=django_db_models.CASCADE,
+        related_name="parts",
+        null=True,
+        blank=True,
+    )
+    brand_prefix = django_db_models.CharField(max_length=64, blank=True, default="")
+    feed_part_number = django_db_models.CharField(max_length=255)
+    part_number = django_db_models.CharField(max_length=255)
+    mfr_part_number = django_db_models.CharField(max_length=255, null=True, blank=True)
+    description = django_db_models.TextField(null=True, blank=True)
+    cost = django_db_models.DecimalField(max_digits=14, decimal_places=5, null=True, blank=True)
+    retail_price = django_db_models.DecimalField(max_digits=14, decimal_places=5, null=True, blank=True)
+    jobber_price = django_db_models.DecimalField(max_digits=14, decimal_places=5, null=True, blank=True)
+    qty_tallmadge = django_db_models.IntegerField(null=True, blank=True)
+    qty_sparks = django_db_models.IntegerField(null=True, blank=True)
+    qty_mcdonough = django_db_models.IntegerField(null=True, blank=True)
+    qty_arlington = django_db_models.IntegerField(null=True, blank=True)
+    core_charge = django_db_models.DecimalField(max_digits=14, decimal_places=5, null=True, blank=True)
+    fee_hazmat = django_db_models.DecimalField(max_digits=14, decimal_places=5, null=True, blank=True)
+    fee_truck_us = django_db_models.DecimalField(max_digits=14, decimal_places=5, null=True, blank=True)
+    fee_handling_ground = django_db_models.DecimalField(max_digits=14, decimal_places=5, null=True, blank=True)
+    fee_handling_air = django_db_models.DecimalField(max_digits=14, decimal_places=5, null=True, blank=True)
+    gtin = django_db_models.CharField(max_length=64, null=True, blank=True)
+    raw_data = django_db_models.JSONField(null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "atech_parts"
+        unique_together = [["feed_part_number"]]
+
+
+class AtechCompanyPricing(django_db_models.Model):
+    """
+    Per-company A-Tech prices for an ``AtechParts`` row (same column layout as the SFTP feed).
+    Catalog / inventory columns remain on ``AtechParts``; amounts here come from each company's feed pull.
+    """
+
+    part = django_db_models.ForeignKey(
+        AtechParts,
+        on_delete=django_db_models.CASCADE,
+        related_name="company_pricing",
+    )
+    company = django_db_models.ForeignKey(
+        Company,
+        on_delete=django_db_models.CASCADE,
+        related_name="atech_company_pricing",
+    )
+    cost = django_db_models.DecimalField(max_digits=14, decimal_places=5, null=True, blank=True)
+    retail_price = django_db_models.DecimalField(max_digits=14, decimal_places=5, null=True, blank=True)
+    jobber_price = django_db_models.DecimalField(max_digits=14, decimal_places=5, null=True, blank=True)
+    core_charge = django_db_models.DecimalField(max_digits=14, decimal_places=5, null=True, blank=True)
+    fee_hazmat = django_db_models.DecimalField(max_digits=14, decimal_places=5, null=True, blank=True)
+    fee_truck_us = django_db_models.DecimalField(max_digits=14, decimal_places=5, null=True, blank=True)
+    fee_handling_ground = django_db_models.DecimalField(max_digits=14, decimal_places=5, null=True, blank=True)
+    fee_handling_air = django_db_models.DecimalField(max_digits=14, decimal_places=5, null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "atech_company_pricing"
+        unique_together = [["part", "company"]]
+
+
+class DlgBrand(django_db_models.Model):
+    """Feed brand label from DLG ``dlg_inventory.csv`` (``Brand`` column)."""
+
+    external_id = django_db_models.CharField(max_length=512)
+    name = django_db_models.CharField(max_length=512)
+    aaia_code = django_db_models.CharField(max_length=255, null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "dlg_brands"
+        unique_together = [["external_id"]]
+
+
+class BrandDlgBrandMapping(django_db_models.Model):
+    brand = django_db_models.ForeignKey(
+        Brands,
+        on_delete=django_db_models.CASCADE,
+        related_name="dlg_brand_mappings",
+    )
+    dlg_brand = django_db_models.ForeignKey(
+        DlgBrand,
+        on_delete=django_db_models.CASCADE,
+        related_name="brand_mappings",
+    )
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "brand_dlg_brand_mapping"
+        unique_together = [["brand", "dlg_brand"]]
+
+
+class DlgParts(django_db_models.Model):
+    """
+    Row from ``dlg_inventory.csv``: ``Name`` = part / SKU, ``Display Name`` = description,
+    ``Available On Hand`` = qty, ``Units`` = sell unit, ``Base Price`` = list/base price.
+    """
+
+    brand = django_db_models.ForeignKey(
+        DlgBrand,
+        on_delete=django_db_models.CASCADE,
+        related_name="parts",
+    )
+    part_number = django_db_models.CharField(max_length=255)
+    display_name = django_db_models.TextField(null=True, blank=True)
+    available_on_hand = django_db_models.IntegerField(null=True, blank=True)
+    units = django_db_models.CharField(max_length=64, null=True, blank=True)
+    base_price = django_db_models.DecimalField(max_digits=14, decimal_places=5, null=True, blank=True)
+    raw_data = django_db_models.JSONField(null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "dlg_parts"
+        unique_together = [["part_number", "brand"]]
+
+
+class DlgCompanyPricing(django_db_models.Model):
+    """
+    Per-company DLG pricing for a ``DlgParts`` row (from that company’s ``dlg_inventory.csv``).
+    Catalog/inventory fields stay on ``DlgParts``; ``base_price`` here is the company-specific amount.
+    """
+
+    part = django_db_models.ForeignKey(
+        DlgParts,
+        on_delete=django_db_models.CASCADE,
+        related_name="company_pricing",
+    )
+    company = django_db_models.ForeignKey(
+        Company,
+        on_delete=django_db_models.CASCADE,
+        related_name="dlg_company_pricing",
+    )
+    base_price = django_db_models.DecimalField(max_digits=14, decimal_places=5, null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "dlg_company_pricing"
+        unique_together = [["part", "company"]]
+
+
 class WheelProsBrand(django_db_models.Model):
     external_id = django_db_models.CharField(max_length=255)
     name = django_db_models.CharField(max_length=255)

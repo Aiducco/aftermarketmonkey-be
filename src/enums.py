@@ -23,6 +23,8 @@ class BrandProviderKind(enum.Enum):
     ROUGH_COUNTRY = 4
     WHEELPROS = 5
     MEYER = 6
+    ATECH = 7
+    DLG = 8
 
 class BrandProviderStatus(enum.Enum):
     ACTIVE = 1

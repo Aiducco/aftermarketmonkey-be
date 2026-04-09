@@ -257,6 +257,29 @@ MEYER_INVENTORY_REMOTE_FILE = os.environ.get("MEYER_INVENTORY_REMOTE_FILE") or "
 MEYER_PRICING_LOCAL_PATH = os.environ.get("MEYER_PRICING_LOCAL_PATH", "/tmp/meyer_pricing.csv")
 MEYER_INVENTORY_LOCAL_PATH = os.environ.get("MEYER_INVENTORY_LOCAL_PATH", "/tmp/meyer_inventory.csv")
 
+# A-Tech relay SFTP: same pattern as Meyer — per-company sftp_user/sftp_password in CompanyProviders.
+try:
+    _atech_port = int(os.environ.get("ATECH_SFTP_PORT") or "22")
+except ValueError:
+    _atech_port = 22
+ATECH_SFTP_HOST = os.environ.get("ATECH_SFTP_HOST") or "54.145.82.238"
+ATECH_SFTP_PORT = _atech_port if 1 <= _atech_port <= 65535 else 22
+ATECH_SFTP_DIRECTORY = os.environ.get("ATECH_SFTP_DIRECTORY") or "uploads"
+# Single combined feed: pricing, per-warehouse qty, fees, GTIN (see clients/atech/feed_spec.py).
+ATECH_FEED_REMOTE_FILE = os.environ.get("ATECH_FEED_REMOTE_FILE") or "atechfile.txt"
+ATECH_FEED_LOCAL_PATH = os.environ.get("ATECH_FEED_LOCAL_PATH", "/tmp/atechfile.txt")
+
+# DLG relay SFTP — inventory CSV (Brand, Name, Display Name, Available On Hand, Units, Base Price).
+try:
+    _dlg_port = int(os.environ.get("DLG_SFTP_PORT") or "22")
+except ValueError:
+    _dlg_port = 22
+DLG_SFTP_HOST = os.environ.get("DLG_SFTP_HOST") or "54.145.82.238"
+DLG_SFTP_PORT = _dlg_port if 1 <= _dlg_port <= 65535 else 22
+DLG_SFTP_DIRECTORY = os.environ.get("DLG_SFTP_DIRECTORY") or "uploads"
+DLG_INVENTORY_REMOTE_FILE = os.environ.get("DLG_INVENTORY_REMOTE_FILE") or "dlg_inventory.csv"
+DLG_INVENTORY_LOCAL_PATH = os.environ.get("DLG_INVENTORY_LOCAL_PATH", "/tmp/dlg_inventory.csv")
+
 # Meilisearch (backend: master key for indexing; FE will use a public read-only key)
 MEILISEARCH_HOST = "http://localhost:7700"
 MEILISEARCH_MASTER_KEY = ""  # Set via env; required for indexing. Create a separate search-only key for FE.
