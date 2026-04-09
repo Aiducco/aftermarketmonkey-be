@@ -1,11 +1,12 @@
 """
 Sync MasterPart, ProviderPart, ProviderPartInventory, and ProviderPartCompanyPricing
-from Turn14, Keystone, Meyer, Rough Country, WheelPros, and DLG provider data (including DLG company pricing).
+from Turn14, Keystone, Meyer, A-Tech, Rough Country, WheelPros, and DLG provider data (including DLG company pricing).
 """
 import logging
 import time
 import typing
 from datetime import date
+from urllib.parse import quote
 
 from django.db import connection
 from django.utils import timezone
@@ -18,6 +19,11 @@ from src import models as src_models
 logger = logging.getLogger(__name__)
 
 _LOG_PREFIX = "[MASTER-PARTS]"
+
+# Public B2B product links for inventory payloads (warehouse_availability.provider_url when qty > 0).
+_DLG_B2B_SEARCH_URL_TEMPLATE = "https://www.dlgb2b.com/search?keywords={}"
+_ATECH_PARTS_URL_TEMPLATE = "https://www.atechmotorsports.com/parts/{}"
+_ROUGH_COUNTRY_SEARCH_URL_TEMPLATE = "https://www.roughcountry.com/search/{}"
 
 
 def _get_brand_for_turn14_brand(turn14_brand: src_models.Turn14Brand) -> typing.Optional[src_models.Brands]:
@@ -1335,18 +1341,27 @@ def sync_master_parts_from_dlg() -> None:
     ))
 
 
-def _rough_country_warehouse_availability(
-    nv_stock: typing.Optional[int], tn_stock: typing.Optional[int]
-) -> typing.Optional[typing.Dict[str, int]]:
-    """Build warehouse_availability from RoughCountryPart NV/TN stock with friendly names."""
-    if nv_stock is None and tn_stock is None:
-        return None
-    out = {}
+def _rough_country_inventory_warehouse_availability(
+    nv_stock: typing.Optional[int],
+    tn_stock: typing.Optional[int],
+    sku: str,
+) -> typing.Optional[typing.Dict[str, typing.Any]]:
+    """
+    NV/TN stock by friendly DC names; provider_url when total on-hand > 0
+    (Rough Country site search by SKU, e.g. /search/47120580B).
+    """
+    out: typing.Dict[str, typing.Any] = {}
     if nv_stock is not None:
         out["Nevada"] = nv_stock
     if tn_stock is not None:
         out["Tennessee"] = tn_stock
-    return out if out else None
+    total = (nv_stock or 0) + (tn_stock or 0)
+    sku_clean = (sku or "").strip()
+    if total > 0 and sku_clean:
+        out["provider_url"] = _ROUGH_COUNTRY_SEARCH_URL_TEMPLATE.format(quote(sku_clean, safe=""))
+    if not out:
+        return None
+    return out
 
 
 def sync_provider_inventory_from_rough_country() -> None:
@@ -1393,13 +1408,18 @@ def sync_provider_inventory_from_rough_country() -> None:
             nv = row.get("nv_stock")
             tn = row.get("tn_stock")
             total = (nv or 0) + (tn or 0)
+            sku_raw = row.get("sku")
+            if isinstance(sku_raw, str):
+                sku_s = sku_raw.strip()
+            else:
+                sku_s = str(sku_raw or "").strip()
             to_upsert.append(
                 src_models.ProviderPartInventory(
                     provider_part=provider_part,
                     warehouse_total_qty=total,
                     manufacturer_inventory=None,
                     manufacturer_esd=None,
-                    warehouse_availability=_rough_country_warehouse_availability(nv, tn),
+                    warehouse_availability=_rough_country_inventory_warehouse_availability(nv, tn, sku_s),
                     last_synced_at=now,
                     updated_at=now,
                 )
@@ -1435,7 +1455,7 @@ def sync_provider_inventory_from_rough_country() -> None:
 
 
 def sync_provider_inventory_from_dlg() -> None:
-    """Sync ProviderPartInventory from DlgParts.available_on_hand (mapped brands only)."""
+    """Sync ProviderPartInventory from DlgParts (mapped brands): totals + warehouse_availability.available_on_hand."""
     logger.info("{} Syncing provider inventory from DLG.".format(_LOG_PREFIX))
 
     dlg_provider = src_models.Providers.objects.filter(
@@ -1487,17 +1507,26 @@ def sync_provider_inventory_from_dlg() -> None:
             if not provider_part:
                 continue
             qty = row.get("available_on_hand")
+            wh_avail: typing.Dict[str, typing.Any]
             try:
-                total_qty = int(qty) if qty is not None else 0
+                if qty is None:
+                    total_qty = 0
+                    wh_avail = {"available_on_hand": None}
+                else:
+                    total_qty = int(qty)
+                    wh_avail = {"available_on_hand": total_qty}
             except (TypeError, ValueError):
                 total_qty = 0
+                wh_avail = {"available_on_hand": None}
+            if total_qty > 0:
+                wh_avail["provider_url"] = _DLG_B2B_SEARCH_URL_TEMPLATE.format(quote(pn, safe=""))
             to_upsert.append(
                 src_models.ProviderPartInventory(
                     provider_part=provider_part,
                     warehouse_total_qty=total_qty,
-                    manufacturer_inventory=total_qty if row.get("available_on_hand") is not None else None,
+                    manufacturer_inventory=None,
                     manufacturer_esd=None,
-                    warehouse_availability=None,
+                    warehouse_availability=wh_avail,
                     last_synced_at=now,
                     updated_at=now,
                 )
@@ -1530,6 +1559,135 @@ def sync_provider_inventory_from_dlg() -> None:
             time.sleep(BATCH_DELAY_SECONDS)
 
     logger.info("{} Synced {} DLG inventory records total.".format(_LOG_PREFIX, total_upserted))
+
+
+def _atech_dc_inventory_sum(row: typing.Dict) -> int:
+    total = 0
+    for k in ("qty_tallmadge", "qty_sparks", "qty_mcdonough", "qty_arlington"):
+        v = row.get(k)
+        if v is not None:
+            try:
+                total += int(v)
+            except (TypeError, ValueError):
+                pass
+    return total
+
+
+def _atech_inventory_warehouse_availability(row: typing.Dict, feed_part_number: str) -> typing.Dict[str, typing.Any]:
+    """DC qty fields from AtechParts; provider_url only when total DC stock > 0."""
+    out: typing.Dict[str, typing.Any] = {
+        "qty_tallmadge": row.get("qty_tallmadge"),
+        "qty_sparks": row.get("qty_sparks"),
+        "qty_mcdonough": row.get("qty_mcdonough"),
+        "qty_arlington": row.get("qty_arlington"),
+    }
+    if _atech_dc_inventory_sum(row) > 0:
+        slug = (feed_part_number or "").strip().lower()
+        if slug:
+            out["provider_url"] = _ATECH_PARTS_URL_TEMPLATE.format(slug)
+    return out
+
+
+def sync_provider_inventory_from_atech() -> None:
+    """
+    Sync ProviderPartInventory from AtechParts DC quantities (mapped brands only).
+    ``ProviderPart`` rows must exist (``provider_external_id`` = ``feed_part_number``).
+    """
+    logger.info("{} Syncing provider inventory from A-Tech.".format(_LOG_PREFIX))
+
+    atech_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.ATECH.value,
+    ).first()
+    if not atech_provider:
+        logger.info("{} No A-Tech provider found.".format(_LOG_PREFIX))
+        return
+
+    mapped_ids = set(
+        src_models.BrandAtechBrandMapping.objects.values_list("atech_brand_id", flat=True).distinct()
+    )
+    if not mapped_ids:
+        logger.info("{} No BrandAtechBrandMapping found.".format(_LOG_PREFIX))
+        return
+
+    provider_parts = {
+        pp.provider_external_id: pp
+        for pp in src_models.ProviderPart.objects.filter(provider=atech_provider)
+    }
+
+    now = timezone.now()
+    total_upserted = 0
+    batch_num = 0
+    last_id = 0
+
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.AtechParts.objects.filter(id__gt=last_id, brand_id__in=mapped_ids)
+            .order_by("id")
+            .values(
+                "id",
+                "feed_part_number",
+                "qty_tallmadge",
+                "qty_sparks",
+                "qty_mcdonough",
+                "qty_arlington",
+            )[:BATCH_SIZE_INVENTORY]
+        )
+        if not batch:
+            break
+
+        last_id = batch[-1]["id"]
+        inv_by_provider_part_id: typing.Dict[int, src_models.ProviderPartInventory] = {}
+        for ap in batch:
+            ext = ap.get("feed_part_number")
+            if isinstance(ext, str):
+                ext = ext.strip()
+            else:
+                ext = str(ext or "").strip()
+            if not ext:
+                continue
+            pp = provider_parts.get(ext)
+            if not pp:
+                continue
+            wh_total = _atech_dc_inventory_sum(ap)
+            inv_by_provider_part_id[pp.id] = src_models.ProviderPartInventory(
+                provider_part=pp,
+                warehouse_total_qty=wh_total,
+                manufacturer_inventory=None,
+                manufacturer_esd=None,
+                warehouse_availability=_atech_inventory_warehouse_availability(ap, ext),
+                last_synced_at=now,
+                updated_at=now,
+            )
+
+        to_upsert = list(inv_by_provider_part_id.values())
+        if to_upsert:
+            to_upsert = _dedupe_provider_part_inventory_for_upsert(
+                to_upsert, context="A-Tech inventory batch={}".format(batch_num)
+            )
+            pgbulk.upsert(
+                src_models.ProviderPartInventory,
+                to_upsert,
+                unique_fields=["provider_part"],
+                update_fields=[
+                    "warehouse_total_qty",
+                    "manufacturer_inventory",
+                    "manufacturer_esd",
+                    "warehouse_availability",
+                    "last_synced_at",
+                    "updated_at",
+                ],
+            )
+            total_upserted += len(to_upsert)
+
+        logger.info("{} A-Tech inventory batch {}: {} records (last_id={})".format(
+            _LOG_PREFIX, batch_num, len(to_upsert), last_id
+        ))
+        connection.close()
+        if len(batch) == BATCH_SIZE_INVENTORY:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    logger.info("{} Synced {} A-Tech inventory records total.".format(_LOG_PREFIX, total_upserted))
 
 
 def sync_provider_pricing_from_rough_country() -> None:
@@ -4003,15 +4161,16 @@ def sync_all_master_parts() -> None:
     7. Provider inventory from Turn14
     8. Provider inventory from Keystone
     9. Provider inventory from Meyer
-    10. Provider inventory from Rough Country
-    11. Provider inventory from DLG
-    12. Provider inventory from WheelPros
-    13. Provider pricing from Turn14
-    14. Provider pricing from Keystone
-    15. Provider pricing from Meyer
-    16. Provider pricing from Rough Country
-    17. Provider pricing from DLG
-    18. Provider pricing from WheelPros
+    10. Provider inventory from A-Tech
+    11. Provider inventory from Rough Country
+    12. Provider inventory from DLG
+    13. Provider inventory from WheelPros
+    14. Provider pricing from Turn14
+    15. Provider pricing from Keystone
+    16. Provider pricing from Meyer
+    17. Provider pricing from Rough Country
+    18. Provider pricing from DLG
+    19. Provider pricing from WheelPros
     """
     logger.info("{} Starting full master parts sync.".format(_LOG_PREFIX))
 
@@ -4040,6 +4199,9 @@ def sync_all_master_parts() -> None:
     connection.close()
 
     sync_provider_inventory_from_meyer()
+    connection.close()
+
+    sync_provider_inventory_from_atech()
     connection.close()
 
     sync_provider_inventory_from_rough_country()

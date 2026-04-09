@@ -24,6 +24,7 @@ FEED_COLUMNS = (
     "fee_handling_ground",
     "fee_handling_air",
     "gtin",
+    "image_url",
 )
 
 # Feed column -> meaning (aligned to A-Tech website labels).
@@ -43,6 +44,7 @@ COLUMN_MEANING = {
     "fee_handling_ground": "Shipping fee (oversize — ground)",
     "fee_handling_air": "Shipping fee (oversize — air)",
     "gtin": "GTIN",
+    "image_url": "Product image URL (optional)",
 }
 
 WAREHOUSE_QTY_COLUMNS = ("tallmadge_qty", "sparks_qty", "mcdonough_qty", "arlington_qty")

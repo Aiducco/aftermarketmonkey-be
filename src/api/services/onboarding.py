@@ -439,9 +439,10 @@ def get_distributor_credentials_info() -> dict:
             "required": ["sftp_user", "sftp_password"],
             "description": (
                 "Email info@aftermarketmonkey.com for SFTP credentials, then enter sftp_user and sftp_password. "
-                "A-Tech delivers one file (atechfile.txt) to AftermarketMonkey's relay — host 54.145.82.238, port 22, "
-                "folder uploads — with part data, Cost/Retail/Jobber, DC quantities (Tallmadge OH, Sparks NV, "
-                "McDonough GA, Arlington TX), core and shipping-related fees, and GTIN."
+                "A-Tech sends one combined catalog and pricing feed to AftermarketMonkey's relay "
+                "(host 54.145.82.238, port 22, folder uploads): part data; cost, retail, and jobber; on-hand per DC "
+                "(Tallmadge OH, Sparks NV, McDonough GA, Arlington TX); core, hazmat, and handling-related fees; GTIN. "
+                "Optional overrides for host, port, folder, or remote filename may be set in credentials when needed."
             ),
             "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("ATECH", "A-Tech"),
             "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("ATECH") or None,

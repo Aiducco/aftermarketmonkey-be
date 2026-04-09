@@ -5,7 +5,7 @@ from src.integrations.services import atech
 
 class Command(BaseCommand):
     help = (
-        "Download A-Tech atechfile.txt from SFTP and upsert AtechParts "
+        "Download the A-Tech combined catalog + pricing feed from SFTP and upsert AtechParts "
         "(requires CompanyProviders for A-Tech with sftp_user / sftp_password; "
         "AtechPrefixBrand rows must map SKU prefixes to AtechBrand)."
     )
