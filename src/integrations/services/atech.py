@@ -7,11 +7,18 @@ from decimal import Decimal
 import pandas as pd
 import pgbulk
 from django.db import connection
+from django.db.models.functions import Upper
 
 from src import enums as src_enums
 from src import models as src_models
 from src.integrations.clients.atech import client as atech_client
 from src.integrations.clients.atech import exceptions as atech_exceptions
+from src.integrations.services.meyer import normalize_brand_match_key
+from src.integrations.utils.brand_matching import (
+    best_fuzzy_brand_match,
+    brands_by_first_token_upper,
+    normalize_upper_words,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -212,7 +219,10 @@ def _primary_atech_company_provider() -> typing.Optional[src_models.CompanyProvi
 
 def _load_prefix_to_brand_id() -> typing.Dict[str, int]:
     """
-    Map uppercase prefix -> AtechBrand id from manual AtechPrefixBrand rows.
+    Map uppercase SKU prefix -> ``AtechBrand`` id from ``AtechPrefixBrand`` (authoritative for ingest).
+
+    Ingest matches the prefix parsed from each feed line (segment before the first ``-``, else the
+    whole token), then sets ``AtechParts.brand`` when this map contains that prefix.
     """
     out: typing.Dict[str, int] = {}
     for row in (
@@ -301,6 +311,420 @@ def _part_from_feed_row(
     )
 
 
+def backfill_atech_parts_brands_from_prefix_mapping(
+    batch_size: int = 5000,
+) -> typing.Tuple[int, int, int]:
+    """
+    Set ``AtechParts.brand_id`` from ``AtechPrefixBrand`` using the same rules as feed ingest:
+
+    - Prefer stored ``brand_prefix`` (uppercase); if blank, derive from ``feed_part_number`` via
+      :func:`_atech_prefix_from_part_number`.
+    - Look up ``AtechBrand`` id in :func:`_load_prefix_to_brand_id`; upsert only when it differs.
+
+    Returns ``(updated_count, already_correct_count, unmapped_count)``.
+    """
+    prefix_to_brand = _load_prefix_to_brand_id()
+    if not prefix_to_brand:
+        logger.warning(
+            "{} No AtechPrefixBrand rows; cannot backfill part brands.".format(_LOG_PREFIX),
+        )
+        return 0, 0, 0
+
+    qs = src_models.AtechParts.objects.order_by("id").values_list(
+        "id",
+        "brand_id",
+        "brand_prefix",
+        "feed_part_number",
+    )
+    batch: typing.List[src_models.AtechParts] = []
+    updated = 0
+    already_correct = 0
+    unmapped = 0
+
+    def _flush() -> None:
+        nonlocal batch, updated
+        if not batch:
+            return
+        # PK-only ``brand_id`` fixups: use bulk_update (avoids pgbulk INSERT paths with null NOT NULLs).
+        src_models.AtechParts.objects.bulk_update(batch, ["brand_id"], batch_size=1000)
+        updated += len(batch)
+        batch = []
+
+    for row in qs.iterator(chunk_size=batch_size):
+        pid, existing_bid, bp, feed_pn = (
+            int(row[0]),
+            row[1],
+            row[2],
+            row[3],
+        )
+        prefix = (bp or "").strip().upper()
+        if not prefix:
+            prefix = _atech_prefix_from_part_number(feed_pn)
+        brand_id = prefix_to_brand.get(prefix) if prefix else None
+        if brand_id is None:
+            unmapped += 1
+            continue
+        if existing_bid == brand_id:
+            already_correct += 1
+            continue
+        if not (feed_pn or "").strip():
+            unmapped += 1
+            continue
+        batch.append(src_models.AtechParts(id=pid, brand_id=brand_id))
+        if len(batch) >= batch_size:
+            _flush()
+
+    _flush()
+    logger.info(
+        "{} Backfill part brands: updated={}, already_correct={}, unmapped_or_no_prefix={}.".format(
+            _LOG_PREFIX,
+            updated,
+            already_correct,
+            unmapped,
+        )
+    )
+    return updated, already_correct, unmapped
+
+
+# ``AtechBrand`` external_id or name (after :func:`normalize_brand_match_key`) -> exact catalog ``Brands.name``.
+# Extend when fuzzy matching would pick the wrong row (same pattern as Meyer canonical overrides).
+_ATECH_UNMAPPED_SYNC_CANONICAL_BRAND: typing.Dict[str, str] = {}
+
+
+def _atech_brand_name_upper_for_sync(atech_brand: src_models.AtechBrand) -> str:
+    name_upper = (atech_brand.name or "").strip().upper()
+    if not name_upper:
+        name_upper = "BRAND_{}".format(atech_brand.external_id)
+    return name_upper
+
+
+def _atech_unmapped_sync_canonical_brand_name(
+    ab: src_models.AtechBrand,
+) -> typing.Optional[str]:
+    for raw in (ab.external_id, ab.name):
+        k = normalize_brand_match_key(raw)
+        if not k:
+            continue
+        target = _ATECH_UNMAPPED_SYNC_CANONICAL_BRAND.get(k)
+        if target:
+            return target
+    return None
+
+
+def sync_unmapped_atech_brands_to_brands(dry_run: bool = False) -> typing.List[src_models.AtechBrand]:
+    """
+    For each ``AtechBrand`` without ``BrandAtechBrandMapping``: resolve ``Brands`` by exact name
+    (uppercase), then fuzzy word-prefix match (shared util with Meyer / WheelPros / DLG); otherwise
+    create a catalog brand. Upserts mapping, ``BrandProviders``, ``CompanyBrands`` for
+    TICK_PERFORMANCE.
+
+    If ``dry_run`` is True, no database writes; logs only A-Tech brands that matched an existing
+    ``Brands`` row (exact, canonical override, or fuzzy).
+    """
+    logger.info(
+        "{} Syncing unmapped A-Tech brands to Brands{}.".format(
+            _LOG_PREFIX,
+            " (dry run)" if dry_run else "",
+        )
+    )
+
+    atech_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.ATECH.value,
+    ).first()
+    if not atech_provider:
+        logger.warning("{} A-Tech provider not found.".format(_LOG_PREFIX))
+        return []
+
+    tick_company = src_models.Company.objects.filter(name="TICK_PERFORMANCE").first()
+    if not tick_company:
+        logger.warning("{} Company TICK_PERFORMANCE not found. Skipping.".format(_LOG_PREFIX))
+        return []
+
+    if not dry_run:
+        _, cp_created = src_models.CompanyProviders.objects.get_or_create(
+            company=tick_company,
+            provider=atech_provider,
+            defaults={"credentials": {}, "primary": False},
+        )
+        if cp_created:
+            logger.info("{} Created CompanyProviders for TICK_PERFORMANCE + A-Tech.".format(_LOG_PREFIX))
+
+    logger.info("{} Loading BrandAtechBrandMapping ids (existing links)...".format(_LOG_PREFIX))
+    mapped_ids = set(
+        src_models.BrandAtechBrandMapping.objects.values_list("atech_brand_id", flat=True).distinct()
+    )
+    logger.info(
+        "{} Loading unmapped AtechBrand rows (exclude {} linked id(s))...".format(
+            _LOG_PREFIX,
+            len(mapped_ids),
+        )
+    )
+    unmapped = list(
+        src_models.AtechBrand.objects.exclude(id__in=mapped_ids).order_by("id")
+    )
+    logger.info("{} Loaded {} unmapped A-Tech brand row(s).".format(_LOG_PREFIX, len(unmapped)))
+    if not unmapped:
+        logger.info("{} No unmapped A-Tech brands.".format(_LOG_PREFIX))
+        return []
+
+    name_upper_keys: typing.Set[str] = set()
+    for ab in unmapped:
+        if (ab.name or "").strip():
+            name_upper_keys.add((ab.name or "").strip().upper())
+
+    brands_by_upper_name: typing.Dict[str, src_models.Brands] = {}
+    if name_upper_keys:
+        for b in (
+            src_models.Brands.objects.annotate(_name_u=Upper("name"))
+            .filter(_name_u__in=name_upper_keys)
+            .order_by("id")
+        ):
+            key = (b.name or "").strip().upper()
+            if key not in brands_by_upper_name:
+                brands_by_upper_name[key] = b
+
+    canonical_targets_upper: typing.Set[str] = set()
+    for ab in unmapped:
+        t = _atech_unmapped_sync_canonical_brand_name(ab)
+        if t:
+            canonical_targets_upper.add(t.strip().upper())
+
+    brands_by_upper_for_canonical: typing.Dict[str, src_models.Brands] = {}
+    if canonical_targets_upper:
+        for b in (
+            src_models.Brands.objects.annotate(_name_u=Upper("name"))
+            .filter(_name_u__in=canonical_targets_upper)
+            .order_by("id")
+        ):
+            ku = (b.name or "").strip().upper()
+            if ku not in brands_by_upper_for_canonical:
+                brands_by_upper_for_canonical[ku] = b
+
+    resolved_by_atech_id: typing.Dict[int, src_models.Brands] = {}
+    canonical_matched_ids: typing.Set[int] = set()
+    exact_matched_ids: typing.Set[int] = set()
+    for ab in sorted(unmapped, key=lambda x: x.id):
+        canon_name = _atech_unmapped_sync_canonical_brand_name(ab)
+        if canon_name:
+            b = brands_by_upper_for_canonical.get(canon_name.strip().upper())
+            if b:
+                resolved_by_atech_id[ab.id] = b
+                canonical_matched_ids.add(ab.id)
+            else:
+                logger.warning(
+                    "{} A-Tech canonical brand override {!r} -> {!r} but no Brands row with that name.".format(
+                        _LOG_PREFIX,
+                        ab.name or ab.external_id,
+                        canon_name,
+                    )
+                )
+
+    for ab in sorted(unmapped, key=lambda x: x.id):
+        if ab.id in resolved_by_atech_id:
+            continue
+        nm = (ab.name or "").strip().upper()
+        if nm:
+            brand = brands_by_upper_name.get(nm)
+            if brand:
+                resolved_by_atech_id[ab.id] = brand
+                exact_matched_ids.add(ab.id)
+
+    unresolved_after_exact = [ab for ab in unmapped if ab.id not in resolved_by_atech_id]
+    brands_first_index: typing.Dict[str, typing.List[src_models.Brands]] = {}
+    if unresolved_after_exact:
+        logger.info(
+            "{} Fuzzy phase: {} A-Tech brand(s) still unmatched; building first-token index "
+            "(full ``Brands`` table scan — can take minutes on large catalogs)...".format(
+                _LOG_PREFIX,
+                len(unresolved_after_exact),
+            )
+        )
+        _t0 = time.monotonic()
+        brands_first_index = brands_by_first_token_upper()
+        logger.info(
+            "{} First-token index built in {:.1f}s ({} first-token bucket(s)).".format(
+                _LOG_PREFIX,
+                time.monotonic() - _t0,
+                len(brands_first_index),
+            )
+        )
+    all_brands_fallback: typing.Optional[typing.List[src_models.Brands]] = None
+    fuzzy_matches = 0
+    fuzzy_matched_ids: typing.Set[int] = set()
+    _fuzzy_total = len(unresolved_after_exact)
+    for _fuzzy_i, ab in enumerate(unresolved_after_exact):
+        if _fuzzy_i > 0 and _fuzzy_i % 200 == 0:
+            logger.info(
+                "{} Fuzzy matching progress: {}/{} AtechBrand(s)...".format(
+                    _LOG_PREFIX,
+                    _fuzzy_i,
+                    _fuzzy_total,
+                )
+            )
+        parts = normalize_upper_words(ab.name or "").split()
+        candidates: typing.List[src_models.Brands] = []
+        if parts:
+            candidates = list(brands_first_index.get(parts[0], ()))
+        if not candidates:
+            if all_brands_fallback is None:
+                logger.info(
+                    "{} Loading full ``Brands`` list as fuzzy fallback (one-time; heavy)...".format(
+                        _LOG_PREFIX,
+                    )
+                )
+                _t1 = time.monotonic()
+                all_brands_fallback = list(
+                    src_models.Brands.objects.only("id", "name", "aaia_code").order_by("id")
+                )
+                logger.info(
+                    "{} Fallback list: {} brand row(s) in {:.1f}s.".format(
+                        _LOG_PREFIX,
+                        len(all_brands_fallback),
+                        time.monotonic() - _t1,
+                    )
+                )
+            candidates = all_brands_fallback
+        brand = best_fuzzy_brand_match(ab.name or "", candidates)
+        if brand:
+            resolved_by_atech_id[ab.id] = brand
+            fuzzy_matched_ids.add(ab.id)
+            fuzzy_matches += 1
+            if not dry_run:
+                logger.debug(
+                    "{} Fuzzy-matched A-Tech brand {!r} to Brand id={} name={!r}.".format(
+                        _LOG_PREFIX,
+                        ab.name,
+                        brand.id,
+                        brand.name,
+                    )
+                )
+
+    if dry_run:
+        for ab in sorted(unmapped, key=lambda x: x.id):
+            if ab.id not in resolved_by_atech_id:
+                continue
+            brand = resolved_by_atech_id[ab.id]
+            if ab.id in canonical_matched_ids:
+                how = "canonical_override"
+            elif ab.id in exact_matched_ids:
+                how = "exact"
+            else:
+                how = "fuzzy"
+            logger.info(
+                "{} [dry-run] match ({}) AtechBrand id={} external_id={!r} name={!r} "
+                "-> Brand id={} name={!r}".format(
+                    _LOG_PREFIX,
+                    how,
+                    ab.id,
+                    ab.external_id,
+                    ab.name,
+                    brand.id,
+                    brand.name,
+                )
+            )
+        would_create = [ab for ab in unmapped if ab.id not in resolved_by_atech_id]
+        logger.info(
+            "{} [dry-run] Summary: {} canonical overrides, {} exact matches, {} fuzzy matches, "
+            "{} unmatched (would create Brand). No writes performed.".format(
+                _LOG_PREFIX,
+                len(canonical_matched_ids),
+                len(exact_matched_ids),
+                len(fuzzy_matched_ids),
+                len(would_create),
+            )
+        )
+        return unmapped
+
+    new_brand_specs: typing.Set[str] = set()
+    for ab in sorted(unmapped, key=lambda x: x.id):
+        if ab.id in resolved_by_atech_id:
+            continue
+        new_brand_specs.add(_atech_brand_name_upper_for_sync(ab))
+
+    created_brands = 0
+    if new_brand_specs:
+        existing_names = set(
+            src_models.Brands.objects.filter(name__in=list(new_brand_specs)).values_list(
+                "name", flat=True
+            )
+        )
+        new_brand_rows = [
+            src_models.Brands(
+                name=name,
+                status=src_enums.BrandProviderStatus.ACTIVE.value,
+                status_name=src_enums.BrandProviderStatus.ACTIVE.name,
+                aaia_code=None,
+            )
+            for name in new_brand_specs
+            if name not in existing_names
+        ]
+        if new_brand_rows:
+            src_models.Brands.objects.bulk_create(new_brand_rows, ignore_conflicts=True)
+            created_brands = len(new_brand_rows)
+        by_name = {
+            b.name: b
+            for b in src_models.Brands.objects.filter(name__in=list(new_brand_specs))
+        }
+        for ab in unmapped:
+            if ab.id not in resolved_by_atech_id:
+                nu = _atech_brand_name_upper_for_sync(ab)
+                resolved_by_atech_id[ab.id] = by_name[nu]
+
+    mapping_models = [
+        src_models.BrandAtechBrandMapping(
+            brand_id=resolved_by_atech_id[ab.id].id,
+            atech_brand_id=ab.id,
+        )
+        for ab in unmapped
+    ]
+    try:
+        pgbulk.upsert(
+            src_models.BrandAtechBrandMapping,
+            mapping_models,
+            unique_fields=["brand", "atech_brand"],
+            update_fields=[],
+            returning=False,
+        )
+    except Exception as e:
+        logger.error("{} Error upserting BrandAtechBrandMapping: {}.".format(_LOG_PREFIX, str(e)))
+        raise
+
+    created_bp = 0
+    created_cb = 0
+    for ab in unmapped:
+        brand = resolved_by_atech_id[ab.id]
+        _, bpc = src_models.BrandProviders.objects.get_or_create(
+            brand=brand,
+            provider=atech_provider,
+        )
+        if bpc:
+            created_bp += 1
+        _, cbc = src_models.CompanyBrands.objects.get_or_create(
+            company=tick_company,
+            brand=brand,
+            defaults={
+                "status": src_enums.CompanyBrandStatus.ACTIVE.value,
+                "status_name": src_enums.CompanyBrandStatus.ACTIVE.name,
+            },
+        )
+        if cbc:
+            created_cb += 1
+
+    logger.info(
+        "{} A-Tech brand sync done. Canonical overrides: {}, brands created: {}, fuzzy name matches: {}, "
+        "BrandAtechBrandMapping upserted: {}, BrandProviders: {}, CompanyBrands: {}.".format(
+            _LOG_PREFIX,
+            len(canonical_matched_ids),
+            created_brands,
+            fuzzy_matches,
+            len(mapping_models),
+            created_bp,
+            created_cb,
+        )
+    )
+    return unmapped
+
+
 def fetch_and_save_atech_catalog(force_download: bool = False) -> None:
     """
     Download atechfile.txt from the primary A-Tech CompanyProvider SFTP and upsert AtechParts.
@@ -338,6 +762,7 @@ def fetch_and_save_atech_catalog(force_download: bool = False) -> None:
     parts_raw: typing.List[src_models.AtechParts] = []
     unmapped_prefix_rows = 0
     for row in records:
+        # Same prefix rule as ``brand_prefix`` on ``AtechParts`` (see ``_atech_prefix_from_part_number``).
         prefix = _atech_prefix_from_part_number(row.get("part_number"))
         brand_id = prefix_to_brand.get(prefix) if prefix else None
         if prefix and brand_id is None:

@@ -1,3 +1,5 @@
+import typing
+
 # Provider kind_name -> display name (used by parts API)
 PROVIDER_DISPLAY_NAMES = {
     "TURN_14": "Turn 14",
@@ -21,6 +23,22 @@ PROVIDER_IMAGE_URLS = {
     "SDC": "",
     "WHEELPROS": "https://api.aftermarketmonkey.com/uploads/wheel_pros_logo.png",
 }
+
+# Public "open in distributor" links (parts API ``provider_go_to_link``); ``urllib.parse.quote`` at call sites.
+# DLG: site search — brand + part in ``keywords`` so short part numbers alone are not ambiguous.
+DLG_B2B_INVENTORY_SEARCH_URL_TEMPLATE = "https://www.dlgb2b.com/search?keywords={keywords}"
+ATECH_INVENTORY_PART_URL_TEMPLATE = "https://www.atechmotorsports.com/parts/{part_slug}"
+ROUGH_COUNTRY_INVENTORY_SEARCH_URL_TEMPLATE = "https://www.roughcountry.com/search/{sku}"
+
+
+def dlg_b2b_search_keywords(dlg_brand_name: typing.Optional[str], part_number: str) -> str:
+    """DLG B2B search: combine brand label and part number so queries are specific (not e.g. a short code alone)."""
+    bn = (dlg_brand_name or "").strip()
+    pn = (part_number or "").strip()
+    if bn and pn:
+        return "{} {}".format(bn, pn)
+    return pn or bn
+
 
 # CompanyProviders.credentials JSON key for Rough Country: jobber Excel URL (required per connection).
 ROUGH_COUNTRY_CREDENTIALS_FEED_URL = "feed_url"

@@ -1,6 +1,6 @@
 """
 Fuzzy matching of distributor/vendor brand names to `Brands` rows (word-prefix alignment).
-Used by Keystone, Rough Country, Wheel Pros, Meyer, DLG, and other provider syncs.
+Used by Keystone, Rough Country, Wheel Pros, Meyer, DLG, A-Tech, and other provider syncs.
 """
 import typing
 

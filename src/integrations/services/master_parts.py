@@ -6,24 +6,19 @@ import logging
 import time
 import typing
 from datetime import date
-from urllib.parse import quote
 
 from django.db import connection
 from django.utils import timezone
 
 import pgbulk
 
+from src import constants as src_constants
 from src import enums as src_enums
 from src import models as src_models
 
 logger = logging.getLogger(__name__)
 
 _LOG_PREFIX = "[MASTER-PARTS]"
-
-# Public B2B product links for inventory payloads (warehouse_availability.provider_url when qty > 0).
-_DLG_B2B_SEARCH_URL_TEMPLATE = "https://www.dlgb2b.com/search?keywords={}"
-_ATECH_PARTS_URL_TEMPLATE = "https://www.atechmotorsports.com/parts/{}"
-_ROUGH_COUNTRY_SEARCH_URL_TEMPLATE = "https://www.roughcountry.com/search/{}"
 
 
 def _get_brand_for_turn14_brand(turn14_brand: src_models.Turn14Brand) -> typing.Optional[src_models.Brands]:
@@ -1344,21 +1339,13 @@ def sync_master_parts_from_dlg() -> None:
 def _rough_country_inventory_warehouse_availability(
     nv_stock: typing.Optional[int],
     tn_stock: typing.Optional[int],
-    sku: str,
 ) -> typing.Optional[typing.Dict[str, typing.Any]]:
-    """
-    NV/TN stock by friendly DC names; provider_url when total on-hand > 0
-    (Rough Country site search by SKU, e.g. /search/47120580B).
-    """
+    """NV/TN stock by friendly DC names."""
     out: typing.Dict[str, typing.Any] = {}
     if nv_stock is not None:
         out["Nevada"] = nv_stock
     if tn_stock is not None:
         out["Tennessee"] = tn_stock
-    total = (nv_stock or 0) + (tn_stock or 0)
-    sku_clean = (sku or "").strip()
-    if total > 0 and sku_clean:
-        out["provider_url"] = _ROUGH_COUNTRY_SEARCH_URL_TEMPLATE.format(quote(sku_clean, safe=""))
     if not out:
         return None
     return out
@@ -1408,18 +1395,13 @@ def sync_provider_inventory_from_rough_country() -> None:
             nv = row.get("nv_stock")
             tn = row.get("tn_stock")
             total = (nv or 0) + (tn or 0)
-            sku_raw = row.get("sku")
-            if isinstance(sku_raw, str):
-                sku_s = sku_raw.strip()
-            else:
-                sku_s = str(sku_raw or "").strip()
             to_upsert.append(
                 src_models.ProviderPartInventory(
                     provider_part=provider_part,
                     warehouse_total_qty=total,
                     manufacturer_inventory=None,
                     manufacturer_esd=None,
-                    warehouse_availability=_rough_country_inventory_warehouse_availability(nv, tn, sku_s),
+                    warehouse_availability=_rough_country_inventory_warehouse_availability(nv, tn),
                     last_synced_at=now,
                     updated_at=now,
                 )
@@ -1518,8 +1500,6 @@ def sync_provider_inventory_from_dlg() -> None:
             except (TypeError, ValueError):
                 total_qty = 0
                 wh_avail = {"available_on_hand": None}
-            if total_qty > 0:
-                wh_avail["provider_url"] = _DLG_B2B_SEARCH_URL_TEMPLATE.format(quote(pn, safe=""))
             to_upsert.append(
                 src_models.ProviderPartInventory(
                     provider_part=provider_part,
@@ -1573,19 +1553,14 @@ def _atech_dc_inventory_sum(row: typing.Dict) -> int:
     return total
 
 
-def _atech_inventory_warehouse_availability(row: typing.Dict, feed_part_number: str) -> typing.Dict[str, typing.Any]:
-    """DC qty fields from AtechParts; provider_url only when total DC stock > 0."""
-    out: typing.Dict[str, typing.Any] = {
+def _atech_inventory_warehouse_availability(row: typing.Dict) -> typing.Dict[str, typing.Any]:
+    """DC qty fields from AtechParts."""
+    return {
         "qty_tallmadge": row.get("qty_tallmadge"),
         "qty_sparks": row.get("qty_sparks"),
         "qty_mcdonough": row.get("qty_mcdonough"),
         "qty_arlington": row.get("qty_arlington"),
     }
-    if _atech_dc_inventory_sum(row) > 0:
-        slug = (feed_part_number or "").strip().lower()
-        if slug:
-            out["provider_url"] = _ATECH_PARTS_URL_TEMPLATE.format(slug)
-    return out
 
 
 def sync_provider_inventory_from_atech() -> None:
@@ -1655,7 +1630,7 @@ def sync_provider_inventory_from_atech() -> None:
                 warehouse_total_qty=wh_total,
                 manufacturer_inventory=None,
                 manufacturer_esd=None,
-                warehouse_availability=_atech_inventory_warehouse_availability(ap, ext),
+                warehouse_availability=_atech_inventory_warehouse_availability(ap),
                 last_synced_at=now,
                 updated_at=now,
             )

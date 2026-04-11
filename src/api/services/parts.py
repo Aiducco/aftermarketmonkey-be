@@ -127,6 +127,24 @@ def _provider_go_to_link(
         if not ext:
             return None
         return "https://online.meyerdistributing.com/parts/details/{}".format(quote(ext, safe=""))
+    if kind_name == "DLG":
+        brand_name = master_part.brand.name if master_part.brand else None
+        pn = (master_part.part_number or "").strip()
+        kw = src_constants.dlg_b2b_search_keywords(brand_name, pn)
+        if not kw:
+            return None
+        return src_constants.DLG_B2B_INVENTORY_SEARCH_URL_TEMPLATE.format(keywords=quote(kw, safe=""))
+    if kind_name == "ATECH":
+        slug = ext.lower()
+        if not slug:
+            return None
+        return src_constants.ATECH_INVENTORY_PART_URL_TEMPLATE.format(part_slug=slug)
+    if kind_name == "ROUGH_COUNTRY":
+        sku_src = master_part.sku or master_part.part_number or ""
+        sku_clean = str(sku_src).strip()
+        if not sku_clean:
+            return None
+        return src_constants.ROUGH_COUNTRY_INVENTORY_SEARCH_URL_TEMPLATE.format(sku=quote(sku_clean, safe=""))
     if kind_name == "WHEELPROS":
         return None
     return None
