@@ -4,12 +4,17 @@ Backend uses master key for indexing; frontend will use a public read-only key.
 """
 import logging
 import typing
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 from django.conf import settings
 
 logger = logging.getLogger(__name__)
 
 INDEX_NAME = getattr(settings, "MEILISEARCH_INDEX_PARTS", "parts")
+
+# Defaults for full reindex after distributor master-parts sync (tuned for typical Meilisearch throughput).
+REINDEX_DEFAULT_BATCH_SIZE = 10000
+REINDEX_DEFAULT_UPLOAD_WORKERS = 4
 
 # Searchable: what the user types to find results
 SEARCHABLE_ATTRIBUTES = ["part_number", "sku", "description", "aaia_code", "brand_name"]
@@ -109,9 +114,12 @@ def add_documents(parts: typing.List) -> bool:
 def add_documents_in_batches(
     queryset,
     batch_size: int = 10000,
+    max_upload_workers: int = 1,
 ) -> typing.Tuple[int, int]:
     """
     Index all parts from a MasterPart queryset in batches (cursor-based by id).
+    When ``max_upload_workers`` > 1, upload batches concurrently (each worker uses its own
+    Meilisearch client). Main thread reads from Django; workers only serialize and POST.
     Returns (total_indexed, total_failed).
     """
     if not is_configured():
@@ -123,21 +131,96 @@ def add_documents_in_batches(
     if queryset.model == MasterPart:
         queryset = queryset.select_related("brand")
 
+    if max_upload_workers <= 1:
+        total_ok = 0
+        total_fail = 0
+        last_id = 0
+
+        while True:
+            batch = list(queryset.filter(id__gt=last_id).order_by("id")[:batch_size])
+            if not batch:
+                break
+            if add_documents(batch):
+                total_ok += len(batch)
+            else:
+                total_fail += len(batch)
+            last_id = batch[-1].id
+
+        return total_ok, total_fail
+
+    def _upload_batch(parts: typing.List) -> typing.Tuple[int, int]:
+        if not parts:
+            return 0, 0
+        try:
+            client = _get_client()
+            index = client.index(INDEX_NAME)
+            docs = [_part_to_document(p) for p in parts]
+            index.add_documents(docs, primary_key="id")
+            return len(docs), 0
+        except Exception as e:
+            logger.exception("Meilisearch parallel batch upload failed: %s", str(e))
+            return 0, len(parts)
+
     total_ok = 0
     total_fail = 0
     last_id = 0
+    max_in_flight = max(2, max_upload_workers * 2)
+    in_flight = []
 
-    while True:
-        batch = list(queryset.filter(id__gt=last_id).order_by("id")[:batch_size])
-        if not batch:
-            break
-        if add_documents(batch):
-            total_ok += len(batch)
-        else:
-            total_fail += len(batch)
-        last_id = batch[-1].id
+    with ThreadPoolExecutor(max_workers=max_upload_workers) as executor:
+        while True:
+            batch = list(queryset.filter(id__gt=last_id).order_by("id")[:batch_size])
+            if not batch:
+                break
+            last_id = batch[-1].id
+            in_flight.append(executor.submit(_upload_batch, batch))
+            while len(in_flight) >= max_in_flight:
+                done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    in_flight.remove(fut)
+                    ok, fail = fut.result()
+                    total_ok += ok
+                    total_fail += fail
+
+        for fut in in_flight:
+            ok, fail = fut.result()
+            total_ok += ok
+            total_fail += fail
 
     return total_ok, total_fail
+
+
+def reindex_all_master_parts(
+    batch_size: int = REINDEX_DEFAULT_BATCH_SIZE,
+    max_upload_workers: int = REINDEX_DEFAULT_UPLOAD_WORKERS,
+) -> typing.Tuple[int, int]:
+    """
+    Configure index, delete all documents, then bulk-index every ``MasterPart``.
+    Uses parallel HTTP uploads when ``max_upload_workers`` > 1.
+    Returns (total_indexed, total_failed). No-op (0, 0) if Meilisearch is not configured.
+    """
+    if not is_configured():
+        logger.warning("Meilisearch not configured; skipping reindex.")
+        return 0, 0
+
+    if not setup_index():
+        logger.error("Meilisearch setup_index failed; skipping reindex.")
+        return 0, 0
+
+    if not delete_all_documents():
+        logger.error("Meilisearch delete_all_documents failed; skipping indexing.")
+        return 0, 0
+
+    from src.models import MasterPart
+
+    queryset = MasterPart.objects.select_related("brand").order_by("id")
+    ok, fail = add_documents_in_batches(
+        queryset,
+        batch_size=batch_size,
+        max_upload_workers=max_upload_workers,
+    )
+    logger.info("Meilisearch full reindex finished: indexed=%s failed=%s", ok, fail)
+    return ok, fail
 
 
 def delete_document(part_id: int) -> bool:

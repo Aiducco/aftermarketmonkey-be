@@ -5,7 +5,7 @@ into the Brands flow (mappings, brand_providers, company_brands for TICK_PERFORM
 from django.core.management.base import BaseCommand
 
 from src.audit import scheduled_tasks as audit_scheduled_tasks
-from src.integrations.services import wheelpros
+from src.integrations.services import master_parts, wheelpros
 
 
 class Command(BaseCommand):
@@ -69,9 +69,15 @@ class Command(BaseCommand):
                 )
             )
 
+            self.stdout.write(
+                "Step 3: Propagating WheelPros catalog into master parts, provider parts, inventory, and pricing..."
+            )
+            master_parts.sync_derived_from_wheelpros(reindex_meilisearch=True)
+            self.stdout.write(self.style.SUCCESS("Derived master layer sync done."))
+
             audit_scheduled_tasks.mark_scheduled_task_completed(
                 execution,
-                message="Successfully completed WheelPros fetch and sync.",
+                message="Successfully completed WheelPros fetch, brand sync, and derived master layer sync.",
             )
             self.stdout.write(self.style.SUCCESS("Successfully completed WheelPros fetch and sync."))
         except Exception as e:

@@ -3,13 +3,12 @@ Fetch Meyer Pricing + Meyer Inventory from SFTP, upsert MeyerBrand / MeyerParts,
 unmapped Meyer brands into the Brands flow (mappings, brand_providers, company_brands for TICK_PERFORMANCE).
 
 Same orchestration pattern as sync_wheelpros / sync_rough_country + ScheduledTaskExecution audit.
-For MasterPart / ProviderPart / inventory / pricing sync, run sync_master_parts_from_meyer (or
-sync_all_master_parts) separately.
+After ingest, master parts / provider parts / inventory / pricing are propagated automatically.
 """
 from django.core.management.base import BaseCommand
 
 from src.audit import scheduled_tasks as audit_scheduled_tasks
-from src.integrations.services import meyer
+from src.integrations.services import master_parts, meyer
 
 
 class Command(BaseCommand):
@@ -76,9 +75,15 @@ class Command(BaseCommand):
                 )
             )
 
+            self.stdout.write(
+                "Step 3: Propagating Meyer catalog into master parts, provider parts, inventory, and pricing..."
+            )
+            master_parts.sync_derived_from_meyer(reindex_meilisearch=True)
+            self.stdout.write(self.style.SUCCESS("Derived master layer sync done."))
+
             audit_scheduled_tasks.mark_scheduled_task_completed(
                 execution,
-                message="Successfully completed Meyer catalog fetch and brand sync.",
+                message="Successfully completed Meyer catalog fetch, brand sync, and derived master layer sync.",
             )
             self.stdout.write(
                 self.style.SUCCESS("Successfully completed Meyer catalog fetch and brand sync.")
