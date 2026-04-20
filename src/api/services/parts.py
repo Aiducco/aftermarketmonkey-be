@@ -135,7 +135,9 @@ def _provider_go_to_link(
             return None
         return src_constants.DLG_B2B_INVENTORY_SEARCH_URL_TEMPLATE.format(keywords=quote(kw, safe=""))
     if kind_name == "ATECH":
-        slug = ext.lower()
+        # ``provider_external_id`` is ``{atech_brand_id}_{part_number}``; public PDP slug is the part number only.
+        slug_src = master_part.sku or master_part.part_number or ext
+        slug = str(slug_src).strip().lower()
         if not slug:
             return None
         return src_constants.ATECH_INVENTORY_PART_URL_TEMPLATE.format(part_slug=slug)

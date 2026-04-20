@@ -934,6 +934,12 @@ def sync_master_parts_from_meyer() -> None:
     ))
 
 
+def _atech_provider_external_id(atech_brand_id: int, part_number: str) -> str:
+    """Stable A-Tech ProviderPart key: ``AtechBrand`` id + part number (same PN can exist under multiple feed brands)."""
+    pn = (part_number or "").strip()
+    return "{}_{}".format(int(atech_brand_id), pn)
+
+
 def sync_master_parts_from_atech() -> None:
     """
     Create/update MasterPart and ProviderPart from AtechParts.
@@ -942,7 +948,8 @@ def sync_master_parts_from_atech() -> None:
     ``MasterPart.part_number`` and ``MasterPart.sku`` are both ``AtechParts.part_number`` (suffix
     after prefix, e.g. ``35370`` for ``ACC-35370``) so ``sync_provider_pricing_from_atech_for_company``
     can resolve ``ProviderPart`` via ``_meyer_provider_parts_by_brand_sku_first``.
-    ``ProviderPart.provider_external_id`` is the same string (matches ``sync_provider_inventory_from_atech``).
+    ``ProviderPart.provider_external_id`` is ``_atech_provider_external_id(brand_id, part_number)``
+    (matches ``sync_provider_inventory_from_atech``).
     """
     logger.info("{} Syncing master parts from A-Tech (batched, cursor-based).".format(_LOG_PREFIX))
 
@@ -994,7 +1001,7 @@ def sync_master_parts_from_atech() -> None:
         last_id = batch[-1]["id"]
         seen = set()
         master_parts_list = []
-        atech_pn_to_brand_part = {}
+        atech_feed_brand_pn_to_brand_part: typing.Dict[typing.Tuple[int, str], typing.Tuple[int, str]] = {}
 
         for row in batch:
             brand = atech_brand_to_brand.get(row["brand_id"])
@@ -1023,7 +1030,7 @@ def sync_master_parts_from_atech() -> None:
                         image_url=row.get("image_url"),
                     )
                 )
-            atech_pn_to_brand_part[pn] = (brand.id, pn)
+            atech_feed_brand_pn_to_brand_part[(int(row["brand_id"]), pn)] = (brand.id, pn)
 
         if not master_parts_list:
             connection.close()
@@ -1093,6 +1100,8 @@ def sync_master_parts_from_atech() -> None:
 
         provider_parts_by_key = {}
         for row in batch:
+            if row["brand_id"] not in atech_brand_to_brand:
+                continue
             pn = row.get("part_number") or ""
             if isinstance(pn, str):
                 pn = pn.strip()
@@ -1100,7 +1109,7 @@ def sync_master_parts_from_atech() -> None:
                 pn = str(pn or "").strip()
             if not pn:
                 continue
-            key_bp = atech_pn_to_brand_part.get(pn)
+            key_bp = atech_feed_brand_pn_to_brand_part.get((int(row["brand_id"]), pn))
             if not key_bp:
                 continue
             master_part = brand_part_to_master.get(key_bp)
@@ -1110,7 +1119,7 @@ def sync_master_parts_from_atech() -> None:
             provider_parts_by_key[pp_key] = src_models.ProviderPart(
                 master_part=master_part,
                 provider=atech_provider,
-                provider_external_id=pn,
+                provider_external_id=_atech_provider_external_id(int(row["brand_id"]), pn),
             )
 
         provider_parts = list(provider_parts_by_key.values())
@@ -1768,7 +1777,8 @@ def _atech_inventory_warehouse_availability(row: typing.Dict) -> typing.Dict[str
 def sync_provider_inventory_from_atech() -> None:
     """
     Sync ProviderPartInventory from AtechParts DC quantities (mapped brands only).
-    ``ProviderPart`` rows must exist (``provider_external_id`` = ``AtechParts.part_number``).
+    ``ProviderPart`` rows must exist; ``provider_external_id`` is
+    ``_atech_provider_external_id(brand_id, part_number)``.
     """
     logger.info("{} Syncing provider inventory from A-Tech.".format(_LOG_PREFIX))
 
@@ -1803,6 +1813,7 @@ def sync_provider_inventory_from_atech() -> None:
             .order_by("id")
             .values(
                 "id",
+                "brand_id",
                 "part_number",
                 "qty_tallmadge",
                 "qty_sparks",
@@ -1823,7 +1834,11 @@ def sync_provider_inventory_from_atech() -> None:
                 ext = str(ext or "").strip()
             if not ext:
                 continue
-            pp = provider_parts.get(ext)
+            bid = ap.get("brand_id")
+            if bid is None:
+                continue
+            ext_id = _atech_provider_external_id(int(bid), ext)
+            pp = provider_parts.get(ext_id)
             if not pp:
                 continue
             wh_total = _atech_dc_inventory_sum(ap)
@@ -3132,7 +3147,8 @@ def _atech_company_pricing_batch_row_id_to_provider_part(
 ) -> typing.Dict[int, src_models.ProviderPart]:
     """
     AtechCompanyPricing row id -> ProviderPart: (catalog brand, MasterPart.sku = ``AtechParts.part_number``)
-    via ``_meyer_provider_parts_by_brand_sku_first`` (same DISTINCT ON pattern as Meyer).
+    via ``_meyer_provider_parts_by_brand_sku_first``. ``ProviderPart.provider_external_id`` may be composite
+    ``{atech_brand_id}_{part_number}``; resolution does not depend on that string.
     """
     row_id_to_pp: typing.Dict[int, src_models.ProviderPart] = {}
     sku_lookup_keys: typing.List[typing.Tuple[int, str]] = []
@@ -4332,7 +4348,7 @@ def sync_all_master_parts() -> None:
     1. Master parts + provider parts from Turn14
     2. Master parts + provider parts from Keystone
     3. Master parts + provider parts from Meyer
-    4. Master parts + provider parts from A-Tech (``AtechParts.part_number`` as part_number + sku)
+    4. Master parts + provider parts from A-Tech (part_number + sku from feed; composite ``provider_external_id``)
     5. Master parts + provider parts from Rough Country
     6. Master parts + provider parts from DLG (part_number only; no sku resolution)
     7. Master parts + provider parts from WheelPros (wheels, tires, accessories)
