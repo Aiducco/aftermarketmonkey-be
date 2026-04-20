@@ -6,7 +6,8 @@ from src.integrations.services import master_parts
 class Command(BaseCommand):
     help = (
         "Sync MasterPart and ProviderPart from AtechParts (BrandAtechBrandMapping + resolved brand only). "
-        "Uses AtechParts.part_number (feed suffix) as MasterPart part_number + sku and ProviderPart.provider_external_id."
+        "Uses AtechParts.part_number as MasterPart part_number + sku; ProviderPart.provider_external_id is "
+        "{atech_brand_id}_{part_number}."
     )
 
     def handle(self, *args, **options):
