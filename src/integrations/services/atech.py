@@ -8,6 +8,7 @@ import pandas as pd
 import pgbulk
 from django.db import connection
 from django.db.models.functions import Upper
+from django.utils import timezone
 
 from src import enums as src_enums
 from src import models as src_models
@@ -805,6 +806,9 @@ def fetch_and_save_atech_catalog(force_download: bool = False) -> None:
         for i in range(0, len(parts), ATECH_PARTS_UPSERT_BATCH):
             batch_num += 1
             batch = parts[i : i + ATECH_PARTS_UPSERT_BATCH]
+            _now = timezone.now()
+            for _p in batch:
+                _p.updated_at = _now
             pgbulk.upsert(
                 src_models.AtechParts,
                 batch,

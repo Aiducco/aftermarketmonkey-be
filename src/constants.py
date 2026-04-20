@@ -28,6 +28,13 @@ PROVIDER_IMAGE_URLS = {
 # DLG: site search — brand + part in ``keywords`` so short part numbers alone are not ambiguous.
 DLG_B2B_INVENTORY_SEARCH_URL_TEMPLATE = "https://www.dlgb2b.com/search?keywords={keywords}"
 ATECH_INVENTORY_PART_URL_TEMPLATE = "https://www.atechmotorsports.com/parts/{part_slug}"
+# ``AtechParts`` qty_* columns -> labels stored in ``ProviderPartInventory.warehouse_availability`` (parts API).
+ATECH_DC_QTY_FIELD_TO_LOCATION_LABEL = {
+    "qty_tallmadge": "Tallmadge, OH",
+    "qty_sparks": "Sparks, NV",
+    "qty_mcdonough": "McDonough, GA",
+    "qty_arlington": "Arlington, TX",
+}
 ROUGH_COUNTRY_INVENTORY_SEARCH_URL_TEMPLATE = "https://www.roughcountry.com/search/{sku}"
 
 

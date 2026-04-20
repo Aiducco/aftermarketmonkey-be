@@ -8,6 +8,7 @@ import pandas as pd
 import pgbulk
 
 from django.db.models.functions import Upper
+from django.utils import timezone
 
 from src import enums as src_enums
 from src import models as src_models
@@ -407,7 +408,7 @@ KEYSTONE_PARTS_UPDATE_FIELDS = [
     "ups_ground_assessorial", "us_ltl", "east_qty", "midwest_qty",
     "california_qty", "southeast_qty", "pacific_nw_qty", "texas_qty",
     "great_lakes_qty", "florida_qty", "total_qty", "kit_components",
-    "is_kit", "raw_data",
+    "is_kit", "raw_data", "updated_at",
 ]
 
 
@@ -423,6 +424,9 @@ def _pgbulk_upsert_keystone_parts_batches(
     for i in range(0, len(part_instances), batch_size):
         batch = part_instances[i : i + batch_size]
         batch_num = (i // batch_size) + 1
+        _now = timezone.now()
+        for _p in batch:
+            _p.updated_at = _now
         pgbulk.upsert(
             src_models.KeystoneParts,
             batch,

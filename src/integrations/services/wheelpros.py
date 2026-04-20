@@ -14,6 +14,7 @@ import pgbulk
 from django.conf import settings
 from django.db import connection
 from django.db.models.functions import Upper
+from django.utils import timezone
 
 from src import constants as src_constants
 from src import enums as src_enums
@@ -668,6 +669,9 @@ def fetch_and_save_wheelpros(
         return
 
     try:
+        _now = timezone.now()
+        for _p in part_instances:
+            _p.updated_at = _now
         pgbulk.upsert(
             src_models.WheelProsPart,
             part_instances,
@@ -689,6 +693,7 @@ def fetch_and_save_wheelpros(
                 "run_date",
                 "warehouse_availability",
                 "raw_data",
+                "updated_at",
             ],
             returning=False,
         )

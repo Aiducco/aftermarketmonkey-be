@@ -13,6 +13,7 @@ from decimal import Decimal
 import pgbulk
 from django.db import connection
 from django.db.models.functions import Upper
+from django.utils import timezone
 
 from src import constants as src_constants
 from src import enums as src_enums
@@ -544,6 +545,9 @@ def fetch_and_save_rough_country(
         logger.warning("{} No part instances from General tab.".format(_LOG_PREFIX))
     else:
         try:
+            _now = timezone.now()
+            for _p in part_instances:
+                _p.updated_at = _now
             pgbulk.upsert(
                 src_models.RoughCountryPart,
                 part_instances,
@@ -576,6 +580,7 @@ def fetch_and_save_rough_country(
                     "discontinued_date",
                     "replacement_sku",
                     "raw_data",
+                    "updated_at",
                 ],
                 returning=False,
             )
@@ -679,16 +684,18 @@ def fetch_and_save_rough_country(
             parts_to_update = list(
                 src_models.RoughCountryPart.objects.filter(sku__in=skus_to_mark)
             )
+            _disc_now = timezone.now()
             for part in parts_to_update:
                 disc = discontinued_by_sku.get(part.sku)
                 if disc:
                     part.is_discontinued = True
                     part.discontinued_date = disc.get("discontinued_date")
                     part.replacement_sku = disc.get("replacement_sku") or None
+                part.updated_at = _disc_now
             if parts_to_update:
                 src_models.RoughCountryPart.objects.bulk_update(
                     parts_to_update,
-                    ["is_discontinued", "discontinued_date", "replacement_sku"],
+                    ["is_discontinued", "discontinued_date", "replacement_sku", "updated_at"],
                 )
 
     # Fitment: need part_id by sku; load parts we have (after upsert, all RC brands)
