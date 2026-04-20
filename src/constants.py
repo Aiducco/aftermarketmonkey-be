@@ -88,7 +88,7 @@ PROVIDER_CATALOG = [
     {
         "kind": enums.BrandProviderKind.KEYSTONE,
         "name": "Keystone",
-        "description": "Sync inventory and pricing from Keystone Automotive via FTP.",
+        "description": "Access inventory and pricing from Keystone Automotive via FTP.",
         "icon_url": "https://api.aftermarketmonkey.com/uploads/keystone.png",
         "category": "Distributors",
         "connection_required_fields": ["ftp_user", "ftp_password"],
@@ -105,9 +105,7 @@ PROVIDER_CATALOG = [
     {
         "kind": enums.BrandProviderKind.ROUGH_COUNTRY,
         "name": "Rough Country",
-        "description": (
-            "Sync parts catalog, pricing, and vehicle fitment from Rough Country via jobber Excel feed."
-        ),
+        "description": "Access catalog, pricing, and fitment from Rough Country via jobber feed.",
         "icon_url": "https://api.aftermarketmonkey.com/uploads/rough_country.png",
         "category": "Distributors",
         "connection_required_fields": [ROUGH_COUNTRY_CREDENTIALS_FEED_URL],
@@ -124,9 +122,7 @@ PROVIDER_CATALOG = [
     {
         "kind": enums.BrandProviderKind.WHEELPROS,
         "name": "Wheel Pros",
-        "description": (
-            "Sync wheels, tires, and accessories inventory and pricing from WheelPros via SFTP."
-        ),
+        "description": "Access wheels, tires, and accessories inventory and pricing from Wheel Pros via SFTP.",
         "icon_url": "https://api.aftermarketmonkey.com/uploads/wheel_pros_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["sftp_user", "sftp_password"],
@@ -147,9 +143,7 @@ PROVIDER_CATALOG = [
     {
         "kind": enums.BrandProviderKind.MEYER,
         "name": "Meyer",
-        "description": (
-            "Sync Meyer pricing and inventory from AftermarketMonkey's SFTP relay (Meyer Pricing + Meyer Inventory CSVs)."
-        ),
+        "description": "Access Meyer catalog, inventory, and pricing from AftermarketMonkey's SFTP relay.",
         "icon_url": "https://api.aftermarketmonkey.com/uploads/meyer_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["sftp_user", "sftp_password"],
@@ -175,11 +169,7 @@ PROVIDER_CATALOG = [
     {
         "kind": enums.BrandProviderKind.ATECH,
         "name": "A-Tech",
-        "description": (
-            "Ingest A-Tech catalog, four-warehouse inventory, and price tiers from AftermarketMonkey&rsquo;s SFTP relay. "
-            "One combined distributor feed supplies part lines, multi-location stock, cost/retail/jobber, fees, and GTIN; "
-            "your company connection unlocks catalog sync plus per-account pricing snapshots on the same layout."
-        ),
+        "description": "Access A-Tech catalog, inventory, and pricing from AftermarketMonkey's SFTP relay.",
         "icon_url": "https://api.aftermarketmonkey.com/uploads/atech_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["sftp_user", "sftp_password"],
@@ -217,9 +207,7 @@ PROVIDER_CATALOG = [
     {
         "kind": enums.BrandProviderKind.DLG,
         "name": "DLG",
-        "description": (
-            "Sync DLG inventory from AftermarketMonkey's SFTP relay (dlg_inventory.csv: brand, SKU, description, qty, price)."
-        ),
+        "description": "Access DLG inventory and pricing from AftermarketMonkey's SFTP relay.",
         "icon_url": "https://api.aftermarketmonkey.com/uploads/dlg_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["sftp_user", "sftp_password"],

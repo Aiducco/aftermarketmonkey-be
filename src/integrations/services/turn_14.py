@@ -18,6 +18,39 @@ logger = logging.getLogger(__name__)
 _LOG_PREFIX = '[TURN-14-SERVICES]'
 
 
+def _stamp_inventory_batch_updated_at(
+    inventory_instances: typing.List[src_models.Turn14BrandInventory],
+    refreshed_at: datetime,
+) -> None:
+    """Single timestamp per batch so pgbulk upsert and Turn14Items bump stay aligned."""
+    for inv in inventory_instances:
+        inv.updated_at = refreshed_at
+
+
+def _bump_turn14_items_updated_at_for_inventory_batch(
+    inventory_instances: typing.List[src_models.Turn14BrandInventory],
+    refreshed_at: datetime,
+) -> int:
+    """
+    When Turn14BrandInventory rows are refreshed, set Turn14Items.updated_at for the same
+    Turn14 item id (shared ``external_id`` on both tables).
+    """
+    if not inventory_instances:
+        return 0
+    external_ids: typing.List[str] = []
+    for inv in inventory_instances:
+        eid = getattr(inv, 'external_id', None)
+        if eid is None:
+            continue
+        s = str(eid).strip()
+        if s:
+            external_ids.append(s)
+    if not external_ids:
+        return 0
+    unique_ids = list(dict.fromkeys(external_ids))
+    return src_models.Turn14Items.objects.filter(external_id__in=unique_ids).update(updated_at=refreshed_at)
+
+
 def fetch_and_save_turn_14_brands() -> None:
     logger.info('{} Started fetching and saving turn 14 brands.'.format(_LOG_PREFIX))
     
@@ -1501,6 +1534,8 @@ def fetch_and_save_all_turn_14_brand_inventory() -> None:
                 continue
             
             try:
+                refreshed_at = timezone.now()
+                _stamp_inventory_batch_updated_at(inventory_instances, refreshed_at)
                 upserted_inventory = pgbulk.upsert(
                     src_models.Turn14BrandInventory,
                     inventory_instances,
@@ -1517,9 +1552,12 @@ def fetch_and_save_all_turn_14_brand_inventory() -> None:
                     ],
                     returning=True,
                 )
+                n_items_bumped = _bump_turn14_items_updated_at_for_inventory_batch(
+                    inventory_instances, refreshed_at
+                )
                 
-                logger.info('{} Successfully upserted {} inventory items for brand: {} (external_id: {}), page: {}.'.format(
-                    _LOG_PREFIX, len(upserted_inventory) if upserted_inventory else 0, turn_14_brand.name, brand_id, page
+                logger.info('{} Successfully upserted {} inventory items for brand: {} (external_id: {}), page: {}; Turn14Items updated_at bumped: {}.'.format(
+                    _LOG_PREFIX, len(upserted_inventory) if upserted_inventory else 0, turn_14_brand.name, brand_id, page, n_items_bumped
                 ))
             except Exception as e:
                 logger.error('{} Error during bulk upsert for brand: {} (external_id: {}), page: {}. Error: {}.'.format(
@@ -1640,6 +1678,8 @@ def fetch_and_save_turn_14_brand_inventory_for_turn14_brands(
                 continue
 
             try:
+                refreshed_at = timezone.now()
+                _stamp_inventory_batch_updated_at(inventory_instances, refreshed_at)
                 upserted_inventory = pgbulk.upsert(
                     src_models.Turn14BrandInventory,
                     inventory_instances,
@@ -1656,9 +1696,12 @@ def fetch_and_save_turn_14_brand_inventory_for_turn14_brands(
                     ],
                     returning=True,
                 )
+                n_items_bumped = _bump_turn14_items_updated_at_for_inventory_batch(
+                    inventory_instances, refreshed_at
+                )
 
-                logger.info('{} Successfully upserted {} inventory items for brand: {} (external_id: {}), page: {}.'.format(
-                    _LOG_PREFIX, len(upserted_inventory) if upserted_inventory else 0, turn_14_brand.name, brand_id, page
+                logger.info('{} Successfully upserted {} inventory items for brand: {} (external_id: {}), page: {}; Turn14Items updated_at bumped: {}.'.format(
+                    _LOG_PREFIX, len(upserted_inventory) if upserted_inventory else 0, turn_14_brand.name, brand_id, page, n_items_bumped
                 ))
             except Exception as e:
                 logger.error('{} Error during bulk upsert for brand: {} (external_id: {}), page: {}. Error: {}.'.format(
@@ -2199,6 +2242,8 @@ def fetch_and_save_turn_14_inventory_updates() -> None:
             continue
 
         try:
+            refreshed_at = timezone.now()
+            _stamp_inventory_batch_updated_at(inventory_instances, refreshed_at)
             upserted_inventory = pgbulk.upsert(
                 src_models.Turn14BrandInventory,
                 inventory_instances,
@@ -2211,9 +2256,12 @@ def fetch_and_save_turn_14_inventory_updates() -> None:
 
             processed_count = len(upserted_inventory) if upserted_inventory else 0
             total_processed += processed_count
+            n_items_bumped = _bump_turn14_items_updated_at_for_inventory_batch(
+                inventory_instances, refreshed_at
+            )
 
-            logger.info('{} Successfully upserted {} inventory updates for page: {}.'.format(
-                _LOG_PREFIX, processed_count, page
+            logger.info('{} Successfully upserted {} inventory updates for page: {}; Turn14Items updated_at bumped: {}.'.format(
+                _LOG_PREFIX, processed_count, page, n_items_bumped
             ))
         except Exception as e:
             logger.error('{} Error during bulk upsert for page: {}. Error: {}.'.format(

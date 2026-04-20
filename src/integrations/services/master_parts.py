@@ -20,6 +20,9 @@ logger = logging.getLogger(__name__)
 
 _LOG_PREFIX = "[MASTER-PARTS]"
 
+# ProviderPart upsert from sync_master_parts_from_* (distributor_refreshed_at from source row updated_at)
+_PROVIDER_PART_SYNC_UPDATE_FIELDS = ["provider_external_id", "distributor_refreshed_at"]
+
 
 def _get_brand_for_turn14_brand(turn14_brand: src_models.Turn14Brand) -> typing.Optional[src_models.Brands]:
     mapping = src_models.BrandTurn14BrandMapping.objects.filter(turn14_brand=turn14_brand).first()
@@ -344,9 +347,16 @@ def sync_master_parts_from_turn14() -> None:
                 id__gt=last_id,
             )
             .order_by("id")
-            .values("id", "external_id", "mfr_part_number", "part_number", "part_description", "thumbnail", "brand_id")[
-                :BATCH_SIZE_MASTER_PARTS
-            ]
+            .values(
+                "id",
+                "external_id",
+                "mfr_part_number",
+                "part_number",
+                "part_description",
+                "thumbnail",
+                "brand_id",
+                "updated_at",
+            )[:BATCH_SIZE_MASTER_PARTS]
         )
         if not batch:
             break
@@ -454,6 +464,7 @@ def sync_master_parts_from_turn14() -> None:
                 master_part=master_part,
                 provider=turn14_provider,
                 provider_external_id=row["external_id"],
+                distributor_refreshed_at=row.get("updated_at"),
             )
 
         provider_parts = list(provider_parts_by_key.values())
@@ -462,7 +473,7 @@ def sync_master_parts_from_turn14() -> None:
                 src_models.ProviderPart,
                 provider_parts,
                 unique_fields=["master_part", "provider"],
-                update_fields=["provider_external_id"],
+                update_fields=_PROVIDER_PART_SYNC_UPDATE_FIELDS,
             )
             total_provider += len(provider_parts)
 
@@ -525,9 +536,16 @@ def sync_master_parts_from_keystone() -> None:
                 id__gt=last_id,
             )
             .order_by("id")
-            .values("id", "vcpn", "brand_id", "manufacturer_part_no", "part_number", "long_description", "aaia_code")[
-                :BATCH_SIZE_MASTER_PARTS
-            ]
+            .values(
+                "id",
+                "vcpn",
+                "brand_id",
+                "manufacturer_part_no",
+                "part_number",
+                "long_description",
+                "aaia_code",
+                "updated_at",
+            )[:BATCH_SIZE_MASTER_PARTS]
         )
         if not batch:
             break
@@ -652,6 +670,7 @@ def sync_master_parts_from_keystone() -> None:
                 master_part=master_part,
                 provider=keystone_provider,
                 provider_external_id=row["vcpn"],
+                distributor_refreshed_at=row.get("updated_at"),
             )
 
         provider_parts = list(provider_parts_by_key.values())
@@ -660,7 +679,7 @@ def sync_master_parts_from_keystone() -> None:
                 src_models.ProviderPart,
                 provider_parts,
                 unique_fields=["master_part", "provider"],
-                update_fields=["provider_external_id"],
+                update_fields=_PROVIDER_PART_SYNC_UPDATE_FIELDS,
             )
             total_provider += len(provider_parts)
 
@@ -727,6 +746,7 @@ def sync_master_parts_from_meyer() -> None:
                 "brand_id",
                 "mfg_item_number",
                 "description",
+                "updated_at",
             )[:BATCH_SIZE_MASTER_PARTS]
         )
         if not batch:
@@ -910,6 +930,7 @@ def sync_master_parts_from_meyer() -> None:
                 master_part=master_part,
                 provider=meyer_provider,
                 provider_external_id=mp_ext,
+                distributor_refreshed_at=row.get("updated_at"),
             )
 
         provider_parts = list(provider_parts_by_key.values())
@@ -918,7 +939,7 @@ def sync_master_parts_from_meyer() -> None:
                 src_models.ProviderPart,
                 provider_parts,
                 unique_fields=["master_part", "provider"],
-                update_fields=["provider_external_id"],
+                update_fields=_PROVIDER_PART_SYNC_UPDATE_FIELDS,
             )
             total_provider += len(provider_parts)
 
@@ -993,6 +1014,7 @@ def sync_master_parts_from_atech() -> None:
                 "part_number",
                 "description",
                 "image_url",
+                "updated_at",
             )[:BATCH_SIZE_MASTER_PARTS]
         )
         if not batch:
@@ -1120,6 +1142,7 @@ def sync_master_parts_from_atech() -> None:
                 master_part=master_part,
                 provider=atech_provider,
                 provider_external_id=_atech_provider_external_id(int(row["brand_id"]), pn),
+                distributor_refreshed_at=row.get("updated_at"),
             )
 
         provider_parts = list(provider_parts_by_key.values())
@@ -1128,7 +1151,7 @@ def sync_master_parts_from_atech() -> None:
                 src_models.ProviderPart,
                 provider_parts,
                 unique_fields=["master_part", "provider"],
-                update_fields=["provider_external_id"],
+                update_fields=_PROVIDER_PART_SYNC_UPDATE_FIELDS,
             )
             total_provider += len(provider_parts)
 
@@ -1198,6 +1221,7 @@ def sync_master_parts_from_rough_country() -> None:
                 "title",
                 "description",
                 "image_1",
+                "updated_at",
             )[:BATCH_SIZE_MASTER_PARTS]
         )
         if not batch:
@@ -1317,6 +1341,7 @@ def sync_master_parts_from_rough_country() -> None:
                 master_part=master_part,
                 provider=rc_provider,
                 provider_external_id=ext_id,
+                distributor_refreshed_at=row.get("updated_at"),
             )
 
         provider_parts = list(provider_parts_by_key.values())
@@ -1325,7 +1350,7 @@ def sync_master_parts_from_rough_country() -> None:
                 src_models.ProviderPart,
                 provider_parts,
                 unique_fields=["master_part", "provider"],
-                update_fields=["provider_external_id"],
+                update_fields=_PROVIDER_PART_SYNC_UPDATE_FIELDS,
             )
             total_provider += len(provider_parts)
 
@@ -1397,6 +1422,7 @@ def sync_master_parts_from_dlg() -> None:
                 "brand_id",
                 "part_number",
                 "display_name",
+                "updated_at",
             )[:BATCH_SIZE_MASTER_PARTS]
         )
         if not batch:
@@ -1525,6 +1551,7 @@ def sync_master_parts_from_dlg() -> None:
                 master_part=master_part,
                 provider=dlg_provider,
                 provider_external_id=ext_id,
+                distributor_refreshed_at=row.get("updated_at"),
             )
 
         provider_parts = list(provider_parts_by_key.values())
@@ -1533,7 +1560,7 @@ def sync_master_parts_from_dlg() -> None:
                 src_models.ProviderPart,
                 provider_parts,
                 unique_fields=["master_part", "provider"],
-                update_fields=["provider_external_id"],
+                update_fields=_PROVIDER_PART_SYNC_UPDATE_FIELDS,
             )
             total_provider += len(provider_parts)
 
@@ -2335,6 +2362,7 @@ def sync_master_parts_from_wheelpros() -> None:
                 "part_number",
                 "part_description",
                 "image_url",
+                "updated_at",
             )[:BATCH_SIZE_MASTER_PARTS_WHEELPROS]
         )
         if not batch:
@@ -2508,6 +2536,7 @@ def sync_master_parts_from_wheelpros() -> None:
                 master_part=master_part,
                 provider=wp_provider,
                 provider_external_id=ext_id,
+                distributor_refreshed_at=row.get("updated_at"),
             )
 
         provider_parts = list(provider_parts_by_key.values())
@@ -2516,7 +2545,7 @@ def sync_master_parts_from_wheelpros() -> None:
                 src_models.ProviderPart,
                 provider_parts,
                 unique_fields=["master_part", "provider"],
-                update_fields=["provider_external_id"],
+                update_fields=_PROVIDER_PART_SYNC_UPDATE_FIELDS,
             )
             total_provider += len(provider_parts)
 

@@ -1171,6 +1171,11 @@ class ProviderPart(django_db_models.Model):
     master_part = django_db_models.ForeignKey(MasterPart, on_delete=django_db_models.CASCADE, related_name="provider_parts")
     provider = django_db_models.ForeignKey(Providers, on_delete=django_db_models.CASCADE, related_name="provider_parts")
     provider_external_id = django_db_models.CharField(max_length=255)
+    distributor_refreshed_at = django_db_models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Last refresh time from the distributor part row (source updated_at) when master parts sync ran.",
+    )
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
