@@ -931,6 +931,207 @@ def sync_master_parts_from_meyer() -> None:
     ))
 
 
+def sync_master_parts_from_atech() -> None:
+    """
+    Create/update MasterPart and ProviderPart from AtechParts.
+    Only rows whose ``AtechParts.brand`` has a ``BrandAtechBrandMapping`` are included.
+
+    ``MasterPart.part_number`` and ``MasterPart.sku`` are both ``AtechParts.part_number`` (suffix
+    after prefix, e.g. ``35370`` for ``ACC-35370``) so ``sync_provider_pricing_from_atech_for_company``
+    can resolve ``ProviderPart`` via ``_meyer_provider_parts_by_brand_sku_first``.
+    ``ProviderPart.provider_external_id`` is the same string (matches ``sync_provider_inventory_from_atech``).
+    """
+    logger.info("{} Syncing master parts from A-Tech (batched, cursor-based).".format(_LOG_PREFIX))
+
+    atech_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.ATECH.value,
+    ).first()
+    if not atech_provider:
+        logger.info("{} No A-Tech provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandAtechBrandMapping.objects.select_related("brand", "atech_brand")
+    )
+    atech_brand_to_brand = {m.atech_brand_id: m.brand for m in mappings}
+    atech_brand_to_aaia = {
+        m.atech_brand_id: (m.atech_brand.aaia_code if m.atech_brand else None)
+        for m in mappings
+    }
+    if not atech_brand_to_brand:
+        logger.info("{} No BrandAtechBrandMapping found. Nothing to sync.".format(_LOG_PREFIX))
+        return
+
+    mapped_atech_brand_ids = set(atech_brand_to_brand.keys())
+
+    total_master = 0
+    total_provider = 0
+    batch_num = 0
+    last_id = 0
+
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.AtechParts.objects.filter(
+                brand_id__in=mapped_atech_brand_ids,
+                id__gt=last_id,
+            )
+            .order_by("id")
+            .values(
+                "id",
+                "brand_id",
+                "part_number",
+                "description",
+                "image_url",
+            )[:BATCH_SIZE_MASTER_PARTS]
+        )
+        if not batch:
+            break
+
+        last_id = batch[-1]["id"]
+        seen = set()
+        master_parts_list = []
+        atech_pn_to_brand_part = {}
+
+        for row in batch:
+            brand = atech_brand_to_brand.get(row["brand_id"])
+            if not brand:
+                continue
+
+            pn = row.get("part_number") or ""
+            if isinstance(pn, str):
+                pn = pn.strip()
+            else:
+                pn = str(pn or "").strip()
+            if not pn:
+                continue
+
+            key = (brand.id, pn)
+            if key not in seen:
+                seen.add(key)
+                aaia = atech_brand_to_aaia.get(row["brand_id"])
+                master_parts_list.append(
+                    src_models.MasterPart(
+                        brand=brand,
+                        part_number=pn,
+                        sku=pn,
+                        description=row.get("description"),
+                        aaia_code=aaia,
+                        image_url=row.get("image_url"),
+                    )
+                )
+            atech_pn_to_brand_part[pn] = (brand.id, pn)
+
+        if not master_parts_list:
+            connection.close()
+            if len(batch) == BATCH_SIZE_MASTER_PARTS:
+                time.sleep(BATCH_DELAY_SECONDS)
+            continue
+
+        pairs = list(seen)
+        existing_by_key = {}
+        if pairs:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(pairs),),
+                )
+                for row in cur.fetchall():
+                    mp_id, b_id, p_num = row
+                    existing_by_key[(b_id, p_num)] = mp_id
+
+        new_parts = [mp for mp in master_parts_list if (mp.brand_id, mp.part_number) not in existing_by_key]
+        existing_keys = [k for k in pairs if k in existing_by_key]
+
+        if new_parts:
+            new_parts = _dedupe_master_parts_for_upsert(
+                new_parts, context="A-Tech new_parts batch={}".format(batch_num)
+            )
+            pgbulk.upsert(
+                src_models.MasterPart,
+                new_parts,
+                unique_fields=["brand", "part_number"],
+                update_fields=[],
+            )
+            total_master += len(new_parts)
+
+        if existing_keys:
+            key_to_mp = {(mp.brand_id, mp.part_number): mp for mp in master_parts_list}
+            values = [
+                (existing_by_key[k], key_to_mp[k].sku, key_to_mp[k].aaia_code)
+                for k in existing_keys
+            ]
+            placeholders = ", ".join(["(%s::bigint, %s, %s)"] * len(values))
+            params = [x for row_vals in values for x in row_vals]
+            with connection.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE master_parts mp SET sku = v.sku, aaia_code = v.aaia_code
+                    FROM (VALUES {}) AS v(id, sku, aaia_code)
+                    WHERE mp.id = v.id
+                    """.format(placeholders),
+                    params,
+                )
+
+        brand_part_to_master = {}
+        if pairs:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(pairs),),
+                )
+                for row in cur.fetchall():
+                    mp_id, b_id, p_num = row
+                    mp = src_models.MasterPart()
+                    mp.id = mp_id
+                    mp.brand_id = b_id
+                    mp.part_number = p_num
+                    brand_part_to_master[(b_id, p_num)] = mp
+
+        provider_parts_by_key = {}
+        for row in batch:
+            pn = row.get("part_number") or ""
+            if isinstance(pn, str):
+                pn = pn.strip()
+            else:
+                pn = str(pn or "").strip()
+            if not pn:
+                continue
+            key_bp = atech_pn_to_brand_part.get(pn)
+            if not key_bp:
+                continue
+            master_part = brand_part_to_master.get(key_bp)
+            if not master_part:
+                continue
+            pp_key = (master_part.id, atech_provider.id)
+            provider_parts_by_key[pp_key] = src_models.ProviderPart(
+                master_part=master_part,
+                provider=atech_provider,
+                provider_external_id=pn,
+            )
+
+        provider_parts = list(provider_parts_by_key.values())
+        if provider_parts:
+            pgbulk.upsert(
+                src_models.ProviderPart,
+                provider_parts,
+                unique_fields=["master_part", "provider"],
+                update_fields=["provider_external_id"],
+            )
+            total_provider += len(provider_parts)
+
+        logger.info("{} A-Tech batch {}: {} items -> {} master, {} provider (last_id={})".format(
+            _LOG_PREFIX, batch_num, len(batch), len(master_parts_list), len(provider_parts), last_id
+        ))
+        connection.close()
+        if len(batch) == BATCH_SIZE_MASTER_PARTS:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    logger.info("{} Synced {} master parts and {} provider parts from A-Tech total.".format(
+        _LOG_PREFIX, total_master, total_provider
+    ))
+
+
 def _rough_country_provider_external_id(rc_brand_id: int, sku: str) -> str:
     """Unique per Rough Country provider: rc_brand_id + sku (same sku can exist under different RC brands)."""
     return "{}_{}".format(rc_brand_id, sku)
@@ -1566,7 +1767,7 @@ def _atech_inventory_warehouse_availability(row: typing.Dict) -> typing.Dict[str
 def sync_provider_inventory_from_atech() -> None:
     """
     Sync ProviderPartInventory from AtechParts DC quantities (mapped brands only).
-    ``ProviderPart`` rows must exist (``provider_external_id`` = ``feed_part_number``).
+    ``ProviderPart`` rows must exist (``provider_external_id`` = ``AtechParts.part_number``).
     """
     logger.info("{} Syncing provider inventory from A-Tech.".format(_LOG_PREFIX))
 
@@ -1601,7 +1802,7 @@ def sync_provider_inventory_from_atech() -> None:
             .order_by("id")
             .values(
                 "id",
-                "feed_part_number",
+                "part_number",
                 "qty_tallmadge",
                 "qty_sparks",
                 "qty_mcdonough",
@@ -1614,7 +1815,7 @@ def sync_provider_inventory_from_atech() -> None:
         last_id = batch[-1]["id"]
         inv_by_provider_part_id: typing.Dict[int, src_models.ProviderPartInventory] = {}
         for ap in batch:
-            ext = ap.get("feed_part_number")
+            ext = ap.get("part_number")
             if isinstance(ext, str):
                 ext = ext.strip()
             else:
@@ -2929,7 +3130,7 @@ def _atech_company_pricing_batch_row_id_to_provider_part(
     atech_brand_to_brand: typing.Dict[int, src_models.Brands],
 ) -> typing.Dict[int, src_models.ProviderPart]:
     """
-    AtechCompanyPricing row id -> ProviderPart: (catalog brand, MasterPart.sku = feed line)
+    AtechCompanyPricing row id -> ProviderPart: (catalog brand, MasterPart.sku = ``AtechParts.part_number``)
     via ``_meyer_provider_parts_by_brand_sku_first`` (same DISTINCT ON pattern as Meyer).
     """
     row_id_to_pp: typing.Dict[int, src_models.ProviderPart] = {}
@@ -2941,22 +3142,22 @@ def _atech_company_pricing_batch_row_id_to_provider_part(
         brand = atech_brand_to_brand.get(row.get("part__brand_id"))
         if not brand:
             continue
-        fn = row.get("part__feed_part_number")
-        if isinstance(fn, str):
-            fn = fn.strip()
+        pn = row.get("part__part_number")
+        if isinstance(pn, str):
+            pn = pn.strip()
         else:
-            fn = str(fn or "").strip()
-        if not fn:
+            pn = str(pn or "").strip()
+        if not pn:
             continue
-        row_meta[rid] = (brand, fn)
-        sku_lookup_keys.append((brand.id, fn))
+        row_meta[rid] = (brand, pn)
+        sku_lookup_keys.append((brand.id, pn))
 
     pp_by_sku = _meyer_provider_parts_by_brand_sku_first(
         atech_provider,
         list(dict.fromkeys(sku_lookup_keys)),
     )
-    for rid, (brand, fn) in row_meta.items():
-        pp = pp_by_sku.get((brand.id, fn))
+    for rid, (brand, pn) in row_meta.items():
+        pp = pp_by_sku.get((brand.id, pn))
         if pp:
             row_id_to_pp[rid] = pp
     return row_id_to_pp
@@ -2997,7 +3198,7 @@ def sync_provider_pricing_from_atech_for_company(company_id: int) -> None:
                 "retail_price",
                 "jobber_price",
                 "part__brand_id",
-                "part__feed_part_number",
+                "part__part_number",
             )[:BATCH_SIZE_PRICING]
         )
         if not batch:
@@ -4130,22 +4331,23 @@ def sync_all_master_parts() -> None:
     1. Master parts + provider parts from Turn14
     2. Master parts + provider parts from Keystone
     3. Master parts + provider parts from Meyer
-    4. Master parts + provider parts from Rough Country
-    5. Master parts + provider parts from DLG (part_number only; no sku resolution)
-    6. Master parts + provider parts from WheelPros (wheels, tires, accessories)
-    7. Provider inventory from Turn14
-    8. Provider inventory from Keystone
-    9. Provider inventory from Meyer
-    10. Provider inventory from A-Tech
-    11. Provider inventory from Rough Country
-    12. Provider inventory from DLG
-    13. Provider inventory from WheelPros
-    14. Provider pricing from Turn14
-    15. Provider pricing from Keystone
-    16. Provider pricing from Meyer
-    17. Provider pricing from Rough Country
-    18. Provider pricing from DLG
-    19. Provider pricing from WheelPros
+    4. Master parts + provider parts from A-Tech (``AtechParts.part_number`` as part_number + sku)
+    5. Master parts + provider parts from Rough Country
+    6. Master parts + provider parts from DLG (part_number only; no sku resolution)
+    7. Master parts + provider parts from WheelPros (wheels, tires, accessories)
+    8. Provider inventory from Turn14
+    9. Provider inventory from Keystone
+    10. Provider inventory from Meyer
+    11. Provider inventory from A-Tech
+    12. Provider inventory from Rough Country
+    13. Provider inventory from DLG
+    14. Provider inventory from WheelPros
+    15. Provider pricing from Turn14
+    16. Provider pricing from Keystone
+    17. Provider pricing from Meyer
+    18. Provider pricing from Rough Country
+    19. Provider pricing from DLG
+    20. Provider pricing from WheelPros
     """
     logger.info("{} Starting full master parts sync.".format(_LOG_PREFIX))
 
@@ -4156,6 +4358,9 @@ def sync_all_master_parts() -> None:
     connection.close()
 
     sync_master_parts_from_meyer()
+    connection.close()
+
+    sync_master_parts_from_atech()
     connection.close()
 
     sync_master_parts_from_rough_country()
