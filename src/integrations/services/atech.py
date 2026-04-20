@@ -860,7 +860,8 @@ def sync_atech_company_pricing_for_company_provider(
 ) -> None:
     """
     Download A-Tech feed file for one ``CompanyProviders`` row and upsert ``AtechCompanyPricing``.
-    Expects ``AtechParts`` rows to exist for ``part_number`` values in the file (``feed_part_number``).
+    Resolves each file line to ``AtechParts`` by ``feed_part_number`` (full distributor line).
+    ``ProviderPart`` / ``MasterPart`` use ``AtechParts.part_number``; see ``sync_master_parts_from_atech``.
     """
     cp = (
         src_models.CompanyProviders.objects.filter(
