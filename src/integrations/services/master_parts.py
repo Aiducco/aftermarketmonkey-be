@@ -3180,15 +3180,17 @@ def _atech_company_pricing_batch_row_id_to_provider_part(
     return row_id_to_pp
 
 
-def sync_provider_pricing_from_atech_for_company(company_id: int) -> None:
-    logger.info("{} Syncing A-Tech provider pricing for company_id={}.".format(_LOG_PREFIX, company_id))
-
+def _run_atech_provider_pricing_sync(company_id: typing.Optional[int]) -> int:
+    """
+    Fan out AtechCompanyPricing -> ProviderPartCompanyPricing.
+    If company_id is None, process all companies (single pass by id, like Keystone / Rough Country).
+    """
     atech_provider = src_models.Providers.objects.filter(
         kind=src_enums.BrandProviderKind.ATECH.value,
     ).first()
     if not atech_provider:
         logger.info("{} No A-Tech provider found.".format(_LOG_PREFIX))
-        return
+        return 0
 
     mappings = list(
         src_models.BrandAtechBrandMapping.objects.select_related("brand", "atech_brand")
@@ -3196,7 +3198,7 @@ def sync_provider_pricing_from_atech_for_company(company_id: int) -> None:
     atech_brand_to_brand = {m.atech_brand_id: m.brand for m in mappings}
     if not atech_brand_to_brand:
         logger.info("{} No BrandAtechBrandMapping found. Nothing to price.".format(_LOG_PREFIX))
-        return
+        return 0
 
     now = timezone.now()
     total_upserted = 0
@@ -3205,9 +3207,11 @@ def sync_provider_pricing_from_atech_for_company(company_id: int) -> None:
 
     while True:
         batch_num += 1
+        qs = src_models.AtechCompanyPricing.objects.filter(id__gt=last_id)
+        if company_id is not None:
+            qs = qs.filter(company_id=company_id)
         batch = list(
-            src_models.AtechCompanyPricing.objects.filter(id__gt=last_id, company_id=company_id)
-            .order_by("id")
+            qs.order_by("id")
             .values(
                 "id",
                 "company_id",
@@ -3250,10 +3254,12 @@ def sync_provider_pricing_from_atech_for_company(company_id: int) -> None:
             )
 
         to_upsert = list(pricing_by_pp_company.values())
+        if company_id is not None:
+            dedupe_ctx = "A-Tech pricing company={} batch={}".format(company_id, batch_num)
+        else:
+            dedupe_ctx = "A-Tech pricing batch={}".format(batch_num)
         if to_upsert:
-            to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
-                to_upsert, context="A-Tech pricing company={} batch={}".format(company_id, batch_num)
-            )
+            to_upsert = _dedupe_provider_part_company_pricing_for_upsert(to_upsert, context=dedupe_ctx)
             pgbulk.upsert(
                 src_models.ProviderPartCompanyPricing,
                 to_upsert,
@@ -3262,15 +3268,36 @@ def sync_provider_pricing_from_atech_for_company(company_id: int) -> None:
             )
             total_upserted += len(to_upsert)
 
-        logger.info("{} A-Tech pricing company={} batch {}: {} records (last_id={})".format(
-            _LOG_PREFIX, company_id, batch_num, len(to_upsert), last_id
-        ))
+        if company_id is not None:
+            logger.info("{} A-Tech pricing company={} batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, company_id, batch_num, len(to_upsert), last_id
+            ))
+        else:
+            logger.info("{} A-Tech pricing batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, batch_num, len(to_upsert), last_id
+            ))
         connection.close()
         if len(batch) == BATCH_SIZE_PRICING:
             time.sleep(BATCH_DELAY_SECONDS)
 
+    return total_upserted
+
+
+def sync_provider_pricing_from_atech() -> None:
+    """
+    Sync ProviderPartCompanyPricing from all AtechCompanyPricing rows (all companies).
+    Same mapping as :func:`sync_provider_pricing_from_atech_for_company`; used by full master parts / cron.
+    """
+    logger.info("{} Syncing A-Tech provider pricing (all companies).".format(_LOG_PREFIX))
+    total = _run_atech_provider_pricing_sync(None)
+    logger.info("{} Synced {} A-Tech pricing records total.".format(_LOG_PREFIX, total))
+
+
+def sync_provider_pricing_from_atech_for_company(company_id: int) -> None:
+    logger.info("{} Syncing A-Tech provider pricing for company_id={}.".format(_LOG_PREFIX, company_id))
+    total = _run_atech_provider_pricing_sync(company_id)
     logger.info("{} Synced {} A-Tech pricing records for company_id={}.".format(
-        _LOG_PREFIX, total_upserted, company_id,
+        _LOG_PREFIX, total, company_id,
     ))
 
 
@@ -4362,9 +4389,10 @@ def sync_all_master_parts() -> None:
     15. Provider pricing from Turn14
     16. Provider pricing from Keystone
     17. Provider pricing from Meyer
-    18. Provider pricing from Rough Country
-    19. Provider pricing from DLG
-    20. Provider pricing from WheelPros
+    18. Provider pricing from A-Tech
+    19. Provider pricing from Rough Country
+    20. Provider pricing from DLG
+    21. Provider pricing from WheelPros
     """
     logger.info("{} Starting full master parts sync.".format(_LOG_PREFIX))
 
@@ -4417,6 +4445,9 @@ def sync_all_master_parts() -> None:
     connection.close()
 
     sync_provider_pricing_from_meyer()
+    connection.close()
+
+    sync_provider_pricing_from_atech()
     connection.close()
 
     sync_provider_pricing_from_rough_country()

@@ -218,6 +218,7 @@ def sync_unmapped_turn_14_brands_to_brands() -> typing.List[src_models.Turn14Bra
         src_models.BrandTurn14BrandMapping(
             brand_id=resolved_by_turn14_id[t14.id].id,
             turn14_brand_id=t14.id,
+            updated_at=timezone.now(),
         )
         for t14 in unmapped_turn14_brands
     ]
@@ -346,6 +347,7 @@ def _transform_locations_data(locations_data: typing.List[typing.Dict]) -> typin
                     state=str(attrs.get('State', '')).strip(),
                     country=str(attrs.get('Country', '')).strip(),
                     zip_code=str(attrs.get('ZipCode', '')).strip(),
+                    updated_at=timezone.now(),
                 )
             )
         except Exception as e:
@@ -387,6 +389,7 @@ def _transform_brands_data(brands_data: typing.List[typing.Dict]) -> typing.List
                 price_groups=price_groups,
                 logo=logo,
                 aaia_code=aaia_code,
+                updated_at=timezone.now(),
             )
             
             brand_instances.append(brand_instance)
@@ -1036,6 +1039,7 @@ def _transform_brand_data(data_items: typing.List[typing.Dict], turn_14_brand: s
                 files=data_item.get('files'),
                 descriptions=data_item.get('descriptions'),
                 relationships=data_item.get('relationships'),
+                updated_at=timezone.now(),
             )
             
             data_instances.append(data_instance)
@@ -1377,6 +1381,7 @@ def _transform_pricing_data(
                 has_map=bool(attributes.get('has_map', False)),
                 can_purchase=bool(attributes.get('can_purchase', False)),
                 pricelists=attributes.get('pricelists'),
+                updated_at=timezone.now(),
             )
             
             pricing_instances.append(pricing_instance)
@@ -1709,6 +1714,7 @@ def _transform_inventory_data(inventory_data: typing.List[typing.Dict], turn_14_
                 eta=attributes.get('eta'),
                 relationships=inventory_item.get('relationships'),
                 total_inventory=total_inventory if total_inventory > 0 else None,
+                updated_at=timezone.now(),
             )
             
             inventory_instances.append(inventory_instance)
