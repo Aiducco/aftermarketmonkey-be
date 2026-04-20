@@ -5,7 +5,7 @@ Downloads from feeds.roughcountry.com or uses local file; upserts brands, parts,
 from django.core.management.base import BaseCommand
 
 from src.audit import scheduled_tasks as audit_scheduled_tasks
-from src.integrations.services import rough_country
+from src.integrations.services import master_parts, rough_country
 
 
 class Command(BaseCommand):
@@ -50,9 +50,15 @@ class Command(BaseCommand):
             rough_country.sync_unmapped_rough_country_brands_to_brands()
             self.stdout.write(self.style.SUCCESS("Unmapped Rough Country brands synced."))
 
+            self.stdout.write(
+                "Step 3: Propagating Rough Country catalog into master parts, provider parts, inventory, and pricing..."
+            )
+            master_parts.sync_derived_from_rough_country(reindex_meilisearch=True)
+            self.stdout.write(self.style.SUCCESS("Derived master layer sync done."))
+
             audit_scheduled_tasks.mark_scheduled_task_completed(
                 execution,
-                message="Successfully completed Rough Country feed sync.",
+                message="Successfully completed Rough Country feed sync and derived master layer sync.",
             )
             self.stdout.write(self.style.SUCCESS("Successfully completed Rough Country feed sync."))
         except Exception as e:

@@ -1,7 +1,7 @@
 from django.core.management.base import BaseCommand
 
 from src import models as src_models
-from src.search.meilisearch_client import add_documents_in_batches, delete_all_documents, is_configured, setup_index
+from src.search.meilisearch_client import is_configured, reindex_all_master_parts, setup_index
 
 
 class Command(BaseCommand):
@@ -33,14 +33,10 @@ class Command(BaseCommand):
             self.stdout.write("Running index setup...")
             setup_index()
 
-        self.stdout.write("Deleting all documents from Meilisearch index...")
-        delete_all_documents()
-        self.stdout.write("Indexing MasterPart records into Meilisearch...")
-        queryset = src_models.MasterPart.objects.select_related("brand").order_by("id")
-        total = queryset.count()
-        self.stdout.write("Total parts to index: {}".format(total))
+        total = src_models.MasterPart.objects.count()
+        self.stdout.write("Full reindex (delete + index). Total parts: {}".format(total))
 
-        ok, fail = add_documents_in_batches(queryset, batch_size=options["batch_size"])
+        ok, fail = reindex_all_master_parts(batch_size=options["batch_size"])
 
         self.stdout.write(
             self.style.SUCCESS("Indexed {} parts. Failed: {}.".format(ok, fail))

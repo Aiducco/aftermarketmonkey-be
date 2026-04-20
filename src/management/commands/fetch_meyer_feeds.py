@@ -1,6 +1,6 @@
 from django.core.management.base import BaseCommand
 
-from src.integrations.services import meyer
+from src.integrations.services import master_parts, meyer
 
 
 class Command(BaseCommand):
@@ -23,6 +23,10 @@ class Command(BaseCommand):
             meyer.fetch_and_save_meyer_catalog_and_inventory(
                 force_download=options.get("force_download", False),
             )
+            self.stdout.write(
+                "Propagating Meyer catalog into master parts, provider parts, inventory, and pricing..."
+            )
+            master_parts.sync_derived_from_meyer(reindex_meilisearch=True)
             self.stdout.write(self.style.SUCCESS("Done."))
         except Exception as e:
             self.stdout.write(self.style.ERROR("Error: {}".format(str(e))))

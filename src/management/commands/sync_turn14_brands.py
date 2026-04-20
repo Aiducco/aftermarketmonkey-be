@@ -5,7 +5,7 @@ records into the Brands flow (BrandTurn14BrandMapping, BrandProviders, CompanyBr
 from django.core.management.base import BaseCommand
 
 from src.audit import scheduled_tasks as audit_scheduled_tasks
-from src.integrations.services import turn_14
+from src.integrations.services import master_parts, turn_14
 
 
 class Command(BaseCommand):
@@ -46,6 +46,10 @@ class Command(BaseCommand):
                 self.stdout.write('  - Brand inventory...')
                 turn_14.fetch_and_save_turn_14_brand_inventory_for_turn14_brands(synced_turn14_brands)
                 self.stdout.write(self.style.SUCCESS('  Brand inventory done.'))
+
+                self.stdout.write('Step 4: Propagating Turn14 catalog into master parts, provider parts, inventory, and pricing...')
+                master_parts.sync_derived_from_turn14(reindex_meilisearch=True)
+                self.stdout.write(self.style.SUCCESS('  Derived master layer sync done.'))
             else:
                 self.stdout.write('Step 3: No newly synced brands; skipping items, brand data, pricing, and inventory fetch.')
 

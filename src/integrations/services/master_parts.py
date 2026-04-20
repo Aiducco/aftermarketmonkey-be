@@ -5,9 +5,11 @@ from Turn14, Keystone, Meyer, A-Tech, Rough Country, WheelPros, and DLG provider
 import logging
 import time
 import typing
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 
-from django.db import connection
+from django.db import close_old_connections, connection
+from django.db.models import Q
 from django.utils import timezone
 
 import pgbulk
@@ -59,6 +61,118 @@ WHEELPROS_LOOKUP_CHUNK = 200
 BATCH_SIZE_INVENTORY = 20000
 BATCH_SIZE_PRICING = 20000
 BATCH_DELAY_SECONDS = 0.1  # Reduced from 0.3 - was adding ~30s per 100 batches
+
+# Partition ``sync_master_parts_from_*`` by internal ``Brands.id`` so workers never compete on the same
+# ``(brand_id, part_number)`` upsert. Tune down if PostgreSQL connection pool is tight.
+MASTER_PARTS_SYNC_MAX_WORKERS = 8
+
+
+def _partition_mapped_brands_for_parallel_ingest(
+    mapping_rows: typing.Sequence[typing.Any],
+    max_workers: int,
+) -> typing.List[typing.List[int]]:
+    internal_ids = sorted({int(m.brand_id) for m in mapping_rows})
+    if not internal_ids:
+        return []
+    n = min(max_workers, len(internal_ids))
+    if n <= 1:
+        return [internal_ids]
+    chunks = [internal_ids[i::n] for i in range(n)]
+    return [c for c in chunks if c]
+
+
+def _catalog_brand_pk_set_for_internal_brand_partition(
+    mapping_rows: typing.Sequence[typing.Any],
+    internal_brand_ids: typing.Collection[int],
+    catalog_brand_id_attr: str,
+) -> typing.Set[int]:
+    ib = frozenset(int(x) for x in internal_brand_ids)
+    out: typing.Set[int] = set()
+    for m in mapping_rows:
+        if int(m.brand_id) not in ib:
+            continue
+        out.add(int(getattr(m, "{}_id".format(catalog_brand_id_attr))))
+    return out
+
+
+def _run_parallel_master_parts_ingest(
+    internal_brand_chunks: typing.List[typing.List[int]],
+    mapping_rows: typing.Sequence[typing.Any],
+    catalog_brand_id_attr: str,
+    worker: typing.Callable[[typing.Set[int]], typing.Tuple[int, int]],
+) -> typing.Tuple[int, int]:
+    """
+    ``catalog_brand_id_attr``: base name of the catalog FK on mapping rows, e.g. ``turn14_brand``
+    (uses ``turn14_brand_id``).
+    """
+    if not internal_brand_chunks:
+        return 0, 0
+    if len(internal_brand_chunks) <= 1:
+        chunk = internal_brand_chunks[0]
+        catalog_ids = _catalog_brand_pk_set_for_internal_brand_partition(
+            mapping_rows, chunk, catalog_brand_id_attr
+        )
+        return worker(catalog_ids)
+
+    def run_partition_worker(internal_chunk: typing.List[int]) -> typing.Tuple[int, int]:
+        close_old_connections()
+        try:
+            catalog_ids = _catalog_brand_pk_set_for_internal_brand_partition(
+                mapping_rows, internal_chunk, catalog_brand_id_attr
+            )
+            if not catalog_ids:
+                return 0, 0
+            return worker(catalog_ids)
+        finally:
+            connection.close()
+
+    total_m, total_p = 0, 0
+    with ThreadPoolExecutor(max_workers=len(internal_brand_chunks)) as ex:
+        futs = [ex.submit(run_partition_worker, ch) for ch in internal_brand_chunks]
+        for fut in futs:
+            m, p = fut.result()
+            total_m += m
+            total_p += p
+    return total_m, total_p
+
+
+def _run_parallel_mapped_brand_int_worker(
+    mapping_rows: typing.Sequence[typing.Any],
+    catalog_brand_id_attr: str,
+    worker: typing.Callable[[typing.Set[int]], int],
+    max_workers: int = MASTER_PARTS_SYNC_MAX_WORKERS,
+) -> int:
+    """
+    Run ``worker`` once per disjoint catalog-brand partition (via internal ``Brands`` round-robin).
+    Workers return ints (e.g. rows upserted); results are summed.
+    """
+    internal_brand_chunks = _partition_mapped_brands_for_parallel_ingest(mapping_rows, max_workers)
+    if not internal_brand_chunks:
+        return 0
+    if len(internal_brand_chunks) <= 1:
+        catalog_ids = _catalog_brand_pk_set_for_internal_brand_partition(
+            mapping_rows, internal_brand_chunks[0], catalog_brand_id_attr
+        )
+        return worker(catalog_ids)
+
+    def run_partition_worker(internal_chunk: typing.List[int]) -> int:
+        close_old_connections()
+        try:
+            catalog_ids = _catalog_brand_pk_set_for_internal_brand_partition(
+                mapping_rows, internal_chunk, catalog_brand_id_attr
+            )
+            if not catalog_ids:
+                return 0
+            return worker(catalog_ids)
+        finally:
+            connection.close()
+
+    total = 0
+    with ThreadPoolExecutor(max_workers=len(internal_brand_chunks)) as ex:
+        futs = [ex.submit(run_partition_worker, ch) for ch in internal_brand_chunks]
+        for fut in futs:
+            total += fut.result()
+    return total
 
 
 # Wheel Pros feed uses numeric warehouse columns; map to "CITY, ST" for ProviderPartInventory JSON.
@@ -301,49 +415,24 @@ MASTER_PART_FULL_UPDATE_FIELDS = ["sku", "description", "aaia_code", "image_url"
 MASTER_PART_PARTIAL_UPDATE_FIELDS = ["sku", "aaia_code"]  # Non-primary providers
 
 
-def sync_master_parts_from_turn14() -> None:
-    """
-    Create/update MasterPart and ProviderPart from Turn14Items.
-    Only processes items whose Turn14Brand has a BrandTurn14BrandMapping.
-    Uses cursor-based pagination (id__gt) and preloaded brand mapping to avoid N+1 and slow OFFSET.
-    """
-    logger.info("{} Syncing master parts from Turn14 (batched, cursor-based).".format(_LOG_PREFIX))
-
-    turn14_provider = src_models.Providers.objects.filter(
-        kind=src_enums.BrandProviderKind.TURN_14.value,
-    ).first()
-    if not turn14_provider:
-        logger.info("{} No Turn14 provider found.".format(_LOG_PREFIX))
-        return
-
-    # Preload turn14_brand_id -> (Brand, aaia_code) in one query
-    mappings = list(
-        src_models.BrandTurn14BrandMapping.objects.select_related("brand", "turn14_brand")
-    )
-    t14_brand_to_brand = {m.turn14_brand_id: m.brand for m in mappings}
-    t14_brand_to_aaia = {
-        m.turn14_brand_id: (m.turn14_brand.aaia_code if m.turn14_brand else None)
-        for m in mappings
-    }
-    if not t14_brand_to_brand:
-        logger.info("{} No BrandTurn14BrandMapping found. Nothing to sync.".format(_LOG_PREFIX))
-        return
-
-    mapped_t14_brand_ids = set(t14_brand_to_brand.keys())
-
+def _ingest_turn14_items_for_mapped_brands(
+    mapped_catalog_brand_ids: typing.Set[int],
+    turn14_provider: src_models.Providers,
+    t14_brand_to_brand: typing.Dict[int, src_models.Brands],
+    t14_brand_to_aaia: typing.Dict[int, typing.Optional[str]],
+) -> typing.Tuple[int, int]:
+    """Batch-ingest Turn14Items into MasterPart / ProviderPart for one disjoint set of Turn14 brand PKs."""
+    if not mapped_catalog_brand_ids:
+        return 0, 0
     total_master = 0
     total_provider = 0
     batch_num = 0
     last_id = 0
-
     while True:
         batch_num += 1
-        # if batch_num < 82:
-        #     continue
-        # Cursor-based: id > last_id, no OFFSET (fast on large tables)
         batch = list(
             src_models.Turn14Items.objects.filter(
-                brand_id__in=mapped_t14_brand_ids,
+                brand_id__in=mapped_catalog_brand_ids,
                 id__gt=last_id,
             )
             .order_by("id")
@@ -372,7 +461,6 @@ def sync_master_parts_from_turn14() -> None:
             if not brand:
                 continue
 
-            # part_number always from mfr_part_number; sku always from part_number
             part_number = row.get("mfr_part_number") or ""
             if isinstance(part_number, str):
                 part_number = part_number.strip()
@@ -429,11 +517,10 @@ def sync_master_parts_from_turn14() -> None:
             src_models.MasterPart,
             master_parts,
             unique_fields=["brand", "part_number"],
-            update_fields=MASTER_PART_FULL_UPDATE_FIELDS,  # Turn14: primary source for all fields
+            update_fields=MASTER_PART_FULL_UPDATE_FIELDS,
         )
         total_master += len(master_parts)
 
-        # Fast lookup: (brand_id, part_number) IN (...) via raw SQL (avoids huge OR query)
         pairs = list(seen)
         brand_part_to_master = {}
         if pairs:
@@ -442,15 +529,14 @@ def sync_master_parts_from_turn14() -> None:
                     "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
                     (tuple(pairs),),
                 )
-                for row in cur.fetchall():
-                    mp_id, b_id, p_num = row
+                for sql_row in cur.fetchall():
+                    mp_id, b_id, p_num = sql_row
                     mp = src_models.MasterPart()
                     mp.id = mp_id
                     mp.brand_id = b_id
                     mp.part_number = p_num
                     brand_part_to_master[(b_id, p_num)] = mp
 
-        # Deduplicate by (master_part, provider): multiple external_ids can map to same (brand, part_number)
         provider_parts_by_key = {}
         for row in batch:
             key = item_to_brand_part.get(row["external_id"])
@@ -488,51 +574,69 @@ def sync_master_parts_from_turn14() -> None:
         if len(batch) == BATCH_SIZE_MASTER_PARTS:
             time.sleep(BATCH_DELAY_SECONDS)
 
+    return total_master, total_provider
+
+
+def sync_master_parts_from_turn14() -> None:
+    """
+    Create/update MasterPart and ProviderPart from Turn14Items.
+    Only processes items whose Turn14Brand has a BrandTurn14BrandMapping.
+    Uses cursor-based pagination (id__gt) and preloaded brand mapping to avoid N+1 and slow OFFSET.
+    """
+    logger.info("{} Syncing master parts from Turn14 (batched, cursor-based).".format(_LOG_PREFIX))
+
+    turn14_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.TURN_14.value,
+    ).first()
+    if not turn14_provider:
+        logger.info("{} No Turn14 provider found.".format(_LOG_PREFIX))
+        return
+
+    # Preload turn14_brand_id -> (Brand, aaia_code) in one query
+    mappings = list(
+        src_models.BrandTurn14BrandMapping.objects.select_related("brand", "turn14_brand")
+    )
+    t14_brand_to_brand = {m.turn14_brand_id: m.brand for m in mappings}
+    t14_brand_to_aaia = {
+        m.turn14_brand_id: (m.turn14_brand.aaia_code if m.turn14_brand else None)
+        for m in mappings
+    }
+    if not t14_brand_to_brand:
+        logger.info("{} No BrandTurn14BrandMapping found. Nothing to sync.".format(_LOG_PREFIX))
+        return
+
+    chunks = _partition_mapped_brands_for_parallel_ingest(mappings, MASTER_PARTS_SYNC_MAX_WORKERS)
+    total_master, total_provider = _run_parallel_master_parts_ingest(
+        chunks,
+        mappings,
+        "turn14_brand",
+        lambda cids: _ingest_turn14_items_for_mapped_brands(
+            cids, turn14_provider, t14_brand_to_brand, t14_brand_to_aaia
+        ),
+    )
     logger.info("{} Synced {} master parts and {} provider parts from Turn14 total.".format(
         _LOG_PREFIX, total_master, total_provider
     ))
 
 
-def sync_master_parts_from_keystone() -> None:
-    """
-    Create/update MasterPart and ProviderPart from KeystoneParts.
-    Only processes parts whose KeystoneBrand has a BrandKeystoneBrandMapping.
-    Uses cursor-based pagination and preloaded brand mapping (same pattern as Turn14).
-    """
-    logger.info("{} Syncing master parts from Keystone (batched, cursor-based).".format(_LOG_PREFIX))
-
-    keystone_provider = src_models.Providers.objects.filter(
-        kind=src_enums.BrandProviderKind.KEYSTONE.value,
-    ).first()
-    if not keystone_provider:
-        logger.info("{} No Keystone provider found.".format(_LOG_PREFIX))
-        return
-
-    # Preload keystone_brand_id -> (Brand, aaia_code) in one query
-    mappings = list(
-        src_models.BrandKeystoneBrandMapping.objects.select_related("brand", "keystone_brand")
-    )
-    ks_brand_to_brand = {m.keystone_brand_id: m.brand for m in mappings}
-    ks_brand_to_aaia = {
-        m.keystone_brand_id: (m.keystone_brand.aaia_code if m.keystone_brand else None)
-        for m in mappings
-    }
-    if not ks_brand_to_brand:
-        logger.info("{} No BrandKeystoneBrandMapping found. Nothing to sync.".format(_LOG_PREFIX))
-        return
-
-    mapped_ks_brand_ids = set(ks_brand_to_brand.keys())
-
+def _ingest_keystone_parts_for_mapped_brands(
+    mapped_catalog_brand_ids: typing.Set[int],
+    keystone_provider: src_models.Providers,
+    ks_brand_to_brand: typing.Dict[int, src_models.Brands],
+    ks_brand_to_aaia: typing.Dict[int, typing.Optional[str]],
+) -> typing.Tuple[int, int]:
+    """Batch-ingest KeystoneParts into MasterPart / ProviderPart for one disjoint set of Keystone brand PKs."""
+    if not mapped_catalog_brand_ids:
+        return 0, 0
     total_master = 0
     total_provider = 0
     batch_num = 0
     last_id = 0
-
     while True:
         batch_num += 1
         batch = list(
             src_models.KeystoneParts.objects.filter(
-                brand_id__in=mapped_ks_brand_ids,
+                brand_id__in=mapped_catalog_brand_ids,
                 id__gt=last_id,
             )
             .order_by("id")
@@ -560,7 +664,6 @@ def sync_master_parts_from_keystone() -> None:
             if not brand:
                 continue
 
-            # part_number always from manufacturer_part_no; sku from vcpn
             part_number = row.get("manufacturer_part_no") or ""
             if isinstance(part_number, str):
                 part_number = part_number.strip()
@@ -573,7 +676,6 @@ def sync_master_parts_from_keystone() -> None:
             if key not in seen:
                 seen.add(key)
                 aaia = row.get("aaia_code") or ks_brand_to_aaia.get(row["brand_id"])
-                # New parts: include description, image_url. Existing parts: Phase 2 only updates sku, aaia_code.
                 master_parts.append(
                     src_models.MasterPart(
                         brand=brand,
@@ -593,7 +695,6 @@ def sync_master_parts_from_keystone() -> None:
             continue
 
         pairs = list(seen)
-        # Two-phase: query existing first so we never overwrite description/image_url on existing parts
         existing_by_key = {}
         if pairs:
             with connection.cursor() as cur:
@@ -601,14 +702,13 @@ def sync_master_parts_from_keystone() -> None:
                     "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
                     (tuple(pairs),),
                 )
-                for row in cur.fetchall():
-                    mp_id, b_id, p_num = row
+                for sql_row in cur.fetchall():
+                    mp_id, b_id, p_num = sql_row
                     existing_by_key[(b_id, p_num)] = mp_id
 
         new_parts = [mp for mp in master_parts if (mp.brand_id, mp.part_number) not in existing_by_key]
         existing_keys = [k for k in pairs if k in existing_by_key]
 
-        # Phase 1: INSERT new parts only (full data). DO NOTHING on conflict.
         if new_parts:
             new_parts = _dedupe_master_parts_for_upsert(
                 new_parts, context="Keystone new_parts batch={}".format(batch_num)
@@ -621,15 +721,11 @@ def sync_master_parts_from_keystone() -> None:
             )
             total_master += len(new_parts)
 
-        # Phase 2: UPDATE existing parts with ONLY sku, aaia_code via raw SQL (never description/image_url)
         if existing_keys:
             key_to_mp = {(mp.brand_id, mp.part_number): mp for mp in master_parts}
-            values = [
-                (existing_by_key[k], key_to_mp[k].sku, key_to_mp[k].aaia_code)
-                for k in existing_keys
-            ]
-            placeholders = ", ".join(["(%s::bigint, %s, %s)"] * len(values))
-            params = [x for row in values for x in row]
+            values = [(existing_by_key[k], key_to_mp[k].aaia_code) for k in existing_keys]
+            placeholders = ", ".join(["(%s::bigint, %s)"] * len(values))
+            params = [x for t in values for x in t]
             with connection.cursor() as cur:
                 cur.execute(
                     """
@@ -640,7 +736,6 @@ def sync_master_parts_from_keystone() -> None:
                     params,
                 )
 
-        # Build brand_part_to_master for provider_parts (need master_part refs)
         brand_part_to_master = {}
         if pairs:
             with connection.cursor() as cur:
@@ -648,15 +743,14 @@ def sync_master_parts_from_keystone() -> None:
                     "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
                     (tuple(pairs),),
                 )
-                for row in cur.fetchall():
-                    mp_id, b_id, p_num = row
+                for sql_row in cur.fetchall():
+                    mp_id, b_id, p_num = sql_row
                     mp = src_models.MasterPart()
                     mp.id = mp_id
                     mp.brand_id = b_id
                     mp.part_number = p_num
                     brand_part_to_master[(b_id, p_num)] = mp
 
-        # Deduplicate by (master_part, provider): multiple vcpns can map to same (brand, part_number)
         provider_parts_by_key = {}
         for row in batch:
             key = vcpn_to_brand_part.get(row["vcpn"])
@@ -690,42 +784,59 @@ def sync_master_parts_from_keystone() -> None:
         if len(batch) == BATCH_SIZE_MASTER_PARTS:
             time.sleep(BATCH_DELAY_SECONDS)
 
+    return total_master, total_provider
+
+
+def sync_master_parts_from_keystone() -> None:
+    """
+    Create/update MasterPart and ProviderPart from KeystoneParts.
+    Only processes parts whose KeystoneBrand has a BrandKeystoneBrandMapping.
+    Uses cursor-based pagination and preloaded brand mapping (same pattern as Turn14).
+    """
+    logger.info("{} Syncing master parts from Keystone (batched, cursor-based).".format(_LOG_PREFIX))
+
+    keystone_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.KEYSTONE.value,
+    ).first()
+    if not keystone_provider:
+        logger.info("{} No Keystone provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandKeystoneBrandMapping.objects.select_related("brand", "keystone_brand")
+    )
+    ks_brand_to_brand = {m.keystone_brand_id: m.brand for m in mappings}
+    ks_brand_to_aaia = {
+        m.keystone_brand_id: (m.keystone_brand.aaia_code if m.keystone_brand else None)
+        for m in mappings
+    }
+    if not ks_brand_to_brand:
+        logger.info("{} No BrandKeystoneBrandMapping found. Nothing to sync.".format(_LOG_PREFIX))
+        return
+
+    chunks = _partition_mapped_brands_for_parallel_ingest(mappings, MASTER_PARTS_SYNC_MAX_WORKERS)
+    total_master, total_provider = _run_parallel_master_parts_ingest(
+        chunks,
+        mappings,
+        "keystone_brand",
+        lambda cids: _ingest_keystone_parts_for_mapped_brands(
+            cids, keystone_provider, ks_brand_to_brand, ks_brand_to_aaia
+        ),
+    )
     logger.info("{} Synced {} master parts and {} provider parts from Keystone total.".format(
         _LOG_PREFIX, total_master, total_provider
     ))
 
 
-def sync_master_parts_from_meyer() -> None:
-    """
-    Create/update MasterPart and ProviderPart from MeyerParts (Meyer Pricing + Inventory feeds).
-    Only processes rows whose MeyerBrand has a BrandMeyerBrandMapping.
-
-    Existing master part resolution (same idea as WheelPros): prefer (brand_id, sku) where sku
-    equals Meyer ``meyer_part``, else (brand_id, part_number) where part_number is ``mfg_item_number``.
-    New rows: INSERT with part_number=mfg_item_number, sku=meyer_part; existing: UPDATE sku/aaia only.
-    """
-    logger.info("{} Syncing master parts from Meyer (batched, cursor-based).".format(_LOG_PREFIX))
-
-    meyer_provider = src_models.Providers.objects.filter(
-        kind=src_enums.BrandProviderKind.MEYER.value,
-    ).first()
-    if not meyer_provider:
-        logger.info("{} No Meyer provider found.".format(_LOG_PREFIX))
-        return
-
-    mappings = list(
-        src_models.BrandMeyerBrandMapping.objects.select_related("brand", "meyer_brand")
-    )
-    my_brand_to_brand = {m.meyer_brand_id: m.brand for m in mappings}
-    my_brand_to_aaia = {
-        m.meyer_brand_id: (m.brand.aaia_code if m.brand else None)
-        for m in mappings
-    }
-    if not my_brand_to_brand:
-        logger.info("{} No BrandMeyerBrandMapping found. Nothing to sync.".format(_LOG_PREFIX))
-        return
-
-    mapped_ids = set(my_brand_to_brand.keys())
+def _ingest_meyer_parts_for_mapped_brands(
+    mapped_catalog_brand_ids: typing.Set[int],
+    meyer_provider: src_models.Providers,
+    my_brand_to_brand: typing.Dict[int, src_models.Brands],
+    my_brand_to_aaia: typing.Dict[int, typing.Optional[str]],
+) -> typing.Tuple[int, int]:
+    """Batch-ingest MeyerParts for one disjoint set of Meyer catalog brand PKs."""
+    if not mapped_catalog_brand_ids:
+        return 0, 0
 
     total_master = 0
     total_provider = 0
@@ -736,7 +847,7 @@ def sync_master_parts_from_meyer() -> None:
         batch_num += 1
         batch = list(
             src_models.MeyerParts.objects.filter(
-                brand_id__in=mapped_ids,
+                brand_id__in=mapped_catalog_brand_ids,
                 id__gt=last_id,
             )
             .order_by("id")
@@ -950,6 +1061,51 @@ def sync_master_parts_from_meyer() -> None:
         if len(batch) == BATCH_SIZE_MASTER_PARTS:
             time.sleep(BATCH_DELAY_SECONDS)
 
+    return total_master, total_provider
+
+
+def sync_master_parts_from_meyer() -> None:
+    """
+    Create/update MasterPart and ProviderPart from MeyerParts (Meyer Pricing + Inventory feeds).
+    Only processes rows whose MeyerBrand has a BrandMeyerBrandMapping.
+
+    Existing master part resolution (same idea as WheelPros): prefer (brand_id, sku) where sku
+    equals Meyer ``meyer_part``, else (brand_id, part_number) where part_number is ``mfg_item_number``.
+    New rows: INSERT with part_number=mfg_item_number, sku=meyer_part; existing: UPDATE sku/aaia only.
+    """
+    logger.info("{} Syncing master parts from Meyer (batched, cursor-based).".format(_LOG_PREFIX))
+
+    meyer_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.MEYER.value,
+    ).first()
+    if not meyer_provider:
+        logger.info("{} No Meyer provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandMeyerBrandMapping.objects.select_related("brand", "meyer_brand")
+    )
+    my_brand_to_brand = {m.meyer_brand_id: m.brand for m in mappings}
+    my_brand_to_aaia = {
+        m.meyer_brand_id: (m.brand.aaia_code if m.brand else None)
+        for m in mappings
+    }
+    if not my_brand_to_brand:
+        logger.info("{} No BrandMeyerBrandMapping found. Nothing to sync.".format(_LOG_PREFIX))
+        return
+
+    chunks = _partition_mapped_brands_for_parallel_ingest(mappings, MASTER_PARTS_SYNC_MAX_WORKERS)
+    total_master, total_provider = _run_parallel_master_parts_ingest(
+        chunks,
+        mappings,
+        "meyer_brand",
+        lambda cids: _ingest_meyer_parts_for_mapped_brands(
+            cids,
+            meyer_provider,
+            my_brand_to_brand,
+            my_brand_to_aaia,
+        ),
+    )
     logger.info("{} Synced {} master parts and {} provider parts from Meyer total.".format(
         _LOG_PREFIX, total_master, total_provider
     ))
@@ -961,39 +1117,15 @@ def _atech_provider_external_id(atech_brand_id: int, part_number: str) -> str:
     return "{}_{}".format(int(atech_brand_id), pn)
 
 
-def sync_master_parts_from_atech() -> None:
-    """
-    Create/update MasterPart and ProviderPart from AtechParts.
-    Only rows whose ``AtechParts.brand`` has a ``BrandAtechBrandMapping`` are included.
-
-    ``MasterPart.part_number`` and ``MasterPart.sku`` are both ``AtechParts.part_number`` (suffix
-    after prefix, e.g. ``35370`` for ``ACC-35370``) so ``sync_provider_pricing_from_atech_for_company``
-    can resolve ``ProviderPart`` via ``_meyer_provider_parts_by_brand_sku_first``.
-    ``ProviderPart.provider_external_id`` is ``_atech_provider_external_id(brand_id, part_number)``
-    (matches ``sync_provider_inventory_from_atech``).
-    """
-    logger.info("{} Syncing master parts from A-Tech (batched, cursor-based).".format(_LOG_PREFIX))
-
-    atech_provider = src_models.Providers.objects.filter(
-        kind=src_enums.BrandProviderKind.ATECH.value,
-    ).first()
-    if not atech_provider:
-        logger.info("{} No A-Tech provider found.".format(_LOG_PREFIX))
-        return
-
-    mappings = list(
-        src_models.BrandAtechBrandMapping.objects.select_related("brand", "atech_brand")
-    )
-    atech_brand_to_brand = {m.atech_brand_id: m.brand for m in mappings}
-    atech_brand_to_aaia = {
-        m.atech_brand_id: (m.atech_brand.aaia_code if m.atech_brand else None)
-        for m in mappings
-    }
-    if not atech_brand_to_brand:
-        logger.info("{} No BrandAtechBrandMapping found. Nothing to sync.".format(_LOG_PREFIX))
-        return
-
-    mapped_atech_brand_ids = set(atech_brand_to_brand.keys())
+def _ingest_atech_parts_for_mapped_brands(
+    mapped_catalog_brand_ids: typing.Set[int],
+    atech_provider: src_models.Providers,
+    atech_brand_to_brand: typing.Dict[int, src_models.Brands],
+    atech_brand_to_aaia: typing.Dict[int, typing.Optional[str]],
+) -> typing.Tuple[int, int]:
+    """Batch-ingest AtechParts for one disjoint set of A-Tech catalog brand PKs."""
+    if not mapped_catalog_brand_ids:
+        return 0, 0
 
     total_master = 0
     total_provider = 0
@@ -1004,7 +1136,7 @@ def sync_master_parts_from_atech() -> None:
         batch_num += 1
         batch = list(
             src_models.AtechParts.objects.filter(
-                brand_id__in=mapped_atech_brand_ids,
+                brand_id__in=mapped_catalog_brand_ids,
                 id__gt=last_id,
             )
             .order_by("id")
@@ -1162,6 +1294,54 @@ def sync_master_parts_from_atech() -> None:
         if len(batch) == BATCH_SIZE_MASTER_PARTS:
             time.sleep(BATCH_DELAY_SECONDS)
 
+    return total_master, total_provider
+
+
+def sync_master_parts_from_atech() -> None:
+    """
+    Create/update MasterPart and ProviderPart from AtechParts.
+    Only rows whose ``AtechParts.brand`` has a ``BrandAtechBrandMapping`` are included.
+
+    ``MasterPart.part_number`` and ``MasterPart.sku`` are both ``AtechParts.part_number`` (suffix
+    after prefix, e.g. ``35370`` for ``ACC-35370``). Pricing resolves ``ProviderPart`` by
+    ``(internal brand, MasterPart.part_number)`` via ``_provider_parts_by_master_brand_and_part_number``
+    (same logical key as ingest's ``unique_together`` on ``MasterPart``).
+    ``ProviderPart.provider_external_id`` is ``_atech_provider_external_id(brand_id, part_number)``
+    (matches ``sync_provider_inventory_from_atech``).
+    """
+    logger.info("{} Syncing master parts from A-Tech (batched, cursor-based).".format(_LOG_PREFIX))
+
+    atech_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.ATECH.value,
+    ).first()
+    if not atech_provider:
+        logger.info("{} No A-Tech provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandAtechBrandMapping.objects.select_related("brand", "atech_brand")
+    )
+    atech_brand_to_brand = {m.atech_brand_id: m.brand for m in mappings}
+    atech_brand_to_aaia = {
+        m.atech_brand_id: (m.atech_brand.aaia_code if m.atech_brand else None)
+        for m in mappings
+    }
+    if not atech_brand_to_brand:
+        logger.info("{} No BrandAtechBrandMapping found. Nothing to sync.".format(_LOG_PREFIX))
+        return
+
+    chunks = _partition_mapped_brands_for_parallel_ingest(mappings, MASTER_PARTS_SYNC_MAX_WORKERS)
+    total_master, total_provider = _run_parallel_master_parts_ingest(
+        chunks,
+        mappings,
+        "atech_brand",
+        lambda cids: _ingest_atech_parts_for_mapped_brands(
+            cids,
+            atech_provider,
+            atech_brand_to_brand,
+            atech_brand_to_aaia,
+        ),
+    )
     logger.info("{} Synced {} master parts and {} provider parts from A-Tech total.".format(
         _LOG_PREFIX, total_master, total_provider
     ))
@@ -1172,34 +1352,15 @@ def _rough_country_provider_external_id(rc_brand_id: int, sku: str) -> str:
     return "{}_{}".format(rc_brand_id, sku)
 
 
-def sync_master_parts_from_rough_country() -> None:
-    """
-    Create/update MasterPart and ProviderPart from RoughCountryPart.
-    Only processes parts whose RoughCountryBrand has a BrandRoughCountryBrandMapping.
-    Uses cursor-based pagination and two-phase upsert (non-primary: INSERT new, UPDATE existing sku/aaia only).
-    """
-    logger.info("{} Syncing master parts from Rough Country (batched, cursor-based).".format(_LOG_PREFIX))
-
-    rc_provider = src_models.Providers.objects.filter(
-        kind=src_enums.BrandProviderKind.ROUGH_COUNTRY.value,
-    ).first()
-    if not rc_provider:
-        logger.info("{} No Rough Country provider found.".format(_LOG_PREFIX))
-        return
-
-    mappings = list(
-        src_models.BrandRoughCountryBrandMapping.objects.select_related("brand", "rough_country_brand")
-    )
-    rc_brand_to_brand = {m.rough_country_brand_id: m.brand for m in mappings}
-    rc_brand_to_aaia = {
-        m.rough_country_brand_id: (m.rough_country_brand.aaia_code if m.rough_country_brand else None)
-        for m in mappings
-    }
-    if not rc_brand_to_brand:
-        logger.info("{} No BrandRoughCountryBrandMapping found. Nothing to sync.".format(_LOG_PREFIX))
-        return
-
-    mapped_rc_brand_ids = set(rc_brand_to_brand.keys())
+def _ingest_rough_country_parts_for_mapped_brands(
+    mapped_catalog_brand_ids: typing.Set[int],
+    rc_provider: src_models.Providers,
+    rc_brand_to_brand: typing.Dict[int, src_models.Brands],
+    rc_brand_to_aaia: typing.Dict[int, typing.Optional[str]],
+) -> typing.Tuple[int, int]:
+    """Batch-ingest RoughCountryPart rows for one disjoint set of RC catalog brand PKs."""
+    if not mapped_catalog_brand_ids:
+        return 0, 0
 
     total_master = 0
     total_provider = 0
@@ -1210,7 +1371,7 @@ def sync_master_parts_from_rough_country() -> None:
         batch_num += 1
         batch = list(
             src_models.RoughCountryPart.objects.filter(
-                brand_id__in=mapped_rc_brand_ids,
+                brand_id__in=mapped_catalog_brand_ids,
                 id__gt=last_id,
             )
             .order_by("id")
@@ -1361,6 +1522,48 @@ def sync_master_parts_from_rough_country() -> None:
         if len(batch) == BATCH_SIZE_MASTER_PARTS:
             time.sleep(BATCH_DELAY_SECONDS)
 
+    return total_master, total_provider
+
+
+def sync_master_parts_from_rough_country() -> None:
+    """
+    Create/update MasterPart and ProviderPart from RoughCountryPart.
+    Only processes parts whose RoughCountryBrand has a BrandRoughCountryBrandMapping.
+    Uses cursor-based pagination and two-phase upsert (non-primary: INSERT new, UPDATE existing sku/aaia only).
+    """
+    logger.info("{} Syncing master parts from Rough Country (batched, cursor-based).".format(_LOG_PREFIX))
+
+    rc_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.ROUGH_COUNTRY.value,
+    ).first()
+    if not rc_provider:
+        logger.info("{} No Rough Country provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandRoughCountryBrandMapping.objects.select_related("brand", "rough_country_brand")
+    )
+    rc_brand_to_brand = {m.rough_country_brand_id: m.brand for m in mappings}
+    rc_brand_to_aaia = {
+        m.rough_country_brand_id: (m.rough_country_brand.aaia_code if m.rough_country_brand else None)
+        for m in mappings
+    }
+    if not rc_brand_to_brand:
+        logger.info("{} No BrandRoughCountryBrandMapping found. Nothing to sync.".format(_LOG_PREFIX))
+        return
+
+    chunks = _partition_mapped_brands_for_parallel_ingest(mappings, MASTER_PARTS_SYNC_MAX_WORKERS)
+    total_master, total_provider = _run_parallel_master_parts_ingest(
+        chunks,
+        mappings,
+        "rough_country_brand",
+        lambda cids: _ingest_rough_country_parts_for_mapped_brands(
+            cids,
+            rc_provider,
+            rc_brand_to_brand,
+            rc_brand_to_aaia,
+        ),
+    )
     logger.info("{} Synced {} master parts and {} provider parts from Rough Country total.".format(
         _LOG_PREFIX, total_master, total_provider
     ))
@@ -1372,37 +1575,15 @@ def _dlg_provider_external_id(dlg_brand_id: int, part_number: str) -> str:
     return "{}_{}".format(int(dlg_brand_id), pn)
 
 
-def sync_master_parts_from_dlg() -> None:
-    """
-    Create/update MasterPart and ProviderPart from DlgParts.
-    Only rows whose DlgBrand has a BrandDlgBrandMapping are included.
-
-    Resolution uses **(catalog brand_id, part_number) only** — no Meyer-style ``(brand_id, sku)`` lookup.
-    ``MasterPart.sku`` is set to ``part_number`` for consistency with other single-key feeds.
-    ``ProviderPart.provider_external_id`` is ``f\"{dlg_brand_id}_{part_number}\"`` so inventory joins stay unique.
-    """
-    logger.info("{} Syncing master parts from DLG (batched, part_number only).".format(_LOG_PREFIX))
-
-    dlg_provider = src_models.Providers.objects.filter(
-        kind=src_enums.BrandProviderKind.DLG.value,
-    ).first()
-    if not dlg_provider:
-        logger.info("{} No DLG provider found.".format(_LOG_PREFIX))
-        return
-
-    mappings = list(
-        src_models.BrandDlgBrandMapping.objects.select_related("brand", "dlg_brand")
-    )
-    dlg_brand_to_brand = {m.dlg_brand_id: m.brand for m in mappings}
-    dlg_brand_to_aaia = {
-        m.dlg_brand_id: (m.brand.aaia_code if m.brand else None)
-        for m in mappings
-    }
-    if not dlg_brand_to_brand:
-        logger.info("{} No BrandDlgBrandMapping found. Nothing to sync.".format(_LOG_PREFIX))
-        return
-
-    mapped_dlg_brand_ids = set(dlg_brand_to_brand.keys())
+def _ingest_dlg_parts_for_mapped_brands(
+    mapped_catalog_brand_ids: typing.Set[int],
+    dlg_provider: src_models.Providers,
+    dlg_brand_to_brand: typing.Dict[int, src_models.Brands],
+    dlg_brand_to_aaia: typing.Dict[int, typing.Optional[str]],
+) -> typing.Tuple[int, int]:
+    """Batch-ingest DlgParts for one disjoint set of DLG catalog brand PKs."""
+    if not mapped_catalog_brand_ids:
+        return 0, 0
 
     total_master = 0
     total_provider = 0
@@ -1413,7 +1594,7 @@ def sync_master_parts_from_dlg() -> None:
         batch_num += 1
         batch = list(
             src_models.DlgParts.objects.filter(
-                brand_id__in=mapped_dlg_brand_ids,
+                brand_id__in=mapped_catalog_brand_ids,
                 id__gt=last_id,
             )
             .order_by("id")
@@ -1571,6 +1752,51 @@ def sync_master_parts_from_dlg() -> None:
         if len(batch) == BATCH_SIZE_MASTER_PARTS:
             time.sleep(BATCH_DELAY_SECONDS)
 
+    return total_master, total_provider
+
+
+def sync_master_parts_from_dlg() -> None:
+    """
+    Create/update MasterPart and ProviderPart from DlgParts.
+    Only rows whose DlgBrand has a BrandDlgBrandMapping are included.
+
+    Resolution uses **(catalog brand_id, part_number) only** — no Meyer-style ``(brand_id, sku)`` lookup.
+    ``MasterPart.sku`` is set to ``part_number`` for consistency with other single-key feeds.
+    ``ProviderPart.provider_external_id`` is ``f\"{dlg_brand_id}_{part_number}\"`` so inventory joins stay unique.
+    """
+    logger.info("{} Syncing master parts from DLG (batched, part_number only).".format(_LOG_PREFIX))
+
+    dlg_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.DLG.value,
+    ).first()
+    if not dlg_provider:
+        logger.info("{} No DLG provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandDlgBrandMapping.objects.select_related("brand", "dlg_brand")
+    )
+    dlg_brand_to_brand = {m.dlg_brand_id: m.brand for m in mappings}
+    dlg_brand_to_aaia = {
+        m.dlg_brand_id: (m.brand.aaia_code if m.brand else None)
+        for m in mappings
+    }
+    if not dlg_brand_to_brand:
+        logger.info("{} No BrandDlgBrandMapping found. Nothing to sync.".format(_LOG_PREFIX))
+        return
+
+    chunks = _partition_mapped_brands_for_parallel_ingest(mappings, MASTER_PARTS_SYNC_MAX_WORKERS)
+    total_master, total_provider = _run_parallel_master_parts_ingest(
+        chunks,
+        mappings,
+        "dlg_brand",
+        lambda cids: _ingest_dlg_parts_for_mapped_brands(
+            cids,
+            dlg_provider,
+            dlg_brand_to_brand,
+            dlg_brand_to_aaia,
+        ),
+    )
     logger.info("{} Synced {} master parts and {} provider parts from DLG total.".format(
         _LOG_PREFIX, total_master, total_provider
     ))
@@ -1605,74 +1831,86 @@ def sync_provider_inventory_from_rough_country() -> None:
         logger.info("{} No Rough Country provider found.".format(_LOG_PREFIX))
         return
 
+    mappings = list(
+        src_models.BrandRoughCountryBrandMapping.objects.select_related("brand", "rough_country_brand")
+    )
+    if not mappings:
+        logger.info("{} No BrandRoughCountryBrandMapping found.".format(_LOG_PREFIX))
+        return
+
     provider_parts = {
         pp.provider_external_id: pp
         for pp in src_models.ProviderPart.objects.filter(provider=rc_provider)
     }
 
     now = timezone.now()
-    total_upserted = 0
-    batch_num = 0
-    last_id = 0
 
-    while True:
-        batch_num += 1
-        batch = list(
-            src_models.RoughCountryPart.objects.filter(id__gt=last_id)
-            .order_by("id")
-            .values("id", "brand_id", "sku", "nv_stock", "tn_stock")[:BATCH_SIZE_INVENTORY]
-        )
-        if not batch:
-            break
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            batch = list(
+                src_models.RoughCountryPart.objects.filter(id__gt=last_id, brand_id__in=catalog_ids)
+                .order_by("id")
+                .values("id", "brand_id", "sku", "nv_stock", "tn_stock")[:BATCH_SIZE_INVENTORY]
+            )
+            if not batch:
+                break
 
-        last_id = batch[-1]["id"]
-        to_upsert = []
-        for row in batch:
-            ext_id = _rough_country_provider_external_id(row["brand_id"], row["sku"])
-            provider_part = provider_parts.get(ext_id)
-            if not provider_part:
-                continue
-            nv = row.get("nv_stock")
-            tn = row.get("tn_stock")
-            total = (nv or 0) + (tn or 0)
-            to_upsert.append(
-                src_models.ProviderPartInventory(
-                    provider_part=provider_part,
-                    warehouse_total_qty=total,
-                    manufacturer_inventory=None,
-                    manufacturer_esd=None,
-                    warehouse_availability=_rough_country_inventory_warehouse_availability(nv, tn),
-                    last_synced_at=now,
-                    updated_at=now,
+            last_id = batch[-1]["id"]
+            to_upsert = []
+            for row in batch:
+                ext_id = _rough_country_provider_external_id(row["brand_id"], row["sku"])
+                provider_part = provider_parts.get(ext_id)
+                if not provider_part:
+                    continue
+                nv = row.get("nv_stock")
+                tn = row.get("tn_stock")
+                total = (nv or 0) + (tn or 0)
+                to_upsert.append(
+                    src_models.ProviderPartInventory(
+                        provider_part=provider_part,
+                        warehouse_total_qty=total,
+                        manufacturer_inventory=None,
+                        manufacturer_esd=None,
+                        warehouse_availability=_rough_country_inventory_warehouse_availability(nv, tn),
+                        last_synced_at=now,
+                        updated_at=now,
+                    )
                 )
-            )
 
-        if to_upsert:
-            to_upsert = _dedupe_provider_part_inventory_for_upsert(
-                to_upsert, context="Rough Country inventory batch={}".format(batch_num)
-            )
-            pgbulk.upsert(
-                src_models.ProviderPartInventory,
-                to_upsert,
-                unique_fields=["provider_part"],
-                update_fields=[
-                    "warehouse_total_qty",
-                    "manufacturer_inventory",
-                    "manufacturer_esd",
-                    "warehouse_availability",
-                    "last_synced_at",
-                    "updated_at",
-                ],
-            )
-            total_upserted += len(to_upsert)
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_inventory_for_upsert(
+                    to_upsert, context="Rough Country inventory batch={}".format(batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartInventory,
+                    to_upsert,
+                    unique_fields=["provider_part"],
+                    update_fields=[
+                        "warehouse_total_qty",
+                        "manufacturer_inventory",
+                        "manufacturer_esd",
+                        "warehouse_availability",
+                        "last_synced_at",
+                        "updated_at",
+                    ],
+                )
+                total_upserted += len(to_upsert)
 
-        logger.info("{} Rough Country inventory batch {}: {} records (last_id={})".format(
-            _LOG_PREFIX, batch_num, len(to_upsert), last_id
-        ))
-        connection.close()
-        if len(batch) == BATCH_SIZE_INVENTORY:
-            time.sleep(BATCH_DELAY_SECONDS)
+            logger.info("{} Rough Country inventory batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_INVENTORY:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
 
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "rough_country_brand", _worker)
     logger.info("{} Synced {} Rough Country inventory records total.".format(_LOG_PREFIX, total_upserted))
 
 
@@ -1687,10 +1925,10 @@ def sync_provider_inventory_from_dlg() -> None:
         logger.info("{} No DLG provider found.".format(_LOG_PREFIX))
         return
 
-    mapped_ids = set(
-        src_models.BrandDlgBrandMapping.objects.values_list("dlg_brand_id", flat=True).distinct()
+    mappings = list(
+        src_models.BrandDlgBrandMapping.objects.select_related("brand", "dlg_brand")
     )
-    if not mapped_ids:
+    if not mappings:
         logger.info("{} No BrandDlgBrandMapping found.".format(_LOG_PREFIX))
         return
 
@@ -1700,84 +1938,89 @@ def sync_provider_inventory_from_dlg() -> None:
     }
 
     now = timezone.now()
-    total_upserted = 0
-    batch_num = 0
-    last_id = 0
 
-    while True:
-        batch_num += 1
-        batch = list(
-            src_models.DlgParts.objects.filter(id__gt=last_id, brand_id__in=mapped_ids)
-            .order_by("id")
-            .values("id", "brand_id", "part_number", "available_on_hand")[:BATCH_SIZE_INVENTORY]
-        )
-        if not batch:
-            break
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            batch = list(
+                src_models.DlgParts.objects.filter(id__gt=last_id, brand_id__in=catalog_ids)
+                .order_by("id")
+                .values("id", "brand_id", "part_number", "available_on_hand")[:BATCH_SIZE_INVENTORY]
+            )
+            if not batch:
+                break
 
-        last_id = batch[-1]["id"]
-        to_upsert = []
-        for row in batch:
-            pn = row.get("part_number") or ""
-            if isinstance(pn, str):
-                pn = pn.strip()
-            else:
-                pn = str(pn or "").strip()
-            if not pn:
-                continue
-            ext_id = _dlg_provider_external_id(row["brand_id"], pn)
-            provider_part = provider_parts.get(ext_id)
-            if not provider_part:
-                continue
-            qty = row.get("available_on_hand")
-            wh_avail: typing.Dict[str, typing.Any]
-            try:
-                if qty is None:
+            last_id = batch[-1]["id"]
+            to_upsert = []
+            for row in batch:
+                pn = row.get("part_number") or ""
+                if isinstance(pn, str):
+                    pn = pn.strip()
+                else:
+                    pn = str(pn or "").strip()
+                if not pn:
+                    continue
+                ext_id = _dlg_provider_external_id(row["brand_id"], pn)
+                provider_part = provider_parts.get(ext_id)
+                if not provider_part:
+                    continue
+                qty = row.get("available_on_hand")
+                wh_avail: typing.Dict[str, typing.Any]
+                try:
+                    if qty is None:
+                        total_qty = 0
+                        wh_avail = {"available_on_hand": None}
+                    else:
+                        total_qty = int(qty)
+                        wh_avail = {"available_on_hand": total_qty}
+                except (TypeError, ValueError):
                     total_qty = 0
                     wh_avail = {"available_on_hand": None}
-                else:
-                    total_qty = int(qty)
-                    wh_avail = {"available_on_hand": total_qty}
-            except (TypeError, ValueError):
-                total_qty = 0
-                wh_avail = {"available_on_hand": None}
-            to_upsert.append(
-                src_models.ProviderPartInventory(
-                    provider_part=provider_part,
-                    warehouse_total_qty=total_qty,
-                    manufacturer_inventory=None,
-                    manufacturer_esd=None,
-                    warehouse_availability=wh_avail,
-                    last_synced_at=now,
-                    updated_at=now,
+                to_upsert.append(
+                    src_models.ProviderPartInventory(
+                        provider_part=provider_part,
+                        warehouse_total_qty=total_qty,
+                        manufacturer_inventory=None,
+                        manufacturer_esd=None,
+                        warehouse_availability=wh_avail,
+                        last_synced_at=now,
+                        updated_at=now,
+                    )
                 )
-            )
 
-        if to_upsert:
-            to_upsert = _dedupe_provider_part_inventory_for_upsert(
-                to_upsert, context="DLG inventory batch={}".format(batch_num)
-            )
-            pgbulk.upsert(
-                src_models.ProviderPartInventory,
-                to_upsert,
-                unique_fields=["provider_part"],
-                update_fields=[
-                    "warehouse_total_qty",
-                    "manufacturer_inventory",
-                    "manufacturer_esd",
-                    "warehouse_availability",
-                    "last_synced_at",
-                    "updated_at",
-                ],
-            )
-            total_upserted += len(to_upsert)
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_inventory_for_upsert(
+                    to_upsert, context="DLG inventory batch={}".format(batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartInventory,
+                    to_upsert,
+                    unique_fields=["provider_part"],
+                    update_fields=[
+                        "warehouse_total_qty",
+                        "manufacturer_inventory",
+                        "manufacturer_esd",
+                        "warehouse_availability",
+                        "last_synced_at",
+                        "updated_at",
+                    ],
+                )
+                total_upserted += len(to_upsert)
 
-        logger.info("{} DLG inventory batch {}: {} records (last_id={})".format(
-            _LOG_PREFIX, batch_num, len(to_upsert), last_id
-        ))
-        connection.close()
-        if len(batch) == BATCH_SIZE_INVENTORY:
-            time.sleep(BATCH_DELAY_SECONDS)
+            logger.info("{} DLG inventory batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_INVENTORY:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
 
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "dlg_brand", _worker)
     logger.info("{} Synced {} DLG inventory records total.".format(_LOG_PREFIX, total_upserted))
 
 
@@ -1816,10 +2059,10 @@ def sync_provider_inventory_from_atech() -> None:
         logger.info("{} No A-Tech provider found.".format(_LOG_PREFIX))
         return
 
-    mapped_ids = set(
-        src_models.BrandAtechBrandMapping.objects.values_list("atech_brand_id", flat=True).distinct()
+    mappings = list(
+        src_models.BrandAtechBrandMapping.objects.select_related("brand", "atech_brand")
     )
-    if not mapped_ids:
+    if not mappings:
         logger.info("{} No BrandAtechBrandMapping found.".format(_LOG_PREFIX))
         return
 
@@ -1829,83 +2072,88 @@ def sync_provider_inventory_from_atech() -> None:
     }
 
     now = timezone.now()
-    total_upserted = 0
-    batch_num = 0
-    last_id = 0
 
-    while True:
-        batch_num += 1
-        batch = list(
-            src_models.AtechParts.objects.filter(id__gt=last_id, brand_id__in=mapped_ids)
-            .order_by("id")
-            .values(
-                "id",
-                "brand_id",
-                "part_number",
-                "qty_tallmadge",
-                "qty_sparks",
-                "qty_mcdonough",
-                "qty_arlington",
-            )[:BATCH_SIZE_INVENTORY]
-        )
-        if not batch:
-            break
-
-        last_id = batch[-1]["id"]
-        inv_by_provider_part_id: typing.Dict[int, src_models.ProviderPartInventory] = {}
-        for ap in batch:
-            ext = ap.get("part_number")
-            if isinstance(ext, str):
-                ext = ext.strip()
-            else:
-                ext = str(ext or "").strip()
-            if not ext:
-                continue
-            bid = ap.get("brand_id")
-            if bid is None:
-                continue
-            ext_id = _atech_provider_external_id(int(bid), ext)
-            pp = provider_parts.get(ext_id)
-            if not pp:
-                continue
-            wh_total = _atech_dc_inventory_sum(ap)
-            inv_by_provider_part_id[pp.id] = src_models.ProviderPartInventory(
-                provider_part=pp,
-                warehouse_total_qty=wh_total,
-                manufacturer_inventory=None,
-                manufacturer_esd=None,
-                warehouse_availability=_atech_inventory_warehouse_availability(ap),
-                last_synced_at=now,
-                updated_at=now,
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            batch = list(
+                src_models.AtechParts.objects.filter(id__gt=last_id, brand_id__in=catalog_ids)
+                .order_by("id")
+                .values(
+                    "id",
+                    "brand_id",
+                    "part_number",
+                    "qty_tallmadge",
+                    "qty_sparks",
+                    "qty_mcdonough",
+                    "qty_arlington",
+                )[:BATCH_SIZE_INVENTORY]
             )
+            if not batch:
+                break
 
-        to_upsert = list(inv_by_provider_part_id.values())
-        if to_upsert:
-            to_upsert = _dedupe_provider_part_inventory_for_upsert(
-                to_upsert, context="A-Tech inventory batch={}".format(batch_num)
-            )
-            pgbulk.upsert(
-                src_models.ProviderPartInventory,
-                to_upsert,
-                unique_fields=["provider_part"],
-                update_fields=[
-                    "warehouse_total_qty",
-                    "manufacturer_inventory",
-                    "manufacturer_esd",
-                    "warehouse_availability",
-                    "last_synced_at",
-                    "updated_at",
-                ],
-            )
-            total_upserted += len(to_upsert)
+            last_id = batch[-1]["id"]
+            inv_by_provider_part_id: typing.Dict[int, src_models.ProviderPartInventory] = {}
+            for ap in batch:
+                ext = ap.get("part_number")
+                if isinstance(ext, str):
+                    ext = ext.strip()
+                else:
+                    ext = str(ext or "").strip()
+                if not ext:
+                    continue
+                bid = ap.get("brand_id")
+                if bid is None:
+                    continue
+                ext_id = _atech_provider_external_id(int(bid), ext)
+                pp = provider_parts.get(ext_id)
+                if not pp:
+                    continue
+                wh_total = _atech_dc_inventory_sum(ap)
+                inv_by_provider_part_id[pp.id] = src_models.ProviderPartInventory(
+                    provider_part=pp,
+                    warehouse_total_qty=wh_total,
+                    manufacturer_inventory=None,
+                    manufacturer_esd=None,
+                    warehouse_availability=_atech_inventory_warehouse_availability(ap),
+                    last_synced_at=now,
+                    updated_at=now,
+                )
 
-        logger.info("{} A-Tech inventory batch {}: {} records (last_id={})".format(
-            _LOG_PREFIX, batch_num, len(to_upsert), last_id
-        ))
-        connection.close()
-        if len(batch) == BATCH_SIZE_INVENTORY:
-            time.sleep(BATCH_DELAY_SECONDS)
+            to_upsert = list(inv_by_provider_part_id.values())
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_inventory_for_upsert(
+                    to_upsert, context="A-Tech inventory batch={}".format(batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartInventory,
+                    to_upsert,
+                    unique_fields=["provider_part"],
+                    update_fields=[
+                        "warehouse_total_qty",
+                        "manufacturer_inventory",
+                        "manufacturer_esd",
+                        "warehouse_availability",
+                        "last_synced_at",
+                        "updated_at",
+                    ],
+                )
+                total_upserted += len(to_upsert)
 
+            logger.info("{} A-Tech inventory batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_INVENTORY:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "atech_brand", _worker)
     logger.info("{} Synced {} A-Tech inventory records total.".format(_LOG_PREFIX, total_upserted))
 
 
@@ -1932,104 +2180,111 @@ def sync_provider_pricing_from_rough_country() -> None:
         return
 
     now = timezone.now()
-    total_upserted = 0
-    batch_num = 0
-    last_id = 0
 
-    while True:
-        batch_num += 1
-        batch = list(
-            src_models.RoughCountryCompanyPricing.objects.filter(id__gt=last_id)
-            .order_by("id")
-            .values(
-                "id",
-                "company_id",
-                "cost",
-                "price",
-                "sale_price",
-                "cnd_map",
-                "cnd_price",
-                "part__brand_id",
-                "part__sku",
-            )[:BATCH_SIZE_PRICING]
-        )
-        if not batch:
-            break
-
-        last_id = batch[-1]["id"]
-        batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
-        companies_by_id = {
-            c.id: c
-            for c in src_models.Company.objects.filter(id__in=batch_company_ids)
-        }
-        master_keys = []
-        for row in batch:
-            brand = rc_brand_to_brand.get(row.get("part__brand_id"))
-            if not brand:
-                continue
-            sku = row.get("part__sku")
-            if isinstance(sku, str):
-                sku = sku.strip()
-            else:
-                sku = str(sku or "").strip()
-            if not sku:
-                continue
-            master_keys.append((brand.id, sku))
-        pp_by_key = _provider_parts_by_master_brand_and_part_number(rc_provider, master_keys)
-
-        to_upsert = []
-        for row in batch:
-            brand = rc_brand_to_brand.get(row.get("part__brand_id"))
-            if not brand:
-                continue
-            sku = row.get("part__sku")
-            if isinstance(sku, str):
-                sku = sku.strip()
-            else:
-                sku = str(sku or "").strip()
-            if not sku:
-                continue
-            provider_part = pp_by_key.get((brand.id, sku))
-            if not provider_part:
-                continue
-            company = companies_by_id.get(row.get("company_id"))
-            if not company:
-                continue
-            cost = row.get("cost") or row.get("price") or row.get("sale_price")
-            cnd_map = row.get("cnd_map")
-            cnd_price = row.get("cnd_price")
-            to_upsert.append(
-                src_models.ProviderPartCompanyPricing(
-                    provider_part=provider_part,
-                    company=company,
-                    cost=cost,
-                    jobber_price=cnd_map,
-                    map_price=cnd_map,
-                    msrp=cnd_price,
-                    retail_price=cnd_price,
-                    last_synced_at=now,
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            batch = list(
+                src_models.RoughCountryCompanyPricing.objects.filter(
+                    id__gt=last_id, part__brand_id__in=catalog_ids
                 )
+                .order_by("id")
+                .values(
+                    "id",
+                    "company_id",
+                    "cost",
+                    "price",
+                    "sale_price",
+                    "cnd_map",
+                    "cnd_price",
+                    "part__brand_id",
+                    "part__sku",
+                )[:BATCH_SIZE_PRICING]
             )
+            if not batch:
+                break
 
-        if to_upsert:
-            to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
-                to_upsert, context="Rough Country pricing batch={}".format(batch_num)
-            )
-            pgbulk.upsert(
-                src_models.ProviderPartCompanyPricing,
-                to_upsert,
-                unique_fields=["provider_part", "company"],
-                update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
-            )
-            total_upserted += len(to_upsert)
+            last_id = batch[-1]["id"]
+            batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
+            companies_by_id = {
+                c.id: c
+                for c in src_models.Company.objects.filter(id__in=batch_company_ids)
+            }
+            master_keys = []
+            for row in batch:
+                brand = rc_brand_to_brand.get(row.get("part__brand_id"))
+                if not brand:
+                    continue
+                sku = row.get("part__sku")
+                if isinstance(sku, str):
+                    sku = sku.strip()
+                else:
+                    sku = str(sku or "").strip()
+                if not sku:
+                    continue
+                master_keys.append((brand.id, sku))
+            pp_by_key = _provider_parts_by_master_brand_and_part_number(rc_provider, master_keys)
 
-        logger.info("{} Rough Country pricing batch {}: {} records (last_id={})".format(
-            _LOG_PREFIX, batch_num, len(to_upsert), last_id
-        ))
-        connection.close()
-        if len(batch) == BATCH_SIZE_PRICING:
-            time.sleep(BATCH_DELAY_SECONDS)
+            to_upsert = []
+            for row in batch:
+                brand = rc_brand_to_brand.get(row.get("part__brand_id"))
+                if not brand:
+                    continue
+                sku = row.get("part__sku")
+                if isinstance(sku, str):
+                    sku = sku.strip()
+                else:
+                    sku = str(sku or "").strip()
+                if not sku:
+                    continue
+                provider_part = pp_by_key.get((brand.id, sku))
+                if not provider_part:
+                    continue
+                company = companies_by_id.get(row.get("company_id"))
+                if not company:
+                    continue
+                cost = row.get("cost") or row.get("price") or row.get("sale_price")
+                cnd_map = row.get("cnd_map")
+                cnd_price = row.get("cnd_price")
+                to_upsert.append(
+                    src_models.ProviderPartCompanyPricing(
+                        provider_part=provider_part,
+                        company=company,
+                        cost=cost,
+                        jobber_price=cnd_map,
+                        map_price=cnd_map,
+                        msrp=cnd_price,
+                        retail_price=cnd_price,
+                        last_synced_at=now,
+                    )
+                )
 
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                    to_upsert, context="Rough Country pricing batch={}".format(batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartCompanyPricing,
+                    to_upsert,
+                    unique_fields=["provider_part", "company"],
+                    update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
+                )
+                total_upserted += len(to_upsert)
+
+            logger.info("{} Rough Country pricing batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_PRICING:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "rough_country_brand", _worker)
     logger.info("{} Synced {} Rough Country pricing records total.".format(_LOG_PREFIX, total_upserted))
 
 
@@ -2315,33 +2570,15 @@ def _dlg_decimal_to_provider_money(value: typing.Any) -> typing.Optional[typing.
         return None
 
 
-def sync_master_parts_from_wheelpros() -> None:
-    """
-    Create/update MasterPart and ProviderPart from WheelProsPart (wheels, tires, accessories).
-    Only processes parts whose WheelProsBrand has a BrandWheelProsBrandMapping.
-    """
-    logger.info("{} Syncing master parts from WheelPros (batched, cursor-based).".format(_LOG_PREFIX))
-
-    wp_provider = src_models.Providers.objects.filter(
-        kind=src_enums.BrandProviderKind.WHEELPROS.value,
-    ).first()
-    if not wp_provider:
-        logger.info("{} No WheelPros provider found.".format(_LOG_PREFIX))
-        return
-
-    mappings = list(
-        src_models.BrandWheelProsBrandMapping.objects.select_related("brand", "wheelpros_brand")
-    )
-    wp_brand_to_brand = {m.wheelpros_brand_id: m.brand for m in mappings}
-    wp_brand_to_aaia = {
-        m.wheelpros_brand_id: (m.brand.aaia_code if m.brand else None)
-        for m in mappings
-    }
-    if not wp_brand_to_brand:
-        logger.info("{} No BrandWheelProsBrandMapping found. Nothing to sync.".format(_LOG_PREFIX))
-        return
-
-    mapped_wp_brand_ids = set(wp_brand_to_brand.keys())
+def _ingest_wheelpros_parts_for_mapped_brands(
+    mapped_catalog_brand_ids: typing.Set[int],
+    wp_provider: src_models.Providers,
+    wp_brand_to_brand: typing.Dict[int, src_models.Brands],
+    wp_brand_to_aaia: typing.Dict[int, typing.Optional[str]],
+) -> typing.Tuple[int, int]:
+    """Batch-ingest WheelProsPart rows for one disjoint set of WheelPros catalog brand PKs."""
+    if not mapped_catalog_brand_ids:
+        return 0, 0
 
     total_master = 0
     total_provider = 0
@@ -2352,7 +2589,7 @@ def sync_master_parts_from_wheelpros() -> None:
         batch_num += 1
         batch = list(
             src_models.WheelProsPart.objects.filter(
-                brand_id__in=mapped_wp_brand_ids,
+                brand_id__in=mapped_catalog_brand_ids,
                 id__gt=last_id,
             )
             .order_by("id")
@@ -2555,6 +2792,47 @@ def sync_master_parts_from_wheelpros() -> None:
         if len(batch) == BATCH_SIZE_MASTER_PARTS_WHEELPROS:
             time.sleep(BATCH_DELAY_SECONDS)
 
+    return total_master, total_provider
+
+
+def sync_master_parts_from_wheelpros() -> None:
+    """
+    Create/update MasterPart and ProviderPart from WheelProsPart (wheels, tires, accessories).
+    Only processes parts whose WheelProsBrand has a BrandWheelProsBrandMapping.
+    """
+    logger.info("{} Syncing master parts from WheelPros (batched, cursor-based).".format(_LOG_PREFIX))
+
+    wp_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.WHEELPROS.value,
+    ).first()
+    if not wp_provider:
+        logger.info("{} No WheelPros provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandWheelProsBrandMapping.objects.select_related("brand", "wheelpros_brand")
+    )
+    wp_brand_to_brand = {m.wheelpros_brand_id: m.brand for m in mappings}
+    wp_brand_to_aaia = {
+        m.wheelpros_brand_id: (m.brand.aaia_code if m.brand else None)
+        for m in mappings
+    }
+    if not wp_brand_to_brand:
+        logger.info("{} No BrandWheelProsBrandMapping found. Nothing to sync.".format(_LOG_PREFIX))
+        return
+
+    chunks = _partition_mapped_brands_for_parallel_ingest(mappings, MASTER_PARTS_SYNC_MAX_WORKERS)
+    total_master, total_provider = _run_parallel_master_parts_ingest(
+        chunks,
+        mappings,
+        "wheelpros_brand",
+        lambda cids: _ingest_wheelpros_parts_for_mapped_brands(
+            cids,
+            wp_provider,
+            wp_brand_to_brand,
+            wp_brand_to_aaia,
+        ),
+    )
     logger.info("{} Synced {} master parts and {} provider parts from WheelPros total.".format(
         _LOG_PREFIX, total_master, total_provider
     ))
@@ -2574,84 +2852,96 @@ def sync_provider_inventory_from_wheelpros() -> None:
         logger.info("{} No WheelPros provider found.".format(_LOG_PREFIX))
         return
 
+    mappings = list(
+        src_models.BrandWheelProsBrandMapping.objects.select_related("brand", "wheelpros_brand")
+    )
+    if not mappings:
+        logger.info("{} No BrandWheelProsBrandMapping found.".format(_LOG_PREFIX))
+        return
+
     provider_parts_by_ext_id, provider_parts_by_brand_sku = _wheelpros_provider_part_lookup(wp_provider)
 
     now = timezone.now()
-    total_upserted = 0
-    batch_num = 0
-    last_id = 0
 
-    while True:
-        batch_num += 1
-        batch = list(
-            src_models.WheelProsPart.objects.filter(id__gt=last_id)
-            .order_by("id")
-            .values("id", "brand_id", "part_number", "total_qoh", "warehouse_availability")[:BATCH_SIZE_INVENTORY]
-        )
-        if not batch:
-            break
-
-        last_id = batch[-1]["id"]
-        to_upsert = []
-        for row in batch:
-            part_number = (row.get("part_number") or "").strip()
-            if not part_number:
-                continue
-            ext_id = _wheelpros_provider_external_id(row["brand_id"], part_number)
-            provider_part = provider_parts_by_ext_id.get(ext_id) or provider_parts_by_brand_sku.get(
-                (row["brand_id"], part_number)
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            batch = list(
+                src_models.WheelProsPart.objects.filter(id__gt=last_id, brand_id__in=catalog_ids)
+                .order_by("id")
+                .values("id", "brand_id", "part_number", "total_qoh", "warehouse_availability")[:BATCH_SIZE_INVENTORY]
             )
-            if not provider_part:
-                continue
-            total_qoh = row.get("total_qoh") or 0
-            wh_avail = row.get("warehouse_availability")
-            if isinstance(wh_avail, dict):
-                try:
-                    wh_avail = {str(k): int(float(v)) if v is not None else 0 for k, v in wh_avail.items()}
-                except (TypeError, ValueError):
-                    wh_avail = None
-            else:
-                wh_avail = None
-            if wh_avail:
-                wh_avail = _map_wheelpros_warehouse_availability(wh_avail)
-            to_upsert.append(
-                src_models.ProviderPartInventory(
-                    provider_part=provider_part,
-                    warehouse_total_qty=total_qoh,
-                    manufacturer_inventory=None,
-                    manufacturer_esd=None,
-                    warehouse_availability=wh_avail if wh_avail else None,
-                    last_synced_at=now,
-                    updated_at=now,
+            if not batch:
+                break
+
+            last_id = batch[-1]["id"]
+            to_upsert = []
+            for row in batch:
+                part_number = (row.get("part_number") or "").strip()
+                if not part_number:
+                    continue
+                ext_id = _wheelpros_provider_external_id(row["brand_id"], part_number)
+                provider_part = provider_parts_by_ext_id.get(ext_id) or provider_parts_by_brand_sku.get(
+                    (row["brand_id"], part_number)
                 )
-            )
+                if not provider_part:
+                    continue
+                total_qoh = row.get("total_qoh") or 0
+                wh_avail = row.get("warehouse_availability")
+                if isinstance(wh_avail, dict):
+                    try:
+                        wh_avail = {str(k): int(float(v)) if v is not None else 0 for k, v in wh_avail.items()}
+                    except (TypeError, ValueError):
+                        wh_avail = None
+                else:
+                    wh_avail = None
+                if wh_avail:
+                    wh_avail = _map_wheelpros_warehouse_availability(wh_avail)
+                to_upsert.append(
+                    src_models.ProviderPartInventory(
+                        provider_part=provider_part,
+                        warehouse_total_qty=total_qoh,
+                        manufacturer_inventory=None,
+                        manufacturer_esd=None,
+                        warehouse_availability=wh_avail if wh_avail else None,
+                        last_synced_at=now,
+                        updated_at=now,
+                    )
+                )
 
-        if to_upsert:
-            to_upsert = _dedupe_provider_part_inventory_for_upsert(
-                to_upsert, context="WheelPros inventory batch={}".format(batch_num)
-            )
-            pgbulk.upsert(
-                src_models.ProviderPartInventory,
-                to_upsert,
-                unique_fields=["provider_part"],
-                update_fields=[
-                    "warehouse_total_qty",
-                    "manufacturer_inventory",
-                    "manufacturer_esd",
-                    "warehouse_availability",
-                    "last_synced_at",
-                    "updated_at",
-                ],
-            )
-            total_upserted += len(to_upsert)
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_inventory_for_upsert(
+                    to_upsert, context="WheelPros inventory batch={}".format(batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartInventory,
+                    to_upsert,
+                    unique_fields=["provider_part"],
+                    update_fields=[
+                        "warehouse_total_qty",
+                        "manufacturer_inventory",
+                        "manufacturer_esd",
+                        "warehouse_availability",
+                        "last_synced_at",
+                        "updated_at",
+                    ],
+                )
+                total_upserted += len(to_upsert)
 
-        logger.info("{} WheelPros inventory batch {}: {} records (last_id={})".format(
-            _LOG_PREFIX, batch_num, len(to_upsert), last_id
-        ))
-        connection.close()
-        if len(batch) == BATCH_SIZE_INVENTORY:
-            time.sleep(BATCH_DELAY_SECONDS)
+            logger.info("{} WheelPros inventory batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_INVENTORY:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
 
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "wheelpros_brand", _worker)
     logger.info("{} Synced {} WheelPros inventory records total.".format(_LOG_PREFIX, total_upserted))
 
 
@@ -2678,92 +2968,99 @@ def sync_provider_pricing_from_wheelpros() -> None:
         return
 
     now = timezone.now()
-    total_upserted = 0
-    batch_num = 0
-    last_id = 0
 
-    while True:
-        batch_num += 1
-        batch = list(
-            src_models.WheelProsCompanyPricing.objects.filter(id__gt=last_id)
-            .order_by("id")
-            .values(
-                "id",
-                "company_id",
-                "msrp_usd",
-                "map_usd",
-                "part__brand_id",
-                "part__part_number",
-            )[:BATCH_SIZE_PRICING]
-        )
-        if not batch:
-            break
-
-        last_id = batch[-1]["id"]
-        batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
-        companies_by_id = {
-            c.id: c
-            for c in src_models.Company.objects.filter(id__in=batch_company_ids)
-        }
-        master_keys = []
-        for row in batch:
-            wb = wp_brand_to_brand.get(row.get("part__brand_id"))
-            if not wb:
-                continue
-            part_number = (row.get("part__part_number") or "").strip()
-            if not part_number:
-                continue
-            master_keys.append((wb.id, part_number))
-        pp_by_key = _provider_parts_by_master_brand_and_part_number(wp_provider, master_keys)
-
-        to_upsert = []
-        for row in batch:
-            wb = wp_brand_to_brand.get(row.get("part__brand_id"))
-            if not wb:
-                continue
-            part_number = (row.get("part__part_number") or "").strip()
-            if not part_number:
-                continue
-            provider_part = pp_by_key.get((wb.id, part_number))
-            if not provider_part:
-                continue
-            company = companies_by_id.get(row.get("company_id"))
-            if not company:
-                continue
-            msrp = row.get("msrp_usd")
-            map_price = row.get("map_usd")
-            to_upsert.append(
-                src_models.ProviderPartCompanyPricing(
-                    provider_part=provider_part,
-                    company=company,
-                    cost=None,
-                    jobber_price=map_price,
-                    map_price=map_price,
-                    msrp=msrp,
-                    retail_price=msrp,
-                    last_synced_at=now,
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            batch = list(
+                src_models.WheelProsCompanyPricing.objects.filter(
+                    id__gt=last_id, part__brand_id__in=catalog_ids
                 )
+                .order_by("id")
+                .values(
+                    "id",
+                    "company_id",
+                    "msrp_usd",
+                    "map_usd",
+                    "part__brand_id",
+                    "part__part_number",
+                )[:BATCH_SIZE_PRICING]
             )
+            if not batch:
+                break
 
-        if to_upsert:
-            to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
-                to_upsert, context="WheelPros pricing batch={}".format(batch_num)
-            )
-            pgbulk.upsert(
-                src_models.ProviderPartCompanyPricing,
-                to_upsert,
-                unique_fields=["provider_part", "company"],
-                update_fields=["jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
-            )
-            total_upserted += len(to_upsert)
+            last_id = batch[-1]["id"]
+            batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
+            companies_by_id = {
+                c.id: c
+                for c in src_models.Company.objects.filter(id__in=batch_company_ids)
+            }
+            master_keys = []
+            for row in batch:
+                wb = wp_brand_to_brand.get(row.get("part__brand_id"))
+                if not wb:
+                    continue
+                part_number = (row.get("part__part_number") or "").strip()
+                if not part_number:
+                    continue
+                master_keys.append((wb.id, part_number))
+            pp_by_key = _provider_parts_by_master_brand_and_part_number(wp_provider, master_keys)
 
-        logger.info("{} WheelPros pricing batch {}: {} records (last_id={})".format(
-            _LOG_PREFIX, batch_num, len(to_upsert), last_id
-        ))
-        connection.close()
-        if len(batch) == BATCH_SIZE_PRICING:
-            time.sleep(BATCH_DELAY_SECONDS)
+            to_upsert = []
+            for row in batch:
+                wb = wp_brand_to_brand.get(row.get("part__brand_id"))
+                if not wb:
+                    continue
+                part_number = (row.get("part__part_number") or "").strip()
+                if not part_number:
+                    continue
+                provider_part = pp_by_key.get((wb.id, part_number))
+                if not provider_part:
+                    continue
+                company = companies_by_id.get(row.get("company_id"))
+                if not company:
+                    continue
+                msrp = row.get("msrp_usd")
+                map_price = row.get("map_usd")
+                to_upsert.append(
+                    src_models.ProviderPartCompanyPricing(
+                        provider_part=provider_part,
+                        company=company,
+                        cost=None,
+                        jobber_price=map_price,
+                        map_price=map_price,
+                        msrp=msrp,
+                        retail_price=msrp,
+                        last_synced_at=now,
+                    )
+                )
 
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                    to_upsert, context="WheelPros pricing batch={}".format(batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartCompanyPricing,
+                    to_upsert,
+                    unique_fields=["provider_part", "company"],
+                    update_fields=["jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
+                )
+                total_upserted += len(to_upsert)
+
+            logger.info("{} WheelPros pricing batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_PRICING:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "wheelpros_brand", _worker)
     logger.info("{} Synced {} WheelPros pricing records total.".format(_LOG_PREFIX, total_upserted))
 
 
@@ -2788,78 +3085,87 @@ def sync_provider_pricing_from_turn14_for_company(company_id: int) -> None:
         return
 
     now = timezone.now()
-    total_upserted = 0
-    batch_num = 0
-    last_id = 0
 
-    while True:
-        batch_num += 1
-        batch = list(
-            src_models.Turn14BrandPricing.objects.filter(id__gt=last_id, company_id=company_id)
-            .order_by("id")
-            .values("id", "external_id", "purchase_cost", "pricelists", "company_id")[:BATCH_SIZE_PRICING]
-        )
-        if not batch:
-            break
-
-        last_id = batch[-1]["id"]
-        batch_company_ids = {pr["company_id"] for pr in batch if pr.get("company_id")}
-        companies_by_id = {
-            c.id: c
-            for c in src_models.Company.objects.filter(id__in=batch_company_ids)
-        }
-        ext_to_key = _turn14_pricing_batch_external_id_to_master_keys(
-            batch, t14_brand_to_brand, mapped_t14_brand_ids
-        )
-        pp_by_key = _provider_parts_by_master_brand_and_part_number(turn14_provider, ext_to_key.values())
-
-        to_upsert = []
-        for pr in batch:
-            eid = str(pr.get("external_id") or "").strip()
-            key = ext_to_key.get(eid)
-            if not key:
-                continue
-            provider_part = pp_by_key.get(key)
-            if not provider_part:
-                continue
-            comp_id = pr.get("company_id")
-            company = companies_by_id.get(comp_id) if comp_id else None
-            if not company:
-                continue
-            cost = pr.get("purchase_cost")
-            jobber_price, map_price, msrp, retail_price = _extract_turn14_prices(pr.get("pricelists"))
-            to_upsert.append(
-                src_models.ProviderPartCompanyPricing(
-                    provider_part=provider_part,
-                    company=company,
-                    cost=cost,
-                    jobber_price=jobber_price,
-                    map_price=map_price,
-                    msrp=msrp,
-                    retail_price=retail_price,
-                    last_synced_at=now,
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            batch = list(
+                src_models.Turn14BrandPricing.objects.filter(
+                    id__gt=last_id,
+                    company_id=company_id,
+                    brand_id__in=catalog_ids,
                 )
+                .order_by("id")
+                .values("id", "external_id", "purchase_cost", "pricelists", "company_id")[:BATCH_SIZE_PRICING]
             )
+            if not batch:
+                break
 
-        if to_upsert:
-            to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
-                to_upsert, context="Turn14 pricing company={} batch={}".format(company_id, batch_num)
+            last_id = batch[-1]["id"]
+            batch_company_ids = {pr["company_id"] for pr in batch if pr.get("company_id")}
+            companies_by_id = {
+                c.id: c
+                for c in src_models.Company.objects.filter(id__in=batch_company_ids)
+            }
+            ext_to_key = _turn14_pricing_batch_external_id_to_master_keys(
+                batch, t14_brand_to_brand, mapped_t14_brand_ids
             )
-            pgbulk.upsert(
-                src_models.ProviderPartCompanyPricing,
-                to_upsert,
-                unique_fields=["provider_part", "company"],
-                update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
-            )
-            total_upserted += len(to_upsert)
+            pp_by_key = _provider_parts_by_master_brand_and_part_number(turn14_provider, ext_to_key.values())
 
-        logger.info("{} Turn14 pricing company={} batch {}: {} records (last_id={})".format(
-            _LOG_PREFIX, company_id, batch_num, len(to_upsert), last_id
-        ))
-        connection.close()
-        if len(batch) == BATCH_SIZE_PRICING:
-            time.sleep(BATCH_DELAY_SECONDS)
+            to_upsert = []
+            for pr in batch:
+                eid = str(pr.get("external_id") or "").strip()
+                key = ext_to_key.get(eid)
+                if not key:
+                    continue
+                provider_part = pp_by_key.get(key)
+                if not provider_part:
+                    continue
+                comp_id = pr.get("company_id")
+                company = companies_by_id.get(comp_id) if comp_id else None
+                if not company:
+                    continue
+                cost = pr.get("purchase_cost")
+                jobber_price, map_price, msrp, retail_price = _extract_turn14_prices(pr.get("pricelists"))
+                to_upsert.append(
+                    src_models.ProviderPartCompanyPricing(
+                        provider_part=provider_part,
+                        company=company,
+                        cost=cost,
+                        jobber_price=jobber_price,
+                        map_price=map_price,
+                        msrp=msrp,
+                        retail_price=retail_price,
+                        last_synced_at=now,
+                    )
+                )
 
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                    to_upsert, context="Turn14 pricing company={} batch={}".format(company_id, batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartCompanyPricing,
+                    to_upsert,
+                    unique_fields=["provider_part", "company"],
+                    update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
+                )
+                total_upserted += len(to_upsert)
+
+            logger.info("{} Turn14 pricing company={} batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, company_id, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_PRICING:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "turn14_brand", _worker)
     logger.info("{} Synced {} Turn14 pricing records for company_id={}.".format(
         _LOG_PREFIX, total_upserted, company_id,
     ))
@@ -2884,98 +3190,107 @@ def sync_provider_pricing_from_keystone_for_company(company_id: int) -> None:
         return
 
     now = timezone.now()
-    total_upserted = 0
-    batch_num = 0
-    last_id = 0
 
-    while True:
-        batch_num += 1
-        batch = list(
-            src_models.KeystoneCompanyPricing.objects.filter(id__gt=last_id, company_id=company_id)
-            .order_by("id")
-            .values(
-                "id",
-                "company_id",
-                "cost",
-                "jobber_price",
-                "part__brand_id",
-                "part__manufacturer_part_no",
-            )[:BATCH_SIZE_PRICING]
-        )
-        if not batch:
-            break
-
-        last_id = batch[-1]["id"]
-        batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
-        companies_by_id = {
-            c.id: c
-            for c in src_models.Company.objects.filter(id__in=batch_company_ids)
-        }
-        master_keys = []
-        for row in batch:
-            brand = ks_brand_to_brand.get(row.get("part__brand_id"))
-            if not brand:
-                continue
-            pn = row.get("part__manufacturer_part_no") or ""
-            if isinstance(pn, str):
-                pn = pn.strip()
-            else:
-                pn = str(pn or "").strip()
-            if not pn:
-                continue
-            master_keys.append((brand.id, pn))
-        pp_by_key = _provider_parts_by_master_brand_and_part_number(keystone_provider, master_keys)
-
-        to_upsert = []
-        for row in batch:
-            brand = ks_brand_to_brand.get(row.get("part__brand_id"))
-            if not brand:
-                continue
-            pn = row.get("part__manufacturer_part_no") or ""
-            if isinstance(pn, str):
-                pn = pn.strip()
-            else:
-                pn = str(pn or "").strip()
-            if not pn:
-                continue
-            provider_part = pp_by_key.get((brand.id, pn))
-            if not provider_part:
-                continue
-            company = companies_by_id.get(row.get("company_id"))
-            if not company:
-                continue
-            to_upsert.append(
-                src_models.ProviderPartCompanyPricing(
-                    provider_part=provider_part,
-                    company=company,
-                    cost=row.get("cost"),
-                    jobber_price=row.get("jobber_price"),
-                    map_price=None,
-                    msrp=None,
-                    retail_price=None,
-                    last_synced_at=now,
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            batch = list(
+                src_models.KeystoneCompanyPricing.objects.filter(
+                    id__gt=last_id,
+                    company_id=company_id,
+                    part__brand_id__in=catalog_ids,
                 )
+                .order_by("id")
+                .values(
+                    "id",
+                    "company_id",
+                    "cost",
+                    "jobber_price",
+                    "part__brand_id",
+                    "part__manufacturer_part_no",
+                )[:BATCH_SIZE_PRICING]
             )
+            if not batch:
+                break
 
-        if to_upsert:
-            to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
-                to_upsert, context="Keystone pricing company={} batch={}".format(company_id, batch_num)
-            )
-            pgbulk.upsert(
-                src_models.ProviderPartCompanyPricing,
-                to_upsert,
-                unique_fields=["provider_part", "company"],
-                update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
-            )
-            total_upserted += len(to_upsert)
+            last_id = batch[-1]["id"]
+            batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
+            companies_by_id = {
+                c.id: c
+                for c in src_models.Company.objects.filter(id__in=batch_company_ids)
+            }
+            master_keys = []
+            for row in batch:
+                brand = ks_brand_to_brand.get(row.get("part__brand_id"))
+                if not brand:
+                    continue
+                pn = row.get("part__manufacturer_part_no") or ""
+                if isinstance(pn, str):
+                    pn = pn.strip()
+                else:
+                    pn = str(pn or "").strip()
+                if not pn:
+                    continue
+                master_keys.append((brand.id, pn))
+            pp_by_key = _provider_parts_by_master_brand_and_part_number(keystone_provider, master_keys)
 
-        logger.info("{} Keystone pricing company={} batch {}: {} records (last_id={})".format(
-            _LOG_PREFIX, company_id, batch_num, len(to_upsert), last_id
-        ))
-        connection.close()
-        if len(batch) == BATCH_SIZE_PRICING:
-            time.sleep(BATCH_DELAY_SECONDS)
+            to_upsert = []
+            for row in batch:
+                brand = ks_brand_to_brand.get(row.get("part__brand_id"))
+                if not brand:
+                    continue
+                pn = row.get("part__manufacturer_part_no") or ""
+                if isinstance(pn, str):
+                    pn = pn.strip()
+                else:
+                    pn = str(pn or "").strip()
+                if not pn:
+                    continue
+                provider_part = pp_by_key.get((brand.id, pn))
+                if not provider_part:
+                    continue
+                company = companies_by_id.get(row.get("company_id"))
+                if not company:
+                    continue
+                to_upsert.append(
+                    src_models.ProviderPartCompanyPricing(
+                        provider_part=provider_part,
+                        company=company,
+                        cost=row.get("cost"),
+                        jobber_price=row.get("jobber_price"),
+                        map_price=None,
+                        msrp=None,
+                        retail_price=None,
+                        last_synced_at=now,
+                    )
+                )
 
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                    to_upsert, context="Keystone pricing company={} batch={}".format(company_id, batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartCompanyPricing,
+                    to_upsert,
+                    unique_fields=["provider_part", "company"],
+                    update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
+                )
+                total_upserted += len(to_upsert)
+
+            logger.info("{} Keystone pricing company={} batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, company_id, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_PRICING:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "keystone_brand", _worker)
     logger.info("{} Synced {} Keystone pricing records for company_id={}.".format(
         _LOG_PREFIX, total_upserted, company_id,
     ))
@@ -3000,77 +3315,86 @@ def sync_provider_pricing_from_meyer_for_company(company_id: int) -> None:
         return
 
     now = timezone.now()
-    total_upserted = 0
-    batch_num = 0
-    last_id = 0
 
-    while True:
-        batch_num += 1
-        batch = list(
-            src_models.MeyerCompanyPricing.objects.filter(id__gt=last_id, company_id=company_id)
-            .order_by("id")
-            .values(
-                "id",
-                "company_id",
-                "cost",
-                "jobber_price",
-                "map_price",
-                "part__brand_id",
-                "part__meyer_part",
-                "part__mfg_item_number",
-            )[:BATCH_SIZE_PRICING]
-        )
-        if not batch:
-            break
-
-        last_id = batch[-1]["id"]
-        batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
-        companies_by_id = {
-            c.id: c
-            for c in src_models.Company.objects.filter(id__in=batch_company_ids)
-        }
-        row_id_to_pp = _meyer_company_pricing_batch_row_id_to_provider_part(
-            batch, meyer_provider, my_brand_to_brand
-        )
-        pricing_by_pp_company: typing.Dict[typing.Tuple[int, int], src_models.ProviderPartCompanyPricing] = {}
-        for row in batch:
-            pp = row_id_to_pp.get(row["id"])
-            if not pp:
-                continue
-            company = companies_by_id.get(row.get("company_id"))
-            if not company:
-                continue
-            pricing_by_pp_company[(pp.id, company.id)] = src_models.ProviderPartCompanyPricing(
-                provider_part=pp,
-                company=company,
-                cost=row.get("cost"),
-                jobber_price=row.get("jobber_price"),
-                map_price=row.get("map_price"),
-                msrp=None,
-                retail_price=None,
-                last_synced_at=now,
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            batch = list(
+                src_models.MeyerCompanyPricing.objects.filter(
+                    id__gt=last_id,
+                    company_id=company_id,
+                    part__brand_id__in=catalog_ids,
+                )
+                .order_by("id")
+                .values(
+                    "id",
+                    "company_id",
+                    "cost",
+                    "jobber_price",
+                    "map_price",
+                    "part__brand_id",
+                    "part__meyer_part",
+                    "part__mfg_item_number",
+                )[:BATCH_SIZE_PRICING]
             )
+            if not batch:
+                break
 
-        to_upsert = list(pricing_by_pp_company.values())
-        if to_upsert:
-            to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
-                to_upsert, context="Meyer pricing company={} batch={}".format(company_id, batch_num)
+            last_id = batch[-1]["id"]
+            batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
+            companies_by_id = {
+                c.id: c
+                for c in src_models.Company.objects.filter(id__in=batch_company_ids)
+            }
+            row_id_to_pp = _meyer_company_pricing_batch_row_id_to_provider_part(
+                batch, meyer_provider, my_brand_to_brand
             )
-            pgbulk.upsert(
-                src_models.ProviderPartCompanyPricing,
-                to_upsert,
-                unique_fields=["provider_part", "company"],
-                update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
-            )
-            total_upserted += len(to_upsert)
+            pricing_by_pp_company: typing.Dict[typing.Tuple[int, int], src_models.ProviderPartCompanyPricing] = {}
+            for row in batch:
+                pp = row_id_to_pp.get(row["id"])
+                if not pp:
+                    continue
+                company = companies_by_id.get(row.get("company_id"))
+                if not company:
+                    continue
+                pricing_by_pp_company[(pp.id, company.id)] = src_models.ProviderPartCompanyPricing(
+                    provider_part=pp,
+                    company=company,
+                    cost=row.get("cost"),
+                    jobber_price=row.get("jobber_price"),
+                    map_price=row.get("map_price"),
+                    msrp=None,
+                    retail_price=None,
+                    last_synced_at=now,
+                )
 
-        logger.info("{} Meyer pricing company={} batch {}: {} records (last_id={})".format(
-            _LOG_PREFIX, company_id, batch_num, len(to_upsert), last_id
-        ))
-        connection.close()
-        if len(batch) == BATCH_SIZE_PRICING:
-            time.sleep(BATCH_DELAY_SECONDS)
+            to_upsert = list(pricing_by_pp_company.values())
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                    to_upsert, context="Meyer pricing company={} batch={}".format(company_id, batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartCompanyPricing,
+                    to_upsert,
+                    unique_fields=["provider_part", "company"],
+                    update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
+                )
+                total_upserted += len(to_upsert)
 
+            logger.info("{} Meyer pricing company={} batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, company_id, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_PRICING:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "meyer_brand", _worker)
     logger.info("{} Synced {} Meyer pricing records for company_id={}.".format(
         _LOG_PREFIX, total_upserted, company_id,
     ))
@@ -3095,75 +3419,84 @@ def sync_provider_pricing_from_dlg_for_company(company_id: int) -> None:
         return
 
     now = timezone.now()
-    total_upserted = 0
-    batch_num = 0
-    last_id = 0
 
-    while True:
-        batch_num += 1
-        batch = list(
-            src_models.DlgCompanyPricing.objects.filter(id__gt=last_id, company_id=company_id)
-            .order_by("id")
-            .values(
-                "id",
-                "company_id",
-                "base_price",
-                "part__brand_id",
-                "part__part_number",
-            )[:BATCH_SIZE_PRICING]
-        )
-        if not batch:
-            break
-
-        last_id = batch[-1]["id"]
-        batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
-        companies_by_id = {
-            c.id: c
-            for c in src_models.Company.objects.filter(id__in=batch_company_ids)
-        }
-        row_id_to_pp = _dlg_company_pricing_batch_row_id_to_provider_part(
-            batch, dlg_provider, dlg_brand_to_brand
-        )
-        pricing_by_pp_company: typing.Dict[typing.Tuple[int, int], src_models.ProviderPartCompanyPricing] = {}
-        for row in batch:
-            pp = row_id_to_pp.get(row["id"])
-            if not pp:
-                continue
-            company = companies_by_id.get(row.get("company_id"))
-            if not company:
-                continue
-            bp = _dlg_decimal_to_provider_money(row.get("base_price"))
-            pricing_by_pp_company[(pp.id, company.id)] = src_models.ProviderPartCompanyPricing(
-                provider_part=pp,
-                company=company,
-                cost=bp,
-                jobber_price=bp,
-                map_price=None,
-                msrp=None,
-                retail_price=bp,
-                last_synced_at=now,
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            batch = list(
+                src_models.DlgCompanyPricing.objects.filter(
+                    id__gt=last_id,
+                    company_id=company_id,
+                    part__brand_id__in=catalog_ids,
+                )
+                .order_by("id")
+                .values(
+                    "id",
+                    "company_id",
+                    "base_price",
+                    "part__brand_id",
+                    "part__part_number",
+                )[:BATCH_SIZE_PRICING]
             )
+            if not batch:
+                break
 
-        to_upsert = list(pricing_by_pp_company.values())
-        if to_upsert:
-            to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
-                to_upsert, context="DLG pricing company={} batch={}".format(company_id, batch_num)
+            last_id = batch[-1]["id"]
+            batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
+            companies_by_id = {
+                c.id: c
+                for c in src_models.Company.objects.filter(id__in=batch_company_ids)
+            }
+            row_id_to_pp = _dlg_company_pricing_batch_row_id_to_provider_part(
+                batch, dlg_provider, dlg_brand_to_brand
             )
-            pgbulk.upsert(
-                src_models.ProviderPartCompanyPricing,
-                to_upsert,
-                unique_fields=["provider_part", "company"],
-                update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
-            )
-            total_upserted += len(to_upsert)
+            pricing_by_pp_company: typing.Dict[typing.Tuple[int, int], src_models.ProviderPartCompanyPricing] = {}
+            for row in batch:
+                pp = row_id_to_pp.get(row["id"])
+                if not pp:
+                    continue
+                company = companies_by_id.get(row.get("company_id"))
+                if not company:
+                    continue
+                bp = _dlg_decimal_to_provider_money(row.get("base_price"))
+                pricing_by_pp_company[(pp.id, company.id)] = src_models.ProviderPartCompanyPricing(
+                    provider_part=pp,
+                    company=company,
+                    cost=bp,
+                    jobber_price=bp,
+                    map_price=None,
+                    msrp=None,
+                    retail_price=bp,
+                    last_synced_at=now,
+                )
 
-        logger.info("{} DLG pricing company={} batch {}: {} records (last_id={})".format(
-            _LOG_PREFIX, company_id, batch_num, len(to_upsert), last_id
-        ))
-        connection.close()
-        if len(batch) == BATCH_SIZE_PRICING:
-            time.sleep(BATCH_DELAY_SECONDS)
+            to_upsert = list(pricing_by_pp_company.values())
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                    to_upsert, context="DLG pricing company={} batch={}".format(company_id, batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartCompanyPricing,
+                    to_upsert,
+                    unique_fields=["provider_part", "company"],
+                    update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
+                )
+                total_upserted += len(to_upsert)
 
+            logger.info("{} DLG pricing company={} batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, company_id, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_PRICING:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "dlg_brand", _worker)
     logger.info("{} Synced {} DLG pricing records for company_id={}.".format(
         _LOG_PREFIX, total_upserted, company_id,
     ))
@@ -3175,12 +3508,16 @@ def _atech_company_pricing_batch_row_id_to_provider_part(
     atech_brand_to_brand: typing.Dict[int, src_models.Brands],
 ) -> typing.Dict[int, src_models.ProviderPart]:
     """
-    AtechCompanyPricing row id -> ProviderPart: (catalog brand, MasterPart.sku = ``AtechParts.part_number``)
-    via ``_meyer_provider_parts_by_brand_sku_first``. ``ProviderPart.provider_external_id`` may be composite
-    ``{atech_brand_id}_{part_number}``; resolution does not depend on that string.
+    AtechCompanyPricing row id -> ProviderPart via ``(internal Brands.id, MasterPart.part_number)``
+    from the linked ``AtechParts`` row (``part__part_number``), matching
+    ``_ingest_atech_parts_for_mapped_brands`` / ``_provider_parts_by_master_brand_and_part_number``.
+
+    Inventory instead resolves by ``ProviderPart.provider_external_id`` =
+    ``_atech_provider_external_id(catalog_brand_id, part_number)``; both paths target the same
+    ``ProviderPart`` when ingest used that master row (one ``ProviderPart`` per ``master_part`` for A-Tech).
     """
     row_id_to_pp: typing.Dict[int, src_models.ProviderPart] = {}
-    sku_lookup_keys: typing.List[typing.Tuple[int, str]] = []
+    part_lookup_keys: typing.List[typing.Tuple[int, str]] = []
     row_meta: typing.Dict[int, typing.Tuple[src_models.Brands, str]] = {}
 
     for row in batch:
@@ -3196,14 +3533,14 @@ def _atech_company_pricing_batch_row_id_to_provider_part(
         if not pn:
             continue
         row_meta[rid] = (brand, pn)
-        sku_lookup_keys.append((brand.id, pn))
+        part_lookup_keys.append((brand.id, pn))
 
-    pp_by_sku = _meyer_provider_parts_by_brand_sku_first(
+    pp_by_brand_part_number = _provider_parts_by_master_brand_and_part_number(
         atech_provider,
-        list(dict.fromkeys(sku_lookup_keys)),
+        list(dict.fromkeys(part_lookup_keys)),
     )
     for rid, (brand, pn) in row_meta.items():
-        pp = pp_by_sku.get((brand.id, pn))
+        pp = pp_by_brand_part_number.get((brand.id, pn))
         if pp:
             row_id_to_pp[rid] = pp
     return row_id_to_pp
@@ -3230,86 +3567,93 @@ def _run_atech_provider_pricing_sync(company_id: typing.Optional[int]) -> int:
         return 0
 
     now = timezone.now()
-    total_upserted = 0
-    batch_num = 0
-    last_id = 0
 
-    while True:
-        batch_num += 1
-        qs = src_models.AtechCompanyPricing.objects.filter(id__gt=last_id)
-        if company_id is not None:
-            qs = qs.filter(company_id=company_id)
-        batch = list(
-            qs.order_by("id")
-            .values(
-                "id",
-                "company_id",
-                "cost",
-                "retail_price",
-                "jobber_price",
-                "part__brand_id",
-                "part__part_number",
-            )[:BATCH_SIZE_PRICING]
-        )
-        if not batch:
-            break
-
-        last_id = batch[-1]["id"]
-        batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
-        companies_by_id = {
-            c.id: c
-            for c in src_models.Company.objects.filter(id__in=batch_company_ids)
-        }
-        row_id_to_pp = _atech_company_pricing_batch_row_id_to_provider_part(
-            batch, atech_provider, atech_brand_to_brand
-        )
-        pricing_by_pp_company: typing.Dict[typing.Tuple[int, int], src_models.ProviderPartCompanyPricing] = {}
-        for row in batch:
-            pp = row_id_to_pp.get(row["id"])
-            if not pp:
-                continue
-            company = companies_by_id.get(row.get("company_id"))
-            if not company:
-                continue
-            pricing_by_pp_company[(pp.id, company.id)] = src_models.ProviderPartCompanyPricing(
-                provider_part=pp,
-                company=company,
-                cost=row.get("cost"),
-                jobber_price=row.get("jobber_price"),
-                map_price=None,
-                msrp=None,
-                retail_price=row.get("retail_price"),
-                last_synced_at=now,
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            qs = src_models.AtechCompanyPricing.objects.filter(
+                id__gt=last_id,
+                part__brand_id__in=catalog_ids,
             )
-
-        to_upsert = list(pricing_by_pp_company.values())
-        if company_id is not None:
-            dedupe_ctx = "A-Tech pricing company={} batch={}".format(company_id, batch_num)
-        else:
-            dedupe_ctx = "A-Tech pricing batch={}".format(batch_num)
-        if to_upsert:
-            to_upsert = _dedupe_provider_part_company_pricing_for_upsert(to_upsert, context=dedupe_ctx)
-            pgbulk.upsert(
-                src_models.ProviderPartCompanyPricing,
-                to_upsert,
-                unique_fields=["provider_part", "company"],
-                update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
+            if company_id is not None:
+                qs = qs.filter(company_id=company_id)
+            batch = list(
+                qs.order_by("id")
+                .values(
+                    "id",
+                    "company_id",
+                    "cost",
+                    "retail_price",
+                    "jobber_price",
+                    "part__brand_id",
+                    "part__part_number",
+                )[:BATCH_SIZE_PRICING]
             )
-            total_upserted += len(to_upsert)
+            if not batch:
+                break
 
-        if company_id is not None:
-            logger.info("{} A-Tech pricing company={} batch {}: {} records (last_id={})".format(
-                _LOG_PREFIX, company_id, batch_num, len(to_upsert), last_id
-            ))
-        else:
-            logger.info("{} A-Tech pricing batch {}: {} records (last_id={})".format(
-                _LOG_PREFIX, batch_num, len(to_upsert), last_id
-            ))
-        connection.close()
-        if len(batch) == BATCH_SIZE_PRICING:
-            time.sleep(BATCH_DELAY_SECONDS)
+            last_id = batch[-1]["id"]
+            batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
+            companies_by_id = {
+                c.id: c
+                for c in src_models.Company.objects.filter(id__in=batch_company_ids)
+            }
+            row_id_to_pp = _atech_company_pricing_batch_row_id_to_provider_part(
+                batch, atech_provider, atech_brand_to_brand
+            )
+            pricing_by_pp_company: typing.Dict[typing.Tuple[int, int], src_models.ProviderPartCompanyPricing] = {}
+            for row in batch:
+                pp = row_id_to_pp.get(row["id"])
+                if not pp:
+                    continue
+                company = companies_by_id.get(row.get("company_id"))
+                if not company:
+                    continue
+                pricing_by_pp_company[(pp.id, company.id)] = src_models.ProviderPartCompanyPricing(
+                    provider_part=pp,
+                    company=company,
+                    cost=row.get("cost"),
+                    jobber_price=row.get("jobber_price"),
+                    map_price=None,
+                    msrp=None,
+                    retail_price=row.get("retail_price"),
+                    last_synced_at=now,
+                )
 
-    return total_upserted
+            to_upsert = list(pricing_by_pp_company.values())
+            if company_id is not None:
+                dedupe_ctx = "A-Tech pricing company={} batch={}".format(company_id, batch_num)
+            else:
+                dedupe_ctx = "A-Tech pricing batch={}".format(batch_num)
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_company_pricing_for_upsert(to_upsert, context=dedupe_ctx)
+                pgbulk.upsert(
+                    src_models.ProviderPartCompanyPricing,
+                    to_upsert,
+                    unique_fields=["provider_part", "company"],
+                    update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
+                )
+                total_upserted += len(to_upsert)
+
+            if company_id is not None:
+                logger.info("{} A-Tech pricing company={} batch {}: {} records (last_id={})".format(
+                    _LOG_PREFIX, company_id, batch_num, len(to_upsert), last_id
+                ))
+            else:
+                logger.info("{} A-Tech pricing batch {}: {} records (last_id={})".format(
+                    _LOG_PREFIX, batch_num, len(to_upsert), last_id
+                ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_PRICING:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    return _run_parallel_mapped_brand_int_worker(mappings, "atech_brand", _worker)
 
 
 def sync_provider_pricing_from_atech() -> None:
@@ -3349,104 +3693,113 @@ def sync_provider_pricing_from_rough_country_for_company(company_id: int) -> Non
         return
 
     now = timezone.now()
-    total_upserted = 0
-    batch_num = 0
-    last_id = 0
 
-    while True:
-        batch_num += 1
-        batch = list(
-            src_models.RoughCountryCompanyPricing.objects.filter(id__gt=last_id, company_id=company_id)
-            .order_by("id")
-            .values(
-                "id",
-                "company_id",
-                "cost",
-                "price",
-                "sale_price",
-                "cnd_map",
-                "cnd_price",
-                "part__brand_id",
-                "part__sku",
-            )[:BATCH_SIZE_PRICING]
-        )
-        if not batch:
-            break
-
-        last_id = batch[-1]["id"]
-        batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
-        companies_by_id = {
-            c.id: c
-            for c in src_models.Company.objects.filter(id__in=batch_company_ids)
-        }
-        master_keys = []
-        for row in batch:
-            brand = rc_brand_to_brand.get(row.get("part__brand_id"))
-            if not brand:
-                continue
-            sku = row.get("part__sku")
-            if isinstance(sku, str):
-                sku = sku.strip()
-            else:
-                sku = str(sku or "").strip()
-            if not sku:
-                continue
-            master_keys.append((brand.id, sku))
-        pp_by_key = _provider_parts_by_master_brand_and_part_number(rc_provider, master_keys)
-
-        to_upsert = []
-        for row in batch:
-            brand = rc_brand_to_brand.get(row.get("part__brand_id"))
-            if not brand:
-                continue
-            sku = row.get("part__sku")
-            if isinstance(sku, str):
-                sku = sku.strip()
-            else:
-                sku = str(sku or "").strip()
-            if not sku:
-                continue
-            provider_part = pp_by_key.get((brand.id, sku))
-            if not provider_part:
-                continue
-            company = companies_by_id.get(row.get("company_id"))
-            if not company:
-                continue
-            cost = row.get("cost") or row.get("price") or row.get("sale_price")
-            cnd_map = row.get("cnd_map")
-            cnd_price = row.get("cnd_price")
-            to_upsert.append(
-                src_models.ProviderPartCompanyPricing(
-                    provider_part=provider_part,
-                    company=company,
-                    cost=cost,
-                    jobber_price=cnd_map,
-                    map_price=cnd_map,
-                    msrp=cnd_price,
-                    retail_price=cnd_price,
-                    last_synced_at=now,
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            batch = list(
+                src_models.RoughCountryCompanyPricing.objects.filter(
+                    id__gt=last_id,
+                    company_id=company_id,
+                    part__brand_id__in=catalog_ids,
                 )
+                .order_by("id")
+                .values(
+                    "id",
+                    "company_id",
+                    "cost",
+                    "price",
+                    "sale_price",
+                    "cnd_map",
+                    "cnd_price",
+                    "part__brand_id",
+                    "part__sku",
+                )[:BATCH_SIZE_PRICING]
             )
+            if not batch:
+                break
 
-        if to_upsert:
-            to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
-                to_upsert, context="Rough Country pricing company={} batch={}".format(company_id, batch_num)
-            )
-            pgbulk.upsert(
-                src_models.ProviderPartCompanyPricing,
-                to_upsert,
-                unique_fields=["provider_part", "company"],
-                update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
-            )
-            total_upserted += len(to_upsert)
+            last_id = batch[-1]["id"]
+            batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
+            companies_by_id = {
+                c.id: c
+                for c in src_models.Company.objects.filter(id__in=batch_company_ids)
+            }
+            master_keys = []
+            for row in batch:
+                brand = rc_brand_to_brand.get(row.get("part__brand_id"))
+                if not brand:
+                    continue
+                sku = row.get("part__sku")
+                if isinstance(sku, str):
+                    sku = sku.strip()
+                else:
+                    sku = str(sku or "").strip()
+                if not sku:
+                    continue
+                master_keys.append((brand.id, sku))
+            pp_by_key = _provider_parts_by_master_brand_and_part_number(rc_provider, master_keys)
 
-        logger.info("{} Rough Country pricing company={} batch {}: {} records (last_id={})".format(
-            _LOG_PREFIX, company_id, batch_num, len(to_upsert), last_id
-        ))
-        connection.close()
-        if len(batch) == BATCH_SIZE_PRICING:
-            time.sleep(BATCH_DELAY_SECONDS)
+            to_upsert = []
+            for row in batch:
+                brand = rc_brand_to_brand.get(row.get("part__brand_id"))
+                if not brand:
+                    continue
+                sku = row.get("part__sku")
+                if isinstance(sku, str):
+                    sku = sku.strip()
+                else:
+                    sku = str(sku or "").strip()
+                if not sku:
+                    continue
+                provider_part = pp_by_key.get((brand.id, sku))
+                if not provider_part:
+                    continue
+                company = companies_by_id.get(row.get("company_id"))
+                if not company:
+                    continue
+                cost = row.get("cost") or row.get("price") or row.get("sale_price")
+                cnd_map = row.get("cnd_map")
+                cnd_price = row.get("cnd_price")
+                to_upsert.append(
+                    src_models.ProviderPartCompanyPricing(
+                        provider_part=provider_part,
+                        company=company,
+                        cost=cost,
+                        jobber_price=cnd_map,
+                        map_price=cnd_map,
+                        msrp=cnd_price,
+                        retail_price=cnd_price,
+                        last_synced_at=now,
+                    )
+                )
 
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                    to_upsert, context="Rough Country pricing company={} batch={}".format(company_id, batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartCompanyPricing,
+                    to_upsert,
+                    unique_fields=["provider_part", "company"],
+                    update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
+                )
+                total_upserted += len(to_upsert)
+
+            logger.info("{} Rough Country pricing company={} batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, company_id, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_PRICING:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "rough_country_brand", _worker)
     logger.info("{} Synced {} Rough Country pricing records for company_id={}.".format(
         _LOG_PREFIX, total_upserted, company_id,
     ))
@@ -3471,92 +3824,101 @@ def sync_provider_pricing_from_wheelpros_for_company(company_id: int) -> None:
         return
 
     now = timezone.now()
-    total_upserted = 0
-    batch_num = 0
-    last_id = 0
 
-    while True:
-        batch_num += 1
-        batch = list(
-            src_models.WheelProsCompanyPricing.objects.filter(id__gt=last_id, company_id=company_id)
-            .order_by("id")
-            .values(
-                "id",
-                "company_id",
-                "msrp_usd",
-                "map_usd",
-                "part__brand_id",
-                "part__part_number",
-            )[:BATCH_SIZE_PRICING]
-        )
-        if not batch:
-            break
-
-        last_id = batch[-1]["id"]
-        batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
-        companies_by_id = {
-            c.id: c
-            for c in src_models.Company.objects.filter(id__in=batch_company_ids)
-        }
-        master_keys = []
-        for row in batch:
-            wb = wp_brand_to_brand.get(row.get("part__brand_id"))
-            if not wb:
-                continue
-            part_number = (row.get("part__part_number") or "").strip()
-            if not part_number:
-                continue
-            master_keys.append((wb.id, part_number))
-        pp_by_key = _provider_parts_by_master_brand_and_part_number(wp_provider, master_keys)
-
-        to_upsert = []
-        for row in batch:
-            wb = wp_brand_to_brand.get(row.get("part__brand_id"))
-            if not wb:
-                continue
-            part_number = (row.get("part__part_number") or "").strip()
-            if not part_number:
-                continue
-            provider_part = pp_by_key.get((wb.id, part_number))
-            if not provider_part:
-                continue
-            company = companies_by_id.get(row.get("company_id"))
-            if not company:
-                continue
-            msrp = row.get("msrp_usd")
-            map_price = row.get("map_usd")
-            to_upsert.append(
-                src_models.ProviderPartCompanyPricing(
-                    provider_part=provider_part,
-                    company=company,
-                    cost=None,
-                    jobber_price=map_price,
-                    map_price=map_price,
-                    msrp=msrp,
-                    retail_price=msrp,
-                    last_synced_at=now,
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            batch = list(
+                src_models.WheelProsCompanyPricing.objects.filter(
+                    id__gt=last_id,
+                    company_id=company_id,
+                    part__brand_id__in=catalog_ids,
                 )
+                .order_by("id")
+                .values(
+                    "id",
+                    "company_id",
+                    "msrp_usd",
+                    "map_usd",
+                    "part__brand_id",
+                    "part__part_number",
+                )[:BATCH_SIZE_PRICING]
             )
+            if not batch:
+                break
 
-        if to_upsert:
-            to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
-                to_upsert, context="WheelPros pricing company={} batch={}".format(company_id, batch_num)
-            )
-            pgbulk.upsert(
-                src_models.ProviderPartCompanyPricing,
-                to_upsert,
-                unique_fields=["provider_part", "company"],
-                update_fields=["jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
-            )
-            total_upserted += len(to_upsert)
+            last_id = batch[-1]["id"]
+            batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
+            companies_by_id = {
+                c.id: c
+                for c in src_models.Company.objects.filter(id__in=batch_company_ids)
+            }
+            master_keys = []
+            for row in batch:
+                wb = wp_brand_to_brand.get(row.get("part__brand_id"))
+                if not wb:
+                    continue
+                part_number = (row.get("part__part_number") or "").strip()
+                if not part_number:
+                    continue
+                master_keys.append((wb.id, part_number))
+            pp_by_key = _provider_parts_by_master_brand_and_part_number(wp_provider, master_keys)
 
-        logger.info("{} WheelPros pricing company={} batch {}: {} records (last_id={})".format(
-            _LOG_PREFIX, company_id, batch_num, len(to_upsert), last_id
-        ))
-        connection.close()
-        if len(batch) == BATCH_SIZE_PRICING:
-            time.sleep(BATCH_DELAY_SECONDS)
+            to_upsert = []
+            for row in batch:
+                wb = wp_brand_to_brand.get(row.get("part__brand_id"))
+                if not wb:
+                    continue
+                part_number = (row.get("part__part_number") or "").strip()
+                if not part_number:
+                    continue
+                provider_part = pp_by_key.get((wb.id, part_number))
+                if not provider_part:
+                    continue
+                company = companies_by_id.get(row.get("company_id"))
+                if not company:
+                    continue
+                msrp = row.get("msrp_usd")
+                map_price = row.get("map_usd")
+                to_upsert.append(
+                    src_models.ProviderPartCompanyPricing(
+                        provider_part=provider_part,
+                        company=company,
+                        cost=None,
+                        jobber_price=map_price,
+                        map_price=map_price,
+                        msrp=msrp,
+                        retail_price=msrp,
+                        last_synced_at=now,
+                    )
+                )
 
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                    to_upsert, context="WheelPros pricing company={} batch={}".format(company_id, batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartCompanyPricing,
+                    to_upsert,
+                    unique_fields=["provider_part", "company"],
+                    update_fields=["jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
+                )
+                total_upserted += len(to_upsert)
+
+            logger.info("{} WheelPros pricing company={} batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, company_id, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_PRICING:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "wheelpros_brand", _worker)
     logger.info("{} Synced {} WheelPros pricing records for company_id={}.".format(
         _LOG_PREFIX, total_upserted, company_id,
     ))
@@ -3634,38 +3996,40 @@ def _map_turn14_inventory_to_location_names(
     return result if result else None
 
 
-def sync_provider_inventory_from_turn14() -> None:
+def _sync_turn14_provider_inventory_batches(
+    *,
+    provider_parts: typing.Dict[str, src_models.ProviderPart],
+    location_map: typing.Dict[str, str],
+    now: typing.Any,
+    catalog_brand_ids: typing.Optional[typing.Set[int]],
+    all_mapped_catalog_brand_ids: typing.Optional[typing.Set[int]],
+    log_context: str,
+) -> int:
     """
-    Sync ProviderPartInventory from Turn14BrandInventory.
-    Uses bulk upsert with cursor-based batching.
+    Cursor-batched Turn14BrandInventory -> ProviderPartInventory upsert for one brand scope.
+
+    If ``catalog_brand_ids`` is set, restrict to those Turn14 brand ids (parallel partition).
+    Else if ``all_mapped_catalog_brand_ids`` is set, process rows with no brand or a catalog brand
+    not in that set (legacy / unmapped inventory still keyed by ``external_id``).
     """
-    logger.info("{} Syncing provider inventory from Turn14.".format(_LOG_PREFIX))
-
-    turn14_provider = src_models.Providers.objects.filter(
-        kind=src_enums.BrandProviderKind.TURN_14.value,
-    ).first()
-    if not turn14_provider:
-        logger.info("{} No Turn14 provider found.".format(_LOG_PREFIX))
-        return
-
-    provider_parts = {
-        pp.provider_external_id: pp
-        for pp in src_models.ProviderPart.objects.filter(provider=turn14_provider)
-    }
-
-    # Load Turn14 locations once: map external_id (e.g. "01") -> name (e.g. "Hatfield")
-    location_map = _get_turn14_location_map()
-
-    now = timezone.now()
     total_upserted = 0
     batch_num = 0
     last_id = 0
-
     while True:
         batch_num += 1
+        qs = src_models.Turn14BrandInventory.objects.filter(id__gt=last_id)
+        if catalog_brand_ids is not None:
+            if not catalog_brand_ids:
+                break
+            qs = qs.filter(brand_id__in=catalog_brand_ids)
+        elif all_mapped_catalog_brand_ids is not None:
+            qs = qs.filter(
+                Q(brand__isnull=True) | ~Q(brand_id__in=all_mapped_catalog_brand_ids)
+            )
+        else:
+            break
         batch = list(
-            src_models.Turn14BrandInventory.objects.filter(id__gt=last_id)
-            .order_by("id")
+            qs.order_by("id")
             .values("id", "external_id", "manufacturer", "inventory")[:BATCH_SIZE_INVENTORY]
         )
         if not batch:
@@ -3694,24 +4058,83 @@ def sync_provider_inventory_from_turn14() -> None:
             )
 
         if to_upsert:
-            to_upsert = _dedupe_provider_part_inventory_for_upsert(
-                to_upsert, context="Turn14 inventory batch={}".format(batch_num)
-            )
+            ctx = "Turn14 inventory {} batch={}".format(log_context, batch_num)
+            to_upsert = _dedupe_provider_part_inventory_for_upsert(to_upsert, context=ctx)
             pgbulk.upsert(
                 src_models.ProviderPartInventory,
                 to_upsert,
                 unique_fields=["provider_part"],
-                update_fields=["warehouse_total_qty", "manufacturer_inventory", "manufacturer_esd", "warehouse_availability", "last_synced_at", "updated_at"],
+                update_fields=[
+                    "warehouse_total_qty",
+                    "manufacturer_inventory",
+                    "manufacturer_esd",
+                    "warehouse_availability",
+                    "last_synced_at",
+                    "updated_at",
+                ],
             )
             total_upserted += len(to_upsert)
 
-        logger.info("{} Turn14 inventory batch {}: {} records (last_id={})".format(
-            _LOG_PREFIX, batch_num, len(to_upsert), last_id
+        logger.info("{} Turn14 inventory {} batch {}: {} records (last_id={})".format(
+            _LOG_PREFIX, log_context, batch_num, len(to_upsert), last_id
         ))
         connection.close()
         if len(batch) == BATCH_SIZE_INVENTORY:
             time.sleep(BATCH_DELAY_SECONDS)
+    return total_upserted
 
+
+def sync_provider_inventory_from_turn14() -> None:
+    """
+    Sync ProviderPartInventory from Turn14BrandInventory.
+    Uses bulk upsert with cursor-based batching.
+    """
+    logger.info("{} Syncing provider inventory from Turn14.".format(_LOG_PREFIX))
+
+    turn14_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.TURN_14.value,
+    ).first()
+    if not turn14_provider:
+        logger.info("{} No Turn14 provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandTurn14BrandMapping.objects.select_related("brand", "turn14_brand")
+    )
+    if not mappings:
+        logger.info("{} No BrandTurn14BrandMapping found.".format(_LOG_PREFIX))
+        return
+
+    provider_parts = {
+        pp.provider_external_id: pp
+        for pp in src_models.ProviderPart.objects.filter(provider=turn14_provider)
+    }
+
+    # Load Turn14 locations once: map external_id (e.g. "01") -> name (e.g. "Hatfield")
+    location_map = _get_turn14_location_map()
+
+    now = timezone.now()
+
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        return _sync_turn14_provider_inventory_batches(
+            provider_parts=provider_parts,
+            location_map=location_map,
+            now=now,
+            catalog_brand_ids=catalog_ids,
+            all_mapped_catalog_brand_ids=None,
+            log_context="mapped brand",
+        )
+
+    mapped_catalog_brand_ids = {m.turn14_brand_id for m in mappings}
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "turn14_brand", _worker)
+    total_upserted += _sync_turn14_provider_inventory_batches(
+        provider_parts=provider_parts,
+        location_map=location_map,
+        now=now,
+        catalog_brand_ids=None,
+        all_mapped_catalog_brand_ids=mapped_catalog_brand_ids,
+        log_context="unmapped or null brand",
+    )
     logger.info("{} Synced {} Turn14 inventory records total.".format(_LOG_PREFIX, total_upserted))
 
 
@@ -3756,64 +4179,83 @@ def sync_provider_inventory_from_keystone() -> None:
         logger.info("{} No Keystone provider found.".format(_LOG_PREFIX))
         return
 
+    mappings = list(
+        src_models.BrandKeystoneBrandMapping.objects.select_related("brand", "keystone_brand")
+    )
+    if not mappings:
+        logger.info("{} No BrandKeystoneBrandMapping found.".format(_LOG_PREFIX))
+        return
+
     provider_parts = {
         pp.provider_external_id: pp
         for pp in src_models.ProviderPart.objects.filter(provider=keystone_provider)
     }
 
     now = timezone.now()
-    total_upserted = 0
-    batch_num = 0
-    last_id = 0
 
-    while True:
-        batch_num += 1
-        batch = list(
-            src_models.KeystoneParts.objects.filter(id__gt=last_id)
-            .order_by("id")
-            .values(
-                "id", "vcpn", "total_qty",
-                "east_qty", "midwest_qty", "california_qty", "southeast_qty",
-                "pacific_nw_qty", "texas_qty", "great_lakes_qty", "florida_qty",
-            )[:BATCH_SIZE_INVENTORY]
-        )
-        if not batch:
-            break
-
-        last_id = batch[-1]["id"]
-        to_upsert = [
-            src_models.ProviderPartInventory(
-                provider_part=provider_parts[kp["vcpn"]],
-                warehouse_total_qty=kp.get("total_qty") or 0,
-                manufacturer_inventory=None,
-                manufacturer_esd=None,
-                warehouse_availability=_keystone_warehouse_availability(kp),
-                last_synced_at=now,
-                updated_at=now,
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            batch = list(
+                src_models.KeystoneParts.objects.filter(id__gt=last_id, brand_id__in=catalog_ids)
+                .order_by("id")
+                .values(
+                    "id", "vcpn", "total_qty",
+                    "east_qty", "midwest_qty", "california_qty", "southeast_qty",
+                    "pacific_nw_qty", "texas_qty", "great_lakes_qty", "florida_qty",
+                )[:BATCH_SIZE_INVENTORY]
             )
-            for kp in batch
-            if kp["vcpn"] in provider_parts
-        ]
+            if not batch:
+                break
 
-        if to_upsert:
-            to_upsert = _dedupe_provider_part_inventory_for_upsert(
-                to_upsert, context="Keystone inventory batch={}".format(batch_num)
-            )
-            pgbulk.upsert(
-                src_models.ProviderPartInventory,
-                to_upsert,
-                unique_fields=["provider_part"],
-                update_fields=["warehouse_total_qty", "manufacturer_inventory", "manufacturer_esd", "warehouse_availability", "last_synced_at", "updated_at"],
-            )
-            total_upserted += len(to_upsert)
+            last_id = batch[-1]["id"]
+            to_upsert = [
+                src_models.ProviderPartInventory(
+                    provider_part=provider_parts[kp["vcpn"]],
+                    warehouse_total_qty=kp.get("total_qty") or 0,
+                    manufacturer_inventory=None,
+                    manufacturer_esd=None,
+                    warehouse_availability=_keystone_warehouse_availability(kp),
+                    last_synced_at=now,
+                    updated_at=now,
+                )
+                for kp in batch
+                if kp["vcpn"] in provider_parts
+            ]
 
-        logger.info("{} Keystone inventory batch {}: {} records (last_id={})".format(
-            _LOG_PREFIX, batch_num, len(to_upsert), last_id
-        ))
-        connection.close()
-        if len(batch) == BATCH_SIZE_INVENTORY:
-            time.sleep(BATCH_DELAY_SECONDS)
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_inventory_for_upsert(
+                    to_upsert, context="Keystone inventory batch={}".format(batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartInventory,
+                    to_upsert,
+                    unique_fields=["provider_part"],
+                    update_fields=[
+                        "warehouse_total_qty",
+                        "manufacturer_inventory",
+                        "manufacturer_esd",
+                        "warehouse_availability",
+                        "last_synced_at",
+                        "updated_at",
+                    ],
+                )
+                total_upserted += len(to_upsert)
 
+            logger.info("{} Keystone inventory batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_INVENTORY:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "keystone_brand", _worker)
     logger.info("{} Synced {} Keystone inventory records total.".format(_LOG_PREFIX, total_upserted))
 
 
@@ -3860,91 +4302,103 @@ def sync_provider_inventory_from_meyer() -> None:
         logger.info("{} No Meyer provider found.".format(_LOG_PREFIX))
         return
 
+    mappings = list(
+        src_models.BrandMeyerBrandMapping.objects.select_related("brand", "meyer_brand")
+    )
+    if not mappings:
+        logger.info("{} No BrandMeyerBrandMapping found.".format(_LOG_PREFIX))
+        return
+
     provider_parts = {
         pp.provider_external_id: pp
         for pp in src_models.ProviderPart.objects.filter(provider=meyer_provider)
     }
 
     now = timezone.now()
-    total_upserted = 0
-    batch_num = 0
-    last_id = 0
 
-    while True:
-        batch_num += 1
-        batch = list(
-            src_models.MeyerParts.objects.filter(id__gt=last_id)
-            .order_by("id")
-            .values(
-                "id",
-                "meyer_part",
-                "available_qty",
-                "mfg_qty_available",
-                "is_stocking",
-                "is_special_order",
-                "inventory_ltl",
-            )[:BATCH_SIZE_INVENTORY]
-        )
-        if not batch:
-            break
-
-        last_id = batch[-1]["id"]
-        # Last row per ProviderPart wins: same meyer_part SKU can exist on multiple MeyerParts (different brands)
-        # but maps to one ProviderPart — PostgreSQL rejects duplicate constrained keys in one INSERT.
-        inv_by_provider_part_id: typing.Dict[int, src_models.ProviderPartInventory] = {}
-        for mp in batch:
-            ext = mp.get("meyer_part")
-            if isinstance(ext, str):
-                ext = ext.strip()
-            else:
-                ext = str(ext or "").strip()
-            pp = provider_parts.get(ext)
-            if not pp:
-                continue
-            avail = mp.get("available_qty")
-            wh_total = 0
-            if avail is not None:
-                try:
-                    wh_total = int(float(avail))
-                except (TypeError, ValueError):
-                    wh_total = 0
-            inv_by_provider_part_id[pp.id] = src_models.ProviderPartInventory(
-                provider_part=pp,
-                warehouse_total_qty=wh_total,
-                manufacturer_inventory=mp.get("mfg_qty_available"),
-                manufacturer_esd=None,
-                warehouse_availability=_meyer_warehouse_availability(mp),
-                last_synced_at=now,
-                updated_at=now,
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            batch = list(
+                src_models.MeyerParts.objects.filter(id__gt=last_id, brand_id__in=catalog_ids)
+                .order_by("id")
+                .values(
+                    "id",
+                    "meyer_part",
+                    "available_qty",
+                    "mfg_qty_available",
+                    "is_stocking",
+                    "is_special_order",
+                    "inventory_ltl",
+                )[:BATCH_SIZE_INVENTORY]
             )
+            if not batch:
+                break
 
-        to_upsert = list(inv_by_provider_part_id.values())
-        if to_upsert:
-            to_upsert = _dedupe_provider_part_inventory_for_upsert(
-                to_upsert, context="Meyer inventory batch={}".format(batch_num)
-            )
-            pgbulk.upsert(
-                src_models.ProviderPartInventory,
-                to_upsert,
-                unique_fields=["provider_part"],
-                update_fields=[
-                    "warehouse_total_qty",
-                    "manufacturer_inventory",
-                    "manufacturer_esd",
-                    "warehouse_availability",
-                    "last_synced_at",
-                    "updated_at",
-                ],
-            )
-            total_upserted += len(to_upsert)
+            last_id = batch[-1]["id"]
+            # Last row per ProviderPart wins: same meyer_part SKU can exist on multiple MeyerParts (different brands)
+            # but maps to one ProviderPart — PostgreSQL rejects duplicate constrained keys in one INSERT.
+            inv_by_provider_part_id: typing.Dict[int, src_models.ProviderPartInventory] = {}
+            for mp in batch:
+                ext = mp.get("meyer_part")
+                if isinstance(ext, str):
+                    ext = ext.strip()
+                else:
+                    ext = str(ext or "").strip()
+                pp = provider_parts.get(ext)
+                if not pp:
+                    continue
+                avail = mp.get("available_qty")
+                wh_total = 0
+                if avail is not None:
+                    try:
+                        wh_total = int(float(avail))
+                    except (TypeError, ValueError):
+                        wh_total = 0
+                inv_by_provider_part_id[pp.id] = src_models.ProviderPartInventory(
+                    provider_part=pp,
+                    warehouse_total_qty=wh_total,
+                    manufacturer_inventory=mp.get("mfg_qty_available"),
+                    manufacturer_esd=None,
+                    warehouse_availability=_meyer_warehouse_availability(mp),
+                    last_synced_at=now,
+                    updated_at=now,
+                )
 
-        logger.info("{} Meyer inventory batch {}: {} records (last_id={})".format(
-            _LOG_PREFIX, batch_num, len(to_upsert), last_id
-        ))
-        connection.close()
-        if len(batch) == BATCH_SIZE_INVENTORY:
-            time.sleep(BATCH_DELAY_SECONDS)
+            to_upsert = list(inv_by_provider_part_id.values())
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_inventory_for_upsert(
+                    to_upsert, context="Meyer inventory batch={}".format(batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartInventory,
+                    to_upsert,
+                    unique_fields=["provider_part"],
+                    update_fields=[
+                        "warehouse_total_qty",
+                        "manufacturer_inventory",
+                        "manufacturer_esd",
+                        "warehouse_availability",
+                        "last_synced_at",
+                        "updated_at",
+                    ],
+                )
+                total_upserted += len(to_upsert)
 
+            logger.info("{} Meyer inventory batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_INVENTORY:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "meyer_brand", _worker)
     logger.info("{} Synced {} Meyer inventory records total.".format(_LOG_PREFIX, total_upserted))
 
 
@@ -4018,78 +4472,86 @@ def sync_provider_pricing_from_turn14() -> None:
         return
 
     now = timezone.now()
-    total_upserted = 0
-    batch_num = 0
-    last_id = 0
 
-    while True:
-        batch_num += 1
-        batch = list(
-            src_models.Turn14BrandPricing.objects.filter(id__gt=last_id)
-            .order_by("id")
-            .values("id", "external_id", "purchase_cost", "pricelists", "company_id")[:BATCH_SIZE_PRICING]
-        )
-        if not batch:
-            break
-
-        last_id = batch[-1]["id"]
-        batch_company_ids = {pr["company_id"] for pr in batch if pr.get("company_id")}
-        companies_by_id = {
-            c.id: c
-            for c in src_models.Company.objects.filter(id__in=batch_company_ids)
-        }
-        ext_to_key = _turn14_pricing_batch_external_id_to_master_keys(
-            batch, t14_brand_to_brand, mapped_t14_brand_ids
-        )
-        pp_by_key = _provider_parts_by_master_brand_and_part_number(turn14_provider, ext_to_key.values())
-
-        to_upsert = []
-        for pr in batch:
-            eid = str(pr.get("external_id") or "").strip()
-            key = ext_to_key.get(eid)
-            if not key:
-                continue
-            provider_part = pp_by_key.get(key)
-            if not provider_part:
-                continue
-            company_id = pr.get("company_id")
-            company = companies_by_id.get(company_id) if company_id else None
-            if not company:
-                continue
-            cost = pr.get("purchase_cost")
-            jobber_price, map_price, msrp, retail_price = _extract_turn14_prices(pr.get("pricelists"))
-            to_upsert.append(
-                src_models.ProviderPartCompanyPricing(
-                    provider_part=provider_part,
-                    company=company,
-                    cost=cost,
-                    jobber_price=jobber_price,
-                    map_price=map_price,
-                    msrp=msrp,
-                    retail_price=retail_price,
-                    last_synced_at=now,
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            batch = list(
+                src_models.Turn14BrandPricing.objects.filter(
+                    id__gt=last_id,
+                    brand_id__in=catalog_ids,
                 )
+                .order_by("id")
+                .values("id", "external_id", "purchase_cost", "pricelists", "company_id")[:BATCH_SIZE_PRICING]
             )
+            if not batch:
+                break
 
-        if to_upsert:
-            to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
-                to_upsert, context="Turn14 pricing batch={}".format(batch_num)
+            last_id = batch[-1]["id"]
+            batch_company_ids = {pr["company_id"] for pr in batch if pr.get("company_id")}
+            companies_by_id = {
+                c.id: c
+                for c in src_models.Company.objects.filter(id__in=batch_company_ids)
+            }
+            ext_to_key = _turn14_pricing_batch_external_id_to_master_keys(
+                batch, t14_brand_to_brand, mapped_t14_brand_ids
             )
-            pgbulk.upsert(
-                src_models.ProviderPartCompanyPricing,
-                to_upsert,
-                unique_fields=["provider_part", "company"],
-                update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
-            )
-            total_upserted += len(to_upsert)
+            pp_by_key = _provider_parts_by_master_brand_and_part_number(turn14_provider, ext_to_key.values())
 
-        logger.info("{} Turn14 pricing batch {}: {} records (last_id={})".format(
-            _LOG_PREFIX, batch_num, len(to_upsert), last_id
-        ))
-        connection.close()
-        if len(batch) == BATCH_SIZE_PRICING:
-            time.sleep(BATCH_DELAY_SECONDS)
+            to_upsert = []
+            for pr in batch:
+                eid = str(pr.get("external_id") or "").strip()
+                key = ext_to_key.get(eid)
+                if not key:
+                    continue
+                provider_part = pp_by_key.get(key)
+                if not provider_part:
+                    continue
+                comp_id = pr.get("company_id")
+                company = companies_by_id.get(comp_id) if comp_id else None
+                if not company:
+                    continue
+                cost = pr.get("purchase_cost")
+                jobber_price, map_price, msrp, retail_price = _extract_turn14_prices(pr.get("pricelists"))
+                to_upsert.append(
+                    src_models.ProviderPartCompanyPricing(
+                        provider_part=provider_part,
+                        company=company,
+                        cost=cost,
+                        jobber_price=jobber_price,
+                        map_price=map_price,
+                        msrp=msrp,
+                        retail_price=retail_price,
+                        last_synced_at=now,
+                    )
+                )
 
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                    to_upsert, context="Turn14 pricing batch={}".format(batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartCompanyPricing,
+                    to_upsert,
+                    unique_fields=["provider_part", "company"],
+                    update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
+                )
+                total_upserted += len(to_upsert)
+
+            logger.info("{} Turn14 pricing batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_PRICING:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "turn14_brand", _worker)
     logger.info("{} Synced {} Turn14 pricing records total.".format(_LOG_PREFIX, total_upserted))
 
 
@@ -4115,98 +4577,106 @@ def sync_provider_pricing_from_keystone() -> None:
         return
 
     now = timezone.now()
-    total_upserted = 0
-    batch_num = 0
-    last_id = 0
 
-    while True:
-        batch_num += 1
-        batch = list(
-            src_models.KeystoneCompanyPricing.objects.filter(id__gt=last_id)
-            .order_by("id")
-            .values(
-                "id",
-                "company_id",
-                "cost",
-                "jobber_price",
-                "part__brand_id",
-                "part__manufacturer_part_no",
-            )[:BATCH_SIZE_PRICING]
-        )
-        if not batch:
-            break
-
-        last_id = batch[-1]["id"]
-        batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
-        companies_by_id = {
-            c.id: c
-            for c in src_models.Company.objects.filter(id__in=batch_company_ids)
-        }
-        master_keys = []
-        for row in batch:
-            brand = ks_brand_to_brand.get(row.get("part__brand_id"))
-            if not brand:
-                continue
-            pn = row.get("part__manufacturer_part_no") or ""
-            if isinstance(pn, str):
-                pn = pn.strip()
-            else:
-                pn = str(pn or "").strip()
-            if not pn:
-                continue
-            master_keys.append((brand.id, pn))
-        pp_by_key = _provider_parts_by_master_brand_and_part_number(keystone_provider, master_keys)
-
-        to_upsert = []
-        for row in batch:
-            brand = ks_brand_to_brand.get(row.get("part__brand_id"))
-            if not brand:
-                continue
-            pn = row.get("part__manufacturer_part_no") or ""
-            if isinstance(pn, str):
-                pn = pn.strip()
-            else:
-                pn = str(pn or "").strip()
-            if not pn:
-                continue
-            provider_part = pp_by_key.get((brand.id, pn))
-            if not provider_part:
-                continue
-            company = companies_by_id.get(row.get("company_id"))
-            if not company:
-                continue
-            to_upsert.append(
-                src_models.ProviderPartCompanyPricing(
-                    provider_part=provider_part,
-                    company=company,
-                    cost=row.get("cost"),
-                    jobber_price=row.get("jobber_price"),
-                    map_price=None,
-                    msrp=None,
-                    retail_price=None,
-                    last_synced_at=now,
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            batch = list(
+                src_models.KeystoneCompanyPricing.objects.filter(
+                    id__gt=last_id,
+                    part__brand_id__in=catalog_ids,
                 )
+                .order_by("id")
+                .values(
+                    "id",
+                    "company_id",
+                    "cost",
+                    "jobber_price",
+                    "part__brand_id",
+                    "part__manufacturer_part_no",
+                )[:BATCH_SIZE_PRICING]
             )
+            if not batch:
+                break
 
-        if to_upsert:
-            to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
-                to_upsert, context="Keystone pricing batch={}".format(batch_num)
-            )
-            pgbulk.upsert(
-                src_models.ProviderPartCompanyPricing,
-                to_upsert,
-                unique_fields=["provider_part", "company"],
-                update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
-            )
-            total_upserted += len(to_upsert)
+            last_id = batch[-1]["id"]
+            batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
+            companies_by_id = {
+                c.id: c
+                for c in src_models.Company.objects.filter(id__in=batch_company_ids)
+            }
+            master_keys = []
+            for row in batch:
+                brand = ks_brand_to_brand.get(row.get("part__brand_id"))
+                if not brand:
+                    continue
+                pn = row.get("part__manufacturer_part_no") or ""
+                if isinstance(pn, str):
+                    pn = pn.strip()
+                else:
+                    pn = str(pn or "").strip()
+                if not pn:
+                    continue
+                master_keys.append((brand.id, pn))
+            pp_by_key = _provider_parts_by_master_brand_and_part_number(keystone_provider, master_keys)
 
-        logger.info("{} Keystone pricing batch {}: {} records (last_id={})".format(
-            _LOG_PREFIX, batch_num, len(to_upsert), last_id
-        ))
-        connection.close()
-        if len(batch) == BATCH_SIZE_PRICING:
-            time.sleep(BATCH_DELAY_SECONDS)
+            to_upsert = []
+            for row in batch:
+                brand = ks_brand_to_brand.get(row.get("part__brand_id"))
+                if not brand:
+                    continue
+                pn = row.get("part__manufacturer_part_no") or ""
+                if isinstance(pn, str):
+                    pn = pn.strip()
+                else:
+                    pn = str(pn or "").strip()
+                if not pn:
+                    continue
+                provider_part = pp_by_key.get((brand.id, pn))
+                if not provider_part:
+                    continue
+                company = companies_by_id.get(row.get("company_id"))
+                if not company:
+                    continue
+                to_upsert.append(
+                    src_models.ProviderPartCompanyPricing(
+                        provider_part=provider_part,
+                        company=company,
+                        cost=row.get("cost"),
+                        jobber_price=row.get("jobber_price"),
+                        map_price=None,
+                        msrp=None,
+                        retail_price=None,
+                        last_synced_at=now,
+                    )
+                )
 
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                    to_upsert, context="Keystone pricing batch={}".format(batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartCompanyPricing,
+                    to_upsert,
+                    unique_fields=["provider_part", "company"],
+                    update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
+                )
+                total_upserted += len(to_upsert)
+
+            logger.info("{} Keystone pricing batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_PRICING:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "keystone_brand", _worker)
     logger.info("{} Synced {} Keystone pricing records total.".format(_LOG_PREFIX, total_upserted))
 
 
@@ -4232,77 +4702,85 @@ def sync_provider_pricing_from_meyer() -> None:
         return
 
     now = timezone.now()
-    total_upserted = 0
-    batch_num = 0
-    last_id = 0
 
-    while True:
-        batch_num += 1
-        batch = list(
-            src_models.MeyerCompanyPricing.objects.filter(id__gt=last_id)
-            .order_by("id")
-            .values(
-                "id",
-                "company_id",
-                "cost",
-                "jobber_price",
-                "map_price",
-                "part__brand_id",
-                "part__meyer_part",
-                "part__mfg_item_number",
-            )[:BATCH_SIZE_PRICING]
-        )
-        if not batch:
-            break
-
-        last_id = batch[-1]["id"]
-        batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
-        companies_by_id = {
-            c.id: c
-            for c in src_models.Company.objects.filter(id__in=batch_company_ids)
-        }
-        row_id_to_pp = _meyer_company_pricing_batch_row_id_to_provider_part(
-            batch, meyer_provider, my_brand_to_brand
-        )
-        pricing_by_pp_company: typing.Dict[typing.Tuple[int, int], src_models.ProviderPartCompanyPricing] = {}
-        for row in batch:
-            pp = row_id_to_pp.get(row["id"])
-            if not pp:
-                continue
-            company = companies_by_id.get(row.get("company_id"))
-            if not company:
-                continue
-            pricing_by_pp_company[(pp.id, company.id)] = src_models.ProviderPartCompanyPricing(
-                provider_part=pp,
-                company=company,
-                cost=row.get("cost"),
-                jobber_price=row.get("jobber_price"),
-                map_price=row.get("map_price"),
-                msrp=None,
-                retail_price=None,
-                last_synced_at=now,
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            batch = list(
+                src_models.MeyerCompanyPricing.objects.filter(
+                    id__gt=last_id,
+                    part__brand_id__in=catalog_ids,
+                )
+                .order_by("id")
+                .values(
+                    "id",
+                    "company_id",
+                    "cost",
+                    "jobber_price",
+                    "map_price",
+                    "part__brand_id",
+                    "part__meyer_part",
+                    "part__mfg_item_number",
+                )[:BATCH_SIZE_PRICING]
             )
+            if not batch:
+                break
 
-        to_upsert = list(pricing_by_pp_company.values())
-        if to_upsert:
-            to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
-                to_upsert, context="Meyer pricing batch={}".format(batch_num)
+            last_id = batch[-1]["id"]
+            batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
+            companies_by_id = {
+                c.id: c
+                for c in src_models.Company.objects.filter(id__in=batch_company_ids)
+            }
+            row_id_to_pp = _meyer_company_pricing_batch_row_id_to_provider_part(
+                batch, meyer_provider, my_brand_to_brand
             )
-            pgbulk.upsert(
-                src_models.ProviderPartCompanyPricing,
-                to_upsert,
-                unique_fields=["provider_part", "company"],
-                update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
-            )
-            total_upserted += len(to_upsert)
+            pricing_by_pp_company: typing.Dict[typing.Tuple[int, int], src_models.ProviderPartCompanyPricing] = {}
+            for row in batch:
+                pp = row_id_to_pp.get(row["id"])
+                if not pp:
+                    continue
+                company = companies_by_id.get(row.get("company_id"))
+                if not company:
+                    continue
+                pricing_by_pp_company[(pp.id, company.id)] = src_models.ProviderPartCompanyPricing(
+                    provider_part=pp,
+                    company=company,
+                    cost=row.get("cost"),
+                    jobber_price=row.get("jobber_price"),
+                    map_price=row.get("map_price"),
+                    msrp=None,
+                    retail_price=None,
+                    last_synced_at=now,
+                )
 
-        logger.info("{} Meyer pricing batch {}: {} records (last_id={})".format(
-            _LOG_PREFIX, batch_num, len(to_upsert), last_id
-        ))
-        connection.close()
-        if len(batch) == BATCH_SIZE_PRICING:
-            time.sleep(BATCH_DELAY_SECONDS)
+            to_upsert = list(pricing_by_pp_company.values())
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                    to_upsert, context="Meyer pricing batch={}".format(batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartCompanyPricing,
+                    to_upsert,
+                    unique_fields=["provider_part", "company"],
+                    update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
+                )
+                total_upserted += len(to_upsert)
 
+            logger.info("{} Meyer pricing batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_PRICING:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "meyer_brand", _worker)
     logger.info("{} Synced {} Meyer pricing records total.".format(_LOG_PREFIX, total_upserted))
 
 
@@ -4326,165 +4804,305 @@ def sync_provider_pricing_from_dlg() -> None:
         return
 
     now = timezone.now()
-    total_upserted = 0
-    batch_num = 0
-    last_id = 0
 
-    while True:
-        batch_num += 1
-        batch = list(
-            src_models.DlgCompanyPricing.objects.filter(id__gt=last_id)
-            .order_by("id")
-            .values(
-                "id",
-                "company_id",
-                "base_price",
-                "part__brand_id",
-                "part__part_number",
-            )[:BATCH_SIZE_PRICING]
-        )
-        if not batch:
-            break
-
-        last_id = batch[-1]["id"]
-        batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
-        companies_by_id = {
-            c.id: c
-            for c in src_models.Company.objects.filter(id__in=batch_company_ids)
-        }
-        row_id_to_pp = _dlg_company_pricing_batch_row_id_to_provider_part(
-            batch, dlg_provider, dlg_brand_to_brand
-        )
-        pricing_by_pp_company: typing.Dict[typing.Tuple[int, int], src_models.ProviderPartCompanyPricing] = {}
-        for row in batch:
-            pp = row_id_to_pp.get(row["id"])
-            if not pp:
-                continue
-            company = companies_by_id.get(row.get("company_id"))
-            if not company:
-                continue
-            bp = _dlg_decimal_to_provider_money(row.get("base_price"))
-            pricing_by_pp_company[(pp.id, company.id)] = src_models.ProviderPartCompanyPricing(
-                provider_part=pp,
-                company=company,
-                cost=bp,
-                jobber_price=bp,
-                map_price=None,
-                msrp=None,
-                retail_price=bp,
-                last_synced_at=now,
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            batch = list(
+                src_models.DlgCompanyPricing.objects.filter(
+                    id__gt=last_id,
+                    part__brand_id__in=catalog_ids,
+                )
+                .order_by("id")
+                .values(
+                    "id",
+                    "company_id",
+                    "base_price",
+                    "part__brand_id",
+                    "part__part_number",
+                )[:BATCH_SIZE_PRICING]
             )
+            if not batch:
+                break
 
-        to_upsert = list(pricing_by_pp_company.values())
-        if to_upsert:
-            to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
-                to_upsert, context="DLG pricing batch={}".format(batch_num)
+            last_id = batch[-1]["id"]
+            batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
+            companies_by_id = {
+                c.id: c
+                for c in src_models.Company.objects.filter(id__in=batch_company_ids)
+            }
+            row_id_to_pp = _dlg_company_pricing_batch_row_id_to_provider_part(
+                batch, dlg_provider, dlg_brand_to_brand
             )
-            pgbulk.upsert(
-                src_models.ProviderPartCompanyPricing,
-                to_upsert,
-                unique_fields=["provider_part", "company"],
-                update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
-            )
-            total_upserted += len(to_upsert)
+            pricing_by_pp_company: typing.Dict[typing.Tuple[int, int], src_models.ProviderPartCompanyPricing] = {}
+            for row in batch:
+                pp = row_id_to_pp.get(row["id"])
+                if not pp:
+                    continue
+                company = companies_by_id.get(row.get("company_id"))
+                if not company:
+                    continue
+                bp = _dlg_decimal_to_provider_money(row.get("base_price"))
+                pricing_by_pp_company[(pp.id, company.id)] = src_models.ProviderPartCompanyPricing(
+                    provider_part=pp,
+                    company=company,
+                    cost=bp,
+                    jobber_price=bp,
+                    map_price=None,
+                    msrp=None,
+                    retail_price=bp,
+                    last_synced_at=now,
+                )
 
-        logger.info("{} DLG pricing batch {}: {} records (last_id={})".format(
-            _LOG_PREFIX, batch_num, len(to_upsert), last_id
-        ))
-        connection.close()
-        if len(batch) == BATCH_SIZE_PRICING:
-            time.sleep(BATCH_DELAY_SECONDS)
+            to_upsert = list(pricing_by_pp_company.values())
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                    to_upsert, context="DLG pricing batch={}".format(batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartCompanyPricing,
+                    to_upsert,
+                    unique_fields=["provider_part", "company"],
+                    update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
+                )
+                total_upserted += len(to_upsert)
 
+            logger.info("{} DLG pricing batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_PRICING:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "dlg_brand", _worker)
     logger.info("{} Synced {} DLG pricing records total.".format(_LOG_PREFIX, total_upserted))
+
+
+def _maybe_reindex_meilisearch_after_master_parts(
+    *,
+    reindex_meilisearch: bool,
+    provider_label: str,
+    continuation: typing.Callable[[], None],
+) -> None:
+    """
+    After ``sync_master_parts_from_*``, optionally run a full Meilisearch reindex (delete + index)
+    overlapped with inventory/pricing DB work on this thread. No-op when Meilisearch is not configured.
+    """
+    if not reindex_meilisearch:
+        continuation()
+        return
+
+    from src.search import meilisearch_client as meilisearch_client
+
+    if not meilisearch_client.is_configured():
+        continuation()
+        return
+
+    def _reindex() -> typing.Tuple[int, int]:
+        return meilisearch_client.reindex_all_master_parts()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        fut = pool.submit(_reindex)
+        try:
+            continuation()
+        finally:
+            ok, fail = fut.result()
+
+    logger.info(
+        "{} Meilisearch reindex after {} master parts: indexed={} failed={}".format(
+            _LOG_PREFIX, provider_label, ok, fail
+        )
+    )
+
+
+def sync_derived_from_turn14(*, reindex_meilisearch: bool = False) -> None:
+    """
+    Propagate Turn14 source data into MasterPart, ProviderPart, ProviderPartInventory,
+    and ProviderPartCompanyPricing. Call after Turn14 item/catalog fetches so the unified
+    layer stays aligned without waiting for the global ``sync_all_master_parts`` job.
+    """
+    logger.info("{} Starting Turn14-only derived sync (parts, inventory, pricing).".format(_LOG_PREFIX))
+    sync_master_parts_from_turn14()
+    connection.close()
+
+    def _cont() -> None:
+        sync_provider_inventory_from_turn14()
+        connection.close()
+        sync_provider_pricing_from_turn14()
+        connection.close()
+
+    _maybe_reindex_meilisearch_after_master_parts(
+        reindex_meilisearch=reindex_meilisearch,
+        provider_label="Turn14",
+        continuation=_cont,
+    )
+    logger.info("{} Completed Turn14-only derived sync.".format(_LOG_PREFIX))
+
+
+def sync_derived_from_keystone(*, reindex_meilisearch: bool = False) -> None:
+    """
+    Propagate Keystone source data into MasterPart, ProviderPart, ProviderPartInventory,
+    and ProviderPartCompanyPricing. Call after Keystone inventory/CSV fetches.
+
+    Set ``reindex_meilisearch=True`` from ingest commands to refresh the parts search index
+    after master parts sync (skipped when Meilisearch is not configured).
+    """
+    logger.info("{} Starting Keystone-only derived sync (parts, inventory, pricing).".format(_LOG_PREFIX))
+    sync_master_parts_from_keystone()
+    connection.close()
+
+    def _cont() -> None:
+        sync_provider_inventory_from_keystone()
+        connection.close()
+        sync_provider_pricing_from_keystone()
+        connection.close()
+
+    _maybe_reindex_meilisearch_after_master_parts(
+        reindex_meilisearch=reindex_meilisearch,
+        provider_label="Keystone",
+        continuation=_cont,
+    )
+    logger.info("{} Completed Keystone-only derived sync.".format(_LOG_PREFIX))
+
+
+def sync_derived_from_rough_country(*, reindex_meilisearch: bool = False) -> None:
+    """
+    Propagate Rough Country source data into MasterPart, ProviderPart, ProviderPartInventory,
+    and ProviderPartCompanyPricing. Call after Rough Country feed ingest.
+    """
+    logger.info("{} Starting Rough Country-only derived sync (parts, inventory, pricing).".format(_LOG_PREFIX))
+    sync_master_parts_from_rough_country()
+    connection.close()
+
+    def _cont() -> None:
+        sync_provider_inventory_from_rough_country()
+        connection.close()
+        sync_provider_pricing_from_rough_country()
+        connection.close()
+
+    _maybe_reindex_meilisearch_after_master_parts(
+        reindex_meilisearch=reindex_meilisearch,
+        provider_label="Rough Country",
+        continuation=_cont,
+    )
+    logger.info("{} Completed Rough Country-only derived sync.".format(_LOG_PREFIX))
+
+
+def sync_derived_from_wheelpros(*, reindex_meilisearch: bool = False) -> None:
+    """
+    Propagate WheelPros source data into MasterPart, ProviderPart, ProviderPartInventory,
+    and ProviderPartCompanyPricing. Call after WheelPros CSV ingest.
+    """
+    logger.info("{} Starting WheelPros-only derived sync (parts, inventory, pricing).".format(_LOG_PREFIX))
+    sync_master_parts_from_wheelpros()
+    connection.close()
+
+    def _cont() -> None:
+        sync_provider_inventory_from_wheelpros()
+        connection.close()
+        sync_provider_pricing_from_wheelpros()
+        connection.close()
+
+    _maybe_reindex_meilisearch_after_master_parts(
+        reindex_meilisearch=reindex_meilisearch,
+        provider_label="WheelPros",
+        continuation=_cont,
+    )
+    logger.info("{} Completed WheelPros-only derived sync.".format(_LOG_PREFIX))
+
+
+def sync_derived_from_meyer(*, reindex_meilisearch: bool = False) -> None:
+    """
+    Propagate Meyer source data into MasterPart, ProviderPart, ProviderPartInventory,
+    and ProviderPartCompanyPricing. Call after Meyer catalog / inventory ingest.
+    """
+    logger.info("{} Starting Meyer-only derived sync (parts, inventory, pricing).".format(_LOG_PREFIX))
+    sync_master_parts_from_meyer()
+    connection.close()
+
+    def _cont() -> None:
+        sync_provider_inventory_from_meyer()
+        connection.close()
+        sync_provider_pricing_from_meyer()
+        connection.close()
+
+    _maybe_reindex_meilisearch_after_master_parts(
+        reindex_meilisearch=reindex_meilisearch,
+        provider_label="Meyer",
+        continuation=_cont,
+    )
+    logger.info("{} Completed Meyer-only derived sync.".format(_LOG_PREFIX))
+
+
+def sync_derived_from_atech(*, reindex_meilisearch: bool = False) -> None:
+    """
+    Propagate A-Tech source data into MasterPart, ProviderPart, ProviderPartInventory,
+    and ProviderPartCompanyPricing. Call after A-Tech feed ingest.
+    """
+    logger.info("{} Starting A-Tech-only derived sync (parts, inventory, pricing).".format(_LOG_PREFIX))
+    sync_master_parts_from_atech()
+    connection.close()
+
+    def _cont() -> None:
+        sync_provider_inventory_from_atech()
+        connection.close()
+        sync_provider_pricing_from_atech()
+        connection.close()
+
+    _maybe_reindex_meilisearch_after_master_parts(
+        reindex_meilisearch=reindex_meilisearch,
+        provider_label="A-Tech",
+        continuation=_cont,
+    )
+    logger.info("{} Completed A-Tech-only derived sync.".format(_LOG_PREFIX))
+
+
+def sync_derived_from_dlg(*, reindex_meilisearch: bool = False) -> None:
+    """
+    Propagate DLG source data into MasterPart, ProviderPart, ProviderPartInventory,
+    and ProviderPartCompanyPricing. Call after DLG catalog ingest.
+    """
+    logger.info("{} Starting DLG-only derived sync (parts, inventory, pricing).".format(_LOG_PREFIX))
+    sync_master_parts_from_dlg()
+    connection.close()
+
+    def _cont() -> None:
+        sync_provider_inventory_from_dlg()
+        connection.close()
+        sync_provider_pricing_from_dlg()
+        connection.close()
+
+    _maybe_reindex_meilisearch_after_master_parts(
+        reindex_meilisearch=reindex_meilisearch,
+        provider_label="DLG",
+        continuation=_cont,
+    )
+    logger.info("{} Completed DLG-only derived sync.".format(_LOG_PREFIX))
 
 
 def sync_all_master_parts() -> None:
     """
-    Run all master parts syncs in sequence:
-    1. Master parts + provider parts from Turn14
-    2. Master parts + provider parts from Keystone
-    3. Master parts + provider parts from Meyer
-    4. Master parts + provider parts from A-Tech (part_number + sku from feed; composite ``provider_external_id``)
-    5. Master parts + provider parts from Rough Country
-    6. Master parts + provider parts from DLG (part_number only; no sku resolution)
-    7. Master parts + provider parts from WheelPros (wheels, tires, accessories)
-    8. Provider inventory from Turn14
-    9. Provider inventory from Keystone
-    10. Provider inventory from Meyer
-    11. Provider inventory from A-Tech
-    12. Provider inventory from Rough Country
-    13. Provider inventory from DLG
-    14. Provider inventory from WheelPros
-    15. Provider pricing from Turn14
-    16. Provider pricing from Keystone
-    17. Provider pricing from Meyer
-    18. Provider pricing from A-Tech
-    19. Provider pricing from Rough Country
-    20. Provider pricing from DLG
-    21. Provider pricing from WheelPros
+    Run each distributor's derived sync in order (master + provider parts, then inventory, then pricing
+    for that distributor before moving to the next). Order matches the previous implementation so
+    dependencies (e.g. Meyer before A-Tech) are preserved.
+
+    Does not reindex Meilisearch per provider; use ``sync_master_parts --reindex-meilisearch`` or
+    individual ingest commands that pass ``reindex_meilisearch=True``.
     """
     logger.info("{} Starting full master parts sync.".format(_LOG_PREFIX))
 
-    sync_master_parts_from_turn14()
-    connection.close()
-
-    sync_master_parts_from_keystone()
-    connection.close()
-
-    sync_master_parts_from_meyer()
-    connection.close()
-
-    sync_master_parts_from_atech()
-    connection.close()
-
-    sync_master_parts_from_rough_country()
-    connection.close()
-
-    sync_master_parts_from_dlg()
-    connection.close()
-
-    sync_master_parts_from_wheelpros()
-    connection.close()
-
-    sync_provider_inventory_from_turn14()
-    connection.close()
-
-    sync_provider_inventory_from_keystone()
-    connection.close()
-
-    sync_provider_inventory_from_meyer()
-    connection.close()
-
-    sync_provider_inventory_from_atech()
-    connection.close()
-
-    sync_provider_inventory_from_rough_country()
-    connection.close()
-
-    sync_provider_inventory_from_dlg()
-    connection.close()
-
-    sync_provider_inventory_from_wheelpros()
-    connection.close()
-
-    sync_provider_pricing_from_turn14()
-    connection.close()
-
-    sync_provider_pricing_from_keystone()
-    connection.close()
-
-    sync_provider_pricing_from_meyer()
-    connection.close()
-
-    sync_provider_pricing_from_atech()
-    connection.close()
-
-    sync_provider_pricing_from_rough_country()
-    connection.close()
-
-    sync_provider_pricing_from_dlg()
-    connection.close()
-
-    sync_provider_pricing_from_wheelpros()
+    sync_derived_from_turn14(reindex_meilisearch=False)
+    sync_derived_from_keystone(reindex_meilisearch=False)
+    sync_derived_from_meyer(reindex_meilisearch=False)
+    sync_derived_from_atech(reindex_meilisearch=False)
+    sync_derived_from_rough_country(reindex_meilisearch=False)
+    sync_derived_from_dlg(reindex_meilisearch=False)
+    sync_derived_from_wheelpros(reindex_meilisearch=False)
 
     logger.info("{} Completed full master parts sync.".format(_LOG_PREFIX))

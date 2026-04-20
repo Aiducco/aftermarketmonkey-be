@@ -8,7 +8,7 @@ from datetime import date, timedelta
 from django.core.management.base import BaseCommand
 
 from src.audit import scheduled_tasks as audit_scheduled_tasks
-from src.integrations.services import turn_14
+from src.integrations.services import master_parts, turn_14
 
 
 class Command(BaseCommand):
@@ -65,12 +65,14 @@ class Command(BaseCommand):
         )
         try:
             turn_14.fetch_and_save_turn_14_pricing_changes(start_date=start_date, end_date=end_date)
+            self.stdout.write('Propagating Turn14 pricing into ProviderPartCompanyPricing...')
+            master_parts.sync_provider_pricing_from_turn14()
             audit_scheduled_tasks.mark_scheduled_task_completed(
                 execution,
-                message='Successfully completed Turn 14 pricing changes fetch and sync.',
+                message='Successfully completed Turn 14 pricing changes fetch, Turn14 sync, and derived pricing sync.',
             )
             self.stdout.write(
-                self.style.SUCCESS('Successfully completed Turn 14 pricing changes fetch and sync.')
+                self.style.SUCCESS('Successfully completed Turn 14 pricing changes fetch and derived sync.')
             )
         except Exception as e:
             audit_scheduled_tasks.mark_scheduled_task_failed(

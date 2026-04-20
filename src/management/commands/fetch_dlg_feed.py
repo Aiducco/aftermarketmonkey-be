@@ -1,7 +1,7 @@
 from django.core.management.base import BaseCommand
 
 from src.audit import scheduled_tasks as audit_scheduled_tasks
-from src.integrations.services import dlg
+from src.integrations.services import dlg, master_parts
 
 
 class Command(BaseCommand):
@@ -22,9 +22,13 @@ class Command(BaseCommand):
         execution = audit_scheduled_tasks.start_scheduled_task_execution("fetch_dlg_feed")
         try:
             dlg.fetch_and_save_dlg_catalog(force_download=options.get("force_download", False))
+            self.stdout.write(
+                "Propagating DLG catalog into master parts, provider parts, inventory, and pricing..."
+            )
+            master_parts.sync_derived_from_dlg(reindex_meilisearch=True)
             audit_scheduled_tasks.mark_scheduled_task_completed(
                 execution,
-                message="Successfully completed DLG catalog and company pricing ingest.",
+                message="Successfully completed DLG ingest and derived master layer sync.",
             )
             self.stdout.write(self.style.SUCCESS("Done."))
         except Exception as e:
