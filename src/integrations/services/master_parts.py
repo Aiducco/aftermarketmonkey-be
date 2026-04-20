@@ -294,7 +294,7 @@ def _dedupe_master_parts_for_upsert(
 # Master part field priority: Turn14 is primary for description, image_url.
 # Other providers (Keystone, etc.) only update sku, aaia_code on existing parts.
 # We use a two-phase approach for non-primary providers: INSERT new, UPDATE existing (sku/aaia only).
-MASTER_PART_FULL_UPDATE_FIELDS = ["sku", "description", "aaia_code", "image_url"]
+MASTER_PART_FULL_UPDATE_FIELDS = ["sku", "description", "aaia_code", "image_url", "updated_at"]
 MASTER_PART_PARTIAL_UPDATE_FIELDS = ["sku", "aaia_code"]  # Non-primary providers
 
 
@@ -412,6 +412,9 @@ def sync_master_parts_from_turn14() -> None:
         master_parts = _dedupe_master_parts_for_upsert(
             master_parts, context="Turn14 master_parts batch={}".format(batch_num)
         )
+        _now_mp = timezone.now()
+        for _mp in master_parts:
+            _mp.updated_at = _now_mp
         pgbulk.upsert(
             src_models.MasterPart,
             master_parts,
@@ -1755,12 +1758,10 @@ def _atech_dc_inventory_sum(row: typing.Dict) -> int:
 
 
 def _atech_inventory_warehouse_availability(row: typing.Dict) -> typing.Dict[str, typing.Any]:
-    """DC qty fields from AtechParts."""
+    """DC qty fields from AtechParts; keys are user-facing city, state labels (see ``constants.ATECH_DC_QTY_FIELD_TO_LOCATION_LABEL``)."""
     return {
-        "qty_tallmadge": row.get("qty_tallmadge"),
-        "qty_sparks": row.get("qty_sparks"),
-        "qty_mcdonough": row.get("qty_mcdonough"),
-        "qty_arlington": row.get("qty_arlington"),
+        label: row.get(field)
+        for field, label in src_constants.ATECH_DC_QTY_FIELD_TO_LOCATION_LABEL.items()
     }
 
 

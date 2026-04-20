@@ -8,6 +8,7 @@ import pandas as pd
 import pgbulk
 from django.db import connection, transaction
 from django.db.models.functions import Lower, Upper
+from django.utils import timezone
 
 from src import enums as src_enums
 from src import models as src_models
@@ -810,6 +811,7 @@ PRICING_UPDATE_FIELDS = [
     "is_oversize",
     "addtl_handling_charge",
     "raw_data",
+    "updated_at",
 ]
 
 # Catalog upsert clears list prices on MeyerParts (always null from primary CSV); amounts live on MeyerCompanyPricing.
@@ -824,6 +826,7 @@ INVENTORY_UPDATE_FIELDS = [
     "is_oversize",
     "addtl_handling_charge",
     "mfg_item_number",
+    "updated_at",
 ]
 
 
@@ -1064,6 +1067,9 @@ def fetch_and_save_meyer_catalog_and_inventory(force_download: bool = False) -> 
             )
         for i in range(0, len(parts), BATCH):
             batch = parts[i : i + BATCH]
+            _now = timezone.now()
+            for _p in batch:
+                _p.updated_at = _now
             pgbulk.upsert(
                 src_models.MeyerParts,
                 batch,
@@ -1223,6 +1229,9 @@ def fetch_and_save_meyer_catalog_and_inventory(force_download: bool = False) -> 
 
         for i in range(0, len(overlay), BATCH):
             batch = overlay[i : i + BATCH]
+            _now = timezone.now()
+            for _p in batch:
+                _p.updated_at = _now
             pgbulk.upsert(
                 src_models.MeyerParts,
                 batch,
