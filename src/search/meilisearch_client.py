@@ -76,6 +76,14 @@ def _get_brand_name(part) -> str:
 
 def _part_to_document(part) -> typing.Dict:
     """Convert MasterPart instance to Meilisearch document."""
+    return master_part_to_index_shape(part)
+
+
+def master_part_to_index_shape(part) -> typing.Dict:
+    """
+    Public shape of a MasterPart as stored in the Meilisearch parts index.
+    Use for API responses that should match indexed search hits (e.g. audit/history tables).
+    """
     brand_name = _get_brand_name(part)
     return {
         "id": part.id,

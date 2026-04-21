@@ -1294,3 +1294,13 @@ class PartRequestAudit(django_db_models.Model):
     class Meta:
         db_table = "part_request_audit"
         ordering = ["-created_at"]
+        indexes = [
+            django_db_models.Index(
+                fields=["company", "action", "user", "created_at"],
+                name="pra_co_act_usr_crt_idx",
+            ),
+            django_db_models.Index(
+                fields=["company", "action", "created_at"],
+                name="pra_co_act_crt_idx",
+            ),
+        ]
