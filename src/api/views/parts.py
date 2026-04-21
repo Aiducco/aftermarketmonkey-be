@@ -4,6 +4,7 @@ import typing
 import simplejson
 from django import http, views
 
+from src.api.services import company_settings as company_settings_services
 from src.api.services import parts as parts_services
 from src.audit import parts as audit_parts
 
@@ -71,6 +72,104 @@ class PartsSearchView(views.View):
                 "data": result["data"],
                 "provider_image_urls": result["provider_image_urls"],
             }),
+            status=200,
+        )
+
+
+class PartAuditMyHistoryView(views.View):
+    """GET /parts/audit/me/ — current user's part detail audit rows with Meilisearch-shaped part payloads."""
+
+    def get(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
+        err, company_id = _auth_check(request)
+        if err:
+            return err
+        if company_id is None:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Company context required"}),
+                status=400,
+            )
+
+        try:
+            limit = min(int(request.GET.get("limit", 50)), 100)
+        except ValueError:
+            limit = 50
+        try:
+            offset = max(int(request.GET.get("offset", 0)), 0)
+        except ValueError:
+            offset = 0
+
+        try:
+            result = parts_services.list_part_detail_audit_history(
+                company_id=company_id,
+                user_id=request.user.id,
+                limit=limit,
+                offset=offset,
+            )
+        except Exception as e:
+            logger.exception("{} Part audit history error: {}".format(_LOG_PREFIX, str(e)))
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Error fetching part audit history"}),
+                status=500,
+            )
+
+        return http.HttpResponse(
+            headers={"Content-Type": "application/json"},
+            content=simplejson.dumps(result),
+            status=200,
+        )
+
+
+class PartAuditCompanyHistoryView(views.View):
+    """GET /parts/audit/company/ — company-wide part detail audit (company admin only)."""
+
+    def get(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
+        err, company_id = _auth_check(request)
+        if err:
+            return err
+        if company_id is None:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Company context required"}),
+                status=400,
+            )
+
+        ok, admin_err = company_settings_services._is_company_admin(request.user, company_id)
+        if not ok:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": admin_err or "Company admin access required"}),
+                status=403,
+            )
+
+        try:
+            limit = min(int(request.GET.get("limit", 50)), 100)
+        except ValueError:
+            limit = 50
+        try:
+            offset = max(int(request.GET.get("offset", 0)), 0)
+        except ValueError:
+            offset = 0
+
+        try:
+            result = parts_services.list_part_detail_audit_history(
+                company_id=company_id,
+                user_id=None,
+                limit=limit,
+                offset=offset,
+            )
+        except Exception as e:
+            logger.exception("{} Company part audit history error: {}".format(_LOG_PREFIX, str(e)))
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Error fetching part audit history"}),
+                status=500,
+            )
+
+        return http.HttpResponse(
+            headers={"Content-Type": "application/json"},
+            content=simplejson.dumps(result),
             status=200,
         )
 

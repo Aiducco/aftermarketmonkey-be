@@ -32,7 +32,12 @@ from src.api.views.onboarding import (
     OnboardingStatusView,
     DistributorCredentialsInfoView,
 )
-from src.api.views.parts import PartsSearchView, PartDetailView
+from src.api.views.parts import (
+    PartAuditCompanyHistoryView,
+    PartAuditMyHistoryView,
+    PartDetailView,
+    PartsSearchView,
+)
 from src.api.views.turn14_locations import Turn14LocationsView
 
 urlpatterns = [
@@ -135,6 +140,16 @@ urlpatterns = [
         "parts/search/",
         PartsSearchView.as_view(),
         name="parts_search",
+    ),
+    path(
+        "parts/audit/me/",
+        PartAuditMyHistoryView.as_view(),
+        name="parts_audit_me",
+    ),
+    path(
+        "parts/audit/company/",
+        PartAuditCompanyHistoryView.as_view(),
+        name="parts_audit_company",
     ),
     path(
         "parts/<int:id>/",

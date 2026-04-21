@@ -9,6 +9,7 @@ from urllib.parse import quote
 from src import constants as src_constants
 from src import enums as src_enums
 from src import models as src_models
+from src.search import meilisearch_client as meilisearch_client
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +69,7 @@ def _get_provider_image_url(kind_name: typing.Optional[str]) -> typing.Optional[
 def get_parts_search(sku: str, limit: int = 50) -> typing.Dict:
     """
     Search MasterPart by part_number (case-insensitive contains).
-    Returns MasterPart fields + brand_id, and provider_image_urls map for frontend.
+    Returns the same part field shape as the Meilisearch index (plus provider_image_urls).
     """
     if not sku or not str(sku).strip():
         return {"data": [], "provider_image_urls": _get_all_provider_image_urls()}
@@ -80,20 +81,7 @@ def get_parts_search(sku: str, limit: int = 50) -> typing.Dict:
         .order_by("brand__name", "part_number")[:limit]
     )
 
-    data = [
-        {
-            "id": p.id,
-            "brand_id": p.brand_id,
-            "part_number": p.part_number,
-            "sku": p.sku,
-            "description": p.description,
-            "aaia_code": p.aaia_code,
-            "image_url": p.image_url,
-            "created_at": p.created_at.isoformat() if p.created_at else None,
-            "updated_at": p.updated_at.isoformat() if p.updated_at else None,
-        }
-        for p in parts
-    ]
+    data = [meilisearch_client.master_part_to_index_shape(p) for p in parts]
     return {"data": data, "provider_image_urls": _get_all_provider_image_urls()}
 
 
@@ -239,6 +227,9 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
             "provider_display_name": src_constants.PROVIDER_DISPLAY_NAMES.get(kind_name, kind_name) if kind_name else None,
             "provider_image_url": distributor_logo_image_url,
             "distributor_logo_image_url": distributor_logo_image_url,
+            "distributor_refreshed_at": (
+                pp.distributor_refreshed_at.isoformat() if pp.distributor_refreshed_at else None
+            ),
             "provider_external_id": pp.provider_external_id,
             "provider_go_to_link": _provider_go_to_link(
                 kind_name,
@@ -289,3 +280,82 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
     base["provider_image_urls"] = _get_all_provider_image_urls()
     base["providers"] = providers_data
     return base
+
+
+def list_part_detail_audit_history(
+    *,
+    company_id: int,
+    user_id: typing.Optional[int] = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> typing.Dict:
+    """
+    Rows from ``PartRequestAudit`` for part detail requests (action=detail, ``master_part_id`` set).
+    When ``user_id`` is set, restrict to that user; otherwise include all users in the company.
+
+    Each item includes ``part`` using :func:`src.search.meilisearch_client.master_part_to_index_shape`
+    when the master part still exists; otherwise ``part`` is null and ``master_part_id`` is still set.
+    """
+    qs = (
+        src_models.PartRequestAudit.objects.filter(
+            company_id=company_id,
+            action="detail",
+        )
+        .exclude(master_part_id__isnull=True)
+        .order_by("-created_at")
+    )
+    if user_id is not None:
+        qs = qs.filter(user_id=user_id)
+
+    total = qs.count()
+    page = qs[offset : offset + limit]
+    rows = list(
+        page.values(
+            "id",
+            "action",
+            "created_at",
+            "master_part_id",
+            "user_id",
+            "user__id",
+            "user__email",
+        )
+    )
+    part_ids = list({r["master_part_id"] for r in rows if r.get("master_part_id")})
+    parts_by_id: typing.Dict[int, src_models.MasterPart] = {}
+    if part_ids:
+        for mp in src_models.MasterPart.objects.filter(id__in=part_ids).select_related("brand"):
+            parts_by_id[mp.id] = mp
+
+    data: typing.List[typing.Dict] = []
+    for r in rows:
+        mpid = r.get("master_part_id")
+        mp = parts_by_id.get(mpid) if mpid else None
+        part_payload = meilisearch_client.master_part_to_index_shape(mp) if mp else None
+        uid = r.get("user_id")
+        u_id = r.get("user__id")
+        u_email = r.get("user__email")
+        data.append(
+            {
+                "id": r["id"],
+                "action": r["action"],
+                "requested_at": r["created_at"].isoformat() if r["created_at"] else None,
+                "master_part_id": mpid,
+                "part": part_payload,
+                "user": (
+                    {
+                        "id": u_id,
+                        "email": u_email or None,
+                    }
+                    if uid is not None
+                    else None
+                ),
+            }
+        )
+
+    return {
+        "data": data,
+        "provider_image_urls": _get_all_provider_image_urls(),
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
