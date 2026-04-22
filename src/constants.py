@@ -125,7 +125,13 @@ PROVIDER_CATALOG = [
         "description": "Access wheels, tires, and accessories inventory and pricing from Wheel Pros via SFTP.",
         "icon_url": "https://api.aftermarketmonkey.com/uploads/wheel_pros_logo.png",
         "category": "Distributors",
-        "connection_required_fields": ["sftp_user", "sftp_password"],
+        "connection_required_fields": [
+            "sftp_user",
+            "sftp_password",
+            "wheel_markup",
+            "tire_markup",
+            "accessories_markup",
+        ],
         # Remote CSV path per feed (wheel/tire/accessories); defaults in settings if omitted
         "connection_optional_fields": ["sftp_path"],
         "installation_instructions_html": (
@@ -134,8 +140,11 @@ PROVIDER_CATALOG = [
             "automatically; you only enter the account credentials Wheel Pros gives you.</p>"
             "<ol>"
             "<li>Request your SFTP <strong>username</strong> and <strong>password</strong> from Wheel Pros.</li>"
-            "<li>Enter <strong>sftp_user</strong> and <strong>sftp_password</strong> below. If your agreement uses "
-            "non-default remote paths, set optional <strong>sftp_path</strong>; otherwise defaults apply per feed.</li>"
+            "<li>Enter <strong>wheel_markup</strong>, <strong>tire_markup</strong>, and <strong>accessories_markup</strong> "
+            "as the percent <em>off</em> list price (0–100) for wheels, tires, and accessories feeds. "
+            "We derive dealer <strong>cost</strong> from MSRP: cost = MSRP &times; (1 &minus; percent/100). "
+            "If left blank, <strong>20%</strong> off MSRP is used per feed.</li>"
+            "<li>If your agreement uses non-default remote paths, set optional <strong>sftp_path</strong>.</li>"
             "<li>Save the connection. Company-specific pricing is read from SFTP after catalog sync.</li>"
             "</ol>"
         ),

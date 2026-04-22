@@ -416,11 +416,18 @@ def get_distributor_credentials_info() -> dict:
             "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("ROUGH_COUNTRY") or None,
         },
         "wheelpros": {
-            "required": ["sftp_user", "sftp_password"],
+            "required": [
+                "sftp_user",
+                "sftp_password",
+                "wheel_markup",
+                "tire_markup",
+                "accessories_markup",
+            ],
             "optional": ["sftp_path"],
             "description": (
                 "Wheel Pros SFTP username and password (host sftp.wheelpros.com is fixed). "
-                "Optional sftp_path overrides default remote CSV paths per feed."
+                "wheel_markup, tire_markup, accessories_markup: percent off MSRP (0–100) per feed; "
+                "default 20% per feed if not set. Optional sftp_path overrides default remote CSV paths."
             ),
             "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("WHEELPROS", "Wheel Pros"),
             "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("WHEELPROS") or None,
