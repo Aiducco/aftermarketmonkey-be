@@ -34,6 +34,7 @@ from src.api.views.onboarding import (
 )
 from src.api.views.parts import (
     MasterPartBrandsForFilterView,
+    MasterPartCategoryFiltersView,
     PartAuditCompanyHistoryView,
     PartAuditMyHistoryView,
     PartDetailView,
@@ -146,6 +147,11 @@ urlpatterns = [
         "parts/search/brands/",
         MasterPartBrandsForFilterView.as_view(),
         name="parts_search_brands",
+    ),
+    path(
+        "parts/search/categories/",
+        MasterPartCategoryFiltersView.as_view(),
+        name="parts_search_categories",
     ),
     path(
         "parts/audit/me/",

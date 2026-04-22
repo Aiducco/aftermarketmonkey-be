@@ -1155,6 +1155,8 @@ class MasterPart(django_db_models.Model):
     description = django_db_models.TextField(null=True)
     aaia_code = django_db_models.CharField(max_length=255, null=True)
     image_url = django_db_models.TextField(null=True)
+    overview_category = django_db_models.CharField(max_length=255, null=True, blank=True)
+    category = django_db_models.CharField(max_length=255, null=True, blank=True)
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
@@ -1176,6 +1178,9 @@ class ProviderPart(django_db_models.Model):
         blank=True,
         help_text="Last refresh time from the distributor part row (source updated_at) when master parts sync ran.",
     )
+    overview_category = django_db_models.CharField(max_length=255, null=True, blank=True)
+    category = django_db_models.CharField(max_length=255, null=True, blank=True)
+    subcategory = django_db_models.CharField(max_length=255, null=True, blank=True)
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
@@ -1220,6 +1225,22 @@ class ProviderPartCompanyPricing(django_db_models.Model):
     class Meta:
         db_table = "provider_part_company_pricing"
         unique_together = [["provider_part", "company"]]
+
+
+class CategoryMapping(django_db_models.Model):
+    """
+    Map a distributor or feed ``source_category`` string to normalized ``category`` and ``overview_category``.
+    """
+
+    source_category = django_db_models.CharField(max_length=255, db_index=True)
+    category = django_db_models.CharField(max_length=255, null=True, blank=True)
+    overview_category = django_db_models.CharField(max_length=255, null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "category_mappings"
 
 
 class IntegrationPricingSyncJob(django_db_models.Model):

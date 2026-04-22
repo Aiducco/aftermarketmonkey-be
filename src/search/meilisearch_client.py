@@ -19,8 +19,8 @@ REINDEX_DEFAULT_UPLOAD_WORKERS = 4
 # Searchable: what the user types to find results (brand_name is on the document for filtering only)
 SEARCHABLE_ATTRIBUTES = ["part_number", "sku", "description", "aaia_code"]
 
-# Filterable: for sidebar / API filters; brand_name is not searchable
-FILTERABLE_ATTRIBUTES = ["brand_name"]
+# Filterable: for sidebar / API filters; categories come from first ProviderPart with non-empty category
+FILTERABLE_ATTRIBUTES = ["brand_name", "category", "overview_category"]
 
 
 def _get_client():
@@ -74,6 +74,28 @@ def _get_brand_name(part) -> str:
         return ""
 
 
+def _index_categories_for_master_part(part) -> typing.Tuple[str, str]:
+    """
+    Map / index fields: first ProviderPart (by id) with non-empty ``category`` ->
+    (category, overview_category). Empty strings when none.
+    """
+    if not part or not getattr(part, "id", None):
+        return "", ""
+    cache = getattr(part, "_prefetched_objects_cache", None)
+    if cache and "provider_parts" in cache:
+        for pp in part.provider_parts.all():
+            c = (pp.category or "").strip()
+            if c:
+                return c, (pp.overview_category or "").strip()
+    from src.models import ProviderPart
+
+    for pp in ProviderPart.objects.filter(master_part_id=part.id).order_by("id"):
+        c = (pp.category or "").strip()
+        if c:
+            return c, (pp.overview_category or "").strip()
+    return "", ""
+
+
 def _part_to_document(part) -> typing.Dict:
     """Convert MasterPart instance to Meilisearch document."""
     return master_part_to_index_shape(part)
@@ -83,8 +105,12 @@ def master_part_to_index_shape(part) -> typing.Dict:
     """
     Public shape of a MasterPart as stored in the Meilisearch parts index.
     Use for API responses that should match indexed search hits (e.g. audit/history tables).
+
+    ``category`` and ``overview_category`` are filter-only in Meilisearch; values come from the
+    first ``ProviderPart`` (by id) with a non-empty ``category`` for that master part.
     """
     brand_name = _get_brand_name(part)
+    category, overview_category = _index_categories_for_master_part(part)
     return {
         "id": part.id,
         "brand_id": part.brand_id,
@@ -94,6 +120,8 @@ def master_part_to_index_shape(part) -> typing.Dict:
         "description": (part.description or "")[:10000],  # Meilisearch has limits
         "aaia_code": part.aaia_code or "",
         "image_url": part.image_url or "",
+        "category": category or "",
+        "overview_category": overview_category or "",
         "created_at": part.created_at.isoformat() if part.created_at else None,
         "updated_at": part.updated_at.isoformat() if part.updated_at else None,
     }
@@ -134,10 +162,14 @@ def add_documents_in_batches(
         return 0, 0
 
     # Ensure brand is loaded (MasterPart.brand -> Brands)
-    from src.models import MasterPart
+    from django.db.models import Prefetch
+
+    from src.models import MasterPart, ProviderPart
 
     if queryset.model == MasterPart:
-        queryset = queryset.select_related("brand")
+        queryset = queryset.select_related("brand").prefetch_related(
+            Prefetch("provider_parts", queryset=ProviderPart.objects.order_by("id"))
+        )
 
     if max_upload_workers <= 1:
         total_ok = 0
