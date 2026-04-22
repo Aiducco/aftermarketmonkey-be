@@ -33,6 +33,7 @@ from src.api.views.onboarding import (
     DistributorCredentialsInfoView,
 )
 from src.api.views.parts import (
+    MasterPartBrandsForFilterView,
     PartAuditCompanyHistoryView,
     PartAuditMyHistoryView,
     PartDetailView,
@@ -140,6 +141,11 @@ urlpatterns = [
         "parts/search/",
         PartsSearchView.as_view(),
         name="parts_search",
+    ),
+    path(
+        "parts/search/brands/",
+        MasterPartBrandsForFilterView.as_view(),
+        name="parts_search_brands",
     ),
     path(
         "parts/audit/me/",

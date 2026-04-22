@@ -85,6 +85,25 @@ def get_parts_search(sku: str, limit: int = 50) -> typing.Dict:
     return {"data": data, "provider_image_urls": _get_all_provider_image_urls()}
 
 
+def get_master_part_brand_filter_options(
+    q: str = "",
+    limit: int = 100,
+) -> typing.List[typing.Dict[str, typing.Union[int, str]]]:
+    """
+    Distinct brands that have at least one MasterPart, ordered by name.
+    ``name`` matches Meilisearch ``brand_name`` / :func:`master_part_to_index_shape` for filters.
+
+    Optional ``q`` applies case-insensitive substring match (for typeahead in a combobox).
+    """
+    cap = min(max(limit, 1), 2000)
+    brand_ids = src_models.MasterPart.objects.values_list("brand_id", flat=True).distinct()
+    brands = src_models.Brands.objects.filter(id__in=brand_ids).order_by("name")
+    sq = (q or "").strip()
+    if sq:
+        brands = brands.filter(name__icontains=sq)
+    return [{"id": row["id"], "name": row["name"]} for row in brands.values("id", "name")[:cap]]
+
+
 def _get_all_provider_image_urls() -> typing.Dict[str, typing.Optional[str]]:
     """Return provider kind_name -> image URL map for all configured providers."""
     return {k: (v if v else None) for k, v in src_constants.PROVIDER_IMAGE_URLS.items()}

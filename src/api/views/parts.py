@@ -76,6 +76,40 @@ class PartsSearchView(views.View):
         )
 
 
+class MasterPartBrandsForFilterView(views.View):
+    """
+    GET /parts/search/brands/ — brands with at least one master part, for search filter comboboxes.
+    Optional query params: q (substring match on name), limit (default 100, max 2000).
+    """
+
+    def get(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
+        err, _company_id = _auth_check(request)
+        if err:
+            return err
+
+        try:
+            limit = min(int(request.GET.get("limit", 100)), 2000)
+        except ValueError:
+            limit = 100
+
+        q = (request.GET.get("q") or "").strip()
+        try:
+            data = parts_services.get_master_part_brand_filter_options(q=q, limit=limit)
+        except Exception as e:
+            logger.exception("{} Master part brands for filter error: {}".format(_LOG_PREFIX, str(e)))
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Error listing brands"}),
+                status=500,
+            )
+
+        return http.HttpResponse(
+            headers={"Content-Type": "application/json"},
+            content=simplejson.dumps({"data": data}),
+            status=200,
+        )
+
+
 class PartAuditMyHistoryView(views.View):
     """GET /parts/audit/me/ — current user's part detail audit rows with Meilisearch-shaped part payloads."""
 

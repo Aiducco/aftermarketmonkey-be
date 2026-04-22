@@ -16,11 +16,11 @@ INDEX_NAME = getattr(settings, "MEILISEARCH_INDEX_PARTS", "parts")
 REINDEX_DEFAULT_BATCH_SIZE = 10000
 REINDEX_DEFAULT_UPLOAD_WORKERS = 4
 
-# Searchable: what the user types to find results
-SEARCHABLE_ATTRIBUTES = ["part_number", "sku", "description", "aaia_code", "brand_name"]
+# Searchable: what the user types to find results (brand_name is on the document for filtering only)
+SEARCHABLE_ATTRIBUTES = ["part_number", "sku", "description", "aaia_code"]
 
-# Filterable: for sidebar filters (e.g. brand_id)
-FILTERABLE_ATTRIBUTES = ["brand_id"]
+# Filterable: for sidebar / API filters; brand_name is not searchable
+FILTERABLE_ATTRIBUTES = ["brand_name"]
 
 
 def _get_client():
