@@ -112,7 +112,7 @@ class MasterPartBrandsForFilterView(views.View):
 
 class MasterPartCategoryFiltersView(views.View):
     """
-    GET /parts/search/categories/ — distinct category and overview_category on provider parts, for filters.
+    GET /parts/search/categories/ — distinct category and overview_category from category_mappings, for filters.
     Optional query params: q (substring match on each), limit (default 200, max 2000).
     """
 
