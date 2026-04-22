@@ -25,7 +25,8 @@ _LOG_PREFIX = "[MASTER-PARTS]"
 # ProviderPart upsert from sync_master_parts_from_* (distributor_refreshed_at from source row updated_at)
 _PROVIDER_PART_SYNC_UPDATE_FIELDS = ["provider_external_id", "distributor_refreshed_at"]
 # Turn14 / Meyer / Rough Country: map ``CategoryMapping`` -> ``ProviderPart.category`` /
-# ``ProviderPart.overview_category`` (Meyer: use first ``category`` segment split on ``;``)
+# ``ProviderPart.overview_category`` (Meyer: first ``category`` segment split on ``;``).
+# If source is empty or not in ``category_mappings``, those two fields are null on upsert.
 TURN14_PROVIDER_PART_SYNC_UPDATE_FIELDS = [
     "provider_external_id",
     "distributor_refreshed_at",
@@ -67,12 +68,19 @@ def _load_category_mapping_by_source() -> typing.Dict[str, typing.Tuple[typing.O
 
 
 def _lookup_categories_from_mapping(
-    source_value: typing.Any,
+    raw_source: typing.Any,
     mapping_by_source: typing.Dict[str, typing.Tuple[typing.Optional[str], typing.Optional[str]]],
 ) -> typing.Tuple[typing.Optional[str], typing.Optional[str]]:
-    if source_value is None:
+    """
+    ``CategoryMapping`` -> ``(category, overview_category)`` for ``ProviderPart`` on Turn14,
+    Meyer, and Rough Country.
+
+    If the source is empty or there is no ``source_category`` row, returns ``(None, None)`` so
+    the upsert clears any previously stored category fields. Does not set ``subcategory``.
+    """
+    if raw_source is None:
         return None, None
-    key = source_value.strip() if isinstance(source_value, str) else str(source_value).strip()
+    key = raw_source.strip() if isinstance(raw_source, str) else str(raw_source).strip()
     if not key:
         return None, None
     hit = mapping_by_source.get(key)
@@ -603,7 +611,7 @@ def _ingest_turn14_items_for_mapped_brands(
             if not master_part:
                 continue
             pp_key = (master_part.id, turn14_provider.id)
-            cat_mapped, overview_mapped = _lookup_categories_from_mapping(
+            cat_v, over_v = _lookup_categories_from_mapping(
                 row.get("category"), category_by_source
             )
             provider_parts_by_key[pp_key] = src_models.ProviderPart(
@@ -611,8 +619,8 @@ def _ingest_turn14_items_for_mapped_brands(
                 provider=turn14_provider,
                 provider_external_id=row["external_id"],
                 distributor_refreshed_at=row.get("updated_at"),
-                category=cat_mapped,
-                overview_category=overview_mapped,
+                category=cat_v,
+                overview_category=over_v,
             )
 
         provider_parts = list(provider_parts_by_key.values())
@@ -1103,7 +1111,7 @@ def _ingest_meyer_parts_for_mapped_brands(
                 continue
             pp_key = (master_part.id, meyer_provider.id)
             first_for_map = _meyer_first_category_token(row.get("category"))
-            cat_mapped, overview_mapped = _lookup_categories_from_mapping(
+            cat_v, over_v = _lookup_categories_from_mapping(
                 first_for_map, category_by_source
             )
             provider_parts_by_key[pp_key] = src_models.ProviderPart(
@@ -1111,8 +1119,8 @@ def _ingest_meyer_parts_for_mapped_brands(
                 provider=meyer_provider,
                 provider_external_id=mp_ext,
                 distributor_refreshed_at=row.get("updated_at"),
-                category=cat_mapped,
-                overview_category=overview_mapped,
+                category=cat_v,
+                overview_category=over_v,
             )
 
         provider_parts = list(provider_parts_by_key.values())
@@ -1573,7 +1581,7 @@ def _ingest_rough_country_parts_for_mapped_brands(
             if not master_part:
                 continue
             pp_key = (master_part.id, rc_provider.id)
-            cat_mapped, overview_mapped = _lookup_categories_from_mapping(
+            cat_v, over_v = _lookup_categories_from_mapping(
                 row.get("category"), category_by_source
             )
             provider_parts_by_key[pp_key] = src_models.ProviderPart(
@@ -1581,8 +1589,8 @@ def _ingest_rough_country_parts_for_mapped_brands(
                 provider=rc_provider,
                 provider_external_id=ext_id,
                 distributor_refreshed_at=row.get("updated_at"),
-                category=cat_mapped,
-                overview_category=overview_mapped,
+                category=cat_v,
+                overview_category=over_v,
             )
 
         provider_parts = list(provider_parts_by_key.values())
