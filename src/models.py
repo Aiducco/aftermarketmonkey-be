@@ -1188,6 +1188,10 @@ class ProviderPart(django_db_models.Model):
     class Meta:
         db_table = "provider_parts"
         unique_together = [["master_part", "provider"]]
+        indexes = [
+            django_db_models.Index(fields=["category"], name="pp_category_idx"),
+            django_db_models.Index(fields=["overview_category"], name="pp_overview_category_idx"),
+        ]
 
 
 class ProviderPartInventory(django_db_models.Model):

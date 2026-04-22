@@ -129,8 +129,17 @@ def get_master_part_category_filter_options(
     if sq:
         base_cat = base_cat.filter(category__icontains=sq)
         base_over = base_over.filter(overview_category__icontains=sq)
-    categories = sorted(set(base_cat.values_list("category", flat=True)))[:cap]
-    overview_categories = sorted(set(base_over.values_list("overview_category", flat=True)))[:cap]
+    # DB-level DISTINCT + ORDER BY + LIMIT (avoids loading every row into Python for set() + sort).
+    categories = list(
+        base_cat.order_by("category")
+        .values_list("category", flat=True)
+        .distinct()[:cap]
+    )
+    overview_categories = list(
+        base_over.order_by("overview_category")
+        .values_list("overview_category", flat=True)
+        .distinct()[:cap]
+    )
     return {
         "categories": categories,
         "overview_categories": overview_categories,
