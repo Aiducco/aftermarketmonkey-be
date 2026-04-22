@@ -114,22 +114,24 @@ def get_master_part_category_filter_options(
     limit: int = 200,
 ) -> typing.Dict[str, typing.List[str]]:
     """
-    Distinct ``category`` and ``overview_category`` from ``ProviderPart`` (non-empty), for
-    search filter UIs. Values match :func:`src.search.meilisearch_client.master_part_to_index_shape`
-    when a row is the first provider part with a category for that master part.
+    Distinct non-empty ``category`` and ``overview_category`` from ``CategoryMapping`` (the
+    same normalized labels written to ``ProviderPart`` / Meilisearch during sync). Used for
+    filter comboboxes so options match the controlled mapping vocabulary, not a scan of
+    every distributor row.
 
     Optional ``q`` applies case-insensitive substring match to each list separately.
     """
     cap = min(max(limit, 1), 2000)
     sq = (q or "").strip()
-    base_cat = src_models.ProviderPart.objects.exclude(category__isnull=True).exclude(category="")
-    base_over = src_models.ProviderPart.objects.exclude(overview_category__isnull=True).exclude(
+    base_cat = src_models.CategoryMapping.objects.exclude(category__isnull=True).exclude(
+        category=""
+    )
+    base_over = src_models.CategoryMapping.objects.exclude(overview_category__isnull=True).exclude(
         overview_category=""
     )
     if sq:
         base_cat = base_cat.filter(category__icontains=sq)
         base_over = base_over.filter(overview_category__icontains=sq)
-    # DB-level DISTINCT + ORDER BY + LIMIT (avoids loading every row into Python for set() + sort).
     categories = list(
         base_cat.order_by("category")
         .values_list("category", flat=True)
