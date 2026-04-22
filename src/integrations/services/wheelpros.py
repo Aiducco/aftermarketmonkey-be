@@ -7,7 +7,7 @@ import logging
 import math
 import typing
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 
 import pgbulk
 
@@ -155,6 +155,73 @@ def _row_get(row: typing.Dict, *keys: str) -> typing.Any:
 def _row_key(row: typing.Dict, *keys: str) -> typing.Optional[str]:
     value = _row_get(row, *keys)
     return _safe_str(value) if value is not None else None
+
+
+# --- Dealer cost from MSRP + company credentials (wheel_markup / tire_markup / accessories_markup %) ---
+
+# When a credential key is missing or empty, treat as this discount off MSRP (20% → cost = 0.8 × MSRP).
+WHEELPROS_DEFAULT_DISCOUNT_PERCENT = Decimal(20)
+
+_WHEELPROS_FEED_TO_MARKUP_KEY = {
+    "wheel": "wheel_markup",
+    "tire": "tire_markup",
+    "accessories": "accessories_markup",
+}
+
+
+def _parse_wp_discount_percent(raw: typing.Any) -> typing.Optional[Decimal]:
+    if raw is None or raw is "":
+        return None
+    try:
+        d = Decimal(str(raw).strip())
+    except Exception:
+        return None
+    if d < 0:
+        d = Decimal(0)
+    if d > 100:
+        d = Decimal(100)
+    return d
+
+
+def discount_percent_for_feed(
+    credentials: typing.Optional[typing.Dict],
+    feed_type: typing.Optional[str],
+) -> Decimal:
+    """
+    Discount percent *off* MSRP (0–100) for a feed, from ``CompanyProviders.credentials``.
+    Unknown feed, missing key, or unparseable value → :data:`WHEELPROS_DEFAULT_DISCOUNT_PERCENT` (20%).
+    """
+    creds = credentials or {}
+    ft = (feed_type or "wheel").strip().lower() if feed_type else "wheel"
+    if ft not in _WHEELPROS_FEED_TO_MARKUP_KEY:
+        ft = "wheel"
+    key = _WHEELPROS_FEED_TO_MARKUP_KEY[ft]
+    pct = _parse_wp_discount_percent(creds.get(key))
+    if pct is None:
+        return WHEELPROS_DEFAULT_DISCOUNT_PERCENT
+    return pct
+
+
+def dealer_cost_from_msrp(
+    msrp: typing.Any,
+    feed_type: typing.Optional[str],
+    credentials: typing.Optional[typing.Dict],
+) -> typing.Optional[Decimal]:
+    """
+    ``cost = MSRP * (1 - discount_percent / 100)`` using the markup key for ``feed_type``.
+    Returns None if ``msrp`` is missing or invalid.
+    """
+    if msrp is None:
+        return None
+    try:
+        m = msrp if isinstance(msrp, Decimal) else Decimal(str(msrp).strip())
+    except Exception:
+        return None
+    if m < 0:
+        m = Decimal(0)
+    pct = discount_percent_for_feed(credentials, feed_type)
+    q = m * (Decimal(1) - pct / Decimal(100))
+    return q.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
 def sync_unmapped_wheelpros_brands_to_brands(dry_run: bool = False) -> typing.List[src_models.WheelProsBrand]:
@@ -435,6 +502,7 @@ def _row_to_wheelpros_part(
     row: typing.Dict,
     brand: src_models.WheelProsBrand,
     include_pricing: bool = True,
+    feed_type: typing.Optional[str] = None,
 ) -> src_models.WheelProsPart:
     part_number = _row_key(row, "PartNumber") or ""
     part_description = _safe_str(_row_get(row, "PartDescription"))
@@ -465,6 +533,7 @@ def _row_to_wheelpros_part(
 
     return src_models.WheelProsPart(
         brand=brand,
+        feed_type=feed_type,
         part_number=part_number,
         part_description=part_description,
         display_style_no=display_style_no,
@@ -661,7 +730,9 @@ def fetch_and_save_wheelpros(
         brand = brand_to_model.get(brand_name)
         if not brand:
             continue
-        seen_by_key[(brand.id, part_number)] = _row_to_wheelpros_part(row, brand, include_pricing=False)
+        seen_by_key[(brand.id, part_number)] = _row_to_wheelpros_part(
+            row, brand, include_pricing=False, feed_type=feed_type
+        )
 
     part_instances = _dedupe_wheelpros_part_instances(list(seen_by_key.values()))
     if not part_instances:
@@ -677,6 +748,7 @@ def fetch_and_save_wheelpros(
             part_instances,
             unique_fields=["brand", "part_number"],
             update_fields=[
+                "feed_type",
                 "part_description",
                 "display_style_no",
                 "finish",
@@ -760,12 +832,14 @@ def fetch_and_save_wheelpros(
                 if not part_id:
                     continue
                 pricing_by_part_id[int(part_id)] = pdata
+            creds_for_cost = dict(cp.credentials or {})
             pricing_to_upsert = [
                 src_models.WheelProsCompanyPricing(
                     part_id=pid,
                     company=cp.company,
                     msrp_usd=pdata.get("msrp_usd"),
                     map_usd=pdata.get("map_usd"),
+                    cost_usd=dealer_cost_from_msrp(pdata.get("msrp_usd"), feed_type, creds_for_cost),
                 )
                 for pid, pdata in pricing_by_part_id.items()
             ]
@@ -776,7 +850,7 @@ def fetch_and_save_wheelpros(
                     src_models.WheelProsCompanyPricing,
                     batch,
                     unique_fields=["part", "company"],
-                    update_fields=["msrp_usd", "map_usd", "updated_at"],
+                    update_fields=["msrp_usd", "map_usd", "cost_usd", "updated_at"],
                     returning=False,
                 )
                 batch_total += len(batch)
@@ -902,12 +976,14 @@ def sync_wheelpros_company_pricing_for_company_provider(
             if not part_id:
                 continue
             pricing_by_part_id[int(part_id)] = pdata
+        creds_for_cost = dict(cp.credentials or {})
         pricing_to_upsert = [
             src_models.WheelProsCompanyPricing(
                 part_id=pid,
                 company=cp.company,
                 msrp_usd=pdata.get("msrp_usd"),
                 map_usd=pdata.get("map_usd"),
+                cost_usd=dealer_cost_from_msrp(pdata.get("msrp_usd"), feed_type, creds_for_cost),
             )
             for pid, pdata in pricing_by_part_id.items()
         ]
@@ -918,7 +994,7 @@ def sync_wheelpros_company_pricing_for_company_provider(
                 src_models.WheelProsCompanyPricing,
                 batch,
                 unique_fields=["part", "company"],
-                update_fields=["msrp_usd", "map_usd", "updated_at"],
+                update_fields=["msrp_usd", "map_usd", "cost_usd", "updated_at"],
                 returning=False,
             )
             batch_total += len(batch)

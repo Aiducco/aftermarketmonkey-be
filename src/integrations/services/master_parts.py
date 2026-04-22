@@ -17,6 +17,7 @@ import pgbulk
 from src import constants as src_constants
 from src import enums as src_enums
 from src import models as src_models
+from src.integrations.services.wheelpros import dealer_cost_from_msrp
 
 logger = logging.getLogger(__name__)
 
@@ -3039,6 +3040,8 @@ def sync_provider_pricing_from_wheelpros() -> None:
     """
     Sync ProviderPartCompanyPricing from WheelProsCompanyPricing (per-company SFTP pricing).
     Resolves ProviderPart via (internal brand id, MasterPart.part_number) like sync_master_parts_from_wheelpros.
+    Sets ``cost`` from MSRP and company ``wheel_markup`` / ``tire_markup`` / ``accessories_markup`` (see
+    :func:`src.integrations.services.wheelpros.dealer_cost_from_msrp`) using ``WheelProsPart.feed_type``.
     """
     logger.info("{} Syncing provider pricing from WheelPros.".format(_LOG_PREFIX))
 
@@ -3079,6 +3082,7 @@ def sync_provider_pricing_from_wheelpros() -> None:
                     "map_usd",
                     "part__brand_id",
                     "part__part_number",
+                    "part__feed_type",
                 )[:BATCH_SIZE_PRICING]
             )
             if not batch:
@@ -3090,6 +3094,13 @@ def sync_provider_pricing_from_wheelpros() -> None:
                 c.id: c
                 for c in src_models.Company.objects.filter(id__in=batch_company_ids)
             }
+            creds_by_company: typing.Dict[int, typing.Dict] = {}
+            if batch_company_ids:
+                for cpr in src_models.CompanyProviders.objects.filter(
+                    company_id__in=batch_company_ids,
+                    provider_id=wp_provider.id,
+                ):
+                    creds_by_company[cpr.company_id] = cpr.credentials or {}
             master_keys = []
             for row in batch:
                 wb = wp_brand_to_brand.get(row.get("part__brand_id"))
@@ -3117,11 +3128,14 @@ def sync_provider_pricing_from_wheelpros() -> None:
                     continue
                 msrp = row.get("msrp_usd")
                 map_price = row.get("map_usd")
+                cid = row.get("company_id")
+                creds = creds_by_company.get(cid) if cid is not None else {}
+                cost = dealer_cost_from_msrp(msrp, row.get("part__feed_type"), creds)
                 to_upsert.append(
                     src_models.ProviderPartCompanyPricing(
                         provider_part=provider_part,
                         company=company,
-                        cost=None,
+                        cost=cost,
                         jobber_price=map_price,
                         map_price=map_price,
                         msrp=msrp,
@@ -3138,7 +3152,7 @@ def sync_provider_pricing_from_wheelpros() -> None:
                     src_models.ProviderPartCompanyPricing,
                     to_upsert,
                     unique_fields=["provider_part", "company"],
-                    update_fields=["jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
+                    update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
                 )
                 total_upserted += len(to_upsert)
 
@@ -3914,6 +3928,11 @@ def sync_provider_pricing_from_wheelpros_for_company(company_id: int) -> None:
         return
 
     now = timezone.now()
+    company_cp = src_models.CompanyProviders.objects.filter(
+        company_id=company_id,
+        provider_id=wp_provider.id,
+    ).first()
+    company_creds = (company_cp.credentials or {}) if company_cp else {}
 
     def _worker(catalog_ids: typing.Set[int]) -> int:
         if not catalog_ids:
@@ -3937,6 +3956,7 @@ def sync_provider_pricing_from_wheelpros_for_company(company_id: int) -> None:
                     "map_usd",
                     "part__brand_id",
                     "part__part_number",
+                    "part__feed_type",
                 )[:BATCH_SIZE_PRICING]
             )
             if not batch:
@@ -3975,11 +3995,12 @@ def sync_provider_pricing_from_wheelpros_for_company(company_id: int) -> None:
                     continue
                 msrp = row.get("msrp_usd")
                 map_price = row.get("map_usd")
+                cost = dealer_cost_from_msrp(msrp, row.get("part__feed_type"), company_creds)
                 to_upsert.append(
                     src_models.ProviderPartCompanyPricing(
                         provider_part=provider_part,
                         company=company,
-                        cost=None,
+                        cost=cost,
                         jobber_price=map_price,
                         map_price=map_price,
                         msrp=msrp,
@@ -3996,7 +4017,7 @@ def sync_provider_pricing_from_wheelpros_for_company(company_id: int) -> None:
                     src_models.ProviderPartCompanyPricing,
                     to_upsert,
                     unique_fields=["provider_part", "company"],
-                    update_fields=["jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
+                    update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
                 )
                 total_upserted += len(to_upsert)
 

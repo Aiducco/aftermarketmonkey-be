@@ -83,11 +83,14 @@ class DlgCredentialsSchema(Schema):
 
 
 class WheelProsCredentialsSchema(Schema):
-    """Wheel Pros SFTP: user/password only; host/port from Django settings."""
+    """Wheel Pros SFTP: user/password; optional path and per-feed % off MSRP for dealer cost."""
 
     sftp_user = fields.String(required=True)
     sftp_password = fields.String(required=True)
     sftp_path = fields.String(required=False, allow_none=True)
+    wheel_markup = fields.String(required=False, allow_none=True)
+    tire_markup = fields.String(required=False, allow_none=True)
+    accessories_markup = fields.String(required=False, allow_none=True)
 
 
 class PersonalizationSchema(Schema):

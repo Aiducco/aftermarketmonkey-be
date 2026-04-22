@@ -958,6 +958,12 @@ class WheelProsPart(django_db_models.Model):
         on_delete=django_db_models.CASCADE,
         related_name="parts",
     )
+    feed_type = django_db_models.CharField(
+        max_length=32,
+        null=True,
+        blank=True,
+        help_text="Which SFTP feed last wrote this row: wheel, tire, or accessories.",
+    )
     part_number = django_db_models.CharField(max_length=255)
     part_description = django_db_models.TextField(null=True, blank=True)
     display_style_no = django_db_models.CharField(max_length=255, null=True, blank=True)
@@ -989,7 +995,8 @@ class WheelProsPart(django_db_models.Model):
 class WheelProsCompanyPricing(django_db_models.Model):
     """
     Per-company Wheel Pros pricing for a catalog row (WheelProsPart).
-    Catalog/inventory fields live on WheelProsPart; msrp/map come from each company's SFTP feed.
+    MSRP/MAP come from each company's SFTP feed; ``cost_usd`` is derived from MSRP and optional
+    credential fields ``wheel_markup`` / ``tire_markup`` / ``accessories_markup`` (percent off list).
     """
     part = django_db_models.ForeignKey(
         WheelProsPart,
@@ -1003,6 +1010,13 @@ class WheelProsCompanyPricing(django_db_models.Model):
     )
     msrp_usd = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     map_usd = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    cost_usd = django_db_models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="Dealer cost derived from MSRP and company wheel/tire/accessories discount % in credentials.",
+    )
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
