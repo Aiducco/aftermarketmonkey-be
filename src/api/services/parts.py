@@ -6,6 +6,8 @@ import re
 import typing
 from urllib.parse import quote
 
+from django.db.models import Prefetch
+
 from src import constants as src_constants
 from src import enums as src_enums
 from src import models as src_models
@@ -78,6 +80,9 @@ def get_parts_search(sku: str, limit: int = 50) -> typing.Dict:
     parts = (
         src_models.MasterPart.objects.filter(part_number__icontains=q)
         .select_related("brand")
+        .prefetch_related(
+            Prefetch("provider_parts", queryset=src_models.ProviderPart.objects.order_by("id"))
+        )
         .order_by("brand__name", "part_number")[:limit]
     )
 
@@ -102,6 +107,34 @@ def get_master_part_brand_filter_options(
     if sq:
         brands = brands.filter(name__icontains=sq)
     return [{"id": row["id"], "name": row["name"]} for row in brands.values("id", "name")[:cap]]
+
+
+def get_master_part_category_filter_options(
+    q: str = "",
+    limit: int = 200,
+) -> typing.Dict[str, typing.List[str]]:
+    """
+    Distinct ``category`` and ``overview_category`` from ``ProviderPart`` (non-empty), for
+    search filter UIs. Values match :func:`src.search.meilisearch_client.master_part_to_index_shape`
+    when a row is the first provider part with a category for that master part.
+
+    Optional ``q`` applies case-insensitive substring match to each list separately.
+    """
+    cap = min(max(limit, 1), 2000)
+    sq = (q or "").strip()
+    base_cat = src_models.ProviderPart.objects.exclude(category__isnull=True).exclude(category="")
+    base_over = src_models.ProviderPart.objects.exclude(overview_category__isnull=True).exclude(
+        overview_category=""
+    )
+    if sq:
+        base_cat = base_cat.filter(category__icontains=sq)
+        base_over = base_over.filter(overview_category__icontains=sq)
+    categories = sorted(set(base_cat.values_list("category", flat=True)))[:cap]
+    overview_categories = sorted(set(base_over.values_list("overview_category", flat=True)))[:cap]
+    return {
+        "categories": categories,
+        "overview_categories": overview_categories,
+    }
 
 
 def _get_all_provider_image_urls() -> typing.Dict[str, typing.Optional[str]]:
@@ -342,7 +375,9 @@ def list_part_detail_audit_history(
     part_ids = list({r["master_part_id"] for r in rows if r.get("master_part_id")})
     parts_by_id: typing.Dict[int, src_models.MasterPart] = {}
     if part_ids:
-        for mp in src_models.MasterPart.objects.filter(id__in=part_ids).select_related("brand"):
+        for mp in src_models.MasterPart.objects.filter(id__in=part_ids).select_related("brand").prefetch_related(
+            Prefetch("provider_parts", queryset=src_models.ProviderPart.objects.order_by("id"))
+        ):
             parts_by_id[mp.id] = mp
 
     data: typing.List[typing.Dict] = []

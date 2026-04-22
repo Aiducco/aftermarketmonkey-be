@@ -24,6 +24,61 @@ _LOG_PREFIX = "[MASTER-PARTS]"
 
 # ProviderPart upsert from sync_master_parts_from_* (distributor_refreshed_at from source row updated_at)
 _PROVIDER_PART_SYNC_UPDATE_FIELDS = ["provider_external_id", "distributor_refreshed_at"]
+# Turn14 / Meyer / Rough Country: map ``CategoryMapping`` -> ``ProviderPart.category`` /
+# ``ProviderPart.overview_category`` (Meyer: use first ``category`` segment split on ``;``)
+TURN14_PROVIDER_PART_SYNC_UPDATE_FIELDS = [
+    "provider_external_id",
+    "distributor_refreshed_at",
+    "category",
+    "overview_category",
+]
+
+
+def _meyer_first_category_token(raw: typing.Any) -> typing.Optional[str]:
+    """
+    Meyer ``category`` can be multiple values separated by ';'. Use the first non-empty
+    segment (stripped) for CategoryMapping, same as Turn14 after that point.
+    """
+    if raw is None:
+        return None
+    s = raw.strip() if isinstance(raw, str) else str(raw).strip()
+    if not s:
+        return None
+    first = s.split(";", 1)[0].strip()
+    return first or None
+
+
+def _load_category_mapping_by_source() -> typing.Dict[str, typing.Tuple[typing.Optional[str], typing.Optional[str]]]:
+    """
+    source_category (stripped) -> (category, overview_category) from category_mappings.
+    Later rows with the same source_category win (order by id).
+    """
+    out: typing.Dict[str, typing.Tuple[typing.Optional[str], typing.Optional[str]]] = {}
+    for row in src_models.CategoryMapping.objects.order_by("id").values(
+        "source_category",
+        "category",
+        "overview_category",
+    ):
+        key = (row["source_category"] or "").strip()
+        if not key:
+            continue
+        out[key] = (row["category"], row["overview_category"])
+    return out
+
+
+def _lookup_categories_from_mapping(
+    source_value: typing.Any,
+    mapping_by_source: typing.Dict[str, typing.Tuple[typing.Optional[str], typing.Optional[str]]],
+) -> typing.Tuple[typing.Optional[str], typing.Optional[str]]:
+    if source_value is None:
+        return None, None
+    key = source_value.strip() if isinstance(source_value, str) else str(source_value).strip()
+    if not key:
+        return None, None
+    hit = mapping_by_source.get(key)
+    if not hit:
+        return None, None
+    return hit
 
 
 def _get_brand_for_turn14_brand(turn14_brand: src_models.Turn14Brand) -> typing.Optional[src_models.Brands]:
@@ -420,6 +475,7 @@ def _ingest_turn14_items_for_mapped_brands(
     turn14_provider: src_models.Providers,
     t14_brand_to_brand: typing.Dict[int, src_models.Brands],
     t14_brand_to_aaia: typing.Dict[int, typing.Optional[str]],
+    category_by_source: typing.Dict[str, typing.Tuple[typing.Optional[str], typing.Optional[str]]],
 ) -> typing.Tuple[int, int]:
     """Batch-ingest Turn14Items into MasterPart / ProviderPart for one disjoint set of Turn14 brand PKs."""
     if not mapped_catalog_brand_ids:
@@ -445,6 +501,7 @@ def _ingest_turn14_items_for_mapped_brands(
                 "thumbnail",
                 "brand_id",
                 "updated_at",
+                "category",
             )[:BATCH_SIZE_MASTER_PARTS]
         )
         if not batch:
@@ -546,11 +603,16 @@ def _ingest_turn14_items_for_mapped_brands(
             if not master_part:
                 continue
             pp_key = (master_part.id, turn14_provider.id)
+            cat_mapped, overview_mapped = _lookup_categories_from_mapping(
+                row.get("category"), category_by_source
+            )
             provider_parts_by_key[pp_key] = src_models.ProviderPart(
                 master_part=master_part,
                 provider=turn14_provider,
                 provider_external_id=row["external_id"],
                 distributor_refreshed_at=row.get("updated_at"),
+                category=cat_mapped,
+                overview_category=overview_mapped,
             )
 
         provider_parts = list(provider_parts_by_key.values())
@@ -559,7 +621,7 @@ def _ingest_turn14_items_for_mapped_brands(
                 src_models.ProviderPart,
                 provider_parts,
                 unique_fields=["master_part", "provider"],
-                update_fields=_PROVIDER_PART_SYNC_UPDATE_FIELDS,
+                update_fields=TURN14_PROVIDER_PART_SYNC_UPDATE_FIELDS,
             )
             total_provider += len(provider_parts)
 
@@ -605,13 +667,14 @@ def sync_master_parts_from_turn14() -> None:
         logger.info("{} No BrandTurn14BrandMapping found. Nothing to sync.".format(_LOG_PREFIX))
         return
 
+    category_by_source = _load_category_mapping_by_source()
     chunks = _partition_mapped_brands_for_parallel_ingest(mappings, MASTER_PARTS_SYNC_MAX_WORKERS)
     total_master, total_provider = _run_parallel_master_parts_ingest(
         chunks,
         mappings,
         "turn14_brand",
         lambda cids: _ingest_turn14_items_for_mapped_brands(
-            cids, turn14_provider, t14_brand_to_brand, t14_brand_to_aaia
+            cids, turn14_provider, t14_brand_to_brand, t14_brand_to_aaia, category_by_source
         ),
     )
     logger.info("{} Synced {} master parts and {} provider parts from Turn14 total.".format(
@@ -833,6 +896,7 @@ def _ingest_meyer_parts_for_mapped_brands(
     meyer_provider: src_models.Providers,
     my_brand_to_brand: typing.Dict[int, src_models.Brands],
     my_brand_to_aaia: typing.Dict[int, typing.Optional[str]],
+    category_by_source: typing.Dict[str, typing.Tuple[typing.Optional[str], typing.Optional[str]]],
 ) -> typing.Tuple[int, int]:
     """Batch-ingest MeyerParts for one disjoint set of Meyer catalog brand PKs."""
     if not mapped_catalog_brand_ids:
@@ -858,6 +922,7 @@ def _ingest_meyer_parts_for_mapped_brands(
                 "mfg_item_number",
                 "description",
                 "updated_at",
+                "category",
             )[:BATCH_SIZE_MASTER_PARTS]
         )
         if not batch:
@@ -1037,11 +1102,17 @@ def _ingest_meyer_parts_for_mapped_brands(
             if not master_part:
                 continue
             pp_key = (master_part.id, meyer_provider.id)
+            first_for_map = _meyer_first_category_token(row.get("category"))
+            cat_mapped, overview_mapped = _lookup_categories_from_mapping(
+                first_for_map, category_by_source
+            )
             provider_parts_by_key[pp_key] = src_models.ProviderPart(
                 master_part=master_part,
                 provider=meyer_provider,
                 provider_external_id=mp_ext,
                 distributor_refreshed_at=row.get("updated_at"),
+                category=cat_mapped,
+                overview_category=overview_mapped,
             )
 
         provider_parts = list(provider_parts_by_key.values())
@@ -1050,7 +1121,7 @@ def _ingest_meyer_parts_for_mapped_brands(
                 src_models.ProviderPart,
                 provider_parts,
                 unique_fields=["master_part", "provider"],
-                update_fields=_PROVIDER_PART_SYNC_UPDATE_FIELDS,
+                update_fields=TURN14_PROVIDER_PART_SYNC_UPDATE_FIELDS,
             )
             total_provider += len(provider_parts)
 
@@ -1094,6 +1165,7 @@ def sync_master_parts_from_meyer() -> None:
         logger.info("{} No BrandMeyerBrandMapping found. Nothing to sync.".format(_LOG_PREFIX))
         return
 
+    category_by_source = _load_category_mapping_by_source()
     chunks = _partition_mapped_brands_for_parallel_ingest(mappings, MASTER_PARTS_SYNC_MAX_WORKERS)
     total_master, total_provider = _run_parallel_master_parts_ingest(
         chunks,
@@ -1104,6 +1176,7 @@ def sync_master_parts_from_meyer() -> None:
             meyer_provider,
             my_brand_to_brand,
             my_brand_to_aaia,
+            category_by_source,
         ),
     )
     logger.info("{} Synced {} master parts and {} provider parts from Meyer total.".format(
@@ -1357,6 +1430,7 @@ def _ingest_rough_country_parts_for_mapped_brands(
     rc_provider: src_models.Providers,
     rc_brand_to_brand: typing.Dict[int, src_models.Brands],
     rc_brand_to_aaia: typing.Dict[int, typing.Optional[str]],
+    category_by_source: typing.Dict[str, typing.Tuple[typing.Optional[str], typing.Optional[str]]],
 ) -> typing.Tuple[int, int]:
     """Batch-ingest RoughCountryPart rows for one disjoint set of RC catalog brand PKs."""
     if not mapped_catalog_brand_ids:
@@ -1383,6 +1457,7 @@ def _ingest_rough_country_parts_for_mapped_brands(
                 "description",
                 "image_1",
                 "updated_at",
+                "category",
             )[:BATCH_SIZE_MASTER_PARTS]
         )
         if not batch:
@@ -1498,11 +1573,16 @@ def _ingest_rough_country_parts_for_mapped_brands(
             if not master_part:
                 continue
             pp_key = (master_part.id, rc_provider.id)
+            cat_mapped, overview_mapped = _lookup_categories_from_mapping(
+                row.get("category"), category_by_source
+            )
             provider_parts_by_key[pp_key] = src_models.ProviderPart(
                 master_part=master_part,
                 provider=rc_provider,
                 provider_external_id=ext_id,
                 distributor_refreshed_at=row.get("updated_at"),
+                category=cat_mapped,
+                overview_category=overview_mapped,
             )
 
         provider_parts = list(provider_parts_by_key.values())
@@ -1511,7 +1591,7 @@ def _ingest_rough_country_parts_for_mapped_brands(
                 src_models.ProviderPart,
                 provider_parts,
                 unique_fields=["master_part", "provider"],
-                update_fields=_PROVIDER_PART_SYNC_UPDATE_FIELDS,
+                update_fields=TURN14_PROVIDER_PART_SYNC_UPDATE_FIELDS,
             )
             total_provider += len(provider_parts)
 
@@ -1552,6 +1632,7 @@ def sync_master_parts_from_rough_country() -> None:
         logger.info("{} No BrandRoughCountryBrandMapping found. Nothing to sync.".format(_LOG_PREFIX))
         return
 
+    category_by_source = _load_category_mapping_by_source()
     chunks = _partition_mapped_brands_for_parallel_ingest(mappings, MASTER_PARTS_SYNC_MAX_WORKERS)
     total_master, total_provider = _run_parallel_master_parts_ingest(
         chunks,
@@ -1562,6 +1643,7 @@ def sync_master_parts_from_rough_country() -> None:
             rc_provider,
             rc_brand_to_brand,
             rc_brand_to_aaia,
+            category_by_source,
         ),
     )
     logger.info("{} Synced {} master parts and {} provider parts from Rough Country total.".format(
