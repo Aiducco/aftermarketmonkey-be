@@ -13,7 +13,7 @@ class Command(BaseCommand):
             self.stdout.write(
                 "Propagating Keystone catalog into master parts, provider parts, inventory, and pricing..."
             )
-            master_parts.sync_derived_from_keystone(reindex_meilisearch=True)
+            master_parts.sync_derived_from_keystone(reindex_meilisearch=False)
             self.stdout.write(self.style.SUCCESS("Successfully completed full Keystone sync and derived sync."))
         except Exception as e:
             self.stdout.write(self.style.ERROR("Error: {}".format(str(e))))

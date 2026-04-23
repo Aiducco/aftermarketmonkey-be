@@ -48,7 +48,7 @@ class Command(BaseCommand):
                 self.stdout.write(self.style.SUCCESS('  Brand inventory done.'))
 
                 self.stdout.write('Step 4: Propagating Turn14 catalog into master parts, provider parts, inventory, and pricing...')
-                master_parts.sync_derived_from_turn14(reindex_meilisearch=True)
+                master_parts.sync_derived_from_turn14(reindex_meilisearch=False)
                 self.stdout.write(self.style.SUCCESS('  Derived master layer sync done.'))
             else:
                 self.stdout.write('Step 3: No newly synced brands; skipping items, brand data, pricing, and inventory fetch.')

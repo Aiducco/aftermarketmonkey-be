@@ -14,6 +14,18 @@ class Command(BaseCommand):
             action="store_true",
             help="Reindex all parts into Meilisearch after sync completes",
         )
+        parser.add_argument(
+            "--reindex-batch-size",
+            type=int,
+            default=None,
+            help="Documents per batch for Meilisearch (default: MEILISEARCH_REINDEX_BATCH_SIZE).",
+        )
+        parser.add_argument(
+            "--reindex-upload-workers",
+            type=int,
+            default=None,
+            help="Parallel Meilisearch upload workers (default: MEILISEARCH_REINDEX_UPLOAD_WORKERS).",
+        )
 
     def handle(self, *args, **options):
         self.stdout.write("Starting full master parts sync...")
@@ -24,7 +36,12 @@ class Command(BaseCommand):
 
             if options.get("reindex_meilisearch") and is_configured():
                 self.stdout.write("Reindexing Meilisearch...")
-                ok, fail = reindex_all_master_parts()
+                kw = {}
+                if options.get("reindex_batch_size") is not None:
+                    kw["batch_size"] = options["reindex_batch_size"]
+                if options.get("reindex_upload_workers") is not None:
+                    kw["max_upload_workers"] = options["reindex_upload_workers"]
+                ok, fail = reindex_all_master_parts(**kw)
                 self.stdout.write(
                     self.style.SUCCESS("Meilisearch: indexed {} parts, failed {}.".format(ok, fail))
                 )

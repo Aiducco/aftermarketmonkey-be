@@ -13,10 +13,10 @@ logger = logging.getLogger(__name__)
 
 INDEX_NAME = getattr(settings, "MEILISEARCH_INDEX_PARTS", "parts")
 
-# Full reindex: large batches + many parallel POSTs often hit proxy/LB timeouts ("connection reset").
-# Smaller batches + sequential uploads are slower but far more reliable on long runs (~millions of docs).
-REINDEX_DEFAULT_BATCH_SIZE = getattr(settings, "MEILISEARCH_REINDEX_BATCH_SIZE", 2500)
-REINDEX_DEFAULT_UPLOAD_WORKERS = getattr(settings, "MEILISEARCH_REINDEX_UPLOAD_WORKERS", 1)
+# Full reindex: tune via MEILISEARCH_REINDEX_BATCH_SIZE and MEILISEARCH_REINDEX_UPLOAD_WORKERS.
+# Larger batches + multiple parallel upload threads are faster; retries still cover transient HTTP errors.
+REINDEX_DEFAULT_BATCH_SIZE = getattr(settings, "MEILISEARCH_REINDEX_BATCH_SIZE", 5000)
+REINDEX_DEFAULT_UPLOAD_WORKERS = getattr(settings, "MEILISEARCH_REINDEX_UPLOAD_WORKERS", 4)
 
 _REINDEX_ADD_RETRIES = 4
 _REINDEX_TRANSIENT_SUBSTRINGS = (

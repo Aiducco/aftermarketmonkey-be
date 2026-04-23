@@ -13,7 +13,7 @@ class Command(BaseCommand):
         try:
             turn_14.fetch_and_save_all_turn_14_brand_items()
             self.stdout.write('Propagating Turn14 catalog into master parts, provider parts, inventory, and pricing...')
-            master_parts.sync_derived_from_turn14(reindex_meilisearch=True)
+            master_parts.sync_derived_from_turn14(reindex_meilisearch=False)
             audit_scheduled_tasks.mark_scheduled_task_completed(
                 execution,
                 message='Successfully completed Turn 14 all brand items fetch and derived sync.',
