@@ -37,6 +37,17 @@ ATECH_DC_QTY_FIELD_TO_LOCATION_LABEL = {
 }
 ROUGH_COUNTRY_INVENTORY_SEARCH_URL_TEMPLATE = "https://www.roughcountry.com/search/{sku}"
 
+# DLG: AftermarketMonkey SFTP relay (single fixed endpoint; DlgSFTPClient always uses these).
+DLG_RELAY_SFTP_HOST = "54.145.82.238"
+DLG_RELAY_SFTP_PORT = 22
+DLG_RELAY_SFTP_DIRECTORY = "uploads"
+# Same as ``src.integrations.clients.dlg.feed_spec`` expected remote basename.
+DLG_INVENTORY_CSV_FILENAME = "dlg_inventory.csv"
+# Inbox for dealers to forward DLG’s inventory file; reading/parsing TBD. Used in provider catalog copy only.
+DLG_INVENTORY_FORWARD_TO_EMAIL = "support@aftermarketmonkey.com"
+# CompanyProviders.credentials key: the dealer’s email that receives mail from DLG (identifies the tenant in forwards).
+DLG_CREDENTIALS_EMAIL_FROM = "email_from"
+
 
 def dlg_b2b_search_keywords(dlg_brand_name: typing.Optional[str], part_number: str) -> str:
     """DLG B2B search: combine brand label and part number so queries are specific (not e.g. a short code alone)."""
@@ -216,23 +227,30 @@ PROVIDER_CATALOG = [
     {
         "kind": enums.BrandProviderKind.DLG,
         "name": "DLG",
-        "description": "Access DLG inventory and pricing from AftermarketMonkey's SFTP relay.",
+        "description": (
+            "DLG emails the inventory file to your business address. Forward that email to AftermarketMonkey support so we can process it."
+        ),
         "icon_url": "https://api.aftermarketmonkey.com/uploads/dlg_logo.png",
         "category": "Distributors",
-        "connection_required_fields": ["sftp_user", "sftp_password"],
+        "connection_required_fields": [DLG_CREDENTIALS_EMAIL_FROM],
         "connection_optional_fields": [],
         "installation_instructions_html": (
-            "<p>Email <a href=\"mailto:info@aftermarketmonkey.com\">info@aftermarketmonkey.com</a> for SFTP credentials. "
-            "DLG inventory is delivered to AftermarketMonkey&rsquo;s relay as <code>dlg_inventory.csv</code> "
-            "(Brand, Name, Display Name, Available On Hand, Units, Base Price).</p>"
-            "<p><strong>Endpoint</strong></p>"
+            "<p><strong>How the feed works</strong></p>"
+            "<p>DLG does not load inventory into AftermarketMonkey directly. They email the "
+            "inventory file (CSV) to <strong>your</strong> business address—the same one DLG has on file. "
+            "You (or your IT) must <strong>forward</strong> that message (or the attachment) to "
+            "<a href=\"mailto:{dlg_fwd}\">{dlg_fwd}</a>. Full automated email ingestion is coming later; for now, "
+            "this forward is how we match inventory updates to your account."
+            "</p>"
+            "<p><strong>What to enter here</strong></p>"
             "<ul>"
-            "<li><strong>SFTP:</strong> <code>54.145.82.238</code></li>"
-            "<li><strong>Port:</strong> <code>22</code></li>"
-            "<li><strong>Folder:</strong> <code>uploads</code></li>"
-            "<li><strong>File:</strong> <code>dlg_inventory.csv</code></li>"
+            "<li><strong>{email_from_key}:</strong> the exact address that <em>receives</em> DLG&rsquo;s inventory email, "
+            "so we can tell which company a message belongs to. Use the mailbox DLG actually uses, not a personal alias "
+            "unless that is the address DLG targets.</li>"
             "</ul>"
-            "<p>Enter <strong>sftp_user</strong> and <strong>sftp_password</strong> below and save.</p>"
+        ).format(
+            dlg_fwd=DLG_INVENTORY_FORWARD_TO_EMAIL,
+            email_from_key=DLG_CREDENTIALS_EMAIL_FROM,
         ),
     },
 ]

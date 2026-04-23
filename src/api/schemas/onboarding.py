@@ -76,10 +76,9 @@ class AtechCredentialsSchema(Schema):
 
 
 class DlgCredentialsSchema(Schema):
-    """DLG relay SFTP — inventory CSV dlg_inventory.csv from settings / relay."""
+    """DLG: dealer address that receives DLG’s inventory email (ingest from relay uses app settings, not this row)."""
 
-    sftp_user = fields.String(required=True)
-    sftp_password = fields.String(required=True)
+    email_from = fields.String(required=True)
 
 
 class WheelProsCredentialsSchema(Schema):
