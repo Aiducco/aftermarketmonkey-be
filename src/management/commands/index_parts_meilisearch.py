@@ -18,13 +18,13 @@ class Command(BaseCommand):
             "--batch-size",
             type=int,
             default=None,
-            help="Documents per batch (default: MEILISEARCH_REINDEX_BATCH_SIZE or 2500). Smaller batches reduce connection resets.",
+            help="Documents per batch (default: MEILISEARCH_REINDEX_BATCH_SIZE, typically 5000).",
         )
         parser.add_argument(
             "--upload-workers",
             type=int,
             default=None,
-            help="Parallel upload threads (default: MEILISEARCH_REINDEX_UPLOAD_WORKERS or 1). Use 1 for most stable long reindexes.",
+            help="Parallel upload threads (default: MEILISEARCH_REINDEX_UPLOAD_WORKERS, typically 4).",
         )
         parser.add_argument(
             "--setup",

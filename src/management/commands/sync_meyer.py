@@ -78,7 +78,7 @@ class Command(BaseCommand):
             self.stdout.write(
                 "Step 3: Propagating Meyer catalog into master parts, provider parts, inventory, and pricing..."
             )
-            master_parts.sync_derived_from_meyer(reindex_meilisearch=True)
+            master_parts.sync_derived_from_meyer(reindex_meilisearch=False)
             self.stdout.write(self.style.SUCCESS("Derived master layer sync done."))
 
             audit_scheduled_tasks.mark_scheduled_task_completed(

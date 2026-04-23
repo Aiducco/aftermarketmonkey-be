@@ -26,7 +26,7 @@ class Command(BaseCommand):
             self.stdout.write(
                 "Propagating A-Tech catalog into master parts, provider parts, inventory, and pricing..."
             )
-            master_parts.sync_derived_from_atech(reindex_meilisearch=True)
+            master_parts.sync_derived_from_atech(reindex_meilisearch=False)
             audit_scheduled_tasks.mark_scheduled_task_completed(
                 execution,
                 message="Successfully completed A-Tech ingest and derived master layer sync.",

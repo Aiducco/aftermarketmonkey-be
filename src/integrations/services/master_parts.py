@@ -5002,29 +5002,20 @@ def _maybe_reindex_meilisearch_after_master_parts(
     continuation: typing.Callable[[], None],
 ) -> None:
     """
-    After ``sync_master_parts_from_*``, optionally run a full Meilisearch reindex (delete + index)
-    overlapped with inventory/pricing DB work on this thread. No-op when Meilisearch is not configured.
+    After ``sync_master_parts_from_*``, run provider inventory + pricing, then optionally a full
+    Meilisearch reindex (used rarely; the scheduled job uses a single reindex at the end of
+    ``ingest_all_providers``). No-op reindex when Meilisearch is not configured.
     """
+    from src.search import meilisearch_client as meilisearch_client
+
     if not reindex_meilisearch:
         continuation()
         return
 
-    from src.search import meilisearch_client as meilisearch_client
-
+    continuation()
     if not meilisearch_client.is_configured():
-        continuation()
         return
-
-    def _reindex() -> typing.Tuple[int, int]:
-        return meilisearch_client.reindex_all_master_parts()
-
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        fut = pool.submit(_reindex)
-        try:
-            continuation()
-        finally:
-            ok, fail = fut.result()
-
+    ok, fail = meilisearch_client.reindex_all_master_parts()
     logger.info(
         "{} Meilisearch reindex after {} master parts: indexed={} failed={}".format(
             _LOG_PREFIX, provider_label, ok, fail
@@ -5061,8 +5052,9 @@ def sync_derived_from_keystone(*, reindex_meilisearch: bool = False) -> None:
     Propagate Keystone source data into MasterPart, ProviderPart, ProviderPartInventory,
     and ProviderPartCompanyPricing. Call after Keystone inventory/CSV fetches.
 
-    Set ``reindex_meilisearch=True`` from ingest commands to refresh the parts search index
-    after master parts sync (skipped when Meilisearch is not configured).
+    ``reindex_meilisearch`` is off in normal operation; the scheduled ``ingest_all_providers`` run
+    ends with a single full reindex. Pass True only for ad-hoc reindex with this call (skipped
+    when Meilisearch is not configured).
     """
     logger.info("{} Starting Keystone-only derived sync (parts, inventory, pricing).".format(_LOG_PREFIX))
     sync_master_parts_from_keystone()
@@ -5203,8 +5195,8 @@ def sync_all_master_parts() -> None:
     for that distributor before moving to the next). Order matches the previous implementation so
     dependencies (e.g. Meyer before A-Tech) are preserved.
 
-    Does not reindex Meilisearch per provider; use ``sync_master_parts --reindex-meilisearch`` or
-    individual ingest commands that pass ``reindex_meilisearch=True``.
+    Does not reindex Meilisearch. After scheduled ``ingest_all_providers`` or a manual run, use
+    ``index_parts_meilisearch`` or ``sync_master_parts --reindex-meilisearch`` to refresh search.
     """
     logger.info("{} Starting full master parts sync.".format(_LOG_PREFIX))
 

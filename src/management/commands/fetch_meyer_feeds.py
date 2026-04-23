@@ -26,7 +26,7 @@ class Command(BaseCommand):
             self.stdout.write(
                 "Propagating Meyer catalog into master parts, provider parts, inventory, and pricing..."
             )
-            master_parts.sync_derived_from_meyer(reindex_meilisearch=True)
+            master_parts.sync_derived_from_meyer(reindex_meilisearch=False)
             self.stdout.write(self.style.SUCCESS("Done."))
         except Exception as e:
             self.stdout.write(self.style.ERROR("Error: {}".format(str(e))))

@@ -284,3 +284,11 @@ DLG_INVENTORY_LOCAL_PATH = os.environ.get("DLG_INVENTORY_LOCAL_PATH", "/tmp/dlg_
 MEILISEARCH_HOST = "http://localhost:7700"
 MEILISEARCH_MASTER_KEY = ""  # Set via env; required for indexing. Create a separate search-only key for FE.
 MEILISEARCH_INDEX_PARTS = "parts"
+try:
+    MEILISEARCH_REINDEX_BATCH_SIZE = int(os.environ.get("MEILISEARCH_REINDEX_BATCH_SIZE", "5000"))
+except ValueError:
+    MEILISEARCH_REINDEX_BATCH_SIZE = 5000
+try:
+    MEILISEARCH_REINDEX_UPLOAD_WORKERS = int(os.environ.get("MEILISEARCH_REINDEX_UPLOAD_WORKERS", "4"))
+except ValueError:
+    MEILISEARCH_REINDEX_UPLOAD_WORKERS = 4

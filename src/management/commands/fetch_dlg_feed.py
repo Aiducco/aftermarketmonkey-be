@@ -25,7 +25,7 @@ class Command(BaseCommand):
             self.stdout.write(
                 "Propagating DLG catalog into master parts, provider parts, inventory, and pricing..."
             )
-            master_parts.sync_derived_from_dlg(reindex_meilisearch=True)
+            master_parts.sync_derived_from_dlg(reindex_meilisearch=False)
             audit_scheduled_tasks.mark_scheduled_task_completed(
                 execution,
                 message="Successfully completed DLG ingest and derived master layer sync.",
