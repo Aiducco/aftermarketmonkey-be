@@ -13,7 +13,7 @@ class Command(BaseCommand):
         try:
             turn_14.fetch_and_save_turn_14_inventory_updates()
             self.stdout.write('Propagating Turn14 inventory into ProviderPartInventory...')
-            master_parts.sync_provider_inventory_from_turn14()
+            # master_parts.sync_provider_inventory_from_turn14()
             audit_scheduled_tasks.mark_scheduled_task_completed(
                 execution,
                 message='Successfully completed Turn 14 inventory updates fetch and derived inventory sync.',
