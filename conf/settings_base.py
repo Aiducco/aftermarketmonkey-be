@@ -269,7 +269,10 @@ ATECH_SFTP_DIRECTORY = os.environ.get("ATECH_SFTP_DIRECTORY") or "uploads"
 ATECH_FEED_REMOTE_FILE = os.environ.get("ATECH_FEED_REMOTE_FILE") or "atechfile.txt"
 ATECH_FEED_LOCAL_PATH = os.environ.get("ATECH_FEED_LOCAL_PATH", "/tmp/atechfile.txt")
 
-# DLG relay SFTP — inventory CSV (Brand, Name, Display Name, Available On Hand, Units, Base Price).
+# DLG: relay host/path/file are in ``src.constants``; app-level SFTP login (not per CompanyProvider) — set in env.
+DLG_RELAY_SFTP_USER = os.environ.get("DLG_RELAY_SFTP_USER", "")
+DLG_RELAY_SFTP_PASSWORD = os.environ.get("DLG_RELAY_SFTP_PASSWORD", "")
+# Legacy / ops — not read by DlgSFTPClient (see src.constants for relay; credentials above for auth)
 try:
     _dlg_port = int(os.environ.get("DLG_SFTP_PORT") or "22")
 except ValueError:

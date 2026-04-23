@@ -7,8 +7,8 @@ from urllib.parse import urlparse
 import paramiko
 from django.conf import settings
 
+from src import constants as src_constants
 from src.integrations.clients.dlg import exceptions
-from src.integrations.clients.dlg.feed_spec import DEFAULT_REMOTE_INVENTORY_FILENAME
 
 logger = logging.getLogger(__name__)
 
@@ -17,28 +17,17 @@ _LOG_PREFIX = "[DLG-SFTP-CLIENT]"
 DEFAULT_LOCAL_INVENTORY = "/tmp/dlg_inventory.csv"
 DEFAULT_FILE_MAX_AGE_SECONDS = 6 * 60 * 60
 
-_DEFAULT_DLG_RELAY_HOST = "54.145.82.238"
-_DEFAULT_DLG_RELAY_PORT = 22
-_DEFAULT_DLG_RELAY_DIRECTORY = "uploads"
-
-
-def _setting_str(name: str, fallback: str) -> str:
-    raw = getattr(settings, name, None)
-    s = str(raw).strip() if raw is not None else ""
-    return s if s else fallback
-
-
-def _setting_int_port(name: str, fallback: int) -> int:
-    raw = getattr(settings, name, None)
-    if raw is None:
-        return fallback
-    try:
-        p = int(raw)
-    except (TypeError, ValueError):
-        return fallback
-    if 1 <= p <= 65535:
-        return p
-    return fallback
+_DLG_IGNORED_CREDENTIAL_KEYS = (
+    "sftp_user",
+    "sftp_password",
+    "sftp_server",
+    "sftp_host",
+    "server_url",
+    "sftp_port",
+    "sftp_directory",
+    "dlg_inventory_remote_file",
+    "feed_remote_file",
+)
 
 
 def _normalize_sftp_server(value: typing.Any) -> str:
@@ -58,36 +47,34 @@ def _remote_join(directory: str, filename: str) -> str:
     return path
 
 
-def _require_non_empty_str(creds: typing.Dict, *keys: str) -> typing.Tuple[typing.List[str], typing.Dict[str, str]]:
-    out: typing.Dict[str, str] = {}
-    missing: typing.List[str] = []
-    for k in keys:
+def _warn_ignored_dlg_overrides(creds: typing.Dict) -> None:
+    for k in _DLG_IGNORED_CREDENTIAL_KEYS:
         v = creds.get(k)
-        s = str(v).strip() if v is not None else ""
-        if not s:
-            missing.append(k)
-        else:
-            out[k] = s
-    return missing, out
-
-
-def _coalesce_nonempty_str(creds: typing.Dict, key: str, fallback: str) -> str:
-    v = creds.get(key)
-    if v is not None and str(v).strip():
-        return str(v).strip()
-    return str(fallback or "").strip()
+        if v is not None and str(v).strip():
+            logger.warning(
+                "{} Ignoring credentials {!r}={!r} — relay host, port, folder, and remote filename are fixed in code.".format(
+                    _LOG_PREFIX, k, v,
+                )
+            )
+    stray_inv = str(creds.get("inventory_remote_file") or "").strip()
+    if stray_inv:
+        logger.warning(
+            "{} Ignoring credentials inventory_remote_file={!r} for DLG (Meyer key collision); using {!r}.".format(
+                _LOG_PREFIX, stray_inv, src_constants.DLG_INVENTORY_CSV_FILENAME,
+            )
+        )
 
 
 class DlgSFTPClient:
     """
     SFTP client for DLG ``dlg_inventory.csv`` on the AftermarketMonkey relay.
 
-    Settings: ``DLG_SFTP_*``, ``DLG_INVENTORY_REMOTE_FILE``, ``DLG_INVENTORY_LOCAL_PATH``.
-    Credentials: ``sftp_user``, ``sftp_password``; optional ``dlg_inventory_remote_file`` or
-    ``feed_remote_file``, ``sftp_server`` / ``sftp_host``, ``local_feed_path``.
+    Host, path, and remote filename are in ``src.constants``. SFTP login is from
+    ``settings.DLG_RELAY_SFTP_USER`` and ``settings.DLG_RELAY_SFTP_PASSWORD`` (app-level, not per company).
+    Company ``credentials`` may only set ``local_feed_path``; ``email_from`` and legacy SFTP keys are ignored
+    (with a warning for SFTP keys).
 
-    We intentionally do **not** read ``inventory_remote_file`` here — that key is used by Meyer
-    for ``Meyer Inventory.csv``; copying Meyer credentials into DLG would otherwise download the wrong file.
+    Local path: ``DLG_INVENTORY_LOCAL_PATH`` setting, else ``/tmp/dlg_inventory.csv``.
     """
 
     def __init__(
@@ -98,69 +85,27 @@ class DlgSFTPClient:
         require_credentials: bool = True,
     ):
         creds = dict(credentials or {})
+        _warn_ignored_dlg_overrides(creds)
 
-        raw_server = (
-            creds.get("sftp_server")
-            or creds.get("sftp_host")
-            or creds.get("server_url")
-            or ""
-        )
-        if str(raw_server or "").strip():
-            self.sftp_server = _normalize_sftp_server(raw_server)
-        else:
-            self.sftp_server = _normalize_sftp_server(
-                _setting_str("DLG_SFTP_HOST", _DEFAULT_DLG_RELAY_HOST)
-            )
+        self.sftp_server = _normalize_sftp_server(src_constants.DLG_RELAY_SFTP_HOST)
+        self.sftp_port = int(src_constants.DLG_RELAY_SFTP_PORT)
+        self.sftp_directory = (src_constants.DLG_RELAY_SFTP_DIRECTORY or "").strip()
+        self.inventory_remote_file = (src_constants.DLG_INVENTORY_CSV_FILENAME or "").strip()
 
-        port_raw = creds.get("sftp_port")
-        self.sftp_port = 0
-        if port_raw is not None and str(port_raw).strip() != "":
-            try:
-                self.sftp_port = int(port_raw)
-            except (TypeError, ValueError):
-                self.sftp_port = 0
-        if not self.sftp_port or self.sftp_port < 1 or self.sftp_port > 65535:
-            self.sftp_port = _setting_int_port("DLG_SFTP_PORT", _DEFAULT_DLG_RELAY_PORT)
+        self.sftp_user = str(getattr(settings, "DLG_RELAY_SFTP_USER", None) or "").strip()
+        self.sftp_password = str(getattr(settings, "DLG_RELAY_SFTP_PASSWORD", None) or "").strip()
 
-        m_auth, str_fields = _require_non_empty_str(creds, "sftp_user", "sftp_password")
-        missing: typing.List[str] = list(m_auth)
-
-        self.sftp_user = str_fields.get("sftp_user", "")
-        self.sftp_password = str_fields.get("sftp_password", "")
-        self.sftp_directory = _coalesce_nonempty_str(
-            creds,
-            "sftp_directory",
-            _setting_str("DLG_SFTP_DIRECTORY", _DEFAULT_DLG_RELAY_DIRECTORY),
-        )
-        # Order: DLG-specific name, then generic feed_remote_file (not inventory_remote_file — Meyer collision).
-        self.inventory_remote_file = _coalesce_nonempty_str(
-            creds,
-            "dlg_inventory_remote_file",
-            _coalesce_nonempty_str(
-                creds,
-                "feed_remote_file",
-                _setting_str("DLG_INVENTORY_REMOTE_FILE", DEFAULT_REMOTE_INVENTORY_FILENAME),
-            ),
-        )
-        stray_inv = str(creds.get("inventory_remote_file") or "").strip()
-        if stray_inv and stray_inv != self.inventory_remote_file:
-            logger.warning(
-                "{} Ignoring credentials inventory_remote_file={!r} for DLG (use dlg_inventory_remote_file "
-                "or feed_remote_file, or DLG_INVENTORY_REMOTE_FILE); using {!r}.".format(
-                    _LOG_PREFIX, stray_inv, self.inventory_remote_file
-                )
-            )
-
+        missing: typing.List[str] = []
         if not self.sftp_server:
-            missing.append(
-                "DLG_SFTP_HOST (env) or sftp_server in credentials — relay host is not configured"
-            )
+            missing.append("DLG_RELAY_SFTP_HOST in src.constants — relay host is not configured")
         if not self.sftp_directory:
-            missing.append("DLG_SFTP_DIRECTORY (env) or sftp_directory in credentials")
+            missing.append("DLG_RELAY_SFTP_DIRECTORY in src.constants")
         if not self.inventory_remote_file:
-            missing.append(
-                "DLG_INVENTORY_REMOTE_FILE (env) or dlg_inventory_remote_file / feed_remote_file in credentials"
-            )
+            missing.append("DLG_INVENTORY_CSV_FILENAME in src.constants")
+        if not self.sftp_user:
+            missing.append("DLG_RELAY_SFTP_USER in Django settings (set via environment)")
+        if not self.sftp_password:
+            missing.append("DLG_RELAY_SFTP_PASSWORD in Django settings (set via environment)")
 
         self.local_inventory_path = (
             str(creds.get("local_feed_path") or "").strip()
@@ -171,8 +116,7 @@ class DlgSFTPClient:
 
         if require_credentials and missing:
             raise ValueError(
-                "Invalid DLG SFTP configuration — missing: {}. "
-                "Company credentials must include sftp_user and sftp_password.".format(", ".join(missing))
+                "Invalid DLG SFTP configuration — missing: {}.".format(", ".join(missing))
             )
 
         self._transport = None

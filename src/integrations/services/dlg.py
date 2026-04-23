@@ -645,8 +645,8 @@ def sync_dlg_company_pricing_for_company_provider(
     force_download: bool = True,
 ) -> None:
     """
-    Download this company’s DLG inventory CSV from SFTP and upsert ``DlgCompanyPricing``.
-    Requires matching ``DlgParts`` rows (run global catalog ingest first).
+    Download this company’s copy of the DLG inventory CSV from the relay and upsert ``DlgCompanyPricing``.
+    SFTP user/password are from Django settings, not company credentials. Requires matching ``DlgParts`` (run global catalog first).
     """
     cp = (
         src_models.CompanyProviders.objects.filter(
@@ -673,7 +673,11 @@ def sync_dlg_company_pricing_for_company_provider(
     try:
         sftp = dlg_client.DlgSFTPClient(credentials=creds)
     except ValueError as e:
-        logger.error("{} company_id={}: {}".format(_LOG_PREFIX, cp.company_id, str(e)))
+        logger.error(
+            "{} company_id={}: {} (SFTP user/password are from settings, not this connection).".format(
+                _LOG_PREFIX, cp.company_id, str(e),
+            )
+        )
         raise
 
     try:
@@ -699,7 +703,11 @@ def sync_dlg_company_pricing_for_company_provider(
 
 
 def fetch_and_save_dlg_catalog(force_download: bool = False) -> None:
-    """Download ``dlg_inventory.csv`` from the primary DLG CompanyProvider and upsert DlgBrand / DlgParts."""
+    """
+    Download the DLG inventory CSV from the relay (host/path/filename: ``src.constants``; SFTP user/password:
+    ``DLG_RELAY_SFTP_USER`` / ``DLG_RELAY_SFTP_PASSWORD`` in settings). ``email_from`` on the primary
+    CompanyProvider is metadata (which mailbox DLG uses). Upserts DlgBrand / DlgParts.
+    """
     logger.info("{} Starting DLG inventory ingest.".format(_LOG_PREFIX))
 
     catalog_cp = _primary_dlg_company_provider()
@@ -707,9 +715,9 @@ def fetch_and_save_dlg_catalog(force_download: bool = False) -> None:
         logger.info("{} No active DLG CompanyProviders. Skipping.".format(_LOG_PREFIX))
         return
 
-    credentials = catalog_cp.credentials
+    # Optional per-flow local path only; never SFTP user/password.
     try:
-        sftp = dlg_client.DlgSFTPClient(credentials=credentials)
+        sftp = dlg_client.DlgSFTPClient(credentials=catalog_cp.credentials)
     except ValueError as e:
         logger.error("{} {}".format(_LOG_PREFIX, str(e)))
         raise
