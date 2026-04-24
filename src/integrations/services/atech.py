@@ -1,12 +1,15 @@
+import csv
 import logging
+import os
 import re
 import time
 import typing
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal
 
 import pandas as pd
 import pgbulk
-from django.db import connection
+from django.db import close_old_connections, connection
 from django.db.models.functions import Upper
 from django.utils import timezone
 
@@ -35,6 +38,22 @@ ATECH_PRICING_UPSERT_BATCH = 15000
 
 # ``feed_part_number__in`` lookups when building AtechCompanyPricing (max params per query).
 ATECH_FEED_KEY_LOOKUP_CHUNK = 15000
+
+# Parallel ORM chunk lookups (``ATECH_PRICING_LOOKUP_MAX_WORKERS``) and parallel per-company
+# pricing pull+ingest in ``fetch_and_save_atech_catalog`` (``ATECH_COMPANY_PRICING_SYNC_MAX_WORKERS``).
+def _atechy_env_int(name: str, default: int) -> int:
+    try:
+        v = int(str(os.environ.get(name, str(default))).strip())
+        return v if v >= 1 else default
+    except (TypeError, ValueError):
+        return default
+
+
+ATECH_PRICING_LOOKUP_MAX_WORKERS = _atechy_env_int("ATECH_PRICING_LOOKUP_MAX_WORKERS", 4)
+ATECH_COMPANY_PRICING_SYNC_MAX_WORKERS = _atechy_env_int("ATECH_COMPANY_PRICING_SYNC_MAX_WORKERS", 2)
+
+# Up to 8MB used only to pick an encoding; streaming uses one pass over the file.
+_ATECH_ENCODING_SNIFF_BYTES = 8 * 1024 * 1024
 
 ATECH_COMPANY_PRICING_UPDATE_FIELDS = [
     "cost",
@@ -119,37 +138,74 @@ def _normalize_row_keys(row: typing.Dict) -> typing.Dict:
 _ATECH_FEED_CSV_ENCODINGS = ("utf-8-sig", "utf-8", "cp1252", "latin-1")
 
 
-def _read_atech_feed_dataframe(path: str) -> pd.DataFrame:
+def _normalize_atech_row_cell(v: typing.Any) -> typing.Any:
+    if v is None or v == "" or (isinstance(v, float) and pd.isna(v)):
+        return None
+    return v
+
+
+def _normalize_atech_row_dict(row: typing.Dict) -> typing.Dict:
+    norm = _normalize_row_keys(row)
+    return {k: _normalize_atech_row_cell(v) for k, v in norm.items()}
+
+
+def _sniff_atech_csv_encoding(path: str) -> str:
+    """
+    Match legacy :func:`pandas.read_csv` behavior: first encoding in
+    :data:`_ATECH_FEED_CSV_ENCODINGS` that decodes a leading file slice. Avoids
+    materializing the whole feed; rare mis-detects are unchanged from previous risk profile.
+    """
+    try:
+        with open(path, "rb") as bf:
+            sample = bf.read(_ATECH_ENCODING_SNIFF_BYTES)
+    except OSError as e:
+        raise ValueError("Could not read A-Tech feed at {!r}: {}".format(path, e)) from e
     last_error: typing.Optional[Exception] = None
-    for encoding in _ATECH_FEED_CSV_ENCODINGS:
+    for enc in _ATECH_FEED_CSV_ENCODINGS:
         try:
-            df = pd.read_csv(path, dtype=object, encoding=encoding, keep_default_na=False)
-            if encoding != "utf-8-sig":
-                logger.info(
-                    "{} Read feed {} with encoding {!r} (utf-8 failed or not used).".format(
-                        _LOG_PREFIX, path, encoding
-                    )
-                )
-            return df
+            sample.decode(enc)
         except UnicodeDecodeError as e:
             last_error = e
             continue
+        return enc
     if last_error:
         raise last_error
-    raise ValueError("Could not read A-Tech feed at {!r}".format(path))
+    return "utf-8"
 
 
-def _records_from_csv(path: str) -> typing.List[typing.Dict]:
-    df = _read_atech_feed_dataframe(path)
-    records = df.to_dict(orient="records")
-    out: typing.List[typing.Dict] = []
-    for row in records:
-        norm = _normalize_row_keys(row)
-        out.append({
-            k: (None if v is None or v == "" or (isinstance(v, float) and pd.isna(v)) else v)
-            for k, v in norm.items()
-        })
-    return out
+def _iter_atech_csv_rows(path: str) -> typing.Iterator[typing.Dict]:
+    """
+    Stream A-Tech feed rows with the same per-cell semantics as the legacy pandas path.
+    """
+    enc = _sniff_atech_csv_encoding(path)
+    if enc != "utf-8-sig":
+        logger.info(
+            "{} Streaming feed {} with encoding {!r}.".format(_LOG_PREFIX, path, enc)
+        )
+    with open(path, "r", newline="", encoding=enc) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            yield _normalize_atech_row_dict(row)
+
+
+def _merge_atech_pricing_row_into_map(
+    row: typing.Dict, pmap: typing.Dict[str, typing.Dict[str, typing.Any]]
+) -> None:
+    """In-place: feed ``part_number`` (full line) -> price payload; last row per key wins."""
+    fn = _clean_csv_value(row.get("part_number"))
+    if not fn:
+        return
+    key = fn.strip()
+    pmap[key] = {
+        "cost": _safe_decimal(row.get("price_atech_current")),
+        "retail_price": _safe_decimal(row.get("price_current_month")),
+        "jobber_price": _safe_decimal(row.get("cost_current_sheet")),
+        "core_charge": _safe_decimal(row.get("cost_core")),
+        "fee_hazmat": _safe_decimal(row.get("fee_hazmat")),
+        "fee_truck_us": _safe_decimal(row.get("fee_truck_us")),
+        "fee_handling_ground": _safe_decimal(row.get("fee_handling_ground")),
+        "fee_handling_air": _safe_decimal(row.get("fee_handling_air")),
+    }
 
 
 def _atech_prefix_from_part_number(part_number: typing.Any) -> str:
@@ -163,27 +219,73 @@ def _atech_prefix_from_part_number(part_number: typing.Any) -> str:
     return s
 
 
-def _atech_pricing_map_from_records(
-    records: typing.List[typing.Dict],
+def _atech_pricing_map_from_iterable(
+    records: typing.Iterable[typing.Dict],
 ) -> typing.Dict[str, typing.Dict[str, typing.Any]]:
     """Map feed ``part_number`` (full line) -> price payload; last row per key wins."""
     out: typing.Dict[str, typing.Dict[str, typing.Any]] = {}
     for row in records:
-        fn = _clean_csv_value(row.get("part_number"))
-        if not fn:
-            continue
-        key = fn.strip()
-        out[key] = {
-            "cost": _safe_decimal(row.get("price_atech_current")),
-            "retail_price": _safe_decimal(row.get("price_current_month")),
-            "jobber_price": _safe_decimal(row.get("cost_current_sheet")),
-            "core_charge": _safe_decimal(row.get("cost_core")),
-            "fee_hazmat": _safe_decimal(row.get("fee_hazmat")),
-            "fee_truck_us": _safe_decimal(row.get("fee_truck_us")),
-            "fee_handling_ground": _safe_decimal(row.get("fee_handling_ground")),
-            "fee_handling_air": _safe_decimal(row.get("fee_handling_air")),
-        }
+        _merge_atech_pricing_row_into_map(row, out)
     return out
+
+
+def _id_by_feed_keys_parallel(
+    feed_keys: typing.List[str],
+    log_prefix: str,
+    company_provider_id: int,
+) -> typing.Dict[str, int]:
+    """
+    Resolve ``feed_part_number`` -> ``AtechParts.id`` in chunks; optional thread parallelism.
+    """
+    if not feed_keys:
+        return {}
+    chunk = ATECH_FEED_KEY_LOOKUP_CHUNK
+    chunks: typing.List[typing.List[str]] = [
+        feed_keys[i : i + chunk] for i in range(0, len(feed_keys), chunk)
+    ]
+    n_chunks = len(chunks)
+    id_by_feed: typing.Dict[str, int] = {}
+    max_w = ATECH_PRICING_LOOKUP_MAX_WORKERS
+    use_parallel = n_chunks > 1 and max_w > 1
+    workers = min(max_w, n_chunks, 32) if use_parallel else 1
+
+    def _load_one(ck: typing.List[str]) -> typing.Dict[str, int]:
+        close_old_connections()
+        try:
+            out: typing.Dict[str, int] = {}
+            for row in src_models.AtechParts.objects.filter(feed_part_number__in=ck).values_list(
+                "feed_part_number", "id"
+            ):
+                fn = (row[0] or "").strip()
+                if fn:
+                    out[fn] = int(row[1])
+            return out
+        finally:
+            close_old_connections()
+
+    if workers == 1:
+        chunk_idx = 0
+        for ck in chunks:
+            chunk_idx += 1
+            id_by_feed.update(_load_one(ck))
+            if n_chunks and (chunk_idx % 25 == 0 or chunk_idx == n_chunks):
+                logger.info(
+                    "{} AtechCompanyPricing part lookup: chunk {}/{} (company_provider id={}).".format(
+                        log_prefix, chunk_idx, n_chunks, company_provider_id
+                    )
+                )
+        return id_by_feed
+
+    logger.info(
+        "{} AtechCompanyPricing part lookup: {} chunk(s), {} worker(s) (company_provider id={}).".format(
+            log_prefix, n_chunks, workers, company_provider_id
+        )
+    )
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = [ex.submit(_load_one, ck) for ck in chunks]
+        for fut in as_completed(futs):
+            id_by_feed.update(fut.result())
+    return id_by_feed
 
 
 def _strip_known_prefix_suffix(full_part: str, prefix_upper: str) -> str:
@@ -234,19 +336,6 @@ def _load_prefix_to_brand_id() -> typing.Dict[str, int]:
         if prefix and bid:
             out[prefix] = int(bid)
     return out
-
-
-def _dedupe_atech_parts_for_upsert(
-    parts: typing.List[src_models.AtechParts],
-) -> typing.List[src_models.AtechParts]:
-    """One row per ``feed_part_number``; later CSV rows win."""
-    by_key: typing.Dict[str, src_models.AtechParts] = {}
-    for p in parts:
-        sku = (p.feed_part_number or "").strip()
-        if not sku:
-            continue
-        by_key[sku] = p
-    return list(by_key.values())
 
 
 def _json_safe_row(row: typing.Dict) -> typing.Dict:
@@ -755,14 +844,12 @@ def fetch_and_save_atech_catalog(force_download: bool = False) -> None:
         logger.error("{} {}".format(_LOG_PREFIX, str(e)))
         raise
 
-    records = _records_from_csv(local_path)
-    if not records:
-        logger.warning("{} Feed file empty or unreadable: {}.".format(_LOG_PREFIX, local_path))
-        return
-
-    parts_raw: typing.List[src_models.AtechParts] = []
+    parts_by_feed_pn: typing.Dict[str, src_models.AtechParts] = {}
     unmapped_prefix_rows = 0
-    for row in records:
+    feed_row_count = 0
+    parts_with_model = 0
+    for row in _iter_atech_csv_rows(local_path):
+        feed_row_count += 1
         # Same prefix rule as ``brand_prefix`` on ``AtechParts`` (see ``_atech_prefix_from_part_number``).
         prefix = _atech_prefix_from_part_number(row.get("part_number"))
         brand_id = prefix_to_brand.get(prefix) if prefix else None
@@ -770,7 +857,14 @@ def fetch_and_save_atech_catalog(force_download: bool = False) -> None:
             unmapped_prefix_rows += 1
         p = _part_from_feed_row(row, brand_id, prefix)
         if p:
-            parts_raw.append(p)
+            parts_with_model += 1
+            sku = (p.feed_part_number or "").strip()
+            if sku:
+                parts_by_feed_pn[sku] = p
+
+    if feed_row_count == 0:
+        logger.warning("{} Feed file empty or unreadable: {}.".format(_LOG_PREFIX, local_path))
+        return
 
     if unmapped_prefix_rows:
         logger.info(
@@ -780,15 +874,16 @@ def fetch_and_save_atech_catalog(force_download: bool = False) -> None:
             )
         )
 
-    parts = _dedupe_atech_parts_for_upsert(parts_raw)
-    if len(parts) < len(parts_raw):
+    if parts_with_model > len(parts_by_feed_pn):
         logger.info(
             "{} Deduped {} -> {} rows on feed_part_number.".format(
                 _LOG_PREFIX,
-                len(parts_raw),
-                len(parts),
+                parts_with_model,
+                len(parts_by_feed_pn),
             )
         )
+
+    parts = list(parts_by_feed_pn.values())
 
     if not parts:
         logger.warning("{} No AtechParts to upsert from primary feed.".format(_LOG_PREFIX))
@@ -837,23 +932,51 @@ def fetch_and_save_atech_catalog(force_download: bool = False) -> None:
         pricing_cps = list(
             _active_atech_company_providers_queryset().filter(provider=atech_provider_row)
         )
-    total_company_pricing = 0
-    for cp in pricing_cps:
-        logger.info(
-            "{} A-Tech company pricing SFTP pull: company_id={} company_provider_id={} primary={}.".format(
-                _LOG_PREFIX,
-                cp.company_id,
-                cp.id,
-                cp.primary,
-            )
-        )
-        sync_atech_company_pricing_for_company_provider(cp.id, force_download=force_download)
-        total_company_pricing += 1
     if pricing_cps:
+        n_cp = len(pricing_cps)
+        max_cw = ATECH_COMPANY_PRICING_SYNC_MAX_WORKERS
+        workers = max(1, min(max_cw, n_cp))
+        if workers == 1:
+            for cp in pricing_cps:
+                logger.info(
+                    "{} A-Tech company pricing SFTP pull: company_id={} company_provider_id={} primary={}.".format(
+                        _LOG_PREFIX,
+                        cp.company_id,
+                        cp.id,
+                        cp.primary,
+                    )
+                )
+                sync_atech_company_pricing_for_company_provider(cp.id, force_download=force_download)
+        else:
+            logger.info(
+                "{} A-Tech company pricing: {} company provider(s), {} parallel worker(s) (per-company files differ).".format(
+                    _LOG_PREFIX,
+                    n_cp,
+                    workers,
+                )
+            )
+
+            def _run_company_pricing_sync(cp: src_models.CompanyProviders) -> None:
+                close_old_connections()
+                try:
+                    logger.info(
+                        "{} A-Tech company pricing SFTP pull: company_id={} company_provider_id={} primary={}.".format(
+                            _LOG_PREFIX,
+                            cp.company_id,
+                            cp.id,
+                            cp.primary,
+                        )
+                    )
+                    sync_atech_company_pricing_for_company_provider(cp.id, force_download=force_download)
+                finally:
+                    close_old_connections()
+
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                list(ex.map(_run_company_pricing_sync, pricing_cps))
         logger.info(
             "{} A-Tech per-company pricing pulls completed for {} company provider(s).".format(
                 _LOG_PREFIX,
-                total_company_pricing,
+                n_cp,
             )
         )
 
@@ -899,8 +1022,7 @@ def sync_atech_company_pricing_for_company_provider(
         )
         raise
 
-    company_records = _records_from_csv(company_feed_path)
-    pmap = _atech_pricing_map_from_records(company_records)
+    pmap = _atech_pricing_map_from_iterable(_iter_atech_csv_rows(company_feed_path))
     if not pmap:
         logger.warning(
             "{} No pricing rows parsed for A-Tech company_provider id={}.".format(_LOG_PREFIX, company_provider_id)
@@ -908,31 +1030,7 @@ def sync_atech_company_pricing_for_company_provider(
         return
 
     feed_keys = list(pmap.keys())
-    id_by_feed: typing.Dict[str, int] = {}
-    n_key_chunks = (
-        (len(feed_keys) + ATECH_FEED_KEY_LOOKUP_CHUNK - 1) // ATECH_FEED_KEY_LOOKUP_CHUNK
-        if feed_keys
-        else 0
-    )
-    chunk_idx = 0
-    for i in range(0, len(feed_keys), ATECH_FEED_KEY_LOOKUP_CHUNK):
-        chunk_idx += 1
-        chunk = feed_keys[i : i + ATECH_FEED_KEY_LOOKUP_CHUNK]
-        if not chunk:
-            continue
-        for row in (
-            src_models.AtechParts.objects.filter(feed_part_number__in=chunk)
-            .values_list("feed_part_number", "id")
-        ):
-            fn = (row[0] or "").strip()
-            if fn:
-                id_by_feed[fn] = int(row[1])
-        if n_key_chunks and (chunk_idx % 25 == 0 or chunk_idx == n_key_chunks):
-            logger.info(
-                "{} AtechCompanyPricing part lookup: chunk {}/{} (company_provider id={}).".format(
-                    _LOG_PREFIX, chunk_idx, n_key_chunks, company_provider_id
-                )
-            )
+    id_by_feed = _id_by_feed_keys_parallel(feed_keys, _LOG_PREFIX, company_provider_id)
 
     pricing_to_upsert: typing.List[src_models.AtechCompanyPricing] = []
     for feed_fn, pdata in pmap.items():
