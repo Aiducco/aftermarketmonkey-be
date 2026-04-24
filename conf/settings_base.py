@@ -268,6 +268,39 @@ ATECH_SFTP_DIRECTORY = os.environ.get("ATECH_SFTP_DIRECTORY") or "uploads"
 # Single combined feed: pricing, per-warehouse qty, fees, GTIN (see clients/atech/feed_spec.py).
 ATECH_FEED_REMOTE_FILE = os.environ.get("ATECH_FEED_REMOTE_FILE") or "atechfile.txt"
 ATECH_FEED_LOCAL_PATH = os.environ.get("ATECH_FEED_LOCAL_PATH", "/tmp/atechfile.txt")
+try:
+    ATECH_PRICING_LOOKUP_MAX_WORKERS = int(os.environ.get("ATECH_PRICING_LOOKUP_MAX_WORKERS", "4"))
+except ValueError:
+    ATECH_PRICING_LOOKUP_MAX_WORKERS = 4
+try:
+    ATECH_COMPANY_PRICING_SYNC_MAX_WORKERS = int(os.environ.get("ATECH_COMPANY_PRICING_SYNC_MAX_WORKERS", "1"))
+except ValueError:
+    ATECH_COMPANY_PRICING_SYNC_MAX_WORKERS = 1
+try:
+    ATECH_PARTS_UPSERT_MAX_WORKERS = int(os.environ.get("ATECH_PARTS_UPSERT_MAX_WORKERS", "1"))
+except ValueError:
+    ATECH_PARTS_UPSERT_MAX_WORKERS = 4
+try:
+    ATECH_COMPANY_PRICING_UPSERT_MAX_WORKERS = int(os.environ.get("ATECH_COMPANY_PRICING_UPSERT_MAX_WORKERS", "1"))
+except ValueError:
+    ATECH_COMPANY_PRICING_UPSERT_MAX_WORKERS = 4
+try:
+    ATECH_PARSE_PROGRESS_EVERY = int(os.environ.get("ATECH_PARSE_PROGRESS_EVERY", "250000"))
+except ValueError:
+    ATECH_PARSE_PROGRESS_EVERY = 250000
+
+try:
+    MEYER_COMPANY_PRICING_SYNC_MAX_WORKERS = int(os.environ.get("MEYER_COMPANY_PRICING_SYNC_MAX_WORKERS", "2"))
+except ValueError:
+    MEYER_COMPANY_PRICING_SYNC_MAX_WORKERS = 2
+try:
+    MEYER_PART_LOOKUP_MAX_WORKERS = int(os.environ.get("MEYER_PART_LOOKUP_MAX_WORKERS", "4"))
+except ValueError:
+    MEYER_PART_LOOKUP_MAX_WORKERS = 4
+try:
+    MEYER_PARSE_PROGRESS_EVERY = int(os.environ.get("MEYER_PARSE_PROGRESS_EVERY", "250000"))
+except ValueError:
+    MEYER_PARSE_PROGRESS_EVERY = 250000
 
 # DLG: relay host/path/file are in ``src.constants``; app-level SFTP login (not per CompanyProvider) — set in env.
 DLG_RELAY_SFTP_USER = os.environ.get("DLG_RELAY_SFTP_USER", "")
