@@ -1,7 +1,5 @@
 import csv
-import codecs
 import logging
-import os
 import re
 import time
 import typing
@@ -10,6 +8,7 @@ from decimal import Decimal
 
 import pandas as pd
 import pgbulk
+from django.conf import settings
 from django.db import close_old_connections, connection
 from django.db.models.functions import Upper
 from django.utils import timezone
@@ -42,21 +41,23 @@ ATECH_FEED_KEY_LOOKUP_CHUNK = 15000
 
 # Parallel ORM chunk lookups (``ATECH_PRICING_LOOKUP_MAX_WORKERS``) and parallel per-company
 # pricing pull+ingest in ``fetch_and_save_atech_catalog`` (``ATECH_COMPANY_PRICING_SYNC_MAX_WORKERS``).
-def _atechy_env_int(name: str, default: int) -> int:
+def _atech_setting_int(name: str, default: int) -> int:
     try:
-        v = int(str(os.environ.get(name, str(default))).strip())
+        raw = getattr(settings, name, default)
+        v = int(str(raw).strip())
         return v if v >= 1 else default
     except (TypeError, ValueError):
         return default
 
 
-ATECH_PRICING_LOOKUP_MAX_WORKERS = _atechy_env_int("ATECH_PRICING_LOOKUP_MAX_WORKERS", 4)
-ATECH_COMPANY_PRICING_SYNC_MAX_WORKERS = _atechy_env_int("ATECH_COMPANY_PRICING_SYNC_MAX_WORKERS", 2)
+ATECH_PRICING_LOOKUP_MAX_WORKERS = _atech_setting_int("ATECH_PRICING_LOOKUP_MAX_WORKERS", 4)
+ATECH_COMPANY_PRICING_SYNC_MAX_WORKERS = _atech_setting_int("ATECH_COMPANY_PRICING_SYNC_MAX_WORKERS", 1)
+ATECH_PARTS_UPSERT_MAX_WORKERS = _atech_setting_int("ATECH_PARTS_UPSERT_MAX_WORKERS", 1)
+ATECH_COMPANY_PRICING_UPSERT_MAX_WORKERS = _atech_setting_int("ATECH_COMPANY_PRICING_UPSERT_MAX_WORKERS", 1)
 
 # Up to 8MB used only to pick an encoding; streaming uses one pass over the file.
 _ATECH_ENCODING_SNIFF_BYTES = 8 * 1024 * 1024
-_ATECH_ENCODING_VALIDATE_CHUNK_BYTES = 1024 * 1024
-ATECH_PARSE_PROGRESS_EVERY = 250000
+ATECH_PARSE_PROGRESS_EVERY = _atech_setting_int("ATECH_PARSE_PROGRESS_EVERY", 250000)
 
 ATECH_COMPANY_PRICING_UPDATE_FIELDS = [
     "cost",
@@ -176,36 +177,12 @@ def _sniff_atech_csv_encoding(path: str) -> str:
     return "utf-8"
 
 
-def _can_decode_atech_file_stream(path: str, encoding: str) -> bool:
-    """
-    Validate that the whole file decodes with ``encoding`` without loading it into memory.
-    """
-    decoder = codecs.getincrementaldecoder(encoding)()
-    try:
-        with open(path, "rb") as bf:
-            while True:
-                chunk = bf.read(_ATECH_ENCODING_VALIDATE_CHUNK_BYTES)
-                if not chunk:
-                    break
-                decoder.decode(chunk, final=False)
-            decoder.decode(b"", final=True)
-        return True
-    except UnicodeDecodeError:
-        return False
-
-
 def _select_atech_csv_encoding(path: str) -> str:
     """
-    Pick first fully valid encoding from the legacy preference order.
-    Keeps compatibility with the old pandas fallback path.
+    Pick a likely encoding from a leading sample.
+    We avoid a full-file pre-validation pass to keep disk reads low on large feeds.
     """
-    preferred = _sniff_atech_csv_encoding(path)
-    ordered = [preferred] + [enc for enc in _ATECH_FEED_CSV_ENCODINGS if enc != preferred]
-    for enc in ordered:
-        if _can_decode_atech_file_stream(path, enc):
-            return enc
-    # latin-1 should always pass; this is a final safety net.
-    return "latin-1"
+    return _sniff_atech_csv_encoding(path)
 
 
 def _iter_atech_csv_rows(path: str) -> typing.Iterator[typing.Dict]:
@@ -217,7 +194,7 @@ def _iter_atech_csv_rows(path: str) -> typing.Iterator[typing.Dict]:
         logger.info(
             "{} Streaming feed {} with encoding {!r}.".format(_LOG_PREFIX, path, enc)
         )
-    with open(path, "r", newline="", encoding=enc) as f:
+    with open(path, "r", newline="", encoding=enc, errors="replace") as f:
         reader = csv.DictReader(f)
         for row in reader:
             yield _normalize_atech_row_dict(row)
@@ -369,6 +346,49 @@ def _id_by_feed_keys_parallel(
         )
     )
     return id_by_feed
+
+
+def _upsert_atech_parts_batch(batch: typing.List[src_models.AtechParts]) -> int:
+    """
+    Upsert one AtechParts batch with thread-safe DB connection handling.
+    """
+    close_old_connections()
+    try:
+        _now = timezone.now()
+        for _p in batch:
+            _p.updated_at = _now
+        pgbulk.upsert(
+            src_models.AtechParts,
+            batch,
+            unique_fields=["feed_part_number"],
+            update_fields=ATECH_PARTS_UPDATE_FIELDS,
+            returning=False,
+        )
+        connection.close()
+        return len(batch)
+    finally:
+        close_old_connections()
+
+
+def _upsert_atech_company_pricing_batch(
+    batch: typing.List[src_models.AtechCompanyPricing],
+) -> int:
+    """
+    Upsert one AtechCompanyPricing batch with thread-safe DB connection handling.
+    """
+    close_old_connections()
+    try:
+        pgbulk.upsert(
+            src_models.AtechCompanyPricing,
+            batch,
+            unique_fields=["part", "company"],
+            update_fields=ATECH_COMPANY_PRICING_UPDATE_FIELDS,
+            returning=False,
+        )
+        connection.close()
+        return len(batch)
+    finally:
+        close_old_connections()
 
 
 def _strip_known_prefix_suffix(full_part: str, prefix_upper: str) -> str:
@@ -1005,39 +1025,52 @@ def fetch_and_save_atech_catalog(force_download: bool = False) -> None:
         logger.warning("{} No AtechParts to upsert from primary feed.".format(_LOG_PREFIX))
     else:
         total_batches = (len(parts) + ATECH_PARTS_UPSERT_BATCH - 1) // ATECH_PARTS_UPSERT_BATCH
+        upsert_workers = max(1, min(ATECH_PARTS_UPSERT_MAX_WORKERS, total_batches))
         logger.info(
-            "{} Upserting {} AtechParts in {} batches (batch_size={}); this can take many minutes.".format(
+            "{} Upserting {} AtechParts in {} batches (batch_size={}, workers={}); this can take many minutes.".format(
                 _LOG_PREFIX,
                 len(parts),
                 total_batches,
                 ATECH_PARTS_UPSERT_BATCH,
+                upsert_workers,
             )
         )
-        batch_num = 0
-        for i in range(0, len(parts), ATECH_PARTS_UPSERT_BATCH):
-            batch_num += 1
-            batch = parts[i : i + ATECH_PARTS_UPSERT_BATCH]
-            _now = timezone.now()
-            for _p in batch:
-                _p.updated_at = _now
-            pgbulk.upsert(
-                src_models.AtechParts,
-                batch,
-                unique_fields=["feed_part_number"],
-                update_fields=ATECH_PARTS_UPDATE_FIELDS,
-            )
-            connection.close()
-            logger.info(
-                "{} AtechParts upsert progress: batch {}/{} (through row ~{}/{})".format(
-                    _LOG_PREFIX,
-                    batch_num,
-                    total_batches,
-                    min(i + len(batch), len(parts)),
-                    len(parts),
+        batches = [
+            parts[i : i + ATECH_PARTS_UPSERT_BATCH]
+            for i in range(0, len(parts), ATECH_PARTS_UPSERT_BATCH)
+        ]
+        if upsert_workers == 1:
+            for batch_num, batch in enumerate(batches, start=1):
+                _upsert_atech_parts_batch(batch)
+                logger.info(
+                    "{} AtechParts upsert progress: batch {}/{} (through row ~{}/{})".format(
+                        _LOG_PREFIX,
+                        batch_num,
+                        total_batches,
+                        min(batch_num * ATECH_PARTS_UPSERT_BATCH, len(parts)),
+                        len(parts),
+                    )
                 )
-            )
-            if i + ATECH_PARTS_UPSERT_BATCH < len(parts):
-                time.sleep(ATECH_PARTS_UPSERT_DELAY)
+                if batch_num < total_batches:
+                    time.sleep(ATECH_PARTS_UPSERT_DELAY)
+        else:
+            # Parallel mode is optional/tunable; use low worker counts to avoid overloading DB/WAL.
+            completed = 0
+            rows_done = 0
+            with ThreadPoolExecutor(max_workers=upsert_workers) as ex:
+                futs = [ex.submit(_upsert_atech_parts_batch, batch) for batch in batches]
+                for fut in as_completed(futs):
+                    rows_done += fut.result()
+                    completed += 1
+                    logger.info(
+                        "{} AtechParts parallel upsert progress: batch {}/{} (through row ~{}/{})".format(
+                            _LOG_PREFIX,
+                            completed,
+                            total_batches,
+                            rows_done,
+                            len(parts),
+                        )
+                    )
 
         logger.info("{} Finished upserting {} AtechParts from primary feed.".format(_LOG_PREFIX, len(parts)))
 
@@ -1196,25 +1229,45 @@ def sync_atech_company_pricing_for_company_provider(
         if pricing_to_upsert
         else 0
     )
-    price_batch_num = 0
-    for j in range(0, len(pricing_to_upsert), ATECH_PRICING_UPSERT_BATCH):
-        price_batch_num += 1
-        batch = pricing_to_upsert[j : j + ATECH_PRICING_UPSERT_BATCH]
-        pgbulk.upsert(
-            src_models.AtechCompanyPricing,
-            batch,
-            unique_fields=["part", "company"],
-            update_fields=ATECH_COMPANY_PRICING_UPDATE_FIELDS,
-            returning=False,
-        )
-        batch_total += len(batch)
-        connection.close()
-        if n_price_batches and (price_batch_num % 10 == 0 or price_batch_num == n_price_batches):
-            logger.info(
-                "{} AtechCompanyPricing upsert progress: {}/{} batches (company_provider id={}).".format(
-                    _LOG_PREFIX, price_batch_num, n_price_batches, company_provider_id
-                )
+    upsert_workers = (
+        max(1, min(ATECH_COMPANY_PRICING_UPSERT_MAX_WORKERS, n_price_batches))
+        if n_price_batches
+        else 1
+    )
+    if n_price_batches:
+        logger.info(
+            "{} AtechCompanyPricing upsert start: {} batch(es), workers={} (company_provider id={}).".format(
+                _LOG_PREFIX, n_price_batches, upsert_workers, company_provider_id
             )
+        )
+    batches = [
+        pricing_to_upsert[j : j + ATECH_PRICING_UPSERT_BATCH]
+        for j in range(0, len(pricing_to_upsert), ATECH_PRICING_UPSERT_BATCH)
+    ]
+    if upsert_workers == 1:
+        price_batch_num = 0
+        for batch in batches:
+            price_batch_num += 1
+            batch_total += _upsert_atech_company_pricing_batch(batch)
+            if n_price_batches and (price_batch_num % 10 == 0 or price_batch_num == n_price_batches):
+                logger.info(
+                    "{} AtechCompanyPricing upsert progress: {}/{} batches (company_provider id={}).".format(
+                        _LOG_PREFIX, price_batch_num, n_price_batches, company_provider_id
+                    )
+                )
+    else:
+        completed = 0
+        with ThreadPoolExecutor(max_workers=upsert_workers) as ex:
+            futs = [ex.submit(_upsert_atech_company_pricing_batch, batch) for batch in batches]
+            for fut in as_completed(futs):
+                batch_total += fut.result()
+                completed += 1
+                if n_price_batches and (completed % 10 == 0 or completed == n_price_batches):
+                    logger.info(
+                        "{} AtechCompanyPricing parallel upsert progress: {}/{} batches (company_provider id={}).".format(
+                            _LOG_PREFIX, completed, n_price_batches, company_provider_id
+                        )
+                    )
     logger.info(
         "{} AtechCompanyPricing upserted {} rows for company_provider id={}.".format(
             _LOG_PREFIX, batch_total, company_provider_id,
