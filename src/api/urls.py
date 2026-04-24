@@ -6,6 +6,7 @@ from src.api.views.integrations import (
     ProvidersCatalogView,
     ProviderConnectView,
     ProviderDisconnectView,
+    ProviderConnectionDetailView,
     CompanyProvidersView,
     CompanyProviderDetailView,
     BrandsWithProvidersView,
@@ -92,6 +93,11 @@ urlpatterns = [
         "integrations/catalog/<int:id>/connect/",
         ProviderConnectView.as_view(),
         name="provider_connect",
+    ),
+    path(
+        "integrations/connections/<int:company_provider_id>/detail/",
+        ProviderConnectionDetailView.as_view(),
+        name="provider_connection_detail",
     ),
     path(
         "integrations/connections/<int:company_provider_id>/",

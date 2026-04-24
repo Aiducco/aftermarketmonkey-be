@@ -149,6 +149,75 @@ class ProviderDisconnectView(views.View):
         return http.HttpResponse(status=204)
 
 
+class ProviderConnectionDetailView(views.View):
+    """
+    GET /integrations/connections/<company_provider_id>/detail/
+    Connection detail: catalog copy, required/optional field keys, redacted ``credentials`` and ``secrets_configured``.
+    """
+
+    def get(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
+        if not request.user or not request.user.is_authenticated:
+            logger.warning(f"{_LOG_PREFIX} User not authenticated for {request.path}")
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "User not authenticated"}),
+                status=401,
+            )
+
+        company_id = getattr(request, "company_id", None)
+        if not company_id:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "No company found in token"}),
+                status=400,
+            )
+
+        company_provider_id = kwargs.get("company_provider_id")
+        if not company_provider_id:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Connection ID is required"}),
+                status=400,
+            )
+
+        try:
+            cpi = int(company_provider_id)
+        except (TypeError, ValueError):
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Invalid connection ID"}),
+                status=400,
+            )
+
+        try:
+            data = integrations_services.get_company_provider_connection_detail(
+                company_id=company_id,
+                company_provider_id=cpi,
+            )
+        except Exception as e:
+            logger.error(
+                f"{_LOG_PREFIX} Error fetching connection detail company_provider_id={cpi} company_id={company_id}: {e}"
+            )
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Error fetching connection detail"}),
+                status=500,
+            )
+
+        if not data:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Connection not found"}),
+                status=404,
+            )
+
+        return http.HttpResponse(
+            headers={"Content-Type": "application/json"},
+            content=simplejson.dumps({"data": data}),
+            status=200,
+        )
+
+
 class CompanyProvidersView(views.View):
     def get(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
 

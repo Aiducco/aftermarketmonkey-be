@@ -327,6 +327,116 @@ def get_company_provider_by_id(company_id: int, provider_id: int) -> typing.Opti
         raise
 
 
+def _credential_key_sensitive(key: str) -> bool:
+    lower = (key or "").lower()
+    if "password" in lower or "secret" in lower:
+        return True
+    return False
+
+
+def _redacted_credentials_for_connection_detail(
+    catalog_entry: typing.Dict[str, typing.Any],
+    raw: typing.Optional[typing.Dict[str, typing.Any]],
+) -> typing.Tuple[typing.Dict[str, typing.Any], typing.Dict[str, bool]]:
+    """
+    Keys: catalog required + optional (in order), then any other keys in storage.
+    Non-sensitive: stored values. Sensitive: always ``null`` in ``credentials``; if a value is stored,
+    ``secrets_configured[key]`` is True (so the FE can show “password set” without echoing the secret).
+    """
+    required = list(catalog_entry.get("connection_required_fields") or [])
+    optional = list(catalog_entry.get("connection_optional_fields") or [])
+    raw = raw or {}
+    key_order: typing.List[str] = []
+    seen: typing.Set[str] = set()
+    for k in required + optional:
+        ks = str(k).strip() if k is not None else ""
+        if ks and ks not in seen:
+            seen.add(ks)
+            key_order.append(ks)
+    for k in sorted(raw.keys(), key=str):
+        ks = str(k).strip() if k is not None else ""
+        if ks and ks not in seen:
+            seen.add(ks)
+            key_order.append(ks)
+
+    credentials: typing.Dict[str, typing.Any] = {}
+    secrets_configured: typing.Dict[str, bool] = {}
+    for key in key_order:
+        val = _normalize_credential_value(raw.get(key))
+        if _credential_key_sensitive(key):
+            credentials[key] = None
+            if val is not None:
+                secrets_configured[key] = True
+        else:
+            credentials[key] = val
+    return credentials, secrets_configured
+
+
+def get_company_provider_connection_detail(
+    company_id: int,
+    company_provider_id: int,
+) -> typing.Optional[typing.Dict[str, typing.Any]]:
+    """
+    One connection: provider row, catalog copy, ``connection_required_fields`` / ``connection_optional_fields``,
+    and ``credentials`` (secrets redacted; see ``secrets_configured`` for sensitive fields that are set).
+    """
+    logger.info(
+        "{} Fetching connection detail for company_provider_id={} company_id={}.".format(
+            _LOG_PREFIX, company_provider_id, company_id,
+        )
+    )
+    company_provider = (
+        src_models.CompanyProviders.objects.filter(
+            id=company_provider_id,
+            company_id=company_id,
+        )
+        .select_related("provider")
+        .first()
+    )
+    if not company_provider:
+        return None
+
+    provider = company_provider.provider
+    if not provider:
+        return None
+
+    catalog_entry = _get_catalog_entry_for_provider(provider.id)
+    if not catalog_entry:
+        return None
+
+    base: typing.Dict[str, typing.Any] = {
+        "id": company_provider.id,
+        "company_id": company_provider.company_id,
+        "provider_id": company_provider.provider_id,
+        "provider_name": provider.name,
+        "provider_status": provider.status,
+        "provider_status_name": provider.status_name,
+        "provider_type": provider.type,
+        "provider_type_name": provider.type_name,
+        "provider_kind": provider.kind,
+        "provider_kind_name": provider.kind_name,
+        "primary": company_provider.primary,
+        "created_at": company_provider.created_at.isoformat() if company_provider.created_at else None,
+        "updated_at": company_provider.updated_at.isoformat() if company_provider.updated_at else None,
+    }
+    base.update(_provider_ui_metadata(provider))
+
+    creds_redacted, secrets_configured = _redacted_credentials_for_connection_detail(
+        catalog_entry,
+        company_provider.credentials,
+    )
+
+    out: typing.Dict[str, typing.Any] = dict(base)
+    out["description"] = catalog_entry.get("description", "")
+    out["category"] = catalog_entry.get("category", "")
+    out["installation_instructions_html"] = catalog_entry.get("installation_instructions_html") or None
+    out["connection_required_fields"] = list(catalog_entry.get("connection_required_fields") or [])
+    out["connection_optional_fields"] = list(catalog_entry.get("connection_optional_fields") or [])
+    out["credentials"] = creds_redacted
+    out["secrets_configured"] = secrets_configured
+    return out
+
+
 def get_all_brands_with_providers() -> typing.List[typing.Dict]:
     """
     Get all brands with their associated providers.
