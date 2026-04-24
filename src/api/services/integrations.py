@@ -23,6 +23,13 @@ def _normalize_credential_value(value: typing.Any) -> typing.Optional[typing.Any
     return s if s else None
 
 
+def _credential_key_sensitive(key: str) -> bool:
+    lower = (key or "").lower()
+    if "password" in lower or "secret" in lower:
+        return True
+    return False
+
+
 def _build_credentials_from_catalog_entry(
     catalog_entry: typing.Dict[str, typing.Any],
     credentials: typing.Dict[str, typing.Any],
@@ -46,6 +53,40 @@ def _build_credentials_from_catalog_entry(
         if v is not None:
             creds[k] = v
     return creds, None
+
+
+def _merge_update_credentials(
+    catalog_entry: typing.Dict[str, typing.Any],
+    existing: typing.Optional[typing.Dict[str, typing.Any]],
+    patch: typing.Dict[str, typing.Any],
+) -> typing.Tuple[typing.Optional[typing.Dict[str, typing.Any]], typing.Optional[str]]:
+    """
+    Apply a partial credential patch onto stored credentials. Only keys in the catalog
+    (required + optional) are allowed. Non-empty values overwrite. Empty / null for a
+    **sensitive** key (password, secret) leaves the previous value unchanged so clients
+    can update other fields without resubmitting secrets.
+    """
+    required = [str(f) for f in (catalog_entry.get("connection_required_fields") or [])]
+    optional = [str(f) for f in (catalog_entry.get("connection_optional_fields") or [])]
+    allowed: typing.Set[str] = set(required) | set(optional)
+    out: typing.Dict[str, typing.Any] = dict(existing or {})
+
+    for k, v in (patch or {}).items():
+        key = str(k)
+        if key not in allowed:
+            return None, "Unknown credential field: {}".format(key)
+        nv = _normalize_credential_value(v)
+        if nv is not None:
+            out[key] = nv
+        else:
+            if _credential_key_sensitive(key):
+                continue
+            out.pop(key, None)
+
+    missing = [f for f in required if not _normalize_credential_value(out.get(f))]
+    if missing:
+        return None, "Missing required fields: {}".format(", ".join(missing))
+    return out, None
 
 
 def _provider_ui_metadata(provider: src_models.Providers) -> typing.Dict[str, typing.Optional[str]]:
@@ -153,8 +194,11 @@ def connect_provider(
     credentials: typing.Dict[str, typing.Any],
 ) -> typing.Tuple[typing.Optional[typing.Dict], typing.Optional[str]]:
     """
-    Create CompanyProviders for a provider. Validates required fields from catalog.
-    Returns (company_provider_data, error_message). On success error_message is None.
+    Create or replace credentials for a ``CompanyProviders`` row (keyed by company + provider).
+    Validates required fields from the catalog, saves, and enqueues
+    ``integration_pricing_sync_jobs.enqueue_company_provider_pricing_sync`` when the provider
+    has per-company pricing sync. Use :func:`update_connection` for partial PATCH updates by
+    connection id.
     """
     provider = src_models.Providers.objects.filter(id=provider_id).first()
     if not provider:
@@ -190,9 +234,59 @@ def connect_provider(
 
     return {
         "id": cp.id,
+        "company_provider_id": cp.id,
         "company_id": cp.company_id,
         "provider_id": cp.provider_id,
         "provider_name": provider.name,
+        "credentials": cp.credentials,
+        "primary": cp.primary,
+        "created_at": cp.created_at.isoformat() if cp.created_at else None,
+        "updated_at": cp.updated_at.isoformat() if cp.updated_at else None,
+    }, None
+
+
+def update_connection(
+    company_id: int,
+    company_provider_id: int,
+    credentials: typing.Dict[str, typing.Any],
+) -> typing.Tuple[typing.Optional[typing.Dict], typing.Optional[str]]:
+    """
+    Patch credentials for an existing connection (``CompanyProviders`` by id and company).
+    Merges with stored JSON (see :func:`_merge_update_credentials`); re-enqueues
+    :func:`integration_pricing_sync_jobs.enqueue_company_provider_pricing_sync` the same
+    way as :func:`connect_provider` on success.
+    """
+    cp = src_models.CompanyProviders.objects.filter(
+        id=company_provider_id,
+        company_id=company_id,
+    ).select_related("provider").first()
+    if not cp or not cp.provider:
+        return None, "Connection not found"
+
+    catalog_entry = _get_catalog_entry_for_provider(cp.provider_id)
+    if not catalog_entry:
+        return None, "Provider not found in catalog"
+
+    creds, err = _merge_update_credentials(
+        catalog_entry,
+        cp.credentials,
+        credentials,
+    )
+    if err:
+        return None, err
+
+    cp.credentials = creds
+    cp.save()
+
+    if integration_pricing_sync_jobs.should_enqueue_pricing_sync(cp.provider.kind):
+        integration_pricing_sync_jobs.enqueue_company_provider_pricing_sync(cp.id)
+
+    return {
+        "id": cp.id,
+        "company_provider_id": cp.id,
+        "company_id": cp.company_id,
+        "provider_id": cp.provider_id,
+        "provider_name": cp.provider.name,
         "credentials": cp.credentials,
         "primary": cp.primary,
         "created_at": cp.created_at.isoformat() if cp.created_at else None,
@@ -327,13 +421,6 @@ def get_company_provider_by_id(company_id: int, provider_id: int) -> typing.Opti
         raise
 
 
-def _credential_key_sensitive(key: str) -> bool:
-    lower = (key or "").lower()
-    if "password" in lower or "secret" in lower:
-        return True
-    return False
-
-
 def _redacted_credentials_for_connection_detail(
     catalog_entry: typing.Dict[str, typing.Any],
     raw: typing.Optional[typing.Dict[str, typing.Any]],
@@ -377,7 +464,8 @@ def get_company_provider_connection_detail(
     company_provider_id: int,
 ) -> typing.Optional[typing.Dict[str, typing.Any]]:
     """
-    One connection: provider row, catalog copy, ``connection_required_fields`` / ``connection_optional_fields``,
+    One connection: provider row, ``company_provider_id`` (same as ``id``, for PATCH URL),
+    catalog copy, ``connection_required_fields`` / ``connection_optional_fields``,
     and ``credentials`` (secrets redacted; see ``secrets_configured`` for sensitive fields that are set).
     """
     logger.info(
@@ -406,6 +494,7 @@ def get_company_provider_connection_detail(
 
     base: typing.Dict[str, typing.Any] = {
         "id": company_provider.id,
+        "company_provider_id": company_provider.id,
         "company_id": company_provider.company_id,
         "provider_id": company_provider.provider_id,
         "provider_name": provider.name,

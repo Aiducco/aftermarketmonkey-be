@@ -107,8 +107,11 @@ class ProviderConnectView(views.View):
         )
 
 
-class ProviderDisconnectView(views.View):
-    """DELETE /integrations/connections/<company_provider_id>/ - Remove CompanyProviders."""
+class ProviderConnectionView(views.View):
+    """
+    DELETE /integrations/connections/<company_provider_id>/ — disconnect.
+    PATCH /integrations/connections/<company_provider_id>/ — partial credential update, same pricing sync enqueue as connect.
+    """
 
     def delete(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
         if not request.user or not request.user.is_authenticated:
@@ -147,6 +150,69 @@ class ProviderDisconnectView(views.View):
             )
 
         return http.HttpResponse(status=204)
+
+    def patch(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
+        if not request.user or not request.user.is_authenticated:
+            logger.warning(f"{_LOG_PREFIX} User not authenticated for {request.path}")
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "User not authenticated"}),
+                status=401,
+            )
+
+        company_id = getattr(request, "company_id", None)
+        if not company_id:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "No company found in token"}),
+                status=400,
+            )
+
+        company_provider_id = kwargs.get("company_provider_id")
+        if not company_provider_id:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Connection ID is required"}),
+                status=400,
+            )
+
+        try:
+            cpi = int(company_provider_id)
+        except (TypeError, ValueError):
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Invalid connection ID"}),
+                status=400,
+            )
+
+        try:
+            body = json.loads(request.body) if request.body else {}
+        except json.JSONDecodeError:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Invalid JSON body"}),
+                status=400,
+            )
+
+        patch = body if isinstance(body, dict) else {}
+        data, err = integrations_services.update_connection(
+            company_id=company_id,
+            company_provider_id=cpi,
+            credentials=patch,
+        )
+        if err:
+            status = 404 if err == "Connection not found" else 400
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": err}),
+                status=status,
+            )
+
+        return http.HttpResponse(
+            headers={"Content-Type": "application/json"},
+            content=simplejson.dumps({"data": data}),
+            status=200,
+        )
 
 
 class ProviderConnectionDetailView(views.View):

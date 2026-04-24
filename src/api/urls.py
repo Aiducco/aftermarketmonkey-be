@@ -5,7 +5,7 @@ from src.api.views.company import CompanyDestinationsView
 from src.api.views.integrations import (
     ProvidersCatalogView,
     ProviderConnectView,
-    ProviderDisconnectView,
+    ProviderConnectionView,
     ProviderConnectionDetailView,
     CompanyProvidersView,
     CompanyProviderDetailView,
@@ -101,8 +101,8 @@ urlpatterns = [
     ),
     path(
         "integrations/connections/<int:company_provider_id>/",
-        ProviderDisconnectView.as_view(),
-        name="provider_disconnect",
+        ProviderConnectionView.as_view(),
+        name="provider_connection",
     ),
     path(
         "company-providers/",
