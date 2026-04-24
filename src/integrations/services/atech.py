@@ -1,4 +1,5 @@
 import csv
+import codecs
 import logging
 import os
 import re
@@ -54,6 +55,8 @@ ATECH_COMPANY_PRICING_SYNC_MAX_WORKERS = _atechy_env_int("ATECH_COMPANY_PRICING_
 
 # Up to 8MB used only to pick an encoding; streaming uses one pass over the file.
 _ATECH_ENCODING_SNIFF_BYTES = 8 * 1024 * 1024
+_ATECH_ENCODING_VALIDATE_CHUNK_BYTES = 1024 * 1024
+ATECH_PARSE_PROGRESS_EVERY = 250000
 
 ATECH_COMPANY_PRICING_UPDATE_FIELDS = [
     "cost",
@@ -173,11 +176,43 @@ def _sniff_atech_csv_encoding(path: str) -> str:
     return "utf-8"
 
 
+def _can_decode_atech_file_stream(path: str, encoding: str) -> bool:
+    """
+    Validate that the whole file decodes with ``encoding`` without loading it into memory.
+    """
+    decoder = codecs.getincrementaldecoder(encoding)()
+    try:
+        with open(path, "rb") as bf:
+            while True:
+                chunk = bf.read(_ATECH_ENCODING_VALIDATE_CHUNK_BYTES)
+                if not chunk:
+                    break
+                decoder.decode(chunk, final=False)
+            decoder.decode(b"", final=True)
+        return True
+    except UnicodeDecodeError:
+        return False
+
+
+def _select_atech_csv_encoding(path: str) -> str:
+    """
+    Pick first fully valid encoding from the legacy preference order.
+    Keeps compatibility with the old pandas fallback path.
+    """
+    preferred = _sniff_atech_csv_encoding(path)
+    ordered = [preferred] + [enc for enc in _ATECH_FEED_CSV_ENCODINGS if enc != preferred]
+    for enc in ordered:
+        if _can_decode_atech_file_stream(path, enc):
+            return enc
+    # latin-1 should always pass; this is a final safety net.
+    return "latin-1"
+
+
 def _iter_atech_csv_rows(path: str) -> typing.Iterator[typing.Dict]:
     """
     Stream A-Tech feed rows with the same per-cell semantics as the legacy pandas path.
     """
-    enc = _sniff_atech_csv_encoding(path)
+    enc = _select_atech_csv_encoding(path)
     if enc != "utf-8-sig":
         logger.info(
             "{} Streaming feed {} with encoding {!r}.".format(_LOG_PREFIX, path, enc)
@@ -221,11 +256,37 @@ def _atech_prefix_from_part_number(part_number: typing.Any) -> str:
 
 def _atech_pricing_map_from_iterable(
     records: typing.Iterable[typing.Dict],
+    *,
+    progress_every: int = 0,
+    progress_label: str = "",
 ) -> typing.Dict[str, typing.Dict[str, typing.Any]]:
     """Map feed ``part_number`` (full line) -> price payload; last row per key wins."""
     out: typing.Dict[str, typing.Dict[str, typing.Any]] = {}
+    rows_seen = 0
+    started = time.monotonic()
     for row in records:
+        rows_seen += 1
         _merge_atech_pricing_row_into_map(row, out)
+        if progress_every > 0 and (rows_seen % progress_every) == 0:
+            logger.info(
+                "{} {} pricing parse progress: {} row(s) scanned, {} unique keys in {:.1f}s.".format(
+                    _LOG_PREFIX,
+                    progress_label or "A-Tech",
+                    rows_seen,
+                    len(out),
+                    time.monotonic() - started,
+                )
+            )
+    if rows_seen:
+        logger.info(
+            "{} {} pricing parse done: {} row(s), {} unique keys in {:.1f}s.".format(
+                _LOG_PREFIX,
+                progress_label or "A-Tech",
+                rows_seen,
+                len(out),
+                time.monotonic() - started,
+            )
+        )
     return out
 
 
@@ -264,6 +325,7 @@ def _id_by_feed_keys_parallel(
             close_old_connections()
 
     if workers == 1:
+        started = time.monotonic()
         chunk_idx = 0
         for ck in chunks:
             chunk_idx += 1
@@ -274,6 +336,16 @@ def _id_by_feed_keys_parallel(
                         log_prefix, chunk_idx, n_chunks, company_provider_id
                     )
                 )
+        logger.info(
+            "{} AtechCompanyPricing part lookup done: {} key(s), {} matched part id(s) in {:.1f}s "
+            "(company_provider id={}).".format(
+                log_prefix,
+                len(feed_keys),
+                len(id_by_feed),
+                time.monotonic() - started,
+                company_provider_id,
+            )
+        )
         return id_by_feed
 
     logger.info(
@@ -281,10 +353,21 @@ def _id_by_feed_keys_parallel(
             log_prefix, n_chunks, workers, company_provider_id
         )
     )
+    started = time.monotonic()
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = [ex.submit(_load_one, ck) for ck in chunks]
         for fut in as_completed(futs):
             id_by_feed.update(fut.result())
+    logger.info(
+        "{} AtechCompanyPricing part lookup done: {} key(s), {} matched part id(s) in {:.1f}s "
+        "(company_provider id={}).".format(
+            log_prefix,
+            len(feed_keys),
+            len(id_by_feed),
+            time.monotonic() - started,
+            company_provider_id,
+        )
+    )
     return id_by_feed
 
 
@@ -838,12 +921,26 @@ def fetch_and_save_atech_catalog(force_download: bool = False) -> None:
         logger.error("{} {}".format(_LOG_PREFIX, str(e)))
         raise
 
+    logger.info(
+        "{} Downloading primary A-Tech feed (force_download={}).".format(
+            _LOG_PREFIX,
+            force_download,
+        )
+    )
     try:
         local_path = sftp.download_feed_file(force_download=force_download)
     except atech_exceptions.AtechException as e:
         logger.error("{} {}".format(_LOG_PREFIX, str(e)))
         raise
 
+    logger.info(
+        "{} Parsing A-Tech feed rows from {} (progress every {} rows).".format(
+            _LOG_PREFIX,
+            local_path,
+            ATECH_PARSE_PROGRESS_EVERY,
+        )
+    )
+    parse_started = time.monotonic()
     parts_by_feed_pn: typing.Dict[str, src_models.AtechParts] = {}
     unmapped_prefix_rows = 0
     feed_row_count = 0
@@ -861,10 +958,29 @@ def fetch_and_save_atech_catalog(force_download: bool = False) -> None:
             sku = (p.feed_part_number or "").strip()
             if sku:
                 parts_by_feed_pn[sku] = p
+        if (feed_row_count % ATECH_PARSE_PROGRESS_EVERY) == 0:
+            logger.info(
+                "{} Feed parse progress: {} row(s) scanned, {} model rows, {} dedup keys in {:.1f}s.".format(
+                    _LOG_PREFIX,
+                    feed_row_count,
+                    parts_with_model,
+                    len(parts_by_feed_pn),
+                    time.monotonic() - parse_started,
+                )
+            )
 
     if feed_row_count == 0:
         logger.warning("{} Feed file empty or unreadable: {}.".format(_LOG_PREFIX, local_path))
         return
+    logger.info(
+        "{} Feed parse done: {} row(s), {} model rows, {} dedup keys in {:.1f}s.".format(
+            _LOG_PREFIX,
+            feed_row_count,
+            parts_with_model,
+            len(parts_by_feed_pn),
+            time.monotonic() - parse_started,
+        )
+    )
 
     if unmapped_prefix_rows:
         logger.info(
@@ -1014,6 +1130,14 @@ def sync_atech_company_pricing_for_company_provider(
     except ValueError as e:
         logger.error("{} company_id={}: {}".format(_LOG_PREFIX, cp.company_id, str(e)))
         raise
+    logger.info(
+        "{} Downloading company feed: company_id={} company_provider_id={} force_download={}.".format(
+            _LOG_PREFIX,
+            cp.company_id,
+            cp.id,
+            force_download,
+        )
+    )
     try:
         company_feed_path = client.download_feed_file(force_download=force_download)
     except atech_exceptions.AtechException as e:
@@ -1022,7 +1146,21 @@ def sync_atech_company_pricing_for_company_provider(
         )
         raise
 
-    pmap = _atech_pricing_map_from_iterable(_iter_atech_csv_rows(company_feed_path))
+    logger.info(
+        "{} Building per-company pricing map: company_id={} company_provider_id={} path={} "
+        "(progress every {} rows).".format(
+            _LOG_PREFIX,
+            cp.company_id,
+            cp.id,
+            company_feed_path,
+            ATECH_PARSE_PROGRESS_EVERY,
+        )
+    )
+    pmap = _atech_pricing_map_from_iterable(
+        _iter_atech_csv_rows(company_feed_path),
+        progress_every=ATECH_PARSE_PROGRESS_EVERY,
+        progress_label="company_id={}".format(cp.company_id),
+    )
     if not pmap:
         logger.warning(
             "{} No pricing rows parsed for A-Tech company_provider id={}.".format(_LOG_PREFIX, company_provider_id)
