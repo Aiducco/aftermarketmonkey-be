@@ -1343,3 +1343,130 @@ class PartRequestAudit(django_db_models.Model):
                 name="pra_co_act_crt_idx",
             ),
         ]
+
+
+class USZipCode(django_db_models.Model):
+    zip_code = django_db_models.CharField(max_length=10, unique=True)
+    city = django_db_models.CharField(max_length=128)
+    state = django_db_models.CharField(max_length=2)
+    county = django_db_models.CharField(max_length=128, null=True, blank=True)
+    latitude = django_db_models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
+    longitude = django_db_models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
+    population = django_db_models.IntegerField(null=True, blank=True)
+    is_major_city = django_db_models.BooleanField(default=False)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "us_zip_code"
+        indexes = [
+            django_db_models.Index(fields=["state"], name="uszip_state_idx"),
+            django_db_models.Index(fields=["state", "city"], name="uszip_state_city_idx"),
+            django_db_models.Index(fields=["is_major_city"], name="uszip_major_idx"),
+        ]
+
+    def __str__(self):
+        return f"{self.zip_code} - {self.city}, {self.state}"
+
+
+class Lead(django_db_models.Model):
+    class Status(django_db_models.IntegerChoices):
+        PENDING = 0, "Pending"
+        CONTACTED = 1, "Contacted"
+        QUALIFIED = 2, "Qualified"
+        DISQUALIFIED = 3, "Disqualified"
+        CONVERTED = 4, "Converted"
+
+    # Identity
+    place_id = django_db_models.CharField(max_length=255, unique=True)
+    name = django_db_models.CharField(max_length=512)
+
+    # Location
+    address = django_db_models.TextField(null=True, blank=True)
+    city = django_db_models.CharField(max_length=128, null=True, blank=True)
+    state = django_db_models.CharField(max_length=64, null=True, blank=True)
+    zip_code = django_db_models.CharField(max_length=10, null=True, blank=True)
+    latitude = django_db_models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
+    longitude = django_db_models.DecimalField(max_digits=9, decimal_places=6, null=True, blank=True)
+
+    # Contact
+    phone = django_db_models.CharField(max_length=64, null=True, blank=True)
+    website = django_db_models.URLField(max_length=512, null=True, blank=True)
+    website_not_found = django_db_models.BooleanField(default=False, blank=True)  # True = Tavily+Claude couldn't find one
+    website_live = django_db_models.BooleanField(null=True, blank=True)  # None = not checked yet
+    emails_not_found = django_db_models.BooleanField(default=False, blank=True)  # True = enrichment tried, nothing found
+    email = django_db_models.EmailField(max_length=255, null=True, blank=True)
+    emails = django_db_models.JSONField(default=list, blank=True)
+
+    # Google Places data
+    rating = django_db_models.DecimalField(max_digits=3, decimal_places=1, null=True, blank=True)
+    review_count = django_db_models.IntegerField(null=True, blank=True)
+    google_maps_url = django_db_models.URLField(max_length=512, null=True, blank=True)
+    business_status = django_db_models.CharField(max_length=64, null=True, blank=True)
+
+    # Search metadata
+    search_query = django_db_models.CharField(max_length=255, null=True, blank=True)
+    source_zip = django_db_models.CharField(max_length=10, null=True, blank=True)
+    category = django_db_models.CharField(max_length=128, null=True, blank=True)
+
+    # AI qualification
+    is_qualified = django_db_models.BooleanField(null=True, blank=True)
+    business_typology = django_db_models.CharField(max_length=64, null=True, blank=True)
+    confidence_score = django_db_models.IntegerField(null=True, blank=True)
+    brands_mentioned = django_db_models.JSONField(default=list, blank=True)
+    ai_reasoning = django_db_models.TextField(null=True, blank=True)
+    ai_skip_reason = django_db_models.CharField(max_length=255, null=True, blank=True)
+    ai_qualified_at = django_db_models.DateTimeField(null=True, blank=True)
+
+    # CRM status
+    status = django_db_models.IntegerField(choices=Status.choices, default=Status.PENDING)
+    importance = django_db_models.IntegerField(null=True, blank=True)  # 1–5 score
+    notes = django_db_models.TextField(null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "lead"
+        indexes = [
+            django_db_models.Index(fields=["state", "city"], name="lead_state_city_idx"),
+            django_db_models.Index(fields=["category"], name="lead_category_idx"),
+            django_db_models.Index(fields=["status"], name="lead_status_idx"),
+            django_db_models.Index(fields=["rating"], name="lead_rating_idx"),
+        ]
+
+    def __str__(self):
+        return f"{self.name} ({self.city}, {self.state})"
+
+
+class LeadEmail(django_db_models.Model):
+    """One row per email address found on a qualified lead's website — with Reoon verification results."""
+
+    lead = django_db_models.ForeignKey(Lead, on_delete=django_db_models.CASCADE, related_name="verified_emails")
+    email = django_db_models.EmailField(max_length=255)
+
+    # Claude AI pre-screening
+    ai_valid = django_db_models.BooleanField(null=True, blank=True)  # None = not checked yet
+
+    # Reoon verification results
+    status = django_db_models.CharField(max_length=32, null=True, blank=True)   # valid, invalid, disposable, unknown, etc.
+    is_valid = django_db_models.BooleanField(null=True, blank=True)
+    is_disposable = django_db_models.BooleanField(null=True, blank=True)
+    is_free_email = django_db_models.BooleanField(null=True, blank=True)
+    is_role_based = django_db_models.BooleanField(null=True, blank=True)
+    mx_found = django_db_models.BooleanField(null=True, blank=True)
+
+    verified_at = django_db_models.DateTimeField(null=True, blank=True)
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "lead_email"
+        unique_together = [("lead", "email")]
+        indexes = [
+            django_db_models.Index(fields=["email"], name="lead_email_email_idx"),
+            django_db_models.Index(fields=["status"], name="lead_email_status_idx"),
+            django_db_models.Index(fields=["is_valid"], name="lead_email_valid_idx"),
+        ]
+
+    def __str__(self):
+        return f"{self.email} ({self.status})"

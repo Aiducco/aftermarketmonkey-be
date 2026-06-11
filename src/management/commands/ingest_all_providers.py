@@ -68,10 +68,14 @@ class Command(BaseCommand):
         self,
         task_name: str,
         success_message: str,
+        continue_on_error: bool = False,
     ) -> typing.Iterator[None]:
         """
         ``start_scheduled_task_execution`` at entry, ``mark_scheduled_task_completed`` or
         ``mark_scheduled_task_failed`` on exit. Yields so the block runs the work.
+
+        If ``continue_on_error=True`` the exception is swallowed after being recorded so the
+        parent run can continue with the next provider.
         """
         ex = audit_scheduled_tasks.start_scheduled_task_execution(task_name)
         self._ingest_log("subtask started | task_name={}".format(task_name))
@@ -80,7 +84,10 @@ class Command(BaseCommand):
         except Exception as e:
             audit_scheduled_tasks.mark_scheduled_task_failed(ex, error_message=str(e))
             self._ingest_log("subtask failed | task_name={} | error={!s}".format(task_name, e))
-            raise
+            if not continue_on_error:
+                raise
+            self._ingest_log("subtask failure ignored (continue_on_error=True) | task_name={}".format(task_name))
+            return
         audit_scheduled_tasks.mark_scheduled_task_completed(ex, message=success_message)
         self._ingest_log("subtask completed | task_name={}".format(task_name))
 
@@ -162,6 +169,7 @@ class Command(BaseCommand):
         with self._audited_step(
             "ingest_all_providers_turn14",
             "Turn14 source fetch complete: brands, item updates, inventory updates (derived in sync_all).",
+            continue_on_error=True,
         ):
             self._ingest_log("Turn14: brands + items + inventory fetches only; derived in sync_all")
             turn_14.fetch_and_save_turn_14_brands()
@@ -188,6 +196,7 @@ class Command(BaseCommand):
         with self._audited_step(
             "ingest_all_providers_keystone",
             "Keystone source fetch complete: brands, parts (derived in sync_all).",
+            continue_on_error=True,
         ):
             self._ingest_log("Keystone: brands + parts fetches only")
             keystone.fetch_and_save_keystone_brands()
@@ -198,6 +207,7 @@ class Command(BaseCommand):
         with self._audited_step(
             "ingest_all_providers_meyer",
             "Meyer source fetch complete: catalog, unmapped brand sync (derived in sync_all).",
+            continue_on_error=True,
         ):
             self._ingest_log("Meyer: SFTP catalog + unmapped brand sync")
             meyer.fetch_and_save_meyer_catalog_and_inventory(force_download=False)
@@ -207,6 +217,7 @@ class Command(BaseCommand):
         with self._audited_step(
             "ingest_all_providers_atech",
             "A-Tech source fetch complete (derived in sync_all).",
+            continue_on_error=True,
         ):
             self._ingest_log("A-Tech: feed download + upsert")
             atech.fetch_and_save_atech_catalog(force_download=False)
@@ -215,6 +226,7 @@ class Command(BaseCommand):
         with self._audited_step(
             "ingest_all_providers_rough_country",
             "Rough Country source fetch + unmapped brand sync complete (derived in sync_all).",
+            continue_on_error=True,
         ):
             self._ingest_log("Rough Country: feed + unmapped brand sync")
             rough_country.fetch_and_save_rough_country(
@@ -228,6 +240,7 @@ class Command(BaseCommand):
         with self._audited_step(
             "ingest_all_providers_dlg",
             "DLG source fetch complete (derived in sync_all).",
+            continue_on_error=True,
         ):
             self._ingest_log("DLG: inventory SFTP + upsert")
             dlg.fetch_and_save_dlg_catalog(force_download=False)
@@ -237,6 +250,7 @@ class Command(BaseCommand):
         with self._audited_step(
             "ingest_all_providers_wheelpros",
             "WheelPros source fetch (wheel, tire, accessories) + unmapped brand sync complete (derived in sync_all).",
+            continue_on_error=True,
         ):
             self._ingest_log("WheelPros: wheel, tire, accessories + unmapped brand sync")
             for ft in ("wheel", "tire", "accessories"):
