@@ -133,6 +133,8 @@ settings.py
 
 .env.app
 .env.db
+.env.app.*
+!.env.app.example
 
 *.log
 .DS_Store*

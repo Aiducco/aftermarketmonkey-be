@@ -1,0 +1,52 @@
+name: Deploy
+
+on:
+  push:
+    branches:
+      - main        # → production
+      - develop     # → development
+
+jobs:
+  deploy:
+    name: Deploy to server
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Determine environment
+        id: env
+        run: |
+          if [ "${{ github.ref_name }}" = "main" ]; then
+            echo "DEPLOY_ENV=production" >> $GITHUB_OUTPUT
+          else
+            echo "DEPLOY_ENV=development" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          password: ${{ secrets.SSH_PASSWORD }}
+          port: 22
+          script_stop: true
+          script: |
+            export DEPLOY_ENV=${{ steps.env.outputs.DEPLOY_ENV }}
+            echo "==> Deploying env=$DEPLOY_ENV"
+
+            cd ~/aftermarketmonkey-be
+
+            echo "==> git pull"
+            git fetch origin
+            git checkout ${{ github.ref_name }}
+            git reset --hard origin/${{ github.ref_name }}
+
+            echo "==> docker compose build"
+            DEPLOY_ENV=$DEPLOY_ENV docker compose build
+
+            echo "==> docker compose up -d"
+            DEPLOY_ENV=$DEPLOY_ENV docker compose up -d
+
+            echo "==> Running DB migrations"
+            DEPLOY_ENV=$DEPLOY_ENV docker compose exec -T app python manage.py migrate --no-input
+
+            echo "==> Done"

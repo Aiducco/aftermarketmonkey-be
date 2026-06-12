@@ -5,7 +5,7 @@ services:
       context: .
     restart: always
     env_file:
-      - ./.env.app
+      - ./.env.app.${DEPLOY_ENV:-production}
     ports:
       - "8005:8000"
     depends_on:
@@ -28,7 +28,7 @@ services:
     ports:
       - "7700:7700"
     environment:
-      - MEILI_ENV=development
+      - MEILI_ENV=${DEPLOY_ENV:-production}
     restart: always
 
 
