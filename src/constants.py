@@ -264,7 +264,6 @@ COMING_SOON_PROVIDERS = [
     {"kind": enums.BrandProviderKind.CTP_DISTRIBUTORS,        "name": "CTP Distributors",           "category": "Distributors", "icon_url": f"{_UPLOADS}/ctp_distributors_logo.png"},
     {"kind": enums.BrandProviderKind.CROWN_AUTOMOTIVE,        "name": "Crown Automotive",           "category": "Distributors", "icon_url": f"{_UPLOADS}/crown_automotive_logo.png"},
     {"kind": enums.BrandProviderKind.DIX_PERF_NORTH,          "name": "DIX Perf North",             "category": "Distributors", "icon_url": f"{_UPLOADS}/dix_perf_north_logo.png"},
-    {"kind": enums.BrandProviderKind.EARL_OWEN,               "name": "Earl Owen",                  "category": "Distributors", "icon_url": f"{_UPLOADS}/earl_owen_logo.png"},
     {"kind": enums.BrandProviderKind.ELITE_WHEEL,             "name": "Elite Wheel",                "category": "Distributors", "icon_url": f"{_UPLOADS}/elite_wheel_logo.png"},
     {"kind": enums.BrandProviderKind.FASTCO,                  "name": "FastCo",                     "category": "Distributors", "icon_url": f"{_UPLOADS}/fastco_logo.png"},
     {"kind": enums.BrandProviderKind.GRANDWEST_ENTERPRISES,   "name": "GrandWest Enterprises",      "category": "Distributors", "icon_url": f"{_UPLOADS}/grandwest_logo.png"},
