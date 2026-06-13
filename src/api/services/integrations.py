@@ -179,7 +179,7 @@ def get_providers_catalog(company_id: int) -> typing.Dict:
             "name": provider.name,
             "display_name": provider.name,
             "description": "",
-            "icon_url": None,
+            "icon_url": entry.get("icon_url") or None,
             "category": entry.get("category", "Distributors"),
             "connection_required_fields": [],
             "connection_optional_fields": [],
