@@ -108,9 +108,8 @@ def _provider_ui_metadata(provider: src_models.Providers) -> typing.Dict[str, ty
 def get_providers_catalog(company_id: int) -> typing.Dict:
     """
     Get integrations catalog: all providers with connection status for the company.
-    Matches the catalog UI: name, description, icon_url, category, connected, required_fields,
-    installation_instructions_html (HTML snippet for setup guidance).
-    Connected status is determined from company_providers table.
+    Includes active integrations (coming_soon=False) and coming-soon distributors
+    (coming_soon=True, always connected=False, no connection fields).
     """
     logger.info('{} Fetching providers catalog for company_id: {}.'.format(
         _LOG_PREFIX, company_id
@@ -129,6 +128,8 @@ def get_providers_catalog(company_id: int) -> typing.Dict:
     }
 
     catalog = []
+
+    # Active integrations — driven by PROVIDER_CATALOG
     for entry in src_constants.PROVIDER_CATALOG:
         kind_value = entry["kind"].value
         provider = providers_by_kind.get(kind_value)
@@ -163,6 +164,31 @@ def get_providers_catalog(company_id: int) -> typing.Dict:
             "company_provider_id": company_provider.id if company_provider else None,
             "kind": kind_value,
             "kind_name": kind_name,
+            "coming_soon": False,
+        })
+
+    # Coming soon distributors — driven by COMING_SOON_PROVIDERS
+    for entry in src_constants.COMING_SOON_PROVIDERS:
+        kind_value = entry["kind"].value
+        provider = providers_by_kind.get(kind_value)
+        if not provider:
+            continue
+
+        catalog.append({
+            "id": provider.id,
+            "name": provider.name,
+            "display_name": provider.name,
+            "description": "",
+            "icon_url": None,
+            "category": entry.get("category", "Distributors"),
+            "connection_required_fields": [],
+            "connection_optional_fields": [],
+            "installation_instructions_html": None,
+            "connected": False,
+            "company_provider_id": None,
+            "kind": kind_value,
+            "kind_name": provider.kind_name or "",
+            "coming_soon": True,
         })
 
     logger.info('{} Found {} providers in catalog for company_id: {}.'.format(

@@ -73,6 +73,8 @@ class Providers(django_db_models.Model):
     kind = django_db_models.PositiveSmallIntegerField()
     kind_name = django_db_models.CharField(max_length=255)
 
+    coming_soon = django_db_models.BooleanField(default=False)
+
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
 

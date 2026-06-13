@@ -255,6 +255,34 @@ PROVIDER_CATALOG = [
     },
 ]
 
+COMING_SOON_PROVIDERS = [
+    {"kind": enums.BrandProviderKind.ATD,                     "name": "ATD",                       "category": "Distributors"},
+    {"kind": enums.BrandProviderKind.ALLPRO_DISTRIBUTING,     "name": "AllPro Distributing",        "category": "Distributors"},
+    {"kind": enums.BrandProviderKind.AUTOMATIC_DISTRIBUTORS,  "name": "Automatic Distributors",     "category": "Distributors"},
+    {"kind": enums.BrandProviderKind.CTP_DISTRIBUTORS,        "name": "CTP Distributors",           "category": "Distributors"},
+    {"kind": enums.BrandProviderKind.CROWN_AUTOMOTIVE,        "name": "Crown Automotive",           "category": "Distributors"},
+    {"kind": enums.BrandProviderKind.DIX_PERF_NORTH,          "name": "DIX Perf North",             "category": "Distributors"},
+    {"kind": enums.BrandProviderKind.EARL_OWEN,               "name": "Earl Owen",                  "category": "Distributors"},
+    {"kind": enums.BrandProviderKind.ELITE_WHEEL,             "name": "Elite Wheel",                "category": "Distributors"},
+    {"kind": enums.BrandProviderKind.FASTCO,                  "name": "FastCo",                     "category": "Distributors"},
+    {"kind": enums.BrandProviderKind.GRANDWEST_ENTERPRISES,   "name": "GrandWest Enterprises",      "category": "Distributors"},
+    {"kind": enums.BrandProviderKind.HELMHOUSE,               "name": "HelmHouse",                  "category": "Distributors"},
+    {"kind": enums.BrandProviderKind.HOLLEY_PERFORMANCE,      "name": "Holley Performance",         "category": "Distributors"},
+    {"kind": enums.BrandProviderKind.THIBAULT,                "name": "Thibault",                   "category": "Distributors"},
+    {"kind": enums.BrandProviderKind.MARCOR,                  "name": "Marcor",                     "category": "Distributors"},
+    {"kind": enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING,"name": "Motor State Distributing",   "category": "Distributors"},
+    {"kind": enums.BrandProviderKind.OVERLAND_VEHICLE_SYSTEMS,"name": "Overland Vehicle Systems",   "category": "Distributors"},
+    {"kind": enums.BrandProviderKind.PARTS_AUTHORITY,         "name": "Parts Authority",            "category": "Distributors"},
+    {"kind": enums.BrandProviderKind.PARTS_CANADA,            "name": "Parts Canada",               "category": "Distributors"},
+    {"kind": enums.BrandProviderKind.PARTS_UNLIMITED,         "name": "Parts Unlimited",            "category": "Distributors"},
+    {"kind": enums.BrandProviderKind.PREMIER_PERFORMANCE,     "name": "Premier Performance",        "category": "Distributors"},
+    {"kind": enums.BrandProviderKind.SSF_IMPORTED_AUTO_PARTS, "name": "SSF Imported Auto Parts",    "category": "Distributors"},
+    {"kind": enums.BrandProviderKind.THE_WHEEL_GROUP,         "name": "The Wheel Group",            "category": "Distributors"},
+    {"kind": enums.BrandProviderKind.THIBERT,                 "name": "Thibert",                    "category": "Distributors"},
+    {"kind": enums.BrandProviderKind.WESTERN_POWER_SPORTS,    "name": "Western Power Sports",       "category": "Distributors"},
+    {"kind": enums.BrandProviderKind.XDP,                     "name": "XDP",                        "category": "Distributors"},
+]
+
 # Field priority configuration for merging CATALOG and DISTRIBUTOR parts
 # Each field maps to its primary source (CATALOG or DISTRIBUTOR)
 # If field is null/empty in primary source, fallback to the other source
