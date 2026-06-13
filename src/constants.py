@@ -279,9 +279,9 @@ COMING_SOON_PROVIDERS = [
     {"kind": enums.BrandProviderKind.PREMIER_PERFORMANCE,     "name": "Premier Performance",        "category": "Distributors", "icon_url": f"{_UPLOADS}/premier_performance_logo.png"},
     {"kind": enums.BrandProviderKind.SSF_IMPORTED_AUTO_PARTS, "name": "SSF Imported Auto Parts",    "category": "Distributors", "icon_url": f"{_UPLOADS}/ssf_logo.png"},
     {"kind": enums.BrandProviderKind.THE_WHEEL_GROUP,         "name": "The Wheel Group",            "category": "Distributors", "icon_url": f"{_UPLOADS}/the_wheel_group_logo.png"},
-    {"kind": enums.BrandProviderKind.THIBERT,                 "name": "Thibert",                    "category": "Distributors", "icon_url": f"{_UPLOADS}/thibert_logo.png"},
-    {"kind": enums.BrandProviderKind.WESTERN_POWER_SPORTS,    "name": "Western Power Sports",       "category": "Distributors", "icon_url": f"{_UPLOADS}/western_power_sports_logo.png"},
-    {"kind": enums.BrandProviderKind.XDP,                     "name": "XDP",                        "category": "Distributors", "icon_url": f"{_UPLOADS}/xdp_logo.png"},
+    # {"kind": enums.BrandProviderKind.THIBERT,                 "name": "Thibert",                    "category": "Distributors", "icon_url": f"{_UPLOADS}/thibert_logo.png"},
+    # {"kind": enums.BrandProviderKind.WESTERN_POWER_SPORTS,    "name": "Western Power Sports",       "category": "Distributors", "icon_url": f"{_UPLOADS}/western_power_sports_logo.png"},
+    # {"kind": enums.BrandProviderKind.XDP,                     "name": "XDP",                        "category": "Distributors", "icon_url": f"{_UPLOADS}/xdp_logo.png"},
 ]
 
 # Field priority configuration for merging CATALOG and DISTRIBUTOR parts
