@@ -269,3 +269,41 @@ class CompanyTeamMemberView(views.View):
         if err:
             return _json_response({"message": err}, status=400)
         return _json_response({"message": "User removed from company"})
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class DeleteAccountView(views.View):
+    """DELETE /settings/account/ — delete the authenticated user's own account."""
+
+    def delete(self, request: http.HttpRequest, *args, **kwargs) -> http.HttpResponse:
+        company_id, err = _auth_and_company(request)
+        if err:
+            return _json_response({"message": err}, status=401)
+
+        ok, error = company_settings_services.delete_user_account(
+            user=request.user,
+            company_id=company_id,
+        )
+        if not ok:
+            return _json_response({"message": error}, status=400)
+
+        return _json_response({"message": "Account deleted successfully"})
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class DeleteCompanyDataView(views.View):
+    """DELETE /settings/company/data/ — admin-only wipe of all company data."""
+
+    def delete(self, request: http.HttpRequest, *args, **kwargs) -> http.HttpResponse:
+        company_id, err = _auth_and_company(request)
+        if err:
+            return _json_response({"message": err}, status=401)
+
+        ok, error = company_settings_services.delete_all_company_data(
+            user=request.user,
+            company_id=company_id,
+        )
+        if not ok:
+            return _json_response({"message": error}, status=403)
+
+        return _json_response({"message": "All company data deleted successfully"})

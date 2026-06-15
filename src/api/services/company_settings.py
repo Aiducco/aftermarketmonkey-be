@@ -313,3 +313,71 @@ def remove_company_user(
     profile.save()
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# Account deletion
+# ---------------------------------------------------------------------------
+
+def delete_user_account(user, company_id: int) -> tuple[bool, str | None]:
+    """
+    Hard-delete the authenticated user's own account.
+    Blocks if the user is the sole admin of their company.
+    Returns (ok, error_message).
+    """
+    try:
+        profile = src_models.UserProfile.objects.get(user=user, company_id=company_id)
+    except src_models.UserProfile.DoesNotExist:
+        # No profile — still allow deleting the auth user
+        profile = None
+
+    if profile and profile.is_company_admin:
+        remaining_admins = src_models.UserProfile.objects.filter(
+            company_id=company_id,
+            is_company_admin=True,
+        ).exclude(user=user).count()
+        if remaining_admins == 0:
+            return False, "Cannot delete account: you are the last admin. Transfer admin rights first."
+
+    # Delete the Django auth user (cascades to UserProfile via OneToOneField)
+    user.delete()
+    return True, None
+
+
+# ---------------------------------------------------------------------------
+# Company data wipe
+# ---------------------------------------------------------------------------
+
+def delete_all_company_data(user, company_id: int) -> tuple[bool, str | None]:
+    """
+    Admin-only: wipe all data for the company inside a single transaction.
+    Deletes all company users, integration connections, integration requests,
+    destinations, onboarding preferences, company brands, and the company row.
+    Returns (ok, error_message).
+    """
+    ok, err = _is_company_admin(user, company_id)
+    if not ok:
+        return False, err
+
+    with transaction.atomic():
+        # Collect all Django auth user IDs in the company before deleting profiles
+        user_ids = list(
+            src_models.UserProfile.objects.filter(company_id=company_id)
+            .values_list("user_id", flat=True)
+        )
+
+        # Company-scoped data — Django cascades handle most FK children,
+        # but we delete explicitly for clarity and safety.
+        src_models.IntegrationRequest.objects.filter(company_id=company_id).delete()
+        src_models.CompanyProviders.objects.filter(company_id=company_id).delete()
+        src_models.CompanyDestinations.objects.filter(company_id=company_id).delete()
+        src_models.CompanyBrands.objects.filter(company_id=company_id).delete()
+        src_models.CompanyOnboardingPreferences.objects.filter(company_id=company_id).delete()
+
+        # Delete all auth users (cascades to UserProfile)
+        auth_models.User.objects.filter(id__in=user_ids).delete()
+
+        # Finally delete the company itself
+        src_models.Company.objects.filter(id=company_id).delete()
+
+    return True, None

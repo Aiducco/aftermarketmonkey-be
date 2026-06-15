@@ -21,6 +21,8 @@ from src.api.views.company_settings import (
     CompanySettingsView,
     CompanyTeamView,
     CompanyTeamMemberView,
+    DeleteAccountView,
+    DeleteCompanyDataView,
 )
 from src.api.views.billing import (
     CreatePortalSessionView,
@@ -204,6 +206,16 @@ urlpatterns = [
         "settings/company/team/<int:user_id>/",
         CompanyTeamMemberView.as_view(),
         name="company_team_member",
+    ),
+    path(
+        "settings/account/",
+        DeleteAccountView.as_view(),
+        name="delete_account",
+    ),
+    path(
+        "settings/company/data/",
+        DeleteCompanyDataView.as_view(),
+        name="delete_company_data",
     ),
     path(
         "billing/subscription/",
