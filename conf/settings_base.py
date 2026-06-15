@@ -218,7 +218,7 @@ STRIPE_PLANS = {
 }
 # Plan amounts in smallest currency unit (cents); currency per plan
 STRIPE_PLAN_AMOUNTS = {
-    "starter": 4900,
+    "starter": 100,  # $1 for testing — change back to 4900 before launch
     "pro": 9900,
     "growth": 19900,
 }
