@@ -4476,6 +4476,31 @@ def sync_provider_inventory_from_keystone() -> None:
     logger.info("{} Synced {} Keystone inventory records total.".format(_LOG_PREFIX, total_upserted))
 
 
+def _meyer_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
+    """
+    Build the product_details list for a MeyerParts row.
+    Boolean flags are stored as True/False; dimensions as float or None.
+    """
+    def _decimal(val):
+        if val is None:
+            return None
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return None
+
+    return [
+        {"key": "is_discontinued",       "label": "Discontinued",                "value": bool(row.get("is_discontinued"))},
+        {"key": "addtl_handling_charge",  "label": "Additional Handling Charge",  "value": bool(row.get("addtl_handling_charge"))},
+        {"key": "is_oversize",            "label": "Oversize Parcel",             "value": bool(row.get("is_oversize"))},
+        {"key": "is_ltl",                 "label": "LTL (Freight)",               "value": bool(row.get("is_ltl"))},
+        {"key": "length_in",              "label": "Length (in)",                 "value": _decimal(row.get("length"))},
+        {"key": "width_in",               "label": "Width (in)",                  "value": _decimal(row.get("width"))},
+        {"key": "height_in",              "label": "Height (in)",                 "value": _decimal(row.get("height"))},
+        {"key": "weight_lbs",             "label": "Weight (lbs)",                "value": _decimal(row.get("weight"))},
+    ]
+
+
 def _meyer_warehouse_availability(row: typing.Dict) -> typing.Dict:
     """Meyer inventory flags + quantities for ProviderPartInventory.warehouse_availability JSON."""
     inv = 0
@@ -4552,6 +4577,14 @@ def sync_provider_inventory_from_meyer() -> None:
                     "is_stocking",
                     "is_special_order",
                     "inventory_ltl",
+                    "is_discontinued",
+                    "addtl_handling_charge",
+                    "is_oversize",
+                    "is_ltl",
+                    "length",
+                    "width",
+                    "height",
+                    "weight",
                 )[:BATCH_SIZE_INVENTORY]
             )
             if not batch:
@@ -4606,6 +4639,21 @@ def sync_provider_inventory_from_meyer() -> None:
                     ],
                 )
                 total_upserted += len(to_upsert)
+
+            # Update product_details on ProviderPart (product metadata, not inventory)
+            pp_details_to_update = []
+            for mp in batch:
+                ext = mp.get("meyer_part")
+                if isinstance(ext, str):
+                    ext = ext.strip()
+                else:
+                    ext = str(ext or "").strip()
+                pp = provider_parts.get(ext)
+                if pp:
+                    pp.product_details = _meyer_product_details(mp)
+                    pp_details_to_update.append(pp)
+            if pp_details_to_update:
+                src_models.ProviderPart.objects.bulk_update(pp_details_to_update, ["product_details"])
 
             logger.info("{} Meyer inventory batch {}: {} records (last_id={})".format(
                 _LOG_PREFIX, batch_num, len(to_upsert), last_id
