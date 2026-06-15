@@ -2115,6 +2115,28 @@ def sync_provider_inventory_from_dlg() -> None:
     logger.info("{} Synced {} DLG inventory records total.".format(_LOG_PREFIX, total_upserted))
 
 
+def _atech_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
+    """
+    Build the product_details list for an AtechParts row.
+    Fee fields: None when value is 0 or null (no charge).
+    """
+    def _fee(val):
+        if val is None:
+            return None
+        try:
+            f = float(val)
+            return f if f != 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    return [
+        {"key": "fee_hazmat",          "label": "HAZMAT Fee",          "value": _fee(row.get("fee_hazmat"))},
+        {"key": "fee_ground_shipping",  "label": "Ground Shipping Fee", "value": _fee(row.get("fee_truck_us"))},
+        {"key": "fee_air_shipping",     "label": "Air Shipping Fee",    "value": _fee(row.get("fee_handling_air"))},
+        {"key": "fee_freight",          "label": "Freight Fee",         "value": _fee(row.get("fee_truck_us"))},
+    ]
+
+
 def _atech_dc_inventory_sum(row: typing.Dict) -> int:
     total = 0
     for k in ("qty_tallmadge", "qty_sparks", "qty_mcdonough", "qty_arlington"):
@@ -2183,6 +2205,9 @@ def sync_provider_inventory_from_atech() -> None:
                     "qty_sparks",
                     "qty_mcdonough",
                     "qty_arlington",
+                    "fee_hazmat",
+                    "fee_truck_us",
+                    "fee_handling_air",
                 )[:BATCH_SIZE_INVENTORY]
             )
             if not batch:
@@ -2235,6 +2260,25 @@ def sync_provider_inventory_from_atech() -> None:
                     ],
                 )
                 total_upserted += len(to_upsert)
+
+            # Update product_details on ProviderPart (product metadata, not inventory)
+            pp_details_to_update = []
+            for ap in batch:
+                ext = ap.get("part_number")
+                if isinstance(ext, str):
+                    ext = ext.strip()
+                else:
+                    ext = str(ext or "").strip()
+                bid = ap.get("brand_id")
+                if not ext or bid is None:
+                    continue
+                ext_id = _atech_provider_external_id(int(bid), ext)
+                pp = provider_parts.get(ext_id)
+                if pp:
+                    pp.product_details = _atech_product_details(ap)
+                    pp_details_to_update.append(pp)
+            if pp_details_to_update:
+                src_models.ProviderPart.objects.bulk_update(pp_details_to_update, ["product_details"])
 
             logger.info("{} A-Tech inventory batch {}: {} records (last_id={})".format(
                 _LOG_PREFIX, batch_num, len(to_upsert), last_id
