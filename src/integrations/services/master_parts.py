@@ -4382,7 +4382,6 @@ def sync_provider_inventory_from_keystone() -> None:
                     manufacturer_inventory=None,
                     manufacturer_esd=None,
                     warehouse_availability=_keystone_warehouse_availability(kp),
-                    product_details=_keystone_product_details(kp),
                     last_synced_at=now,
                     updated_at=now,
                 )
@@ -4403,10 +4402,21 @@ def sync_provider_inventory_from_keystone() -> None:
                         "manufacturer_inventory",
                         "manufacturer_esd",
                         "warehouse_availability",
-                        "product_details",
                         "last_synced_at",
                         "updated_at",
                     ],
+                )
+
+            # Update product_details on ProviderPart (product metadata, not inventory)
+            pp_details_to_update = []
+            for kp in batch:
+                if kp["vcpn"] in provider_parts:
+                    pp = provider_parts[kp["vcpn"]]
+                    pp.product_details = _keystone_product_details(kp)
+                    pp_details_to_update.append(pp)
+            if pp_details_to_update:
+                src_models.ProviderPart.objects.bulk_update(
+                    pp_details_to_update, ["product_details"]
                 )
                 total_upserted += len(to_upsert)
 

@@ -307,6 +307,7 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
         }
 
         if integrated:
+            provider_info["product_details"] = pp.product_details
             if inv_obj:
                 wh_avail = inv_obj.warehouse_availability
                 if kind_name == "TURN_14":
@@ -318,7 +319,6 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
                     "warehouse_availability": wh_avail,
                     "last_synced_at": inv_obj.last_synced_at.isoformat() if inv_obj.last_synced_at else None,
                 }
-                provider_info["product_details"] = inv_obj.product_details
 
             pricing_row = None
             if company_id is not None:
