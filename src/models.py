@@ -1208,6 +1208,7 @@ class ProviderPart(django_db_models.Model):
     category = django_db_models.CharField(max_length=255, null=True, blank=True)
     subcategory = django_db_models.CharField(max_length=255, null=True, blank=True)
     product_details = django_db_models.JSONField(null=True)
+    is_discontinued = django_db_models.BooleanField(default=False)
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)

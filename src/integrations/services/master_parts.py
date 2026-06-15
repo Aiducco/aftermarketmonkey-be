@@ -2015,16 +2015,17 @@ def sync_provider_inventory_from_rough_country() -> None:
                 )
                 total_upserted += len(to_upsert)
 
-            # Update product_details on ProviderPart (product metadata, not inventory)
+            # Update product_details and is_discontinued on ProviderPart
             pp_details_to_update = []
             for row in batch:
                 ext_id = _rough_country_provider_external_id(row["brand_id"], row["sku"])
                 pp = provider_parts.get(ext_id)
                 if pp:
                     pp.product_details = _rough_country_product_details(row)
+                    pp.is_discontinued = bool(row.get("is_discontinued"))
                     pp_details_to_update.append(pp)
             if pp_details_to_update:
-                src_models.ProviderPart.objects.bulk_update(pp_details_to_update, ["product_details"])
+                src_models.ProviderPart.objects.bulk_update(pp_details_to_update, ["product_details", "is_discontinued"])
 
             logger.info("{} Rough Country inventory batch {}: {} records (last_id={})".format(
                 _LOG_PREFIX, batch_num, len(to_upsert), last_id
@@ -3166,7 +3167,7 @@ def sync_provider_inventory_from_wheelpros() -> None:
                 )
                 total_upserted += len(to_upsert)
 
-            # Update product_details on ProviderPart (product metadata, not inventory)
+            # Update product_details and is_discontinued on ProviderPart
             pp_details_to_update = []
             for row in batch:
                 part_number = (row.get("part_number") or "").strip()
@@ -3178,9 +3179,10 @@ def sync_provider_inventory_from_wheelpros() -> None:
                 )
                 if provider_part:
                     provider_part.product_details = _wheelpros_product_details(row)
+                    provider_part.is_discontinued = (row.get("inv_order_type") or "").strip() == "N2"
                     pp_details_to_update.append(provider_part)
             if pp_details_to_update:
-                src_models.ProviderPart.objects.bulk_update(pp_details_to_update, ["product_details"])
+                src_models.ProviderPart.objects.bulk_update(pp_details_to_update, ["product_details", "is_discontinued"])
 
             logger.info("{} WheelPros inventory batch {}: {} records (last_id={})".format(
                 _LOG_PREFIX, batch_num, len(to_upsert), last_id
@@ -4786,7 +4788,7 @@ def sync_provider_inventory_from_meyer() -> None:
                 )
                 total_upserted += len(to_upsert)
 
-            # Update product_details on ProviderPart (product metadata, not inventory)
+            # Update product_details and is_discontinued on ProviderPart
             pp_details_to_update = []
             for mp in batch:
                 ext = mp.get("meyer_part")
@@ -4797,9 +4799,10 @@ def sync_provider_inventory_from_meyer() -> None:
                 pp = provider_parts.get(ext)
                 if pp:
                     pp.product_details = _meyer_product_details(mp)
+                    pp.is_discontinued = bool(mp.get("is_discontinued"))
                     pp_details_to_update.append(pp)
             if pp_details_to_update:
-                src_models.ProviderPart.objects.bulk_update(pp_details_to_update, ["product_details"])
+                src_models.ProviderPart.objects.bulk_update(pp_details_to_update, ["product_details", "is_discontinued"])
 
             logger.info("{} Meyer inventory batch {}: {} records (last_id={})".format(
                 _LOG_PREFIX, batch_num, len(to_upsert), last_id

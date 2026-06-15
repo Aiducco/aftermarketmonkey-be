@@ -301,6 +301,7 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
                 turn14_vmm,
             ),
             "company_integration": {"connected": integrated},
+            "is_discontinued": pp.is_discontinued,
             "inventory": None,
             "pricing": None,
             "product_details": None,
