@@ -338,6 +338,9 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
                     "last_synced_at": (
                         pricing_row.last_synced_at.isoformat() if pricing_row.last_synced_at else None
                     ),
+                    "cost_tooltip": (
+                        "Cost set by user in Settings" if kind_name == "WHEELPROS" else None
+                    ),
                 }
 
         providers_data.append(provider_info)
