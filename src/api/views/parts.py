@@ -4,6 +4,7 @@ import typing
 import simplejson
 from django import http, views
 
+from src.api.services import billing as billing_services
 from src.api.services import company_settings as company_settings_services
 from src.api.services import parts as parts_services
 from src.audit import parts as audit_parts
@@ -256,6 +257,14 @@ class PartDetailView(views.View):
                 headers={"Content-Type": "application/json"},
                 content=simplejson.dumps({"message": "Part ID required"}),
                 status=400,
+            )
+
+        allowed, reason = billing_services.check_detail_view_limit(company_id)
+        if not allowed:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": reason, "upgrade_required": True}),
+                status=402,
             )
 
         try:
