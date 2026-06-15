@@ -1364,6 +1364,38 @@ class PartRequestAudit(django_db_models.Model):
         ]
 
 
+class SupportTicket(django_db_models.Model):
+    STATUS_OPEN = "open"
+    STATUS_IN_PROGRESS = "in_progress"
+    STATUS_RESOLVED = "resolved"
+    STATUS_CLOSED = "closed"
+
+    company = django_db_models.ForeignKey(
+        Company,
+        on_delete=django_db_models.CASCADE,
+        related_name="support_tickets",
+    )
+    user = django_db_models.ForeignKey(
+        auth_models.User,
+        on_delete=django_db_models.CASCADE,
+        related_name="support_tickets",
+    )
+    subject = django_db_models.CharField(max_length=100)
+    message = django_db_models.TextField()
+    status = django_db_models.CharField(max_length=20, default=STATUS_OPEN)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "support_tickets"
+        ordering = ["-created_at"]
+        indexes = [
+            django_db_models.Index(fields=["company"], name="st_company_idx"),
+            django_db_models.Index(fields=["user"], name="st_user_idx"),
+        ]
+
+
 class USZipCode(django_db_models.Model):
     zip_code = django_db_models.CharField(max_length=10, unique=True)
     city = django_db_models.CharField(max_length=128)

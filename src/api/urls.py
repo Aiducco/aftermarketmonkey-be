@@ -24,6 +24,7 @@ from src.api.views.company_settings import (
     DeleteAccountView,
     DeleteCompanyDataView,
 )
+from src.api.views.support import SupportTicketsView
 from src.api.views.billing import (
     CreatePortalSessionView,
     CreateCheckoutSessionView,
@@ -243,5 +244,10 @@ urlpatterns = [
         "billing/webhook/",
         WebhookView.as_view(),
         name="billing_webhook",
+    ),
+    path(
+        "support/tickets/",
+        SupportTicketsView.as_view(),
+        name="support_tickets",
     ),
 ]
