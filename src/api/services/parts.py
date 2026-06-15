@@ -315,6 +315,7 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
                     "manufacturer_inventory": inv_obj.manufacturer_inventory,
                     "manufacturer_esd": inv_obj.manufacturer_esd.isoformat() if inv_obj.manufacturer_esd else None,
                     "warehouse_availability": wh_avail,
+                    "product_details": inv_obj.product_details,
                     "last_synced_at": inv_obj.last_synced_at.isoformat() if inv_obj.last_synced_at else None,
                 }
 

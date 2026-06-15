@@ -4276,6 +4276,37 @@ def _keystone_warehouse_availability(row: typing.Dict) -> typing.Optional[typing
     return None
 
 
+def _keystone_product_details(row: typing.Dict) -> typing.Dict:
+    """Build the product_details dict for a KeystoneParts row."""
+    upsable = bool(row.get("upsable"))
+
+    def _decimal(val):
+        return float(val) if val is not None else None
+
+    kit_raw = row.get("kit_components") or ""
+    kit_html = kit_raw.replace("|", "<br>") if kit_raw else None
+
+    details: typing.Dict[str, typing.Any] = {
+        "parcel_eligible": upsable,
+        "non_returnable": bool(row.get("is_non_returnable")),
+        "hazmat": bool(row.get("is_hazmat")),
+        "length_in": _decimal(row.get("length")),
+        "width_in": _decimal(row.get("width")),
+        "height_in": _decimal(row.get("height")),
+        "weight_lbs": _decimal(row.get("weight")),
+        "is_kit": bool(row.get("is_kit")),
+        "kit_components": kit_html,
+    }
+
+    # Shipping fee: UPS assessorial only shown when UPSable; freight (LTL) only when not UPSable
+    if upsable:
+        details["ups_assessorial_fee"] = _decimal(row.get("ups_ground_assessorial"))
+    else:
+        details["freight_fee"] = _decimal(row.get("us_ltl"))
+
+    return details
+
+
 def sync_provider_inventory_from_keystone() -> None:
     """
     Sync ProviderPartInventory from KeystoneParts.
@@ -4319,6 +4350,11 @@ def sync_provider_inventory_from_keystone() -> None:
                     "id", "vcpn", "total_qty",
                     "east_qty", "midwest_qty", "california_qty", "southeast_qty",
                     "pacific_nw_qty", "texas_qty", "great_lakes_qty", "florida_qty",
+                    # product_details fields
+                    "upsable", "ups_ground_assessorial", "us_ltl",
+                    "is_non_returnable", "is_hazmat",
+                    "length", "width", "height", "weight",
+                    "is_kit", "kit_components",
                 )[:BATCH_SIZE_INVENTORY]
             )
             if not batch:
@@ -4332,6 +4368,7 @@ def sync_provider_inventory_from_keystone() -> None:
                     manufacturer_inventory=None,
                     manufacturer_esd=None,
                     warehouse_availability=_keystone_warehouse_availability(kp),
+                    product_details=_keystone_product_details(kp),
                     last_synced_at=now,
                     updated_at=now,
                 )
@@ -4352,6 +4389,7 @@ def sync_provider_inventory_from_keystone() -> None:
                         "manufacturer_inventory",
                         "manufacturer_esd",
                         "warehouse_availability",
+                        "product_details",
                         "last_synced_at",
                         "updated_at",
                     ],

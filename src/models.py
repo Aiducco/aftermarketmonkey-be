@@ -1228,6 +1228,7 @@ class ProviderPartInventory(django_db_models.Model):
     manufacturer_inventory = django_db_models.IntegerField(null=True)
     manufacturer_esd = django_db_models.DateField(null=True)
     warehouse_availability = django_db_models.JSONField(null=True)
+    product_details = django_db_models.JSONField(null=True)
     last_synced_at = django_db_models.DateTimeField(null=True)
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
