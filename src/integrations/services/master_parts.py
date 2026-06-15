@@ -4276,8 +4276,11 @@ def _keystone_warehouse_availability(row: typing.Dict) -> typing.Optional[typing
     return None
 
 
-def _keystone_product_details(row: typing.Dict) -> typing.Dict:
-    """Build the product_details dict for a KeystoneParts row."""
+def _keystone_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
+    """
+    Build the product_details list for a KeystoneParts row.
+    Each entry: {key, label, value} — ready for FE to iterate and render.
+    """
     upsable = bool(row.get("upsable"))
 
     def _decimal(val):
@@ -4286,23 +4289,34 @@ def _keystone_product_details(row: typing.Dict) -> typing.Dict:
     kit_raw = row.get("kit_components") or ""
     kit_html = kit_raw.replace("|", "<br>") if kit_raw else None
 
-    details: typing.Dict[str, typing.Any] = {
-        "parcel_eligible": upsable,
-        "non_returnable": bool(row.get("is_non_returnable")),
-        "hazmat": bool(row.get("is_hazmat")),
-        "length_in": _decimal(row.get("length")),
-        "width_in": _decimal(row.get("width")),
-        "height_in": _decimal(row.get("height")),
-        "weight_lbs": _decimal(row.get("weight")),
-        "is_kit": bool(row.get("is_kit")),
-        "kit_components": kit_html,
-    }
+    details = [
+        {"key": "parcel_eligible",  "label": "Parcel Eligible",           "value": upsable},
+    ]
 
-    # Shipping fee: UPS assessorial only shown when UPSable; freight (LTL) only when not UPSable
+    # Shipping fee: only one applies depending on UPSable
     if upsable:
-        details["ups_assessorial_fee"] = _decimal(row.get("ups_ground_assessorial"))
+        details.append({
+            "key": "ups_assessorial_fee",
+            "label": "UPS Assessorial Fee (Drop Ship Orders)",
+            "value": _decimal(row.get("ups_ground_assessorial")),
+        })
     else:
-        details["freight_fee"] = _decimal(row.get("us_ltl"))
+        details.append({
+            "key": "freight_fee",
+            "label": "Freight Fee (Drop Ship Orders)",
+            "value": _decimal(row.get("us_ltl")),
+        })
+
+    details += [
+        {"key": "non_returnable",   "label": "Non-Returnable",            "value": bool(row.get("is_non_returnable"))},
+        {"key": "hazmat",           "label": "HAZMAT",                    "value": bool(row.get("is_hazmat"))},
+        {"key": "length_in",        "label": "Length (in)",               "value": _decimal(row.get("length"))},
+        {"key": "width_in",         "label": "Width (in)",                "value": _decimal(row.get("width"))},
+        {"key": "height_in",        "label": "Height (in)",               "value": _decimal(row.get("height"))},
+        {"key": "weight_lbs",       "label": "Weight (lbs)",              "value": _decimal(row.get("weight"))},
+        {"key": "is_kit",           "label": "Kit",                       "value": bool(row.get("is_kit"))},
+        {"key": "kit_components",   "label": "Kit Components",            "value": kit_html},
+    ]
 
     return details
 
