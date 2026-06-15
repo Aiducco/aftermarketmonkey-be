@@ -2973,6 +2973,50 @@ def sync_master_parts_from_wheelpros() -> None:
     ))
 
 
+_WHEELPROS_INV_ORDER_TYPE_LABELS: typing.Dict[str, str] = {
+    "BL": "Blanks",
+    "BW": "Blowout",
+    "CS": "Custom Shop",
+    "DB": "Drill from Blank",
+    "IT": "International Only",
+    "N2": "Subject to Inventory (Discontinued)",
+    "NW": "New",
+    "RG": "Regional",
+    "RW": "Race Wheels",
+    "SO": "Special Order",
+    "ST": "Stocking (Standard)",
+}
+
+
+def _wheelpros_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
+    """
+    Build the product_details list for a WheelProsPart row.
+    inv_order_type is mapped to a human-readable label.
+    """
+    def _decimal(val):
+        if val is None:
+            return None
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return None
+
+    raw_inv_type = (row.get("inv_order_type") or "").strip()
+    inv_type_label = _WHEELPROS_INV_ORDER_TYPE_LABELS.get(raw_inv_type, raw_inv_type) if raw_inv_type else None
+
+    return [
+        {"key": "image_url",       "label": "Image",            "value": row.get("image_url") or None},
+        {"key": "inv_order_type",  "label": "Inventory Type",   "value": inv_type_label},
+        {"key": "shipping_weight", "label": "Shipping Weight",  "value": _decimal(row.get("shipping_weight"))},
+        {"key": "finish",          "label": "Finish",           "value": row.get("finish") or None},
+        {"key": "size",            "label": "Size",             "value": row.get("size") or None},
+        {"key": "bolt_pattern",    "label": "Bolt Pattern",     "value": row.get("bolt_pattern") or None},
+        {"key": "offset",          "label": "Offset",           "value": row.get("offset") or None},
+        {"key": "center_bore",     "label": "Center Bore",      "value": row.get("center_bore") or None},
+        {"key": "load_rating",     "label": "Load Rating",      "value": row.get("load_rating") or None},
+    ]
+
+
 def sync_provider_inventory_from_wheelpros() -> None:
     """
     Sync ProviderPartInventory from WheelProsPart (total_qoh, warehouse_availability).
@@ -3009,7 +3053,11 @@ def sync_provider_inventory_from_wheelpros() -> None:
             batch = list(
                 src_models.WheelProsPart.objects.filter(id__gt=last_id, brand_id__in=catalog_ids)
                 .order_by("id")
-                .values("id", "brand_id", "part_number", "total_qoh", "warehouse_availability")[:BATCH_SIZE_INVENTORY]
+                .values(
+                    "id", "brand_id", "part_number", "total_qoh", "warehouse_availability",
+                    "image_url", "inv_order_type", "shipping_weight",
+                    "finish", "size", "bolt_pattern", "offset", "center_bore", "load_rating",
+                )[:BATCH_SIZE_INVENTORY]
             )
             if not batch:
                 break
@@ -3067,6 +3115,22 @@ def sync_provider_inventory_from_wheelpros() -> None:
                     ],
                 )
                 total_upserted += len(to_upsert)
+
+            # Update product_details on ProviderPart (product metadata, not inventory)
+            pp_details_to_update = []
+            for row in batch:
+                part_number = (row.get("part_number") or "").strip()
+                if not part_number:
+                    continue
+                ext_id = _wheelpros_provider_external_id(row["brand_id"], part_number)
+                provider_part = provider_parts_by_ext_id.get(ext_id) or provider_parts_by_brand_sku.get(
+                    (row["brand_id"], part_number)
+                )
+                if provider_part:
+                    provider_part.product_details = _wheelpros_product_details(row)
+                    pp_details_to_update.append(provider_part)
+            if pp_details_to_update:
+                src_models.ProviderPart.objects.bulk_update(pp_details_to_update, ["product_details"])
 
             logger.info("{} WheelPros inventory batch {}: {} records (last_id={})".format(
                 _LOG_PREFIX, batch_num, len(to_upsert), last_id
