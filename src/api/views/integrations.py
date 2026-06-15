@@ -723,3 +723,77 @@ class ExecutionRunPartsHistoryView(views.View):
             status=200,
         )
 
+
+class IntegrationRequestsView(views.View):
+    """
+    GET  /integrations/requests/  — return provider IDs already requested by this company
+    POST /integrations/requests/  — create (or no-op) a request for a provider
+    """
+
+    def _auth_check(self, request):
+        if not request.user or not request.user.is_authenticated:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "User not authenticated"}),
+                status=401,
+            )
+        company_id = getattr(request, "company_id", None)
+        if not company_id:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "No company found in token"}),
+                status=400,
+            )
+        return None
+
+    def get(self, request: http.HttpRequest, *args, **kwargs) -> http.HttpResponse:
+        err = self._auth_check(request)
+        if err:
+            return err
+
+        provider_ids = integrations_services.get_integration_requests(company_id=request.company_id)
+        return http.HttpResponse(
+            headers={"Content-Type": "application/json"},
+            content=simplejson.dumps({"requested_provider_ids": provider_ids}),
+            status=200,
+        )
+
+    def post(self, request: http.HttpRequest, *args, **kwargs) -> http.HttpResponse:
+        err = self._auth_check(request)
+        if err:
+            return err
+
+        try:
+            body = json.loads(request.body)
+        except Exception:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Invalid JSON body"}),
+                status=400,
+            )
+
+        provider_id = body.get("provider_id")
+        if not provider_id:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "provider_id is required"}),
+                status=400,
+            )
+
+        ok, error = integrations_services.create_integration_request(
+            company_id=request.company_id,
+            provider_id=provider_id,
+        )
+        if not ok:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": error}),
+                status=404,
+            )
+
+        return http.HttpResponse(
+            headers={"Content-Type": "application/json"},
+            content=simplejson.dumps({"status": "requested"}),
+            status=200,
+        )
+

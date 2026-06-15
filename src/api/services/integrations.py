@@ -926,6 +926,36 @@ def get_execution_run_parts_history(
     logger.info('{} Found {} parts history records for execution_run_id: {} (page {} of {}).'.format(
         _LOG_PREFIX, len(data), execution_run_id, page_obj.number, paginator.num_pages
     ))
-    
+
     return result
+
+
+# ---------------------------------------------------------------------------
+# Integration requests
+# ---------------------------------------------------------------------------
+
+def create_integration_request(company_id: int, provider_id: int) -> typing.Tuple[bool, typing.Optional[str]]:
+    """
+    Create an IntegrationRequest for the given company + provider.
+    Idempotent — if one already exists, return success without error.
+    Returns (ok, error_message).
+    """
+    provider = src_models.Providers.objects.filter(id=provider_id).first()
+    if not provider:
+        return False, "Provider not found"
+
+    src_models.IntegrationRequest.objects.get_or_create(
+        company_id=company_id,
+        provider=provider,
+    )
+    return True, None
+
+
+def get_integration_requests(company_id: int) -> typing.List[int]:
+    """Return list of provider IDs the company has already requested."""
+    return list(
+        src_models.IntegrationRequest.objects.filter(company_id=company_id)
+        .values_list("provider_id", flat=True)
+    )
+
 
