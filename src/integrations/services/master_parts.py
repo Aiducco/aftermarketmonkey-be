@@ -1908,6 +1908,25 @@ def _rough_country_inventory_warehouse_availability(
     return out
 
 
+def _rough_country_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
+    """
+    Build the product_details list for a RoughCountryPart row.
+    - Discontinued / Discontinued Date: None unless SKU is on the Discontinued tab.
+    - Replacement Part #: None if blank.
+    """
+    is_disc = bool(row.get("is_discontinued"))
+    disc_date = row.get("discontinued_date")
+    disc_date_str = disc_date.isoformat() if disc_date and hasattr(disc_date, "isoformat") else (str(disc_date) if disc_date else None)
+    repl = (row.get("replacement_sku") or "").strip() or None
+
+    return [
+        {"key": "link",              "label": "Product Page URL",    "value": row.get("link") or None},
+        {"key": "is_discontinued",   "label": "Discontinued",        "value": "Yes" if is_disc else None},
+        {"key": "discontinued_date", "label": "Discontinued Date",   "value": disc_date_str if is_disc else None},
+        {"key": "replacement_sku",   "label": "Replacement Part #",  "value": repl},
+    ]
+
+
 def sync_provider_inventory_from_rough_country() -> None:
     """
     Sync ProviderPartInventory from RoughCountryPart (nv_stock, tn_stock).
@@ -1947,7 +1966,10 @@ def sync_provider_inventory_from_rough_country() -> None:
             batch = list(
                 src_models.RoughCountryPart.objects.filter(id__gt=last_id, brand_id__in=catalog_ids)
                 .order_by("id")
-                .values("id", "brand_id", "sku", "nv_stock", "tn_stock")[:BATCH_SIZE_INVENTORY]
+                .values(
+                    "id", "brand_id", "sku", "nv_stock", "tn_stock",
+                    "link", "is_discontinued", "discontinued_date", "replacement_sku",
+                )[:BATCH_SIZE_INVENTORY]
             )
             if not batch:
                 break
@@ -1992,6 +2014,17 @@ def sync_provider_inventory_from_rough_country() -> None:
                     ],
                 )
                 total_upserted += len(to_upsert)
+
+            # Update product_details on ProviderPart (product metadata, not inventory)
+            pp_details_to_update = []
+            for row in batch:
+                ext_id = _rough_country_provider_external_id(row["brand_id"], row["sku"])
+                pp = provider_parts.get(ext_id)
+                if pp:
+                    pp.product_details = _rough_country_product_details(row)
+                    pp_details_to_update.append(pp)
+            if pp_details_to_update:
+                src_models.ProviderPart.objects.bulk_update(pp_details_to_update, ["product_details"])
 
             logger.info("{} Rough Country inventory batch {}: {} records (last_id={})".format(
                 _LOG_PREFIX, batch_num, len(to_upsert), last_id
@@ -4215,6 +4248,16 @@ def _map_turn14_inventory_to_location_names(
     return result if result else None
 
 
+def _turn14_product_details(item_row: typing.Dict) -> typing.List[typing.Dict]:
+    """
+    Build the product_details list for a Turn14Items row.
+    """
+    return [
+        {"key": "ltl_freight_required", "label": "LTL (Freight)",  "value": bool(item_row.get("ltl_freight_required"))},
+        {"key": "clearance_item",        "label": "Final Sale",      "value": bool(item_row.get("clearance_item"))},
+    ]
+
+
 def _sync_turn14_provider_inventory_batches(
     *,
     provider_parts: typing.Dict[str, src_models.ProviderPart],
@@ -4293,6 +4336,28 @@ def _sync_turn14_provider_inventory_batches(
                 ],
             )
             total_upserted += len(to_upsert)
+
+        # Update product_details on ProviderPart from Turn14Items fields
+        batch_ext_ids = [inv["external_id"] for inv in batch if inv.get("external_id")]
+        if batch_ext_ids:
+            items_by_ext_id = {
+                row["external_id"]: row
+                for row in src_models.Turn14Items.objects.filter(
+                    external_id__in=batch_ext_ids
+                ).values("external_id", "ltl_freight_required", "clearance_item")
+            }
+            pp_details_to_update = []
+            for inv in batch:
+                ext_id = inv.get("external_id")
+                if not ext_id:
+                    continue
+                pp = provider_parts.get(ext_id)
+                item_row = items_by_ext_id.get(ext_id)
+                if pp and item_row:
+                    pp.product_details = _turn14_product_details(item_row)
+                    pp_details_to_update.append(pp)
+            if pp_details_to_update:
+                src_models.ProviderPart.objects.bulk_update(pp_details_to_update, ["product_details"])
 
         logger.info("{} Turn14 inventory {} batch {}: {} records (last_id={})".format(
             _LOG_PREFIX, log_context, batch_num, len(to_upsert), last_id
