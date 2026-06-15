@@ -19,6 +19,11 @@ class Company(django_db_models.Model):
 
     # Stripe billing
     stripe_customer_id = django_db_models.CharField(max_length=255, null=True, blank=True)
+    # Local subscription state — kept in sync via Stripe webhooks
+    subscription_plan = django_db_models.CharField(max_length=32, null=True, blank=True)
+    subscription_id = django_db_models.CharField(max_length=255, null=True, blank=True)
+    subscription_status = django_db_models.CharField(max_length=32, null=True, blank=True)
+    subscription_period_end = django_db_models.DateTimeField(null=True, blank=True)
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)

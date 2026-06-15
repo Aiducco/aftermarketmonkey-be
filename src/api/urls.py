@@ -28,6 +28,8 @@ from src.api.views.billing import (
     CreatePortalSessionView,
     CreateCheckoutSessionView,
     SubscriptionView,
+    UsageView,
+    WebhookView,
 )
 from src.api.views.onboarding import (
     RegisterView,
@@ -231,5 +233,15 @@ urlpatterns = [
         "billing/create-checkout-session/",
         CreateCheckoutSessionView.as_view(),
         name="billing_create_checkout_session",
+    ),
+    path(
+        "billing/usage/",
+        UsageView.as_view(),
+        name="billing_usage",
+    ),
+    path(
+        "billing/webhook/",
+        WebhookView.as_view(),
+        name="billing_webhook",
     ),
 ]

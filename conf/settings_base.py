@@ -228,6 +228,26 @@ STRIPE_PLAN_CURRENCIES = {
     "growth": "usd",
 }
 
+# Stripe webhook signing secret — set via env (STRIPE_WEBHOOK_SECRET)
+STRIPE_WEBHOOK_SECRET = ""
+
+# Per-plan feature limits. -1 means unlimited. Searches are always unlimited.
+# None key = free/unsubscribed tier.
+PLAN_LIMITS = {
+    None: {
+        "detail_views_per_month": 50,
+    },
+    "starter": {
+        "detail_views_per_month": 500,
+    },
+    "pro": {
+        "detail_views_per_month": 2500,
+    },
+    "growth": {
+        "detail_views_per_month": -1,  # unlimited
+    },
+}
+
 # WheelPros SFTP: host/port for all connections (override via env). Per-company user/password in
 # CompanyProviders.credentials; optional WHEELPROS_SFTP_USER/PASSWORD for local/dev sync only.
 WHEELPROS_SFTP_HOST = os.environ.get("WHEELPROS_SFTP_HOST", "sftp.wheelpros.com")
