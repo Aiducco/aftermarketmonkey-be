@@ -275,7 +275,7 @@ COMING_SOON_PROVIDERS = [
     {"kind": enums.BrandProviderKind.OVERLAND_VEHICLE_SYSTEMS,"name": "Overland Vehicle Systems",   "category": "Distributors", "icon_url": f"{_UPLOADS}/overland_vehicle_systems_logo.png"},
     {"kind": enums.BrandProviderKind.PARTS_AUTHORITY,         "name": "Parts Authority",            "category": "Distributors", "icon_url": f"{_UPLOADS}/parts_authority_logo.png"},
     {"kind": enums.BrandProviderKind.PARTS_CANADA,            "name": "Parts Canada",               "category": "Distributors", "icon_url": f"{_UPLOADS}/parts_canada_logo.png"},
-    {"kind": enums.BrandProviderKind.PARTS_UNLIMITED,         "name": "Parts Unlimited",            "category": "Distributors", "icon_url": f"{_UPLOADS}/parts_unlimited_logo.png"},
+    # {"kind": enums.BrandProviderKind.PARTS_UNLIMITED,         "name": "Parts Unlimited",            "category": "Distributors", "icon_url": f"{_UPLOADS}/parts_unlimited_logo.png"},
     {"kind": enums.BrandProviderKind.PREMIER_PERFORMANCE,     "name": "Premier Performance",        "category": "Distributors", "icon_url": f"{_UPLOADS}/premier_performance_logo.png"},
     {"kind": enums.BrandProviderKind.SSF_IMPORTED_AUTO_PARTS, "name": "SSF Imported Auto Parts",    "category": "Distributors", "icon_url": f"{_UPLOADS}/ssf_logo.png"},
     {"kind": enums.BrandProviderKind.THE_WHEEL_GROUP,         "name": "The Wheel Group",            "category": "Distributors", "icon_url": f"{_UPLOADS}/the_wheel_group_logo.png"},
