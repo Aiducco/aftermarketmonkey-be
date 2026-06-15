@@ -2074,7 +2074,7 @@ def sync_provider_inventory_from_dlg() -> None:
             batch = list(
                 src_models.DlgParts.objects.filter(id__gt=last_id, brand_id__in=catalog_ids)
                 .order_by("id")
-                .values("id", "brand_id", "part_number", "available_on_hand")[:BATCH_SIZE_INVENTORY]
+                .values("id", "brand_id", "part_number", "available_on_hand", "units")[:BATCH_SIZE_INVENTORY]
             )
             if not batch:
                 break
@@ -2135,6 +2135,23 @@ def sync_provider_inventory_from_dlg() -> None:
                     ],
                 )
                 total_upserted += len(to_upsert)
+
+            # Update product_details on ProviderPart (product metadata, not inventory)
+            pp_details_to_update = []
+            for row in batch:
+                pn = row.get("part_number") or ""
+                pn = pn.strip() if isinstance(pn, str) else str(pn or "").strip()
+                if not pn:
+                    continue
+                ext_id = _dlg_provider_external_id(row["brand_id"], pn)
+                pp = provider_parts.get(ext_id)
+                if pp:
+                    pp.product_details = [
+                        {"key": "units", "label": "Unit", "value": row.get("units") or None},
+                    ]
+                    pp_details_to_update.append(pp)
+            if pp_details_to_update:
+                src_models.ProviderPart.objects.bulk_update(pp_details_to_update, ["product_details"])
 
             logger.info("{} DLG inventory batch {}: {} records (last_id={})".format(
                 _LOG_PREFIX, batch_num, len(to_upsert), last_id
