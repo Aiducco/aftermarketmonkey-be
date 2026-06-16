@@ -236,7 +236,7 @@ STRIPE_WEBHOOK_SECRET = ""
 # None key = free/unsubscribed tier.
 PLAN_LIMITS = {
     None: {
-        "detail_views_per_month": 1,  # temp: 1 for paywall testing — change back to 50
+        "detail_views_per_month": 50,
     },
     "starter": {
         "detail_views_per_month": 500,
