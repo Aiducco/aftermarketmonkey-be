@@ -44,7 +44,7 @@ DLG_RELAY_SFTP_DIRECTORY = "uploads"
 # Same as ``src.integrations.clients.dlg.feed_spec`` expected remote basename.
 DLG_INVENTORY_CSV_FILENAME = "dlg_inventory.csv"
 # Inbox for dealers to forward DLG’s inventory file; reading/parsing TBD. Used in provider catalog copy only.
-DLG_INVENTORY_FORWARD_TO_EMAIL = "support@aftermarketmonkey.com"
+DLG_INVENTORY_FORWARD_TO_EMAIL = "support@aftermarketscout.com"
 # CompanyProviders.credentials key: the dealer’s email that receives mail from DLG (identifies the tenant in forwards).
 DLG_CREDENTIALS_EMAIL_FROM = "email_from"
 
@@ -228,7 +228,7 @@ PROVIDER_CATALOG = [
         "kind": enums.BrandProviderKind.DLG,
         "name": "DLG",
         "description": (
-            "DLG emails the inventory file to your business address. Forward that email to AftermarketMonkey support so we can process it."
+            "DLG emails the inventory file to your business address. Forward that email to AftermarketScout support so we can process it."
         ),
         "icon_url": "https://api.aftermarketmonkey.com/uploads/dlg_logo.png",
         "category": "Distributors",
@@ -236,7 +236,7 @@ PROVIDER_CATALOG = [
         "connection_optional_fields": [],
         "installation_instructions_html": (
             "<p><strong>How the feed works</strong></p>"
-            "<p>DLG does not load inventory into AftermarketMonkey directly. They email the "
+            "<p>DLG does not load inventory into AftermarketScout directly. They email the "
             "inventory file (CSV) to <strong>your</strong> business address—the same one DLG has on file. "
             "You (or your IT) must <strong>forward</strong> that message (or the attachment) to "
             "<a href=\"mailto:{dlg_fwd}\">{dlg_fwd}</a>. Full automated email ingestion is coming later; for now, "
