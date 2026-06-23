@@ -416,6 +416,12 @@ def get_company_provider_by_id(company_id: int, provider_id: int) -> typing.Opti
             return None
         
         provider = company_provider.provider
+        catalog_entry = {}
+        if provider:
+            for entry in src_constants.PROVIDER_CATALOG:
+                if entry["kind"].value == provider.kind:
+                    catalog_entry = entry
+                    break
         data = {
             "id": company_provider.id,
             "company_id": company_provider.company_id,
@@ -429,6 +435,8 @@ def get_company_provider_by_id(company_id: int, provider_id: int) -> typing.Opti
             "provider_kind_name": provider.kind_name if provider else None,
             "credentials": company_provider.credentials,
             "primary": company_provider.primary,
+            "connection_required_fields": list(catalog_entry.get("connection_required_fields") or []),
+            "connection_optional_fields": list(catalog_entry.get("connection_optional_fields") or []),
             "created_at": company_provider.created_at.isoformat() if company_provider.created_at else None,
             "updated_at": company_provider.updated_at.isoformat() if company_provider.updated_at else None,
         }
