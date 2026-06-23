@@ -169,7 +169,7 @@ PROVIDER_CATALOG = [
         "connection_required_fields": ["sftp_user", "sftp_password"],
         "connection_optional_fields": [],
         "installation_instructions_html": (
-            "<p>Email <a href=\"mailto:info@aftermarketmonkey.com\">info@aftermarketmonkey.com</a> so we can "
+            "<p>Email <a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a> so we can "
             "create a unique SFTP account for you and send a <strong>username</strong> and <strong>password</strong>. "
             "Meyer Distributing delivers the data feed to AftermarketMonkey&rsquo;s SFTP relay; ask your Meyer account "
             "representative to set up the feed to connect to <strong>our</strong> SFTP endpoint using the details below.</p>"
@@ -183,7 +183,7 @@ PROVIDER_CATALOG = [
             "</ul>"
             "<p>When you have your login, enter <strong>sftp_user</strong> and <strong>sftp_password</strong> below "
             "and save the connection. For help, contact "
-            "<a href=\"mailto:info@aftermarketmonkey.com\">info@aftermarketmonkey.com</a>.</p>"
+            "<a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a>.</p>"
         ),
     },
     {
@@ -195,7 +195,7 @@ PROVIDER_CATALOG = [
         "connection_required_fields": ["sftp_user", "sftp_password"],
         "connection_optional_fields": [],
         "installation_instructions_html": (
-            "<p>Email <a href=\"mailto:info@aftermarketmonkey.com\">info@aftermarketmonkey.com</a> so we can "
+            "<p>Email <a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a> so we can "
             "provision a dedicated SFTP login (<strong>username</strong> and <strong>password</strong>) on "
             "AftermarketMonkey&rsquo;s relay. Ask your A-Tech representative to deliver their standard "
             "combined catalog and pricing extract to <strong>our</strong> endpoint so a single drop updates your data."
@@ -221,7 +221,7 @@ PROVIDER_CATALOG = [
             "</ul>"
             "<p>After we send your SFTP details, enter <strong>sftp_user</strong> and <strong>sftp_password</strong> "
             "below and save. Saving also schedules a pricing refresh for your company where supported. "
-            "Questions: <a href=\"mailto:info@aftermarketmonkey.com\">info@aftermarketmonkey.com</a>.</p>"
+            "Questions: <a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a>.</p>"
         ),
     },
     {

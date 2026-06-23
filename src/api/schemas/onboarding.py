@@ -62,14 +62,14 @@ class KeystoneCredentialsSchema(Schema):
 
 
 class MeyerCredentialsSchema(Schema):
-    """Meyer relay SFTP — credentials from info@aftermarketmonkey.com; host/path/files from settings."""
+    """Meyer relay SFTP — credentials from info@aftermarketscout.com; host/path/files from settings."""
 
     sftp_user = fields.String(required=True)
     sftp_password = fields.String(required=True)
 
 
 class AtechCredentialsSchema(Schema):
-    """A-Tech relay SFTP — credentials from info@aftermarketmonkey.com; combined catalog, multi-DC inventory, and pricing feed (remote name configurable via settings or credentials)."""
+    """A-Tech relay SFTP — credentials from info@aftermarketscout.com; combined catalog, multi-DC inventory, and pricing feed (remote name configurable via settings or credentials)."""
 
     sftp_user = fields.String(required=True)
     sftp_password = fields.String(required=True)
