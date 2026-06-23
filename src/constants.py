@@ -38,7 +38,7 @@ ATECH_DC_QTY_FIELD_TO_LOCATION_LABEL = {
 ROUGH_COUNTRY_INVENTORY_SEARCH_URL_TEMPLATE = "https://www.roughcountry.com/search/{sku}"
 
 # DLG: AftermarketMonkey SFTP relay (single fixed endpoint; DlgSFTPClient always uses these).
-DLG_RELAY_SFTP_HOST = "54.145.82.238"
+DLG_RELAY_SFTP_HOST = "5.161.121.143"
 DLG_RELAY_SFTP_PORT = 22
 DLG_RELAY_SFTP_DIRECTORY = "uploads"
 # Same as ``src.integrations.clients.dlg.feed_spec`` expected remote basename.
@@ -175,7 +175,7 @@ PROVIDER_CATALOG = [
             "representative to set up the feed to connect to <strong>our</strong> SFTP endpoint using the details below.</p>"
             "<p><strong>Endpoint for your Meyer rep</strong></p>"
             "<ul>"
-            "<li><strong>SFTP:</strong> <code>54.145.82.238</code></li>"
+            "<li><strong>SFTP:</strong> <code>5.161.121.143</code></li>"
             "<li><strong>Port:</strong> <code>22</code></li>"
             "<li><strong>Folder:</strong> <code>uploads</code></li>"
             "<li><strong>Files:</strong> <code>Meyer Pricing.csv</code>, <code>Meyer Inventory.csv</code></li>"
@@ -202,7 +202,7 @@ PROVIDER_CATALOG = [
             "</p>"
             "<p><strong>Relay endpoint (for your A-Tech rep)</strong></p>"
             "<ul>"
-            "<li><strong>Host:</strong> <code>54.145.82.238</code> (SFTP)</li>"
+            "<li><strong>Host:</strong> <code>5.161.121.143</code> (SFTP)</li>"
             "<li><strong>Port:</strong> <code>22</code></li>"
             "<li><strong>Directory:</strong> <code>uploads</code></li>"
             "<li><strong>Credentials:</strong> we send you the SFTP user and password after onboarding</li>"
