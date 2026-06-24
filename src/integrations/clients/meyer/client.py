@@ -18,7 +18,7 @@ DEFAULT_LOCAL_INVENTORY = "/tmp/meyer_inventory.csv"
 DEFAULT_FILE_MAX_AGE_SECONDS = 6 * 60 * 60
 
 # If Django settings omit MEYER_SFTP_* (older deploys) or values are blank, use relay defaults.
-_DEFAULT_MEYER_RELAY_HOST = "54.145.82.238"
+_DEFAULT_MEYER_RELAY_HOST = "5.161.121.143"
 _DEFAULT_MEYER_RELAY_PORT = 22
 _DEFAULT_MEYER_RELAY_DIRECTORY = "uploads"
 _DEFAULT_MEYER_PRICING_REMOTE_FILE = "Meyer Pricing.csv"
