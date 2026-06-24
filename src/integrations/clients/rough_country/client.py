@@ -21,6 +21,7 @@ _LOG_PREFIX = "[ROUGH-COUNTRY-CLIENT]"
 
 DEFAULT_FILE_URL = "https://feeds.roughcountry.com/jobber_pc2A.xlsx"
 DEFAULT_LOCAL_FILE_NAME = "jobber_pc2A.xlsx"
+REQUIRED_FEED_URL_PREFIX = "https://feeds.roughcountry.com/jobber_"
 
 
 def _df_to_list_of_dicts(df: pd.DataFrame) -> typing.List[typing.Dict]:
@@ -49,6 +50,12 @@ class RoughCountryFeedClient:
             or getattr(settings, "ROUGH_COUNTRY_FEED_URL", None)
             or DEFAULT_FILE_URL
         )
+        if self.file_url and not self.file_url.startswith(REQUIRED_FEED_URL_PREFIX):
+            raise ValueError(
+                "Invalid Rough Country feed URL — must start with '{}'. Got: '{}'.".format(
+                    REQUIRED_FEED_URL_PREFIX, self.file_url
+                )
+            )
         self.local_file_name = local_file_name or DEFAULT_LOCAL_FILE_NAME
         self.local_file_path = local_file_path
 

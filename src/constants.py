@@ -124,8 +124,8 @@ PROVIDER_CATALOG = [
             "<p><strong>Rough Country</strong> uses a downloadable Excel jobber feed URL per dealer account.</p>"
             "<ol>"
             "<li>In your Rough Country jobber portal, <strong>locate the feed</strong> (or download link) for "
-            "the full catalog (General, Fitment, Discontinued). Copy the <strong>full HTTPS URL</strong>—the "
-            "complete link starting with <code>https://</code>.</li>"
+            "the full catalog (General, Fitment, Discontinued). Copy the <strong>full HTTPS URL</strong>—it "
+            "should start with <code>https://feeds.roughcountry.com/jobber_</code>.</li>"
             "<li>Paste that URL into <strong>feed_url</strong> below and save the connection.</li>"
             "</ol>"
         ),

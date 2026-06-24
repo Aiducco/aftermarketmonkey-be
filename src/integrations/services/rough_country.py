@@ -66,6 +66,12 @@ def _rough_country_feed_client_for_credentials(
         url = raw_url.strip() if isinstance(raw_url, str) and raw_url.strip() else None
     else:
         url = url.strip() if url.strip() else None
+    if url and not url.startswith(rough_country_client.REQUIRED_FEED_URL_PREFIX):
+        raise ValueError(
+            "Rough Country feed_url must start with '{}'. Got: '{}'.".format(
+                rough_country_client.REQUIRED_FEED_URL_PREFIX, url
+            )
+        )
     path = local_file_path_override
     if path is not None:
         path = path.strip() if path.strip() else None
