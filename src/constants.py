@@ -14,14 +14,14 @@ PROVIDER_DISPLAY_NAMES = {
 
 # Provider kind_name -> image URL (used by parts API)
 PROVIDER_IMAGE_URLS = {
-    "TURN_14": "https://api.aftermarketmonkey.com/uploads/t14_logo.png",
-    "KEYSTONE": "https://api.aftermarketmonkey.com/uploads/keystone.png",
-    "MEYER": "https://api.aftermarketmonkey.com/uploads/meyer_logo.png",
-    "ATECH": "https://api.aftermarketmonkey.com/uploads/atech_logo.png",
-    "DLG": "https://api.aftermarketmonkey.com/uploads/dlg_logo.png",
-    "ROUGH_COUNTRY": "https://api.aftermarketmonkey.com/uploads/rough_country.png",
+    "TURN_14": "https://api.aftermarketscout.com/uploads/t14_logo.png",
+    "KEYSTONE": "https://api.aftermarketscout.com/uploads/keystone.png",
+    "MEYER": "https://api.aftermarketscout.com/uploads/meyer_logo.png",
+    "ATECH": "https://api.aftermarketscout.com/uploads/atech_logo.png",
+    "DLG": "https://api.aftermarketscout.com/uploads/dlg_logo.png",
+    "ROUGH_COUNTRY": "https://api.aftermarketscout.com/uploads/rough_country.png",
     "SDC": "",
-    "WHEELPROS": "https://api.aftermarketmonkey.com/uploads/wheel_pros_logo.png",
+    "WHEELPROS": "https://api.aftermarketscout.com/uploads/wheel_pros_logo.png",
 }
 
 # Public "open in distributor" links (parts API ``provider_go_to_link``); ``urllib.parse.quote`` at call sites.
@@ -37,7 +37,7 @@ ATECH_DC_QTY_FIELD_TO_LOCATION_LABEL = {
 }
 ROUGH_COUNTRY_INVENTORY_SEARCH_URL_TEMPLATE = "https://www.roughcountry.com/search/{sku}"
 
-# DLG: AftermarketMonkey SFTP relay (single fixed endpoint; DlgSFTPClient always uses these).
+# DLG: AfterMarketScout SFTP relay (single fixed endpoint; DlgSFTPClient always uses these).
 DLG_RELAY_SFTP_HOST = "5.161.121.143"
 DLG_RELAY_SFTP_PORT = 22
 DLG_RELAY_SFTP_DIRECTORY = "uploads"
@@ -80,7 +80,7 @@ PROVIDER_CATALOG = [
         "kind": enums.BrandProviderKind.TURN_14,
         "name": "Turn 14",
         "description": "Access real-time inventory, pricing, and product data from Turn 14 Distribution.",
-        "icon_url": "https://api.aftermarketmonkey.com/uploads/t14_logo.png",
+        "icon_url": "https://api.aftermarketscout.com/uploads/t14_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["client_id", "client_secret"],
         "installation_instructions_html": (
@@ -91,7 +91,7 @@ PROVIDER_CATALOG = [
             "<a href=\"https://www.turn14.com/api_settings.php\" target=\"_blank\" rel=\"noopener noreferrer\">"
             "https://www.turn14.com/api_settings.php</a>.</li>"
             "<li>Copy the <strong>client ID</strong> and <strong>client secret</strong> from that page.</li>"
-            "<li>Paste them into the fields below and save. aftermarketmonkey uses them only to call Turn 14 on your behalf.</li>"
+            "<li>Paste them into the fields below and save. AfterMarketScout uses them only to call Turn 14 on your behalf.</li>"
             "</ul>"
             "<p>If you cannot access that page or the credentials are missing, contact Turn 14 support or your account manager.</p>"
         ),
@@ -100,7 +100,7 @@ PROVIDER_CATALOG = [
         "kind": enums.BrandProviderKind.KEYSTONE,
         "name": "Keystone",
         "description": "Access inventory and pricing from Keystone Automotive via FTP.",
-        "icon_url": "https://api.aftermarketmonkey.com/uploads/keystone.png",
+        "icon_url": "https://api.aftermarketscout.com/uploads/keystone.png",
         "category": "Distributors",
         "connection_required_fields": ["ftp_user", "ftp_password"],
         "installation_instructions_html": (
@@ -117,7 +117,7 @@ PROVIDER_CATALOG = [
         "kind": enums.BrandProviderKind.ROUGH_COUNTRY,
         "name": "Rough Country",
         "description": "Access catalog, pricing, and fitment from Rough Country via jobber feed.",
-        "icon_url": "https://api.aftermarketmonkey.com/uploads/rough_country.png",
+        "icon_url": "https://api.aftermarketscout.com/uploads/rough_country.png",
         "category": "Distributors",
         "connection_required_fields": [ROUGH_COUNTRY_CREDENTIALS_FEED_URL],
         "installation_instructions_html": (
@@ -134,7 +134,7 @@ PROVIDER_CATALOG = [
         "kind": enums.BrandProviderKind.WHEELPROS,
         "name": "Wheel Pros",
         "description": "Access wheels, tires, and accessories inventory and pricing from Wheel Pros via SFTP.",
-        "icon_url": "https://api.aftermarketmonkey.com/uploads/wheel_pros_logo.png",
+        "icon_url": "https://api.aftermarketscout.com/uploads/wheel_pros_logo.png",
         "category": "Distributors",
         "connection_required_fields": [
             "sftp_user",
@@ -147,7 +147,7 @@ PROVIDER_CATALOG = [
         "connection_optional_fields": ["sftp_path"],
         "installation_instructions_html": (
             "<p><strong>Wheel Pros</strong> inventory and pricing CSVs (wheels, tires, accessories) are on Wheel "
-            "Pros&rsquo; SFTP server (<code>sftp.wheelpros.com</code>, port 22). AftermarketMonkey connects there "
+            "Pros&rsquo; SFTP server (<code>sftp.wheelpros.com</code>, port 22). AfterMarketScout connects there "
             "automatically; you only enter the account credentials Wheel Pros gives you.</p>"
             "<ol>"
             "<li>Request your SFTP <strong>username</strong> and <strong>password</strong> from Wheel Pros.</li>"
@@ -163,15 +163,15 @@ PROVIDER_CATALOG = [
     {
         "kind": enums.BrandProviderKind.MEYER,
         "name": "Meyer",
-        "description": "Access Meyer catalog, inventory, and pricing from AftermarketMonkey's SFTP relay.",
-        "icon_url": "https://api.aftermarketmonkey.com/uploads/meyer_logo.png",
+        "description": "Access Meyer catalog, inventory, and pricing from AfterMarketScout's SFTP relay.",
+        "icon_url": "https://api.aftermarketscout.com/uploads/meyer_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["sftp_user", "sftp_password"],
         "connection_optional_fields": [],
         "installation_instructions_html": (
             "<p>Email <a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a> so we can "
             "create a unique SFTP account for you and send a <strong>username</strong> and <strong>password</strong>. "
-            "Meyer Distributing delivers the data feed to AftermarketMonkey&rsquo;s SFTP relay; ask your Meyer account "
+            "Meyer Distributing delivers the data feed to AfterMarketScout&rsquo;s SFTP relay; ask your Meyer account "
             "representative to set up the feed to connect to <strong>our</strong> SFTP endpoint using the details below.</p>"
             "<p><strong>Endpoint for your Meyer rep</strong></p>"
             "<ul>"
@@ -189,15 +189,15 @@ PROVIDER_CATALOG = [
     {
         "kind": enums.BrandProviderKind.ATECH,
         "name": "A-Tech",
-        "description": "Access A-Tech catalog, inventory, and pricing from AftermarketMonkey's SFTP relay.",
-        "icon_url": "https://api.aftermarketmonkey.com/uploads/atech_logo.png",
+        "description": "Access A-Tech catalog, inventory, and pricing from AfterMarketScout's SFTP relay.",
+        "icon_url": "https://api.aftermarketscout.com/uploads/atech_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["sftp_user", "sftp_password"],
         "connection_optional_fields": [],
         "installation_instructions_html": (
             "<p>Email <a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a> so we can "
             "provision a dedicated SFTP login (<strong>username</strong> and <strong>password</strong>) on "
-            "AftermarketMonkey&rsquo;s relay. Ask your A-Tech representative to deliver their standard "
+            "AfterMarketScout&rsquo;s relay. Ask your A-Tech representative to deliver their standard "
             "combined catalog and pricing extract to <strong>our</strong> endpoint so a single drop updates your data."
             "</p>"
             "<p><strong>Relay endpoint (for your A-Tech rep)</strong></p>"
@@ -230,7 +230,7 @@ PROVIDER_CATALOG = [
         "description": (
             "DLG emails the inventory file to your business address. Forward that email to AftermarketScout support so we can process it."
         ),
-        "icon_url": "https://api.aftermarketmonkey.com/uploads/dlg_logo.png",
+        "icon_url": "https://api.aftermarketscout.com/uploads/dlg_logo.png",
         "category": "Distributors",
         "connection_required_fields": [DLG_CREDENTIALS_EMAIL_FROM],
         "connection_optional_fields": [],
@@ -255,7 +255,7 @@ PROVIDER_CATALOG = [
     },
 ]
 
-_UPLOADS = "https://api.aftermarketmonkey.com/uploads"
+_UPLOADS = "https://api.aftermarketscout.com/uploads"
 
 COMING_SOON_PROVIDERS = [
     {"kind": enums.BrandProviderKind.ATD,                     "name": "ATD",                       "category": "Distributors", "icon_url": f"{_UPLOADS}/atd_logo.png"},

@@ -68,7 +68,7 @@ class RoughCountryFeedClient:
             req = urllib.request.Request(
                 self.file_url,
                 headers={
-                    "User-Agent": "Mozilla/5.0 (compatible; AftermarketMonkey/1.0; +https://aftermarketmonkey.com)",
+                    "User-Agent": "Mozilla/5.0 (compatible; AfterMarketScout/1.0; +https://aftermarketscout.com)",
                     "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,*/*",
                 },
             )

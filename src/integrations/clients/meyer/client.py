@@ -89,7 +89,7 @@ class MeyerSFTPClient:
 
     Defaults host, port, remote directory, and CSV filenames from Django settings
     (``MEYER_SFTP_*``, ``MEYER_PRICING_REMOTE_FILE``, ``MEYER_INVENTORY_REMOTE_FILE``)—the
-    AftermarketMonkey relay SFTP. Per-company ``credentials`` must include ``sftp_user`` and
+    AfterMarketScout relay SFTP. Per-company ``credentials`` must include ``sftp_user`` and
     ``sftp_password``. Optional overrides: ``sftp_server`` (or ``sftp_host`` / ``server_url``),
     ``sftp_port``, ``sftp_directory``, ``pricing_remote_file``, ``inventory_remote_file``.
 

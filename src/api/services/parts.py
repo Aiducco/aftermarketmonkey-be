@@ -49,13 +49,13 @@ _LOG_PREFIX = "[PARTS-SERVICES]"
 
 # Provider kind_name -> image URL (edit here to add logos)
 PROVIDER_IMAGE_URLS = {
-    "TURN_14": "https://api.aftermarketmonkey.com/uploads/t14_logo.png",
-    "KEYSTONE": "https://api.aftermarketmonkey.com/uploads/keystone.png",
-    "MEYER": "https://api.aftermarketmonkey.com/uploads/meyer_logo.png",
-    "ATECH": "https://api.aftermarketmonkey.com/uploads/atech_logo.png",
-    "DLG": "https://api.aftermarketmonkey.com/uploads/dlg_logo.png",
-    "ROUGH_COUNTRY": "https://api.aftermarketmonkey.com/uploads/rough_country.png",
-    "WHEELPROS": "https://api.aftermarketmonkey.com/uploads/wheel_pros_logo.png",
+    "TURN_14": "https://api.aftermarketscout.com/uploads/t14_logo.png",
+    "KEYSTONE": "https://api.aftermarketscout.com/uploads/keystone.png",
+    "MEYER": "https://api.aftermarketscout.com/uploads/meyer_logo.png",
+    "ATECH": "https://api.aftermarketscout.com/uploads/atech_logo.png",
+    "DLG": "https://api.aftermarketscout.com/uploads/dlg_logo.png",
+    "ROUGH_COUNTRY": "https://api.aftermarketscout.com/uploads/rough_country.png",
+    "WHEELPROS": "https://api.aftermarketscout.com/uploads/wheel_pros_logo.png",
     "SDC": "",
 }
 

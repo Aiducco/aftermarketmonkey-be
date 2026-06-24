@@ -67,7 +67,7 @@ def _warn_ignored_dlg_overrides(creds: typing.Dict) -> None:
 
 class DlgSFTPClient:
     """
-    SFTP client for DLG ``dlg_inventory.csv`` on the AftermarketMonkey relay.
+    SFTP client for DLG ``dlg_inventory.csv`` on the AfterMarketScout relay.
 
     Host, path, and remote filename are in ``src.constants``. SFTP login is from
     ``settings.DLG_RELAY_SFTP_USER`` and ``settings.DLG_RELAY_SFTP_PASSWORD`` (app-level, not per company).

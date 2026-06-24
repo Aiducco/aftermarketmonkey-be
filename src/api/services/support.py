@@ -46,7 +46,7 @@ def _notify_support(ticket: src_models.SupportTicket) -> None:
 
     try:
         user = ticket.user
-        from_email = getattr(settings, "DEFAULT_FROM_EMAIL", "noreply@aftermarketmonkey.com")
+        from_email = getattr(settings, "DEFAULT_FROM_EMAIL", "noreply@aftermarketscout.com")
         send_mail(
             subject=f"[Support] #{ticket.id} — {ticket.subject}",
             message=(

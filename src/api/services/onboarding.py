@@ -434,7 +434,7 @@ def get_distributor_credentials_info() -> dict:
             "required": ["sftp_user", "sftp_password"],
             "description": (
                 "Email info@aftermarketscout.com for SFTP credentials, then enter sftp_user and sftp_password. "
-                "Meyer data is delivered to AftermarketMonkey's relay; your rep uses host 5.161.121.143, port 22, "
+                "Meyer data is delivered to AfterMarketScout's relay; your rep uses host 5.161.121.143, port 22, "
                 "folder uploads, files Meyer Pricing.csv and Meyer Inventory.csv."
             ),
             "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("MEYER", "Meyer"),
@@ -444,7 +444,7 @@ def get_distributor_credentials_info() -> dict:
             "required": ["sftp_user", "sftp_password"],
             "description": (
                 "Email info@aftermarketscout.com for SFTP credentials, then enter sftp_user and sftp_password. "
-                "A-Tech sends one combined catalog and pricing feed to AftermarketMonkey's relay "
+                "A-Tech sends one combined catalog and pricing feed to AfterMarketScout's relay "
                 "(host 5.161.121.143, port 22, folder uploads): part data; cost, retail, and jobber; on-hand per DC "
                 "(Tallmadge OH, Sparks NV, McDonough GA, Arlington TX); core, hazmat, and handling-related fees; GTIN. "
                 "Optional overrides for host, port, folder, or remote filename may be set in credentials when needed."

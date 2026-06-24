@@ -85,7 +85,7 @@ class AtechSFTPClient:
     SFTP client for the A-Tech combined pricing + inventory feed (single file).
 
     Defaults host, port, remote directory, and filename from Django settings
-    (``ATECH_SFTP_*``, ``ATECH_FEED_REMOTE_FILE``) on the AftermarketMonkey relay.
+    (``ATECH_SFTP_*``, ``ATECH_FEED_REMOTE_FILE``) on the AfterMarketScout relay.
     Per-company ``credentials`` must include ``sftp_user`` and ``sftp_password``.
     Optional overrides: ``sftp_server`` (or ``sftp_host`` / ``server_url``),
     ``sftp_port``, ``sftp_directory``, ``feed_remote_file`` (or ``remote_file``).
