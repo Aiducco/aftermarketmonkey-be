@@ -15,6 +15,11 @@ PROVIDER_DISPLAY_NAMES = {
     "CROWN_AUTOMOTIVE": "Crown Automotive",
     "DIX_PERF_NORTH": "DIX Perf North",
     "EARL_OWEN": "Earl Owen",
+    "ELITE_WHEEL": "Elite Wheel",
+    "FASTCO": "FastCo",
+    "GRANDWEST_ENTERPRISES": "GrandWest Enterprises",
+    "HELMHOUSE": "HelmHouse",
+    "THIBAULT": "Thibault",
 }
 
 # Provider kind_name -> image URL (used by parts API)
@@ -32,6 +37,11 @@ PROVIDER_IMAGE_URLS = {
     "CROWN_AUTOMOTIVE": "https://api.aftermarketscout.com/uploads/crown_automotive_logo.png",
     "DIX_PERF_NORTH": "https://api.aftermarketscout.com/uploads/dix_perf_north_logo.png",
     "EARL_OWEN": "https://api.aftermarketscout.com/uploads/earl_owen_logo.png",
+    "ELITE_WHEEL": "https://api.aftermarketscout.com/uploads/elite_wheel_logo.png",
+    "FASTCO": "https://api.aftermarketscout.com/uploads/fastco_logo.png",
+    "GRANDWEST_ENTERPRISES": "https://api.aftermarketscout.com/uploads/grandwest_logo.png",
+    "HELMHOUSE": "https://api.aftermarketscout.com/uploads/helmhouse_logo.png",
+    "THIBAULT": "https://api.aftermarketscout.com/uploads/thibault_logo.png",
 }
 
 # Public "open in distributor" links (parts API ``provider_go_to_link``); ``urllib.parse.quote`` at call sites.
@@ -399,6 +409,93 @@ PROVIDER_CATALOG = [
             "<a href=\"mailto:JSmith@earlowen.com\">JSmith@earlowen.com</a>.</p>"
         ),
     },
+    {
+        "kind": enums.BrandProviderKind.ELITE_WHEEL,
+        "name": "Elite Wheel",
+        "description": "Access Elite Wheel & Tire inventory and pricing via API.",
+        "icon_url": "https://api.aftermarketscout.com/uploads/elite_wheel_logo.png",
+        "category": "Distributors",
+        "connection_required_fields": ["username", "password"],
+        "installation_instructions_html": (
+            "<p><strong>Elite Wheel &amp; Tire</strong> provides access via their API using a "
+            "<strong>Username</strong> and <strong>Password</strong>.</p>"
+            "<ol>"
+            "<li>Fill out the "
+            "<a href=\"https://www.ewwfl.com\" target=\"_blank\" rel=\"noopener noreferrer\">Inventory Request Form</a> "
+            "on the Elite Wheel website — this is the most efficient way to get API access.</li>"
+            "<li>Alternatively, email <a href=\"mailto:it@ewwfl.com\">it@ewwfl.com</a> or contact your Elite sales rep.</li>"
+            "<li>Once you receive your credentials, enter your <strong>Username</strong> and <strong>Password</strong> "
+            "below and save the connection.</li>"
+            "</ol>"
+            "<p>For assistance contact: <a href=\"mailto:it@ewwfl.com\">it@ewwfl.com</a>.</p>"
+        ),
+    },
+    {
+        "kind": enums.BrandProviderKind.FASTCO,
+        "name": "FastCo",
+        "description": "Access FastCo inventory and pricing via FTP.",
+        "icon_url": "https://api.aftermarketscout.com/uploads/fastco_logo.png",
+        "category": "Distributors",
+        "connection_required_fields": ["ftp_user", "ftp_password"],
+        "installation_instructions_html": (
+            "<p><strong>FastCo</strong> provides an FTP account for your product data. "
+            "However, a request must be raised with your account manager before they will create it.</p>"
+            "<ol>"
+            "<li>Contact your FastCo account manager and request FTP access.</li>"
+            "<li>Once you have the connection details, enter your <strong>FTP Login</strong> and "
+            "<strong>FTP Password</strong> below and save.</li>"
+            "</ol>"
+            "<p>For assistance contact: <a href=\"mailto:PYoshida@fastco.ca\">PYoshida@fastco.ca</a>.</p>"
+        ),
+    },
+    {
+        "kind": enums.BrandProviderKind.GRANDWEST_ENTERPRISES,
+        "name": "GrandWest Enterprises",
+        "description": "Access GrandWest Enterprises inventory and pricing via account feed.",
+        "icon_url": "https://api.aftermarketscout.com/uploads/grandwest_logo.png",
+        "category": "Distributors",
+        "connection_required_fields": ["account_number"],
+        "connection_optional_fields": ["access_token", "token_secret"],
+        "installation_instructions_html": (
+            "<p><strong>GrandWest Enterprises</strong> provides a data feed to keep your stock and pricing up to date.</p>"
+            "<ol>"
+            "<li>Contact your GrandWest sales representative and ask them for access.</li>"
+            "<li>You should receive an <strong>Account Number</strong> — enter it below.</li>"
+            "<li>If GrandWest also provides an <strong>Access Token</strong> and <strong>Token Secret</strong> "
+            "for order tracking, enter those in the optional fields.</li>"
+            "</ol>"
+            "<p>For assistance contact: "
+            "<a href=\"mailto:itsupport@grandwestauto.com\">itsupport@grandwestauto.com</a>.</p>"
+        ),
+    },
+    {
+        "kind": enums.BrandProviderKind.HELMHOUSE,
+        "name": "HelmHouse",
+        "description": "Access HelmHouse public inventory and pricing — no account required.",
+        "icon_url": "https://api.aftermarketscout.com/uploads/helmhouse_logo.png",
+        "category": "Distributors",
+        "connection_required_fields": [],
+        "installation_instructions_html": (
+            "<p><strong>Helmet House</strong> provides public price and stock data — "
+            "an account is not required. Simply save the connection to activate it.</p>"
+            "<p>For assistance contact: "
+            "<a href=\"mailto:info@helmethouse.com\">info@helmethouse.com</a>.</p>"
+        ),
+    },
+    {
+        "kind": enums.BrandProviderKind.THIBAULT,
+        "name": "Thibault",
+        "description": "Access Thibault (Importations Thibault) inventory via their open FTP feed.",
+        "icon_url": "https://api.aftermarketscout.com/uploads/thibault_logo.png",
+        "category": "Distributors",
+        "connection_required_fields": [],
+        "installation_instructions_html": (
+            "<p><strong>Thibault</strong> (Importations Thibault) FTP feed is already enabled for all dealers — "
+            "no store-specific login credentials are required. Simply save the connection to activate it.</p>"
+            "<p>For assistance contact: "
+            "<a href=\"mailto:info@importationsthibault.com\">info@importationsthibault.com</a>.</p>"
+        ),
+    },
 ]
 
 _UPLOADS = "https://api.aftermarketscout.com/uploads"
@@ -406,12 +503,7 @@ _UPLOADS = "https://api.aftermarketscout.com/uploads"
 COMING_SOON_PROVIDERS = [
     {"kind": enums.BrandProviderKind.ATD,                     "name": "ATD",                       "category": "Distributors", "icon_url": f"{_UPLOADS}/atd_logo.png"},
     {"kind": enums.BrandProviderKind.ALLPRO_DISTRIBUTING,     "name": "AllPro Distributing",        "category": "Distributors", "icon_url": f"{_UPLOADS}/allpro_logo.png"},
-    {"kind": enums.BrandProviderKind.ELITE_WHEEL,             "name": "Elite Wheel",                "category": "Distributors", "icon_url": f"{_UPLOADS}/elite_wheel_logo.png"},
-    # {"kind": enums.BrandProviderKind.FASTCO,                  "name": "FastCo",                     "category": "Distributors", "icon_url": f"{_UPLOADS}/fastco_logo.png"},
-    # {"kind": enums.BrandProviderKind.GRANDWEST_ENTERPRISES,   "name": "GrandWest Enterprises",      "category": "Distributors", "icon_url": f"{_UPLOADS}/grandwest_logo.png"},
-    # {"kind": enums.BrandProviderKind.HELMHOUSE,               "name": "HelmHouse",                  "category": "Distributors", "icon_url": f"{_UPLOADS}/helmhouse_logo.png"},
     {"kind": enums.BrandProviderKind.HOLLEY_PERFORMANCE,      "name": "Holley Performance",         "category": "Distributors", "icon_url": f"{_UPLOADS}/holley_logo.png"},
-    {"kind": enums.BrandProviderKind.THIBAULT,                "name": "Thibault",                   "category": "Distributors", "icon_url": f"{_UPLOADS}/thibault_logo.png"},
     {"kind": enums.BrandProviderKind.MARCOR,                  "name": "Marcor",                     "category": "Distributors", "icon_url": f"{_UPLOADS}/marcor_logo.png"},
     {"kind": enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING,"name": "Motor State Distributing",   "category": "Distributors", "icon_url": f"{_UPLOADS}/motor_state_logo.png"},
     {"kind": enums.BrandProviderKind.OVERLAND_VEHICLE_SYSTEMS,"name": "Overland Vehicle Systems",   "category": "Distributors", "icon_url": f"{_UPLOADS}/overland_vehicle_systems_logo.png"},
