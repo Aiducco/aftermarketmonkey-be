@@ -253,6 +253,142 @@ PROVIDER_CATALOG = [
             email_from_key=DLG_CREDENTIALS_EMAIL_FROM,
         ),
     },
+    {
+        "kind": enums.BrandProviderKind.AUTOMATIC_DISTRIBUTORS,
+        "name": "Automatic Distributors",
+        "description": "Access inventory and pricing from Automatic Distributors via FTP.",
+        "icon_url": "https://api.aftermarketscout.com/uploads/automatic_distributors_logo.png",
+        "category": "Distributors",
+        "connection_required_fields": ["ftp_user", "ftp_password"],
+        "installation_instructions_html": (
+            "<p><strong>Automatic Distributors</strong> provides an FTP account for your product data. "
+            "However, a request must be raised with your account manager before they will create it. "
+            "These are the same credentials as their catalog connection.</p>"
+            "<ol>"
+            "<li>Contact your Automatic Distributors account manager and request FTP access for data feeds.</li>"
+            "<li>Once you receive your <strong>FTP Login</strong> and <strong>FTP Password</strong>, "
+            "enter them below and save the connection.</li>"
+            "</ol>"
+            "<p>For assistance please contact: "
+            "<a href=\"mailto:Custserv@autodist.com\">Custserv@autodist.com</a>.</p>"
+        ),
+    },
+    {
+        "kind": enums.BrandProviderKind.CTP_DISTRIBUTORS,
+        "name": "CTP Distributors",
+        "description": "Access inventory and pricing from CTP Distributors via FTP relay.",
+        "icon_url": "https://api.aftermarketscout.com/uploads/ctp_distributors_logo.png",
+        "category": "Distributors",
+        "connection_required_fields": ["ftp_user", "ftp_password"],
+        "installation_instructions_html": (
+            "<p><strong>CTP Distributors</strong> sends their data feed directly to an FTP site. "
+            "Please ask your CTP account representative to set up this FTP connection.</p>"
+            "<ol>"
+            "<li>Email <a href=\"mailto:support@dataheretothere.com\">support@dataheretothere.com</a> "
+            "and they will create a unique account for you to receive CTP&rsquo;s data.</li>"
+            "<li>Once you have your credentials, enter your <strong>FTP Login</strong> and "
+            "<strong>FTP Password</strong> below.</li>"
+            "</ol>"
+            "<p><strong>Example connection details</strong></p>"
+            "<ul>"
+            "<li><strong>FTP:</strong> <code>ftp.dataheretothere.com</code></li>"
+            "<li><strong>Port:</strong> <code>21</code></li>"
+            "<li><strong>Folder:</strong> <code>/ctp</code></li>"
+            "</ul>"
+            "<p>For assistance please contact: "
+            "<a href=\"https://www.ctpdistributors.com/contact\" target=\"_blank\" rel=\"noopener noreferrer\">"
+            "https://www.ctpdistributors.com/contact</a>.</p>"
+        ),
+    },
+    {
+        "kind": enums.BrandProviderKind.CROWN_AUTOMOTIVE,
+        "name": "Crown Automotive",
+        "description": "Access Crown Automotive inventory and pricing via FTP relay.",
+        "icon_url": "https://api.aftermarketscout.com/uploads/crown_automotive_logo.png",
+        "category": "Distributors",
+        "connection_required_fields": ["ftp_user", "ftp_password"],
+        "installation_instructions_html": (
+            "<p><strong>Crown Automotive</strong> provides an FTP-based data feed. "
+            "If you do not have your own FTP site, email "
+            "<a href=\"mailto:support@dataheretothere.com\">support@dataheretothere.com</a> "
+            "and they will create a unique account for you to receive Crown&rsquo;s data. "
+            "This login can be shared with your Crown account representative so they can provide "
+            "your stock and pricing data.</p>"
+            "<ol>"
+            "<li>Obtain your FTP credentials from <a href=\"mailto:support@dataheretothere.com\">"
+            "support@dataheretothere.com</a>.</li>"
+            "<li>Share the credentials with your Crown account rep and ask them to push the feed.</li>"
+            "<li>Enter your <strong>FTP Login</strong> and <strong>FTP Password</strong> below and save.</li>"
+            "</ol>"
+            "<p><strong>Example connection details</strong></p>"
+            "<ul>"
+            "<li><strong>FTP:</strong> <code>ftp.dataheretothere.com</code></li>"
+            "<li><strong>Folder:</strong> <code>/crown</code></li>"
+            "</ul>"
+            "<p>For assistance contact: "
+            "<a href=\"mailto:support@dataheretothere.com\">support@dataheretothere.com</a>.</p>"
+        ),
+    },
+    {
+        "kind": enums.BrandProviderKind.DIX_PERF_NORTH,
+        "name": "DIX Perf North",
+        "description": "Access DIX Performance North inventory and pricing via FTP relay.",
+        "icon_url": "https://api.aftermarketscout.com/uploads/dix_perf_north_logo.png",
+        "category": "Distributors",
+        "connection_required_fields": ["ftp_user", "ftp_password"],
+        "installation_instructions_html": (
+            "<p><strong>DIX Performance North</strong> provides an FTP-based data feed. "
+            "If you do not have your own FTP site, email "
+            "<a href=\"mailto:support@dataheretothere.com\">support@dataheretothere.com</a> "
+            "and they will create a unique account for you to receive DIX&rsquo;s data. "
+            "This login can be shared with your DIX account representative so they can provide "
+            "your stock and pricing data.</p>"
+            "<ol>"
+            "<li>Obtain your FTP credentials from "
+            "<a href=\"mailto:support@dataheretothere.com\">support@dataheretothere.com</a>.</li>"
+            "<li>Share the credentials with your DIX rep and ask them to push the feed.</li>"
+            "<li>Enter your <strong>FTP Login</strong> and <strong>FTP Password</strong> below and save.</li>"
+            "</ol>"
+            "<p><strong>Example connection details</strong></p>"
+            "<ul>"
+            "<li><strong>FTP:</strong> <code>ftp.dataheretothere.com</code></li>"
+            "<li><strong>Port:</strong> <code>21</code></li>"
+            "<li><strong>Folder:</strong> <code>/dix</code></li>"
+            "</ul>"
+            "<p>For assistance contact: "
+            "<a href=\"mailto:sp@dixperformancenorth.com\">sp@dixperformancenorth.com</a>.</p>"
+        ),
+    },
+    {
+        "kind": enums.BrandProviderKind.EARL_OWEN,
+        "name": "Earl Owen",
+        "description": "Access Earl Owen Company inventory and pricing via FTP relay.",
+        "icon_url": "https://api.aftermarketscout.com/uploads/earl_owen_logo.png",
+        "category": "Distributors",
+        "connection_required_fields": ["ftp_user", "ftp_password"],
+        "installation_instructions_html": (
+            "<p><strong>Earl Owen Company</strong> provides an FTP-based data feed. "
+            "If you do not have your own FTP site, email "
+            "<a href=\"mailto:support@dataheretothere.com\">support@dataheretothere.com</a> "
+            "and they will create a unique account for you to receive Earl Owen&rsquo;s data. "
+            "This login can be shared with your Earl Owen account representative so they can provide "
+            "your stock and pricing data.</p>"
+            "<ol>"
+            "<li>Obtain your FTP credentials from "
+            "<a href=\"mailto:support@dataheretothere.com\">support@dataheretothere.com</a>.</li>"
+            "<li>Share the credentials with your Earl Owen rep and ask them to push the feed.</li>"
+            "<li>Enter your <strong>FTP Login</strong> and <strong>FTP Password</strong> below and save.</li>"
+            "</ol>"
+            "<p><strong>Example connection details</strong></p>"
+            "<ul>"
+            "<li><strong>FTP:</strong> <code>ftp.dataheretothere.com</code></li>"
+            "<li><strong>Port:</strong> <code>21</code></li>"
+            "<li><strong>Folder:</strong> <code>/earlowen</code></li>"
+            "</ul>"
+            "<p>For assistance contact: "
+            "<a href=\"mailto:JSmith@earlowen.com\">JSmith@earlowen.com</a>.</p>"
+        ),
+    },
 ]
 
 _UPLOADS = "https://api.aftermarketscout.com/uploads"
@@ -260,10 +396,6 @@ _UPLOADS = "https://api.aftermarketscout.com/uploads"
 COMING_SOON_PROVIDERS = [
     {"kind": enums.BrandProviderKind.ATD,                     "name": "ATD",                       "category": "Distributors", "icon_url": f"{_UPLOADS}/atd_logo.png"},
     {"kind": enums.BrandProviderKind.ALLPRO_DISTRIBUTING,     "name": "AllPro Distributing",        "category": "Distributors", "icon_url": f"{_UPLOADS}/allpro_logo.png"},
-    {"kind": enums.BrandProviderKind.AUTOMATIC_DISTRIBUTORS,  "name": "Automatic Distributors",     "category": "Distributors", "icon_url": f"{_UPLOADS}/automatic_distributors_logo.png"},
-    {"kind": enums.BrandProviderKind.CTP_DISTRIBUTORS,        "name": "CTP Distributors",           "category": "Distributors", "icon_url": f"{_UPLOADS}/ctp_distributors_logo.png"},
-    {"kind": enums.BrandProviderKind.CROWN_AUTOMOTIVE,        "name": "Crown Automotive",           "category": "Distributors", "icon_url": f"{_UPLOADS}/crown_automotive_logo.png"},
-    {"kind": enums.BrandProviderKind.DIX_PERF_NORTH,          "name": "DIX Perf North",             "category": "Distributors", "icon_url": f"{_UPLOADS}/dix_perf_north_logo.png"},
     {"kind": enums.BrandProviderKind.ELITE_WHEEL,             "name": "Elite Wheel",                "category": "Distributors", "icon_url": f"{_UPLOADS}/elite_wheel_logo.png"},
     # {"kind": enums.BrandProviderKind.FASTCO,                  "name": "FastCo",                     "category": "Distributors", "icon_url": f"{_UPLOADS}/fastco_logo.png"},
     # {"kind": enums.BrandProviderKind.GRANDWEST_ENTERPRISES,   "name": "GrandWest Enterprises",      "category": "Distributors", "icon_url": f"{_UPLOADS}/grandwest_logo.png"},

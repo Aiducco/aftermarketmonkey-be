@@ -32,6 +32,7 @@ class BrandProviderKind(enum.Enum):
     CTP_DISTRIBUTORS = 12
     CROWN_AUTOMOTIVE = 13
     DIX_PERF_NORTH = 14
+    EARL_OWEN = 15
     ELITE_WHEEL = 16
     FASTCO = 17
     GRANDWEST_ENTERPRISES = 18
