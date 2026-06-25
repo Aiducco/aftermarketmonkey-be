@@ -10,6 +10,11 @@ PROVIDER_DISPLAY_NAMES = {
     "ROUGH_COUNTRY": "Rough Country",
     "SDC": "SDC",
     "WHEELPROS": "Wheel Pros",
+    "AUTOMATIC_DISTRIBUTORS": "Automatic Distributors",
+    "CTP_DISTRIBUTORS": "CTP Distributors",
+    "CROWN_AUTOMOTIVE": "Crown Automotive",
+    "DIX_PERF_NORTH": "DIX Perf North",
+    "EARL_OWEN": "Earl Owen",
 }
 
 # Provider kind_name -> image URL (used by parts API)
@@ -22,6 +27,11 @@ PROVIDER_IMAGE_URLS = {
     "ROUGH_COUNTRY": "https://api.aftermarketscout.com/uploads/rough_country.png",
     "SDC": "",
     "WHEELPROS": "https://api.aftermarketscout.com/uploads/wheel_pros_logo.png",
+    "AUTOMATIC_DISTRIBUTORS": "https://api.aftermarketscout.com/uploads/automatic_distributors_logo.png",
+    "CTP_DISTRIBUTORS": "https://api.aftermarketscout.com/uploads/ctp_distributors_logo.png",
+    "CROWN_AUTOMOTIVE": "https://api.aftermarketscout.com/uploads/crown_automotive_logo.png",
+    "DIX_PERF_NORTH": "https://api.aftermarketscout.com/uploads/dix_perf_north_logo.png",
+    "EARL_OWEN": "https://api.aftermarketscout.com/uploads/earl_owen_logo.png",
 }
 
 # Public "open in distributor" links (parts API ``provider_go_to_link``); ``urllib.parse.quote`` at call sites.
