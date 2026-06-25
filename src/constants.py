@@ -20,6 +20,9 @@ PROVIDER_DISPLAY_NAMES = {
     "GRANDWEST_ENTERPRISES": "GrandWest Enterprises",
     "HELMHOUSE": "HelmHouse",
     "THIBAULT": "Thibault",
+    "MARCOR": "Marcor",
+    "OVERLAND_VEHICLE_SYSTEMS": "Overland Vehicle Systems",
+    "PARTS_AUTHORITY": "Parts Authority",
 }
 
 # Provider kind_name -> image URL (used by parts API)
@@ -42,6 +45,9 @@ PROVIDER_IMAGE_URLS = {
     "GRANDWEST_ENTERPRISES": "https://api.aftermarketscout.com/uploads/grandwest_logo.png",
     "HELMHOUSE": "https://api.aftermarketscout.com/uploads/helmhouse_logo.png",
     "THIBAULT": "https://api.aftermarketscout.com/uploads/thibault_logo.png",
+    "MARCOR": "https://api.aftermarketscout.com/uploads/marcor_logo.png",
+    "OVERLAND_VEHICLE_SYSTEMS": "https://api.aftermarketscout.com/uploads/overland_vehicle_systems_logo.png",
+    "PARTS_AUTHORITY": "https://api.aftermarketscout.com/uploads/parts_authority_logo.png",
 }
 
 # Public "open in distributor" links (parts API ``provider_go_to_link``); ``urllib.parse.quote`` at call sites.
@@ -496,6 +502,61 @@ PROVIDER_CATALOG = [
             "<a href=\"mailto:info@importationsthibault.com\">info@importationsthibault.com</a>.</p>"
         ),
     },
+    {
+        "kind": enums.BrandProviderKind.MARCOR,
+        "name": "Marcor",
+        "description": "Access Marcor Automotive public inventory and pricing — no account required.",
+        "icon_url": "https://api.aftermarketscout.com/uploads/marcor_logo.png",
+        "category": "Distributors",
+        "connection_required_fields": [],
+        "installation_instructions_html": (
+            "<p><strong>Marcor Automotive</strong> provides a public price and stock data feed — "
+            "an account is not required. Simply save the connection to activate it.</p>"
+            "<p>For assistance contact: "
+            "<a href=\"mailto:sales@marcor.ca\">sales@marcor.ca</a>.</p>"
+        ),
+    },
+    {
+        "kind": enums.BrandProviderKind.OVERLAND_VEHICLE_SYSTEMS,
+        "name": "Overland Vehicle Systems",
+        "description": "Access Overland Vehicle Systems inventory and pricing via FTP.",
+        "icon_url": "https://api.aftermarketscout.com/uploads/overland_vehicle_systems_logo.png",
+        "category": "Distributors",
+        "connection_required_fields": ["ftp_user", "ftp_password"],
+        "installation_instructions_html": (
+            "<p><strong>Overland Vehicle Systems</strong> provides the pricing file via FTP. "
+            "A request must first be made with Overland Vehicle Systems to enable access.</p>"
+            "<ol>"
+            "<li>Contact Overland Vehicle Systems to request FTP access for your account.</li>"
+            "<li>Once access is enabled, enter your <strong>FTP Login</strong> and "
+            "<strong>FTP Password</strong> below and save the connection.</li>"
+            "</ol>"
+            "<p>For assistance contact: "
+            "<a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a>.</p>"
+        ),
+    },
+    {
+        "kind": enums.BrandProviderKind.PARTS_AUTHORITY,
+        "name": "Parts Authority",
+        "description": "Access Parts Authority inventory and pricing via FTP.",
+        "icon_url": "https://api.aftermarketscout.com/uploads/parts_authority_logo.png",
+        "category": "Distributors",
+        "connection_required_fields": ["ftp_user", "ftp_password"],
+        "installation_instructions_html": (
+            "<p><strong>Parts Authority</strong> provides inventory and pricing via their FTP server.</p>"
+            "<ol>"
+            "<li>Contact Parts Authority to obtain your FTP <strong>Login</strong> and <strong>Password</strong>.</li>"
+            "<li>Enter them below and save the connection.</li>"
+            "</ol>"
+            "<p><strong>Connection details</strong></p>"
+            "<ul>"
+            "<li><strong>FTP Host:</strong> <code>ftp.panetny.com</code></li>"
+            "<li><strong>Port:</strong> <code>21</code></li>"
+            "</ul>"
+            "<p>For assistance contact: "
+            "<a href=\"mailto:contactus@partsauthority.com\">contactus@partsauthority.com</a>.</p>"
+        ),
+    },
 ]
 
 _UPLOADS = "https://api.aftermarketscout.com/uploads"
@@ -504,10 +565,7 @@ COMING_SOON_PROVIDERS = [
     {"kind": enums.BrandProviderKind.ATD,                     "name": "ATD",                       "category": "Distributors", "icon_url": f"{_UPLOADS}/atd_logo.png"},
     {"kind": enums.BrandProviderKind.ALLPRO_DISTRIBUTING,     "name": "AllPro Distributing",        "category": "Distributors", "icon_url": f"{_UPLOADS}/allpro_logo.png"},
     {"kind": enums.BrandProviderKind.HOLLEY_PERFORMANCE,      "name": "Holley Performance",         "category": "Distributors", "icon_url": f"{_UPLOADS}/holley_logo.png"},
-    {"kind": enums.BrandProviderKind.MARCOR,                  "name": "Marcor",                     "category": "Distributors", "icon_url": f"{_UPLOADS}/marcor_logo.png"},
     {"kind": enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING,"name": "Motor State Distributing",   "category": "Distributors", "icon_url": f"{_UPLOADS}/motor_state_logo.png"},
-    {"kind": enums.BrandProviderKind.OVERLAND_VEHICLE_SYSTEMS,"name": "Overland Vehicle Systems",   "category": "Distributors", "icon_url": f"{_UPLOADS}/overland_vehicle_systems_logo.png"},
-    {"kind": enums.BrandProviderKind.PARTS_AUTHORITY,         "name": "Parts Authority",            "category": "Distributors", "icon_url": f"{_UPLOADS}/parts_authority_logo.png"},
     {"kind": enums.BrandProviderKind.PARTS_CANADA,            "name": "Parts Canada",               "category": "Distributors", "icon_url": f"{_UPLOADS}/parts_canada_logo.png"},
     # {"kind": enums.BrandProviderKind.PARTS_UNLIMITED,         "name": "Parts Unlimited",            "category": "Distributors", "icon_url": f"{_UPLOADS}/parts_unlimited_logo.png"},
     {"kind": enums.BrandProviderKind.PREMIER_PERFORMANCE,     "name": "Premier Performance",        "category": "Distributors", "icon_url": f"{_UPLOADS}/premier_performance_logo.png"},
