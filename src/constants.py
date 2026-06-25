@@ -31,6 +31,7 @@ PROVIDER_DISPLAY_NAMES = {
     "THIBERT": "Thibert",
     "WESTERN_POWER_SPORTS": "Western Power Sports",
     "XDP": "XDP",
+    "ATD": "ATD",
 }
 
 # Provider kind_name -> image URL (used by parts API)
@@ -64,6 +65,7 @@ PROVIDER_IMAGE_URLS = {
     "THIBERT": "https://api.aftermarketscout.com/uploads/thibert_logo.png",
     "WESTERN_POWER_SPORTS": "https://api.aftermarketscout.com/uploads/western_power_sports_logo.png",
     "XDP": "https://api.aftermarketscout.com/uploads/xdp_logo.png",
+    "ATD": "https://api.aftermarketscout.com/uploads/atd_logo.png",
 }
 
 # Public "open in distributor" links (parts API ``provider_go_to_link``); ``urllib.parse.quote`` at call sites.
@@ -726,12 +728,31 @@ PROVIDER_CATALOG = [
             "XDP Help Desk</a>.</p>"
         ),
     },
+    {
+        "kind": enums.BrandProviderKind.ATD,
+        "name": "ATD",
+        "description": "Connect to American Tire Distributors (ATD) Ship to Home API for inventory and pricing.",
+        "icon_url": "https://api.aftermarketscout.com/uploads/atd_logo.png",
+        "category": "Distributors",
+        "connection_required_fields": ["username", "password", "client_id", "location"],
+        "installation_instructions_html": (
+            "<p><strong>ATD (American Tire Distributors)</strong> provides inventory and pricing via their "
+            "Ship to Home API. You will need your ATD account credentials to connect.</p>"
+            "<ul>"
+            "<li><strong>Username</strong> — your ATD API username</li>"
+            "<li><strong>Password</strong> — your ATD API password</li>"
+            "<li><strong>Client ID</strong> — your ATD client identifier</li>"
+            "<li><strong>Location</strong> — your ATD location code</li>"
+            "</ul>"
+            "<p>For access or assistance, contact your ATD representative at "
+            "<a href=\"mailto:bmoyer@atd-us.com\">bmoyer@atd-us.com</a>.</p>"
+        ),
+    },
 ]
 
 _UPLOADS = "https://api.aftermarketscout.com/uploads"
 
 COMING_SOON_PROVIDERS = [
-    {"kind": enums.BrandProviderKind.ATD,                     "name": "ATD",                       "category": "Distributors", "icon_url": f"{_UPLOADS}/atd_logo.png"},
     {"kind": enums.BrandProviderKind.ALLPRO_DISTRIBUTING,     "name": "AllPro Distributing",        "category": "Distributors", "icon_url": f"{_UPLOADS}/allpro_logo.png"},
     {"kind": enums.BrandProviderKind.HOLLEY_PERFORMANCE,      "name": "Holley Performance",         "category": "Distributors", "icon_url": f"{_UPLOADS}/holley_logo.png"},
     {"kind": enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING,"name": "Motor State Distributing",   "category": "Distributors", "icon_url": f"{_UPLOADS}/motor_state_logo.png"},
