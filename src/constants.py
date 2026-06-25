@@ -27,6 +27,11 @@ PROVIDER_DISPLAY_NAMES = {
     "PARTS_UNLIMITED": "Parts Unlimited",
     "PREMIER_PERFORMANCE": "Premier Performance",
     "SSF_IMPORTED_AUTO_PARTS": "SSF Imported Auto Parts",
+    "THE_WHEEL_GROUP": "The Wheel Group",
+    "THIBERT": "Thibert",
+    "WESTERN_POWER_SPORTS": "Western Power Sports",
+    "XDP": "XDP",
+    "ASAP_NETWORK": "ASAP Network",
 }
 
 # Provider kind_name -> image URL (used by parts API)
@@ -56,6 +61,11 @@ PROVIDER_IMAGE_URLS = {
     "PARTS_UNLIMITED": "https://api.aftermarketscout.com/uploads/parts_unlimited_logo.png",
     "PREMIER_PERFORMANCE": "https://api.aftermarketscout.com/uploads/premier_performance_logo.png",
     "SSF_IMPORTED_AUTO_PARTS": "https://api.aftermarketscout.com/uploads/ssf_logo.png",
+    "THE_WHEEL_GROUP": "https://api.aftermarketscout.com/uploads/the_wheel_group_logo.png",
+    "THIBERT": "https://api.aftermarketscout.com/uploads/thibert_logo.png",
+    "WESTERN_POWER_SPORTS": "https://api.aftermarketscout.com/uploads/western_power_sports_logo.png",
+    "XDP": "https://api.aftermarketscout.com/uploads/xdp_logo.png",
+    "ASAP_NETWORK": "https://api.aftermarketscout.com/uploads/asap_network_logo.png",
 }
 
 # Public "open in distributor" links (parts API ``provider_go_to_link``); ``urllib.parse.quote`` at call sites.
@@ -644,6 +654,99 @@ PROVIDER_CATALOG = [
             "<a href=\"mailto:info@ssfautoparts.com\">info@ssfautoparts.com</a>.</p>"
         ),
     },
+    {
+        "kind": enums.BrandProviderKind.THE_WHEEL_GROUP,
+        "name": "The Wheel Group",
+        "description": "Access The Wheel Group inventory and pricing via AfterMarketScout's SFTP relay.",
+        "icon_url": "https://api.aftermarketscout.com/uploads/the_wheel_group_logo.png",
+        "category": "Distributors",
+        "connection_required_fields": ["ftp_user", "ftp_password"],
+        "installation_instructions_html": (
+            "<p><strong>The Wheel Group</strong> provides an FTP-based data feed delivered to "
+            "AfterMarketScout&rsquo;s relay. Email "
+            "<a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a> "
+            "and we will create a unique account for you. Share the credentials with your "
+            "Wheel Group account representative so they can push the feed.</p>"
+            "<p><strong>Relay endpoint (for your Wheel Group rep)</strong></p>"
+            "<ul>"
+            "<li><strong>SFTP:</strong> <code>5.161.121.143</code></li>"
+            "<li><strong>Port:</strong> <code>22</code></li>"
+            "<li><strong>Folder:</strong> <code>/wheelgroup</code></li>"
+            "</ul>"
+            "<p>For assistance contact: "
+            "<a href=\"mailto:prestonw@wheel-1.com\">prestonw@wheel-1.com</a>.</p>"
+        ),
+    },
+    {
+        "kind": enums.BrandProviderKind.THIBERT,
+        "name": "Thibert",
+        "description": "Access Thibert inventory and pricing via FTP.",
+        "icon_url": "https://api.aftermarketscout.com/uploads/thibert_logo.png",
+        "category": "Distributors",
+        "connection_required_fields": ["ftp_user", "ftp_password"],
+        "installation_instructions_html": (
+            "<p><strong>Thibert</strong> provides an FTP account for your product data. "
+            "However, a request must be raised with your account manager before they will create it.</p>"
+            "<ol>"
+            "<li>Contact your Thibert account manager to request FTP access.</li>"
+            "<li>Once you have your credentials, enter your <strong>FTP Login</strong> and "
+            "<strong>FTP Password</strong> below and save.</li>"
+            "</ol>"
+            "<p>For assistance contact: "
+            "<a href=\"mailto:infoecommerce@rthibert.com\">infoecommerce@rthibert.com</a>.</p>"
+        ),
+    },
+    {
+        "kind": enums.BrandProviderKind.WESTERN_POWER_SPORTS,
+        "name": "Western Power Sports",
+        "description": "Access Western Power Sports inventory and pricing via API key.",
+        "icon_url": "https://api.aftermarketscout.com/uploads/western_power_sports_logo.png",
+        "category": "Distributors",
+        "connection_required_fields": ["api_key"],
+        "installation_instructions_html": (
+            "<p><strong>Western Power Sports (WPS)</strong> provides access via an API key.</p>"
+            "<ol>"
+            "<li>Contact your WPS account manager to obtain your <strong>API Key</strong>.</li>"
+            "<li>Enter it below and save the connection.</li>"
+            "</ol>"
+            "<p>For assistance contact: "
+            "<a href=\"mailto:webservices@wps-inc.com\">webservices@wps-inc.com</a>.</p>"
+        ),
+    },
+    {
+        "kind": enums.BrandProviderKind.XDP,
+        "name": "XDP",
+        "description": "Access XDP (Xtreme Diesel Performance) public inventory and pricing — no account required.",
+        "icon_url": "https://api.aftermarketscout.com/uploads/xdp_logo.png",
+        "category": "Distributors",
+        "connection_required_fields": [],
+        "installation_instructions_html": (
+            "<p><strong>XDP (Xtreme Diesel Performance)</strong> provides a public price and stock data feed — "
+            "an account is not required. Simply save the connection to activate it.</p>"
+            "<p>For assistance visit the "
+            "<a href=\"https://www.xdp.com/help\" target=\"_blank\" rel=\"noopener noreferrer\">"
+            "XDP Help Desk</a>.</p>"
+        ),
+    },
+    {
+        "kind": enums.BrandProviderKind.ASAP_NETWORK,
+        "name": "ASAP Network",
+        "description": "Access ASAP Network catalog data via API key — request brand access from each manufacturer.",
+        "icon_url": "https://api.aftermarketscout.com/uploads/asap_network_logo.png",
+        "category": "Distributors",
+        "connection_required_fields": ["api_key"],
+        "installation_instructions_html": (
+            "<p><strong>ASAP Network</strong> provides catalog data per brand. Before you can use a "
+            "brand&rsquo;s data you must request access — the manufacturer will then review and grant or deny it.</p>"
+            "<ol>"
+            "<li>In the ASAP Network portal, select <strong>Request Brands</strong> on the left-hand side.</li>"
+            "<li>Select the brand and press <strong>Request Data</strong>.</li>"
+            "<li>Once approved, enter your <strong>API Key</strong> below and save.</li>"
+            "</ol>"
+            "<p>For assistance contact: "
+            "<a href=\"mailto:amanda@asapnetwork.org\">amanda@asapnetwork.org</a>.</p>"
+        ),
+    },
 ]
 
 _UPLOADS = "https://api.aftermarketscout.com/uploads"
@@ -653,10 +756,6 @@ COMING_SOON_PROVIDERS = [
     {"kind": enums.BrandProviderKind.ALLPRO_DISTRIBUTING,     "name": "AllPro Distributing",        "category": "Distributors", "icon_url": f"{_UPLOADS}/allpro_logo.png"},
     {"kind": enums.BrandProviderKind.HOLLEY_PERFORMANCE,      "name": "Holley Performance",         "category": "Distributors", "icon_url": f"{_UPLOADS}/holley_logo.png"},
     {"kind": enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING,"name": "Motor State Distributing",   "category": "Distributors", "icon_url": f"{_UPLOADS}/motor_state_logo.png"},
-    {"kind": enums.BrandProviderKind.THE_WHEEL_GROUP,         "name": "The Wheel Group",            "category": "Distributors", "icon_url": f"{_UPLOADS}/the_wheel_group_logo.png"},
-    # {"kind": enums.BrandProviderKind.THIBERT,                 "name": "Thibert",                    "category": "Distributors", "icon_url": f"{_UPLOADS}/thibert_logo.png"},
-    # {"kind": enums.BrandProviderKind.WESTERN_POWER_SPORTS,    "name": "Western Power Sports",       "category": "Distributors", "icon_url": f"{_UPLOADS}/western_power_sports_logo.png"},
-    # {"kind": enums.BrandProviderKind.XDP,                     "name": "XDP",                        "category": "Distributors", "icon_url": f"{_UPLOADS}/xdp_logo.png"},
 ]
 
 # Field priority configuration for merging CATALOG and DISTRIBUTOR parts

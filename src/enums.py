@@ -51,6 +51,7 @@ class BrandProviderKind(enum.Enum):
     THIBERT = 31
     WESTERN_POWER_SPORTS = 32
     XDP = 33
+    ASAP_NETWORK = 34
 
 class BrandProviderStatus(enum.Enum):
     ACTIVE = 1
