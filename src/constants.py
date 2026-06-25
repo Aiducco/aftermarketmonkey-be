@@ -31,7 +31,6 @@ PROVIDER_DISPLAY_NAMES = {
     "THIBERT": "Thibert",
     "WESTERN_POWER_SPORTS": "Western Power Sports",
     "XDP": "XDP",
-    "ASAP_NETWORK": "ASAP Network",
 }
 
 # Provider kind_name -> image URL (used by parts API)
@@ -65,7 +64,6 @@ PROVIDER_IMAGE_URLS = {
     "THIBERT": "https://api.aftermarketscout.com/uploads/thibert_logo.png",
     "WESTERN_POWER_SPORTS": "https://api.aftermarketscout.com/uploads/western_power_sports_logo.png",
     "XDP": "https://api.aftermarketscout.com/uploads/xdp_logo.png",
-    "ASAP_NETWORK": "https://api.aftermarketscout.com/uploads/asap_network_logo.png",
 }
 
 # Public "open in distributor" links (parts API ``provider_go_to_link``); ``urllib.parse.quote`` at call sites.
@@ -726,25 +724,6 @@ PROVIDER_CATALOG = [
             "<p>For assistance visit the "
             "<a href=\"https://www.xdp.com/help\" target=\"_blank\" rel=\"noopener noreferrer\">"
             "XDP Help Desk</a>.</p>"
-        ),
-    },
-    {
-        "kind": enums.BrandProviderKind.ASAP_NETWORK,
-        "name": "ASAP Network",
-        "description": "Access ASAP Network catalog data via API key — request brand access from each manufacturer.",
-        "icon_url": "https://api.aftermarketscout.com/uploads/asap_network_logo.png",
-        "category": "Distributors",
-        "connection_required_fields": ["api_key"],
-        "installation_instructions_html": (
-            "<p><strong>ASAP Network</strong> provides catalog data per brand. Before you can use a "
-            "brand&rsquo;s data you must request access — the manufacturer will then review and grant or deny it.</p>"
-            "<ol>"
-            "<li>In the ASAP Network portal, select <strong>Request Brands</strong> on the left-hand side.</li>"
-            "<li>Select the brand and press <strong>Request Data</strong>.</li>"
-            "<li>Once approved, enter your <strong>API Key</strong> below and save.</li>"
-            "</ol>"
-            "<p>For assistance contact: "
-            "<a href=\"mailto:amanda@asapnetwork.org\">amanda@asapnetwork.org</a>.</p>"
         ),
     },
 ]
