@@ -967,3 +967,35 @@ def get_integration_requests(company_id: int) -> typing.List[int]:
     )
 
 
+# Custom (free-text) integration requests
+# ---------------------------------------------------------------------------
+
+def create_custom_integration_request(
+    company_id: int, distributor_name: str
+) -> typing.Tuple[bool, typing.Optional[str]]:
+    """
+    Create a CustomIntegrationRequest for a distributor not in our system.
+    Idempotent — if one already exists for this company + name, return success.
+    Returns (ok, error_message).
+    """
+    name = (distributor_name or "").strip()
+    if not name:
+        return False, "distributor_name is required"
+    if len(name) > 255:
+        return False, "distributor_name must be 255 characters or fewer"
+
+    src_models.CustomIntegrationRequest.objects.get_or_create(
+        company_id=company_id,
+        distributor_name=name,
+    )
+    return True, None
+
+
+def get_custom_integration_requests(company_id: int) -> typing.List[str]:
+    """Return list of distributor names the company has already requested."""
+    return list(
+        src_models.CustomIntegrationRequest.objects.filter(company_id=company_id)
+        .values_list("distributor_name", flat=True)
+    )
+
+

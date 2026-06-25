@@ -113,6 +113,16 @@ class IntegrationRequest(django_db_models.Model):
         unique_together = ["company", "provider"]
 
 
+class CustomIntegrationRequest(django_db_models.Model):
+    company = django_db_models.ForeignKey(Company, on_delete=django_db_models.CASCADE, related_name="custom_integration_requests")
+    distributor_name = django_db_models.CharField(max_length=255)
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "custom_integration_requests"
+        unique_together = ["company", "distributor_name"]
+
+
 class Brands(django_db_models.Model):
     name = django_db_models.CharField(max_length=255)
     status = django_db_models.PositiveSmallIntegerField()

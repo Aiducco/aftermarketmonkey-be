@@ -15,6 +15,7 @@ from src.api.views.integrations import (
     ExecutionRunsView,
     ExecutionRunPartsHistoryView,
     IntegrationRequestsView,
+    CustomIntegrationRequestsView,
 )
 from src.api.views.company_settings import (
     ProfileView,
@@ -99,6 +100,11 @@ urlpatterns = [
         "integrations/requests/",
         IntegrationRequestsView.as_view(),
         name="integration_requests",
+    ),
+    path(
+        "integrations/custom-requests/",
+        CustomIntegrationRequestsView.as_view(),
+        name="custom_integration_requests",
     ),
     path(
         "integrations/catalog/<int:id>/connect/",
