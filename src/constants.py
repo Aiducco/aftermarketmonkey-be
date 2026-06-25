@@ -23,6 +23,10 @@ PROVIDER_DISPLAY_NAMES = {
     "MARCOR": "Marcor",
     "OVERLAND_VEHICLE_SYSTEMS": "Overland Vehicle Systems",
     "PARTS_AUTHORITY": "Parts Authority",
+    "PARTS_CANADA": "Parts Canada",
+    "PARTS_UNLIMITED": "Parts Unlimited",
+    "PREMIER_PERFORMANCE": "Premier Performance",
+    "SSF_IMPORTED_AUTO_PARTS": "SSF Imported Auto Parts",
 }
 
 # Provider kind_name -> image URL (used by parts API)
@@ -48,6 +52,10 @@ PROVIDER_IMAGE_URLS = {
     "MARCOR": "https://api.aftermarketscout.com/uploads/marcor_logo.png",
     "OVERLAND_VEHICLE_SYSTEMS": "https://api.aftermarketscout.com/uploads/overland_vehicle_systems_logo.png",
     "PARTS_AUTHORITY": "https://api.aftermarketscout.com/uploads/parts_authority_logo.png",
+    "PARTS_CANADA": "https://api.aftermarketscout.com/uploads/parts_canada_logo.png",
+    "PARTS_UNLIMITED": "https://api.aftermarketscout.com/uploads/parts_unlimited_logo.png",
+    "PREMIER_PERFORMANCE": "https://api.aftermarketscout.com/uploads/premier_performance_logo.png",
+    "SSF_IMPORTED_AUTO_PARTS": "https://api.aftermarketscout.com/uploads/ssf_logo.png",
 }
 
 # Public "open in distributor" links (parts API ``provider_go_to_link``); ``urllib.parse.quote`` at call sites.
@@ -557,6 +565,85 @@ PROVIDER_CATALOG = [
             "<a href=\"mailto:contactus@partsauthority.com\">contactus@partsauthority.com</a>.</p>"
         ),
     },
+    {
+        "kind": enums.BrandProviderKind.PARTS_CANADA,
+        "name": "Parts Canada",
+        "description": "Access Parts Canada inventory and pricing via API access token.",
+        "icon_url": "https://api.aftermarketscout.com/uploads/parts_canada_logo.png",
+        "category": "Distributors",
+        "connection_required_fields": ["access_token"],
+        "installation_instructions_html": (
+            "<p><strong>Parts Canada</strong> provides API access using an access token. "
+            "Accounts start in sandbox mode for development; once you are ready to go live, "
+            "Parts Canada will activate your production access.</p>"
+            "<ol>"
+            "<li>Contact your Parts Canada representative to request your <strong>production access token</strong>, "
+            "which is required to retrieve live stock and pricing.</li>"
+            "<li>Enter the token in the <strong>Access Token</strong> field below and save.</li>"
+            "</ol>"
+            "<p>For assistance contact: "
+            "<a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a>.</p>"
+        ),
+    },
+    {
+        "kind": enums.BrandProviderKind.PARTS_UNLIMITED,
+        "name": "Parts Unlimited",
+        "description": "Access Parts Unlimited inventory and pricing via their Price File API.",
+        "icon_url": "https://api.aftermarketscout.com/uploads/parts_unlimited_logo.png",
+        "category": "Distributors",
+        "connection_required_fields": ["username", "password", "dealer_number"],
+        "installation_instructions_html": (
+            "<p><strong>Parts Unlimited</strong> connection requires access to their "
+            "<strong>Price File API</strong>, which uses your dealer portal credentials.</p>"
+            "<ol>"
+            "<li>Use the same credentials you use to log in to the Parts Unlimited Dealer Login at "
+            "<a href=\"https://dealer.parts-unlimited.com/login\" target=\"_blank\" rel=\"noopener noreferrer\">"
+            "dealer.parts-unlimited.com/login</a>.</li>"
+            "<li>Enter your <strong>Username</strong>, <strong>Password</strong>, and "
+            "<strong>Dealer Number</strong> below and save.</li>"
+            "</ol>"
+            "<p>For assistance contact: "
+            "<a href=\"mailto:AGelsinger@parts-unltd.com\">AGelsinger@parts-unltd.com</a>.</p>"
+        ),
+    },
+    {
+        "kind": enums.BrandProviderKind.PREMIER_PERFORMANCE,
+        "name": "Premier Performance",
+        "description": "Access Premier Performance inventory and pricing via FTP.",
+        "icon_url": "https://api.aftermarketscout.com/uploads/premier_performance_logo.png",
+        "category": "Distributors",
+        "connection_required_fields": ["ftp_user", "ftp_password"],
+        "installation_instructions_html": (
+            "<p><strong>Premier Performance</strong> provides a portal where you can configure your FTP connection. "
+            "However, a request must be raised with your account manager before they will provide access to the portal.</p>"
+            "<ol>"
+            "<li>Contact your Premier Performance account manager to request FTP portal access.</li>"
+            "<li>Once you have your credentials, enter your <strong>FTP Login</strong> and "
+            "<strong>FTP Password</strong> below and save.</li>"
+            "</ol>"
+            "<p>For assistance contact: "
+            "<a href=\"mailto:datateam@premierwd.com\">datateam@premierwd.com</a>.</p>"
+        ),
+    },
+    {
+        "kind": enums.BrandProviderKind.SSF_IMPORTED_AUTO_PARTS,
+        "name": "SSF Imported Auto Parts",
+        "description": "Access SSF Imported Auto Parts inventory and pricing via SFTP.",
+        "icon_url": "https://api.aftermarketscout.com/uploads/ssf_logo.png",
+        "category": "Distributors",
+        "connection_required_fields": ["account_number", "sftp_user", "sftp_password"],
+        "installation_instructions_html": (
+            "<p><strong>SSF Imported Auto Parts</strong> provides FTP accounts for stock and pricing data. "
+            "SSF data is confidential and proprietary and may be used only to search for and purchase products.</p>"
+            "<ol>"
+            "<li>Contact your SSF representative to obtain your <strong>Account Number</strong>, "
+            "<strong>SFTP Login</strong>, and <strong>SFTP Password</strong>.</li>"
+            "<li>Enter all three fields below and save the connection.</li>"
+            "</ol>"
+            "<p>For assistance contact: "
+            "<a href=\"mailto:info@ssfautoparts.com\">info@ssfautoparts.com</a>.</p>"
+        ),
+    },
 ]
 
 _UPLOADS = "https://api.aftermarketscout.com/uploads"
@@ -566,10 +653,6 @@ COMING_SOON_PROVIDERS = [
     {"kind": enums.BrandProviderKind.ALLPRO_DISTRIBUTING,     "name": "AllPro Distributing",        "category": "Distributors", "icon_url": f"{_UPLOADS}/allpro_logo.png"},
     {"kind": enums.BrandProviderKind.HOLLEY_PERFORMANCE,      "name": "Holley Performance",         "category": "Distributors", "icon_url": f"{_UPLOADS}/holley_logo.png"},
     {"kind": enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING,"name": "Motor State Distributing",   "category": "Distributors", "icon_url": f"{_UPLOADS}/motor_state_logo.png"},
-    {"kind": enums.BrandProviderKind.PARTS_CANADA,            "name": "Parts Canada",               "category": "Distributors", "icon_url": f"{_UPLOADS}/parts_canada_logo.png"},
-    # {"kind": enums.BrandProviderKind.PARTS_UNLIMITED,         "name": "Parts Unlimited",            "category": "Distributors", "icon_url": f"{_UPLOADS}/parts_unlimited_logo.png"},
-    {"kind": enums.BrandProviderKind.PREMIER_PERFORMANCE,     "name": "Premier Performance",        "category": "Distributors", "icon_url": f"{_UPLOADS}/premier_performance_logo.png"},
-    {"kind": enums.BrandProviderKind.SSF_IMPORTED_AUTO_PARTS, "name": "SSF Imported Auto Parts",    "category": "Distributors", "icon_url": f"{_UPLOADS}/ssf_logo.png"},
     {"kind": enums.BrandProviderKind.THE_WHEEL_GROUP,         "name": "The Wheel Group",            "category": "Distributors", "icon_url": f"{_UPLOADS}/the_wheel_group_logo.png"},
     # {"kind": enums.BrandProviderKind.THIBERT,                 "name": "Thibert",                    "category": "Distributors", "icon_url": f"{_UPLOADS}/thibert_logo.png"},
     # {"kind": enums.BrandProviderKind.WESTERN_POWER_SPORTS,    "name": "Western Power Sports",       "category": "Distributors", "icon_url": f"{_UPLOADS}/western_power_sports_logo.png"},
