@@ -303,14 +303,15 @@ PROVIDER_CATALOG = [
         "description": "Access inventory and pricing from Automatic Distributors via FTP.",
         "icon_url": "https://api.aftermarketscout.com/uploads/automatic_distributors_logo.png",
         "category": "Distributors",
-        "connection_required_fields": ["ftp_user", "ftp_password"],
+        "connection_required_fields": ["ftp_host", "ftp_port", "ftp_user", "ftp_password"],
         "installation_instructions_html": (
             "<p><strong>Automatic Distributors</strong> provides an FTP account for your product data. "
             "However, a request must be raised with your account manager before they will create it. "
             "These are the same credentials as their catalog connection.</p>"
             "<ol>"
             "<li>Contact your Automatic Distributors account manager and request FTP access for data feeds.</li>"
-            "<li>Once you receive your <strong>FTP Login</strong> and <strong>FTP Password</strong>, "
+            "<li>Once you receive your <strong>FTP Host</strong>, <strong>FTP Port</strong>, "
+            "<strong>FTP Login</strong>, and <strong>FTP Password</strong>, "
             "enter them below and save the connection.</li>"
             "</ol>"
             "<p>For assistance please contact: "
@@ -404,36 +405,6 @@ PROVIDER_CATALOG = [
         ),
     },
     {
-        "kind": enums.BrandProviderKind.EARL_OWEN,
-        "name": "Earl Owen",
-        "description": "Access Earl Owen Company inventory and pricing via FTP relay.",
-        "icon_url": "https://api.aftermarketscout.com/uploads/earl_owen_logo.png",
-        "category": "Distributors",
-        "connection_required_fields": ["ftp_user", "ftp_password"],
-        "installation_instructions_html": (
-            "<p><strong>Earl Owen Company</strong> provides an FTP-based data feed. "
-            "If you do not have your own FTP site, email "
-            "<a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a> "
-            "and they will create a unique account for you to receive Earl Owen&rsquo;s data. "
-            "This login can be shared with your Earl Owen account representative so they can provide "
-            "your stock and pricing data.</p>"
-            "<ol>"
-            "<li>Obtain your FTP credentials from "
-            "<a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a>.</li>"
-            "<li>Share the credentials with your Earl Owen rep and ask them to push the feed.</li>"
-            "<li>Enter your <strong>FTP Login</strong> and <strong>FTP Password</strong> below and save.</li>"
-            "</ol>"
-            "<p><strong>Example connection details</strong></p>"
-            "<ul>"
-            "<li><strong>FTP:</strong> <code>5.161.121.143</code></li>"
-            "<li><strong>Port:</strong> <code>22</code></li>"
-            "<li><strong>Folder:</strong> <code>/earlowen</code></li>"
-            "</ul>"
-            "<p>For assistance contact: "
-            "<a href=\"mailto:JSmith@earlowen.com\">JSmith@earlowen.com</a>.</p>"
-        ),
-    },
-    {
         "kind": enums.BrandProviderKind.ELITE_WHEEL,
         "name": "Elite Wheel",
         "description": "Access Elite Wheel & Tire inventory and pricing via API.",
@@ -460,13 +431,14 @@ PROVIDER_CATALOG = [
         "description": "Access FastCo inventory and pricing via FTP.",
         "icon_url": "https://api.aftermarketscout.com/uploads/fastco_logo.png",
         "category": "Distributors",
-        "connection_required_fields": ["ftp_user", "ftp_password"],
+        "connection_required_fields": ["ftp_host", "ftp_port", "ftp_user", "ftp_password"],
         "installation_instructions_html": (
             "<p><strong>FastCo</strong> provides an FTP account for your product data. "
             "However, a request must be raised with your account manager before they will create it.</p>"
             "<ol>"
             "<li>Contact your FastCo account manager and request FTP access.</li>"
-            "<li>Once you have the connection details, enter your <strong>FTP Login</strong> and "
+            "<li>Once you have the connection details, enter your <strong>FTP Host</strong>, "
+            "<strong>FTP Port</strong>, <strong>FTP Login</strong>, and "
             "<strong>FTP Password</strong> below and save.</li>"
             "</ol>"
             "<p>For assistance contact: <a href=\"mailto:PYoshida@fastco.ca\">PYoshida@fastco.ca</a>.</p>"
@@ -540,14 +512,14 @@ PROVIDER_CATALOG = [
         "description": "Access Overland Vehicle Systems inventory and pricing via FTP.",
         "icon_url": "https://api.aftermarketscout.com/uploads/overland_vehicle_systems_logo.png",
         "category": "Distributors",
-        "connection_required_fields": ["ftp_user", "ftp_password"],
+        "connection_required_fields": ["ftp_host", "ftp_port", "ftp_user", "ftp_password"],
         "installation_instructions_html": (
             "<p><strong>Overland Vehicle Systems</strong> provides the pricing file via FTP. "
             "A request must first be made with Overland Vehicle Systems to enable access.</p>"
             "<ol>"
             "<li>Contact Overland Vehicle Systems to request FTP access for your account.</li>"
-            "<li>Once access is enabled, enter your <strong>FTP Login</strong> and "
-            "<strong>FTP Password</strong> below and save the connection.</li>"
+            "<li>Once access is enabled, enter your <strong>FTP Host</strong>, <strong>FTP Port</strong>, "
+            "<strong>FTP Login</strong>, and <strong>FTP Password</strong> below and save the connection.</li>"
             "</ol>"
             "<p>For assistance contact: "
             "<a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a>.</p>"
@@ -559,17 +531,18 @@ PROVIDER_CATALOG = [
         "description": "Access Parts Authority inventory and pricing via FTP.",
         "icon_url": "https://api.aftermarketscout.com/uploads/parts_authority_logo.png",
         "category": "Distributors",
-        "connection_required_fields": ["ftp_user", "ftp_password"],
+        "connection_required_fields": ["ftp_host", "ftp_port", "ftp_user", "ftp_password"],
         "installation_instructions_html": (
             "<p><strong>Parts Authority</strong> provides inventory and pricing via their FTP server.</p>"
             "<ol>"
-            "<li>Contact Parts Authority to obtain your FTP <strong>Login</strong> and <strong>Password</strong>.</li>"
-            "<li>Enter them below and save the connection.</li>"
+            "<li>Contact Parts Authority to obtain your FTP credentials.</li>"
+            "<li>Enter the <strong>FTP Host</strong>, <strong>FTP Port</strong>, "
+            "<strong>FTP Login</strong>, and <strong>FTP Password</strong> below and save.</li>"
             "</ol>"
-            "<p><strong>Connection details</strong></p>"
+            "<p><strong>Default connection details</strong></p>"
             "<ul>"
             "<li><strong>FTP Host:</strong> <code>ftp.panetny.com</code></li>"
-            "<li><strong>Port:</strong> <code>21</code></li>"
+            "<li><strong>FTP Port:</strong> <code>21</code></li>"
             "</ul>"
             "<p>For assistance contact: "
             "<a href=\"mailto:contactus@partsauthority.com\">contactus@partsauthority.com</a>.</p>"
@@ -622,14 +595,14 @@ PROVIDER_CATALOG = [
         "description": "Access Premier Performance inventory and pricing via FTP.",
         "icon_url": "https://api.aftermarketscout.com/uploads/premier_performance_logo.png",
         "category": "Distributors",
-        "connection_required_fields": ["ftp_user", "ftp_password"],
+        "connection_required_fields": ["ftp_host", "ftp_port", "ftp_user", "ftp_password"],
         "installation_instructions_html": (
             "<p><strong>Premier Performance</strong> provides a portal where you can configure your FTP connection. "
             "However, a request must be raised with your account manager before they will provide access to the portal.</p>"
             "<ol>"
             "<li>Contact your Premier Performance account manager to request FTP portal access.</li>"
-            "<li>Once you have your credentials, enter your <strong>FTP Login</strong> and "
-            "<strong>FTP Password</strong> below and save.</li>"
+            "<li>Once you have your credentials, enter your <strong>FTP Host</strong>, <strong>FTP Port</strong>, "
+            "<strong>FTP Login</strong>, and <strong>FTP Password</strong> below and save.</li>"
             "</ol>"
             "<p>For assistance contact: "
             "<a href=\"mailto:datateam@premierwd.com\">datateam@premierwd.com</a>.</p>"
@@ -641,14 +614,15 @@ PROVIDER_CATALOG = [
         "description": "Access SSF Imported Auto Parts inventory and pricing via SFTP.",
         "icon_url": "https://api.aftermarketscout.com/uploads/ssf_logo.png",
         "category": "Distributors",
-        "connection_required_fields": ["account_number", "sftp_user", "sftp_password"],
+        "connection_required_fields": ["account_number", "sftp_host", "sftp_port", "sftp_user", "sftp_password"],
         "installation_instructions_html": (
             "<p><strong>SSF Imported Auto Parts</strong> provides FTP accounts for stock and pricing data. "
             "SSF data is confidential and proprietary and may be used only to search for and purchase products.</p>"
             "<ol>"
             "<li>Contact your SSF representative to obtain your <strong>Account Number</strong>, "
+            "<strong>SFTP Host</strong>, <strong>SFTP Port</strong>, "
             "<strong>SFTP Login</strong>, and <strong>SFTP Password</strong>.</li>"
-            "<li>Enter all three fields below and save the connection.</li>"
+            "<li>Enter all five fields below and save the connection.</li>"
             "</ol>"
             "<p>For assistance contact: "
             "<a href=\"mailto:info@ssfautoparts.com\">info@ssfautoparts.com</a>.</p>"
@@ -683,14 +657,14 @@ PROVIDER_CATALOG = [
         "description": "Access Thibert inventory and pricing via FTP.",
         "icon_url": "https://api.aftermarketscout.com/uploads/thibert_logo.png",
         "category": "Distributors",
-        "connection_required_fields": ["ftp_user", "ftp_password"],
+        "connection_required_fields": ["ftp_host", "ftp_port", "ftp_user", "ftp_password"],
         "installation_instructions_html": (
             "<p><strong>Thibert</strong> provides an FTP account for your product data. "
             "However, a request must be raised with your account manager before they will create it.</p>"
             "<ol>"
             "<li>Contact your Thibert account manager to request FTP access.</li>"
-            "<li>Once you have your credentials, enter your <strong>FTP Login</strong> and "
-            "<strong>FTP Password</strong> below and save.</li>"
+            "<li>Once you have your credentials, enter your <strong>FTP Host</strong>, <strong>FTP Port</strong>, "
+            "<strong>FTP Login</strong>, and <strong>FTP Password</strong> below and save.</li>"
             "</ol>"
             "<p>For assistance contact: "
             "<a href=\"mailto:infoecommerce@rthibert.com\">infoecommerce@rthibert.com</a>.</p>"
