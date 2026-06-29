@@ -165,6 +165,7 @@ def get_providers_catalog(company_id: int) -> typing.Dict:
             "kind": kind_value,
             "kind_name": kind_name,
             "coming_soon": False,
+            "integration_time": entry.get("integration_time") or None,
         })
 
     # Coming soon distributors — driven by COMING_SOON_PROVIDERS
