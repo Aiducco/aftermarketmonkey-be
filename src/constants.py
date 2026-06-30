@@ -127,7 +127,7 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/t14_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["client_id", "client_secret"],
-        "integration_time": "1-2 hours",
+        "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
             "<p>Turn 14 connections use OAuth2. Your <strong>client ID</strong> and <strong>client secret</strong> "
             "are shown on Turn 14's API settings page.</p>"
@@ -148,7 +148,7 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/keystone.png",
         "category": "Distributors",
         "connection_required_fields": ["ftp_user", "ftp_password"],
-        "integration_time": "1-2 hours",
+        "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
             "<p><strong>Keystone</strong> data is loaded from their FTP inventory feed using your account credentials.</p>"
             "<ol>"
@@ -166,7 +166,7 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/rough_country.png",
         "category": "Distributors",
         "connection_required_fields": [ROUGH_COUNTRY_CREDENTIALS_FEED_URL],
-        "integration_time": "1-2 hours",
+        "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
             "<p><strong>Rough Country</strong> uses a downloadable Excel jobber feed URL per dealer account.</p>"
             "<ol>"
@@ -192,7 +192,7 @@ PROVIDER_CATALOG = [
         ],
         # Remote CSV path per feed (wheel/tire/accessories); defaults in settings if omitted
         "connection_optional_fields": ["sftp_path"],
-        "integration_time": "1-2 hours",
+        "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
             "<p><strong>Wheel Pros</strong> inventory and pricing CSVs (wheels, tires, accessories) are on Wheel "
             "Pros&rsquo; SFTP server (<code>sftp.wheelpros.com</code>, port 22). AfterMarketScout connects there "
@@ -216,7 +216,7 @@ PROVIDER_CATALOG = [
         "category": "Distributors",
         "connection_required_fields": ["sftp_user", "sftp_password"],
         "connection_optional_fields": [],
-        "integration_time": "1-2 hours",
+        "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
             "<p>Email <a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a> so we can "
             "create a unique SFTP account for you and send a <strong>username</strong> and <strong>password</strong>. "
@@ -243,7 +243,7 @@ PROVIDER_CATALOG = [
         "category": "Distributors",
         "connection_required_fields": ["sftp_user", "sftp_password"],
         "connection_optional_fields": [],
-        "integration_time": "1-2 hours",
+        "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
             "<p>Email <a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a> so we can "
             "provision a dedicated SFTP login (<strong>username</strong> and <strong>password</strong>) on "
@@ -284,7 +284,7 @@ PROVIDER_CATALOG = [
         "category": "Distributors",
         "connection_required_fields": [DLG_CREDENTIALS_EMAIL_FROM],
         "connection_optional_fields": [],
-        "integration_time": "1-2 days",
+        "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>How the feed works</strong></p>"
             "<p>DLG does not load inventory into AftermarketScout directly. They email the "
@@ -311,7 +311,7 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/automatic_distributors_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["ftp_host", "ftp_port", "ftp_user", "ftp_password"],
-        "integration_time": "1-2 days",
+        "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>Automatic Distributors</strong> provides an FTP account for your product data. "
             "However, a request must be raised with your account manager before they will create it. "
@@ -333,7 +333,7 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/ctp_distributors_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["ftp_user", "ftp_password"],
-        "integration_time": "1-2 days",
+        "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>CTP Distributors</strong> sends their data feed directly to an FTP site. "
             "Please ask your CTP account representative to set up this FTP connection.</p>"
@@ -361,7 +361,7 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/crown_automotive_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["ftp_user", "ftp_password"],
-        "integration_time": "1-2 days",
+        "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>Crown Automotive</strong> provides an FTP-based data feed. "
             "If you do not have your own FTP site, email "
@@ -391,7 +391,7 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/dix_perf_north_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["ftp_user", "ftp_password"],
-        "integration_time": "1-2 days",
+        "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>DIX Performance North</strong> provides an FTP-based data feed. "
             "If you do not have your own FTP site, email "
@@ -422,7 +422,7 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/elite_wheel_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["username", "password"],
-        "integration_time": "1-2 days",
+        "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>Elite Wheel &amp; Tire</strong> provides access via their API using a "
             "<strong>Username</strong> and <strong>Password</strong>.</p>"
@@ -444,7 +444,7 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/fastco_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["ftp_host", "ftp_port", "ftp_user", "ftp_password"],
-        "integration_time": "1-2 days",
+        "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>FastCo</strong> provides an FTP account for your product data. "
             "However, a request must be raised with your account manager before they will create it.</p>"
@@ -465,7 +465,7 @@ PROVIDER_CATALOG = [
         "category": "Distributors",
         "connection_required_fields": ["account_number"],
         "connection_optional_fields": ["access_token", "token_secret"],
-        "integration_time": "1-2 days",
+        "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>GrandWest Enterprises</strong> provides a data feed to keep your stock and pricing up to date.</p>"
             "<ol>"
@@ -485,7 +485,7 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/helmhouse_logo.png",
         "category": "Distributors",
         "connection_required_fields": [],
-        "integration_time": "1-2 days",
+        "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>Helmet House</strong> provides public price and stock data — "
             "an account is not required. Simply save the connection to activate it.</p>"
@@ -500,7 +500,7 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/thibault_logo.png",
         "category": "Distributors",
         "connection_required_fields": [],
-        "integration_time": "1-2 days",
+        "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>Thibault</strong> (Importations Thibault) FTP feed is already enabled for all dealers — "
             "no store-specific login credentials are required. Simply save the connection to activate it.</p>"
@@ -515,7 +515,7 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/marcor_logo.png",
         "category": "Distributors",
         "connection_required_fields": [],
-        "integration_time": "1-2 days",
+        "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>Marcor Automotive</strong> provides a public price and stock data feed — "
             "an account is not required. Simply save the connection to activate it.</p>"
@@ -530,7 +530,7 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/overland_vehicle_systems_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["ftp_host", "ftp_port", "ftp_user", "ftp_password"],
-        "integration_time": "1-2 days",
+        "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>Overland Vehicle Systems</strong> provides the pricing file via FTP. "
             "A request must first be made with Overland Vehicle Systems to enable access.</p>"
@@ -550,7 +550,7 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/parts_authority_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["ftp_host", "ftp_port", "ftp_user", "ftp_password"],
-        "integration_time": "1-2 days",
+        "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>Parts Authority</strong> provides inventory and pricing via their FTP server.</p>"
             "<ol>"
@@ -574,7 +574,7 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/parts_canada_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["access_token"],
-        "integration_time": "1-2 days",
+        "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>Parts Canada</strong> provides API access using an access token. "
             "Accounts start in sandbox mode for development; once you are ready to go live, "
@@ -595,7 +595,7 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/parts_unlimited_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["username", "password", "dealer_number"],
-        "integration_time": "1-2 days",
+        "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>Parts Unlimited</strong> connection requires access to their "
             "<strong>Price File API</strong>, which uses your dealer portal credentials.</p>"
@@ -617,7 +617,7 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/premier_performance_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["ftp_host", "ftp_port", "ftp_user", "ftp_password"],
-        "integration_time": "1-2 days",
+        "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>Premier Performance</strong> provides a portal where you can configure your FTP connection. "
             "However, a request must be raised with your account manager before they will provide access to the portal.</p>"
@@ -637,7 +637,7 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/ssf_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["account_number", "sftp_host", "sftp_port", "sftp_user", "sftp_password"],
-        "integration_time": "1-2 days",
+        "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>SSF Imported Auto Parts</strong> provides FTP accounts for stock and pricing data. "
             "SSF data is confidential and proprietary and may be used only to search for and purchase products.</p>"
@@ -658,7 +658,7 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/the_wheel_group_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["ftp_user", "ftp_password"],
-        "integration_time": "1-2 days",
+        "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>The Wheel Group</strong> provides an FTP-based data feed delivered to "
             "AfterMarketScout&rsquo;s relay. Email "
@@ -682,7 +682,7 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/thibert_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["ftp_host", "ftp_port", "ftp_user", "ftp_password"],
-        "integration_time": "1-2 days",
+        "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>Thibert</strong> provides an FTP account for your product data. "
             "However, a request must be raised with your account manager before they will create it.</p>"
@@ -702,7 +702,7 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/western_power_sports_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["api_key"],
-        "integration_time": "1-2 days",
+        "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>Western Power Sports (WPS)</strong> provides access via an API key.</p>"
             "<ol>"
@@ -720,7 +720,7 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/xdp_logo.png",
         "category": "Distributors",
         "connection_required_fields": [],
-        "integration_time": "1-2 days",
+        "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>XDP (Xtreme Diesel Performance)</strong> provides a public price and stock data feed — "
             "an account is not required. Simply save the connection to activate it.</p>"
@@ -736,7 +736,7 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/atd_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["username", "password", "client_id", "location"],
-        "integration_time": "1-2 days",
+        "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>ATD (American Tire Distributors)</strong> provides inventory and pricing via their "
             "Ship to Home API. You will need your ATD account credentials to connect.</p>"
