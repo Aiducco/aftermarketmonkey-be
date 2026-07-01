@@ -1403,17 +1403,21 @@ def fetch_and_save_meyer_catalog_and_inventory(force_download: bool = False) -> 
                 try:
                     pc = meyer_client.MeyerSFTPClient(credentials=creds)
                 except ValueError as e:
-                    logger.error("{} company_id={}: {}".format(_LOG_PREFIX, cp.company_id, str(e)))
-                    raise
+                    logger.error(
+                        "{} Skipping Meyer pricing for company_id={}: {}".format(
+                            _LOG_PREFIX, cp.company_id, str(e),
+                        )
+                    )
+                    return 0
                 try:
                     company_pricing_path = pc.download_pricing_file(force_download=force_download)
                 except meyer_exceptions.MeyerException as e:
                     logger.error(
-                        "{} Meyer pricing download error company_id={}: {}.".format(
+                        "{} Skipping Meyer pricing for company_id={}: download error: {}.".format(
                             _LOG_PREFIX, cp.company_id, str(e),
                         )
                     )
-                    raise
+                    return 0
                 mfgs_c, pmap_mfg = _meyer_pricing_map_by_mfg_from_iterable(
                     _iter_records_from_csv(company_pricing_path),
                     progress_every=MEYER_PARSE_PROGRESS_EVERY,
@@ -1476,9 +1480,17 @@ def fetch_and_save_meyer_catalog_and_inventory(force_download: bool = False) -> 
                 )
             )
             with ThreadPoolExecutor(max_workers=workers) as ex:
-                futs = [ex.submit(_sync_one_company_pricing, cp) for cp in pricing_cps]
-                for fut in as_completed(futs):
-                    total_company_pricing += fut.result()
+                fut_to_cp = {ex.submit(_sync_one_company_pricing, cp): cp for cp in pricing_cps}
+                for fut in as_completed(fut_to_cp):
+                    cp = fut_to_cp[fut]
+                    try:
+                        total_company_pricing += fut.result()
+                    except Exception as e:
+                        logger.error(
+                            "{} Meyer pricing sync failed for company_id={}: {}.".format(
+                                _LOG_PREFIX, cp.company_id, str(e),
+                            )
+                        )
         logger.info(
             "{} Meyer per-company pricing done: {} rows across {} companies.".format(
                 _LOG_PREFIX,

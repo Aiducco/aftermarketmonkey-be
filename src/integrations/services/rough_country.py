@@ -655,13 +655,13 @@ def fetch_and_save_rough_country(
                     price_data = price_client.get_feed_data(download_if_missing=download)
                 except rough_country_exceptions.RoughCountryException as e:
                     logger.error(
-                        "{} Pricing feed error company_id={}: {}.".format(
+                        "{} Skipping Rough Country pricing for company_id={}: {}.".format(
                             _LOG_PREFIX,
                             cp.company_id,
                             str(e),
                         )
                     )
-                    raise
+                    continue
                 g = price_data.get("general") or []
                 m2b = _ensure_rough_country_brands_from_manufacturers(g)
                 pmap = _deduped_pricing_by_brand_sku_from_general(g, m2b)

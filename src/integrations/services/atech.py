@@ -1142,7 +1142,14 @@ def fetch_and_save_atech_catalog(force_download: bool = False) -> None:
                         cp.primary,
                     )
                 )
-                sync_atech_company_pricing_for_company_provider(cp.id, force_download=force_download)
+                try:
+                    sync_atech_company_pricing_for_company_provider(cp.id, force_download=force_download)
+                except Exception as e:
+                    logger.error(
+                        "{} Skipping A-Tech pricing for company_id={}: {}.".format(
+                            _LOG_PREFIX, cp.company_id, str(e),
+                        )
+                    )
         else:
             logger.info(
                 "{} A-Tech company pricing: {} company provider(s), {} parallel worker(s) (per-company files differ).".format(
@@ -1164,6 +1171,12 @@ def fetch_and_save_atech_catalog(force_download: bool = False) -> None:
                         )
                     )
                     sync_atech_company_pricing_for_company_provider(cp.id, force_download=force_download)
+                except Exception as e:
+                    logger.error(
+                        "{} Skipping A-Tech pricing for company_id={}: {}.".format(
+                            _LOG_PREFIX, cp.company_id, str(e),
+                        )
+                    )
                 finally:
                     close_old_connections()
 

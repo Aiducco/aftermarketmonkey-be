@@ -850,13 +850,13 @@ def fetch_and_save_wheelpros(
                 )
             except wheelpros_exceptions.WheelProsException as e:
                 logger.error(
-                    "{} WheelPros pricing feed error company_id={}: {}.".format(
+                    "{} Skipping WheelPros pricing for company_id={}: {}.".format(
                         _LOG_PREFIX,
                         cp.company_id,
                         str(e),
                     )
                 )
-                raise
+                continue
             pmap = _wheelpros_pricing_map_from_records(price_records, brand_by_external)
             # Collapse by catalog part_id so one INSERT row per (part, company); last pmap row wins.
             pricing_by_part_id: typing.Dict[int, typing.Dict[str, typing.Any]] = {}
