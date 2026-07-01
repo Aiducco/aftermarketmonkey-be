@@ -25,6 +25,13 @@ class Company(django_db_models.Model):
     subscription_status = django_db_models.CharField(max_length=32, null=True, blank=True)
     subscription_period_end = django_db_models.DateTimeField(null=True, blank=True)
 
+    # Dedicated SFTP relay account (one per company) — auto-provisioned in the background so
+    # relay-based distributors (Meyer, A-Tech, etc.) can be connected with one click instead of
+    # the company emailing support for credentials.
+    relay_sftp_username = django_db_models.CharField(max_length=64, null=True, blank=True, unique=True)
+    relay_sftp_password = django_db_models.CharField(max_length=128, null=True, blank=True)
+    relay_sftp_provisioned_at = django_db_models.DateTimeField(null=True, blank=True)
+
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
 

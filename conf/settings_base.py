@@ -270,7 +270,7 @@ try:
     _meyer_port = int(os.environ.get("MEYER_SFTP_PORT") or "22")
 except ValueError:
     _meyer_port = 22
-MEYER_SFTP_HOST = os.environ.get("MEYER_SFTP_HOST") or "54.145.82.238"
+MEYER_SFTP_HOST = os.environ.get("MEYER_SFTP_HOST") or "5.161.121.143"
 MEYER_SFTP_PORT = _meyer_port if 1 <= _meyer_port <= 65535 else 22
 MEYER_SFTP_DIRECTORY = os.environ.get("MEYER_SFTP_DIRECTORY") or "uploads"
 MEYER_PRICING_REMOTE_FILE = os.environ.get("MEYER_PRICING_REMOTE_FILE") or "Meyer Pricing.csv"
@@ -283,7 +283,7 @@ try:
     _atech_port = int(os.environ.get("ATECH_SFTP_PORT") or "22")
 except ValueError:
     _atech_port = 22
-ATECH_SFTP_HOST = os.environ.get("ATECH_SFTP_HOST") or "54.145.82.238"
+ATECH_SFTP_HOST = os.environ.get("ATECH_SFTP_HOST") or "5.161.121.143"
 ATECH_SFTP_PORT = _atech_port if 1 <= _atech_port <= 65535 else 22
 ATECH_SFTP_DIRECTORY = os.environ.get("ATECH_SFTP_DIRECTORY") or "uploads"
 # Single combined feed: pricing, per-warehouse qty, fees, GTIN (see clients/atech/feed_spec.py).
@@ -322,6 +322,20 @@ try:
     MEYER_PARSE_PROGRESS_EVERY = int(os.environ.get("MEYER_PARSE_PROGRESS_EVERY", "250000"))
 except ValueError:
     MEYER_PARSE_PROGRESS_EVERY = 250000
+
+# Relay SFTP account provisioning: creates a dedicated, chrooted SFTP login per company on the
+# relay box itself (same server as MEYER_SFTP_HOST/ATECH_SFTP_HOST above), mirroring the manually
+# created "thor" account (Linux user in the `sftpusers` group, home under RELAY_SFTP_BASE_DIR,
+# relies on sshd's `Match Group sftpusers` block for the chroot — no per-user sshd config needed).
+RELAY_SFTP_SSH_HOST = os.environ.get("RELAY_SFTP_SSH_HOST") or "5.161.121.143"
+try:
+    RELAY_SFTP_SSH_PORT = int(os.environ.get("RELAY_SFTP_SSH_PORT") or "22")
+except ValueError:
+    RELAY_SFTP_SSH_PORT = 22
+RELAY_SFTP_SSH_USER = os.environ.get("RELAY_SFTP_SSH_USER") or "root"
+RELAY_SFTP_SSH_PASSWORD = os.environ.get("RELAY_SFTP_SSH_PASSWORD") or ""
+RELAY_SFTP_GROUP = os.environ.get("RELAY_SFTP_GROUP") or "sftpusers"
+RELAY_SFTP_BASE_DIR = os.environ.get("RELAY_SFTP_BASE_DIR") or "/sftp"
 
 # DLG: relay host/path/file are in ``src.constants``; app-level SFTP login (not per CompanyProvider) — set in env.
 DLG_RELAY_SFTP_USER = os.environ.get("DLG_RELAY_SFTP_USER", "")

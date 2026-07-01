@@ -5,11 +5,34 @@ from django.core.paginator import Paginator
 
 from src import constants as src_constants
 from src import models as src_models
-from src.integrations.services import integration_pricing_sync_jobs
+from src.integrations.services import integration_pricing_sync_jobs, relay_sftp_provisioning
 
 logger = logging.getLogger(__name__)
 
 _LOG_PREFIX = '[INTEGRATIONS-SERVICES]'
+
+
+def _render_relay_instructions_html(
+    catalog_entry: typing.Dict[str, typing.Any],
+    company: typing.Optional[src_models.Company],
+) -> typing.Optional[str]:
+    """
+    For ``relay_provisioned`` catalog entries, substitute the company's own auto-provisioned
+    relay SFTP username/password into the ``{{SFTP_USER}}`` / ``{{SFTP_PASSWORD}}`` placeholders
+    so the distributor rep gets real, ready-to-use credentials instead of a request-by-email flow.
+    """
+    template = catalog_entry.get("installation_instructions_html") or ""
+    if not catalog_entry.get("relay_provisioned"):
+        return template or None
+    username = getattr(company, "relay_sftp_username", None) if company else None
+    password = getattr(company, "relay_sftp_password", None) if company else None
+    if not username or not password:
+        return (
+            "<p>Your dedicated SFTP account is being created and will appear here shortly &mdash; "
+            "check back in a few minutes. Still missing? Contact "
+            "<a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a>.</p>"
+        )
+    return template.replace("{{SFTP_USER}}", username).replace("{{SFTP_PASSWORD}}", password)
 
 
 def _normalize_credential_value(value: typing.Any) -> typing.Optional[typing.Any]:
@@ -115,6 +138,8 @@ def get_providers_catalog(company_id: int) -> typing.Dict:
         _LOG_PREFIX, company_id
     ))
 
+    company = src_models.Company.objects.filter(id=company_id).first()
+
     # Get company's connected provider IDs
     connected_provider_ids = set(
         src_models.CompanyProviders.objects.filter(
@@ -159,7 +184,8 @@ def get_providers_catalog(company_id: int) -> typing.Dict:
             "category": entry.get("category", ""),
             "connection_required_fields": entry.get("connection_required_fields", []),
             "connection_optional_fields": entry.get("connection_optional_fields", []),
-            "installation_instructions_html": entry.get("installation_instructions_html") or None,
+            "installation_instructions_html": _render_relay_instructions_html(entry, company),
+            "relay_provisioned": bool(entry.get("relay_provisioned")),
             "connected": connected,
             "company_provider_id": company_provider.id if company_provider else None,
             "kind": kind_value,
@@ -235,9 +261,24 @@ def connect_provider(
     if not catalog_entry:
         return None, "Provider not found in catalog"
 
-    creds, err = _build_credentials_from_catalog_entry(catalog_entry, credentials)
-    if err:
-        return None, err
+    if catalog_entry.get("relay_provisioned"):
+        company = src_models.Company.objects.filter(id=company_id).first()
+        if not company:
+            return None, "Company not found"
+        if not company.relay_sftp_username or not company.relay_sftp_password:
+            try:
+                relay_sftp_provisioning.provision_company_sftp_account(company)
+            except Exception as e:
+                logger.error("{} Relay SFTP provisioning failed for company_id={}: {}".format(
+                    _LOG_PREFIX, company_id, e
+                ))
+                return None, "Your SFTP account could not be created. Please contact info@aftermarketscout.com."
+        user_field, password_field = catalog_entry.get("relay_credential_fields", ("sftp_user", "sftp_password"))
+        creds = {user_field: company.relay_sftp_username, password_field: company.relay_sftp_password}
+    else:
+        creds, err = _build_credentials_from_catalog_entry(catalog_entry, credentials)
+        if err:
+            return None, err
 
     # Check if already connected
     existing = src_models.CompanyProviders.objects.filter(
@@ -545,19 +586,28 @@ def get_company_provider_connection_detail(
     }
     base.update(_provider_ui_metadata(provider))
 
-    creds_redacted, secrets_configured = _redacted_credentials_for_connection_detail(
-        catalog_entry,
-        company_provider.credentials,
-    )
-
     out: typing.Dict[str, typing.Any] = dict(base)
     out["description"] = catalog_entry.get("description", "")
     out["category"] = catalog_entry.get("category", "")
-    out["installation_instructions_html"] = catalog_entry.get("installation_instructions_html") or None
     out["connection_required_fields"] = list(catalog_entry.get("connection_required_fields") or [])
     out["connection_optional_fields"] = list(catalog_entry.get("connection_optional_fields") or [])
-    out["credentials"] = creds_redacted
-    out["secrets_configured"] = secrets_configured
+    out["relay_provisioned"] = bool(catalog_entry.get("relay_provisioned"))
+
+    if catalog_entry.get("relay_provisioned"):
+        # These credentials are meant to be handed to the distributor's rep, not kept secret from
+        # the company itself — show them plainly instead of redacting like a normal password field.
+        company = src_models.Company.objects.filter(id=company_provider.company_id).first()
+        out["installation_instructions_html"] = _render_relay_instructions_html(catalog_entry, company)
+        out["credentials"] = dict(company_provider.credentials or {})
+        out["secrets_configured"] = {k: True for k in (company_provider.credentials or {}).keys()}
+    else:
+        out["installation_instructions_html"] = catalog_entry.get("installation_instructions_html") or None
+        creds_redacted, secrets_configured = _redacted_credentials_for_connection_detail(
+            catalog_entry,
+            company_provider.credentials,
+        )
+        out["credentials"] = creds_redacted
+        out["secrets_configured"] = secrets_configured
     return out
 
 

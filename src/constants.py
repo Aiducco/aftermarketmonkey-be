@@ -214,25 +214,26 @@ PROVIDER_CATALOG = [
         "description": "Access Meyer catalog, inventory, and pricing from AfterMarketScout's SFTP relay.",
         "icon_url": "https://api.aftermarketscout.com/uploads/meyer_logo.png",
         "category": "Distributors",
-        "connection_required_fields": ["sftp_user", "sftp_password"],
+        "connection_required_fields": [],
         "connection_optional_fields": [],
+        "relay_provisioned": True,
+        "relay_credential_fields": ("sftp_user", "sftp_password"),
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
-            "<p>Email <a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a> so we can "
-            "create a unique SFTP account for you and send a <strong>username</strong> and <strong>password</strong>. "
-            "Meyer Distributing delivers the data feed to AfterMarketScout&rsquo;s SFTP relay; ask your Meyer account "
-            "representative to set up the feed to connect to <strong>our</strong> SFTP endpoint using the details below.</p>"
+            "<p>AfterMarketScout has already created a dedicated SFTP account for your company. "
+            "Send the details below to your Meyer account representative and ask them to set up the feed "
+            "to connect to <strong>our</strong> SFTP endpoint.</p>"
             "<p><strong>Endpoint for your Meyer rep</strong></p>"
             "<ul>"
             "<li><strong>SFTP:</strong> <code>5.161.121.143</code></li>"
             "<li><strong>Port:</strong> <code>22</code></li>"
             "<li><strong>Folder:</strong> <code>uploads</code></li>"
             "<li><strong>Files:</strong> <code>Meyer Pricing.csv</code>, <code>Meyer Inventory.csv</code></li>"
-            "<li><strong>User / password:</strong> we provide these after you email us</li>"
+            "<li><strong>Username:</strong> <code>{{SFTP_USER}}</code></li>"
+            "<li><strong>Password:</strong> <code>{{SFTP_PASSWORD}}</code></li>"
             "</ul>"
-            "<p>When you have your login, enter <strong>sftp_user</strong> and <strong>sftp_password</strong> below "
-            "and save the connection. For help, contact "
-            "<a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a>.</p>"
+            "<p>No credentials to enter here &mdash; just click <strong>Connect</strong>. "
+            "For help, contact <a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a>.</p>"
         ),
     },
     {
@@ -241,21 +242,22 @@ PROVIDER_CATALOG = [
         "description": "Access A-Tech catalog, inventory, and pricing from AfterMarketScout's SFTP relay.",
         "icon_url": "https://api.aftermarketscout.com/uploads/atech_logo.png",
         "category": "Distributors",
-        "connection_required_fields": ["sftp_user", "sftp_password"],
+        "connection_required_fields": [],
         "connection_optional_fields": [],
+        "relay_provisioned": True,
+        "relay_credential_fields": ("sftp_user", "sftp_password"),
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
-            "<p>Email <a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a> so we can "
-            "provision a dedicated SFTP login (<strong>username</strong> and <strong>password</strong>) on "
-            "AfterMarketScout&rsquo;s relay. Ask your A-Tech representative to deliver their standard "
-            "combined catalog and pricing extract to <strong>our</strong> endpoint so a single drop updates your data."
-            "</p>"
+            "<p>AfterMarketScout has already created a dedicated SFTP login for your company on our relay. "
+            "Ask your A-Tech representative to deliver their standard combined catalog and pricing extract to "
+            "<strong>our</strong> endpoint so a single drop updates your data.</p>"
             "<p><strong>Relay endpoint (for your A-Tech rep)</strong></p>"
             "<ul>"
             "<li><strong>Host:</strong> <code>5.161.121.143</code> (SFTP)</li>"
             "<li><strong>Port:</strong> <code>22</code></li>"
             "<li><strong>Directory:</strong> <code>uploads</code></li>"
-            "<li><strong>Credentials:</strong> we send you the SFTP user and password after onboarding</li>"
+            "<li><strong>Username:</strong> <code>{{SFTP_USER}}</code></li>"
+            "<li><strong>Password:</strong> <code>{{SFTP_PASSWORD}}</code></li>"
             "</ul>"
             "<p><strong>What we sync from their combined feed</strong></p>"
             "<ul>"
@@ -269,8 +271,8 @@ PROVIDER_CATALOG = [
             "<li><strong>Extras:</strong> core and freight-related fee columns, hazmat / handling flags where present, "
             "and GTIN when the supplier includes it.</li>"
             "</ul>"
-            "<p>After we send your SFTP details, enter <strong>sftp_user</strong> and <strong>sftp_password</strong> "
-            "below and save. Saving also schedules a pricing refresh for your company where supported. "
+            "<p>No credentials to enter here &mdash; just click <strong>Connect</strong>. "
+            "Connecting also schedules a pricing refresh for your company where supported. "
             "Questions: <a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a>.</p>"
         ),
     },
@@ -332,24 +334,24 @@ PROVIDER_CATALOG = [
         "description": "Access inventory and pricing from CTP Distributors via FTP relay.",
         "icon_url": "https://api.aftermarketscout.com/uploads/ctp_distributors_logo.png",
         "category": "Distributors",
-        "connection_required_fields": ["ftp_user", "ftp_password"],
+        "connection_required_fields": [],
+        "relay_provisioned": True,
+        "relay_credential_fields": ("ftp_user", "ftp_password"),
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
-            "<p><strong>CTP Distributors</strong> sends their data feed directly to an FTP site. "
-            "Please ask your CTP account representative to set up this FTP connection.</p>"
-            "<ol>"
-            "<li>Email <a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a> "
-            "and they will create a unique account for you to receive CTP&rsquo;s data.</li>"
-            "<li>Once you have your credentials, enter your <strong>FTP Login</strong> and "
-            "<strong>FTP Password</strong> below.</li>"
-            "</ol>"
-            "<p><strong>Example connection details</strong></p>"
+            "<p>AfterMarketScout has already created a dedicated FTP account for your company. "
+            "Share the details below with your CTP account representative and ask them to set up "
+            "their feed to connect to <strong>our</strong> endpoint.</p>"
+            "<p><strong>Endpoint for your CTP rep</strong></p>"
             "<ul>"
             "<li><strong>FTP:</strong> <code>5.161.121.143</code></li>"
             "<li><strong>Port:</strong> <code>22</code></li>"
-            "<li><strong>Folder:</strong> <code>/ctp</code></li>"
+            "<li><strong>Folder:</strong> <code>uploads</code></li>"
+            "<li><strong>Username:</strong> <code>{{SFTP_USER}}</code></li>"
+            "<li><strong>Password:</strong> <code>{{SFTP_PASSWORD}}</code></li>"
             "</ul>"
-            "<p>For assistance please contact: "
+            "<p>No credentials to enter here &mdash; just click <strong>Connect</strong>. "
+            "For assistance please contact: "
             "<a href=\"https://www.ctpdistributors.com/contact\" target=\"_blank\" rel=\"noopener noreferrer\">"
             "https://www.ctpdistributors.com/contact</a>.</p>"
         ),
@@ -360,27 +362,24 @@ PROVIDER_CATALOG = [
         "description": "Access Crown Automotive inventory and pricing via FTP relay.",
         "icon_url": "https://api.aftermarketscout.com/uploads/crown_automotive_logo.png",
         "category": "Distributors",
-        "connection_required_fields": ["ftp_user", "ftp_password"],
+        "connection_required_fields": [],
+        "relay_provisioned": True,
+        "relay_credential_fields": ("ftp_user", "ftp_password"),
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
-            "<p><strong>Crown Automotive</strong> provides an FTP-based data feed. "
-            "If you do not have your own FTP site, email "
-            "<a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a> "
-            "and they will create a unique account for you to receive Crown&rsquo;s data. "
-            "This login can be shared with your Crown account representative so they can provide "
-            "your stock and pricing data.</p>"
-            "<ol>"
-            "<li>Obtain your FTP credentials from <a href=\"mailto:info@aftermarketscout.com\">"
-            "info@aftermarketscout.com</a>.</li>"
-            "<li>Share the credentials with your Crown account rep and ask them to push the feed.</li>"
-            "<li>Enter your <strong>FTP Login</strong> and <strong>FTP Password</strong> below and save.</li>"
-            "</ol>"
-            "<p><strong>Example connection details</strong></p>"
+            "<p>AfterMarketScout has already created a dedicated FTP account for your company. "
+            "Share the details below with your Crown account representative so they can push your "
+            "stock and pricing data to <strong>our</strong> endpoint.</p>"
+            "<p><strong>Endpoint for your Crown rep</strong></p>"
             "<ul>"
             "<li><strong>FTP:</strong> <code>5.161.121.143</code></li>"
-            "<li><strong>Folder:</strong> <code>/crown</code></li>"
+            "<li><strong>Port:</strong> <code>22</code></li>"
+            "<li><strong>Folder:</strong> <code>uploads</code></li>"
+            "<li><strong>Username:</strong> <code>{{SFTP_USER}}</code></li>"
+            "<li><strong>Password:</strong> <code>{{SFTP_PASSWORD}}</code></li>"
             "</ul>"
-            "<p>For assistance contact: "
+            "<p>No credentials to enter here &mdash; just click <strong>Connect</strong>. "
+            "For assistance contact: "
             "<a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a>.</p>"
         ),
     },
@@ -390,28 +389,24 @@ PROVIDER_CATALOG = [
         "description": "Access DIX Performance North inventory and pricing via FTP relay.",
         "icon_url": "https://api.aftermarketscout.com/uploads/dix_perf_north_logo.png",
         "category": "Distributors",
-        "connection_required_fields": ["ftp_user", "ftp_password"],
+        "connection_required_fields": [],
+        "relay_provisioned": True,
+        "relay_credential_fields": ("ftp_user", "ftp_password"),
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
-            "<p><strong>DIX Performance North</strong> provides an FTP-based data feed. "
-            "If you do not have your own FTP site, email "
-            "<a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a> "
-            "and they will create a unique account for you to receive DIX&rsquo;s data. "
-            "This login can be shared with your DIX account representative so they can provide "
-            "your stock and pricing data.</p>"
-            "<ol>"
-            "<li>Obtain your FTP credentials from "
-            "<a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a>.</li>"
-            "<li>Share the credentials with your DIX rep and ask them to push the feed.</li>"
-            "<li>Enter your <strong>FTP Login</strong> and <strong>FTP Password</strong> below and save.</li>"
-            "</ol>"
-            "<p><strong>Example connection details</strong></p>"
+            "<p>AfterMarketScout has already created a dedicated FTP account for your company. "
+            "Share the details below with your DIX account representative so they can push your "
+            "stock and pricing data to <strong>our</strong> endpoint.</p>"
+            "<p><strong>Endpoint for your DIX rep</strong></p>"
             "<ul>"
             "<li><strong>FTP:</strong> <code>5.161.121.143</code></li>"
             "<li><strong>Port:</strong> <code>22</code></li>"
-            "<li><strong>Folder:</strong> <code>/dix</code></li>"
+            "<li><strong>Folder:</strong> <code>uploads</code></li>"
+            "<li><strong>Username:</strong> <code>{{SFTP_USER}}</code></li>"
+            "<li><strong>Password:</strong> <code>{{SFTP_PASSWORD}}</code></li>"
             "</ul>"
-            "<p>For assistance contact: "
+            "<p>No credentials to enter here &mdash; just click <strong>Connect</strong>. "
+            "For assistance contact: "
             "<a href=\"mailto:sp@dixperformancenorth.com\">sp@dixperformancenorth.com</a>.</p>"
         ),
     },
@@ -657,21 +652,24 @@ PROVIDER_CATALOG = [
         "description": "Access The Wheel Group inventory and pricing via AfterMarketScout's SFTP relay.",
         "icon_url": "https://api.aftermarketscout.com/uploads/the_wheel_group_logo.png",
         "category": "Distributors",
-        "connection_required_fields": ["ftp_user", "ftp_password"],
+        "connection_required_fields": [],
+        "relay_provisioned": True,
+        "relay_credential_fields": ("ftp_user", "ftp_password"),
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
-            "<p><strong>The Wheel Group</strong> provides an FTP-based data feed delivered to "
-            "AfterMarketScout&rsquo;s relay. Email "
-            "<a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a> "
-            "and we will create a unique account for you. Share the credentials with your "
-            "Wheel Group account representative so they can push the feed.</p>"
+            "<p>AfterMarketScout has already created a dedicated SFTP account for your company. "
+            "Share the details below with your Wheel Group account representative so they can push "
+            "the feed to <strong>our</strong> relay.</p>"
             "<p><strong>Relay endpoint (for your Wheel Group rep)</strong></p>"
             "<ul>"
             "<li><strong>SFTP:</strong> <code>5.161.121.143</code></li>"
             "<li><strong>Port:</strong> <code>22</code></li>"
-            "<li><strong>Folder:</strong> <code>/wheelgroup</code></li>"
+            "<li><strong>Folder:</strong> <code>uploads</code></li>"
+            "<li><strong>Username:</strong> <code>{{SFTP_USER}}</code></li>"
+            "<li><strong>Password:</strong> <code>{{SFTP_PASSWORD}}</code></li>"
             "</ul>"
-            "<p>For assistance contact: "
+            "<p>No credentials to enter here &mdash; just click <strong>Connect</strong>. "
+            "For assistance contact: "
             "<a href=\"mailto:prestonw@wheel-1.com\">prestonw@wheel-1.com</a>.</p>"
         ),
     },
