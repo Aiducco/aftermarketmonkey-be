@@ -23,7 +23,9 @@ from src.integrations.clients.wheelpros import client as wheelpros_client
 from src.integrations.clients.wheelpros import exceptions as wheelpros_exceptions
 from src.integrations.utils.brand_matching import (
     best_fuzzy_brand_match,
+    brands_by_compact_key,
     brands_by_first_token_upper,
+    normalize_compact_key,
     normalize_upper_words,
 )
 
@@ -296,6 +298,22 @@ def sync_unmapped_wheelpros_brands_to_brands(dry_run: bool = False) -> typing.Li
                 resolved_by_wp_id[wb.id] = brand
                 exact_matched_wp_ids.add(wb.id)
 
+    # Compact-key phase: catches punctuation/spacing-only differences (e.g. 'AUTOMETER' vs
+    # 'AUTO METER') that the word-prefix fuzzy phase below can't, since it compares whole tokens
+    # and never merges/splits words.
+    compact_matched_wp_ids: typing.Set[int] = set()
+    still_unresolved = [wb for wb in unmapped_wheelpros_brands if wb.id not in resolved_by_wp_id]
+    if still_unresolved:
+        compact_index = brands_by_compact_key()
+        for wb in sorted(still_unresolved, key=lambda x: x.id):
+            key = normalize_compact_key(wb.name or "")
+            if not key:
+                continue
+            brand = compact_index.get(key)
+            if brand:
+                resolved_by_wp_id[wb.id] = brand
+                compact_matched_wp_ids.add(wb.id)
+
     unresolved_after_exact = [
         wb for wb in unmapped_wheelpros_brands if wb.id not in resolved_by_wp_id
     ]
@@ -334,7 +352,12 @@ def sync_unmapped_wheelpros_brands_to_brands(dry_run: bool = False) -> typing.Li
             if wb.id not in resolved_by_wp_id:
                 continue
             brand = resolved_by_wp_id[wb.id]
-            how = "exact" if wb.id in exact_matched_wp_ids else "fuzzy"
+            if wb.id in exact_matched_wp_ids:
+                how = "exact"
+            elif wb.id in compact_matched_wp_ids:
+                how = "compact"
+            else:
+                how = "fuzzy"
             logger.info(
                 "{} [dry-run] match ({}) WheelProsBrand id={} external_id={!r} name={!r} "
                 "-> Brand id={} name={!r}".format(
@@ -349,10 +372,11 @@ def sync_unmapped_wheelpros_brands_to_brands(dry_run: bool = False) -> typing.Li
             )
         would_create = [wb for wb in unmapped_wheelpros_brands if wb.id not in resolved_by_wp_id]
         logger.info(
-            "{} [dry-run] Summary: {} exact matches, {} fuzzy matches, {} unmatched (would create Brand). "
-            "No writes performed.".format(
+            "{} [dry-run] Summary: {} exact matches, {} compact matches, {} fuzzy matches, "
+            "{} unmatched (would create Brand). No writes performed.".format(
                 _LOG_PREFIX,
                 len(exact_matched_wp_ids),
+                len(compact_matched_wp_ids),
                 len(fuzzy_matched_wp_ids),
                 len(would_create),
             )
@@ -433,10 +457,11 @@ def sync_unmapped_wheelpros_brands_to_brands(dry_run: bool = False) -> typing.Li
             created_company_brands += 1
 
     logger.info(
-        "{} Sync complete. Brands created: {}, fuzzy name matches: {}, "
+        "{} Sync complete. Brands created: {}, compact matches: {}, fuzzy name matches: {}, "
         "BrandWheelProsBrandMapping upserted: {}, BrandProviders: {}, CompanyBrands: {}.".format(
             _LOG_PREFIX,
             created_brands,
+            len(compact_matched_wp_ids),
             fuzzy_matches,
             len(mapping_models),
             created_brand_providers,
@@ -646,7 +671,15 @@ def fetch_and_save_wheelpros(
     ).first()
     pricing_cps: typing.List[src_models.CompanyProviders] = []
     if wp_provider:
-        pricing_cps = list(_active_wheelpros_company_providers_queryset().filter(provider=wp_provider))
+        all_cps = list(_active_wheelpros_company_providers_queryset().filter(provider=wp_provider))
+        for cp in all_cps:
+            if not cp.active:
+                logger.info(
+                    "{} Skipping WheelPros company pricing for company_provider_id={} (company_id={}): inactive.".format(
+                        _LOG_PREFIX, cp.id, cp.company_id,
+                    )
+                )
+        pricing_cps = [cp for cp in all_cps if cp.active]
     if wp_provider and not pricing_cps:
         logger.warning(
             "{} No active WheelPros company providers; catalog will sync but not company pricing.".format(

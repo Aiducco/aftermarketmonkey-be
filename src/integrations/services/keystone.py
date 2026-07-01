@@ -18,7 +18,9 @@ from src.integrations.clients.keystone import client as keystone_client
 from src.integrations.clients.keystone import exceptions as keystone_exceptions
 from src.integrations.utils.brand_matching import (
     best_fuzzy_brand_match,
+    brands_by_compact_key,
     brands_by_first_token_upper,
+    normalize_compact_key,
     normalize_upper_words,
 )
 
@@ -258,6 +260,24 @@ def sync_unmapped_keystone_brands_to_brands() -> typing.List[src_models.Keystone
         if brand:
             resolved_by_keystone_id[kb.id] = brand
 
+    # Compact-key phase: catches punctuation/spacing-only differences (e.g. 'AUTOMETER' vs
+    # 'AUTO METER') that the word-prefix fuzzy phase below can't, since it compares whole tokens
+    # and never merges/splits words.
+    compact_matches = 0
+    still_unresolved = [
+        kb for kb in unmapped_keystone_brands if kb.id not in resolved_by_keystone_id
+    ]
+    if still_unresolved:
+        compact_index = brands_by_compact_key()
+        for kb in sorted(still_unresolved, key=lambda x: x.id):
+            key = normalize_compact_key(kb.name or "")
+            if not key:
+                continue
+            brand = compact_index.get(key)
+            if brand:
+                resolved_by_keystone_id[kb.id] = brand
+                compact_matches += 1
+
     unresolved_after_exact = [kb for kb in unmapped_keystone_brands if kb.id not in resolved_by_keystone_id]
     brands_first_index = (
         brands_by_first_token_upper() if unresolved_after_exact else {}
@@ -380,10 +400,11 @@ def sync_unmapped_keystone_brands_to_brands() -> typing.List[src_models.Keystone
     created_company_brands = len(cb_to_create)
 
     logger.info(
-        "{} Sync complete. Brands created: {}, fuzzy name matches: {}, "
+        "{} Sync complete. Brands created: {}, compact matches: {}, fuzzy name matches: {}, "
         "BrandKeystoneBrandMapping upserted: {}, BrandProviders: {}, CompanyBrands: {}.".format(
             _LOG_PREFIX,
             created_brands,
+            compact_matches,
             fuzzy_matches,
             len(mapping_models),
             created_brand_providers,
@@ -612,6 +633,14 @@ def fetch_and_save_all_keystone_brand_parts() -> None:
                 )
             )
 
+        if not company_provider.active:
+            logger.info(
+                "{} Skipping KeystoneCompanyPricing upsert for company={} (company_provider_id={}): inactive.".format(
+                    _LOG_PREFIX, company.name, company_provider.id,
+                )
+            )
+            continue
+
         part_lookup = _vcpn_brand_id_lookup_for_records(records, brand_mappings)
         pricing_instances = _build_keystone_company_pricing_instances(
             records, brand_mappings, company, part_lookup,
@@ -763,6 +792,14 @@ def fetch_and_save_all_keystone_brands_and_parts() -> None:
                     _LOG_PREFIX, company.name,
                 )
             )
+
+        if not company_provider.active:
+            logger.info(
+                "{} Skipping KeystoneCompanyPricing upsert for company={} (company_provider_id={}): inactive.".format(
+                    _LOG_PREFIX, company.name, company_provider.id,
+                )
+            )
+            continue
 
         part_lookup = _vcpn_brand_id_lookup_for_records(records, keystone_brands)
         pricing_instances = _build_keystone_company_pricing_instances(

@@ -101,6 +101,7 @@ class CompanyProviders(django_db_models.Model):
     credentials = django_db_models.JSONField()
 
     primary = django_db_models.BooleanField(default=False)
+    active = django_db_models.BooleanField(default=True)
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)

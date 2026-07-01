@@ -22,7 +22,9 @@ from src.integrations.clients.rough_country import client as rough_country_clien
 from src.integrations.clients.rough_country import exceptions as rough_country_exceptions
 from src.integrations.utils.brand_matching import (
     best_fuzzy_brand_match,
+    brands_by_compact_key,
     brands_by_first_token_upper,
+    normalize_compact_key,
     normalize_upper_words,
 )
 
@@ -294,6 +296,22 @@ def sync_unmapped_rough_country_brands_to_brands() -> typing.List[src_models.Rou
         if brand:
             resolved_by_rc_id[rb.id] = brand
 
+    # Compact-key phase: catches punctuation/spacing-only differences (e.g. 'AUTOMETER' vs
+    # 'AUTO METER') that the word-prefix fuzzy phase below can't, since it compares whole tokens
+    # and never merges/splits words.
+    compact_matches = 0
+    still_unresolved = [rb for rb in unmapped_rc_brands if rb.id not in resolved_by_rc_id]
+    if still_unresolved:
+        compact_index = brands_by_compact_key()
+        for rb in sorted(still_unresolved, key=lambda x: x.id):
+            key = normalize_compact_key(rb.name or "")
+            if not key:
+                continue
+            brand = compact_index.get(key)
+            if brand:
+                resolved_by_rc_id[rb.id] = brand
+                compact_matches += 1
+
     unresolved_after_exact = [rb for rb in unmapped_rc_brands if rb.id not in resolved_by_rc_id]
     brands_first_index = brands_by_first_token_upper() if unresolved_after_exact else {}
     all_brands_fallback: typing.Optional[typing.List[src_models.Brands]] = None
@@ -401,10 +419,11 @@ def sync_unmapped_rough_country_brands_to_brands() -> typing.List[src_models.Rou
             created_company_brands += 1
 
     logger.info(
-        "{} Sync complete. Brands created: {}, fuzzy name matches: {}, "
+        "{} Sync complete. Brands created: {}, compact matches: {}, fuzzy name matches: {}, "
         "BrandRoughCountryBrandMapping upserted: {}, BrandProviders: {}, CompanyBrands: {}.".format(
             _LOG_PREFIX,
             created_brands,
+            compact_matches,
             fuzzy_matches,
             len(mapping_models),
             created_brand_providers,
@@ -481,7 +500,15 @@ def fetch_and_save_rough_country(
     ).first()
     pricing_cps = []
     if rc_provider:
-        pricing_cps = list(_active_rough_country_company_providers_queryset().filter(provider=rc_provider))
+        all_cps = list(_active_rough_country_company_providers_queryset().filter(provider=rc_provider))
+        for cp in all_cps:
+            if not cp.active:
+                logger.info(
+                    "{} Skipping Rough Country company pricing for company_provider_id={} (company_id={}): inactive.".format(
+                        _LOG_PREFIX, cp.id, cp.company_id,
+                    )
+                )
+        pricing_cps = [cp for cp in all_cps if cp.active]
     if rc_provider and not pricing_cps:
         logger.warning(
             "{} No active Rough Country company providers; catalog will sync but not company pricing.".format(

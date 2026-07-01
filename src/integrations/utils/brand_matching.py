@@ -2,13 +2,39 @@
 Fuzzy matching of distributor/vendor brand names to `Brands` rows (word-prefix alignment).
 Used by Keystone, Rough Country, Wheel Pros, Meyer, DLG, A-Tech, and other provider syncs.
 """
+import re
 import typing
 
 from src import models as src_models
 
+_NON_ALNUM_RE = re.compile(r"[^A-Z0-9]")
+
 
 def normalize_upper_words(name: str) -> str:
     return " ".join((name or "").strip().upper().split())
+
+
+def normalize_compact_key(name: str) -> str:
+    """
+    Strip everything but letters/digits (spaces, hyphens, periods, apostrophes, ampersands, ...).
+
+    Word-prefix fuzzy matching compares whole tokens, so it never catches purely
+    tokenization-shape differences like 'AUTOMETER' vs 'AUTO METER' or 'WD40' vs 'WD-40' -
+    those need a punctuation/spacing-insensitive identity key instead.
+    """
+    return _NON_ALNUM_RE.sub("", (name or "").upper())
+
+
+def brands_by_compact_key() -> typing.Dict[str, src_models.Brands]:
+    """Index brands by compact key (first Brands row by id wins on collision)."""
+    idx: typing.Dict[str, src_models.Brands] = {}
+    for b in src_models.Brands.objects.only("id", "name", "aaia_code").order_by("id").iterator(
+        chunk_size=2000
+    ):
+        key = normalize_compact_key(b.name or "")
+        if key and key not in idx:
+            idx[key] = b
+    return idx
 
 
 def word_prefix_align(shorter: typing.List[str], longer: typing.List[str]) -> bool:

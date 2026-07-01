@@ -1061,16 +1061,16 @@ def _ingest_meyer_parts_for_mapped_brands(
             for i in range(0, len(existing_keys), WHEELPROS_LOOKUP_CHUNK):
                 chunk_keys = existing_keys[i : i + WHEELPROS_LOOKUP_CHUNK]
                 values = [
-                    (existing_by_key[k], key_to_mp[k].sku, key_to_mp[k].aaia_code)
+                    (existing_by_key[k], key_to_mp[k].aaia_code)
                     for k in chunk_keys
                 ]
-                placeholders = ", ".join(["(%s::bigint, %s, %s)"] * len(values))
+                placeholders = ", ".join(["(%s::bigint, %s)"] * len(values))
                 params = [x for row_vals in values for x in row_vals]
                 with connection.cursor() as cur:
                     cur.execute(
                         """
-                        UPDATE master_parts mp SET sku = v.sku, aaia_code = v.aaia_code
-                        FROM (VALUES {}) AS v(id, sku, aaia_code)
+                        UPDATE master_parts mp SET aaia_code = v.aaia_code
+                        FROM (VALUES {}) AS v(id, aaia_code)
                         WHERE mp.id = v.id
                         """.format(placeholders),
                         params,
@@ -1304,16 +1304,16 @@ def _ingest_atech_parts_for_mapped_brands(
         if existing_keys:
             key_to_mp = {(mp.brand_id, mp.part_number): mp for mp in master_parts_list}
             values = [
-                (existing_by_key[k], key_to_mp[k].sku, key_to_mp[k].aaia_code)
+                (existing_by_key[k], key_to_mp[k].aaia_code)
                 for k in existing_keys
             ]
-            placeholders = ", ".join(["(%s::bigint, %s, %s)"] * len(values))
+            placeholders = ", ".join(["(%s::bigint, %s)"] * len(values))
             params = [x for row_vals in values for x in row_vals]
             with connection.cursor() as cur:
                 cur.execute(
                     """
-                    UPDATE master_parts mp SET sku = v.sku, aaia_code = v.aaia_code
-                    FROM (VALUES {}) AS v(id, sku, aaia_code)
+                    UPDATE master_parts mp SET aaia_code = v.aaia_code
+                    FROM (VALUES {}) AS v(id, aaia_code)
                     WHERE mp.id = v.id
                     """.format(placeholders),
                     params,
@@ -1542,16 +1542,16 @@ def _ingest_rough_country_parts_for_mapped_brands(
         if existing_keys:
             key_to_mp = {(mp.brand_id, mp.part_number): mp for mp in master_parts}
             values = [
-                (existing_by_key[k], key_to_mp[k].sku, key_to_mp[k].aaia_code)
+                (existing_by_key[k], key_to_mp[k].aaia_code)
                 for k in existing_keys
             ]
-            placeholders = ", ".join(["(%s::bigint, %s, %s)"] * len(values))
+            placeholders = ", ".join(["(%s::bigint, %s)"] * len(values))
             params = [x for row in values for x in row]
             with connection.cursor() as cur:
                 cur.execute(
                     """
-                    UPDATE master_parts mp SET sku = v.sku, aaia_code = v.aaia_code
-                    FROM (VALUES {}) AS v(id, sku, aaia_code)
+                    UPDATE master_parts mp SET aaia_code = v.aaia_code
+                    FROM (VALUES {}) AS v(id, aaia_code)
                     WHERE mp.id = v.id
                     """.format(placeholders),
                     params,
@@ -1772,16 +1772,16 @@ def _ingest_dlg_parts_for_mapped_brands(
         if existing_keys:
             key_to_mp = {(mp.brand_id, mp.part_number): mp for mp in master_parts}
             values = [
-                (existing_by_key[k], key_to_mp[k].sku, key_to_mp[k].aaia_code)
+                (existing_by_key[k], key_to_mp[k].aaia_code)
                 for k in existing_keys
             ]
-            placeholders = ", ".join(["(%s::bigint, %s, %s)"] * len(values))
+            placeholders = ", ".join(["(%s::bigint, %s)"] * len(values))
             params = [x for row_vals in values for x in row_vals]
             with connection.cursor() as cur:
                 cur.execute(
                     """
-                    UPDATE master_parts mp SET sku = v.sku, aaia_code = v.aaia_code
-                    FROM (VALUES {}) AS v(id, sku, aaia_code)
+                    UPDATE master_parts mp SET aaia_code = v.aaia_code
+                    FROM (VALUES {}) AS v(id, aaia_code)
                     WHERE mp.id = v.id
                     """.format(placeholders),
                     params,
@@ -2898,23 +2898,27 @@ def _ingest_wheelpros_parts_for_mapped_brands(
             )
             total_master += len(new_parts)
 
-        # Phase 2: UPDATE existing parts with ONLY sku, aaia_code via raw SQL (never description/image_url).
-        # Keeps existing description and image_url from primary source (e.g. Turn14, catalog). Same as Keystone.
+        # Phase 2: UPDATE existing parts with ONLY aaia_code via raw SQL (never sku/description/image_url).
+        # sku is set once at creation and never overwritten by later syncs, since it's shared across
+        # providers with different formats (e.g. brand-prefixed vs bare part numbers) and is used as a
+        # matching key — overwriting it here causes cross-provider matching to flip-flop and spawn
+        # duplicate MasterPart rows. Keeps existing description and image_url from primary source
+        # (e.g. Turn14, catalog). Same as Keystone.
         if existing_keys:
             key_to_mp = {(mp.brand_id, mp.part_number): mp for mp in master_parts}
             for i in range(0, len(existing_keys), WHEELPROS_LOOKUP_CHUNK):
                 chunk_keys = existing_keys[i : i + WHEELPROS_LOOKUP_CHUNK]
                 values = [
-                    (existing_by_key[k], key_to_mp[k].sku, key_to_mp[k].aaia_code)
+                    (existing_by_key[k], key_to_mp[k].aaia_code)
                     for k in chunk_keys
                 ]
-                placeholders = ", ".join(["(%s::bigint, %s, %s)"] * len(values))
+                placeholders = ", ".join(["(%s::bigint, %s)"] * len(values))
                 params = [x for row in values for x in row]
                 with connection.cursor() as cur:
                     cur.execute(
                         """
-                        UPDATE master_parts mp SET sku = v.sku, aaia_code = v.aaia_code
-                        FROM (VALUES {}) AS v(id, sku, aaia_code)
+                        UPDATE master_parts mp SET aaia_code = v.aaia_code
+                        FROM (VALUES {}) AS v(id, aaia_code)
                         WHERE mp.id = v.id
                         """.format(placeholders),
                         params,

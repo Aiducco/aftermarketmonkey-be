@@ -1117,9 +1117,17 @@ def fetch_and_save_atech_catalog(force_download: bool = False) -> None:
     atech_provider_row = src_models.Providers.objects.filter(kind=atech_kind).first()
     pricing_cps: typing.List[src_models.CompanyProviders] = []
     if atech_provider_row:
-        pricing_cps = list(
+        all_cps = list(
             _active_atech_company_providers_queryset().filter(provider=atech_provider_row)
         )
+        for cp in all_cps:
+            if not cp.active:
+                logger.info(
+                    "{} Skipping A-Tech company pricing for company_provider_id={} (company_id={}): inactive.".format(
+                        _LOG_PREFIX, cp.id, cp.company_id,
+                    )
+                )
+        pricing_cps = [cp for cp in all_cps if cp.active]
     if pricing_cps:
         n_cp = len(pricing_cps)
         max_cw = ATECH_COMPANY_PRICING_SYNC_MAX_WORKERS

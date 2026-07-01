@@ -13,6 +13,16 @@ There is no ``manage.py`` subcommand; load this file from the Django shell.
 
 Use ``run_name=...`` (not ``__main__``) so the script does not start the interactive ``PAIRS_TO_CHECK`` runner.
 
+**Batch merge from a known (keep_id, delete_id) list** (no per-row confirmation, still fully logged;
+each pair runs in its own transaction so one bad pair can't affect the others)::
+
+    python manage.py shell
+    >>> import runpy
+    >>> ns = runpy.run_path("scripts/merge_duplicate_brands.py", run_name="merge_loader")
+    >>> pairs = [(3312, 4090), (2994, 5542)]  # (keep_id, delete_id)
+    >>> ns["merge_batch"](pairs, dry_run=True)   # preview first
+    >>> ns["merge_batch"](pairs)                 # then actually merge
+
 **Interactive duplicate scan** (Turn14/Keystone/WheelPros/Rough Country heuristics): run as a module::
 
     python scripts/merge_duplicate_brands.py
@@ -48,6 +58,21 @@ def _confirm(msg, default_no=True):
     if default_no:
         return r in ("y", "yes")
     return r not in ("n", "no")
+
+
+def _auto_confirm(msg, default_no=True):
+    """Non-interactive stand-in for ``_confirm`` used by batch mode: always proceeds, just logs."""
+    print("{} [auto-yes]".format(msg))
+    return True
+
+
+_IN_CLAUSE_CHUNK = 2000
+
+
+def _chunked(items, size=_IN_CLAUSE_CHUNK):
+    items = list(items)
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
 
 
 def _search_provider_brands(name_or_code):
@@ -108,11 +133,19 @@ def _get_mappings_for_brand(brand):
         out.append("rough_country")
     if src_models.BrandMeyerBrandMapping.objects.filter(brand=brand).exists():
         out.append("meyer")
+    if src_models.BrandAtechBrandMapping.objects.filter(brand=brand).exists():
+        out.append("atech")
+    if src_models.BrandDlgBrandMapping.objects.filter(brand=brand).exists():
+        out.append("dlg")
     return out
 
 
-def merge_brands(brand_to_keep, brand_to_delete):
-    """Merge brand_to_delete into brand_to_keep, then delete brand_to_delete."""
+def merge_brands(brand_to_keep, brand_to_delete, confirm=_confirm):
+    """Merge brand_to_delete into brand_to_keep, then delete brand_to_delete.
+
+    ``confirm`` defaults to the interactive y/N prompt; pass ``_auto_confirm`` for batch mode
+    (still prints every action, just doesn't block on input).
+    """
     keep_id = brand_to_keep.id
     delete_id = brand_to_delete.id
 
@@ -122,10 +155,10 @@ def merge_brands(brand_to_keep, brand_to_delete):
     for m in wp_list:
         existing = src_models.BrandWheelProsBrandMapping.objects.filter(brand_id=keep_id, wheelpros_brand=m.wheelpros_brand).first()
         if existing:
-            if _confirm("  Delete mapping id={} (wheelpros_brand={})? Keep already has.".format(m.id, m.wheelpros_brand.name)):
+            if confirm("  Delete mapping id={} (wheelpros_brand={})? Keep already has.".format(m.id, m.wheelpros_brand.name)):
                 m.delete()
         else:
-            if _confirm("  Update mapping id={} brand_id {} -> {} (wheelpros_brand={})?".format(m.id, delete_id, keep_id, m.wheelpros_brand.name)):
+            if confirm("  Update mapping id={} brand_id {} -> {} (wheelpros_brand={})?".format(m.id, delete_id, keep_id, m.wheelpros_brand.name)):
                 m.brand_id = keep_id
                 m.save()
 
@@ -135,10 +168,10 @@ def merge_brands(brand_to_keep, brand_to_delete):
     for m in ks_list:
         existing = src_models.BrandKeystoneBrandMapping.objects.filter(brand_id=keep_id, keystone_brand=m.keystone_brand).first()
         if existing:
-            if _confirm("  Delete mapping id={} (keystone_brand={})? Keep already has.".format(m.id, m.keystone_brand.name)):
+            if confirm("  Delete mapping id={} (keystone_brand={})? Keep already has.".format(m.id, m.keystone_brand.name)):
                 m.delete()
         else:
-            if _confirm("  Update mapping id={} brand_id {} -> {} (keystone_brand={})?".format(m.id, delete_id, keep_id, m.keystone_brand.name)):
+            if confirm("  Update mapping id={} brand_id {} -> {} (keystone_brand={})?".format(m.id, delete_id, keep_id, m.keystone_brand.name)):
                 m.brand_id = keep_id
                 m.save()
 
@@ -148,10 +181,10 @@ def merge_brands(brand_to_keep, brand_to_delete):
     for m in t14_list:
         existing = src_models.BrandTurn14BrandMapping.objects.filter(brand_id=keep_id, turn14_brand=m.turn14_brand).first()
         if existing:
-            if _confirm("  Delete mapping id={} (turn14_brand={})? Keep already has.".format(m.id, m.turn14_brand.name)):
+            if confirm("  Delete mapping id={} (turn14_brand={})? Keep already has.".format(m.id, m.turn14_brand.name)):
                 m.delete()
         else:
-            if _confirm("  Update mapping id={} brand_id {} -> {} (turn14_brand={})?".format(m.id, delete_id, keep_id, m.turn14_brand.name)):
+            if confirm("  Update mapping id={} brand_id {} -> {} (turn14_brand={})?".format(m.id, delete_id, keep_id, m.turn14_brand.name)):
                 m.brand_id = keep_id
                 m.save()
 
@@ -161,10 +194,10 @@ def merge_brands(brand_to_keep, brand_to_delete):
     for m in rc_list:
         existing = src_models.BrandRoughCountryBrandMapping.objects.filter(brand_id=keep_id, rough_country_brand=m.rough_country_brand).first()
         if existing:
-            if _confirm("  Delete mapping id={} (rough_country_brand={})? Keep already has.".format(m.id, m.rough_country_brand.name)):
+            if confirm("  Delete mapping id={} (rough_country_brand={})? Keep already has.".format(m.id, m.rough_country_brand.name)):
                 m.delete()
         else:
-            if _confirm("  Update mapping id={} brand_id {} -> {} (rough_country_brand={})?".format(m.id, delete_id, keep_id, m.rough_country_brand.name)):
+            if confirm("  Update mapping id={} brand_id {} -> {} (rough_country_brand={})?".format(m.id, delete_id, keep_id, m.rough_country_brand.name)):
                 m.brand_id = keep_id
                 m.save()
 
@@ -178,14 +211,60 @@ def merge_brands(brand_to_keep, brand_to_delete):
             brand_id=keep_id, meyer_brand=m.meyer_brand
         ).first()
         if existing:
-            if _confirm(
+            if confirm(
                 "  Delete mapping id={} (meyer_brand={})? Keep already has.".format(m.id, m.meyer_brand.name)
             ):
                 m.delete()
         else:
-            if _confirm(
+            if confirm(
                 "  Update mapping id={} brand_id {} -> {} (meyer_brand={})?".format(
                     m.id, delete_id, keep_id, m.meyer_brand.name
+                )
+            ):
+                m.brand_id = keep_id
+                m.save()
+
+    # 5a. BrandAtechBrandMapping
+    atech_list = list(
+        src_models.BrandAtechBrandMapping.objects.filter(brand_id=delete_id).select_related("atech_brand")
+    )
+    print("\n--- BrandAtechBrandMapping: {} to process ---".format(len(atech_list)))
+    for m in atech_list:
+        existing = src_models.BrandAtechBrandMapping.objects.filter(
+            brand_id=keep_id, atech_brand=m.atech_brand
+        ).first()
+        if existing:
+            if confirm(
+                "  Delete mapping id={} (atech_brand={})? Keep already has.".format(m.id, m.atech_brand.name)
+            ):
+                m.delete()
+        else:
+            if confirm(
+                "  Update mapping id={} brand_id {} -> {} (atech_brand={})?".format(
+                    m.id, delete_id, keep_id, m.atech_brand.name
+                )
+            ):
+                m.brand_id = keep_id
+                m.save()
+
+    # 5b. BrandDlgBrandMapping
+    dlg_list = list(
+        src_models.BrandDlgBrandMapping.objects.filter(brand_id=delete_id).select_related("dlg_brand")
+    )
+    print("\n--- BrandDlgBrandMapping: {} to process ---".format(len(dlg_list)))
+    for m in dlg_list:
+        existing = src_models.BrandDlgBrandMapping.objects.filter(
+            brand_id=keep_id, dlg_brand=m.dlg_brand
+        ).first()
+        if existing:
+            if confirm(
+                "  Delete mapping id={} (dlg_brand={})? Keep already has.".format(m.id, m.dlg_brand.name)
+            ):
+                m.delete()
+        else:
+            if confirm(
+                "  Update mapping id={} brand_id {} -> {} (dlg_brand={})?".format(
+                    m.id, delete_id, keep_id, m.dlg_brand.name
                 )
             ):
                 m.brand_id = keep_id
@@ -197,74 +276,170 @@ def merge_brands(brand_to_keep, brand_to_delete):
     for bp in bp_list:
         existing = src_models.BrandProviders.objects.filter(brand_id=keep_id, provider=bp.provider).first()
         if existing:
-            if _confirm("  Delete BrandProviders id={} (provider={})? Keep already has.".format(bp.id, bp.provider.kind_name)):
+            if confirm("  Delete BrandProviders id={} (provider={})? Keep already has.".format(bp.id, bp.provider.kind_name)):
                 bp.delete()
         else:
-            if _confirm("  Update BrandProviders id={} brand_id {} -> {} (provider={})?".format(bp.id, delete_id, keep_id, bp.provider.kind_name)):
+            if confirm("  Update BrandProviders id={} brand_id {} -> {} (provider={})?".format(bp.id, delete_id, keep_id, bp.provider.kind_name)):
                 bp.brand_id = keep_id
                 bp.save()
 
-    # 7. MasterPart (update brand_id, handle duplicates)
-    mp_list = list(src_models.MasterPart.objects.filter(brand_id=delete_id))
+    # 7. MasterPart (update brand_id, handle duplicates) - bulk, not per-row.
+    mp_list = list(src_models.MasterPart.objects.filter(brand_id=delete_id).only("id", "part_number"))
     print("\n--- MasterPart: {} to process ---".format(len(mp_list)))
     if mp_list:
-        conflicts = sum(1 for mp in mp_list if src_models.MasterPart.objects.filter(brand_id=keep_id, part_number=mp.part_number).exists())
-        print("  ({} conflicts with keep brand)".format(conflicts))
-        if _confirm("  Process {} MasterPart records?".format(len(mp_list))):
+        part_numbers = [mp.part_number for mp in mp_list]
+        keep_mp_by_pn = {}
+        for chunk in _chunked(part_numbers):
+            for keep_mp in src_models.MasterPart.objects.filter(
+                brand_id=keep_id, part_number__in=chunk
+            ).only("id", "part_number"):
+                keep_mp_by_pn[keep_mp.part_number] = keep_mp
+
+        conflict_mps = [mp for mp in mp_list if mp.part_number in keep_mp_by_pn]
+        non_conflict_ids = [mp.id for mp in mp_list if mp.part_number not in keep_mp_by_pn]
+        print("  ({} conflicts with keep brand, {} simple reassigns)".format(len(conflict_mps), len(non_conflict_ids)))
+
+        if confirm("  Process {} MasterPart records?".format(len(mp_list))):
             from django.db import transaction
+
             with transaction.atomic():
-                for mp in mp_list:
-                    existing = src_models.MasterPart.objects.filter(brand_id=keep_id, part_number=mp.part_number).first()
-                    if existing:
-                        for pp in src_models.ProviderPart.objects.filter(master_part=mp):
-                            kp = src_models.ProviderPart.objects.filter(master_part=existing, provider=pp.provider).first()
-                            if kp:
-                                pp.delete()
-                            else:
-                                pp.master_part = existing
-                                pp.save()
-                        mp.delete()
-                    else:
-                        mp.brand_id = keep_id
-                        mp.save()
+                # Non-conflicting: just repoint brand_id, in batched bulk UPDATEs.
+                for chunk in _chunked(non_conflict_ids):
+                    src_models.MasterPart.objects.filter(id__in=chunk).update(brand_id=keep_id)
+
+                if conflict_mps:
+                    conflict_mp_ids = [mp.id for mp in conflict_mps]
+                    mp_id_to_keep_mp_id = {mp.id: keep_mp_by_pn[mp.part_number].id for mp in conflict_mps}
+                    keep_mp_ids = list({v for v in mp_id_to_keep_mp_id.values()})
+
+                    delete_pps = []
+                    for chunk in _chunked(conflict_mp_ids):
+                        delete_pps.extend(
+                            src_models.ProviderPart.objects.filter(master_part_id__in=chunk).only(
+                                "id", "master_part_id", "provider_id"
+                            )
+                        )
+
+                    existing_keep_pps = set()
+                    for chunk in _chunked(keep_mp_ids):
+                        existing_keep_pps.update(
+                            src_models.ProviderPart.objects.filter(master_part_id__in=chunk).values_list(
+                                "master_part_id", "provider_id"
+                            )
+                        )
+
+                    reassign_objs = []
+                    delete_pp_ids = []
+                    for pp in delete_pps:
+                        new_master_id = mp_id_to_keep_mp_id[pp.master_part_id]
+                        if (new_master_id, pp.provider_id) in existing_keep_pps:
+                            delete_pp_ids.append(pp.id)
+                        else:
+                            pp.master_part_id = new_master_id
+                            reassign_objs.append(pp)
+
+                    for chunk in _chunked(delete_pp_ids):
+                        src_models.ProviderPart.objects.filter(id__in=chunk).delete()
+
+                    if reassign_objs:
+                        src_models.ProviderPart.objects.bulk_update(
+                            reassign_objs, ["master_part_id"], batch_size=_IN_CLAUSE_CHUNK
+                        )
+
+                    for chunk in _chunked(conflict_mp_ids):
+                        src_models.MasterPart.objects.filter(id__in=chunk).delete()
 
     # 8. CompanyDestinationParts
     cdp_count = src_models.CompanyDestinationParts.objects.filter(brand_id=delete_id).count()
     if cdp_count:
-        if _confirm("  Update {} CompanyDestinationParts brand_id {} -> {}?".format(cdp_count, delete_id, keep_id)):
+        if confirm("  Update {} CompanyDestinationParts brand_id {} -> {}?".format(cdp_count, delete_id, keep_id)):
             src_models.CompanyDestinationParts.objects.filter(brand_id=delete_id).update(brand_id=keep_id)
 
     # 9. CompanyBrands - delete for merge brand
     cb_count = src_models.CompanyBrands.objects.filter(brand_id=delete_id).count()
     print("\n--- CompanyBrands: {} to delete (brand_id={}) ---".format(cb_count, delete_id))
     if cb_count:
-        if _confirm("  Delete {} CompanyBrands for '{}'?".format(cb_count, brand_to_delete.name)):
+        if confirm("  Delete {} CompanyBrands for '{}'?".format(cb_count, brand_to_delete.name)):
             src_models.CompanyBrands.objects.filter(brand_id=delete_id).delete()
 
     # 10. BigCommerceBrands, BrandSDCBrandMapping if any
     bbc = src_models.BigCommerceBrands.objects.filter(brand_id=delete_id)
     if bbc.exists():
-        if _confirm("  Update {} BigCommerceBrands?".format(bbc.count())):
+        if confirm("  Update {} BigCommerceBrands?".format(bbc.count())):
             bbc.update(brand_id=keep_id)
     sdc = src_models.BrandSDCBrandMapping.objects.filter(brand_id=delete_id)
     if sdc.exists():
         for m in sdc:
             ex = src_models.BrandSDCBrandMapping.objects.filter(brand_id=keep_id, sdc_brand=m.sdc_brand).first()
             if ex:
-                if _confirm("  Delete BrandSDCBrandMapping id={}?".format(m.id)):
+                if confirm("  Delete BrandSDCBrandMapping id={}?".format(m.id)):
                     m.delete()
             else:
-                if _confirm("  Update BrandSDCBrandMapping id={}?".format(m.id)):
+                if confirm("  Update BrandSDCBrandMapping id={}?".format(m.id)):
                     m.brand_id = keep_id
                     m.save()
 
     # 11. Delete brand
     print("\n--- Delete brand '{}' (id={}) ---".format(brand_to_delete.name, delete_id))
-    if _confirm("  Confirm DELETE brand '{}'?".format(brand_to_delete.name)):
+    if confirm("  Confirm DELETE brand '{}'?".format(brand_to_delete.name)):
         brand_to_delete.delete()
         print("  [OK] Done.")
     else:
         print("  [SKIP] Brand NOT deleted.")
+
+
+def merge_batch(pairs, dry_run=False):
+    """
+    Batch-merge an explicit list of ``(keep_id, delete_id)`` tuples, no per-row confirmation.
+
+    Every action is still printed (via ``_auto_confirm``) so the log is a full audit trail.
+    Pass ``dry_run=True`` to only print what *would* happen (fetches + prints ids/names, no merge_brands call).
+    Skips a pair with a warning if either id doesn't exist, or if keep_id == delete_id.
+    Wraps each pair in its own transaction so one bad pair can't corrupt others.
+    """
+    from django.db import transaction
+
+    results = {"merged": [], "skipped": []}
+    for keep_id, delete_id in pairs:
+        if keep_id == delete_id:
+            print("[SKIP] keep_id == delete_id == {}".format(keep_id))
+            results["skipped"].append((keep_id, delete_id, "same id"))
+            continue
+        keep = src_models.Brands.objects.filter(pk=keep_id).first()
+        delete = src_models.Brands.objects.filter(pk=delete_id).first()
+        if not keep or not delete:
+            print("[SKIP] pair ({}, {}): missing Brands row (keep={}, delete={})".format(
+                keep_id, delete_id, bool(keep), bool(delete)
+            ))
+            results["skipped"].append((keep_id, delete_id, "missing brand row"))
+            continue
+
+        print("\n" + "#" * 60)
+        print("KEEP: id={} name='{}'  <-  MERGE+DELETE: id={} name='{}'".format(
+            keep.id, keep.name, delete.id, delete.name
+        ))
+        print("#" * 60)
+
+        if dry_run:
+            print("[DRY-RUN] Would merge id={} into id={}.".format(delete.id, keep.id))
+            continue
+
+        try:
+            with transaction.atomic():
+                merge_brands(keep, delete, confirm=_auto_confirm)
+            results["merged"].append((keep_id, delete_id))
+        except Exception as e:
+            print("[ERROR] pair ({}, {}): {}".format(keep_id, delete_id, e))
+            import traceback
+            traceback.print_exc()
+            results["skipped"].append((keep_id, delete_id, str(e)))
+
+    print("\n" + "=" * 60)
+    print("Batch done. Merged: {}, Skipped: {}".format(len(results["merged"]), len(results["skipped"])))
+    if results["skipped"]:
+        for keep_id, delete_id, reason in results["skipped"]:
+            print("  SKIPPED ({}, {}): {}".format(keep_id, delete_id, reason))
+    return results
 
 
 def process_pair(label, names):

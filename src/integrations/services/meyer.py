@@ -1218,9 +1218,17 @@ def fetch_and_save_meyer_catalog_and_inventory(force_download: bool = False) -> 
     meyer_provider_row = src_models.Providers.objects.filter(kind=meyer_kind).first()
     pricing_cps: typing.List[src_models.CompanyProviders] = []
     if meyer_provider_row:
-        pricing_cps = list(
+        all_cps = list(
             _active_meyer_company_providers_queryset().filter(provider=meyer_provider_row)
         )
+        for cp in all_cps:
+            if not cp.active:
+                logger.info(
+                    "{} Skipping Meyer company pricing for company_provider_id={} (company_id={}): inactive.".format(
+                        _LOG_PREFIX, cp.id, cp.company_id,
+                    )
+                )
+        pricing_cps = [cp for cp in all_cps if cp.active]
     if meyer_provider_row and not pricing_cps:
         logger.warning(
             "{} No active Meyer company providers; ingest may be incomplete.".format(_LOG_PREFIX)

@@ -844,7 +844,18 @@ def fetch_and_save_dlg_catalog(force_download: bool = False) -> None:
 
     logger.info("{} Finished DLG inventory ingest ({} parts).".format(_LOG_PREFIX, len(parts)))
 
-    for cp in _active_dlg_company_providers_queryset():
+    all_cps = list(_active_dlg_company_providers_queryset())
+    inactive_cps = [cp for cp in all_cps if not cp.active]
+    for cp in inactive_cps:
+        logger.info(
+            "{} Skipping DLG per-company pricing for company_provider_id={} (company_id={}): inactive.".format(
+                _LOG_PREFIX, cp.id, cp.company_id,
+            )
+        )
+
+    for cp in all_cps:
+        if not cp.active:
+            continue
         try:
             sync_dlg_company_pricing_for_company_provider(cp.id, force_download=force_download)
         except Exception as e:
