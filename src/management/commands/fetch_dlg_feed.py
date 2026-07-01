@@ -6,9 +6,11 @@ from src.integrations.services import dlg, master_parts
 
 class Command(BaseCommand):
     help = (
-        "Download DLG dlg_inventory.csv from the fixed relay; SFTP auth is DLG_RELAY_SFTP_USER / "
-        "DLG_RELAY_SFTP_PASSWORD in settings. Upserts DlgBrand / DlgParts, then DlgCompanyPricing per company. "
-        "CompanyProviders need email_from only; local_feed_path is optional per connection."
+        "Download DLG dlg_inventory.csv from the fixed relay host/path; SFTP auth comes from the primary "
+        "DLG CompanyProviders row's credentials (sftp_user/sftp_password), falling back to "
+        "DLG_RELAY_SFTP_USER / DLG_RELAY_SFTP_PASSWORD in settings if unset. Upserts DlgBrand / DlgParts, "
+        "then DlgCompanyPricing per company using each company's own credentials. CompanyProviders may also "
+        "set email_from and local_feed_path."
     )
 
     def add_arguments(self, parser):

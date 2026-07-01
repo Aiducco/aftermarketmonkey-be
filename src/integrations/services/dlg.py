@@ -16,7 +16,9 @@ from src.integrations.clients.dlg import client as dlg_client
 from src.integrations.clients.dlg import exceptions as dlg_exceptions
 from src.integrations.utils.brand_matching import (
     best_fuzzy_brand_match,
+    brands_by_compact_key,
     brands_by_first_token_upper,
+    normalize_compact_key,
     normalize_upper_words,
 )
 
@@ -366,6 +368,26 @@ def sync_unmapped_dlg_brands_to_brands(dry_run: bool = False) -> typing.List[src
             exact_matched_ids.add(db.id)
             break
 
+    # Compact-key phase: catches punctuation/spacing-only differences (e.g. 'AUTOMETER' vs
+    # 'AUTO METER') that the word-prefix fuzzy phase below can't, since it compares whole tokens
+    # and never merges/splits words.
+    compact_matched_ids: typing.Set[int] = set()
+    still_unresolved = [db for db in unmapped if db.id not in resolved_by_dlg_id]
+    if still_unresolved:
+        compact_index = brands_by_compact_key()
+        for db in sorted(still_unresolved, key=lambda x: x.id):
+            source = _dlg_sync_source_label(db)
+            key = normalize_compact_key(source)
+            if not key:
+                continue
+            brand = compact_index.get(key)
+            if not brand:
+                continue
+            if _dlg_is_toyo_toyota_collision(source, brand.name or ""):
+                continue
+            resolved_by_dlg_id[db.id] = brand
+            compact_matched_ids.add(db.id)
+
     unresolved_after_exact = [db for db in unmapped if db.id not in resolved_by_dlg_id]
     brands_first_index = brands_by_first_token_upper() if unresolved_after_exact else {}
     all_brands_fallback: typing.Optional[typing.List[src_models.Brands]] = None
@@ -408,6 +430,8 @@ def sync_unmapped_dlg_brands_to_brands(dry_run: bool = False) -> typing.List[src
                 how = "canonical_override"
             elif db.id in exact_matched_ids:
                 how = "exact"
+            elif db.id in compact_matched_ids:
+                how = "compact"
             else:
                 how = "fuzzy"
             logger.info(
@@ -424,11 +448,12 @@ def sync_unmapped_dlg_brands_to_brands(dry_run: bool = False) -> typing.List[src
             )
         would_create = [db for db in unmapped if db.id not in resolved_by_dlg_id]
         logger.info(
-            "{} [dry-run] Summary: {} canonical overrides, {} exact matches, {} fuzzy matches, "
-            "{} unmatched (would create Brand). No writes performed.".format(
+            "{} [dry-run] Summary: {} canonical overrides, {} exact matches, {} compact matches, "
+            "{} fuzzy matches, {} unmatched (would create Brand). No writes performed.".format(
                 _LOG_PREFIX,
                 len(canonical_matched_ids),
                 len(exact_matched_ids),
+                len(compact_matched_ids),
                 len(fuzzy_matched_ids),
                 len(would_create),
             )
@@ -511,10 +536,12 @@ def sync_unmapped_dlg_brands_to_brands(dry_run: bool = False) -> typing.List[src
             created_cb += 1
 
     logger.info(
-        "{} DLG brand sync done. Canonical overrides: {}, brands created: {}, fuzzy name matches: {}, "
-        "BrandDlgBrandMapping upserted: {}, BrandProviders: {}, CompanyBrands: {}.".format(
+        "{} DLG brand sync done. Canonical overrides: {}, compact matches: {}, brands created: {}, "
+        "fuzzy name matches: {}, BrandDlgBrandMapping upserted: {}, BrandProviders: {}, "
+        "CompanyBrands: {}.".format(
             _LOG_PREFIX,
             len(canonical_matched_ids),
+            len(compact_matched_ids),
             created_brands,
             fuzzy_matches,
             len(mapping_models),
@@ -674,7 +701,7 @@ def sync_dlg_company_pricing_for_company_provider(
         sftp = dlg_client.DlgSFTPClient(credentials=creds)
     except ValueError as e:
         logger.error(
-            "{} company_id={}: {} (SFTP user/password are from settings, not this connection).".format(
+            "{} company_id={}: {}.".format(
                 _LOG_PREFIX, cp.company_id, str(e),
             )
         )
@@ -704,9 +731,11 @@ def sync_dlg_company_pricing_for_company_provider(
 
 def fetch_and_save_dlg_catalog(force_download: bool = False) -> None:
     """
-    Download the DLG inventory CSV from the relay (host/path/filename: ``src.constants``; SFTP user/password:
-    ``DLG_RELAY_SFTP_USER`` / ``DLG_RELAY_SFTP_PASSWORD`` in settings). ``email_from`` on the primary
-    CompanyProvider is metadata (which mailbox DLG uses). Upserts DlgBrand / DlgParts.
+    Download the DLG inventory CSV from the relay (host/path/filename fixed in ``src.constants``;
+    SFTP user/password come from the primary DLG CompanyProviders row's credentials, falling back to
+    ``DLG_RELAY_SFTP_USER`` / ``DLG_RELAY_SFTP_PASSWORD`` in settings if that row has no per-company
+    account). ``email_from`` on the primary CompanyProvider is metadata (which mailbox DLG uses).
+    Upserts DlgBrand / DlgParts.
     """
     logger.info("{} Starting DLG inventory ingest.".format(_LOG_PREFIX))
 
@@ -715,7 +744,6 @@ def fetch_and_save_dlg_catalog(force_download: bool = False) -> None:
         logger.info("{} No active DLG CompanyProviders. Skipping.".format(_LOG_PREFIX))
         return
 
-    # Optional per-flow local path only; never SFTP user/password.
     try:
         sftp = dlg_client.DlgSFTPClient(credentials=catalog_cp.credentials)
     except ValueError as e:

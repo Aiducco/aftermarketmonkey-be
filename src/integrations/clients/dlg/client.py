@@ -18,12 +18,6 @@ DEFAULT_LOCAL_INVENTORY = "/tmp/dlg_inventory.csv"
 DEFAULT_FILE_MAX_AGE_SECONDS = 6 * 60 * 60
 
 _DLG_IGNORED_CREDENTIAL_KEYS = (
-    "sftp_user",
-    "sftp_password",
-    "sftp_server",
-    "sftp_host",
-    "server_url",
-    "sftp_port",
     "sftp_directory",
     "dlg_inventory_remote_file",
     "feed_remote_file",
@@ -67,12 +61,17 @@ def _warn_ignored_dlg_overrides(creds: typing.Dict) -> None:
 
 class DlgSFTPClient:
     """
-    SFTP client for DLG ``dlg_inventory.csv`` on the AfterMarketScout relay.
+    SFTP client for DLG ``dlg_inventory.csv``.
 
-    Host, path, and remote filename are in ``src.constants``. SFTP login is from
-    ``settings.DLG_RELAY_SFTP_USER`` and ``settings.DLG_RELAY_SFTP_PASSWORD`` (app-level, not per company).
-    Company ``credentials`` may only set ``local_feed_path``; ``email_from`` and legacy SFTP keys are ignored
-    (with a warning for SFTP keys).
+    Directory and remote filename are fixed in ``src.constants``. Host/port and SFTP login
+    (``sftp_user`` / ``sftp_password``) come from the calling ``CompanyProviders.credentials`` row
+    (``sftp_server``/``sftp_host``/``server_url`` and ``sftp_port``), falling back to
+    ``src.constants.DLG_RELAY_SFTP_HOST``/``DLG_RELAY_SFTP_PORT`` (our current relay) when the row
+    doesn't set them — this lets the primary company stay on its old relay host while others use the
+    current one. User/password fall back to ``settings.DLG_RELAY_SFTP_USER`` /
+    ``settings.DLG_RELAY_SFTP_PASSWORD`` only when the company row has no per-company account yet.
+    Company ``credentials`` may also set ``local_feed_path``; ``email_from`` is metadata, and stray
+    directory/filename overrides are ignored (with a warning).
 
     Local path: ``DLG_INVENTORY_LOCAL_PATH`` setting, else ``/tmp/dlg_inventory.csv``.
     """
@@ -87,25 +86,35 @@ class DlgSFTPClient:
         creds = dict(credentials or {})
         _warn_ignored_dlg_overrides(creds)
 
-        self.sftp_server = _normalize_sftp_server(src_constants.DLG_RELAY_SFTP_HOST)
-        self.sftp_port = int(src_constants.DLG_RELAY_SFTP_PORT)
+        creds_server = _normalize_sftp_server(
+            creds.get("sftp_server") or creds.get("sftp_host") or creds.get("server_url")
+        )
+        self.sftp_server = creds_server or _normalize_sftp_server(src_constants.DLG_RELAY_SFTP_HOST)
+
+        creds_port = str(creds.get("sftp_port") or "").strip()
+        self.sftp_port = int(creds_port) if creds_port else int(src_constants.DLG_RELAY_SFTP_PORT)
+
         self.sftp_directory = (src_constants.DLG_RELAY_SFTP_DIRECTORY or "").strip()
         self.inventory_remote_file = (src_constants.DLG_INVENTORY_CSV_FILENAME or "").strip()
 
-        self.sftp_user = str(getattr(settings, "DLG_RELAY_SFTP_USER", None) or "").strip()
-        self.sftp_password = str(getattr(settings, "DLG_RELAY_SFTP_PASSWORD", None) or "").strip()
+        self.sftp_user = str(creds.get("sftp_user") or "").strip() or str(
+            getattr(settings, "DLG_RELAY_SFTP_USER", None) or ""
+        ).strip()
+        self.sftp_password = str(creds.get("sftp_password") or "").strip() or str(
+            getattr(settings, "DLG_RELAY_SFTP_PASSWORD", None) or ""
+        ).strip()
 
         missing: typing.List[str] = []
         if not self.sftp_server:
-            missing.append("DLG_RELAY_SFTP_HOST in src.constants — relay host is not configured")
+            missing.append("sftp_server (company credentials, or DLG_RELAY_SFTP_HOST fallback in src.constants)")
         if not self.sftp_directory:
             missing.append("DLG_RELAY_SFTP_DIRECTORY in src.constants")
         if not self.inventory_remote_file:
             missing.append("DLG_INVENTORY_CSV_FILENAME in src.constants")
         if not self.sftp_user:
-            missing.append("DLG_RELAY_SFTP_USER in Django settings (set via environment)")
+            missing.append("sftp_user (company credentials, or DLG_RELAY_SFTP_USER fallback in Django settings)")
         if not self.sftp_password:
-            missing.append("DLG_RELAY_SFTP_PASSWORD in Django settings (set via environment)")
+            missing.append("sftp_password (company credentials, or DLG_RELAY_SFTP_PASSWORD fallback in Django settings)")
 
         self.local_inventory_path = (
             str(creds.get("local_feed_path") or "").strip()
