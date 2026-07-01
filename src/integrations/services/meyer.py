@@ -2,6 +2,7 @@ import codecs
 import csv
 import logging
 import re
+import sys
 import time
 import typing
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -20,13 +21,25 @@ from src.integrations.clients.meyer import client as meyer_client
 from src.integrations.clients.meyer import exceptions as meyer_exceptions
 from src.integrations.utils.brand_matching import (
     best_fuzzy_brand_match,
+    brands_by_compact_key,
     brands_by_first_token_upper,
+    normalize_compact_key,
     normalize_upper_words,
 )
 
 logger = logging.getLogger(__name__)
 
 _LOG_PREFIX = "[MEYER-SERVICES]"
+
+# Some feed lines exceed the csv module's default 131072-byte field limit; raise it as high
+# as the platform allows (shared csv module state, so this also covers other integrations).
+_maxint = sys.maxsize
+while True:
+    try:
+        csv.field_size_limit(_maxint)
+        break
+    except OverflowError:
+        _maxint = int(_maxint / 10)
 
 MEYER_PRICING_UPSERT_BATCH = 2000
 MEYER_PART_LOOKUP_CHUNK = 3000
@@ -113,7 +126,15 @@ def _truthy(value: typing.Any) -> bool:
 def _normalize_meyer_row(row: typing.Dict) -> typing.Dict:
     out: typing.Dict[str, typing.Any] = {}
     for k, v in row.items():
-        out[k] = None if v is None or v == "" or (isinstance(v, float) and pd.isna(v)) else v
+        if v is None or v == "" or (isinstance(v, float) and pd.isna(v)):
+            out[k] = None
+            continue
+        if isinstance(v, str) and "\x00" in v:
+            # Postgres text/json columns reject NUL bytes; feeds occasionally embed them.
+            v = v.replace("\x00", "")
+            if v == "":
+                v = None
+        out[k] = v
     return out
 
 
@@ -707,6 +728,22 @@ def sync_unmapped_meyer_brands_to_brands(dry_run: bool = False) -> typing.List[s
                 resolved_by_meyer_id[mb.id] = brand
                 exact_matched_ids.add(mb.id)
 
+    # Compact-key phase: catches punctuation/spacing-only differences (e.g. 'AUTOMETER' vs
+    # 'AUTO METER') that the word-prefix fuzzy phase below can't, since it compares whole tokens
+    # and never merges/splits words.
+    compact_matched_ids: typing.Set[int] = set()
+    still_unresolved = [mb for mb in unmapped if mb.id not in resolved_by_meyer_id]
+    if still_unresolved:
+        compact_index = brands_by_compact_key()
+        for mb in sorted(still_unresolved, key=lambda x: x.id):
+            key = normalize_compact_key(mb.name or "")
+            if not key:
+                continue
+            brand = compact_index.get(key)
+            if brand:
+                resolved_by_meyer_id[mb.id] = brand
+                compact_matched_ids.add(mb.id)
+
     unresolved_after_exact = [mb for mb in unmapped if mb.id not in resolved_by_meyer_id]
     brands_first_index = brands_by_first_token_upper() if unresolved_after_exact else {}
     all_brands_fallback: typing.Optional[typing.List[src_models.Brands]] = None
@@ -747,6 +784,8 @@ def sync_unmapped_meyer_brands_to_brands(dry_run: bool = False) -> typing.List[s
                 how = "canonical_override"
             elif mb.id in exact_matched_ids:
                 how = "exact"
+            elif mb.id in compact_matched_ids:
+                how = "compact"
             else:
                 how = "fuzzy"
             logger.info(
@@ -763,11 +802,12 @@ def sync_unmapped_meyer_brands_to_brands(dry_run: bool = False) -> typing.List[s
             )
         would_create = [mb for mb in unmapped if mb.id not in resolved_by_meyer_id]
         logger.info(
-            "{} [dry-run] Summary: {} canonical overrides, {} exact matches, {} fuzzy matches, "
-            "{} unmatched (would create Brand). No writes performed.".format(
+            "{} [dry-run] Summary: {} canonical overrides, {} exact matches, {} compact matches, "
+            "{} fuzzy matches, {} unmatched (would create Brand). No writes performed.".format(
                 _LOG_PREFIX,
                 len(canonical_matched_ids),
                 len(exact_matched_ids),
+                len(compact_matched_ids),
                 len(fuzzy_matched_ids),
                 len(would_create),
             )
@@ -848,10 +888,12 @@ def sync_unmapped_meyer_brands_to_brands(dry_run: bool = False) -> typing.List[s
             created_cb += 1
 
     logger.info(
-        "{} Meyer brand sync done. Canonical overrides: {}, brands created: {}, fuzzy name matches: {}, "
-        "BrandMeyerBrandMapping upserted: {}, BrandProviders: {}, CompanyBrands: {}.".format(
+        "{} Meyer brand sync done. Canonical overrides: {}, compact matches: {}, brands created: {}, "
+        "fuzzy name matches: {}, BrandMeyerBrandMapping upserted: {}, BrandProviders: {}, "
+        "CompanyBrands: {}.".format(
             _LOG_PREFIX,
             len(canonical_matched_ids),
+            len(compact_matched_ids),
             created_brands,
             fuzzy_matches,
             len(mapping_models),

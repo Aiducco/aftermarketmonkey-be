@@ -1,6 +1,7 @@
 import csv
 import logging
 import re
+import sys
 import time
 import typing
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -20,13 +21,25 @@ from src.integrations.clients.atech import exceptions as atech_exceptions
 from src.integrations.services.meyer import normalize_brand_match_key
 from src.integrations.utils.brand_matching import (
     best_fuzzy_brand_match,
+    brands_by_compact_key,
     brands_by_first_token_upper,
+    normalize_compact_key,
     normalize_upper_words,
 )
 
 logger = logging.getLogger(__name__)
 
 _LOG_PREFIX = "[ATECH-SERVICES]"
+
+# Some A-Tech feed lines exceed the csv module's default 131072-byte field limit
+# (e.g. long/malformed description or raw lines); raise it as high as the platform allows.
+_maxint = sys.maxsize
+while True:
+    try:
+        csv.field_size_limit(_maxint)
+        break
+    except OverflowError:
+        _maxint = int(_maxint / 10)
 
 _EXCEL_FORMULA_PATTERN = re.compile(r'^="?([^"]*)"?$|^=(\d+(?:\.\d+)?)$')
 
@@ -145,6 +158,11 @@ _ATECH_FEED_CSV_ENCODINGS = ("utf-8-sig", "utf-8", "cp1252", "latin-1")
 def _normalize_atech_row_cell(v: typing.Any) -> typing.Any:
     if v is None or v == "" or (isinstance(v, float) and pd.isna(v)):
         return None
+    if isinstance(v, str) and "\x00" in v:
+        # Postgres text/json columns reject NUL bytes; feeds occasionally embed them.
+        v = v.replace("\x00", "")
+        if v == "":
+            return None
     return v
 
 
@@ -722,6 +740,22 @@ def sync_unmapped_atech_brands_to_brands(dry_run: bool = False) -> typing.List[s
                 resolved_by_atech_id[ab.id] = brand
                 exact_matched_ids.add(ab.id)
 
+    # Compact-key phase: catches punctuation/spacing-only differences (e.g. 'AUTOMETER' vs
+    # 'AUTO METER', 'WD40' vs 'WD-40') that the word-prefix fuzzy phase below can't, since it
+    # compares whole tokens and never merges/splits words.
+    compact_matched_ids: typing.Set[int] = set()
+    still_unresolved = [ab for ab in unmapped if ab.id not in resolved_by_atech_id]
+    if still_unresolved:
+        compact_index = brands_by_compact_key()
+        for ab in sorted(still_unresolved, key=lambda x: x.id):
+            key = normalize_compact_key(ab.name or "")
+            if not key:
+                continue
+            brand = compact_index.get(key)
+            if brand:
+                resolved_by_atech_id[ab.id] = brand
+                compact_matched_ids.add(ab.id)
+
     unresolved_after_exact = [ab for ab in unmapped if ab.id not in resolved_by_atech_id]
     brands_first_index: typing.Dict[str, typing.List[src_models.Brands]] = {}
     if unresolved_after_exact:
@@ -801,6 +835,8 @@ def sync_unmapped_atech_brands_to_brands(dry_run: bool = False) -> typing.List[s
                 how = "canonical_override"
             elif ab.id in exact_matched_ids:
                 how = "exact"
+            elif ab.id in compact_matched_ids:
+                how = "compact"
             else:
                 how = "fuzzy"
             logger.info(
@@ -817,11 +853,12 @@ def sync_unmapped_atech_brands_to_brands(dry_run: bool = False) -> typing.List[s
             )
         would_create = [ab for ab in unmapped if ab.id not in resolved_by_atech_id]
         logger.info(
-            "{} [dry-run] Summary: {} canonical overrides, {} exact matches, {} fuzzy matches, "
-            "{} unmatched (would create Brand). No writes performed.".format(
+            "{} [dry-run] Summary: {} canonical overrides, {} exact matches, {} compact matches, "
+            "{} fuzzy matches, {} unmatched (would create Brand). No writes performed.".format(
                 _LOG_PREFIX,
                 len(canonical_matched_ids),
                 len(exact_matched_ids),
+                len(compact_matched_ids),
                 len(fuzzy_matched_ids),
                 len(would_create),
             )
@@ -904,10 +941,12 @@ def sync_unmapped_atech_brands_to_brands(dry_run: bool = False) -> typing.List[s
             created_cb += 1
 
     logger.info(
-        "{} A-Tech brand sync done. Canonical overrides: {}, brands created: {}, fuzzy name matches: {}, "
-        "BrandAtechBrandMapping upserted: {}, BrandProviders: {}, CompanyBrands: {}.".format(
+        "{} A-Tech brand sync done. Canonical overrides: {}, compact matches: {}, brands created: {}, "
+        "fuzzy name matches: {}, BrandAtechBrandMapping upserted: {}, BrandProviders: {}, "
+        "CompanyBrands: {}.".format(
             _LOG_PREFIX,
             len(canonical_matched_ids),
+            len(compact_matched_ids),
             created_brands,
             fuzzy_matches,
             len(mapping_models),
