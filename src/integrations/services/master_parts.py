@@ -2,6 +2,8 @@
 Sync MasterPart, ProviderPart, ProviderPartInventory, and ProviderPartCompanyPricing
 from Turn14, Keystone, Meyer, A-Tech, Rough Country, WheelPros, DLG, and Premier (APG Wholesale) provider data.
 """
+import ctypes
+import gc
 import logging
 import time
 import typing
@@ -6296,6 +6298,27 @@ def sync_derived_from_premier(*, reindex_meilisearch: bool = False, skip_master_
     logger.info("{} Completed Premier-only derived sync.".format(_LOG_PREFIX))
 
 
+def _reclaim_memory() -> None:
+    """
+    Force Python to return freed heap to the OS between major sync phases.
+
+    Python's allocator (pymalloc + glibc malloc) holds freed pages for reuse rather than
+    returning them to the OS. After a large provider sync (e.g. Turn14 with 776k parts +
+    inventory + pricing in parallel workers), RSS can be several GB even though objects are
+    freed. By calling gc.collect() and malloc_trim(0) we get that memory back before the
+    next provider starts, preventing cumulative OOM across the full sync_all_master_parts run.
+    """
+    collected = gc.collect()
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+        logger.info("{} _reclaim_memory: gc collected={} malloc_trim done".format(_LOG_PREFIX, collected))
+    except Exception as e:
+        logger.info("{} _reclaim_memory: gc collected={} malloc_trim unavailable ({})".format(
+            _LOG_PREFIX, collected, e
+        ))
+
+
 def sync_all_master_parts() -> None:
     """
     Run each distributor's derived sync in order (master + provider parts, then inventory, then pricing
@@ -6308,12 +6331,19 @@ def sync_all_master_parts() -> None:
     logger.info("{} Starting full master parts sync.".format(_LOG_PREFIX))
 
     sync_derived_from_turn14(reindex_meilisearch=False)
+    _reclaim_memory()
     sync_derived_from_keystone(reindex_meilisearch=False)
+    _reclaim_memory()
     sync_derived_from_meyer(reindex_meilisearch=False)
+    _reclaim_memory()
     sync_derived_from_atech(reindex_meilisearch=False)
+    _reclaim_memory()
     sync_derived_from_rough_country(reindex_meilisearch=False)
+    _reclaim_memory()
     sync_derived_from_dlg(reindex_meilisearch=False)
+    _reclaim_memory()
     sync_derived_from_wheelpros(reindex_meilisearch=False)
+    _reclaim_memory()
     sync_derived_from_premier(reindex_meilisearch=False)
 
     logger.info("{} Completed full master parts sync.".format(_LOG_PREFIX))
