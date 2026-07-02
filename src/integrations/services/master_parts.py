@@ -5753,14 +5753,24 @@ def _ingest_premier_parts_for_mapped_brands(
 
         if existing_keys:
             key_to_mp = {(mp.brand_id, mp.part_number): mp for mp in master_parts_list}
-            values = [(existing_by_key[k], key_to_mp[k].aaia_code) for k in existing_keys]
-            placeholders = ", ".join(["(%s::bigint, %s)"] * len(values))
+            values = [
+                (existing_by_key[k], key_to_mp[k].aaia_code, key_to_mp[k].image_url)
+                for k in existing_keys
+            ]
+            placeholders = ", ".join(["(%s::bigint, %s, %s)"] * len(values))
             params = [x for t in values for x in t]
             with connection.cursor() as cur:
                 cur.execute(
                     """
-                    UPDATE master_parts mp SET aaia_code = v.aaia_code
-                    FROM (VALUES {}) AS v(id, aaia_code)
+                    UPDATE master_parts mp SET
+                        aaia_code = v.aaia_code,
+                        image_url = CASE
+                            WHEN (mp.image_url IS NULL OR mp.image_url = '')
+                                AND v.image_url IS NOT NULL AND v.image_url != ''
+                            THEN v.image_url
+                            ELSE mp.image_url
+                        END
+                    FROM (VALUES {}) AS v(id, aaia_code, image_url)
                     WHERE mp.id = v.id
                     """.format(placeholders),
                     params,
