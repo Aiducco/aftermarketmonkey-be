@@ -193,52 +193,17 @@ class Command(BaseCommand):
                 master_parts.sync_all_master_parts()
             self.stdout.write(self.style.SUCCESS("Master parts sync completed."))
 
-            if not options.get("skip_meilisearch") and is_configured():
-                with self._audited_step(
-                    "ingest_all_providers_meilisearch_reindex",
-                    "Meilisearch full reindex (delete + bulk index) complete.",
-                ):
-                    self._ingest_log("Meilisearch full reindex (delete + index)")
-                    bs = options.get("reindex_batch_size")
-                    w = options.get("reindex_upload_workers")
-                    kwargs: typing.Dict[str, int] = {}
-                    if bs is not None:
-                        kwargs["batch_size"] = bs
-                    if w is not None:
-                        kwargs["max_upload_workers"] = w
-                    ok, fail = reindex_all_master_parts(**kwargs)
-                    self._ingest_log(
-                        "Meilisearch reindex finished | indexed={} failed={}".format(ok, fail)
-                    )
-                    self.stdout.write(
-                        self.style.SUCCESS(
-                            "Meilisearch: indexed {} parts, failed {}.".format(ok, fail)
-                        )
-                    )
-            elif not options.get("skip_meilisearch"):
-                ex = audit_scheduled_tasks.start_scheduled_task_execution(
-                    "ingest_all_providers_meilisearch_reindex"
-                )
-                audit_scheduled_tasks.mark_scheduled_task_skipped(
-                    ex, message="Meilisearch not configured (MEILISEARCH_HOST empty)."
-                )
-                self._ingest_log("Meilisearch not configured; subtask recorded as SKIPPED")
-            else:
-                ex = audit_scheduled_tasks.start_scheduled_task_execution(
-                    "ingest_all_providers_meilisearch_reindex"
-                )
-                audit_scheduled_tasks.mark_scheduled_task_skipped(
-                    ex, message="Skipped: --skip-meilisearch"
-                )
-                self._ingest_log("Meilisearch reindex skipped; subtask recorded as SKIPPED")
+            # Meilisearch full reindex is intentionally disabled here.
+            # Run ``index_parts_meilisearch`` separately to avoid OOM during the 4-hour ingest window.
+            ex = audit_scheduled_tasks.start_scheduled_task_execution(
+                "ingest_all_providers_meilisearch_reindex"
+            )
+            audit_scheduled_tasks.mark_scheduled_task_skipped(
+                ex, message="Meilisearch reindex disabled in ingest_all_providers; run index_parts_meilisearch separately."
+            )
+            self._ingest_log("Meilisearch reindex skipped (disabled; run index_parts_meilisearch separately)")
 
-            end_msg = "Completed full scheduled ingest and master parts sync"
-            if options.get("skip_meilisearch"):
-                end_msg += " (Meilisearch skipped)."
-            elif is_configured():
-                end_msg += "; Meilisearch reindex ran."
-            else:
-                end_msg += " (Meilisearch not configured)."
+            end_msg = "Completed full scheduled ingest and master parts sync (Meilisearch reindex disabled)."
             audit_scheduled_tasks.mark_scheduled_task_completed(execution, message=end_msg)
             self._ingest_log("run completed successfully")
             self.stdout.write(self.style.SUCCESS("Successfully completed {}.".format(_TASK_NAME)))
