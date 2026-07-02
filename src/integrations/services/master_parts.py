@@ -118,7 +118,7 @@ def _get_brand_for_wheelpros_brand(
     return mapping.brand if mapping else None
 
 
-BATCH_SIZE_MASTER_PARTS = 2000
+BATCH_SIZE_MASTER_PARTS = 5000
 BATCH_SIZE_MASTER_PARTS_WHEELPROS = 3000
 # Max tuples per IN clause to avoid PostgreSQL stack depth limit (StatementTooComplex)
 WHEELPROS_LOOKUP_CHUNK = 200
@@ -128,7 +128,7 @@ BATCH_DELAY_SECONDS = 0.1  # Reduced from 0.3 - was adding ~30s per 100 batches
 
 # Partition ``sync_master_parts_from_*`` by internal ``Brands.id`` so workers never compete on the same
 # ``(brand_id, part_number)`` upsert. Tune down if PostgreSQL connection pool is tight.
-MASTER_PARTS_SYNC_MAX_WORKERS = 3
+MASTER_PARTS_SYNC_MAX_WORKERS = 10
 
 
 def _partition_mapped_brands_for_parallel_ingest(
