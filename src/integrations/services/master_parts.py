@@ -118,17 +118,17 @@ def _get_brand_for_wheelpros_brand(
     return mapping.brand if mapping else None
 
 
-BATCH_SIZE_MASTER_PARTS = 5000
-BATCH_SIZE_MASTER_PARTS_WHEELPROS = 10000  # Larger batches = fewer round-trips
+BATCH_SIZE_MASTER_PARTS = 2000
+BATCH_SIZE_MASTER_PARTS_WHEELPROS = 3000
 # Max tuples per IN clause to avoid PostgreSQL stack depth limit (StatementTooComplex)
 WHEELPROS_LOOKUP_CHUNK = 200
-BATCH_SIZE_INVENTORY = 20000
-BATCH_SIZE_PRICING = 20000
+BATCH_SIZE_INVENTORY = 5000
+BATCH_SIZE_PRICING = 5000
 BATCH_DELAY_SECONDS = 0.1  # Reduced from 0.3 - was adding ~30s per 100 batches
 
 # Partition ``sync_master_parts_from_*`` by internal ``Brands.id`` so workers never compete on the same
 # ``(brand_id, part_number)`` upsert. Tune down if PostgreSQL connection pool is tight.
-MASTER_PARTS_SYNC_MAX_WORKERS = 8
+MASTER_PARTS_SYNC_MAX_WORKERS = 3
 
 
 def _partition_mapped_brands_for_parallel_ingest(
@@ -5351,15 +5351,21 @@ def _maybe_reindex_meilisearch_after_master_parts(
     )
 
 
-def sync_derived_from_turn14(*, reindex_meilisearch: bool = False) -> None:
+def sync_derived_from_turn14(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False) -> None:
     """
     Propagate Turn14 source data into MasterPart, ProviderPart, ProviderPartInventory,
     and ProviderPartCompanyPricing. Call after Turn14 item/catalog fetches so the unified
     layer stays aligned without waiting for the global ``sync_all_master_parts`` job.
+
+    Pass ``skip_master_parts=True`` to run only inventory + pricing (fast incremental path).
     """
-    logger.info("{} Starting Turn14-only derived sync (parts, inventory, pricing).".format(_LOG_PREFIX))
-    sync_master_parts_from_turn14()
-    connection.close()
+    logger.info("{} Starting Turn14-only derived sync ({}).".format(
+        _LOG_PREFIX,
+        "inventory + pricing only" if skip_master_parts else "parts, inventory, pricing",
+    ))
+    if not skip_master_parts:
+        sync_master_parts_from_turn14()
+        connection.close()
 
     def _cont() -> None:
         sync_provider_inventory_from_turn14()
@@ -5367,15 +5373,18 @@ def sync_derived_from_turn14(*, reindex_meilisearch: bool = False) -> None:
         sync_provider_pricing_from_turn14()
         connection.close()
 
-    _maybe_reindex_meilisearch_after_master_parts(
-        reindex_meilisearch=reindex_meilisearch,
-        provider_label="Turn14",
-        continuation=_cont,
-    )
+    if skip_master_parts:
+        _cont()
+    else:
+        _maybe_reindex_meilisearch_after_master_parts(
+            reindex_meilisearch=reindex_meilisearch,
+            provider_label="Turn14",
+            continuation=_cont,
+        )
     logger.info("{} Completed Turn14-only derived sync.".format(_LOG_PREFIX))
 
 
-def sync_derived_from_keystone(*, reindex_meilisearch: bool = False) -> None:
+def sync_derived_from_keystone(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False) -> None:
     """
     Propagate Keystone source data into MasterPart, ProviderPart, ProviderPartInventory,
     and ProviderPartCompanyPricing. Call after Keystone inventory/CSV fetches.
@@ -5383,10 +5392,16 @@ def sync_derived_from_keystone(*, reindex_meilisearch: bool = False) -> None:
     ``reindex_meilisearch`` is off in normal operation; the scheduled ``ingest_all_providers`` run
     ends with a single full reindex. Pass True only for ad-hoc reindex with this call (skipped
     when Meilisearch is not configured).
+
+    Pass ``skip_master_parts=True`` to run only inventory + pricing (fast incremental path).
     """
-    logger.info("{} Starting Keystone-only derived sync (parts, inventory, pricing).".format(_LOG_PREFIX))
-    sync_master_parts_from_keystone()
-    connection.close()
+    logger.info("{} Starting Keystone-only derived sync ({}).".format(
+        _LOG_PREFIX,
+        "inventory + pricing only" if skip_master_parts else "parts, inventory, pricing",
+    ))
+    if not skip_master_parts:
+        sync_master_parts_from_keystone()
+        connection.close()
 
     def _cont() -> None:
         sync_provider_inventory_from_keystone()
@@ -5394,22 +5409,31 @@ def sync_derived_from_keystone(*, reindex_meilisearch: bool = False) -> None:
         sync_provider_pricing_from_keystone()
         connection.close()
 
-    _maybe_reindex_meilisearch_after_master_parts(
-        reindex_meilisearch=reindex_meilisearch,
-        provider_label="Keystone",
-        continuation=_cont,
-    )
+    if skip_master_parts:
+        _cont()
+    else:
+        _maybe_reindex_meilisearch_after_master_parts(
+            reindex_meilisearch=reindex_meilisearch,
+            provider_label="Keystone",
+            continuation=_cont,
+        )
     logger.info("{} Completed Keystone-only derived sync.".format(_LOG_PREFIX))
 
 
-def sync_derived_from_rough_country(*, reindex_meilisearch: bool = False) -> None:
+def sync_derived_from_rough_country(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False) -> None:
     """
     Propagate Rough Country source data into MasterPart, ProviderPart, ProviderPartInventory,
     and ProviderPartCompanyPricing. Call after Rough Country feed ingest.
+
+    Pass ``skip_master_parts=True`` to run only inventory + pricing (fast incremental path).
     """
-    logger.info("{} Starting Rough Country-only derived sync (parts, inventory, pricing).".format(_LOG_PREFIX))
-    sync_master_parts_from_rough_country()
-    connection.close()
+    logger.info("{} Starting Rough Country-only derived sync ({}).".format(
+        _LOG_PREFIX,
+        "inventory + pricing only" if skip_master_parts else "parts, inventory, pricing",
+    ))
+    if not skip_master_parts:
+        sync_master_parts_from_rough_country()
+        connection.close()
 
     def _cont() -> None:
         sync_provider_inventory_from_rough_country()
@@ -5417,22 +5441,31 @@ def sync_derived_from_rough_country(*, reindex_meilisearch: bool = False) -> Non
         sync_provider_pricing_from_rough_country()
         connection.close()
 
-    _maybe_reindex_meilisearch_after_master_parts(
-        reindex_meilisearch=reindex_meilisearch,
-        provider_label="Rough Country",
-        continuation=_cont,
-    )
+    if skip_master_parts:
+        _cont()
+    else:
+        _maybe_reindex_meilisearch_after_master_parts(
+            reindex_meilisearch=reindex_meilisearch,
+            provider_label="Rough Country",
+            continuation=_cont,
+        )
     logger.info("{} Completed Rough Country-only derived sync.".format(_LOG_PREFIX))
 
 
-def sync_derived_from_wheelpros(*, reindex_meilisearch: bool = False) -> None:
+def sync_derived_from_wheelpros(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False) -> None:
     """
     Propagate WheelPros source data into MasterPart, ProviderPart, ProviderPartInventory,
     and ProviderPartCompanyPricing. Call after WheelPros CSV ingest.
+
+    Pass ``skip_master_parts=True`` to run only inventory + pricing (fast incremental path).
     """
-    logger.info("{} Starting WheelPros-only derived sync (parts, inventory, pricing).".format(_LOG_PREFIX))
-    sync_master_parts_from_wheelpros()
-    connection.close()
+    logger.info("{} Starting WheelPros-only derived sync ({}).".format(
+        _LOG_PREFIX,
+        "inventory + pricing only" if skip_master_parts else "parts, inventory, pricing",
+    ))
+    if not skip_master_parts:
+        sync_master_parts_from_wheelpros()
+        connection.close()
 
     def _cont() -> None:
         sync_provider_inventory_from_wheelpros()
@@ -5440,22 +5473,31 @@ def sync_derived_from_wheelpros(*, reindex_meilisearch: bool = False) -> None:
         sync_provider_pricing_from_wheelpros()
         connection.close()
 
-    _maybe_reindex_meilisearch_after_master_parts(
-        reindex_meilisearch=reindex_meilisearch,
-        provider_label="WheelPros",
-        continuation=_cont,
-    )
+    if skip_master_parts:
+        _cont()
+    else:
+        _maybe_reindex_meilisearch_after_master_parts(
+            reindex_meilisearch=reindex_meilisearch,
+            provider_label="WheelPros",
+            continuation=_cont,
+        )
     logger.info("{} Completed WheelPros-only derived sync.".format(_LOG_PREFIX))
 
 
-def sync_derived_from_meyer(*, reindex_meilisearch: bool = False) -> None:
+def sync_derived_from_meyer(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False) -> None:
     """
     Propagate Meyer source data into MasterPart, ProviderPart, ProviderPartInventory,
     and ProviderPartCompanyPricing. Call after Meyer catalog / inventory ingest.
+
+    Pass ``skip_master_parts=True`` to run only inventory + pricing (fast incremental path).
     """
-    logger.info("{} Starting Meyer-only derived sync (parts, inventory, pricing).".format(_LOG_PREFIX))
-    sync_master_parts_from_meyer()
-    connection.close()
+    logger.info("{} Starting Meyer-only derived sync ({}).".format(
+        _LOG_PREFIX,
+        "inventory + pricing only" if skip_master_parts else "parts, inventory, pricing",
+    ))
+    if not skip_master_parts:
+        sync_master_parts_from_meyer()
+        connection.close()
 
     def _cont() -> None:
         sync_provider_inventory_from_meyer()
@@ -5463,22 +5505,31 @@ def sync_derived_from_meyer(*, reindex_meilisearch: bool = False) -> None:
         sync_provider_pricing_from_meyer()
         connection.close()
 
-    _maybe_reindex_meilisearch_after_master_parts(
-        reindex_meilisearch=reindex_meilisearch,
-        provider_label="Meyer",
-        continuation=_cont,
-    )
+    if skip_master_parts:
+        _cont()
+    else:
+        _maybe_reindex_meilisearch_after_master_parts(
+            reindex_meilisearch=reindex_meilisearch,
+            provider_label="Meyer",
+            continuation=_cont,
+        )
     logger.info("{} Completed Meyer-only derived sync.".format(_LOG_PREFIX))
 
 
-def sync_derived_from_atech(*, reindex_meilisearch: bool = False) -> None:
+def sync_derived_from_atech(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False) -> None:
     """
     Propagate A-Tech source data into MasterPart, ProviderPart, ProviderPartInventory,
     and ProviderPartCompanyPricing. Call after A-Tech feed ingest.
+
+    Pass ``skip_master_parts=True`` to run only inventory + pricing (fast incremental path).
     """
-    logger.info("{} Starting A-Tech-only derived sync (parts, inventory, pricing).".format(_LOG_PREFIX))
-    sync_master_parts_from_atech()
-    connection.close()
+    logger.info("{} Starting A-Tech-only derived sync ({}).".format(
+        _LOG_PREFIX,
+        "inventory + pricing only" if skip_master_parts else "parts, inventory, pricing",
+    ))
+    if not skip_master_parts:
+        sync_master_parts_from_atech()
+        connection.close()
 
     def _cont() -> None:
         sync_provider_inventory_from_atech()
@@ -5486,22 +5537,31 @@ def sync_derived_from_atech(*, reindex_meilisearch: bool = False) -> None:
         sync_provider_pricing_from_atech()
         connection.close()
 
-    _maybe_reindex_meilisearch_after_master_parts(
-        reindex_meilisearch=reindex_meilisearch,
-        provider_label="A-Tech",
-        continuation=_cont,
-    )
+    if skip_master_parts:
+        _cont()
+    else:
+        _maybe_reindex_meilisearch_after_master_parts(
+            reindex_meilisearch=reindex_meilisearch,
+            provider_label="A-Tech",
+            continuation=_cont,
+        )
     logger.info("{} Completed A-Tech-only derived sync.".format(_LOG_PREFIX))
 
 
-def sync_derived_from_dlg(*, reindex_meilisearch: bool = False) -> None:
+def sync_derived_from_dlg(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False) -> None:
     """
     Propagate DLG source data into MasterPart, ProviderPart, ProviderPartInventory,
     and ProviderPartCompanyPricing. Call after DLG catalog ingest.
+
+    Pass ``skip_master_parts=True`` to run only inventory + pricing (fast incremental path).
     """
-    logger.info("{} Starting DLG-only derived sync (parts, inventory, pricing).".format(_LOG_PREFIX))
-    sync_master_parts_from_dlg()
-    connection.close()
+    logger.info("{} Starting DLG-only derived sync ({}).".format(
+        _LOG_PREFIX,
+        "inventory + pricing only" if skip_master_parts else "parts, inventory, pricing",
+    ))
+    if not skip_master_parts:
+        sync_master_parts_from_dlg()
+        connection.close()
 
     def _cont() -> None:
         sync_provider_inventory_from_dlg()
@@ -5509,11 +5569,14 @@ def sync_derived_from_dlg(*, reindex_meilisearch: bool = False) -> None:
         sync_provider_pricing_from_dlg()
         connection.close()
 
-    _maybe_reindex_meilisearch_after_master_parts(
-        reindex_meilisearch=reindex_meilisearch,
-        provider_label="DLG",
-        continuation=_cont,
-    )
+    if skip_master_parts:
+        _cont()
+    else:
+        _maybe_reindex_meilisearch_after_master_parts(
+            reindex_meilisearch=reindex_meilisearch,
+            provider_label="DLG",
+            continuation=_cont,
+        )
     logger.info("{} Completed DLG-only derived sync.".format(_LOG_PREFIX))
 
 
@@ -5537,3 +5600,29 @@ def sync_all_master_parts() -> None:
     sync_derived_from_wheelpros(reindex_meilisearch=False)
 
     logger.info("{} Completed full master parts sync.".format(_LOG_PREFIX))
+
+
+def sync_all_master_parts_incremental() -> None:
+    """
+    Fast sync: ProviderPartInventory + ProviderPartCompanyPricing only for all providers.
+    Skips the MasterPart / ProviderPart upsert phase — no new parts, descriptions, or SKU
+    changes are picked up. Only updates inventory quantities and company pricing for parts
+    that already exist in the master layer.
+
+    Run this frequently (e.g. every few hours) to keep inventory and pricing fresh.
+    Run ``sync_all_master_parts`` once per day (off-peak) to pick up new/changed parts
+    and trigger a Meilisearch reindex.
+
+    Provider order is preserved so any cross-provider dependencies remain consistent.
+    """
+    logger.info("{} Starting incremental master parts sync (inventory + pricing only).".format(_LOG_PREFIX))
+
+    sync_derived_from_turn14(skip_master_parts=True)
+    sync_derived_from_keystone(skip_master_parts=True)
+    sync_derived_from_meyer(skip_master_parts=True)
+    sync_derived_from_atech(skip_master_parts=True)
+    sync_derived_from_rough_country(skip_master_parts=True)
+    sync_derived_from_dlg(skip_master_parts=True)
+    sync_derived_from_wheelpros(skip_master_parts=True)
+
+    logger.info("{} Completed incremental master parts sync.".format(_LOG_PREFIX))
