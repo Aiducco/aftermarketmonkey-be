@@ -16,6 +16,7 @@ class Command(BaseCommand):
     )
 
     def handle(self, *args, **options):
+        audit_scheduled_tasks.cleanup_stale_started_executions('sync_turn14_brands')
         self.stdout.write('Starting Turn 14 brands fetch and sync...')
         execution = audit_scheduled_tasks.start_scheduled_task_execution('sync_turn14_brands')
         try:

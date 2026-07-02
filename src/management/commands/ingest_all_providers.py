@@ -92,6 +92,18 @@ class Command(BaseCommand):
         self._ingest_log("subtask completed | task_name={}".format(task_name))
 
     def handle(self, *args, **options):
+        audit_scheduled_tasks.cleanup_stale_started_executions([
+            _TASK_NAME,
+            "ingest_all_providers_turn14",
+            "ingest_all_providers_keystone",
+            "ingest_all_providers_meyer",
+            "ingest_all_providers_atech",
+            "ingest_all_providers_rough_country",
+            "ingest_all_providers_dlg",
+            "ingest_all_providers_wheelpros",
+            "ingest_all_providers_sync_all_master_parts",
+            "ingest_all_providers_meilisearch_reindex",
+        ])
         self._ingest_log("start")
         execution = audit_scheduled_tasks.start_scheduled_task_execution(_TASK_NAME)
         try:

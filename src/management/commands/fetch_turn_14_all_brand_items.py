@@ -8,6 +8,7 @@ class Command(BaseCommand):
     help = 'Fetch and save Turn 14 items for all brands (BrandProviders + Turn 14)'
 
     def handle(self, *args, **options):
+        audit_scheduled_tasks.cleanup_stale_started_executions('fetch_turn_14_all_brand_items')
         self.stdout.write('Starting Turn 14 all brand items fetch...')
         execution = audit_scheduled_tasks.start_scheduled_task_execution('fetch_turn_14_all_brand_items')
         try:

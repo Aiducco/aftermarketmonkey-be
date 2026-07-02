@@ -19,6 +19,7 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
+        audit_scheduled_tasks.cleanup_stale_started_executions("sync_atech_brands")
         dry_run = options.get("dry_run", False)
         if dry_run:
             self.stdout.write("Dry run: no database writes.")

@@ -28,6 +28,7 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
+        audit_scheduled_tasks.cleanup_stale_started_executions("sync_master_parts")
         self.stdout.write("Starting full master parts sync...")
         execution = audit_scheduled_tasks.start_scheduled_task_execution("sync_master_parts")
         try:

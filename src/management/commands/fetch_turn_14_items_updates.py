@@ -8,6 +8,7 @@ class Command(BaseCommand):
     help = 'Fetch and save Turn 14 items updates'
 
     def handle(self, *args, **options):
+        audit_scheduled_tasks.cleanup_stale_started_executions('fetch_turn_14_items_updates')
         self.stdout.write('Starting Turn 14 items updates fetch...')
         execution = audit_scheduled_tasks.start_scheduled_task_execution('fetch_turn_14_items_updates')
         try:

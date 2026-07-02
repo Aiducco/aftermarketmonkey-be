@@ -19,6 +19,7 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
+        audit_scheduled_tasks.cleanup_stale_started_executions("fetch_atech_feed")
         self.stdout.write("Fetching A-Tech feed from SFTP...")
         execution = audit_scheduled_tasks.start_scheduled_task_execution("fetch_atech_feed")
         try:

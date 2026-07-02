@@ -40,6 +40,7 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
+        audit_scheduled_tasks.cleanup_stale_started_executions("sync_wheelpros")
         self.stdout.write("Starting WheelPros fetch and sync...")
         execution = audit_scheduled_tasks.start_scheduled_task_execution("sync_wheelpros")
         feed_type = options.get("feed_type", "all")

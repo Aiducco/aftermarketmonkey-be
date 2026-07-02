@@ -15,6 +15,7 @@ class Command(BaseCommand):
     )
 
     def handle(self, *args, **options):
+        audit_scheduled_tasks.cleanup_stale_started_executions("sync_keystone_brands")
         self.stdout.write("Starting Keystone brands fetch and sync...")
         execution = audit_scheduled_tasks.start_scheduled_task_execution("sync_keystone_brands")
         try:

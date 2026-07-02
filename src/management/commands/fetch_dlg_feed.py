@@ -21,6 +21,7 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
+        audit_scheduled_tasks.cleanup_stale_started_executions("fetch_dlg_feed")
         self.stdout.write("Fetching DLG inventory from SFTP...")
         execution = audit_scheduled_tasks.start_scheduled_task_execution("fetch_dlg_feed")
         try:

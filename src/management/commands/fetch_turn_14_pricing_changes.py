@@ -39,6 +39,7 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
+        audit_scheduled_tasks.cleanup_stale_started_executions('fetch_turn_14_pricing_changes')
         days = options['days']
         start_date_arg = options['start_date']
         end_date_arg = options['end_date']
