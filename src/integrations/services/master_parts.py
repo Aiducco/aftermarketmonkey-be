@@ -128,7 +128,7 @@ BATCH_DELAY_SECONDS = 0.1  # Reduced from 0.3 - was adding ~30s per 100 batches
 
 # Partition ``sync_master_parts_from_*`` by internal ``Brands.id`` so workers never compete on the same
 # ``(brand_id, part_number)`` upsert. Tune down if PostgreSQL connection pool is tight.
-MASTER_PARTS_SYNC_MAX_WORKERS = 16
+MASTER_PARTS_SYNC_MAX_WORKERS = 8
 
 
 def _partition_mapped_brands_for_parallel_ingest(
