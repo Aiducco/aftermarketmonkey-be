@@ -479,6 +479,26 @@ MASTER_PART_FULL_UPDATE_FIELDS = ["sku", "description", "aaia_code", "image_url"
 MASTER_PART_PARTIAL_UPDATE_FIELDS = ["sku", "aaia_code"]  # Non-primary providers
 
 
+def _collapse_doubled_sku_prefix(sku, part_number):
+    """
+    Turn14's own internal SKU field sometimes has the brand/vendor prefix baked in twice
+    (e.g. sku="FPEFPE-HSC-4-S" for mfr_part_number="FPE-HSC-4-S") -- a data defect on
+    Turn14's side, not something we generate. Left as-is, that garbled sku can never match
+    another provider's correctly single-prefixed sku/part_number for the same real part,
+    so ingest creates a duplicate MasterPart instead of finding the existing Turn14 row.
+    If sku is exactly "<prefix><part_number>" where part_number itself already starts with
+    that same prefix, collapse sku down to part_number.
+    """
+    if not sku or not part_number or sku == part_number:
+        return sku
+    if not sku.upper().endswith(part_number.upper()):
+        return sku
+    prefix = sku[: len(sku) - len(part_number)]
+    if prefix and part_number.upper().startswith(prefix.upper()):
+        return part_number
+    return sku
+
+
 def _ingest_turn14_items_for_mapped_brands(
     mapped_catalog_brand_ids: typing.Set[int],
     turn14_provider: src_models.Providers,
@@ -537,6 +557,7 @@ def _ingest_turn14_items_for_mapped_brands(
                 sku = sku.strip().upper()
             else:
                 sku = str(sku or "").strip().upper()
+            sku = _collapse_doubled_sku_prefix(sku, part_number)
             if not part_number:
                 continue
 

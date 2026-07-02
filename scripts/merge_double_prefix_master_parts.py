@@ -1,19 +1,28 @@
 """
-Merge duplicate MasterPart rows created by the sku-overwrite flip-flop bug.
+Merge duplicate MasterPart rows created by the Turn14 double-prefix sku bug.
 
-Background: before the Phase-2 sku-overwrite fix in master_parts.py, providers with a
-brand-prefixed part number (WheelPros, sometimes Meyer/A-Tech/Rough Country/DLG) could fail
-to match an already-existing MasterPart if another provider's sync had since overwritten its
-sku away from the bridging value, creating a second MasterPart row for the same real part
-(e.g. brand=BAK: part_number="448329" vs part_number="BAK448329", same sku "BAK448329").
+Background: Turn14's own internal "part_number" field (stored as MasterPart.sku, see
+``_ingest_turn14_items_for_mapped_brands`` in master_parts.py) sometimes has the brand/vendor
+prefix baked in twice for certain brands -- a Turn14-side data defect, not something our
+ingest generates (e.g. sku="FPEFPE-HSC-4-S" for mfr_part_number/part_number="FPE-HSC-4-S").
+That garbled sku can never match another provider's correctly single-prefixed sku or
+part_number for the same real part, so ingest creates a brand-new duplicate MasterPart
+instead of finding the existing Turn14 row (e.g. Meyer creates part_number="-HSC-4-S",
+sku="FPE-HSC-4-S" alongside it). This is fixed going forward by
+``_collapse_doubled_sku_prefix`` in master_parts.py; this script cleans up the rows that
+were already duplicated before that fix landed.
 
-This script finds every ``(brand_id, sku)`` group with more than one distinct ``part_number``
-still in ``master_parts`` -- the exact fingerprint of that bug -- and merges each pair: keeps
-the row with more ProviderPart links (falling back to shorter part_number, then lower id),
-reassigns ProviderParts from the duplicate onto the canonical row (deleting the loser on a
-per-provider conflict, keeping whichever has the more recent ``distributor_refreshed_at``),
-backfills any blank description/image_url/aaia_code on the canonical row, then deletes the
-duplicate MasterPart.
+This script finds every MasterPart whose sku is exactly "<prefix><part_number>" where
+part_number itself already starts with that same prefix (the doubled-prefix fingerprint),
+then looks for a sibling row in the same brand whose part_number or sku equals the
+collapsed (de-duplicated) value -- the row created by another provider that couldn't
+match the garbled Turn14 row. Canonical selection prefers more ProviderPart links, then
+the row whose part_number is NOT a plain suffix of the other's (i.e. keeps the fuller,
+correctly-prefixed part_number rather than a provider's prefix-stripped convention), then
+lower id. The kept row's sku is normalized to the collapsed value as part of the merge.
+ProviderParts are reassigned from the duplicate onto the canonical row (deleting the loser
+on a per-provider conflict, keeping whichever has the more recent ``distributor_refreshed_at``),
+blank description/image_url/aaia_code are backfilled, then the duplicate MasterPart is deleted.
 
 There is no ``manage.py`` subcommand; load this file from the Django shell.
 
@@ -21,7 +30,7 @@ There is no ``manage.py`` subcommand; load this file from the Django shell.
 
     python manage.py shell
     >>> import runpy
-    >>> ns = runpy.run_path("scripts/merge_flip_flop_master_parts.py", run_name="merge_loader")
+    >>> ns = runpy.run_path("scripts/merge_double_prefix_master_parts.py", run_name="merge_loader")
     >>> pairs = ns["find_duplicate_pairs"]()
     >>> len(pairs)
     >>> ns["merge_batch"](pairs, dry_run=True)
@@ -30,10 +39,9 @@ There is no ``manage.py`` subcommand; load this file from the Django shell.
 
     >>> ns["merge_batch"](pairs)
 
-**Merge one pair by id** (e.g. the BAK448329 example, keep the row with more links)::
+**Merge one pair by id** (e.g. a FLEECE PERFORMANCE FPE-HSC-4-S example)::
 
-    >>> from src import models as m
-    >>> ns["merge_pair"](37424805, 72549853)
+    >>> ns["merge_pair"](37207520, 38283813)
 
 Use ``run_name=...`` (not ``__main__``) so the script does not start the interactive runner.
 """
@@ -58,53 +66,78 @@ def _chunked(items, size=_IN_CLAUSE_CHUNK):
         yield items[i : i + size]
 
 
+def _collapse_doubled_sku_prefix(sku, part_number):
+    """Mirrors master_parts._collapse_doubled_sku_prefix; kept local so this script has no
+    import-order dependency on the ingest module."""
+    if not sku or not part_number or sku == part_number:
+        return sku
+    if not sku.upper().endswith(part_number.upper()):
+        return sku
+    prefix = sku[: len(sku) - len(part_number)]
+    if prefix and part_number.upper().startswith(prefix.upper()):
+        return part_number
+    return sku
+
+
 def find_duplicate_pairs():
     """
-    Return a list of ``(id_a, id_b)`` MasterPart id pairs sharing ``(brand_id, sku)`` but with
-    different ``part_number`` -- the flip-flop bug's fingerprint. Every group currently has
-    exactly 2 rows (verified against production data), but this doesn't assume that: it emits
-    all pairwise combinations within a group just in case.
+    Return a list of ``(id_doubled, id_clean)`` MasterPart id pairs matching the doubled-prefix
+    bug's fingerprint: one row's sku is "<prefix><part_number>" where part_number already starts
+    with that prefix, and a sibling row in the same brand has part_number or sku equal to the
+    collapsed value.
     """
     with connection.cursor() as cur:
         cur.execute(
-            """
-            SELECT brand_id, sku, array_agg(id ORDER BY id)
-            FROM master_parts
-            WHERE sku IS NOT NULL AND sku != ''
-            GROUP BY brand_id, sku
-            HAVING COUNT(DISTINCT part_number) > 1
+            r"""
+            WITH doubled AS (
+                SELECT mp.id, mp.brand_id, mp.part_number, mp.sku,
+                       regexp_replace(mp.sku, '^([A-Za-z]{2,6})\1', E'\\1') AS collapsed_sku
+                FROM master_parts mp
+                WHERE mp.sku ~ '^([A-Za-z]{2,6})\1'
+            )
+            SELECT DISTINCT d.id, mp2.id
+            FROM doubled d
+            JOIN master_parts mp2
+                ON mp2.brand_id = d.brand_id
+                AND (mp2.sku = d.collapsed_sku OR mp2.part_number = d.collapsed_sku)
+            WHERE mp2.id != d.id
             """
         )
         rows = cur.fetchall()
-
-    pairs = []
-    for brand_id, sku, ids in rows:
-        for i in range(len(ids)):
-            for j in range(i + 1, len(ids)):
-                pairs.append((ids[i], ids[j]))
-    return pairs
+    return [(a, b) for a, b in rows]
 
 
 def _pick_canonical(mp_a, mp_b, pp_counts):
-    """Prefer more ProviderPart links, then shorter part_number, then lower id."""
+    """
+    Prefer more ProviderPart links. Tie-break: prefer the row whose part_number is NOT a plain
+    suffix of the other's (i.e. keep the fuller, correctly brand-prefixed part_number rather than
+    a provider's prefix-stripped convention, e.g. keep "FPE-HSC-4-S" over "-HSC-4-S"). Final
+    tie-break: lower id.
+    """
     ca = pp_counts.get(mp_a.id, 0)
     cb = pp_counts.get(mp_b.id, 0)
     if ca != cb:
         return (mp_a, mp_b) if ca > cb else (mp_b, mp_a)
-    la = len(mp_a.part_number or "")
-    lb = len(mp_b.part_number or "")
-    if la != lb:
-        return (mp_a, mp_b) if la < lb else (mp_b, mp_a)
+
+    pn_a = (mp_a.part_number or "").upper()
+    pn_b = (mp_b.part_number or "").upper()
+    if pn_a != pn_b:
+        a_is_suffix_of_b = pn_b.endswith(pn_a) and len(pn_a) < len(pn_b)
+        b_is_suffix_of_a = pn_a.endswith(pn_b) and len(pn_b) < len(pn_a)
+        if a_is_suffix_of_b and not b_is_suffix_of_a:
+            return (mp_b, mp_a)
+        if b_is_suffix_of_a and not a_is_suffix_of_b:
+            return (mp_a, mp_b)
+
     return (mp_a, mp_b) if mp_a.id < mp_b.id else (mp_b, mp_a)
 
 
 def merge_pair(id_a, id_b, confirm=None):
     """
-    Merge two MasterPart rows known to be duplicates of each other. Picks the canonical row
-    automatically (more ProviderPart links wins), reassigns/reconciles ProviderParts, backfills
-    blank descriptive fields, then deletes the loser. Prints every action; no confirmation
-    prompt (this is meant to run in a batch after ``find_duplicate_pairs`` has already scoped
-    the exact bug signature -- pass ``confirm`` if you want a gate anyway).
+    Merge two MasterPart rows known to be duplicates of each other under the double-prefix
+    bug. Picks the canonical row automatically, normalizes its sku (collapsing any doubled
+    prefix), reassigns/reconciles ProviderParts, backfills blank descriptive fields, then
+    deletes the loser. Prints every action.
     """
     mp_a = src_models.MasterPart.objects.filter(pk=id_a).first()
     mp_b = src_models.MasterPart.objects.filter(pk=id_b).first()
@@ -140,15 +173,22 @@ def merge_pair(id_a, id_b, confirm=None):
         return False
 
     with transaction.atomic():
-        # Backfill blank descriptive fields on keep from dup.
+        # Normalize keep's sku, collapsing a doubled prefix if present.
+        corrected_sku = _collapse_doubled_sku_prefix(keep.sku or "", keep.part_number or "")
         changed = []
+        if corrected_sku != keep.sku:
+            print("  Normalizing keep.sku: '{}' -> '{}'.".format(keep.sku, corrected_sku))
+            keep.sku = corrected_sku
+            changed.append("sku")
+
+        # Backfill blank descriptive fields on keep from dup.
         for field in ("description", "image_url", "aaia_code"):
             if not getattr(keep, field) and getattr(dup, field):
                 setattr(keep, field, getattr(dup, field))
                 changed.append(field)
         if changed:
             keep.save(update_fields=changed)
-            print("  Backfilled {} on keep from dup.".format(changed))
+            print("  Updated {} on keep.".format(changed))
 
         # Reassign ProviderParts, resolving per-provider conflicts by freshest distributor_refreshed_at.
         keep_pps = {
@@ -220,8 +260,11 @@ def merge_batch(pairs, dry_run=False):
                 .values_list("master_part_id", "n")
             )
             keep, dup = _pick_canonical(mp_a, mp_b, pp_counts)
-            print("[DRY-RUN] would KEEP id={} ('{}', sku='{}') <- MERGE id={} ('{}', sku='{}')".format(
-                keep.id, keep.part_number, keep.sku, dup.id, dup.part_number, dup.sku
+            corrected_sku = _collapse_doubled_sku_prefix(keep.sku or "", keep.part_number or "")
+            print("[DRY-RUN] would KEEP id={} ('{}', sku='{}'{}) <- MERGE id={} ('{}', sku='{}')".format(
+                keep.id, keep.part_number, keep.sku,
+                " -> '{}'".format(corrected_sku) if corrected_sku != keep.sku else "",
+                dup.id, dup.part_number, dup.sku,
             ))
             continue
 
