@@ -6,10 +6,22 @@ Meilisearch reindex.
 Creates a parent ``ScheduledTaskExecution`` for the whole run and a **child** execution per
 sub-step (each provider source ingest, ``sync_all_master_parts``, and Meilisearch) so
 ScheduledTaskExecution shows start/finish of each part.
+
+Source fetch ordering:
+  1. Turn14 always runs first and must complete before any other provider starts.
+  2. All remaining providers (Keystone, Meyer, A-Tech, Rough Country, DLG, WheelPros,
+     Premier) run in parallel via a ThreadPoolExecutor.
+  3. Meyer, A-Tech and DLG all use the shared SFTP relay at 5.161.121.143 — a
+     semaphore caps concurrent relay connections at ``RELAY_SFTP_MAX_CONCURRENT``
+     to avoid saturating the relay.
 """
+import concurrent.futures
 import contextlib
 import logging
+import threading
 import typing
+
+from django.db import connection
 
 from django.core.management.base import BaseCommand
 
@@ -30,6 +42,10 @@ from src.search.meilisearch_client import is_configured, reindex_all_master_part
 logger = logging.getLogger(__name__)
 
 _TASK_NAME = "ingest_all_providers"
+
+# Meyer, A-Tech and DLG all tunnel through the same SFTP relay host.
+# Cap concurrent relay connections to avoid saturating it.
+RELAY_SFTP_MAX_CONCURRENT = 2
 
 
 class Command(BaseCommand):
@@ -109,14 +125,65 @@ class Command(BaseCommand):
         self._ingest_log("start")
         execution = audit_scheduled_tasks.start_scheduled_task_execution(_TASK_NAME)
         try:
+            # ----------------------------------------------------------------
+            # Phase 1: Turn14 always runs first and must complete before
+            # any other provider starts.
+            # ----------------------------------------------------------------
+            self._ingest_log("phase 1 | Turn14 source fetch (must complete before others)")
             self._run_turn14()
-            self._run_keystone()
-            self._run_meyer()
-            self._run_atech()
-            self._run_rough_country()
-            self._run_dlg()
-            self._run_wheelpros()
-            self._run_premier()
+            self._ingest_log("phase 1 | Turn14 done; starting parallel provider fetches")
+
+            # ----------------------------------------------------------------
+            # Phase 2: all remaining providers in parallel.
+            # Meyer / A-Tech / DLG share the SFTP relay — a semaphore limits
+            # concurrent relay connections to RELAY_SFTP_MAX_CONCURRENT.
+            # ----------------------------------------------------------------
+            relay_sem = threading.Semaphore(RELAY_SFTP_MAX_CONCURRENT)
+
+            def _relay(fn: typing.Callable[[], None]) -> typing.Callable[[], None]:
+                """Wrap a relay-SFTP provider call so it acquires the semaphore."""
+                def _wrapped() -> None:
+                    with relay_sem:
+                        fn()
+                    connection.close()
+                return _wrapped
+
+            def _direct(fn: typing.Callable[[], None]) -> typing.Callable[[], None]:
+                """Wrap a non-relay provider call to close its DB connection when done."""
+                def _wrapped() -> None:
+                    fn()
+                    connection.close()
+                return _wrapped
+
+            parallel_tasks: typing.List[typing.Tuple[str, typing.Callable[[], None]]] = [
+                ("keystone",      _direct(self._run_keystone)),
+                ("meyer",         _relay(self._run_meyer)),
+                ("atech",         _relay(self._run_atech)),
+                ("rough_country", _direct(self._run_rough_country)),
+                ("dlg",           _relay(self._run_dlg)),
+                ("wheelpros",     _direct(self._run_wheelpros)),
+                ("premier",       _direct(self._run_premier)),
+            ]
+
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=len(parallel_tasks),
+                thread_name_prefix="ingest_provider",
+            ) as pool:
+                fut_map = {
+                    pool.submit(fn): name
+                    for name, fn in parallel_tasks
+                }
+                for fut in concurrent.futures.as_completed(fut_map):
+                    name = fut_map[fut]
+                    try:
+                        fut.result()
+                        self._ingest_log("phase 2 | {} fetch thread finished".format(name))
+                    except Exception as exc:  # noqa: BLE001 – logged, not re-raised
+                        self._ingest_log(
+                            "phase 2 | {} fetch thread raised unexpected error: {!s}".format(name, exc)
+                        )
+
+            self._ingest_log("phase 2 | all provider fetches complete")
 
             with self._audited_step(
                 "ingest_all_providers_sync_all_master_parts",
