@@ -20,6 +20,7 @@ from src.integrations.services import (
     keystone,
     master_parts,
     meyer,
+    premier,
     rough_country,
     turn_14,
     wheelpros,
@@ -101,6 +102,7 @@ class Command(BaseCommand):
             "ingest_all_providers_rough_country",
             "ingest_all_providers_dlg",
             "ingest_all_providers_wheelpros",
+            "ingest_all_providers_premier",
             "ingest_all_providers_sync_all_master_parts",
             "ingest_all_providers_meilisearch_reindex",
         ])
@@ -114,10 +116,11 @@ class Command(BaseCommand):
             self._run_rough_country()
             self._run_dlg()
             self._run_wheelpros()
+            self._run_premier()
 
             with self._audited_step(
                 "ingest_all_providers_sync_all_master_parts",
-                "Full derived sync (Turn14, Keystone, Meyer, A-Tech, RC, DLG, WheelPros) complete.",
+                "Full derived sync (Turn14, Keystone, Meyer, A-Tech, RC, DLG, WheelPros, Premier) complete.",
             ):
                 self._ingest_log("all provider source ingests done; running sync_all_master_parts()")
                 master_parts.sync_all_master_parts()
@@ -274,3 +277,14 @@ class Command(BaseCommand):
                     feed_type=ft,
                 )
             wheelpros.sync_unmapped_wheelpros_brands_to_brands()
+
+    def _run_premier(self) -> None:
+        with self._audited_step(
+            "ingest_all_providers_premier",
+            "Premier source fetch complete: brands, parts (derived in sync_all).",
+            continue_on_error=True,
+        ):
+            self._ingest_log("Premier: brands + parts fetches only")
+            premier.fetch_and_save_premier_brands()
+            premier.sync_unmapped_premier_brands_to_brands()
+            premier.fetch_and_save_all_premier_brand_parts()

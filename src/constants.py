@@ -25,7 +25,7 @@ PROVIDER_DISPLAY_NAMES = {
     "PARTS_AUTHORITY": "Parts Authority",
     "PARTS_CANADA": "Parts Canada",
     "PARTS_UNLIMITED": "Parts Unlimited",
-    "PREMIER_PERFORMANCE": "Premier Performance",
+    "PREMIER_PERFORMANCE": "APG Wholesale (Premier)",
     "SSF_IMPORTED_AUTO_PARTS": "SSF Imported Auto Parts",
     "THE_WHEEL_GROUP": "The Wheel Group",
     "THIBERT": "Thibert",
@@ -59,7 +59,7 @@ PROVIDER_IMAGE_URLS = {
     "PARTS_AUTHORITY": "https://api.aftermarketscout.com/uploads/parts_authority_logo.png",
     "PARTS_CANADA": "https://api.aftermarketscout.com/uploads/parts_canada_logo.png",
     "PARTS_UNLIMITED": "https://api.aftermarketscout.com/uploads/parts_unlimited_logo.png",
-    "PREMIER_PERFORMANCE": "https://api.aftermarketscout.com/uploads/premier_performance_logo.png",
+    "PREMIER_PERFORMANCE": "https://api.aftermarketscout.com/uploads/apg_wholesale_logo.png",
     "SSF_IMPORTED_AUTO_PARTS": "https://api.aftermarketscout.com/uploads/ssf_logo.png",
     "THE_WHEEL_GROUP": "https://api.aftermarketscout.com/uploads/the_wheel_group_logo.png",
     "THIBERT": "https://api.aftermarketscout.com/uploads/thibert_logo.png",
@@ -78,6 +78,13 @@ ATECH_DC_QTY_FIELD_TO_LOCATION_LABEL = {
     "qty_sparks": "Sparks, NV",
     "qty_mcdonough": "McDonough, GA",
     "qty_arlington": "Arlington, TX",
+}
+# Premier Performance (APG Wholesale) warehouse qty fields -> user-facing location labels (FE display).
+PREMIER_WAREHOUSE_QTY_FIELD_TO_LOCATION_LABEL = {
+    "nv_qty": "Las Vegas, NV",
+    "ky_qty": "Louisville, KY",
+    "wa_qty": "Silverdale, WA",
+    "mfg_qty": "Manufacturer Inventory",
 }
 ROUGH_COUNTRY_INVENTORY_SEARCH_URL_TEMPLATE = "https://www.roughcountry.com/search/{sku}"
 
@@ -607,21 +614,24 @@ PROVIDER_CATALOG = [
     },
     {
         "kind": enums.BrandProviderKind.PREMIER_PERFORMANCE,
-        "name": "Premier Performance",
-        "description": "Access Premier Performance inventory and pricing via FTP.",
-        "icon_url": "https://api.aftermarketscout.com/uploads/premier_performance_logo.png",
+        "name": "APG Wholesale (Premier)",
+        "description": "Access APG Wholesale (Premier) inventory and pricing via FTP using your account credentials.",
+        "icon_url": "https://api.aftermarketscout.com/uploads/apg_wholesale_logo.png",
         "category": "Distributors",
-        "connection_required_fields": ["ftp_host", "ftp_port", "ftp_user", "ftp_password"],
-        "integration_time": "Data available within 1-2 days",
+        "connection_required_fields": ["ftp_user", "ftp_password"],
+        "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
-            "<p><strong>Premier Performance</strong> provides a portal where you can configure your FTP connection. "
-            "However, a request must be raised with your account manager before they will provide access to the portal.</p>"
+            "<p><strong>APG Wholesale (Premier)</strong> delivers a daily inventory and pricing feed via their FTP server. "
+            "AfterMarketScout connects to <code>datafeed.pppwd.com</code> (port 21) automatically — "
+            "you only need to provide your account credentials.</p>"
             "<ol>"
-            "<li>Contact your Premier Performance account manager to request FTP portal access.</li>"
-            "<li>Once you have your credentials, enter your <strong>FTP Host</strong>, <strong>FTP Port</strong>, "
-            "<strong>FTP Login</strong>, and <strong>FTP Password</strong> below and save.</li>"
+            "<li>Contact your APG Wholesale (Premier) account manager or email "
+            "<a href=\"mailto:datateam@premierwd.com\">datateam@premierwd.com</a> to request FTP data feed access.</li>"
+            "<li>Once you receive your <strong>FTP Login</strong> and <strong>FTP Password</strong>, "
+            "enter them below and save the connection.</li>"
             "</ol>"
-            "<p>For assistance contact: "
+            "<p>No host or port to enter — those are fixed and managed by AfterMarketScout. "
+            "For assistance contact: "
             "<a href=\"mailto:datateam@premierwd.com\">datateam@premierwd.com</a>.</p>"
         ),
     },

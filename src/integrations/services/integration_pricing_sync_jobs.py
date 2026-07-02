@@ -15,6 +15,7 @@ from src.integrations.services import master_parts
 from src.integrations.services import atech as atech_services
 from src.integrations.services import dlg as dlg_services
 from src.integrations.services import meyer as meyer_services
+from src.integrations.services import premier as premier_services
 from src.integrations.services import rough_country as rough_country_services
 from src.integrations.services import turn_14 as turn_14_services
 from src.integrations.services import wheelpros as wheelpros_services
@@ -84,6 +85,9 @@ def _sync_distributor_tables_then_master_parts(cp: src_models.CompanyProviders) 
     elif kind == src_enums.BrandProviderKind.DLG.value:
         dlg_services.sync_dlg_company_pricing_for_company_provider(cp.id)
         master_parts.sync_provider_pricing_from_dlg_for_company(company_id)
+    elif kind == src_enums.BrandProviderKind.PREMIER_PERFORMANCE.value:
+        premier_services.fetch_and_save_all_premier_brand_parts()
+        master_parts.sync_provider_pricing_from_premier_for_company(company_id)
     else:
         raise ValueError("Unsupported provider kind for pricing sync: {}".format(kind))
 

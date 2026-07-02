@@ -628,6 +628,117 @@ class KeystoneCompanyPricing(django_db_models.Model):
         unique_together = ["part", "company"]
 
 
+class PremierBrand(django_db_models.Model):
+    """Brand / manufacturer from the Premier Performance data feed (Brand column)."""
+    external_id = django_db_models.CharField(max_length=255)
+    name = django_db_models.CharField(max_length=255)
+    line_code = django_db_models.CharField(max_length=64, null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "premier_brands"
+        unique_together = [["external_id"]]
+
+
+class BrandPremierBrandMapping(django_db_models.Model):
+    brand = django_db_models.ForeignKey(
+        "Brands", on_delete=django_db_models.CASCADE, related_name="premier_brand_mappings"
+    )
+    premier_brand = django_db_models.ForeignKey(
+        PremierBrand, on_delete=django_db_models.CASCADE, related_name="brand_mappings"
+    )
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "brand_premier_brand_mapping"
+        unique_together = ["brand", "premier_brand"]
+
+
+class PremierParts(django_db_models.Model):
+    """Catalog row from the Premier Performance master data feed."""
+    premier_part_number = django_db_models.CharField(max_length=255)
+    brand = django_db_models.ForeignKey(
+        PremierBrand, on_delete=django_db_models.CASCADE, related_name="parts"
+    )
+    mfg_part_number = django_db_models.CharField(max_length=255, null=True)
+    long_description = django_db_models.TextField(null=True)
+    external_long_description = django_db_models.TextField(null=True)
+    length = django_db_models.DecimalField(max_digits=10, decimal_places=3, null=True)
+    width = django_db_models.DecimalField(max_digits=10, decimal_places=3, null=True)
+    height = django_db_models.DecimalField(max_digits=10, decimal_places=3, null=True)
+    weight = django_db_models.DecimalField(max_digits=10, decimal_places=3, null=True)
+    upc_code = django_db_models.CharField(max_length=255, null=True)
+    usa_item_availability = django_db_models.IntegerField(null=True)
+    core_charge = django_db_models.DecimalField(max_digits=10, decimal_places=4, null=True)
+    jobber_price = django_db_models.DecimalField(max_digits=10, decimal_places=4, null=True)
+    map_price = django_db_models.DecimalField(max_digits=10, decimal_places=4, null=True)
+    retail_price = django_db_models.DecimalField(max_digits=10, decimal_places=4, null=True)
+    inventory_status = django_db_models.CharField(max_length=64, null=True)
+    nv_qty = django_db_models.IntegerField(null=True)
+    ky_qty = django_db_models.IntegerField(null=True)
+    mfg_qty = django_db_models.IntegerField(null=True)
+    wa_qty = django_db_models.IntegerField(null=True)
+    image_url = django_db_models.TextField(null=True)
+    ships_ltl = django_db_models.BooleanField(default=False)
+    item_with_cores = django_db_models.BooleanField(default=False)
+    prop65_carcinogen = django_db_models.BooleanField(default=False)
+    prop65_reproductive_harm = django_db_models.BooleanField(default=False)
+    approved_line = django_db_models.BooleanField(default=False)
+    california_legal = django_db_models.BooleanField(default=False)
+    line_code = django_db_models.CharField(max_length=64, null=True)
+    pies_ems_code = django_db_models.CharField(max_length=64, null=True)
+    drop_ship_fee = django_db_models.DecimalField(max_digits=10, decimal_places=4, null=True)
+    canada_map = django_db_models.DecimalField(max_digits=10, decimal_places=4, null=True)
+    canada_msrp = django_db_models.DecimalField(max_digits=10, decimal_places=4, null=True)
+    canada_jobber = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True)
+    part_category = django_db_models.CharField(max_length=255, null=True)
+    part_subcategory = django_db_models.CharField(max_length=255, null=True)
+    part_terminology = django_db_models.CharField(max_length=255, null=True)
+    freight_cost = django_db_models.DecimalField(max_digits=10, decimal_places=3, null=True)
+    minimum_order_qty = django_db_models.IntegerField(null=True)
+    drop_shippable_from_mfg = django_db_models.BooleanField(default=False)
+    vendor_enhanced_emissions_code = django_db_models.CharField(max_length=255, null=True)
+    is_kit = django_db_models.BooleanField(default=False)
+    kit_component_list = django_db_models.TextField(null=True)
+    raw_data = django_db_models.JSONField(null=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "premier_parts"
+        unique_together = ["premier_part_number", "brand"]
+
+
+class PremierCompanyPricing(django_db_models.Model):
+    """
+    Per-company Premier FTP pricing for a catalog row (PremierParts).
+    Catalog fields live on PremierParts; cost/jobber/map/core come from each company's feed.
+    """
+    part = django_db_models.ForeignKey(
+        PremierParts, on_delete=django_db_models.CASCADE, related_name="company_pricing"
+    )
+    company = django_db_models.ForeignKey(
+        Company, on_delete=django_db_models.CASCADE, related_name="premier_company_pricing"
+    )
+    customer_price = django_db_models.DecimalField(max_digits=10, decimal_places=4, null=True)
+    jobber_price = django_db_models.DecimalField(max_digits=10, decimal_places=4, null=True)
+    map_price = django_db_models.DecimalField(max_digits=10, decimal_places=4, null=True)
+    core_charge = django_db_models.DecimalField(max_digits=10, decimal_places=4, null=True)
+    customer_cad_price = django_db_models.DecimalField(max_digits=10, decimal_places=4, null=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "premier_company_pricing"
+        unique_together = ["part", "company"]
+
+
 class MeyerBrand(django_db_models.Model):
     """Manufacturer / brand label from Meyer pricing feed (MFG column)."""
     external_id = django_db_models.CharField(max_length=512)
