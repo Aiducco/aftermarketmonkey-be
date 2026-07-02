@@ -15,8 +15,8 @@ INDEX_NAME = getattr(settings, "MEILISEARCH_INDEX_PARTS", "parts")
 
 # Full reindex: tune via MEILISEARCH_REINDEX_BATCH_SIZE and MEILISEARCH_REINDEX_UPLOAD_WORKERS.
 # Larger batches + multiple parallel upload threads are faster; retries still cover transient HTTP errors.
-REINDEX_DEFAULT_BATCH_SIZE = getattr(settings, "MEILISEARCH_REINDEX_BATCH_SIZE", 5000)
-REINDEX_DEFAULT_UPLOAD_WORKERS = getattr(settings, "MEILISEARCH_REINDEX_UPLOAD_WORKERS", 4)
+REINDEX_DEFAULT_BATCH_SIZE = getattr(settings, "MEILISEARCH_REINDEX_BATCH_SIZE", 20000)
+REINDEX_DEFAULT_UPLOAD_WORKERS = getattr(settings, "MEILISEARCH_REINDEX_UPLOAD_WORKERS", 8)
 
 _REINDEX_ADD_RETRIES = 4
 _REINDEX_TRANSIENT_SUBSTRINGS = (
@@ -99,6 +99,8 @@ def _index_categories_for_master_part(part) -> typing.Tuple[str, str]:
     """
     Map / index fields: first ProviderPart (by id) with non-empty ``category`` ->
     (category, overview_category). Empty strings when none.
+    Used for single-part indexing (e.g. post-save signals).
+    For bulk reindex use _bulk_category_map_for_ids() instead.
     """
     if not part or not getattr(part, "id", None):
         return "", ""
@@ -115,6 +117,102 @@ def _index_categories_for_master_part(part) -> typing.Tuple[str, str]:
         if c:
             return c, (pp.overview_category or "").strip()
     return "", ""
+
+
+def _bulk_category_map_for_ids(
+    master_part_ids: typing.List[int],
+) -> typing.Dict[int, typing.Tuple[str, str]]:
+    """
+    Single query: returns {master_part_id: (category, overview_category)} for the first
+    ProviderPart (lowest id) with a non-empty category for each id in the list.
+    Replaces the per-part N+1 lookup during bulk reindex.
+    """
+    from src.models import ProviderPart
+
+    result: typing.Dict[int, typing.Tuple[str, str]] = {}
+    if not master_part_ids:
+        return result
+    seen: typing.Set[int] = set()
+    qs = (
+        ProviderPart.objects
+        .filter(master_part_id__in=master_part_ids)
+        .exclude(category__isnull=True)
+        .exclude(category="")
+        .order_by("master_part_id", "id")
+        .values("master_part_id", "category", "overview_category")
+    )
+    for row in qs:
+        mpid = row["master_part_id"]
+        if mpid not in seen:
+            result[mpid] = (row["category"] or "", row["overview_category"] or "")
+            seen.add(mpid)
+    return result
+
+
+def _build_docs_for_batch(
+    parts: typing.List,
+    cat_map: typing.Dict[int, typing.Tuple[str, str]],
+) -> typing.List[typing.Dict]:
+    """
+    Build Meilisearch document dicts for a batch of MasterPart instances.
+    ``cat_map`` comes from _bulk_category_map_for_ids() — pre-computed in the main thread
+    so worker threads only do the HTTP upload, not DB queries.
+    """
+    docs = []
+    for part in parts:
+        brand_name = _get_brand_name(part)
+        category, overview_category = cat_map.get(part.id, ("", ""))
+        docs.append({
+            "id": part.id,
+            "brand_id": part.brand_id,
+            "brand_name": brand_name or "",
+            "part_number": part.part_number or "",
+            "sku": part.sku or "",
+            "description": (part.description or "")[:10000],
+            "aaia_code": part.aaia_code or "",
+            "image_url": part.image_url or "",
+            "category": category,
+            "overview_category": overview_category,
+            "created_at": part.created_at.isoformat() if part.created_at else None,
+            "updated_at": part.updated_at.isoformat() if part.updated_at else None,
+        })
+    return docs
+
+
+def _upload_raw_docs(docs: typing.List[typing.Dict]) -> bool:
+    """
+    Upload pre-built document dicts to Meilisearch with retries.
+    Returns True on success. Workers and single-threaded paths both use this.
+    """
+    if not docs:
+        return True
+    last_err: typing.Optional[BaseException] = None
+    for attempt in range(_REINDEX_ADD_RETRIES):
+        try:
+            client = _get_client()
+            index = client.index(INDEX_NAME)
+            index.add_documents(docs, primary_key="id")
+            return True
+        except Exception as e:
+            last_err = e
+            if attempt < _REINDEX_ADD_RETRIES - 1 and _transient_meilisearch_error(e):
+                wait_s = min(30.0, 2.0 ** attempt)
+                logger.warning(
+                    "Meilisearch _upload_raw_docs: transient error (retry) | len=%s attempt=%s/%s "
+                    "wait_s=%.1f err_type=%s err=%s",
+                    len(docs), attempt + 1, _REINDEX_ADD_RETRIES,
+                    wait_s, type(e).__name__, e,
+                )
+                time.sleep(wait_s)
+                continue
+            logger.exception(
+                "Meilisearch _upload_raw_docs: failed | len=%s attempt=%s err_type=%s",
+                len(docs), attempt + 1, type(e).__name__,
+            )
+            return False
+    if last_err:
+        logger.exception("Meilisearch _upload_raw_docs: exhausted retries | err=%s", last_err)
+    return False
 
 
 def _part_to_document(part) -> typing.Dict:
@@ -215,15 +313,12 @@ def add_documents_in_batches(
     if not is_configured():
         return 0, 0
 
-    # Ensure brand is loaded (MasterPart.brand -> Brands)
-    from django.db.models import Prefetch
-
-    from src.models import MasterPart, ProviderPart
+    # Ensure brand is loaded (MasterPart.brand -> Brands).
+    # Category data is fetched per-batch via _bulk_category_map_for_ids — no prefetch_related needed.
+    from src.models import MasterPart
 
     if queryset.model == MasterPart:
-        queryset = queryset.select_related("brand").prefetch_related(
-            Prefetch("provider_parts", queryset=ProviderPart.objects.order_by("id"))
-        )
+        queryset = queryset.select_related("brand")
 
     if max_upload_workers <= 1:
         total_ok = 0
@@ -246,7 +341,9 @@ def add_documents_in_batches(
             batch_num += 1
             id_first, id_last = batch[0].id, batch[-1].id
             batch_t0 = time.monotonic()
-            ok = add_documents(batch)
+            cat_map = _bulk_category_map_for_ids([p.id for p in batch])
+            docs = _build_docs_for_batch(batch, cat_map)
+            ok = _upload_raw_docs(docs)
             batch_dt = time.monotonic() - batch_t0
             if ok:
                 total_ok += len(batch)
@@ -295,13 +392,14 @@ def add_documents_in_batches(
         return total_ok, total_fail
 
     def _upload_batch(
-        parts: typing.List,
+        docs: typing.List[typing.Dict],
         batch_index: int,
+        id_first: int,
+        id_last: int,
     ) -> typing.Tuple[int, int]:
-        if not parts:
+        """Upload pre-built doc dicts. DB queries are done in the main thread; worker only does HTTP."""
+        if not docs:
             return 0, 0
-        id_first, id_last = parts[0].id, parts[-1].id
-        docs = [_part_to_document(p) for p in parts]
         last_err: typing.Optional[BaseException] = None
         upload_t0 = time.monotonic()
         for attempt in range(_REINDEX_ADD_RETRIES):
@@ -361,7 +459,7 @@ def add_documents_in_batches(
                     len(docs),
                     type(e).__name__,
                 )
-                return 0, len(parts)
+                return 0, len(docs)
         if last_err:
             logger.exception(
                 "Meilisearch parallel batch: exhausted retries | batch=%s id_range=%s..%s err=%s",
@@ -370,7 +468,7 @@ def add_documents_in_batches(
                 id_last,
                 last_err,
             )
-        return 0, len(parts)
+        return 0, len(docs)
 
     total_ok = 0
     total_fail = 0
@@ -397,7 +495,11 @@ def add_documents_in_batches(
                 break
             last_id = batch[-1].id
             batch_index += 1
-            in_flight.append(executor.submit(_upload_batch, batch, batch_index))
+            id_first, id_last = batch[0].id, batch[-1].id
+            # Build docs in the main thread (DB queries) so workers only handle HTTP.
+            cat_map = _bulk_category_map_for_ids([p.id for p in batch])
+            docs = _build_docs_for_batch(batch, cat_map)
+            in_flight.append(executor.submit(_upload_batch, docs, batch_index, id_first, id_last))
             while len(in_flight) >= max_in_flight:
                 done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
                 for fut in done:
@@ -516,15 +618,25 @@ def delete_document(part_id: int) -> bool:
 
 
 def delete_all_documents() -> bool:
-    """Clear all documents from the parts index."""
+    """
+    Clear all documents from the parts index and wait for the async task to complete.
+    Meilisearch delete_all_documents() is asynchronous — without waiting, new documents
+    can be indexed into the index while the delete is still in progress.
+    """
     if not is_configured():
         return False
 
     try:
         client = _get_client()
         index = client.index(INDEX_NAME)
-        index.delete_all_documents()
-        logger.info("Meilisearch: deleted all documents from '%s'", INDEX_NAME)
+        task = index.delete_all_documents()
+        logger.info(
+            "Meilisearch: delete_all_documents enqueued | index=%s task_uid=%s; waiting for completion…",
+            INDEX_NAME,
+            task.task_uid,
+        )
+        client.wait_for_task(task.task_uid, timeout_in_ms=300_000)
+        logger.info("Meilisearch: all documents deleted from '%s'", INDEX_NAME)
         return True
     except Exception as e:
         logger.exception("Meilisearch delete_all_documents failed: %s", str(e))
