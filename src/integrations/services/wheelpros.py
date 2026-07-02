@@ -6,13 +6,14 @@ Catalog uses the primary CompanyProvider (or first active); pricing loads per co
 import logging
 import math
 import typing
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
 
 import pgbulk
 
 from django.conf import settings
-from django.db import connection
+from django.db import close_old_connections, connection
 from django.db.models.functions import Upper
 from django.utils import timezone
 
@@ -34,6 +35,18 @@ logger = logging.getLogger(__name__)
 _LOG_PREFIX = "[WHEELPROS-SERVICES]"
 
 WP_PRICING_UPSERT_BATCH = 2000
+
+
+def _wp_setting_int(name: str, default: int) -> int:
+    try:
+        raw = getattr(settings, name, default)
+        v = int(str(raw).strip())
+        return v if v >= 1 else default
+    except (TypeError, ValueError):
+        return default
+
+
+WHEELPROS_COMPANY_PRICING_SYNC_MAX_WORKERS = _wp_setting_int("WHEELPROS_COMPANY_PRICING_SYNC_MAX_WORKERS", 6)
 
 
 def _dedupe_wheelpros_part_instances(
@@ -825,77 +838,107 @@ def fetch_and_save_wheelpros(
             b.external_id: b
             for b in src_models.WheelProsBrand.objects.filter(external_id__in=brand_names)
         }
-        total_pricing = 0
-        for cp in pricing_cps:
-            logger.info(
-                "{} Pricing feed for company_id={} (primary={}).".format(
-                    _LOG_PREFIX,
-                    cp.company_id,
-                    cp.primary,
-                )
-            )
-            creds = dict(cp.credentials or {})
-            creds["sftp_path"] = sftp_path
-            pc = wheelpros_client.WheelProsSFTPClient(
-                credentials=creds,
-                local_file_path=local_path,
-                require_credentials=not local_only,
-            )
+        n_cp = len(pricing_cps)
+        max_cw = WHEELPROS_COMPANY_PRICING_SYNC_MAX_WORKERS
+        workers = max(1, min(max_cw, n_cp))
+
+        def _sync_one_wp_company_pricing(cp: src_models.CompanyProviders) -> int:
+            close_old_connections()
             try:
-                price_records = pc.get_feed_records(
-                    force_download=download,
-                    local_only=local_only,
-                    sftp_path=sftp_path,
-                    local_file_path=local_path,
-                )
-            except wheelpros_exceptions.WheelProsException as e:
-                logger.error(
-                    "{} Skipping WheelPros pricing for company_id={}: {}.".format(
+                logger.info(
+                    "{} Pricing feed for company_id={} (primary={}).".format(
                         _LOG_PREFIX,
                         cp.company_id,
-                        str(e),
+                        cp.primary,
                     )
                 )
-                continue
-            pmap = _wheelpros_pricing_map_from_records(price_records, brand_by_external)
-            # Collapse by catalog part_id so one INSERT row per (part, company); last pmap row wins.
-            pricing_by_part_id: typing.Dict[int, typing.Dict[str, typing.Any]] = {}
-            for (bid, pn), pdata in pmap.items():
-                part_id = id_by_brand_pn.get((bid, pn))
-                if not part_id:
-                    continue
-                pricing_by_part_id[int(part_id)] = pdata
-            creds_for_cost = dict(cp.credentials or {})
-            pricing_to_upsert = [
-                src_models.WheelProsCompanyPricing(
-                    part_id=pid,
-                    company=cp.company,
-                    msrp_usd=pdata.get("msrp_usd"),
-                    map_usd=pdata.get("map_usd"),
-                    cost_usd=dealer_cost_from_msrp(pdata.get("msrp_usd"), feed_type, creds_for_cost),
+                creds = dict(cp.credentials or {})
+                creds["sftp_path"] = sftp_path
+                pc = wheelpros_client.WheelProsSFTPClient(
+                    credentials=creds,
+                    local_file_path=local_path,
+                    require_credentials=not local_only,
                 )
-                for pid, pdata in pricing_by_part_id.items()
-            ]
-            batch_total = 0
-            for j in range(0, len(pricing_to_upsert), WP_PRICING_UPSERT_BATCH):
-                batch = pricing_to_upsert[j : j + WP_PRICING_UPSERT_BATCH]
-                pgbulk.upsert(
-                    src_models.WheelProsCompanyPricing,
-                    batch,
-                    unique_fields=["part", "company"],
-                    update_fields=["msrp_usd", "map_usd", "cost_usd", "updated_at"],
-                    returning=False,
+                try:
+                    price_records = pc.get_feed_records(
+                        force_download=download,
+                        local_only=local_only,
+                        sftp_path=sftp_path,
+                        local_file_path=local_path,
+                    )
+                except wheelpros_exceptions.WheelProsException as e:
+                    logger.error(
+                        "{} Skipping WheelPros pricing for company_id={}: {}.".format(
+                            _LOG_PREFIX,
+                            cp.company_id,
+                            str(e),
+                        )
+                    )
+                    return 0
+                pmap = _wheelpros_pricing_map_from_records(price_records, brand_by_external)
+                # Collapse by catalog part_id so one INSERT row per (part, company); last pmap row wins.
+                pricing_by_part_id: typing.Dict[int, typing.Dict[str, typing.Any]] = {}
+                for (bid, pn), pdata in pmap.items():
+                    part_id = id_by_brand_pn.get((bid, pn))
+                    if not part_id:
+                        continue
+                    pricing_by_part_id[int(part_id)] = pdata
+                creds_for_cost = dict(cp.credentials or {})
+                pricing_to_upsert = [
+                    src_models.WheelProsCompanyPricing(
+                        part_id=pid,
+                        company=cp.company,
+                        msrp_usd=pdata.get("msrp_usd"),
+                        map_usd=pdata.get("map_usd"),
+                        cost_usd=dealer_cost_from_msrp(pdata.get("msrp_usd"), feed_type, creds_for_cost),
+                    )
+                    for pid, pdata in pricing_by_part_id.items()
+                ]
+                batch_total = 0
+                for j in range(0, len(pricing_to_upsert), WP_PRICING_UPSERT_BATCH):
+                    batch = pricing_to_upsert[j : j + WP_PRICING_UPSERT_BATCH]
+                    pgbulk.upsert(
+                        src_models.WheelProsCompanyPricing,
+                        batch,
+                        unique_fields=["part", "company"],
+                        update_fields=["msrp_usd", "map_usd", "cost_usd", "updated_at"],
+                        returning=False,
+                    )
+                    batch_total += len(batch)
+                    connection.close()
+                logger.info(
+                    "{} Upserted {} WheelPros company pricing rows for company_id={}.".format(
+                        _LOG_PREFIX,
+                        batch_total,
+                        cp.company_id,
+                    )
                 )
-                batch_total += len(batch)
+                return batch_total
+            finally:
                 connection.close()
-            total_pricing += batch_total
+
+        total_pricing = 0
+        if workers == 1:
+            for cp in pricing_cps:
+                total_pricing += _sync_one_wp_company_pricing(cp)
+        else:
             logger.info(
-                "{} Upserted {} WheelPros company pricing rows for company_id={}.".format(
-                    _LOG_PREFIX,
-                    batch_total,
-                    cp.company_id,
+                "{} WheelPros {} pricing: {} company provider(s), {} parallel worker(s).".format(
+                    _LOG_PREFIX, feed_type, n_cp, workers,
                 )
             )
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                fut_to_cp = {ex.submit(_sync_one_wp_company_pricing, cp): cp for cp in pricing_cps}
+                for fut in as_completed(fut_to_cp):
+                    cp = fut_to_cp[fut]
+                    try:
+                        total_pricing += fut.result()
+                    except Exception as e:
+                        logger.error(
+                            "{} WheelPros {} pricing sync failed for company_id={}: {}.".format(
+                                _LOG_PREFIX, feed_type, cp.company_id, str(e),
+                            )
+                        )
         logger.info(
             "{} WheelPros pricing finished: {} rows across {} companies.".format(
                 _LOG_PREFIX,

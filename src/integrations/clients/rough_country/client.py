@@ -6,6 +6,8 @@ Per-company feed URL is stored in CompanyProviders.credentials as feed_url
 (see src.constants.ROUGH_COUNTRY_CREDENTIALS_FEED_URL).
 """
 import logging
+import os
+import time
 import typing
 import urllib.error
 import urllib.request
@@ -22,6 +24,7 @@ _LOG_PREFIX = "[ROUGH-COUNTRY-CLIENT]"
 DEFAULT_FILE_URL = "https://feeds.roughcountry.com/jobber_pc2A.xlsx"
 DEFAULT_LOCAL_FILE_NAME = "jobber_pc2A.xlsx"
 REQUIRED_FEED_URL_PREFIX = "https://feeds.roughcountry.com/jobber_"
+DEFAULT_FILE_MAX_AGE_SECONDS = 6 * 60 * 60  # 6 hours
 
 
 def _df_to_list_of_dicts(df: pd.DataFrame) -> typing.List[typing.Dict]:
@@ -64,8 +67,14 @@ class RoughCountryFeedClient:
         if self.local_file_path:
             return self.local_file_path
         import tempfile
-        import os
         return os.path.join(tempfile.gettempdir(), self.local_file_name)
+
+    def is_file_outdated(self, path: typing.Optional[str] = None, max_age: int = DEFAULT_FILE_MAX_AGE_SECONDS) -> bool:
+        """Return True if local file is missing or older than max_age seconds."""
+        p = path or self._get_xlsx_path()
+        if not os.path.exists(p):
+            return True
+        return (time.time() - os.path.getmtime(p)) > max_age
 
     def download(self) -> str:
         """Download the Excel file from file_url to local path. Returns path."""
@@ -100,10 +109,10 @@ class RoughCountryFeedClient:
         """
         Load Excel and return dict with keys: general, fitment, discontinued.
         Each value is a list of row dicts (column names as keys).
+        Re-downloads if the file is missing or older than 6 hours.
         """
-        import os
         path = self._get_xlsx_path()
-        if download_if_missing and not os.path.exists(path):
+        if download_if_missing and self.is_file_outdated(path):
             self.download()
         path = self._get_xlsx_path()
 

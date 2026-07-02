@@ -1,11 +1,10 @@
+import csv
 import ftplib
 import logging
 import os
 import time
 import typing
 import zipfile
-
-import pandas as pd
 
 from django.conf import settings
 
@@ -129,16 +128,21 @@ class PremierFTPClient:
                     raise exceptions.PremierFileNotFoundError(
                         "CSV not found in zip. Contents: {}".format(names)
                     )
-                csv_data = zf.read(csv_name)
+                # Stream CSV directly from ZIP into local file — avoids reading all bytes into memory.
+                with zf.open(csv_name) as csv_stream:
+                    with open(self.local_file_path, "wb") as csv_file:
+                        while True:
+                            chunk = csv_stream.read(65536)
+                            if not chunk:
+                                break
+                            csv_file.write(chunk)
 
-            with open(self.local_file_path, "wb") as csv_file:
-                csv_file.write(csv_data)
-
+            csv_size = os.path.getsize(self.local_file_path)
             if os.path.exists(zip_path):
                 os.remove(zip_path)
 
             logger.info("{} Downloaded and extracted ({} bytes CSV).".format(
-                _LOG_PREFIX, len(csv_data)
+                _LOG_PREFIX, csv_size
             ))
             return self.local_file_path
 
@@ -162,33 +166,46 @@ class PremierFTPClient:
                 except OSError:
                     pass
 
-    def get_inventory_dataframe(self, force_download: bool = False) -> pd.DataFrame:
+    def get_inventory_records(self, force_download: bool = False) -> typing.List[typing.Dict]:
+        """
+        Download the inventory file and return as list of dicts (one per row).
+        Uses csv.DictReader to avoid pandas overhead; eliminates intermediate DataFrame.
+        Use force_download=True to bypass cache when expecting updated/full data.
+        """
         self.download_inventory_file(force_download=force_download)
+        path = self.local_file_path
         try:
-            df = None
-            for encoding in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
-                try:
-                    df = pd.read_csv(
-                        self.local_file_path,
-                        encoding=encoding,
-                        on_bad_lines="warn",
-                    )
-                    break
-                except UnicodeDecodeError:
-                    continue
-            if df is None:
+            enc = None
+            last_error: typing.Optional[Exception] = None
+            try:
+                with open(path, "rb") as bf:
+                    sample = bf.read(8 * 1024 * 1024)
+            except OSError as e:
                 raise exceptions.PremierDataValidationError(
-                    "Unable to decode CSV with utf-8, utf-8-sig, cp1252, or latin-1."
+                    "Could not open Premier CSV: {}".format(e)
                 )
-            logger.info("{} Loaded inventory CSV with {} rows.".format(_LOG_PREFIX, len(df)))
-            return df
+            for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+                try:
+                    sample.decode(encoding)
+                    enc = encoding
+                    break
+                except UnicodeDecodeError as e:
+                    last_error = e
+                    continue
+            if enc is None:
+                raise exceptions.PremierDataValidationError(
+                    "Unable to decode CSV with utf-8-sig, utf-8, cp1252, or latin-1: {}".format(last_error)
+                )
+            records: typing.List[typing.Dict] = []
+            with open(path, "r", newline="", encoding=enc, errors="replace") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    records.append(dict(row))
+            logger.info("{} Loaded inventory CSV with {} rows.".format(_LOG_PREFIX, len(records)))
+            return records
         except exceptions.PremierDataValidationError:
             raise
         except Exception as e:
-            msg = "Unable to process CSV: {}".format(str(e))
+            msg = "Unable to fetch or process the CSV file. Error: {}".format(str(e))
             logger.exception("{} {}.".format(_LOG_PREFIX, msg))
             raise exceptions.PremierDataValidationError(msg)
-
-    def get_inventory_records(self, force_download: bool = False) -> typing.List[typing.Dict]:
-        df = self.get_inventory_dataframe(force_download=force_download)
-        return df.to_dict("records")

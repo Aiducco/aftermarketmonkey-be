@@ -1,12 +1,16 @@
+import csv
 import logging
 import re
+import sys
 import time
 import typing
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal
 
 import pandas as pd
 import pgbulk
-from django.db import connection
+from django.conf import settings
+from django.db import close_old_connections, connection
 from django.db.models.functions import Upper
 from django.utils import timezone
 
@@ -33,6 +37,28 @@ DLG_PARTS_UPSERT_DELAY = 0.05
 DLG_PRICING_UPSERT_BATCH = 2000
 DLG_PART_ID_LOOKUP_CHUNK = 3000
 
+# Some feed lines exceed the csv module's default 131072-byte field limit; raise it as high
+# as the platform allows.
+_maxint = sys.maxsize
+while True:
+    try:
+        csv.field_size_limit(_maxint)
+        break
+    except OverflowError:
+        _maxint = int(_maxint / 10)
+
+
+def _dlg_setting_int(name: str, default: int) -> int:
+    try:
+        raw = getattr(settings, name, default)
+        v = int(str(raw).strip())
+        return v if v >= 1 else default
+    except (TypeError, ValueError):
+        return default
+
+
+DLG_COMPANY_PRICING_SYNC_MAX_WORKERS = _dlg_setting_int("DLG_COMPANY_PRICING_SYNC_MAX_WORKERS", 6)
+
 DLG_PARTS_UPDATE_FIELDS = [
     "display_name",
     "available_on_hand",
@@ -43,6 +69,45 @@ DLG_PARTS_UPDATE_FIELDS = [
 ]
 
 _DLG_CSV_ENCODINGS = ("utf-8-sig", "utf-8", "cp1252", "latin-1")
+_DLG_ENCODING_SNIFF_BYTES = 8 * 1024 * 1024
+
+
+def _sniff_dlg_csv_encoding(path: str) -> str:
+    try:
+        with open(path, "rb") as bf:
+            sample = bf.read(_DLG_ENCODING_SNIFF_BYTES)
+    except OSError as e:
+        raise ValueError("Could not read DLG CSV at {!r}: {}".format(path, e)) from e
+    last_error: typing.Optional[Exception] = None
+    for enc in _DLG_CSV_ENCODINGS:
+        try:
+            sample.decode(enc)
+            return enc
+        except UnicodeDecodeError as e:
+            last_error = e
+            continue
+    if last_error:
+        raise last_error
+    return "utf-8"
+
+
+def _iter_dlg_csv_rows(path: str) -> typing.Iterator[typing.Dict]:
+    """Stream DLG inventory CSV rows without materializing the full DataFrame."""
+    enc = _sniff_dlg_csv_encoding(path)
+    if enc != "utf-8-sig":
+        logger.info("{} Streaming DLG CSV {} with encoding {!r}.".format(_LOG_PREFIX, path, enc))
+    with open(path, "r", newline="", encoding=enc, errors="replace") as f:
+        reader = csv.DictReader(f)
+        for raw_row in reader:
+            norm = _normalize_row_keys(raw_row)
+            yield {
+                k: (None if v is None or v == "" else v)
+                for k, v in norm.items()
+            }
+
+
+def _records_from_csv(path: str) -> typing.List[typing.Dict]:
+    return list(_iter_dlg_csv_rows(path))
 
 
 def _clean_csv_value(value: typing.Any) -> typing.Optional[str]:
@@ -83,36 +148,6 @@ def _safe_int(value: typing.Any) -> typing.Optional[int]:
 
 def _normalize_row_keys(row: typing.Dict) -> typing.Dict:
     return {(k.strip() if isinstance(k, str) else k): v for k, v in row.items()}
-
-
-def _read_dlg_dataframe(path: str) -> pd.DataFrame:
-    last_error: typing.Optional[Exception] = None
-    for encoding in _DLG_CSV_ENCODINGS:
-        try:
-            df = pd.read_csv(path, dtype=object, encoding=encoding, keep_default_na=False)
-            if encoding != "utf-8-sig":
-                logger.info(
-                    "{} Read DLG inventory {} with encoding {!r}.".format(_LOG_PREFIX, path, encoding)
-                )
-            return df
-        except UnicodeDecodeError as e:
-            last_error = e
-            continue
-    if last_error:
-        raise last_error
-    raise ValueError("Could not read DLG inventory at {!r}".format(path))
-
-
-def _records_from_csv(path: str) -> typing.List[typing.Dict]:
-    df = _read_dlg_dataframe(path)
-    out: typing.List[typing.Dict] = []
-    for row in df.to_dict(orient="records"):
-        norm = _normalize_row_keys(row)
-        out.append({
-            k: (None if v is None or v == "" or (isinstance(v, float) and pd.isna(v)) else v)
-            for k, v in norm.items()
-        })
-    return out
 
 
 def _dlg_brand_key(value: typing.Any) -> typing.Optional[str]:
@@ -853,9 +888,13 @@ def fetch_and_save_dlg_catalog(force_download: bool = False) -> None:
             )
         )
 
-    for cp in all_cps:
-        if not cp.active:
-            continue
+    active_cps = [cp for cp in all_cps if cp.active]
+    n_cp = len(active_cps)
+    max_cw = DLG_COMPANY_PRICING_SYNC_MAX_WORKERS
+    workers = max(1, min(max_cw, n_cp)) if n_cp else 0
+
+    def _run_dlg_company_pricing_sync(cp: src_models.CompanyProviders) -> None:
+        close_old_connections()
         try:
             sync_dlg_company_pricing_for_company_provider(cp.id, force_download=force_download)
         except Exception as e:
@@ -866,3 +905,17 @@ def fetch_and_save_dlg_catalog(force_download: bool = False) -> None:
                     str(e),
                 )
             )
+        finally:
+            connection.close()
+
+    if workers == 1:
+        for cp in active_cps:
+            _run_dlg_company_pricing_sync(cp)
+    elif workers > 1:
+        logger.info(
+            "{} DLG per-company pricing: {} company provider(s), {} parallel worker(s).".format(
+                _LOG_PREFIX, n_cp, workers,
+            )
+        )
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            list(ex.map(_run_dlg_company_pricing_sync, active_cps))

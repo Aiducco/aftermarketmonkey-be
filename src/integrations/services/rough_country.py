@@ -7,11 +7,13 @@ Catalog and fitment use the primary CompanyProvider (or first active); pricing l
 import logging
 import math
 import typing
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from decimal import Decimal
 
 import pgbulk
-from django.db import connection
+from django.conf import settings
+from django.db import close_old_connections, connection
 from django.db.models.functions import Upper
 from django.utils import timezone
 
@@ -36,6 +38,21 @@ _LOG_PREFIX = "[ROUGH-COUNTRY-SERVICES]"
 DEFAULT_RC_BRAND_NAME = "ROUGH COUNTRY"
 
 RC_PRICING_UPSERT_BATCH = 2000
+
+
+def _rc_setting_int(name: str, default: int) -> int:
+    try:
+        raw = getattr(settings, name, default)
+        v = int(str(raw).strip())
+        return v if v >= 1 else default
+    except (TypeError, ValueError):
+        return default
+
+
+# Excel parsing is CPU-heavy so keep lower than CSV providers.
+ROUGH_COUNTRY_COMPANY_PRICING_SYNC_MAX_WORKERS = _rc_setting_int(
+    "ROUGH_COUNTRY_COMPANY_PRICING_SYNC_MAX_WORKERS", 4
+)
 
 
 def _normalize_rc_manufacturer_external_id(raw: typing.Optional[str]) -> str:
@@ -636,71 +653,101 @@ def fetch_and_save_rough_country(
                     for pid, bid, psku in cur.fetchall():
                         id_by_brand_sku[(bid, psku)] = pid
 
-            total_pricing_all = 0
-            for cp in pricing_cps:
-                logger.info(
-                    "{} Pricing feed for company_id={} (primary={}).".format(
-                        _LOG_PREFIX,
-                        cp.company_id,
-                        cp.primary,
-                    )
-                )
-                price_client = _rough_country_feed_client_for_credentials(
-                    cp.credentials or {},
-                    file_url,
-                    local_file_path,
-                    local_file_name,
-                )
+            n_cp = len(pricing_cps)
+            max_cw = ROUGH_COUNTRY_COMPANY_PRICING_SYNC_MAX_WORKERS
+            workers = max(1, min(max_cw, n_cp))
+
+            def _sync_one_rc_company_pricing(cp: src_models.CompanyProviders) -> int:
+                close_old_connections()
                 try:
-                    price_data = price_client.get_feed_data(download_if_missing=download)
-                except rough_country_exceptions.RoughCountryException as e:
-                    logger.error(
-                        "{} Skipping Rough Country pricing for company_id={}: {}.".format(
+                    logger.info(
+                        "{} Pricing feed for company_id={} (primary={}).".format(
                             _LOG_PREFIX,
                             cp.company_id,
-                            str(e),
+                            cp.primary,
                         )
                     )
-                    continue
-                g = price_data.get("general") or []
-                m2b = _ensure_rough_country_brands_from_manufacturers(g)
-                pmap = _deduped_pricing_by_brand_sku_from_general(g, m2b)
-                pricing_to_upsert = []
-                for (bid, sku), pdata in pmap.items():
-                    part_id = id_by_brand_sku.get((bid, sku))
-                    if not part_id:
-                        continue
-                    pricing_to_upsert.append(
-                        src_models.RoughCountryCompanyPricing(
-                            part_id=part_id,
-                            company=cp.company,
-                            price=pdata.get("price"),
-                            sale_price=pdata.get("sale_price"),
-                            cost=pdata.get("cost"),
-                            cnd_map=pdata.get("cnd_map"),
-                            cnd_price=pdata.get("cnd_price"),
+                    price_client = _rough_country_feed_client_for_credentials(
+                        cp.credentials or {},
+                        file_url,
+                        local_file_path,
+                        local_file_name,
+                    )
+                    try:
+                        price_data = price_client.get_feed_data(download_if_missing=download)
+                    except rough_country_exceptions.RoughCountryException as e:
+                        logger.error(
+                            "{} Skipping Rough Country pricing for company_id={}: {}.".format(
+                                _LOG_PREFIX,
+                                cp.company_id,
+                                str(e),
+                            )
+                        )
+                        return 0
+                    g = price_data.get("general") or []
+                    m2b = _ensure_rough_country_brands_from_manufacturers(g)
+                    pmap = _deduped_pricing_by_brand_sku_from_general(g, m2b)
+                    pricing_to_upsert = []
+                    for (bid, sku), pdata in pmap.items():
+                        part_id = id_by_brand_sku.get((bid, sku))
+                        if not part_id:
+                            continue
+                        pricing_to_upsert.append(
+                            src_models.RoughCountryCompanyPricing(
+                                part_id=part_id,
+                                company=cp.company,
+                                price=pdata.get("price"),
+                                sale_price=pdata.get("sale_price"),
+                                cost=pdata.get("cost"),
+                                cnd_map=pdata.get("cnd_map"),
+                                cnd_price=pdata.get("cnd_price"),
+                            )
+                        )
+                    total_cp = 0
+                    for j in range(0, len(pricing_to_upsert), RC_PRICING_UPSERT_BATCH):
+                        batch = pricing_to_upsert[j : j + RC_PRICING_UPSERT_BATCH]
+                        pgbulk.upsert(
+                            src_models.RoughCountryCompanyPricing,
+                            batch,
+                            unique_fields=["part", "company"],
+                            update_fields=["price", "sale_price", "cost", "cnd_map", "cnd_price", "updated_at"],
+                            returning=False,
+                        )
+                        total_cp += len(batch)
+                        connection.close()
+                    logger.info(
+                        "{} Upserted {} Rough Country company pricing rows for company_id={}.".format(
+                            _LOG_PREFIX,
+                            total_cp,
+                            cp.company_id,
                         )
                     )
-                total_cp = 0
-                for j in range(0, len(pricing_to_upsert), RC_PRICING_UPSERT_BATCH):
-                    batch = pricing_to_upsert[j : j + RC_PRICING_UPSERT_BATCH]
-                    pgbulk.upsert(
-                        src_models.RoughCountryCompanyPricing,
-                        batch,
-                        unique_fields=["part", "company"],
-                        update_fields=["price", "sale_price", "cost", "cnd_map", "cnd_price", "updated_at"],
-                        returning=False,
-                    )
-                    total_cp += len(batch)
+                    return total_cp
+                finally:
                     connection.close()
-                total_pricing_all += total_cp
+
+            total_pricing_all = 0
+            if workers == 1:
+                for cp in pricing_cps:
+                    total_pricing_all += _sync_one_rc_company_pricing(cp)
+            else:
                 logger.info(
-                    "{} Upserted {} Rough Country company pricing rows for company_id={}.".format(
-                        _LOG_PREFIX,
-                        total_cp,
-                        cp.company_id,
+                    "{} Rough Country pricing: {} company provider(s), {} parallel worker(s).".format(
+                        _LOG_PREFIX, n_cp, workers,
                     )
                 )
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    fut_to_cp = {ex.submit(_sync_one_rc_company_pricing, cp): cp for cp in pricing_cps}
+                    for fut in as_completed(fut_to_cp):
+                        cp = fut_to_cp[fut]
+                        try:
+                            total_pricing_all += fut.result()
+                        except Exception as e:
+                            logger.error(
+                                "{} Rough Country pricing sync failed for company_id={}: {}.".format(
+                                    _LOG_PREFIX, cp.company_id, str(e),
+                                )
+                            )
             logger.info(
                 "{} Rough Country pricing finished: {} rows across {} companies.".format(
                     _LOG_PREFIX,

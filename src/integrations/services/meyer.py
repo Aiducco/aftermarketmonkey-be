@@ -59,7 +59,7 @@ def _meyer_setting_int(name: str, default: int) -> int:
         return default
 
 
-MEYER_COMPANY_PRICING_SYNC_MAX_WORKERS = _meyer_setting_int("MEYER_COMPANY_PRICING_SYNC_MAX_WORKERS", 2)
+MEYER_COMPANY_PRICING_SYNC_MAX_WORKERS = _meyer_setting_int("MEYER_COMPANY_PRICING_SYNC_MAX_WORKERS", 6)
 MEYER_PART_LOOKUP_MAX_WORKERS = _meyer_setting_int("MEYER_PART_LOOKUP_MAX_WORKERS", 4)
 MEYER_PARSE_PROGRESS_EVERY = _meyer_setting_int("MEYER_PARSE_PROGRESS_EVERY", 250000)
 
@@ -1249,11 +1249,14 @@ def fetch_and_save_meyer_catalog_and_inventory(force_download: bool = False) -> 
         raise
 
     logger.info(
-        "{} Scanning Meyer pricing/inventory files for brand keys (progress every {} rows).".format(
+        "{} Single-pass scan of Meyer pricing feed: collecting brand keys + building catalog parts "
+        "(progress every {} rows).".format(
             _LOG_PREFIX, MEYER_PARSE_PROGRESS_EVERY,
         )
     )
+    # Single pass over pricing CSV: collect MFG names AND accumulate part rows simultaneously.
     pricing_mfg_names: typing.Set[str] = set()
+    pricing_rows_collected: typing.List[typing.Dict] = []
     pricing_row_count = 0
     scan_started = time.monotonic()
     for row in _iter_records_from_csv(pricing_path):
@@ -1261,6 +1264,7 @@ def fetch_and_save_meyer_catalog_and_inventory(force_download: bool = False) -> 
         m = _meyer_brand_key(row.get("MFG"))
         if m:
             pricing_mfg_names.add(m)
+        pricing_rows_collected.append(row)
         if (pricing_row_count % MEYER_PARSE_PROGRESS_EVERY) == 0:
             logger.info(
                 "{} Pricing scan progress: {} row(s), {} unique MFG in {:.1f}s.".format(
@@ -1270,7 +1274,10 @@ def fetch_and_save_meyer_catalog_and_inventory(force_download: bool = False) -> 
                     time.monotonic() - scan_started,
                 )
             )
+
+    # Single pass over inventory CSV: collect MFG names AND accumulate part rows simultaneously.
     inventory_mfg_names: typing.Set[str] = set()
+    inventory_rows_collected: typing.List[typing.Dict] = []
     inventory_row_count = 0
     inv_scan_started = time.monotonic()
     for row in _iter_records_from_csv(inventory_path):
@@ -1278,6 +1285,7 @@ def fetch_and_save_meyer_catalog_and_inventory(force_download: bool = False) -> 
         m = _meyer_brand_key(row.get("MFGName"))
         if m:
             inventory_mfg_names.add(m)
+        inventory_rows_collected.append(row)
         if (inventory_row_count % MEYER_PARSE_PROGRESS_EVERY) == 0:
             logger.info(
                 "{} Inventory scan progress: {} row(s), {} unique MFG in {:.1f}s.".format(
@@ -1318,12 +1326,12 @@ def fetch_and_save_meyer_catalog_and_inventory(force_download: bool = False) -> 
 
     if pricing_row_count > 0:
         logger.info(
-            "{} Building catalog parts from primary pricing feed (streaming).".format(_LOG_PREFIX)
+            "{} Building catalog parts from collected pricing rows (no second file read).".format(_LOG_PREFIX)
         )
         parts_by_key: typing.Dict[typing.Tuple[int, str], src_models.MeyerParts] = {}
         parts_raw_count = 0
         build_started = time.monotonic()
-        for row in _iter_records_from_csv(pricing_path):
+        for row in pricing_rows_collected:
             p = _part_from_pricing_row(row, brand_by_mfg, include_pricing=False)
             if not p:
                 continue
@@ -1507,8 +1515,9 @@ def fetch_and_save_meyer_catalog_and_inventory(force_download: bool = False) -> 
 
     if inventory_row_count > 0:
         overlay_raw: typing.List[src_models.MeyerParts] = []
+        # Identify any brands from inventory not yet in brand_by_mfg (we already collected rows).
         missing_brands = set()
-        for row in _iter_records_from_csv(inventory_path):
+        for row in inventory_rows_collected:
             mfg = _meyer_brand_key(row.get("MFGName"))
             if mfg and mfg not in brand_by_mfg:
                 missing_brands.add(mfg)
@@ -1525,7 +1534,7 @@ def fetch_and_save_meyer_catalog_and_inventory(force_download: bool = False) -> 
             )
             brand_by_mfg.update(_brand_map_for_names(missing_brands))
 
-        for row in _iter_records_from_csv(inventory_path):
+        for row in inventory_rows_collected:
             p = _part_from_inventory_row(row, brand_by_mfg)
             if p:
                 overlay_raw.append(p)

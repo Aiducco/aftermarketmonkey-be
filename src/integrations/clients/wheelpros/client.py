@@ -1,9 +1,9 @@
+import csv
 import logging
 import os
 import time
 import typing
 
-import pandas as pd
 import paramiko
 from django.conf import settings
 
@@ -162,25 +162,38 @@ class WheelProsSFTPClient:
                 local_file_path=local_path,
             )
         try:
-            df = None
+            enc = None
+            last_error: typing.Optional[Exception] = None
+            try:
+                with open(path, "rb") as bf:
+                    sample = bf.read(8 * 1024 * 1024)
+            except OSError as e:
+                raise exceptions.WheelProsParseError("Could not open WheelPros CSV: {}".format(e))
             for encoding in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
                 try:
-                    df = pd.read_csv(
-                        path,
-                        encoding=encoding,
-                        dtype=str,
-                        keep_default_na=False,
-                        on_bad_lines="warn",
-                    )
+                    sample.decode(encoding)
+                    enc = encoding
                     break
-                except UnicodeDecodeError:
+                except UnicodeDecodeError as e:
+                    last_error = e
                     continue
-            if df is None:
-                raise ValueError("Unable to decode CSV with supported encodings.")
-            if df.empty:
-                return []
-            df.columns = [str(c).strip() for c in df.columns]
-            return df.replace({pd.NA: None, "": None}).to_dict("records")
+            if enc is None:
+                raise exceptions.WheelProsParseError(
+                    "Unable to decode WheelPros CSV with supported encodings: {}".format(last_error)
+                )
+            records: typing.List[typing.Dict] = []
+            with open(path, "r", newline="", encoding=enc, errors="replace") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    # Strip column name whitespace; replace empty strings with None
+                    norm = {
+                        (k.strip() if isinstance(k, str) else k): (None if v == "" else v)
+                        for k, v in row.items()
+                    }
+                    records.append(norm)
+            return records
+        except exceptions.WheelProsParseError:
+            raise
         except Exception as e:
             msg = "Failed to parse WheelPros CSV: {}".format(str(e))
             logger.error("{} {}".format(_LOG_PREFIX, msg))

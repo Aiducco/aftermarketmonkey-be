@@ -1,12 +1,14 @@
 import logging
 import time
 import typing
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal
 
 import pandas as pd
 import pgbulk
 
-from django.db import connection
+from django.conf import settings
+from django.db import close_old_connections, connection
 from django.db.models.functions import Upper
 from django.utils import timezone
 
@@ -28,6 +30,16 @@ _LOG_PREFIX = "[PREMIER-SERVICES]"
 
 PREMIER_PGBULK_BATCH_SIZE = 5000
 PREMIER_PGBULK_BATCH_DELAY_SECONDS = 0.5
+
+
+def _premier_setting_int(name: str, default: int) -> int:
+    try:
+        return int(getattr(settings, name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+PREMIER_COMPANY_PRICING_SYNC_MAX_WORKERS = _premier_setting_int("PREMIER_COMPANY_PRICING_SYNC_MAX_WORKERS", 4)
 
 PREMIER_PARTS_UPDATE_FIELDS = [
     "mfg_part_number", "long_description", "external_long_description",
@@ -522,7 +534,57 @@ def fetch_and_save_all_premier_brand_parts() -> None:
     total_parts = 0
     total_pricing = 0
 
-    for company_provider in company_providers_ordered:
+    # Separate primary providers (run sequentially first for catalog) from non-primaries.
+    primary_providers = [cp for cp in company_providers_ordered if cp.primary or not has_primary]
+    non_primary_providers = [cp for cp in company_providers_ordered if not cp.primary and has_primary]
+
+    def _sync_premier_pricing_for_cp(company_provider: src_models.CompanyProviders) -> int:
+        """Fetch records for one non-primary company and upsert PremierCompanyPricing only."""
+        close_old_connections()
+        try:
+            company = company_provider.company
+            if not company_provider.active:
+                logger.info("{} Skipping PremierCompanyPricing for company={} (inactive).".format(
+                    _LOG_PREFIX, company.name
+                ))
+                return 0
+            try:
+                ftp_client = premier_client.PremierFTPClient(credentials=company_provider.credentials)
+            except ValueError as e:
+                logger.error("{} Invalid credentials company={}: {}.".format(_LOG_PREFIX, company.name, str(e)))
+                return 0
+            try:
+                records = ftp_client.get_inventory_records()
+            except premier_exceptions.PremierException as e:
+                logger.error("{} FTP error company={}: {}.".format(_LOG_PREFIX, company.name, str(e)))
+                return 0
+            if not records:
+                logger.warning("{} No records company={}.".format(_LOG_PREFIX, company.name))
+                return 0
+            brand_data: typing.Dict[str, typing.Optional[str]] = {}
+            for row in records:
+                name = _clean(row.get("Brand"))
+                if name and name not in brand_data:
+                    brand_data[name] = _clean(row.get("Line Code"))
+            premier_brands = {
+                b.name: b
+                for b in src_models.PremierBrand.objects.filter(external_id__in=brand_data.keys())
+            }
+            part_lookup = _part_number_brand_id_lookup(records, premier_brands)
+            pricing_instances = _build_company_pricing_instances(records, premier_brands, company, part_lookup)
+            try:
+                n = _pgbulk_upsert_premier_company_pricing_batches(
+                    pricing_instances, PREMIER_PGBULK_BATCH_SIZE, PREMIER_PGBULK_BATCH_DELAY_SECONDS,
+                )
+                return n
+            except Exception as e:
+                logger.error("{} Pricing upsert failed company={}: {}.".format(_LOG_PREFIX, company.name, str(e)))
+                return 0
+        finally:
+            connection.close()
+
+    # Run primary providers synchronously (they do catalog upserts).
+    for company_provider in primary_providers:
         company = company_provider.company
         should_upsert_parts = company_provider.primary or not has_primary
 
@@ -596,6 +658,28 @@ def fetch_and_save_all_premier_brand_parts() -> None:
         except Exception as e:
             logger.error("{} Pricing upsert failed company={}: {}.".format(_LOG_PREFIX, company.name, str(e)))
             raise
+
+    # Run non-primary providers in parallel (pricing only).
+    if non_primary_providers:
+        n_np = len(non_primary_providers)
+        np_workers = max(1, min(PREMIER_COMPANY_PRICING_SYNC_MAX_WORKERS, n_np))
+        logger.info("{} Syncing {} non-primary company pricing records with {} workers.".format(
+            _LOG_PREFIX, n_np, np_workers,
+        ))
+        if np_workers == 1:
+            for cp in non_primary_providers:
+                total_pricing += _sync_premier_pricing_for_cp(cp)
+        else:
+            with ThreadPoolExecutor(max_workers=np_workers) as ex:
+                fut_to_cp = {ex.submit(_sync_premier_pricing_for_cp, cp): cp for cp in non_primary_providers}
+                for fut in as_completed(fut_to_cp):
+                    cp = fut_to_cp[fut]
+                    try:
+                        total_pricing += fut.result()
+                    except Exception as e:
+                        logger.error("{} Pricing sync failed company={}: {}.".format(
+                            _LOG_PREFIX, cp.company.name, str(e)
+                        ))
 
     logger.info("{} Finished: parts_upserted={} pricing_upserted={}.".format(
         _LOG_PREFIX, total_parts, total_pricing,

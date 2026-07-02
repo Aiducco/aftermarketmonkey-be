@@ -1,12 +1,12 @@
+import csv
 import ftplib
+import io
 import logging
 import os
 import ssl
 import time
 import typing
 import zipfile
-
-import pandas as pd
 
 from django.conf import settings
 
@@ -166,17 +166,22 @@ class KeystoneFTPClient:
                     raise exceptions.KeystoneFileNotFoundError(
                         "Inventory CSV not found in zip. Contents: {}".format(names)
                     )
-                csv_data = zf.read(csv_name)
+                # Stream CSV directly from ZIP into local file — avoids reading all bytes into memory.
+                with zf.open(csv_name) as csv_stream:
+                    with open(self.local_file_path, "wb") as csv_file:
+                        while True:
+                            chunk = csv_stream.read(65536)
+                            if not chunk:
+                                break
+                            csv_file.write(chunk)
 
-            with open(self.local_file_path, "wb") as csv_file:
-                csv_file.write(csv_data)
-
+            csv_size = os.path.getsize(self.local_file_path)
             if os.path.exists(zip_path):
                 os.remove(zip_path)
 
             logger.info(
                 "{} Inventory downloaded from zip and extracted ({} bytes CSV).".format(
-                    _LOG_PREFIX, len(csv_data)
+                    _LOG_PREFIX, csv_size
                 )
             )
             return self.local_file_path
@@ -199,43 +204,46 @@ class KeystoneFTPClient:
                 except OSError:
                     pass
 
-    def get_inventory_dataframe(self, force_download: bool = False) -> pd.DataFrame:
+    def get_inventory_records(self, force_download: bool = False) -> typing.List[typing.Dict]:
         """
-        Download the inventory file (if needed) and return as pandas DataFrame.
+        Download the inventory file and return as list of dicts (one per row).
+        Uses csv.DictReader to avoid pandas overhead; eliminates intermediate DataFrame.
         Use force_download=True to bypass cache when expecting updated/full data.
         """
         self.download_inventory_file(force_download=force_download)
+        path = self.local_file_path
         try:
-            # Try UTF-8 first, fall back to cp1252 (common for Excel exports)
-            df = None
+            enc = None
+            last_error: typing.Optional[Exception] = None
+            try:
+                with open(path, "rb") as bf:
+                    sample = bf.read(8 * 1024 * 1024)
+            except OSError as e:
+                raise exceptions.KeystoneDataValidationError(
+                    "Could not open Keystone CSV: {}".format(e)
+                )
             for encoding in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
                 try:
-                    df = pd.read_csv(
-                        self.local_file_path,
-                        encoding=encoding,
-                        on_bad_lines="warn",  # Log malformed rows instead of failing silently
-                    )
+                    sample.decode(encoding)
+                    enc = encoding
                     break
-                except UnicodeDecodeError:
+                except UnicodeDecodeError as e:
+                    last_error = e
                     continue
-            if df is None:
+            if enc is None:
                 raise exceptions.KeystoneDataValidationError(
-                    "Unable to decode CSV with utf-8, utf-8-sig, cp1252, or latin-1."
+                    "Unable to decode CSV with utf-8, utf-8-sig, cp1252, or latin-1: {}".format(last_error)
                 )
-
-            logger.info("{} Loaded inventory CSV with {} rows.".format(_LOG_PREFIX, len(df)))
-            return df
+            records: typing.List[typing.Dict] = []
+            with open(path, "r", newline="", encoding=enc, errors="replace") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    records.append(dict(row))
+            logger.info("{} Loaded inventory CSV with {} rows.".format(_LOG_PREFIX, len(records)))
+            return records
         except exceptions.KeystoneDataValidationError:
             raise
         except Exception as e:
             msg = "Unable to fetch or process the CSV file. Error: {}".format(str(e))
             logger.exception("{} {}.".format(_LOG_PREFIX, msg))
             raise exceptions.KeystoneDataValidationError(msg)
-
-    def get_inventory_records(self, force_download: bool = False) -> typing.List[typing.Dict]:
-        """
-        Download the inventory file and return as list of dicts (one per row).
-        Use force_download=True to bypass cache when expecting updated/full data.
-        """
-        df = self.get_inventory_dataframe(force_download=force_download)
-        return df.to_dict("records")
