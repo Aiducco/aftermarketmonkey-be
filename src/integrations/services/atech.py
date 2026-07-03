@@ -43,8 +43,9 @@ while True:
 
 _EXCEL_FORMULA_PATTERN = re.compile(r'^="?([^"]*)"?$|^=(\d+(?:\.\d+)?)$')
 
-# Larger batches = fewer DB round-trips on multi-million-row feeds (tune down if OOM on small workers).
-ATECH_PARTS_UPSERT_BATCH = 50000
+# Streaming catalog ingest: buffer size for per-batch upsert (O(batch_size) memory).
+# Old ATECH_PARTS_UPSERT_BATCH was 50000 and loaded the entire feed first; this replaces it.
+ATECH_STREAMING_BATCH_SIZE = 5000
 ATECH_PARTS_UPSERT_DELAY = 0.05
 
 ATECH_PRICING_UPSERT_BATCH = 15000
@@ -65,7 +66,6 @@ def _atech_setting_int(name: str, default: int) -> int:
 
 ATECH_PRICING_LOOKUP_MAX_WORKERS = _atech_setting_int("ATECH_PRICING_LOOKUP_MAX_WORKERS", 4)
 ATECH_COMPANY_PRICING_SYNC_MAX_WORKERS = _atech_setting_int("ATECH_COMPANY_PRICING_SYNC_MAX_WORKERS", 6)
-ATECH_PARTS_UPSERT_MAX_WORKERS = _atech_setting_int("ATECH_PARTS_UPSERT_MAX_WORKERS", 4)
 ATECH_COMPANY_PRICING_UPSERT_MAX_WORKERS = _atech_setting_int("ATECH_COMPANY_PRICING_UPSERT_MAX_WORKERS", 4)
 
 # Up to 8MB used only to pick an encoding; streaming uses one pass over the file.
@@ -365,27 +365,6 @@ def _id_by_feed_keys_parallel(
     )
     return id_by_feed
 
-
-def _upsert_atech_parts_batch(batch: typing.List[src_models.AtechParts]) -> int:
-    """
-    Upsert one AtechParts batch with thread-safe DB connection handling.
-    """
-    close_old_connections()
-    try:
-        _now = timezone.now()
-        for _p in batch:
-            _p.updated_at = _now
-        pgbulk.upsert(
-            src_models.AtechParts,
-            batch,
-            unique_fields=["feed_part_number"],
-            update_fields=ATECH_PARTS_UPDATE_FIELDS,
-            returning=False,
-        )
-        connection.close()
-        return len(batch)
-    finally:
-        close_old_connections()
 
 
 def _upsert_atech_company_pricing_batch(
@@ -993,17 +972,48 @@ def fetch_and_save_atech_catalog(force_download: bool = False) -> None:
         raise
 
     logger.info(
-        "{} Parsing A-Tech feed rows from {} (progress every {} rows).".format(
+        "{} Streaming A-Tech feed from {} in batches of {} (progress every {} rows).".format(
             _LOG_PREFIX,
             local_path,
+            ATECH_STREAMING_BATCH_SIZE,
             ATECH_PARSE_PROGRESS_EVERY,
         )
     )
     parse_started = time.monotonic()
-    parts_by_feed_pn: typing.Dict[str, src_models.AtechParts] = {}
+    # Buffer dict keyed by feed_part_number for within-batch dedup (last row per key wins).
+    parts_buf: typing.Dict[str, src_models.AtechParts] = {}
     unmapped_prefix_rows = 0
     feed_row_count = 0
     parts_with_model = 0
+    batch_num = 0
+    total_upserted = 0
+
+    def _flush_atech_catalog_batch() -> None:
+        nonlocal batch_num, total_upserted
+        if not parts_buf:
+            return
+        batch = list(parts_buf.values())
+        _now = timezone.now()
+        for _p in batch:
+            _p.updated_at = _now
+        pgbulk.upsert(
+            src_models.AtechParts,
+            batch,
+            unique_fields=["feed_part_number"],
+            update_fields=ATECH_PARTS_UPDATE_FIELDS,
+            returning=False,
+        )
+        batch_num += 1
+        total_upserted += len(batch)
+        logger.info(
+            "{} AtechParts batch {} upserted ({} rows, {} total, {:.1f}s elapsed).".format(
+                _LOG_PREFIX, batch_num, len(batch), total_upserted, time.monotonic() - parse_started
+            )
+        )
+        connection.close()
+        time.sleep(ATECH_PARTS_UPSERT_DELAY)
+        parts_buf.clear()
+
     for row in _iter_atech_csv_rows(local_path):
         feed_row_count += 1
         # Same prefix rule as ``brand_prefix`` on ``AtechParts`` (see ``_atech_prefix_from_part_number``).
@@ -1016,14 +1026,16 @@ def fetch_and_save_atech_catalog(force_download: bool = False) -> None:
             parts_with_model += 1
             sku = (p.feed_part_number or "").strip()
             if sku:
-                parts_by_feed_pn[sku] = p
+                parts_buf[sku] = p
+        if len(parts_buf) >= ATECH_STREAMING_BATCH_SIZE:
+            _flush_atech_catalog_batch()
         if (feed_row_count % ATECH_PARSE_PROGRESS_EVERY) == 0:
             logger.info(
-                "{} Feed parse progress: {} row(s) scanned, {} model rows, {} dedup keys in {:.1f}s.".format(
+                "{} Feed progress: {} rows scanned, {} model rows, {} upserted so far in {:.1f}s.".format(
                     _LOG_PREFIX,
                     feed_row_count,
                     parts_with_model,
-                    len(parts_by_feed_pn),
+                    total_upserted,
                     time.monotonic() - parse_started,
                 )
             )
@@ -1031,87 +1043,25 @@ def fetch_and_save_atech_catalog(force_download: bool = False) -> None:
     if feed_row_count == 0:
         logger.warning("{} Feed file empty or unreadable: {}.".format(_LOG_PREFIX, local_path))
         return
-    logger.info(
-        "{} Feed parse done: {} row(s), {} model rows, {} dedup keys in {:.1f}s.".format(
-            _LOG_PREFIX,
-            feed_row_count,
-            parts_with_model,
-            len(parts_by_feed_pn),
-            time.monotonic() - parse_started,
-        )
-    )
+
+    _flush_atech_catalog_batch()
 
     if unmapped_prefix_rows:
         logger.info(
-            "{} Ingested {} feed rows with no AtechPrefixBrand mapping (brand left null).".format(
+            "{} {} feed rows had no AtechPrefixBrand mapping (brand left null).".format(
                 _LOG_PREFIX,
                 unmapped_prefix_rows,
             )
         )
 
-    if parts_with_model > len(parts_by_feed_pn):
-        logger.info(
-            "{} Deduped {} -> {} rows on feed_part_number.".format(
-                _LOG_PREFIX,
-                parts_with_model,
-                len(parts_by_feed_pn),
-            )
-        )
-
-    parts = list(parts_by_feed_pn.values())
-
-    if not parts:
-        logger.warning("{} No AtechParts to upsert from primary feed.".format(_LOG_PREFIX))
+    if total_upserted == 0:
+        logger.warning("{} No AtechParts upserted from primary feed.".format(_LOG_PREFIX))
     else:
-        total_batches = (len(parts) + ATECH_PARTS_UPSERT_BATCH - 1) // ATECH_PARTS_UPSERT_BATCH
-        upsert_workers = max(1, min(ATECH_PARTS_UPSERT_MAX_WORKERS, total_batches))
         logger.info(
-            "{} Upserting {} AtechParts in {} batches (batch_size={}, workers={}); this can take many minutes.".format(
-                _LOG_PREFIX,
-                len(parts),
-                total_batches,
-                ATECH_PARTS_UPSERT_BATCH,
-                upsert_workers,
+            "{} Finished: {} AtechParts upserted from {} feed rows in {:.1f}s.".format(
+                _LOG_PREFIX, total_upserted, feed_row_count, time.monotonic() - parse_started
             )
         )
-        batches = [
-            parts[i : i + ATECH_PARTS_UPSERT_BATCH]
-            for i in range(0, len(parts), ATECH_PARTS_UPSERT_BATCH)
-        ]
-        if upsert_workers == 1:
-            for batch_num, batch in enumerate(batches, start=1):
-                _upsert_atech_parts_batch(batch)
-                logger.info(
-                    "{} AtechParts upsert progress: batch {}/{} (through row ~{}/{})".format(
-                        _LOG_PREFIX,
-                        batch_num,
-                        total_batches,
-                        min(batch_num * ATECH_PARTS_UPSERT_BATCH, len(parts)),
-                        len(parts),
-                    )
-                )
-                if batch_num < total_batches:
-                    time.sleep(ATECH_PARTS_UPSERT_DELAY)
-        else:
-            # Parallel mode is optional/tunable; use low worker counts to avoid overloading DB/WAL.
-            completed = 0
-            rows_done = 0
-            with ThreadPoolExecutor(max_workers=upsert_workers) as ex:
-                futs = [ex.submit(_upsert_atech_parts_batch, batch) for batch in batches]
-                for fut in as_completed(futs):
-                    rows_done += fut.result()
-                    completed += 1
-                    logger.info(
-                        "{} AtechParts parallel upsert progress: batch {}/{} (through row ~{}/{})".format(
-                            _LOG_PREFIX,
-                            completed,
-                            total_batches,
-                            rows_done,
-                            len(parts),
-                        )
-                    )
-
-        logger.info("{} Finished upserting {} AtechParts from primary feed.".format(_LOG_PREFIX, len(parts)))
 
     # Per-company pricing (AtechCompanyPricing) is handled by IntegrationPricingSyncJob
     # (Phase 3) for each CompanyProvider independently.

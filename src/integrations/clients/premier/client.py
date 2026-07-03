@@ -166,36 +166,39 @@ class PremierFTPClient:
                 except OSError:
                     pass
 
+    def _detect_csv_encoding(self, path: str) -> str:
+        """Detect encoding from an 8 MiB sample of the CSV. Returns the first successful encoding."""
+        try:
+            with open(path, "rb") as bf:
+                sample = bf.read(8 * 1024 * 1024)
+        except OSError as e:
+            raise exceptions.PremierDataValidationError(
+                "Could not open Premier CSV: {}".format(e)
+            )
+        last_error: typing.Optional[Exception] = None
+        for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+            try:
+                sample.decode(encoding)
+                return encoding
+            except UnicodeDecodeError as e:
+                last_error = e
+        raise exceptions.PremierDataValidationError(
+            "Unable to decode CSV with utf-8-sig, utf-8, cp1252, or latin-1: {}".format(last_error)
+        )
+
     def get_inventory_records(self, force_download: bool = False) -> typing.List[typing.Dict]:
         """
         Download the inventory file and return as list of dicts (one per row).
         Uses csv.DictReader to avoid pandas overhead; eliminates intermediate DataFrame.
         Use force_download=True to bypass cache when expecting updated/full data.
+
+        NOTE: loads the entire CSV into memory. Prefer iter_inventory_records() for
+        large files to keep memory bounded.
         """
         self.download_inventory_file(force_download=force_download)
         path = self.local_file_path
         try:
-            enc = None
-            last_error: typing.Optional[Exception] = None
-            try:
-                with open(path, "rb") as bf:
-                    sample = bf.read(8 * 1024 * 1024)
-            except OSError as e:
-                raise exceptions.PremierDataValidationError(
-                    "Could not open Premier CSV: {}".format(e)
-                )
-            for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
-                try:
-                    sample.decode(encoding)
-                    enc = encoding
-                    break
-                except UnicodeDecodeError as e:
-                    last_error = e
-                    continue
-            if enc is None:
-                raise exceptions.PremierDataValidationError(
-                    "Unable to decode CSV with utf-8-sig, utf-8, cp1252, or latin-1: {}".format(last_error)
-                )
+            enc = self._detect_csv_encoding(path)
             records: typing.List[typing.Dict] = []
             with open(path, "r", newline="", encoding=enc, errors="replace") as f:
                 reader = csv.DictReader(f)
@@ -207,5 +210,28 @@ class PremierFTPClient:
             raise
         except Exception as e:
             msg = "Unable to fetch or process the CSV file. Error: {}".format(str(e))
+            logger.exception("{} {}.".format(_LOG_PREFIX, msg))
+            raise exceptions.PremierDataValidationError(msg)
+
+    def iter_inventory_records(self, force_download: bool = False) -> typing.Iterator[typing.Dict]:
+        """
+        Stream the inventory CSV row-by-row as dicts — no full-file accumulation.
+
+        Use this instead of get_inventory_records() for large catalogs. The caller
+        receives one dict per row and can process + discard it immediately, keeping
+        memory usage O(batch_size) rather than O(file_size).
+        """
+        self.download_inventory_file(force_download=force_download)
+        path = self.local_file_path
+        try:
+            enc = self._detect_csv_encoding(path)
+            with open(path, "r", newline="", encoding=enc, errors="replace") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    yield dict(row)
+        except exceptions.PremierDataValidationError:
+            raise
+        except Exception as e:
+            msg = "Unable to stream Premier CSV. Error: {}".format(str(e))
             logger.exception("{} {}.".format(_LOG_PREFIX, msg))
             raise exceptions.PremierDataValidationError(msg)

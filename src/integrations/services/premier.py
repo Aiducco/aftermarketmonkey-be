@@ -370,80 +370,89 @@ def _pgbulk_upsert_premier_company_pricing_batches(
     return total
 
 
+def _transform_single_premier_row(
+    row: typing.Dict,
+    brand_name_to_premier_brand: typing.Dict[str, src_models.PremierBrand],
+    omit_pricing: bool = False,
+) -> typing.Optional[src_models.PremierParts]:
+    """Transform a single CSV row into a PremierParts instance, or None if invalid/unmapped."""
+    try:
+        brand_name = _clean(row.get("Brand"))
+        if not brand_name:
+            return None
+        premier_brand = brand_name_to_premier_brand.get(brand_name)
+        if not premier_brand:
+            return None
+
+        part_number = _clean(row.get("Premier Part Number"))
+        if not part_number:
+            return None
+
+        return src_models.PremierParts(
+            premier_part_number=part_number,
+            brand=premier_brand,
+            mfg_part_number=_clean(row.get("Mfg Part Number")),
+            long_description=_clean(row.get("Long Description")),
+            external_long_description=_clean(row.get("External Long Description")),
+            length=_safe_decimal(row.get("Length")),
+            width=_safe_decimal(row.get("Width")),
+            height=_safe_decimal(row.get("Height")),
+            weight=_safe_decimal(row.get("Weight")),
+            upc_code=_upc_clean(row.get("Upc")),
+            usa_item_availability=_safe_int(row.get("USA Item Availability")),
+            core_charge=None if omit_pricing else _safe_decimal(row.get("Core Charge")),
+            jobber_price=None if omit_pricing else _safe_decimal(row.get("Jobber")),
+            map_price=None if omit_pricing else _safe_decimal(row.get("MAP")),
+            retail_price=_safe_decimal(row.get("Retail")),
+            inventory_status=_clean(row.get("Inventory Status")),
+            nv_qty=_safe_int(row.get("NV whse")),
+            ky_qty=_safe_int(row.get("KY whse")),
+            mfg_qty=_safe_int(row.get("MFG Invt")),
+            wa_qty=_safe_int(row.get("WA whse")),
+            image_url=_clean(row.get("ImageURL")),
+            ships_ltl=_safe_bool(row.get("ShipsLTL")),
+            item_with_cores=_safe_bool(row.get("ItemWithCores")),
+            prop65_carcinogen=_safe_bool(row.get("Proposition 65 Carcinogen")),
+            prop65_reproductive_harm=_safe_bool(row.get("Proposition 65 Reproductive Harm")),
+            approved_line=_safe_bool(row.get("Approved Line")),
+            california_legal=_safe_bool(row.get("California Legal")),
+            line_code=_clean(row.get("Line Code")),
+            pies_ems_code=_clean(row.get("PIES EMS Code")),
+            drop_ship_fee=_safe_decimal(row.get("Drop Ship Fee")),
+            canada_map=_safe_decimal(row.get("Canada MAP")),
+            canada_msrp=_safe_decimal(row.get("Canada MSRP")),
+            canada_jobber=_safe_decimal(row.get("Canada Jobber")),
+            part_category=_clean(row.get("Part Category")),
+            part_subcategory=_clean(row.get("Part Subcategory")),
+            part_terminology=_clean(row.get("Part Terminology")),
+            freight_cost=_safe_decimal(row.get("Freight Cost")),
+            minimum_order_qty=_safe_int(row.get("Minimum Order Qty")),
+            drop_shippable_from_mfg=_safe_bool(row.get("Drop Shippable From MFG")),
+            vendor_enhanced_emissions_code=_clean(row.get("Vendor Enhanced Emissions Code")),
+            is_kit=_safe_bool(row.get("Kit")),
+            kit_component_list=_clean(row.get("Kit Component List")),
+            raw_data={
+                k: (None if (v is None or (isinstance(v, float) and pd.isna(v))) else v)
+                for k, v in row.items()
+            },
+        )
+    except Exception as e:
+        logger.warning("{} Error transforming row: {}. Skipping.".format(_LOG_PREFIX, str(e)))
+        return None
+
+
 def _transform_parts_data(
     records: typing.List[typing.Dict],
     brand_name_to_premier_brand: typing.Dict[str, src_models.PremierBrand],
     omit_pricing: bool = False,
 ) -> typing.List[src_models.PremierParts]:
-    part_instances = []
+    """Transform a list of CSV rows into PremierParts instances (filters out invalid/unmapped rows)."""
+    out = []
     for row in records:
-        try:
-            brand_name = _clean(row.get("Brand"))
-            if not brand_name:
-                continue
-            premier_brand = brand_name_to_premier_brand.get(brand_name)
-            if not premier_brand:
-                continue
-
-            part_number = _clean(row.get("Premier Part Number"))
-            if not part_number:
-                logger.warning("{} Skipping row with missing Premier Part Number.".format(_LOG_PREFIX))
-                continue
-
-            part_instances.append(
-                src_models.PremierParts(
-                    premier_part_number=part_number,
-                    brand=premier_brand,
-                    mfg_part_number=_clean(row.get("Mfg Part Number")),
-                    long_description=_clean(row.get("Long Description")),
-                    external_long_description=_clean(row.get("External Long Description")),
-                    length=_safe_decimal(row.get("Length")),
-                    width=_safe_decimal(row.get("Width")),
-                    height=_safe_decimal(row.get("Height")),
-                    weight=_safe_decimal(row.get("Weight")),
-                    upc_code=_upc_clean(row.get("Upc")),
-                    usa_item_availability=_safe_int(row.get("USA Item Availability")),
-                    core_charge=None if omit_pricing else _safe_decimal(row.get("Core Charge")),
-                    jobber_price=None if omit_pricing else _safe_decimal(row.get("Jobber")),
-                    map_price=None if omit_pricing else _safe_decimal(row.get("MAP")),
-                    retail_price=_safe_decimal(row.get("Retail")),
-                    inventory_status=_clean(row.get("Inventory Status")),
-                    nv_qty=_safe_int(row.get("NV whse")),
-                    ky_qty=_safe_int(row.get("KY whse")),
-                    mfg_qty=_safe_int(row.get("MFG Invt")),
-                    wa_qty=_safe_int(row.get("WA whse")),
-                    image_url=_clean(row.get("ImageURL")),
-                    ships_ltl=_safe_bool(row.get("ShipsLTL")),
-                    item_with_cores=_safe_bool(row.get("ItemWithCores")),
-                    prop65_carcinogen=_safe_bool(row.get("Proposition 65 Carcinogen")),
-                    prop65_reproductive_harm=_safe_bool(row.get("Proposition 65 Reproductive Harm")),
-                    approved_line=_safe_bool(row.get("Approved Line")),
-                    california_legal=_safe_bool(row.get("California Legal")),
-                    line_code=_clean(row.get("Line Code")),
-                    pies_ems_code=_clean(row.get("PIES EMS Code")),
-                    drop_ship_fee=_safe_decimal(row.get("Drop Ship Fee")),
-                    canada_map=_safe_decimal(row.get("Canada MAP")),
-                    canada_msrp=_safe_decimal(row.get("Canada MSRP")),
-                    canada_jobber=_safe_decimal(row.get("Canada Jobber")),
-                    part_category=_clean(row.get("Part Category")),
-                    part_subcategory=_clean(row.get("Part Subcategory")),
-                    part_terminology=_clean(row.get("Part Terminology")),
-                    freight_cost=_safe_decimal(row.get("Freight Cost")),
-                    minimum_order_qty=_safe_int(row.get("Minimum Order Qty")),
-                    drop_shippable_from_mfg=_safe_bool(row.get("Drop Shippable From MFG")),
-                    vendor_enhanced_emissions_code=_clean(row.get("Vendor Enhanced Emissions Code")),
-                    is_kit=_safe_bool(row.get("Kit")),
-                    kit_component_list=_clean(row.get("Kit Component List")),
-                    raw_data={
-                        k: (None if (v is None or (isinstance(v, float) and pd.isna(v))) else v)
-                        for k, v in row.items()
-                    },
-                )
-            )
-        except Exception as e:
-            logger.warning("{} Error transforming row: {}. Skipping.".format(_LOG_PREFIX, str(e)))
-            continue
-    return part_instances
+        part = _transform_single_premier_row(row, brand_name_to_premier_brand, omit_pricing)
+        if part is not None:
+            out.append(part)
+    return out
 
 
 def _part_number_brand_id_lookup(
@@ -562,21 +571,20 @@ def fetch_and_save_all_premier_brand_parts() -> None:
             logger.error("{} Invalid credentials company={}: {}.".format(_LOG_PREFIX, company.name, str(e)))
             continue
 
-        try:
-            records = ftp_client.get_inventory_records()
-        except premier_exceptions.PremierException as e:
-            logger.error("{} FTP error company={}: {}.".format(_LOG_PREFIX, company.name, str(e)))
-            continue
-
-        if not records:
-            logger.warning("{} No records company={}.".format(_LOG_PREFIX, company.name))
-            continue
-
+        # ── Pass 1: stream to collect brand names only (no row accumulation) ──────────────────
         brand_data: typing.Dict[str, typing.Optional[str]] = {}
-        for row in records:
-            name = _clean(row.get("Brand"))
-            if name and name not in brand_data:
-                brand_data[name] = _clean(row.get("Line Code"))
+        try:
+            for row in ftp_client.iter_inventory_records():
+                name = _clean(row.get("Brand"))
+                if name and name not in brand_data:
+                    brand_data[name] = _clean(row.get("Line Code"))
+        except premier_exceptions.PremierException as e:
+            logger.error("{} FTP error (pass 1) company={}: {}.".format(_LOG_PREFIX, company.name, str(e)))
+            continue
+
+        if not brand_data:
+            logger.warning("{} No brand rows found in feed company={}.".format(_LOG_PREFIX, company.name))
+            continue
 
         if brand_data:
             brand_instances = [
@@ -590,21 +598,69 @@ def fetch_and_save_all_premier_brand_parts() -> None:
                 update_fields=["name", "line_code", "updated_at"],
                 returning=False,
             )
+        logger.info("{} Upserted {} Premier brands company={}.".format(
+            _LOG_PREFIX, len(brand_data), company.name
+        ))
 
         premier_brands = {
             b.name: b
             for b in src_models.PremierBrand.objects.filter(external_id__in=brand_data.keys())
         }
 
-        part_instances = _transform_parts_data(records, premier_brands, omit_pricing=True)
-        if part_instances:
-            try:
-                total_parts += _pgbulk_upsert_premier_parts_batches(
-                    part_instances, PREMIER_PGBULK_BATCH_SIZE, PREMIER_PGBULK_BATCH_DELAY_SECONDS,
-                )
-            except Exception as e:
-                logger.error("{} Parts upsert failed company={}: {}.".format(_LOG_PREFIX, company.name, str(e)))
-                raise
+        # ── Pass 2: stream parts in batches of PREMIER_PGBULK_BATCH_SIZE ───────────────────
+        # Buffer dict keyed by (premier_part_number, brand_id) provides within-batch dedup
+        # so pgbulk.upsert never sees duplicate constrained-key pairs in one call.
+        parts_buf: typing.Dict[typing.Tuple[str, int], src_models.PremierParts] = {}
+        batch_num = 0
+        company_parts = 0
+        row_count = 0
+
+        def _flush_premier_catalog_batch() -> None:
+            nonlocal batch_num, company_parts
+            if not parts_buf:
+                return
+            batch_list = list(parts_buf.values())
+            _now = timezone.now()
+            for _p in batch_list:
+                _p.updated_at = _now
+            pgbulk.upsert(
+                src_models.PremierParts,
+                batch_list,
+                unique_fields=["premier_part_number", "brand"],
+                update_fields=PREMIER_PARTS_UPDATE_FIELDS,
+                returning=False,
+            )
+            batch_num += 1
+            company_parts += len(batch_list)
+            logger.info("{} Upserted PremierParts batch {} ({} rows, {} total) company={}.".format(
+                _LOG_PREFIX, batch_num, len(batch_list), company_parts, company.name
+            ))
+            connection.close()
+            time.sleep(PREMIER_PGBULK_BATCH_DELAY_SECONDS)
+            parts_buf.clear()
+
+        try:
+            for row in ftp_client.iter_inventory_records():
+                row_count += 1
+                part = _transform_single_premier_row(row, premier_brands, omit_pricing=True)
+                if part is None:
+                    continue
+                bid = part.brand_id
+                if not bid:
+                    continue
+                parts_buf[(part.premier_part_number, int(bid))] = part
+                if len(parts_buf) >= PREMIER_PGBULK_BATCH_SIZE:
+                    _flush_premier_catalog_batch()
+        except premier_exceptions.PremierException as e:
+            logger.error("{} FTP error (pass 2) company={}: {}.".format(_LOG_PREFIX, company.name, str(e)))
+            raise
+
+        _flush_premier_catalog_batch()
+
+        logger.info("{} Premier catalog pass 2 done: {} rows scanned, {} parts upserted company={}.".format(
+            _LOG_PREFIX, row_count, company_parts, company.name
+        ))
+        total_parts += company_parts
 
     logger.info("{} Finished Premier catalog sync: parts_upserted={}. "
                 "Per-company pricing handled by Phase 3 pricing jobs.".format(
