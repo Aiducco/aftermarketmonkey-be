@@ -2048,7 +2048,9 @@ def sync_provider_inventory_from_rough_country() -> None:
                     pp.is_discontinued = bool(row.get("is_discontinued"))
                     pp_details_to_update.append(pp)
             if pp_details_to_update:
-                src_models.ProviderPart.objects.bulk_update(pp_details_to_update, ["product_details", "is_discontinued"])
+                src_models.ProviderPart.objects.bulk_update(
+                    pp_details_to_update, ["product_details", "is_discontinued"], batch_size=500
+                )
 
             logger.info("{} Rough Country inventory batch {}: {} records (last_id={})".format(
                 _LOG_PREFIX, batch_num, len(to_upsert), last_id
@@ -2175,7 +2177,9 @@ def sync_provider_inventory_from_dlg() -> None:
                     ]
                     pp_details_to_update.append(pp)
             if pp_details_to_update:
-                src_models.ProviderPart.objects.bulk_update(pp_details_to_update, ["product_details"])
+                src_models.ProviderPart.objects.bulk_update(
+                    pp_details_to_update, ["product_details"], batch_size=500
+                )
 
             logger.info("{} DLG inventory batch {}: {} records (last_id={})".format(
                 _LOG_PREFIX, batch_num, len(to_upsert), last_id
@@ -2352,7 +2356,9 @@ def sync_provider_inventory_from_atech() -> None:
                     pp.product_details = _atech_product_details(ap)
                     pp_details_to_update.append(pp)
             if pp_details_to_update:
-                src_models.ProviderPart.objects.bulk_update(pp_details_to_update, ["product_details"])
+                src_models.ProviderPart.objects.bulk_update(
+                    pp_details_to_update, ["product_details"], batch_size=500
+                )
 
             logger.info("{} A-Tech inventory batch {}: {} records (last_id={})".format(
                 _LOG_PREFIX, batch_num, len(to_upsert), last_id
@@ -3218,7 +3224,9 @@ def sync_provider_inventory_from_wheelpros() -> None:
                     provider_part.is_discontinued = (row.get("inv_order_type") or "").strip() == "N2"
                     pp_details_to_update.append(provider_part)
             if pp_details_to_update:
-                src_models.ProviderPart.objects.bulk_update(pp_details_to_update, ["product_details", "is_discontinued"])
+                src_models.ProviderPart.objects.bulk_update(
+                    pp_details_to_update, ["product_details", "is_discontinued"], batch_size=500
+                )
 
             logger.info("{} WheelPros inventory batch {}: {} records (last_id={})".format(
                 _LOG_PREFIX, batch_num, len(to_upsert), last_id
@@ -4412,7 +4420,9 @@ def _sync_turn14_provider_inventory_batches(
                     pp.product_details = _turn14_product_details(item_row)
                     pp_details_to_update.append(pp)
             if pp_details_to_update:
-                src_models.ProviderPart.objects.bulk_update(pp_details_to_update, ["product_details"])
+                src_models.ProviderPart.objects.bulk_update(
+                    pp_details_to_update, ["product_details"], batch_size=500
+                )
 
         logger.info("{} Turn14 inventory {} batch {}: {} records (last_id={})".format(
             _LOG_PREFIX, log_context, batch_num, len(to_upsert), last_id
@@ -4644,7 +4654,7 @@ def sync_provider_inventory_from_keystone() -> None:
                     pp_details_to_update.append(pp)
             if pp_details_to_update:
                 src_models.ProviderPart.objects.bulk_update(
-                    pp_details_to_update, ["product_details"]
+                    pp_details_to_update, ["product_details"], batch_size=500
                 )
                 total_upserted += len(to_upsert)
 
@@ -4825,7 +4835,10 @@ def sync_provider_inventory_from_meyer() -> None:
                 )
                 total_upserted += len(to_upsert)
 
-            # Update product_details and is_discontinued on ProviderPart
+            # Update product_details and is_discontinued on ProviderPart.
+            # batch_size=500 breaks each call into small SQL statements (~100 KB each)
+            # instead of one massive CASE...WHEN statement for all 10k rows, which was
+            # OOM-killing Postgres when 16 threads fired simultaneously.
             pp_details_to_update = []
             for mp in batch:
                 ext = mp.get("meyer_part")
@@ -4839,7 +4852,11 @@ def sync_provider_inventory_from_meyer() -> None:
                     pp.is_discontinued = bool(mp.get("is_discontinued"))
                     pp_details_to_update.append(pp)
             if pp_details_to_update:
-                src_models.ProviderPart.objects.bulk_update(pp_details_to_update, ["product_details", "is_discontinued"])
+                src_models.ProviderPart.objects.bulk_update(
+                    pp_details_to_update,
+                    ["product_details", "is_discontinued"],
+                    batch_size=500,
+                )
 
             logger.info("{} Meyer inventory batch {}: {} records (last_id={})".format(
                 _LOG_PREFIX, batch_num, len(to_upsert), last_id
@@ -4849,7 +4866,12 @@ def sync_provider_inventory_from_meyer() -> None:
                 time.sleep(BATCH_DELAY_SECONDS)
         return total_upserted
 
-    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "meyer_brand", _worker)
+    # max_workers=4 instead of the global 16: Meyer's bulk_update(product_details) generates
+    # large SQL statements (JSON per row). 16 concurrent threads were OOM-killing Postgres at
+    # 627 MiB RSS. 4 workers × batch_size=500 keeps peak SQL in-flight at ~400 KB total.
+    total_upserted = _run_parallel_mapped_brand_int_worker(
+        mappings, "meyer_brand", _worker, max_workers=4
+    )
     logger.info("{} Synced {} Meyer inventory records total.".format(_LOG_PREFIX, total_upserted))
 
 
@@ -6022,7 +6044,9 @@ def sync_provider_inventory_from_premier() -> None:
                     ],
                 )
             if pp_details_to_update:
-                src_models.ProviderPart.objects.bulk_update(pp_details_to_update, ["product_details"])
+                src_models.ProviderPart.objects.bulk_update(
+                    pp_details_to_update, ["product_details"], batch_size=500
+                )
             total_upserted += len(to_upsert)
 
             logger.info("{} Premier inventory batch {}: {} records (last_id={})".format(
