@@ -614,39 +614,72 @@ def fetch_and_save_all_keystone_brand_parts() -> None:
             ))
             continue
 
+        # Stream the CSV row-by-row, build models in batches of KEYSTONE_PGBULK_BATCH_SIZE,
+        # upsert each batch immediately, then discard it — O(batch_size) memory regardless
+        # of how large the CSV is.
         try:
-            records = ftp_client.get_inventory_records()
+            rows_iter = ftp_client.iter_inventory_records()
         except keystone_exceptions.KeystoneException as e:
             logger.error("{} Keystone error company={}: {}.".format(_LOG_PREFIX, company.name, str(e)))
             continue
 
-        if not records:
-            logger.warning("{} No inventory records company={}.".format(_LOG_PREFIX, company.name))
-            continue
+        batch: typing.List[src_models.KeystoneParts] = []
+        batch_num = 0
+        company_parts = 0
+        row_count = 0
 
-        logger.info("{} company={}: {} CSV rows, {} mapped brands.".format(
-            _LOG_PREFIX, company.name, len(records), len(brand_mappings),
-        ))
-
-        part_instances = _transform_parts_data(records, brand_mappings, omit_pricing_for_parts=True)
-        if not part_instances:
-            logger.warning("{} No part instances company={}.".format(_LOG_PREFIX, company.name))
-            continue
+        def _flush_keystone_catalog_batch() -> None:
+            nonlocal batch_num, company_parts
+            if not batch:
+                return
+            _now = timezone.now()
+            for _p in batch:
+                _p.updated_at = _now
+            pgbulk.upsert(
+                src_models.KeystoneParts,
+                batch,
+                unique_fields=["vcpn", "brand"],
+                update_fields=KEYSTONE_PARTS_UPDATE_FIELDS,
+                returning=False,
+            )
+            batch_num += 1
+            company_parts += len(batch)
+            logger.info("{} Upserted Keystone parts batch {} ({} rows, {} total) company={}.".format(
+                _LOG_PREFIX, batch_num, len(batch), company_parts, company.name,
+            ))
+            connection.close()
+            time.sleep(KEYSTONE_PGBULK_BATCH_DELAY_SECONDS)
 
         try:
-            total_parts += _pgbulk_upsert_keystone_parts_batches(
-                part_instances,
-                KEYSTONE_PGBULK_BATCH_SIZE,
-                KEYSTONE_PGBULK_BATCH_DELAY_SECONDS,
-            )
+            for row in rows_iter:
+                row_count += 1
+                part = _transform_single_keystone_row(row, brand_mappings, omit_pricing=True)
+                if part is None:
+                    continue
+                batch.append(part)
+                if len(batch) >= KEYSTONE_PGBULK_BATCH_SIZE:
+                    _flush_keystone_catalog_batch()
+                    batch = []
+            _flush_keystone_catalog_batch()  # final partial batch
         except Exception as e:
-            logger.error("{} Keystone parts upsert failed company={}: {}.".format(
+            logger.error("{} Keystone parts streaming upsert failed company={}: {}.".format(
                 _LOG_PREFIX, company.name, str(e),
             ))
             raise
 
+        if company_parts == 0:
+            logger.warning("{} No part instances company={} ({} CSV rows scanned).".format(
+                _LOG_PREFIX, company.name, row_count,
+            ))
+            continue
+
+        logger.info("{} company={}: {} CSV rows scanned, {} parts upserted, {} mapped brands.".format(
+            _LOG_PREFIX, company.name, row_count, company_parts, len(brand_mappings),
+        ))
+        total_parts += company_parts
+
     logger.info(
-        "{} Finished Keystone catalog sync: {} part row upserts (batched). "
+        "{} Finished Keystone catalog sync: {} part row upserts (streamed). "
         "Per-company pricing handled by Phase 3 pricing jobs.".format(
             _LOG_PREFIX, total_parts,
         )
@@ -813,86 +846,94 @@ def fetch_and_save_all_keystone_brands_and_parts() -> None:
     )
 
 
+def _transform_single_keystone_row(
+    row: typing.Dict,
+    brand_name_to_keystone_brand: typing.Dict[str, src_models.KeystoneBrand],
+    omit_pricing: bool = True,
+) -> typing.Optional[src_models.KeystoneParts]:
+    """
+    Convert one CSV row dict into a KeystoneParts instance.
+
+    Returns None (silently) when the row has no VendorName / unknown brand / missing VCPN.
+    Callers that need logging for unknown brands should check the brand lookup themselves;
+    this function is intentionally quiet for high-throughput streaming paths.
+    """
+    try:
+        vendor_name = _clean_csv_value(row.get("VendorName"))
+        if not vendor_name:
+            return None
+        keystone_brand = brand_name_to_keystone_brand.get(vendor_name)
+        if not keystone_brand:
+            return None
+        vcpn = _clean_csv_value(row.get("VCPN"))
+        if not vcpn:
+            return None
+        if omit_pricing:
+            jobber_price = None
+            cost = None
+            core_charge = None
+        else:
+            jobber_price = _safe_decimal(row.get("JobberPrice"))
+            cost = _safe_decimal(row.get("Cost"))
+            core_charge = _safe_decimal(row.get("CoreCharge"))
+        return src_models.KeystoneParts(
+            vcpn=vcpn,
+            brand=keystone_brand,
+            vendor_code=_clean_csv_value(row.get("VendorCode")),
+            part_number=_clean_csv_value(row.get("PartNumber")),
+            manufacturer_part_no=_clean_csv_value(row.get("ManufacturerPartNo")),
+            long_description=_clean_csv_value(row.get("LongDescription")),
+            jobber_price=jobber_price,
+            cost=cost,
+            upsable=_safe_bool(row.get("UPSable")),
+            core_charge=core_charge,
+            case_qty=_safe_int(row.get("CaseQty")),
+            is_non_returnable=_safe_bool(row.get("IsNonReturnable")),
+            prop65_toxicity=_clean_csv_value(row.get("Prop65Toxicity")),
+            upc_code=_clean_csv_value(row.get("UPCCode")),
+            weight=_safe_decimal(row.get("Weight")),
+            height=_safe_decimal(row.get("Height")),
+            length=_safe_decimal(row.get("Length")),
+            width=_safe_decimal(row.get("Width")),
+            aaia_code=_clean_csv_value(row.get("AAIACode")),
+            is_hazmat=_safe_bool(row.get("IsHazmat")),
+            is_chemical=_safe_bool(row.get("IsChemical")),
+            ups_ground_assessorial=_safe_decimal(row.get("UPS_Ground_Assessorial")),
+            us_ltl=_safe_decimal(row.get("US_LTL")),
+            east_qty=_safe_int(row.get("EastQty")),
+            midwest_qty=_safe_int(row.get("MidwestQty")),
+            california_qty=_safe_int(row.get("CaliforniaQty")),
+            southeast_qty=_safe_int(row.get("SoutheastQty")),
+            pacific_nw_qty=_safe_int(row.get("PacificNWQty")),
+            texas_qty=_safe_int(row.get("TexasQty")),
+            great_lakes_qty=_safe_int(row.get("GreatLakesQty")),
+            florida_qty=_safe_int(row.get("FloridaQty")),
+            total_qty=_safe_int(row.get("TotalQty")),
+            kit_components=_clean_csv_value(row.get("KitComponents")),
+            is_kit=_safe_bool(row.get("IsKit")),
+            raw_data={
+                k: (None if (v is None or (isinstance(v, float) and pd.isna(v))) else v)
+                for k, v in row.items()
+            },
+        )
+    except Exception as e:
+        logger.warning("{} Error transforming row {}: {}. Skipping.".format(
+            _LOG_PREFIX, row, str(e)
+        ))
+        return None
+
+
 def _transform_parts_data(
     records: typing.List[typing.Dict],
     brand_name_to_keystone_brand: typing.Dict[str, src_models.KeystoneBrand],
     omit_pricing_for_parts: bool = False,
 ) -> typing.List[src_models.KeystoneParts]:
+    """Transform a list of CSV row dicts into KeystoneParts instances (batch/legacy path)."""
     part_instances = []
-
     for row in records:
-        try:
-            vendor_name = _clean_csv_value(row.get("VendorName"))
-            if not vendor_name:
-                continue
-
-            keystone_brand = brand_name_to_keystone_brand.get(vendor_name)
-            if not keystone_brand:
-                logger.info("{} Skipping row with missing brand - part number: {}".format(_LOG_PREFIX, row.get('PartNumber')))
-                continue
-
-            vcpn = _clean_csv_value(row.get("VCPN"))
-            if not vcpn:
-                logger.warning("{} Skipping row with missing VCPN: {}.".format(_LOG_PREFIX, row))
-                continue
-
-            if omit_pricing_for_parts:
-                jobber_price = None
-                cost = None
-                core_charge = None
-            else:
-                jobber_price = _safe_decimal(row.get("JobberPrice"))
-                cost = _safe_decimal(row.get("Cost"))
-                core_charge = _safe_decimal(row.get("CoreCharge"))
-
-            part_instance = src_models.KeystoneParts(
-                vcpn=vcpn,
-                brand=keystone_brand,
-                vendor_code=_clean_csv_value(row.get("VendorCode")),
-                part_number=_clean_csv_value(row.get("PartNumber")),
-                manufacturer_part_no=_clean_csv_value(row.get("ManufacturerPartNo")),
-                long_description=_clean_csv_value(row.get("LongDescription")),
-                jobber_price=jobber_price,
-                cost=cost,
-                upsable=_safe_bool(row.get("UPSable")),
-                core_charge=core_charge,
-                case_qty=_safe_int(row.get("CaseQty")),
-                is_non_returnable=_safe_bool(row.get("IsNonReturnable")),
-                prop65_toxicity=_clean_csv_value(row.get("Prop65Toxicity")),
-                upc_code=_clean_csv_value(row.get("UPCCode")),
-                weight=_safe_decimal(row.get("Weight")),
-                height=_safe_decimal(row.get("Height")),
-                length=_safe_decimal(row.get("Length")),
-                width=_safe_decimal(row.get("Width")),
-                aaia_code=_clean_csv_value(row.get("AAIACode")),
-                is_hazmat=_safe_bool(row.get("IsHazmat")),
-                is_chemical=_safe_bool(row.get("IsChemical")),
-                ups_ground_assessorial=_safe_decimal(row.get("UPS_Ground_Assessorial")),
-                us_ltl=_safe_decimal(row.get("US_LTL")),
-                east_qty=_safe_int(row.get("EastQty")),
-                midwest_qty=_safe_int(row.get("MidwestQty")),
-                california_qty=_safe_int(row.get("CaliforniaQty")),
-                southeast_qty=_safe_int(row.get("SoutheastQty")),
-                pacific_nw_qty=_safe_int(row.get("PacificNWQty")),
-                texas_qty=_safe_int(row.get("TexasQty")),
-                great_lakes_qty=_safe_int(row.get("GreatLakesQty")),
-                florida_qty=_safe_int(row.get("FloridaQty")),
-                total_qty=_safe_int(row.get("TotalQty")),
-                kit_components=_clean_csv_value(row.get("KitComponents")),
-                is_kit=_safe_bool(row.get("IsKit")),
-                raw_data={
-                    k: (None if (v is None or (isinstance(v, float) and pd.isna(v))) else v)
-                    for k, v in row.items()
-                },
-            )
-            part_instances.append(part_instance)
-
-        except Exception as e:
-            logger.warning("{} Error transforming row {}: {}. Skipping.".format(
-                _LOG_PREFIX, row, str(e)
-            ))
-            continue
-
+        part = _transform_single_keystone_row(row, brand_name_to_keystone_brand, omit_pricing=omit_pricing_for_parts)
+        if part is not None:
+            part_instances.append(part)
     return part_instances
 
 

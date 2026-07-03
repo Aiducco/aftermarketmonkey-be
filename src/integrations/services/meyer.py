@@ -1177,25 +1177,6 @@ def _part_from_inventory_row(
     )
 
 
-def _dedupe_meyer_parts_for_upsert(
-    parts: typing.List[src_models.MeyerParts],
-) -> typing.List[src_models.MeyerParts]:
-    """
-    One row per (brand_id, meyer_part) so a single INSERT ... ON CONFLICT batch
-    never targets the same unique constraint twice (PostgreSQL CardinalityViolation).
-    Later CSV rows win.
-    """
-    by_key: typing.Dict[typing.Tuple[int, str], src_models.MeyerParts] = {}
-    for p in parts:
-        bid = p.brand_id
-        if bid is None and p.brand is not None:
-            bid = p.brand.pk
-        sku = (p.meyer_part or "").strip()
-        if not bid or not sku:
-            continue
-        by_key[(int(bid), sku)] = p
-    return list(by_key.values())
-
 
 def fetch_and_save_meyer_catalog_and_inventory(force_download: bool = False) -> None:
     """
@@ -1231,15 +1212,16 @@ def fetch_and_save_meyer_catalog_and_inventory(force_download: bool = False) -> 
         logger.error("{} {}".format(_LOG_PREFIX, str(e)))
         raise
 
+    # -------------------------------------------------------------------------
+    # Pass 1 — brand discovery: stream both CSVs collecting only MFG name
+    # strings (a few hundred unique values, negligible memory).  No row dicts
+    # are accumulated — each row dict is created and immediately discarded.
+    # -------------------------------------------------------------------------
     logger.info(
-        "{} Single-pass scan of Meyer pricing feed: collecting brand keys + building catalog parts "
-        "(progress every {} rows).".format(
-            _LOG_PREFIX, MEYER_PARSE_PROGRESS_EVERY,
-        )
+        "{} Pass 1 — brand discovery: streaming pricing + inventory feeds "
+        "(progress every {} rows).".format(_LOG_PREFIX, MEYER_PARSE_PROGRESS_EVERY)
     )
-    # Single pass over pricing CSV: collect MFG names AND accumulate part rows simultaneously.
     pricing_mfg_names: typing.Set[str] = set()
-    pricing_rows_collected: typing.List[typing.Dict] = []
     pricing_row_count = 0
     scan_started = time.monotonic()
     for row in _iter_records_from_csv(pricing_path):
@@ -1247,20 +1229,15 @@ def fetch_and_save_meyer_catalog_and_inventory(force_download: bool = False) -> 
         m = _meyer_brand_key(row.get("MFG"))
         if m:
             pricing_mfg_names.add(m)
-        pricing_rows_collected.append(row)
         if (pricing_row_count % MEYER_PARSE_PROGRESS_EVERY) == 0:
             logger.info(
-                "{} Pricing scan progress: {} row(s), {} unique MFG in {:.1f}s.".format(
-                    _LOG_PREFIX,
-                    pricing_row_count,
-                    len(pricing_mfg_names),
+                "{} Pricing brand scan: {} row(s), {} unique MFG in {:.1f}s.".format(
+                    _LOG_PREFIX, pricing_row_count, len(pricing_mfg_names),
                     time.monotonic() - scan_started,
                 )
             )
 
-    # Single pass over inventory CSV: collect MFG names AND accumulate part rows simultaneously.
     inventory_mfg_names: typing.Set[str] = set()
-    inventory_rows_collected: typing.List[typing.Dict] = []
     inventory_row_count = 0
     inv_scan_started = time.monotonic()
     for row in _iter_records_from_csv(inventory_path):
@@ -1268,13 +1245,10 @@ def fetch_and_save_meyer_catalog_and_inventory(force_download: bool = False) -> 
         m = _meyer_brand_key(row.get("MFGName"))
         if m:
             inventory_mfg_names.add(m)
-        inventory_rows_collected.append(row)
         if (inventory_row_count % MEYER_PARSE_PROGRESS_EVERY) == 0:
             logger.info(
-                "{} Inventory scan progress: {} row(s), {} unique MFG in {:.1f}s.".format(
-                    _LOG_PREFIX,
-                    inventory_row_count,
-                    len(inventory_mfg_names),
+                "{} Inventory brand scan: {} row(s), {} unique MFG in {:.1f}s.".format(
+                    _LOG_PREFIX, inventory_row_count, len(inventory_mfg_names),
                     time.monotonic() - inv_scan_started,
                 )
             )
@@ -1283,9 +1257,7 @@ def fetch_and_save_meyer_catalog_and_inventory(force_download: bool = False) -> 
         logger.warning("{} Both feeds empty.".format(_LOG_PREFIX))
         return
 
-    mfg_names = set(pricing_mfg_names)
-    mfg_names.update(inventory_mfg_names)
-
+    mfg_names = pricing_mfg_names | inventory_mfg_names
     brand_objs = [
         src_models.MeyerBrand(external_id=n, name=n, aaia_code=None)
         for n in sorted(mfg_names)
@@ -1303,113 +1275,139 @@ def fetch_and_save_meyer_catalog_and_inventory(force_download: bool = False) -> 
         logger.warning("{} No Meyer brands after upsert.".format(_LOG_PREFIX))
         return
 
-    BATCH = 10000
+    # -------------------------------------------------------------------------
+    # Pass 2 — catalog upsert: stream pricing CSV again, accumulate at most
+    # BATCH rows in a dict (for within-batch dedup on (brand_id, meyer_part)),
+    # flush each batch to the DB, then discard it.  Cross-batch duplicates are
+    # handled transparently by PostgreSQL ON CONFLICT — last writer wins.
+    # Memory stays at O(BATCH) regardless of CSV size.
+    # -------------------------------------------------------------------------
+    BATCH = 5000
     DELAY = 0.3
 
     if pricing_row_count > 0:
         logger.info(
-            "{} Building catalog parts from collected pricing rows (no second file read).".format(_LOG_PREFIX)
+            "{} Pass 2 — pricing catalog: streaming {} rows in batches of {}.".format(
+                _LOG_PREFIX, pricing_row_count, BATCH,
+            )
         )
-        parts_by_key: typing.Dict[typing.Tuple[int, str], src_models.MeyerParts] = {}
-        parts_raw_count = 0
-        build_started = time.monotonic()
-        for row in pricing_rows_collected:
+        # Dict keyed by (brand_id, meyer_part) for within-batch dedup.
+        parts_buf: typing.Dict[typing.Tuple[int, str], src_models.MeyerParts] = {}
+        total_catalog_upserted = 0
+        batch_num = 0
+        upsert_started = time.monotonic()
+
+        def _flush_catalog_buf() -> None:
+            nonlocal total_catalog_upserted, batch_num
+            if not parts_buf:
+                return
+            batch_list = list(parts_buf.values())
+            _now = timezone.now()
+            for _p in batch_list:
+                _p.updated_at = _now
+            pgbulk.upsert(
+                src_models.MeyerParts,
+                batch_list,
+                unique_fields=["meyer_part", "brand"],
+                update_fields=CATALOG_FROM_PRICING_UPDATE_FIELDS,
+            )
+            batch_num += 1
+            total_catalog_upserted += len(batch_list)
+            logger.info(
+                "{} Catalog upsert batch {} — {} rows flushed ({} total, {:.1f}s elapsed).".format(
+                    _LOG_PREFIX, batch_num, len(batch_list), total_catalog_upserted,
+                    time.monotonic() - upsert_started,
+                )
+            )
+            parts_buf.clear()
+            connection.close()
+            time.sleep(DELAY)
+
+        for row in _iter_records_from_csv(pricing_path):
             p = _part_from_pricing_row(row, brand_by_mfg, include_pricing=False)
             if not p:
                 continue
-            parts_raw_count += 1
             bid = p.brand_id
             if bid is None and p.brand is not None:
                 bid = p.brand.pk
             sku = (p.meyer_part or "").strip()
             if not bid or not sku:
                 continue
-            parts_by_key[(int(bid), sku)] = p
-            if (parts_raw_count % MEYER_PARSE_PROGRESS_EVERY) == 0:
-                logger.info(
-                    "{} Catalog build progress: {} usable row(s), {} dedup key(s) in {:.1f}s.".format(
-                        _LOG_PREFIX,
-                        parts_raw_count,
-                        len(parts_by_key),
-                        time.monotonic() - build_started,
-                    )
-                )
-        parts = list(parts_by_key.values())
-        if len(parts) < parts_raw_count:
-            logger.info(
-                "{} Catalog from pricing: {} duplicate (brand, meyer_part) rows; kept {}.".format(
-                    _LOG_PREFIX, parts_raw_count - len(parts), len(parts),
-                )
+            parts_buf[(int(bid), sku)] = p
+            if len(parts_buf) >= BATCH:
+                _flush_catalog_buf()
+
+        _flush_catalog_buf()  # flush final partial batch
+        logger.info(
+            "{} MeyerParts catalog sync complete: {} rows upserted from pricing feed.".format(
+                _LOG_PREFIX, total_catalog_upserted,
             )
-        for i in range(0, len(parts), BATCH):
-            batch = parts[i : i + BATCH]
-            _now = timezone.now()
-            for _p in batch:
-                _p.updated_at = _now
-            pgbulk.upsert(
-                src_models.MeyerParts,
-                batch,
-                unique_fields=["meyer_part", "brand"],
-                update_fields=CATALOG_FROM_PRICING_UPDATE_FIELDS,
-            )
-            connection.close()
-            if i + BATCH < len(parts):
-                time.sleep(DELAY)
-        logger.info("{} Upserted {} MeyerParts catalog rows from primary pricing (no list prices).".format(
-            _LOG_PREFIX, len(parts),
-        ))
+        )
 
     # Per-company pricing (MeyerCompanyPricing) is handled by Phase 3 pricing jobs.
 
+    # -------------------------------------------------------------------------
+    # Pass 2 — inventory overlay: stream inventory CSV again, same batched
+    # dedup pattern.  All brands are already in brand_by_mfg from Pass 1 so
+    # no missing-brand check is needed.
+    # -------------------------------------------------------------------------
     if inventory_row_count > 0:
-        overlay_raw: typing.List[src_models.MeyerParts] = []
-        # Identify any brands from inventory not yet in brand_by_mfg (we already collected rows).
-        missing_brands = set()
-        for row in inventory_rows_collected:
-            mfg = _meyer_brand_key(row.get("MFGName"))
-            if mfg and mfg not in brand_by_mfg:
-                missing_brands.add(mfg)
-        if missing_brands:
-            extra = [
-                src_models.MeyerBrand(external_id=n, name=n, aaia_code=None)
-                for n in sorted(missing_brands)
-            ]
-            pgbulk.upsert(
-                src_models.MeyerBrand,
-                extra,
-                unique_fields=["external_id"],
-                update_fields=["name"],
+        logger.info(
+            "{} Pass 2 — inventory overlay: streaming {} rows in batches of {}.".format(
+                _LOG_PREFIX, inventory_row_count, BATCH,
             )
-            brand_by_mfg.update(_brand_map_for_names(missing_brands))
+        )
+        overlay_buf: typing.Dict[typing.Tuple[int, str], src_models.MeyerParts] = {}
+        total_overlay_upserted = 0
+        inv_batch_num = 0
+        inv_upsert_started = time.monotonic()
 
-        for row in inventory_rows_collected:
-            p = _part_from_inventory_row(row, brand_by_mfg)
-            if p:
-                overlay_raw.append(p)
-
-        overlay = _dedupe_meyer_parts_for_upsert(overlay_raw)
-        if len(overlay) < len(overlay_raw):
-            logger.info(
-                "{} Inventory: {} duplicate (brand, meyer_part) rows in feed; kept {}.".format(
-                    _LOG_PREFIX, len(overlay_raw) - len(overlay), len(overlay),
-                )
-            )
-
-        for i in range(0, len(overlay), BATCH):
-            batch = overlay[i : i + BATCH]
+        def _flush_overlay_buf() -> None:
+            nonlocal total_overlay_upserted, inv_batch_num
+            if not overlay_buf:
+                return
+            batch_list = list(overlay_buf.values())
             _now = timezone.now()
-            for _p in batch:
+            for _p in batch_list:
                 _p.updated_at = _now
             pgbulk.upsert(
                 src_models.MeyerParts,
-                batch,
+                batch_list,
                 unique_fields=["meyer_part", "brand"],
                 update_fields=INVENTORY_UPDATE_FIELDS,
             )
+            inv_batch_num += 1
+            total_overlay_upserted += len(batch_list)
+            logger.info(
+                "{} Inventory upsert batch {} — {} rows flushed ({} total, {:.1f}s elapsed).".format(
+                    _LOG_PREFIX, inv_batch_num, len(batch_list), total_overlay_upserted,
+                    time.monotonic() - inv_upsert_started,
+                )
+            )
+            overlay_buf.clear()
             connection.close()
-            if i + BATCH < len(overlay):
-                time.sleep(DELAY)
-        logger.info("{} Upserted {} inventory overlays.".format(_LOG_PREFIX, len(overlay)))
+            time.sleep(DELAY)
+
+        for row in _iter_records_from_csv(inventory_path):
+            p = _part_from_inventory_row(row, brand_by_mfg)
+            if not p:
+                continue
+            bid = p.brand_id
+            if bid is None and p.brand is not None:
+                bid = p.brand.pk
+            sku = (p.meyer_part or "").strip()
+            if not bid or not sku:
+                continue
+            overlay_buf[(int(bid), sku)] = p
+            if len(overlay_buf) >= BATCH:
+                _flush_overlay_buf()
+
+        _flush_overlay_buf()  # flush final partial batch
+        logger.info(
+            "{} MeyerParts inventory overlay complete: {} rows upserted.".format(
+                _LOG_PREFIX, total_overlay_upserted,
+            )
+        )
 
     logger.info("{} Meyer ingest complete.".format(_LOG_PREFIX))
 
