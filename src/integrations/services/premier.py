@@ -87,6 +87,21 @@ def _safe_bool(value: typing.Any) -> bool:
     return str(value).strip().upper() in ("YES", "TRUE", "1", "T", "Y")
 
 
+def _upc_clean(value: typing.Any) -> typing.Optional[str]:
+    """
+    Premier delivers UPC as a float in the CSV (e.g. 889668106350.0).
+    Convert to int-string so we store "889668106350" not "889668106350.0".
+    Falls back to plain string cleanup if conversion fails.
+    """
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    try:
+        return str(int(float(value)))
+    except (TypeError, ValueError):
+        s = str(value).strip()
+        return s if s else None
+
+
 def fetch_and_save_premier_brands() -> None:
     """
     Download the Premier CSV and upsert brands from unique Brand + Line Code values.
@@ -387,7 +402,7 @@ def _transform_parts_data(
                     width=_safe_decimal(row.get("Width")),
                     height=_safe_decimal(row.get("Height")),
                     weight=_safe_decimal(row.get("Weight")),
-                    upc_code=_clean(row.get("Upc")),
+                    upc_code=_upc_clean(row.get("Upc")),
                     usa_item_availability=_safe_int(row.get("USA Item Availability")),
                     core_charge=None if omit_pricing else _safe_decimal(row.get("Core Charge")),
                     jobber_price=None if omit_pricing else _safe_decimal(row.get("Jobber")),

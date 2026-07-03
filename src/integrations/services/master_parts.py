@@ -130,7 +130,7 @@ BATCH_DELAY_SECONDS = 0.1  # Reduced from 0.3 - was adding ~30s per 100 batches
 
 # Partition ``sync_master_parts_from_*`` by internal ``Brands.id`` so workers never compete on the same
 # ``(brand_id, part_number)`` upsert. Tune down if PostgreSQL connection pool is tight.
-MASTER_PARTS_SYNC_MAX_WORKERS = 8
+MASTER_PARTS_SYNC_MAX_WORKERS = 16
 
 
 def _partition_mapped_brands_for_parallel_ingest(
@@ -5363,17 +5363,19 @@ def _maybe_reindex_meilisearch_after_master_parts(
     )
 
 
-def sync_derived_from_turn14(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False) -> None:
+def sync_derived_from_turn14(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False, skip_pricing: bool = False) -> None:
     """
     Propagate Turn14 source data into MasterPart, ProviderPart, ProviderPartInventory,
     and ProviderPartCompanyPricing. Call after Turn14 item/catalog fetches so the unified
     layer stays aligned without waiting for the global ``sync_all_master_parts`` job.
 
     Pass ``skip_master_parts=True`` to run only inventory + pricing (fast incremental path).
+    Pass ``skip_pricing=True`` to run only master parts + inventory (global catalog sync path;
+    pricing handled separately via IntegrationPricingSyncJob queue).
     """
     logger.info("{} Starting Turn14-only derived sync ({}).".format(
         _LOG_PREFIX,
-        "inventory + pricing only" if skip_master_parts else "parts, inventory, pricing",
+        "inventory + pricing only" if skip_master_parts else "parts, inventory" + ("" if skip_pricing else ", pricing"),
     ))
     if not skip_master_parts:
         sync_master_parts_from_turn14()
@@ -5382,8 +5384,9 @@ def sync_derived_from_turn14(*, reindex_meilisearch: bool = False, skip_master_p
     def _cont() -> None:
         sync_provider_inventory_from_turn14()
         connection.close()
-        sync_provider_pricing_from_turn14()
-        connection.close()
+        if not skip_pricing:
+            sync_provider_pricing_from_turn14()
+            connection.close()
 
     if skip_master_parts:
         _cont()
@@ -5396,20 +5399,17 @@ def sync_derived_from_turn14(*, reindex_meilisearch: bool = False, skip_master_p
     logger.info("{} Completed Turn14-only derived sync.".format(_LOG_PREFIX))
 
 
-def sync_derived_from_keystone(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False) -> None:
+def sync_derived_from_keystone(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False, skip_pricing: bool = False) -> None:
     """
     Propagate Keystone source data into MasterPart, ProviderPart, ProviderPartInventory,
     and ProviderPartCompanyPricing. Call after Keystone inventory/CSV fetches.
 
-    ``reindex_meilisearch`` is off in normal operation; the scheduled ``ingest_all_providers`` run
-    ends with a single full reindex. Pass True only for ad-hoc reindex with this call (skipped
-    when Meilisearch is not configured).
-
     Pass ``skip_master_parts=True`` to run only inventory + pricing (fast incremental path).
+    Pass ``skip_pricing=True`` to run only master parts + inventory (global catalog sync path).
     """
     logger.info("{} Starting Keystone-only derived sync ({}).".format(
         _LOG_PREFIX,
-        "inventory + pricing only" if skip_master_parts else "parts, inventory, pricing",
+        "inventory + pricing only" if skip_master_parts else "parts, inventory" + ("" if skip_pricing else ", pricing"),
     ))
     if not skip_master_parts:
         sync_master_parts_from_keystone()
@@ -5418,8 +5418,9 @@ def sync_derived_from_keystone(*, reindex_meilisearch: bool = False, skip_master
     def _cont() -> None:
         sync_provider_inventory_from_keystone()
         connection.close()
-        sync_provider_pricing_from_keystone()
-        connection.close()
+        if not skip_pricing:
+            sync_provider_pricing_from_keystone()
+            connection.close()
 
     if skip_master_parts:
         _cont()
@@ -5432,16 +5433,17 @@ def sync_derived_from_keystone(*, reindex_meilisearch: bool = False, skip_master
     logger.info("{} Completed Keystone-only derived sync.".format(_LOG_PREFIX))
 
 
-def sync_derived_from_rough_country(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False) -> None:
+def sync_derived_from_rough_country(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False, skip_pricing: bool = False) -> None:
     """
     Propagate Rough Country source data into MasterPart, ProviderPart, ProviderPartInventory,
     and ProviderPartCompanyPricing. Call after Rough Country feed ingest.
 
     Pass ``skip_master_parts=True`` to run only inventory + pricing (fast incremental path).
+    Pass ``skip_pricing=True`` to run only master parts + inventory (global catalog sync path).
     """
     logger.info("{} Starting Rough Country-only derived sync ({}).".format(
         _LOG_PREFIX,
-        "inventory + pricing only" if skip_master_parts else "parts, inventory, pricing",
+        "inventory + pricing only" if skip_master_parts else "parts, inventory" + ("" if skip_pricing else ", pricing"),
     ))
     if not skip_master_parts:
         sync_master_parts_from_rough_country()
@@ -5450,8 +5452,9 @@ def sync_derived_from_rough_country(*, reindex_meilisearch: bool = False, skip_m
     def _cont() -> None:
         sync_provider_inventory_from_rough_country()
         connection.close()
-        sync_provider_pricing_from_rough_country()
-        connection.close()
+        if not skip_pricing:
+            sync_provider_pricing_from_rough_country()
+            connection.close()
 
     if skip_master_parts:
         _cont()
@@ -5464,16 +5467,17 @@ def sync_derived_from_rough_country(*, reindex_meilisearch: bool = False, skip_m
     logger.info("{} Completed Rough Country-only derived sync.".format(_LOG_PREFIX))
 
 
-def sync_derived_from_wheelpros(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False) -> None:
+def sync_derived_from_wheelpros(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False, skip_pricing: bool = False) -> None:
     """
     Propagate WheelPros source data into MasterPart, ProviderPart, ProviderPartInventory,
     and ProviderPartCompanyPricing. Call after WheelPros CSV ingest.
 
     Pass ``skip_master_parts=True`` to run only inventory + pricing (fast incremental path).
+    Pass ``skip_pricing=True`` to run only master parts + inventory (global catalog sync path).
     """
     logger.info("{} Starting WheelPros-only derived sync ({}).".format(
         _LOG_PREFIX,
-        "inventory + pricing only" if skip_master_parts else "parts, inventory, pricing",
+        "inventory + pricing only" if skip_master_parts else "parts, inventory" + ("" if skip_pricing else ", pricing"),
     ))
     if not skip_master_parts:
         sync_master_parts_from_wheelpros()
@@ -5482,8 +5486,9 @@ def sync_derived_from_wheelpros(*, reindex_meilisearch: bool = False, skip_maste
     def _cont() -> None:
         sync_provider_inventory_from_wheelpros()
         connection.close()
-        sync_provider_pricing_from_wheelpros()
-        connection.close()
+        if not skip_pricing:
+            sync_provider_pricing_from_wheelpros()
+            connection.close()
 
     if skip_master_parts:
         _cont()
@@ -5496,16 +5501,17 @@ def sync_derived_from_wheelpros(*, reindex_meilisearch: bool = False, skip_maste
     logger.info("{} Completed WheelPros-only derived sync.".format(_LOG_PREFIX))
 
 
-def sync_derived_from_meyer(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False) -> None:
+def sync_derived_from_meyer(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False, skip_pricing: bool = False) -> None:
     """
     Propagate Meyer source data into MasterPart, ProviderPart, ProviderPartInventory,
     and ProviderPartCompanyPricing. Call after Meyer catalog / inventory ingest.
 
     Pass ``skip_master_parts=True`` to run only inventory + pricing (fast incremental path).
+    Pass ``skip_pricing=True`` to run only master parts + inventory (global catalog sync path).
     """
     logger.info("{} Starting Meyer-only derived sync ({}).".format(
         _LOG_PREFIX,
-        "inventory + pricing only" if skip_master_parts else "parts, inventory, pricing",
+        "inventory + pricing only" if skip_master_parts else "parts, inventory" + ("" if skip_pricing else ", pricing"),
     ))
     if not skip_master_parts:
         sync_master_parts_from_meyer()
@@ -5514,8 +5520,9 @@ def sync_derived_from_meyer(*, reindex_meilisearch: bool = False, skip_master_pa
     def _cont() -> None:
         sync_provider_inventory_from_meyer()
         connection.close()
-        sync_provider_pricing_from_meyer()
-        connection.close()
+        if not skip_pricing:
+            sync_provider_pricing_from_meyer()
+            connection.close()
 
     if skip_master_parts:
         _cont()
@@ -5528,16 +5535,17 @@ def sync_derived_from_meyer(*, reindex_meilisearch: bool = False, skip_master_pa
     logger.info("{} Completed Meyer-only derived sync.".format(_LOG_PREFIX))
 
 
-def sync_derived_from_atech(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False) -> None:
+def sync_derived_from_atech(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False, skip_pricing: bool = False) -> None:
     """
     Propagate A-Tech source data into MasterPart, ProviderPart, ProviderPartInventory,
     and ProviderPartCompanyPricing. Call after A-Tech feed ingest.
 
     Pass ``skip_master_parts=True`` to run only inventory + pricing (fast incremental path).
+    Pass ``skip_pricing=True`` to run only master parts + inventory (global catalog sync path).
     """
     logger.info("{} Starting A-Tech-only derived sync ({}).".format(
         _LOG_PREFIX,
-        "inventory + pricing only" if skip_master_parts else "parts, inventory, pricing",
+        "inventory + pricing only" if skip_master_parts else "parts, inventory" + ("" if skip_pricing else ", pricing"),
     ))
     if not skip_master_parts:
         sync_master_parts_from_atech()
@@ -5546,8 +5554,9 @@ def sync_derived_from_atech(*, reindex_meilisearch: bool = False, skip_master_pa
     def _cont() -> None:
         sync_provider_inventory_from_atech()
         connection.close()
-        sync_provider_pricing_from_atech()
-        connection.close()
+        if not skip_pricing:
+            sync_provider_pricing_from_atech()
+            connection.close()
 
     if skip_master_parts:
         _cont()
@@ -5560,16 +5569,17 @@ def sync_derived_from_atech(*, reindex_meilisearch: bool = False, skip_master_pa
     logger.info("{} Completed A-Tech-only derived sync.".format(_LOG_PREFIX))
 
 
-def sync_derived_from_dlg(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False) -> None:
+def sync_derived_from_dlg(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False, skip_pricing: bool = False) -> None:
     """
     Propagate DLG source data into MasterPart, ProviderPart, ProviderPartInventory,
     and ProviderPartCompanyPricing. Call after DLG catalog ingest.
 
     Pass ``skip_master_parts=True`` to run only inventory + pricing (fast incremental path).
+    Pass ``skip_pricing=True`` to run only master parts + inventory (global catalog sync path).
     """
     logger.info("{} Starting DLG-only derived sync ({}).".format(
         _LOG_PREFIX,
-        "inventory + pricing only" if skip_master_parts else "parts, inventory, pricing",
+        "inventory + pricing only" if skip_master_parts else "parts, inventory" + ("" if skip_pricing else ", pricing"),
     ))
     if not skip_master_parts:
         sync_master_parts_from_dlg()
@@ -5578,8 +5588,9 @@ def sync_derived_from_dlg(*, reindex_meilisearch: bool = False, skip_master_part
     def _cont() -> None:
         sync_provider_inventory_from_dlg()
         connection.close()
-        sync_provider_pricing_from_dlg()
-        connection.close()
+        if not skip_pricing:
+            sync_provider_pricing_from_dlg()
+            connection.close()
 
     if skip_master_parts:
         _cont()
@@ -5639,10 +5650,11 @@ def _premier_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
         {"key": "item_with_cores",      "label": "Item With Cores",             "value": _bool(row.get("item_with_cores"))},
         {"key": "is_kit",               "label": "Kit",                         "value": _bool(row.get("is_kit"))},
         {"key": "kit_components",       "label": "Kit Components",              "value": kit_html},
-        {"key": "prop65_carcinogen",    "label": "Prop 65 Carcinogen",          "value": _bool(row.get("prop65_carcinogen"))},
-        {"key": "prop65_reproductive",  "label": "Prop 65 Reproductive Harm",   "value": _bool(row.get("prop65_reproductive_harm"))},
+        {"key": "prop65_carcinogen",    "label": "Prop 65 Warning (Cancer)",            "value": _bool(row.get("prop65_carcinogen"))},
+        {"key": "prop65_reproductive",  "label": "Prop 65 Warning (Reproductive Harm)", "value": _bool(row.get("prop65_reproductive_harm"))},
         {"key": "approved_line",        "label": "Approved Line",               "value": _bool(row.get("approved_line"))},
         {"key": "california_legal",     "label": "California Legal",            "value": _bool(row.get("california_legal"))},
+        {"key": "inventory_status",     "label": "Inventory Status",            "value": row.get("inventory_status")},
         {"key": "pies_ems_code",        "label": "PIES EMS Code",               "value": row.get("pies_ems_code")},
         {"key": "minimum_order_qty",    "label": "Minimum Order Qty",           "value": row.get("minimum_order_qty")},
         {"key": "drop_shippable_mfg",   "label": "Drop Shippable from MFG",    "value": _bool(row.get("drop_shippable_from_mfg"))},
@@ -5935,7 +5947,12 @@ def sync_provider_inventory_from_premier() -> None:
                     "id",
                     "brand_id",
                     "premier_part_number",
-                    *src_constants.PREMIER_WAREHOUSE_QTY_FIELD_TO_LOCATION_LABEL.keys(),
+                    "nv_qty",
+                    "ky_qty",
+                    "wa_qty",
+                    "mfg_qty",
+                    "usa_item_availability",
+                    "inventory_status",
                     "ships_ltl",
                     "drop_ship_fee",
                     "length",
@@ -5971,16 +5988,13 @@ def sync_provider_inventory_from_premier() -> None:
                 if not pp:
                     continue
 
-                total_qty = sum(
-                    int(kp.get(f) or 0)
-                    for f in src_constants.PREMIER_WAREHOUSE_QTY_FIELD_TO_LOCATION_LABEL
-                )
+                total_qty = kp.get("usa_item_availability") or 0
 
                 to_upsert.append(
                     src_models.ProviderPartInventory(
                         provider_part=pp,
                         warehouse_total_qty=total_qty,
-                        manufacturer_inventory=None,
+                        manufacturer_inventory=kp.get("mfg_qty"),
                         manufacturer_esd=None,
                         warehouse_availability=_premier_warehouse_availability(kp),
                         last_synced_at=now,
@@ -6069,6 +6083,7 @@ def sync_provider_pricing_from_premier() -> None:
                     "map_price",
                     "part__brand_id",
                     "part__mfg_part_number",
+                    "part__retail_price",
                 )[:BATCH_SIZE_PRICING]
             )
             if not batch:
@@ -6120,7 +6135,7 @@ def sync_provider_pricing_from_premier() -> None:
                         cost=row.get("customer_price"),
                         jobber_price=row.get("jobber_price"),
                         map_price=row.get("map_price"),
-                        msrp=None,
+                        msrp=row.get("part__retail_price"),
                         retail_price=None,
                         last_synced_at=now,
                     )
@@ -6193,6 +6208,7 @@ def sync_provider_pricing_from_premier_for_company(company_id: int) -> None:
                     "map_price",
                     "part__brand_id",
                     "part__mfg_part_number",
+                    "part__retail_price",
                 )[:BATCH_SIZE_PRICING]
             )
             if not batch:
@@ -6244,7 +6260,7 @@ def sync_provider_pricing_from_premier_for_company(company_id: int) -> None:
                         cost=row.get("customer_price"),
                         jobber_price=row.get("jobber_price"),
                         map_price=row.get("map_price"),
-                        msrp=None,
+                        msrp=row.get("part__retail_price"),
                         retail_price=None,
                         last_synced_at=now,
                     )
@@ -6276,16 +6292,17 @@ def sync_provider_pricing_from_premier_for_company(company_id: int) -> None:
     ))
 
 
-def sync_derived_from_premier(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False) -> None:
+def sync_derived_from_premier(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False, skip_pricing: bool = False) -> None:
     """
     Propagate Premier (APG Wholesale) source data into MasterPart, ProviderPart,
     ProviderPartInventory, and ProviderPartCompanyPricing. Call after Premier FTP ingest.
 
     Pass ``skip_master_parts=True`` to run only inventory + pricing (fast incremental path).
+    Pass ``skip_pricing=True`` to run only master parts + inventory (global catalog sync path).
     """
     logger.info("{} Starting Premier-only derived sync ({}).".format(
         _LOG_PREFIX,
-        "inventory + pricing only" if skip_master_parts else "parts, inventory, pricing",
+        "inventory + pricing only" if skip_master_parts else "parts, inventory" + ("" if skip_pricing else ", pricing"),
     ))
     if not skip_master_parts:
         sync_master_parts_from_premier()
@@ -6294,8 +6311,9 @@ def sync_derived_from_premier(*, reindex_meilisearch: bool = False, skip_master_
     def _cont() -> None:
         sync_provider_inventory_from_premier()
         connection.close()
-        sync_provider_pricing_from_premier()
-        connection.close()
+        if not skip_pricing:
+            sync_provider_pricing_from_premier()
+            connection.close()
 
     if skip_master_parts:
         _cont()
@@ -6357,6 +6375,43 @@ def sync_all_master_parts() -> None:
     sync_derived_from_premier(reindex_meilisearch=False)
 
     logger.info("{} Completed full master parts sync.".format(_LOG_PREFIX))
+
+
+def sync_all_master_parts_global() -> None:
+    """
+    Global catalog + inventory sync — **no per-company pricing**.
+
+    Designed for the nightly ``ingest_all_providers`` pipeline:
+    - Runs MasterPart / ProviderPart upsert + ProviderPartInventory for every provider.
+    - Skips ProviderPartCompanyPricing (``skip_pricing=True``) to keep memory low and
+      separate the long-running catalog phase from per-company pricing concerns.
+    - After this call, the caller should enqueue ``IntegrationPricingSyncJob`` rows for all
+      active company-providers so pricing syncs run asynchronously.
+
+    Provider ordering:
+    - Turn14 always runs **first** (other providers may shadow Turn14 data; Turn14 must settle first).
+    - All remaining providers run sequentially with ``_reclaim_memory()`` between each to prevent
+      cumulative RSS growth across the multi-hour sync window.
+    """
+    logger.info("{} Starting global master parts sync (catalog + inventory, no pricing).".format(_LOG_PREFIX))
+
+    sync_derived_from_turn14(skip_pricing=True)
+    _reclaim_memory()
+    sync_derived_from_keystone(skip_pricing=True)
+    _reclaim_memory()
+    sync_derived_from_meyer(skip_pricing=True)
+    _reclaim_memory()
+    sync_derived_from_atech(skip_pricing=True)
+    _reclaim_memory()
+    sync_derived_from_rough_country(skip_pricing=True)
+    _reclaim_memory()
+    sync_derived_from_dlg(skip_pricing=True)
+    _reclaim_memory()
+    sync_derived_from_wheelpros(skip_pricing=True)
+    _reclaim_memory()
+    sync_derived_from_premier(skip_pricing=True)
+
+    logger.info("{} Completed global master parts sync (catalog + inventory, no pricing).".format(_LOG_PREFIX))
 
 
 def sync_all_master_parts_incremental() -> None:
