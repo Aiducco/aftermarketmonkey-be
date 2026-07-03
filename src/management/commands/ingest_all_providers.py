@@ -1,19 +1,35 @@
 """
-Single scheduled entrypoint: all distributor **source fetches** in order, then
-``sync_all_master_parts`` (applies all ``sync_derived_from_*`` in one pass), then one
-Meilisearch reindex.
+Single scheduled entrypoint: all distributor **source fetches** in parallel, then
+``sync_all_master_parts_global`` (catalog + inventory, no pricing), then pricing jobs
+enqueued for all active company-providers, then Meilisearch zero-downtime reindex.
+
+Architecture overview:
+  Phase 1 — Source fetch (all providers in parallel):
+    All distributors (Turn14, Keystone, Meyer, A-Tech, Rough Country, DLG, WheelPros,
+    Premier) run concurrently via a ThreadPoolExecutor. Meyer, A-Tech and DLG share the
+    SFTP relay at 5.161.121.143 — a semaphore caps concurrent relay connections at
+    ``RELAY_SFTP_MAX_CONCURRENT``.
+
+  Phase 2 — Global catalog + inventory sync:
+    ``sync_all_master_parts_global()`` upserts MasterPart / ProviderPart / ProviderPartInventory
+    for every provider. Turn14 always runs first inside this function; all other providers
+    follow sequentially with memory reclamation between each. No pricing in this phase.
+
+  Phase 3 — Enqueue per-company pricing jobs:
+    ``enqueue_all_active_company_provider_pricing_jobs()`` creates an
+    ``IntegrationPricingSyncJob`` row for every active company-provider. The
+    ``process_integration_pricing_sync_jobs`` management command (run by a separate cron)
+    picks these up and runs per-company pricing syncs asynchronously, decoupling them from
+    the long catalog sync window.
+
+  Phase 4 — Meilisearch zero-downtime reindex (nightly, via index_parts_meilisearch):
+    ``reindex_all_master_parts_zero_downtime()`` indexes into a staging index then
+    atomically swaps it with the live index so users never see an empty search.
+    This phase is intentionally **disabled** here and runs from its own nightly cron
+    to avoid OOM during the 4-hour ingest window.
 
 Creates a parent ``ScheduledTaskExecution`` for the whole run and a **child** execution per
-sub-step (each provider source ingest, ``sync_all_master_parts``, and Meilisearch) so
-ScheduledTaskExecution shows start/finish of each part.
-
-Source fetch ordering:
-  1. Turn14 always runs first and must complete before any other provider starts.
-  2. All remaining providers (Keystone, Meyer, A-Tech, Rough Country, DLG, WheelPros,
-     Premier) run in parallel via a ThreadPoolExecutor.
-  3. Meyer, A-Tech and DLG all use the shared SFTP relay at 5.161.121.143 — a
-     semaphore caps concurrent relay connections at ``RELAY_SFTP_MAX_CONCURRENT``
-     to avoid saturating the relay.
+sub-step so the admin panel shows start/finish of each part.
 """
 import concurrent.futures
 import contextlib
@@ -29,6 +45,7 @@ from src.audit import scheduled_tasks as audit_scheduled_tasks
 from src.integrations.services import (
     atech,
     dlg,
+    integration_pricing_sync_jobs,
     keystone,
     master_parts,
     meyer,
@@ -37,7 +54,7 @@ from src.integrations.services import (
     turn_14,
     wheelpros,
 )
-from src.search.meilisearch_client import is_configured, reindex_all_master_parts
+from src.search.meilisearch_client import is_configured, reindex_all_master_parts_zero_downtime
 
 logger = logging.getLogger(__name__)
 
@@ -50,9 +67,9 @@ RELAY_SFTP_MAX_CONCURRENT = 2
 
 class Command(BaseCommand):
     help = (
-        "Fetch/source-ingest for each distributor in order, then ``sync_all_master_parts``, then one "
-        "Meilisearch reindex. Each step records its own ``ScheduledTaskExecution`` (per provider, "
-        "sync, reindex) plus a parent run row."
+        "Source fetch for all distributors (parallel), then sync_all_master_parts_global "
+        "(catalog + inventory, no pricing), then enqueue per-company pricing jobs, then "
+        "Meilisearch zero-downtime reindex (skipped here; run index_parts_meilisearch nightly)."
     )
 
     def add_arguments(self, parser):
@@ -120,24 +137,18 @@ class Command(BaseCommand):
             "ingest_all_providers_wheelpros",
             "ingest_all_providers_premier",
             "ingest_all_providers_sync_all_master_parts",
+            "ingest_all_providers_enqueue_pricing_jobs",
             "ingest_all_providers_meilisearch_reindex",
         ])
         self._ingest_log("start")
         execution = audit_scheduled_tasks.start_scheduled_task_execution(_TASK_NAME)
         try:
             # ----------------------------------------------------------------
-            # Phase 1: Turn14 always runs first and must complete before
-            # any other provider starts.
-            # ----------------------------------------------------------------
-            self._ingest_log("phase 1 | Turn14 source fetch (must complete before others)")
-            self._run_turn14()
-            self._ingest_log("phase 1 | Turn14 done; starting parallel provider fetches")
-
-            # ----------------------------------------------------------------
-            # Phase 2: all remaining providers in parallel.
+            # Phase 1: All providers fetch in parallel.
             # Meyer / A-Tech / DLG share the SFTP relay — a semaphore limits
             # concurrent relay connections to RELAY_SFTP_MAX_CONCURRENT.
             # ----------------------------------------------------------------
+            self._ingest_log("phase 1 | starting parallel source fetches for all providers")
             relay_sem = threading.Semaphore(RELAY_SFTP_MAX_CONCURRENT)
 
             def _relay(fn: typing.Callable[[], None]) -> typing.Callable[[], None]:
@@ -156,6 +167,7 @@ class Command(BaseCommand):
                 return _wrapped
 
             parallel_tasks: typing.List[typing.Tuple[str, typing.Callable[[], None]]] = [
+                ("turn14",        _direct(self._run_turn14)),
                 ("keystone",      _direct(self._run_keystone)),
                 ("meyer",         _relay(self._run_meyer)),
                 ("atech",         _relay(self._run_atech)),
@@ -177,33 +189,58 @@ class Command(BaseCommand):
                     name = fut_map[fut]
                     try:
                         fut.result()
-                        self._ingest_log("phase 2 | {} fetch thread finished".format(name))
+                        self._ingest_log("phase 1 | {} fetch thread finished".format(name))
                     except Exception as exc:  # noqa: BLE001 – logged, not re-raised
                         self._ingest_log(
-                            "phase 2 | {} fetch thread raised unexpected error: {!s}".format(name, exc)
+                            "phase 1 | {} fetch thread raised unexpected error: {!s}".format(name, exc)
                         )
 
-            self._ingest_log("phase 2 | all provider fetches complete")
+            self._ingest_log("phase 1 | all provider source fetches complete")
 
+            # ----------------------------------------------------------------
+            # Phase 2: Global catalog + inventory sync (Turn14 first inside).
+            # No pricing — pricing is handled per-company via the job queue.
+            # ----------------------------------------------------------------
             with self._audited_step(
                 "ingest_all_providers_sync_all_master_parts",
-                "Full derived sync (Turn14, Keystone, Meyer, A-Tech, RC, DLG, WheelPros, Premier) complete.",
+                "Global catalog + inventory sync (all providers, no pricing) complete.",
             ):
-                self._ingest_log("all provider source ingests done; running sync_all_master_parts()")
-                master_parts.sync_all_master_parts()
-            self.stdout.write(self.style.SUCCESS("Master parts sync completed."))
+                self._ingest_log(
+                    "phase 2 | running sync_all_master_parts_global() "
+                    "(Turn14 first, then others; no pricing)"
+                )
+                master_parts.sync_all_master_parts_global()
+            self.stdout.write(self.style.SUCCESS("Master parts global sync completed."))
 
-            # Meilisearch full reindex is intentionally disabled here.
-            # Run ``index_parts_meilisearch`` separately to avoid OOM during the 4-hour ingest window.
+            # ----------------------------------------------------------------
+            # Phase 3: Enqueue per-company pricing sync jobs.
+            # ----------------------------------------------------------------
+            with self._audited_step(
+                "ingest_all_providers_enqueue_pricing_jobs",
+                "Per-company pricing sync jobs enqueued for all active company-providers.",
+            ):
+                self._ingest_log("phase 3 | enqueueing pricing sync jobs for all active company-providers")
+                n_jobs = integration_pricing_sync_jobs.enqueue_all_active_company_provider_pricing_jobs()
+                self._ingest_log("phase 3 | enqueued {} pricing sync job(s)".format(n_jobs))
+            self.stdout.write(self.style.SUCCESS("Pricing sync jobs enqueued: {}.".format(n_jobs)))
+
+            # ----------------------------------------------------------------
+            # Phase 4: Meilisearch zero-downtime reindex.
+            # Intentionally disabled here — run ``index_parts_meilisearch`` from its
+            # own nightly cron to avoid OOM during the 4-hour ingest window.
+            # ----------------------------------------------------------------
             ex = audit_scheduled_tasks.start_scheduled_task_execution(
                 "ingest_all_providers_meilisearch_reindex"
             )
             audit_scheduled_tasks.mark_scheduled_task_skipped(
                 ex, message="Meilisearch reindex disabled in ingest_all_providers; run index_parts_meilisearch separately."
             )
-            self._ingest_log("Meilisearch reindex skipped (disabled; run index_parts_meilisearch separately)")
+            self._ingest_log("phase 4 | Meilisearch reindex skipped (run index_parts_meilisearch nightly)")
 
-            end_msg = "Completed full scheduled ingest and master parts sync (Meilisearch reindex disabled)."
+            end_msg = (
+                "Completed full scheduled ingest, global master parts sync, and pricing job enqueueing "
+                "(Meilisearch reindex runs separately via nightly cron)."
+            )
             audit_scheduled_tasks.mark_scheduled_task_completed(execution, message=end_msg)
             self._ingest_log("run completed successfully")
             self.stdout.write(self.style.SUCCESS("Successfully completed {}.".format(_TASK_NAME)))

@@ -179,10 +179,11 @@ def _build_docs_for_batch(
     return docs
 
 
-def _upload_raw_docs(docs: typing.List[typing.Dict]) -> bool:
+def _upload_raw_docs(docs: typing.List[typing.Dict], index_name: str = INDEX_NAME) -> bool:
     """
     Upload pre-built document dicts to Meilisearch with retries.
     Returns True on success. Workers and single-threaded paths both use this.
+    Pass ``index_name`` to target a staging index during zero-downtime reindex.
     """
     if not docs:
         return True
@@ -190,7 +191,7 @@ def _upload_raw_docs(docs: typing.List[typing.Dict]) -> bool:
     for attempt in range(_REINDEX_ADD_RETRIES):
         try:
             client = _get_client()
-            index = client.index(INDEX_NAME)
+            index = client.index(index_name)
             index.add_documents(docs, primary_key="id")
             return True
         except Exception as e:
@@ -198,20 +199,20 @@ def _upload_raw_docs(docs: typing.List[typing.Dict]) -> bool:
             if attempt < _REINDEX_ADD_RETRIES - 1 and _transient_meilisearch_error(e):
                 wait_s = min(30.0, 2.0 ** attempt)
                 logger.warning(
-                    "Meilisearch _upload_raw_docs: transient error (retry) | len=%s attempt=%s/%s "
+                    "Meilisearch _upload_raw_docs: transient error (retry) | index=%s len=%s attempt=%s/%s "
                     "wait_s=%.1f err_type=%s err=%s",
-                    len(docs), attempt + 1, _REINDEX_ADD_RETRIES,
+                    index_name, len(docs), attempt + 1, _REINDEX_ADD_RETRIES,
                     wait_s, type(e).__name__, e,
                 )
                 time.sleep(wait_s)
                 continue
             logger.exception(
-                "Meilisearch _upload_raw_docs: failed | len=%s attempt=%s err_type=%s",
-                len(docs), attempt + 1, type(e).__name__,
+                "Meilisearch _upload_raw_docs: failed | index=%s len=%s attempt=%s err_type=%s",
+                index_name, len(docs), attempt + 1, type(e).__name__,
             )
             return False
     if last_err:
-        logger.exception("Meilisearch _upload_raw_docs: exhausted retries | err=%s", last_err)
+        logger.exception("Meilisearch _upload_raw_docs: exhausted retries | index=%s err=%s", index_name, last_err)
     return False
 
 
@@ -303,11 +304,13 @@ def add_documents_in_batches(
     queryset,
     batch_size: int = 10000,
     max_upload_workers: int = 1,
+    target_index_name: str = INDEX_NAME,
 ) -> typing.Tuple[int, int]:
     """
     Index all parts from a MasterPart queryset in batches (cursor-based by id).
     When ``max_upload_workers`` > 1, upload batches concurrently (each worker uses its own
     Meilisearch client). Main thread reads from Django; workers only serialize and POST.
+    Pass ``target_index_name`` to write into a staging index (used by zero-downtime reindex).
     Returns (total_indexed, total_failed).
     """
     if not is_configured():
@@ -330,7 +333,7 @@ def add_documents_in_batches(
 
         logger.info(
             "Meilisearch bulk index: started | index=%s batch_size=%s workers=1",
-            INDEX_NAME,
+            target_index_name,
             batch_size,
         )
 
@@ -343,7 +346,7 @@ def add_documents_in_batches(
             batch_t0 = time.monotonic()
             cat_map = _bulk_category_map_for_ids([p.id for p in batch])
             docs = _build_docs_for_batch(batch, cat_map)
-            ok = _upload_raw_docs(docs)
+            ok = _upload_raw_docs(docs, index_name=target_index_name)
             batch_dt = time.monotonic() - batch_t0
             if ok:
                 total_ok += len(batch)
@@ -405,7 +408,7 @@ def add_documents_in_batches(
         for attempt in range(_REINDEX_ADD_RETRIES):
             try:
                 client = _get_client()
-                index = client.index(INDEX_NAME)
+                index = client.index(target_index_name)
                 index.add_documents(docs, primary_key="id")
                 upload_dt = time.monotonic() - upload_t0
                 dps = len(docs) / upload_dt if upload_dt > 0 else 0.0
@@ -482,7 +485,7 @@ def add_documents_in_batches(
     logger.info(
         "Meilisearch bulk index: started (parallel) | index=%s batch_size=%s max_upload_workers=%s "
         "max_in_flight=%s",
-        INDEX_NAME,
+        target_index_name,
         batch_size,
         max_upload_workers,
         max_in_flight,
@@ -600,6 +603,134 @@ def reindex_all_master_parts(
         total_elapsed,
     )
     return ok, fail
+
+
+def reindex_all_master_parts_zero_downtime(
+    batch_size: int = REINDEX_DEFAULT_BATCH_SIZE,
+    max_upload_workers: int = REINDEX_DEFAULT_UPLOAD_WORKERS,
+) -> typing.Tuple[int, int]:
+    """
+    Zero-downtime full reindex using Meilisearch ``swap_indexes``.
+
+    Flow:
+      1. Create / configure a staging index (``<INDEX_NAME>_staging``).
+      2. Index every ``MasterPart`` into the staging index.
+      3. Atomically swap ``<INDEX_NAME>`` ↔ ``<INDEX_NAME>_staging``:
+         users continue to query the live index throughout.
+      4. Delete the staging index (which now holds the previous/stale documents).
+
+    Falls back to ``reindex_all_master_parts`` (delete-then-reindex) if
+    Meilisearch is not configured or ``swap_indexes`` is unavailable.
+    Returns (total_indexed, total_failed). No-op (0, 0) if not configured.
+    """
+    if not is_configured():
+        logger.warning("Meilisearch not configured; skipping zero-downtime reindex.")
+        return 0, 0
+
+    staging_name = "{}_staging".format(INDEX_NAME)
+    from src.models import MasterPart
+
+    total_parts = MasterPart.objects.count()
+    host = getattr(settings, "MEILISEARCH_HOST", "")
+    pipeline_t0 = time.monotonic()
+    logger.info(
+        "Meilisearch zero-downtime reindex: start | live=%s staging=%s host=%s total_master_parts=%s "
+        "batch_size=%s max_upload_workers=%s",
+        INDEX_NAME,
+        staging_name,
+        host,
+        total_parts,
+        batch_size,
+        max_upload_workers,
+    )
+
+    try:
+        client = _get_client()
+
+        # --- Step 1: create / configure staging index ---
+        try:
+            client.create_index(staging_name, {"primaryKey": "id"})
+            logger.info("Meilisearch zero-downtime reindex: created staging index '%s'", staging_name)
+        except Exception as create_exc:
+            # Index may already exist from a previous failed run — that's OK.
+            logger.info(
+                "Meilisearch zero-downtime reindex: staging index '%s' already exists or create failed "
+                "(will configure + overwrite): %s",
+                staging_name,
+                create_exc,
+            )
+
+        staging = client.index(staging_name)
+        staging.update_searchable_attributes(SEARCHABLE_ATTRIBUTES)
+        staging.update_filterable_attributes(FILTERABLE_ATTRIBUTES)
+        logger.info("Meilisearch zero-downtime reindex: staging index configured")
+
+        # --- Step 2: delete any stale docs in staging (from previous failed run) ---
+        try:
+            del_task = staging.delete_all_documents()
+            client.wait_for_task(del_task.task_uid, timeout_in_ms=300_000)
+            logger.info("Meilisearch zero-downtime reindex: staging cleared")
+        except Exception as del_exc:
+            logger.info(
+                "Meilisearch zero-downtime reindex: staging clear failed (may be empty): %s", del_exc
+            )
+
+        # --- Step 3: index all parts into staging ---
+        queryset = MasterPart.objects.select_related("brand").order_by("id")
+        t_index = time.monotonic()
+        ok, fail = add_documents_in_batches(
+            queryset,
+            batch_size=batch_size,
+            max_upload_workers=max_upload_workers,
+            target_index_name=staging_name,
+        )
+        index_elapsed = time.monotonic() - t_index
+        logger.info(
+            "Meilisearch zero-downtime reindex: staging indexed | ok=%s fail=%s elapsed_s=%.1f",
+            ok,
+            fail,
+            index_elapsed,
+        )
+
+        if fail > 0:
+            logger.error(
+                "Meilisearch zero-downtime reindex: %s documents failed to index; aborting swap "
+                "to preserve live index integrity",
+                fail,
+            )
+            return ok, fail
+
+        # --- Step 4: atomic swap ---
+        swap_task = client.swap_indexes([{"indexes": [INDEX_NAME, staging_name]}])
+        client.wait_for_task(swap_task.task_uid, timeout_in_ms=60_000)
+        logger.info(
+            "Meilisearch zero-downtime reindex: swap_indexes done | %s now live, %s has old data",
+            INDEX_NAME,
+            staging_name,
+        )
+
+        # --- Step 5: delete staging (now holds the old/stale data) ---
+        try:
+            del_task2 = client.delete_index(staging_name)
+            client.wait_for_task(del_task2.task_uid, timeout_in_ms=120_000)
+            logger.info("Meilisearch zero-downtime reindex: staging index deleted")
+        except Exception as cleanup_exc:
+            logger.warning(
+                "Meilisearch zero-downtime reindex: staging cleanup failed (non-fatal): %s", cleanup_exc
+            )
+
+        total_elapsed = time.monotonic() - pipeline_t0
+        logger.info(
+            "Meilisearch zero-downtime reindex: pipeline done | indexed=%s failed=%s total_elapsed_s=%.1f",
+            ok,
+            fail,
+            total_elapsed,
+        )
+        return ok, fail
+
+    except Exception as e:
+        logger.exception("Meilisearch zero-downtime reindex: unexpected error: %s", e)
+        return 0, 0
 
 
 def delete_document(part_id: int) -> bool:

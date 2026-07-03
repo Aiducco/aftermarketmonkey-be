@@ -103,6 +103,12 @@ class CompanyProviders(django_db_models.Model):
     primary = django_db_models.BooleanField(default=False)
     active = django_db_models.BooleanField(default=True)
 
+    # Set to True once the first successful pricing sync completes for this connection.
+    # False means the initial data ingest is still pending or in progress — the frontend
+    # should show a "Ingesting data..." / "Setting up..." state instead of empty results.
+    # Existing rows are migrated to True so only newly-connected providers start as False.
+    initial_sync_completed = django_db_models.BooleanField(default=False)
+
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
 
@@ -1424,6 +1430,13 @@ class IntegrationPricingSyncJob(django_db_models.Model):
     status_name = django_db_models.CharField(max_length=64)
     message = django_db_models.TextField(null=True, blank=True)
     error_message = django_db_models.TextField(null=True, blank=True)
+
+    # When True the job skips the raw distributor data fetch (API / SFTP / CSV download)
+    # and only runs the master-parts pricing sync layer.  Set to True by the nightly
+    # ingest_all_providers pipeline which already fetched all raw data in Phase 1.
+    # Leave False (default) for on-demand jobs triggered by new-company onboarding so the
+    # full fetch + sync cycle runs.
+    skip_raw_fetch = django_db_models.BooleanField(default=False)
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
