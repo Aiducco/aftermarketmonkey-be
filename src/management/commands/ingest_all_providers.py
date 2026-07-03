@@ -1,14 +1,16 @@
 """
-Single scheduled entrypoint: all distributor **source fetches** in parallel, then
+Single scheduled entrypoint: all distributor **source fetches** sequentially, then
 ``sync_all_master_parts_global`` (catalog + inventory, no pricing), then pricing jobs
 enqueued for all active company-providers, then Meilisearch zero-downtime reindex.
 
 Architecture overview:
-  Phase 1 — Source fetch (all providers in parallel):
+  Phase 1 — Source fetch (all providers sequential):
     All distributors (Turn14, Keystone, Meyer, A-Tech, Rough Country, DLG, WheelPros,
-    Premier) run concurrently via a ThreadPoolExecutor. Meyer, A-Tech and DLG share the
-    SFTP relay at 5.161.121.143 — a semaphore caps concurrent relay connections at
-    ``RELAY_SFTP_MAX_CONCURRENT``.
+    Premier) run one-at-a-time with memory reclaimed between each to stay within
+    server RAM limits. Per-company pricing is no longer embedded here, so each
+    provider only loads its own catalog/inventory — much lighter than before.
+    WheelPros fetches its three feeds (wheel / tire / accessories) concurrently
+    internally, but the provider itself still runs sequentially relative to others.
 
   Phase 2 — Global catalog + inventory sync:
     ``sync_all_master_parts_global()`` upserts MasterPart / ProviderPart / ProviderPartInventory
@@ -34,7 +36,6 @@ sub-step so the admin panel shows start/finish of each part.
 import concurrent.futures
 import contextlib
 import logging
-import threading
 import typing
 
 from django.db import connection
@@ -60,16 +61,13 @@ logger = logging.getLogger(__name__)
 
 _TASK_NAME = "ingest_all_providers"
 
-# Meyer, A-Tech and DLG all tunnel through the same SFTP relay host.
-# Cap concurrent relay connections to avoid saturating it.
-RELAY_SFTP_MAX_CONCURRENT = 2
-
 
 class Command(BaseCommand):
     help = (
-        "Source fetch for all distributors (parallel), then sync_all_master_parts_global "
-        "(catalog + inventory, no pricing), then enqueue per-company pricing jobs, then "
-        "Meilisearch zero-downtime reindex (skipped here; run index_parts_meilisearch nightly)."
+        "Source fetch for all distributors (sequential, with memory reclamation between each), "
+        "then sync_all_master_parts_global (catalog + inventory, no pricing), then enqueue "
+        "per-company pricing jobs, then Meilisearch zero-downtime reindex (skipped here; run "
+        "index_parts_meilisearch nightly)."
     )
 
     def add_arguments(self, parser):
@@ -144,56 +142,34 @@ class Command(BaseCommand):
         execution = audit_scheduled_tasks.start_scheduled_task_execution(_TASK_NAME)
         try:
             # ----------------------------------------------------------------
-            # Phase 1: All providers fetch in parallel.
-            # Meyer / A-Tech / DLG share the SFTP relay — a semaphore limits
-            # concurrent relay connections to RELAY_SFTP_MAX_CONCURRENT.
+            # Phase 1: All providers fetch sequentially.
+            # Memory is reclaimed between each provider so the process stays
+            # within server RAM limits. Per-company pricing is no longer done
+            # here (moved to Phase 3 pricing jobs), so each fetch only loads
+            # catalog + inventory — much lighter than before.
+            # WheelPros fetches its three feeds concurrently internally but
+            # is still sequential relative to every other provider.
             # ----------------------------------------------------------------
-            self._ingest_log("phase 1 | starting parallel source fetches for all providers")
-            relay_sem = threading.Semaphore(RELAY_SFTP_MAX_CONCURRENT)
-
-            def _relay(fn: typing.Callable[[], None]) -> typing.Callable[[], None]:
-                """Wrap a relay-SFTP provider call so it acquires the semaphore."""
-                def _wrapped() -> None:
-                    with relay_sem:
-                        fn()
-                    connection.close()
-                return _wrapped
-
-            def _direct(fn: typing.Callable[[], None]) -> typing.Callable[[], None]:
-                """Wrap a non-relay provider call to close its DB connection when done."""
-                def _wrapped() -> None:
-                    fn()
-                    connection.close()
-                return _wrapped
-
-            parallel_tasks: typing.List[typing.Tuple[str, typing.Callable[[], None]]] = [
-                ("turn14",        _direct(self._run_turn14)),
-                ("keystone",      _direct(self._run_keystone)),
-                ("meyer",         _relay(self._run_meyer)),
-                ("atech",         _relay(self._run_atech)),
-                ("rough_country", _direct(self._run_rough_country)),
-                ("dlg",           _relay(self._run_dlg)),
-                ("wheelpros",     _direct(self._run_wheelpros)),
-                ("premier",       _direct(self._run_premier)),
+            self._ingest_log("phase 1 | starting sequential source fetches for all providers")
+            phase1_providers: typing.List[typing.Tuple[str, typing.Callable[[], None]]] = [
+                ("turn14",        self._run_turn14),
+                ("keystone",      self._run_keystone),
+                ("meyer",         self._run_meyer),
+                ("atech",         self._run_atech),
+                ("rough_country", self._run_rough_country),
+                ("dlg",           self._run_dlg),
+                ("wheelpros",     self._run_wheelpros),
+                ("premier",       self._run_premier),
             ]
-
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=len(parallel_tasks),
-                thread_name_prefix="ingest_provider",
-            ) as pool:
-                fut_map = {
-                    pool.submit(fn): name
-                    for name, fn in parallel_tasks
-                }
-                for fut in concurrent.futures.as_completed(fut_map):
-                    name = fut_map[fut]
-                    try:
-                        fut.result()
-                        self._ingest_log("phase 1 | {} fetch thread finished".format(name))
-                    except Exception as exc:  # noqa: BLE001 – logged, not re-raised
-                        self._ingest_log(
-                            "phase 1 | {} fetch thread raised unexpected error: {!s}".format(name, exc)
-                        )
+            for name, run_fn in phase1_providers:
+                self._ingest_log("phase 1 | starting {} fetch".format(name))
+                try:
+                    run_fn()
+                    self._ingest_log("phase 1 | {} fetch complete".format(name))
+                except Exception as exc:  # noqa: BLE001 – _audited_step already swallows; belt-and-suspenders
+                    self._ingest_log("phase 1 | {} fetch failed: {!s}".format(name, exc))
+                master_parts._reclaim_memory()
+                connection.close()
 
             self._ingest_log("phase 1 | all provider source fetches complete")
 
