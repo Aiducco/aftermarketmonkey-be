@@ -261,13 +261,11 @@ class Command(BaseCommand):
             if synced:
                 n = len(synced)
                 self._ingest_log(
-                    "Turn14: {} new brand(s); fetching items, media, pricing, inventory for those".format(
-                        n
-                    )
+                    "Turn14: {} new brand(s); fetching items, media, inventory for those "
+                    "(per-company pricing handled by Phase 3 pricing jobs)".format(n)
                 )
                 turn_14.fetch_and_save_turn_14_items_for_turn14_brands(synced)
                 turn_14.fetch_and_save_turn_14_brand_data_for_turn14_brands(synced)
-                turn_14.fetch_and_save_turn_14_brand_pricing_for_turn14_brands(synced)
                 turn_14.fetch_and_save_turn_14_brand_inventory_for_turn14_brands(synced)
             else:
                 self._ingest_log("Turn14: no new brands; skipped brand-scoped fetches")
@@ -336,8 +334,9 @@ class Command(BaseCommand):
             "WheelPros source fetch (wheel, tire, accessories) + unmapped brand sync complete (derived in sync_all).",
             continue_on_error=True,
         ):
-            self._ingest_log("WheelPros: wheel, tire, accessories + unmapped brand sync")
-            for ft in ("wheel", "tire", "accessories"):
+            self._ingest_log("WheelPros: wheel, tire, accessories (parallel) + unmapped brand sync")
+
+            def _fetch_feed(ft: str) -> None:
                 self._ingest_log("WheelPros: fetching feed={}".format(ft))
                 wheelpros.fetch_and_save_wheelpros(
                     local_file_path=None,
@@ -345,6 +344,21 @@ class Command(BaseCommand):
                     local_only=False,
                     feed_type=ft,
                 )
+                connection.close()
+
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=3,
+                thread_name_prefix="wheelpros_feed",
+            ) as wp_pool:
+                futs = {wp_pool.submit(_fetch_feed, ft): ft for ft in ("wheel", "tire", "accessories")}
+                for fut in concurrent.futures.as_completed(futs):
+                    ft = futs[fut]
+                    try:
+                        fut.result()
+                        self._ingest_log("WheelPros: feed={} finished".format(ft))
+                    except Exception as exc:  # noqa: BLE001
+                        self._ingest_log("WheelPros: feed={} failed: {!s}".format(ft, exc))
+
             wheelpros.sync_unmapped_wheelpros_brands_to_brands()
 
     def _run_premier(self) -> None:

@@ -2,14 +2,13 @@ import logging
 import re
 import time
 import typing
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal
 
 import pandas as pd
 import pgbulk
 
 from django.conf import settings
-from django.db import close_old_connections, connection
+from django.db import connection
 from django.db.models.functions import Upper
 from django.utils import timezone
 
@@ -598,64 +597,13 @@ def fetch_and_save_all_keystone_brand_parts() -> None:
     )
 
     total_parts = 0
-    total_pricing = 0
 
-    # Separate primary providers (run sequentially first for catalog) from non-primaries.
+    # Only the primary provider downloads the Keystone catalog here.
+    # Per-company pricing (KeystoneCompanyPricing) is handled by IntegrationPricingSyncJob
+    # (Phase 3) for each CompanyProvider independently — keeping Phase 1 O(1) regardless
+    # of how many companies are connected.
     primary_providers = [cp for cp in company_providers_ordered if cp.primary or not has_keystone_primary]
-    non_primary_providers = [cp for cp in company_providers_ordered if not cp.primary and has_keystone_primary]
 
-    def _sync_keystone_pricing_for_cp(company_provider: src_models.CompanyProviders) -> int:
-        """Fetch records for one non-primary company and upsert KeystoneCompanyPricing only."""
-        close_old_connections()
-        try:
-            company = company_provider.company
-            if not company_provider.active:
-                logger.info(
-                    "{} Skipping KeystoneCompanyPricing upsert for company={} (company_provider_id={}): inactive.".format(
-                        _LOG_PREFIX, company.name, company_provider.id,
-                    )
-                )
-                return 0
-            try:
-                ftp_client = keystone_client.KeystoneFTPClient(credentials=company_provider.credentials)
-            except ValueError as e:
-                logger.error("{} Invalid Keystone credentials company={}: {}.".format(
-                    _LOG_PREFIX, company.name, str(e),
-                ))
-                return 0
-            try:
-                records = ftp_client.get_inventory_records()
-            except keystone_exceptions.KeystoneException as e:
-                logger.error("{} Keystone error company={}: {}.".format(_LOG_PREFIX, company.name, str(e)))
-                return 0
-            if not records:
-                logger.warning("{} No inventory records company={}.".format(_LOG_PREFIX, company.name))
-                return 0
-            logger.info(
-                "{} Skipping KeystoneParts upsert for company={} (non-primary; catalog from primary only).".format(
-                    _LOG_PREFIX, company.name,
-                )
-            )
-            part_lookup = _vcpn_brand_id_lookup_for_records(records, brand_mappings)
-            pricing_instances = _build_keystone_company_pricing_instances(
-                records, brand_mappings, company, part_lookup,
-            )
-            try:
-                n = _pgbulk_upsert_keystone_company_pricing_batches(
-                    pricing_instances,
-                    KEYSTONE_PGBULK_BATCH_SIZE,
-                    KEYSTONE_PGBULK_BATCH_DELAY_SECONDS,
-                )
-                return n
-            except Exception as e:
-                logger.error("{} KeystoneCompanyPricing upsert failed company={}: {}.".format(
-                    _LOG_PREFIX, company.name, str(e),
-                ))
-                raise
-        finally:
-            connection.close()
-
-    # Run primary providers synchronously (they do catalog upserts).
     for company_provider in primary_providers:
         company = company_provider.company
         try:
@@ -697,58 +645,10 @@ def fetch_and_save_all_keystone_brand_parts() -> None:
             ))
             raise
 
-        if not company_provider.active:
-            logger.info(
-                "{} Skipping KeystoneCompanyPricing upsert for company={} (company_provider_id={}): inactive.".format(
-                    _LOG_PREFIX, company.name, company_provider.id,
-                )
-            )
-            continue
-
-        part_lookup = _vcpn_brand_id_lookup_for_records(records, brand_mappings)
-        pricing_instances = _build_keystone_company_pricing_instances(
-            records, brand_mappings, company, part_lookup,
-        )
-        try:
-            total_pricing += _pgbulk_upsert_keystone_company_pricing_batches(
-                pricing_instances,
-                KEYSTONE_PGBULK_BATCH_SIZE,
-                KEYSTONE_PGBULK_BATCH_DELAY_SECONDS,
-            )
-        except Exception as e:
-            logger.error("{} KeystoneCompanyPricing upsert failed company={}: {}.".format(
-                _LOG_PREFIX, company.name, str(e),
-            ))
-            raise
-
-    # Run non-primary providers in parallel (pricing only).
-    if non_primary_providers:
-        n_np = len(non_primary_providers)
-        np_workers = max(1, min(KEYSTONE_COMPANY_PRICING_SYNC_MAX_WORKERS, n_np))
-        if np_workers > 1:
-            logger.info(
-                "{} KeystoneCompanyPricing for {} non-primary provider(s), {} parallel worker(s).".format(
-                    _LOG_PREFIX, n_np, np_workers,
-                )
-            )
-        if np_workers == 1:
-            for cp in non_primary_providers:
-                total_pricing += _sync_keystone_pricing_for_cp(cp)
-        else:
-            with ThreadPoolExecutor(max_workers=np_workers) as ex:
-                fut_to_cp = {ex.submit(_sync_keystone_pricing_for_cp, cp): cp for cp in non_primary_providers}
-                for fut in as_completed(fut_to_cp):
-                    cp = fut_to_cp[fut]
-                    try:
-                        total_pricing += fut.result()
-                    except Exception as e:
-                        logger.error("{} KeystoneCompanyPricing parallel sync failed company={}: {}.".format(
-                            _LOG_PREFIX, cp.company.name, str(e),
-                        ))
-
     logger.info(
-        "{} Finished Keystone brand parts sync: {} part row upserts (batched), {} company-pricing upserts (batched).".format(
-            _LOG_PREFIX, total_parts, total_pricing,
+        "{} Finished Keystone catalog sync: {} part row upserts (batched). "
+        "Per-company pricing handled by Phase 3 pricing jobs.".format(
+            _LOG_PREFIX, total_parts,
         )
     )
 

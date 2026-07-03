@@ -4,13 +4,12 @@ import re
 import sys
 import time
 import typing
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal
 
 import pandas as pd
 import pgbulk
 from django.conf import settings
-from django.db import close_old_connections, connection
+from django.db import connection
 from django.db.models.functions import Upper
 from django.utils import timezone
 
@@ -877,45 +876,5 @@ def fetch_and_save_dlg_catalog(force_download: bool = False) -> None:
         if i + DLG_PARTS_UPSERT_BATCH < len(parts):
             time.sleep(DLG_PARTS_UPSERT_DELAY)
 
-    logger.info("{} Finished DLG inventory ingest ({} parts).".format(_LOG_PREFIX, len(parts)))
-
-    all_cps = list(_active_dlg_company_providers_queryset())
-    inactive_cps = [cp for cp in all_cps if not cp.active]
-    for cp in inactive_cps:
-        logger.info(
-            "{} Skipping DLG per-company pricing for company_provider_id={} (company_id={}): inactive.".format(
-                _LOG_PREFIX, cp.id, cp.company_id,
-            )
-        )
-
-    active_cps = [cp for cp in all_cps if cp.active]
-    n_cp = len(active_cps)
-    max_cw = DLG_COMPANY_PRICING_SYNC_MAX_WORKERS
-    workers = max(1, min(max_cw, n_cp)) if n_cp else 0
-
-    def _run_dlg_company_pricing_sync(cp: src_models.CompanyProviders) -> None:
-        close_old_connections()
-        try:
-            sync_dlg_company_pricing_for_company_provider(cp.id, force_download=force_download)
-        except Exception as e:
-            logger.error(
-                "{} DLG per-company pricing failed after catalog ingest (company_provider_id={}): {}.".format(
-                    _LOG_PREFIX,
-                    cp.id,
-                    str(e),
-                )
-            )
-        finally:
-            connection.close()
-
-    if workers == 1:
-        for cp in active_cps:
-            _run_dlg_company_pricing_sync(cp)
-    elif workers > 1:
-        logger.info(
-            "{} DLG per-company pricing: {} company provider(s), {} parallel worker(s).".format(
-                _LOG_PREFIX, n_cp, workers,
-            )
-        )
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            list(ex.map(_run_dlg_company_pricing_sync, active_cps))
+    logger.info("{} Finished DLG catalog ingest ({} parts). "
+                "Per-company pricing handled by Phase 3 pricing jobs.".format(_LOG_PREFIX, len(parts)))

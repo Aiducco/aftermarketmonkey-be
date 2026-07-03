@@ -52,14 +52,16 @@ def should_enqueue_pricing_sync(provider_kind: int) -> bool:
     return provider_kind in _PRICING_SYNC_KINDS
 
 
-def enqueue_all_active_company_provider_pricing_jobs(skip_raw_fetch: bool = True) -> int:
+def enqueue_all_active_company_provider_pricing_jobs() -> int:
     """
     Enqueue a pricing sync job for every active ``CompanyProviders`` row whose provider
     kind is in ``_PRICING_SYNC_KINDS``.
 
-    Called by the nightly ``ingest_all_providers`` pipeline after Phase 1 (source fetch)
-    and Phase 2 (global catalog sync) complete. Phase 1 already fetched all raw pricing
-    data, so ``skip_raw_fetch=True`` by default — jobs only run the master-parts sync.
+    Called by the nightly ``ingest_all_providers`` pipeline after Phase 2 (global catalog
+    sync) completes.  All jobs use ``skip_raw_fetch=False`` so each company-provider
+    downloads its own fresh per-company pricing data (FTP/SFTP/API) before syncing to
+    the master pricing layer.  Phase 1 only fetches global catalog data, never per-company
+    pricing, so there is nothing to skip here.
 
     Idempotent: any existing OPEN job for the same company-provider is removed before
     creating a fresh one (same behaviour as ``enqueue_company_provider_pricing_sync``).
@@ -73,11 +75,11 @@ def enqueue_all_active_company_provider_pricing_jobs(skip_raw_fetch: bool = True
     )
     enqueued = 0
     for cp_id in qs:
-        enqueue_company_provider_pricing_sync(cp_id, skip_raw_fetch=skip_raw_fetch)
+        enqueue_company_provider_pricing_sync(cp_id, skip_raw_fetch=False)
         enqueued += 1
     logger.info(
-        "{} enqueue_all_active_company_provider_pricing_jobs: enqueued {} job(s) skip_raw_fetch={}.".format(
-            _LOG_PREFIX, enqueued, skip_raw_fetch
+        "{} enqueue_all_active_company_provider_pricing_jobs: enqueued {} job(s).".format(
+            _LOG_PREFIX, enqueued
         )
     )
     return enqueued

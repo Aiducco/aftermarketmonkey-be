@@ -1113,81 +1113,8 @@ def fetch_and_save_atech_catalog(force_download: bool = False) -> None:
 
         logger.info("{} Finished upserting {} AtechParts from primary feed.".format(_LOG_PREFIX, len(parts)))
 
-    atech_kind = src_enums.BrandProviderKind.ATECH.value
-    atech_provider_row = src_models.Providers.objects.filter(kind=atech_kind).first()
-    pricing_cps: typing.List[src_models.CompanyProviders] = []
-    if atech_provider_row:
-        all_cps = list(
-            _active_atech_company_providers_queryset().filter(provider=atech_provider_row)
-        )
-        for cp in all_cps:
-            if not cp.active:
-                logger.info(
-                    "{} Skipping A-Tech company pricing for company_provider_id={} (company_id={}): inactive.".format(
-                        _LOG_PREFIX, cp.id, cp.company_id,
-                    )
-                )
-        pricing_cps = [cp for cp in all_cps if cp.active]
-    if pricing_cps:
-        n_cp = len(pricing_cps)
-        max_cw = ATECH_COMPANY_PRICING_SYNC_MAX_WORKERS
-        workers = max(1, min(max_cw, n_cp))
-        if workers == 1:
-            for cp in pricing_cps:
-                logger.info(
-                    "{} A-Tech company pricing SFTP pull: company_id={} company_provider_id={} primary={}.".format(
-                        _LOG_PREFIX,
-                        cp.company_id,
-                        cp.id,
-                        cp.primary,
-                    )
-                )
-                try:
-                    sync_atech_company_pricing_for_company_provider(cp.id, force_download=force_download)
-                except Exception as e:
-                    logger.error(
-                        "{} Skipping A-Tech pricing for company_id={}: {}.".format(
-                            _LOG_PREFIX, cp.company_id, str(e),
-                        )
-                    )
-        else:
-            logger.info(
-                "{} A-Tech company pricing: {} company provider(s), {} parallel worker(s) (per-company files differ).".format(
-                    _LOG_PREFIX,
-                    n_cp,
-                    workers,
-                )
-            )
-
-            def _run_company_pricing_sync(cp: src_models.CompanyProviders) -> None:
-                close_old_connections()
-                try:
-                    logger.info(
-                        "{} A-Tech company pricing SFTP pull: company_id={} company_provider_id={} primary={}.".format(
-                            _LOG_PREFIX,
-                            cp.company_id,
-                            cp.id,
-                            cp.primary,
-                        )
-                    )
-                    sync_atech_company_pricing_for_company_provider(cp.id, force_download=force_download)
-                except Exception as e:
-                    logger.error(
-                        "{} Skipping A-Tech pricing for company_id={}: {}.".format(
-                            _LOG_PREFIX, cp.company_id, str(e),
-                        )
-                    )
-                finally:
-                    close_old_connections()
-
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                list(ex.map(_run_company_pricing_sync, pricing_cps))
-        logger.info(
-            "{} A-Tech per-company pricing pulls completed for {} company provider(s).".format(
-                _LOG_PREFIX,
-                n_cp,
-            )
-        )
+    # Per-company pricing (AtechCompanyPricing) is handled by IntegrationPricingSyncJob
+    # (Phase 3) for each CompanyProvider independently.
 
 
 def sync_atech_company_pricing_for_company_provider(
