@@ -1972,8 +1972,8 @@ def sync_provider_inventory_from_rough_country() -> None:
         return
 
     provider_parts = {
-        pp.provider_external_id: pp
-        for pp in src_models.ProviderPart.objects.filter(provider=rc_provider)
+        row["provider_external_id"]: src_models.ProviderPart(id=row["id"])
+        for row in src_models.ProviderPart.objects.filter(provider=rc_provider).values("id", "provider_external_id")
     }
 
     now = timezone.now()
@@ -2081,8 +2081,8 @@ def sync_provider_inventory_from_dlg() -> None:
         return
 
     provider_parts = {
-        pp.provider_external_id: pp
-        for pp in src_models.ProviderPart.objects.filter(provider=dlg_provider)
+        row["provider_external_id"]: src_models.ProviderPart(id=row["id"])
+        for row in src_models.ProviderPart.objects.filter(provider=dlg_provider).values("id", "provider_external_id")
     }
 
     now = timezone.now()
@@ -2254,8 +2254,8 @@ def sync_provider_inventory_from_atech() -> None:
         return
 
     provider_parts = {
-        pp.provider_external_id: pp
-        for pp in src_models.ProviderPart.objects.filter(provider=atech_provider)
+        row["provider_external_id"]: src_models.ProviderPart(id=row["id"])
+        for row in src_models.ProviderPart.objects.filter(provider=atech_provider).values("id", "provider_external_id")
     }
 
     now = timezone.now()
@@ -4436,8 +4436,8 @@ def sync_provider_inventory_from_turn14() -> None:
         return
 
     provider_parts = {
-        pp.provider_external_id: pp
-        for pp in src_models.ProviderPart.objects.filter(provider=turn14_provider)
+        row["provider_external_id"]: src_models.ProviderPart(id=row["id"])
+        for row in src_models.ProviderPart.objects.filter(provider=turn14_provider).values("id", "provider_external_id")
     }
 
     # Load Turn14 locations once: map external_id (e.g. "01") -> name (e.g. "Hatfield")
@@ -4562,8 +4562,8 @@ def sync_provider_inventory_from_keystone() -> None:
         return
 
     provider_parts = {
-        pp.provider_external_id: pp
-        for pp in src_models.ProviderPart.objects.filter(provider=keystone_provider)
+        row["provider_external_id"]: src_models.ProviderPart(id=row["id"])
+        for row in src_models.ProviderPart.objects.filter(provider=keystone_provider).values("id", "provider_external_id")
     }
 
     now = timezone.now()
@@ -4726,9 +4726,10 @@ def sync_provider_inventory_from_meyer() -> None:
         logger.info("{} No BrandMeyerBrandMapping found.".format(_LOG_PREFIX))
         return
 
+    # Load only id + provider_external_id to avoid materialising ~950k full ORM objects (~1-2 GB).
     provider_parts = {
-        pp.provider_external_id: pp
-        for pp in src_models.ProviderPart.objects.filter(provider=meyer_provider)
+        row["provider_external_id"]: src_models.ProviderPart(id=row["id"])
+        for row in src_models.ProviderPart.objects.filter(provider=meyer_provider).values("id", "provider_external_id")
     }
 
     now = timezone.now()
@@ -5901,8 +5902,8 @@ def sync_provider_inventory_from_premier() -> None:
         return
 
     provider_parts = {
-        pp.provider_external_id: pp
-        for pp in src_models.ProviderPart.objects.filter(provider=premier_provider)
+        row["provider_external_id"]: src_models.ProviderPart(id=row["id"])
+        for row in src_models.ProviderPart.objects.filter(provider=premier_provider).values("id", "provider_external_id")
     }
 
     now = timezone.now()
