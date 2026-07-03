@@ -2506,17 +2506,26 @@ def _wheelpros_provider_part_lookup(wp_provider):
     """
     Build two lookups for WheelPros ProviderPart: by provider_external_id, and by (brand_id, sku).
     Use ext_id first, then (brand_id, sku) so inventory/pricing resolve like master parts (sku then part_number).
+    Uses .values() to avoid loading full ORM objects + select_related master_part into memory.
     """
-    provider_parts_list = list(
-        src_models.ProviderPart.objects.filter(provider=wp_provider).select_related("master_part")
+    by_ext_id: typing.Dict[str, src_models.ProviderPart] = {}
+    by_brand_sku: typing.Dict[typing.Tuple[int, str], src_models.ProviderPart] = {}
+    qs = (
+        src_models.ProviderPart.objects
+        .filter(provider=wp_provider)
+        .values("id", "provider_external_id", "master_part__brand_id", "master_part__sku")
     )
-    by_ext_id = {pp.provider_external_id: pp for pp in provider_parts_list}
-    by_brand_sku = {}
-    for pp in provider_parts_list:
-        if pp.master_part and pp.master_part.sku:
-            key = (pp.master_part.brand_id, (pp.master_part.sku or "").strip())
+    for row in qs:
+        pp_stub = src_models.ProviderPart(id=row["id"])
+        ext_id = row["provider_external_id"]
+        if ext_id:
+            by_ext_id[ext_id] = pp_stub
+        brand_id = row["master_part__brand_id"]
+        sku = (row["master_part__sku"] or "").strip() if row["master_part__sku"] else ""
+        if brand_id and sku:
+            key = (brand_id, sku)
             if key not in by_brand_sku:
-                by_brand_sku[key] = pp
+                by_brand_sku[key] = pp_stub
     return by_ext_id, by_brand_sku
 
 
