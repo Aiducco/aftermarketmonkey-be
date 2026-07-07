@@ -226,6 +226,7 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
         "description": part.description,
         "aaia_code": part.aaia_code,
         "image_url": part.image_url,
+        "gtin": part.gtin,
         "created_at": part.created_at.isoformat() if part.created_at else None,
         "updated_at": part.updated_at.isoformat() if part.updated_at else None,
     }

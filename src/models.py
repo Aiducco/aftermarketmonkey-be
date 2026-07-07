@@ -1321,6 +1321,7 @@ class MasterPart(django_db_models.Model):
     description = django_db_models.TextField(null=True)
     aaia_code = django_db_models.CharField(max_length=255, null=True)
     image_url = django_db_models.TextField(null=True)
+    gtin = django_db_models.CharField(max_length=255, null=True, blank=True)
     overview_category = django_db_models.CharField(max_length=255, null=True, blank=True)
     category = django_db_models.CharField(max_length=255, null=True, blank=True)
 

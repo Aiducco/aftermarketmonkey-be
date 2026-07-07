@@ -171,6 +171,7 @@ def _build_docs_for_batch(
             "description": (part.description or "")[:10000],
             "aaia_code": part.aaia_code or "",
             "image_url": part.image_url or "",
+            "gtin": part.gtin or "",
             "category": category,
             "overview_category": overview_category,
             "created_at": part.created_at.isoformat() if part.created_at else None,
@@ -240,6 +241,7 @@ def master_part_to_index_shape(part) -> typing.Dict:
         "description": (part.description or "")[:10000],  # Meilisearch has limits
         "aaia_code": part.aaia_code or "",
         "image_url": part.image_url or "",
+        "gtin": part.gtin or "",
         "category": category or "",
         "overview_category": overview_category or "",
         "created_at": part.created_at.isoformat() if part.created_at else None,

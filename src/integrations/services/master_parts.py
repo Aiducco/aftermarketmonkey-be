@@ -477,7 +477,7 @@ def _dedupe_master_parts_for_upsert(
 # Master part field priority: Turn14 is primary for description, image_url.
 # Other providers (Keystone, etc.) only update sku, aaia_code on existing parts.
 # We use a two-phase approach for non-primary providers: INSERT new, UPDATE existing (sku/aaia only).
-MASTER_PART_FULL_UPDATE_FIELDS = ["sku", "description", "aaia_code", "image_url", "updated_at"]
+MASTER_PART_FULL_UPDATE_FIELDS = ["sku", "description", "aaia_code", "image_url", "gtin", "updated_at"]
 MASTER_PART_PARTIAL_UPDATE_FIELDS = ["sku", "aaia_code"]  # Non-primary providers
 
 
@@ -533,6 +533,7 @@ def _ingest_turn14_items_for_mapped_brands(
                 "brand_id",
                 "updated_at",
                 "category",
+                "barcode",
             )[:BATCH_SIZE_MASTER_PARTS]
         )
         if not batch:
@@ -574,6 +575,7 @@ def _ingest_turn14_items_for_mapped_brands(
                         description=row.get("part_description"),
                         aaia_code=t14_brand_to_aaia.get(row["brand_id"]),
                         image_url=row.get("thumbnail"),
+                        gtin=row.get("barcode") or None,
                     )
                 )
             else:
@@ -744,6 +746,7 @@ def _ingest_keystone_parts_for_mapped_brands(
                 "long_description",
                 "aaia_code",
                 "updated_at",
+                "upc_code",
             )[:BATCH_SIZE_MASTER_PARTS]
         )
         if not batch:
@@ -779,6 +782,7 @@ def _ingest_keystone_parts_for_mapped_brands(
                         description=row.get("long_description"),
                         aaia_code=aaia,
                         image_url=None,
+                        gtin=row.get("upc_code") or None,
                     )
                 )
             vcpn_to_brand_part[row["vcpn"]] = (brand.id, part_number)
@@ -818,15 +822,17 @@ def _ingest_keystone_parts_for_mapped_brands(
 
         if existing_keys:
             key_to_mp = {(mp.brand_id, mp.part_number): mp for mp in master_parts}
-            values = [(existing_by_key[k], key_to_mp[k].aaia_code) for k in existing_keys]
-            placeholders = ", ".join(["(%s::bigint, %s)"] * len(values))
+            values = [(existing_by_key[k], key_to_mp[k].aaia_code, key_to_mp[k].gtin) for k in existing_keys]
+            placeholders = ", ".join(["(%s::bigint, %s, %s)"] * len(values))
             params = [x for t in values for x in t]
             with connection.cursor() as cur:
                 cur.execute(
                     """
-                    UPDATE master_parts mp SET aaia_code = v.aaia_code
-                    FROM (VALUES {}) AS v(id, aaia_code)
-                    WHERE mp.id = v.id
+                    UPDATE master_parts mp SET
+                        aaia_code = v.aaia_code,
+                        gtin = COALESCE(mp.gtin, v.gtin)
+                    FROM (VALUES {}) AS v(id, aaia_code, gtin)
+                    WHERE mp.id = v.id::bigint
                     """.format(placeholders),
                     params,
                 )
@@ -955,6 +961,7 @@ def _ingest_meyer_parts_for_mapped_brands(
                 "description",
                 "updated_at",
                 "category",
+                "upc",
             )[:BATCH_SIZE_MASTER_PARTS]
         )
         if not batch:
@@ -999,6 +1006,7 @@ def _ingest_meyer_parts_for_mapped_brands(
                         description=row.get("description"),
                         aaia_code=aaia,
                         image_url=None,
+                        gtin=row.get("upc") or None,
                     )
                 )
             part_to_sku[key] = meyer_part
@@ -1084,17 +1092,19 @@ def _ingest_meyer_parts_for_mapped_brands(
             for i in range(0, len(existing_keys), WHEELPROS_LOOKUP_CHUNK):
                 chunk_keys = existing_keys[i : i + WHEELPROS_LOOKUP_CHUNK]
                 values = [
-                    (existing_by_key[k], key_to_mp[k].aaia_code)
+                    (existing_by_key[k], key_to_mp[k].aaia_code, key_to_mp[k].gtin)
                     for k in chunk_keys
                 ]
-                placeholders = ", ".join(["(%s::bigint, %s)"] * len(values))
+                placeholders = ", ".join(["(%s::bigint, %s, %s)"] * len(values))
                 params = [x for row_vals in values for x in row_vals]
                 with connection.cursor() as cur:
                     cur.execute(
                         """
-                        UPDATE master_parts mp SET aaia_code = v.aaia_code
-                        FROM (VALUES {}) AS v(id, aaia_code)
-                        WHERE mp.id = v.id
+                        UPDATE master_parts mp SET
+                            aaia_code = v.aaia_code,
+                            gtin = COALESCE(mp.gtin, v.gtin)
+                        FROM (VALUES {}) AS v(id, aaia_code, gtin)
+                        WHERE mp.id = v.id::bigint
                         """.format(placeholders),
                         params,
                     )
@@ -1252,6 +1262,7 @@ def _ingest_atech_parts_for_mapped_brands(
                 "description",
                 "image_url",
                 "updated_at",
+                "gtin",
             )[:BATCH_SIZE_MASTER_PARTS]
         )
         if not batch:
@@ -1287,6 +1298,7 @@ def _ingest_atech_parts_for_mapped_brands(
                         description=row.get("description"),
                         aaia_code=aaia,
                         image_url=row.get("image_url"),
+                        gtin=row.get("gtin") or None,
                     )
                 )
             atech_feed_brand_pn_to_brand_part[(int(row["brand_id"]), pn)] = (brand.id, pn)
@@ -1327,17 +1339,19 @@ def _ingest_atech_parts_for_mapped_brands(
         if existing_keys:
             key_to_mp = {(mp.brand_id, mp.part_number): mp for mp in master_parts_list}
             values = [
-                (existing_by_key[k], key_to_mp[k].aaia_code)
+                (existing_by_key[k], key_to_mp[k].aaia_code, key_to_mp[k].gtin)
                 for k in existing_keys
             ]
-            placeholders = ", ".join(["(%s::bigint, %s)"] * len(values))
+            placeholders = ", ".join(["(%s::bigint, %s, %s)"] * len(values))
             params = [x for row_vals in values for x in row_vals]
             with connection.cursor() as cur:
                 cur.execute(
                     """
-                    UPDATE master_parts mp SET aaia_code = v.aaia_code
-                    FROM (VALUES {}) AS v(id, aaia_code)
-                    WHERE mp.id = v.id
+                    UPDATE master_parts mp SET
+                        aaia_code = v.aaia_code,
+                        gtin = COALESCE(mp.gtin, v.gtin)
+                    FROM (VALUES {}) AS v(id, aaia_code, gtin)
+                    WHERE mp.id = v.id::bigint
                     """.format(placeholders),
                     params,
                 )
@@ -1490,6 +1504,7 @@ def _ingest_rough_country_parts_for_mapped_brands(
                 "image_1",
                 "updated_at",
                 "category",
+                "upc",
             )[:BATCH_SIZE_MASTER_PARTS]
         )
         if not batch:
@@ -1522,6 +1537,7 @@ def _ingest_rough_country_parts_for_mapped_brands(
                         description=desc,
                         aaia_code=aaia,
                         image_url=row.get("image_1"),
+                        gtin=row.get("upc") or None,
                     )
                 )
             rc_external_id_to_brand_part[_rough_country_provider_external_id(row["brand_id"], row["sku"])] = (
@@ -1565,17 +1581,19 @@ def _ingest_rough_country_parts_for_mapped_brands(
         if existing_keys:
             key_to_mp = {(mp.brand_id, mp.part_number): mp for mp in master_parts}
             values = [
-                (existing_by_key[k], key_to_mp[k].aaia_code)
+                (existing_by_key[k], key_to_mp[k].aaia_code, key_to_mp[k].gtin)
                 for k in existing_keys
             ]
-            placeholders = ", ".join(["(%s::bigint, %s)"] * len(values))
+            placeholders = ", ".join(["(%s::bigint, %s, %s)"] * len(values))
             params = [x for row in values for x in row]
             with connection.cursor() as cur:
                 cur.execute(
                     """
-                    UPDATE master_parts mp SET aaia_code = v.aaia_code
-                    FROM (VALUES {}) AS v(id, aaia_code)
-                    WHERE mp.id = v.id
+                    UPDATE master_parts mp SET
+                        aaia_code = v.aaia_code,
+                        gtin = COALESCE(mp.gtin, v.gtin)
+                    FROM (VALUES {}) AS v(id, aaia_code, gtin)
+                    WHERE mp.id = v.id::bigint
                     """.format(placeholders),
                     params,
                 )
@@ -5715,6 +5733,7 @@ def _ingest_premier_parts_for_mapped_brands(
                 "long_description",
                 "image_url",
                 "updated_at",
+                "upc_code",
             )[:BATCH_SIZE_MASTER_PARTS]
         )
         if not batch:
@@ -5758,6 +5777,7 @@ def _ingest_premier_parts_for_mapped_brands(
                         description=row.get("long_description"),
                         aaia_code=aaia,
                         image_url=row.get("image_url"),
+                        gtin=row.get("upc_code") or None,
                     )
                 )
             premier_ext_to_brand_part[
@@ -5800,10 +5820,10 @@ def _ingest_premier_parts_for_mapped_brands(
         if existing_keys:
             key_to_mp = {(mp.brand_id, mp.part_number): mp for mp in master_parts_list}
             values = [
-                (existing_by_key[k], key_to_mp[k].aaia_code, key_to_mp[k].image_url)
+                (existing_by_key[k], key_to_mp[k].aaia_code, key_to_mp[k].image_url, key_to_mp[k].gtin)
                 for k in existing_keys
             ]
-            placeholders = ", ".join(["(%s::bigint, %s, %s)"] * len(values))
+            placeholders = ", ".join(["(%s::bigint, %s, %s, %s)"] * len(values))
             params = [x for t in values for x in t]
             with connection.cursor() as cur:
                 cur.execute(
@@ -5814,9 +5834,10 @@ def _ingest_premier_parts_for_mapped_brands(
                             WHEN v.image_url IS NOT NULL AND v.image_url != ''
                             THEN v.image_url
                             ELSE mp.image_url
-                        END
-                    FROM (VALUES {}) AS v(id, aaia_code, image_url)
-                    WHERE mp.id = v.id
+                        END,
+                        gtin = COALESCE(mp.gtin, v.gtin)
+                    FROM (VALUES {}) AS v(id, aaia_code, image_url, gtin)
+                    WHERE mp.id = v.id::bigint
                     """.format(placeholders),
                     params,
                 )
