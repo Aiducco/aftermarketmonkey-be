@@ -43,6 +43,7 @@ while True:
 
 MEYER_PRICING_UPSERT_BATCH = 2000
 MEYER_PART_LOOKUP_CHUNK = 3000
+MEYER_COMPANY_PRICING_STREAM_BATCH = 5000
 
 _EXCEL_FORMULA_PATTERN = re.compile(r'^="?([^"]*)"?$|^=(\d+(?:\.\d+)?)$')
 _MEYER_FEED_CSV_ENCODINGS = ("utf-8-sig", "utf-8", "cp1252", "latin-1")
@@ -1418,7 +1419,8 @@ def sync_meyer_company_pricing_for_company_provider(
 ) -> None:
     """
     Download Meyer pricing CSV for one CompanyProviders row and upsert MeyerCompanyPricing.
-    Expects MeyerParts catalog to already exist for SKUs in the file.
+    Two-pass streaming: Pass 1 collects brand names only; Pass 2 streams rows in
+    MEYER_COMPANY_PRICING_STREAM_BATCH chunks — no full-file accumulation in memory.
     """
     cp = (
         src_models.CompanyProviders.objects.filter(
@@ -1453,62 +1455,95 @@ def sync_meyer_company_pricing_for_company_provider(
         )
         raise
 
+    # Pass 1: stream CSV once to collect brand name strings only — O(n_brands) memory.
     logger.info(
-        "{} Parsing company pricing feed company_id={} company_provider_id={} (progress every {} rows).".format(
-            _LOG_PREFIX,
-            cp.company_id,
-            cp.id,
-            MEYER_PARSE_PROGRESS_EVERY,
+        "{} Pass 1 — collecting brand names company_id={} company_provider_id={}.".format(
+            _LOG_PREFIX, cp.company_id, cp.id,
         )
     )
-    mfgs_c, pmap_mfg = _meyer_pricing_map_by_mfg_from_iterable(
-        _iter_records_from_csv(company_pricing_path),
-        progress_every=MEYER_PARSE_PROGRESS_EVERY,
-        progress_label="company_id={}".format(cp.company_id),
-    )
-    brand_by_mfg = _brand_map_for_names(mfgs_c)
-    _ensure_meyer_brands_for_mfgs(mfgs_c, brand_by_mfg)
-    pmap: typing.Dict[typing.Tuple[int, str], typing.Dict[str, typing.Any]] = {}
-    for (mfg, sku), pdata in pmap_mfg.items():
-        b = brand_by_mfg.get(mfg)
-        if b:
-            pmap[(b.id, sku)] = pdata
-    if not pmap:
-        logger.warning("{} No pricing rows parsed for company_provider id={}.".format(_LOG_PREFIX, company_provider_id))
+    mfg_names: typing.Set[str] = set()
+    for row in _iter_records_from_csv(company_pricing_path):
+        mfg = _meyer_brand_key(row.get("MFG"))
+        if mfg:
+            mfg_names.add(mfg)
+
+    if not mfg_names:
+        logger.warning(
+            "{} No pricing rows parsed for company_provider id={}.".format(_LOG_PREFIX, company_provider_id)
+        )
         return
 
-    pairs = list(pmap.keys())
-    id_by_brand_sku = _meyer_part_ids_by_brand_sku(pairs, company_provider_id=company_provider_id)
+    brand_by_mfg = _brand_map_for_names(mfg_names)
+    _ensure_meyer_brands_for_mfgs(mfg_names, brand_by_mfg)  # mutates brand_by_mfg in-place
 
-    pricing_to_upsert: typing.List[src_models.MeyerCompanyPricing] = []
-    for (bid, sku), pdata in pmap.items():
-        part_id = id_by_brand_sku.get((bid, sku))
-        if not part_id:
-            continue
-        pricing_to_upsert.append(
-            src_models.MeyerCompanyPricing(
-                part_id=part_id,
-                company=cp.company,
-                jobber_price=pdata.get("jobber_price"),
-                cost=pdata.get("cost"),
-                core_charge=pdata.get("core_charge"),
-                map_price=pdata.get("map_price"),
+    # Pass 2: stream CSV, buffer (brand_id, sku) -> pricing payload, flush every batch.
+    logger.info(
+        "{} Pass 2 — streaming company pricing company_id={} company_provider_id={} "
+        "(batch_size={}).".format(
+            _LOG_PREFIX, cp.company_id, cp.id, MEYER_COMPANY_PRICING_STREAM_BATCH,
+        )
+    )
+    buf: typing.Dict[typing.Tuple[int, str], typing.Dict[str, typing.Any]] = {}
+    total_upserted = 0
+    batch_num = 0
+
+    def _flush_buf() -> None:
+        nonlocal total_upserted, batch_num
+        if not buf:
+            return
+        id_map = _meyer_part_ids_by_brand_sku(list(buf.keys()), company_provider_id=company_provider_id)
+        pricing_rows: typing.List[src_models.MeyerCompanyPricing] = []
+        for (bid, sku), pdata in buf.items():
+            part_id = id_map.get((bid, sku))
+            if not part_id:
+                continue
+            pricing_rows.append(
+                src_models.MeyerCompanyPricing(
+                    part_id=part_id,
+                    company=cp.company,
+                    jobber_price=pdata.get("jobber_price"),
+                    cost=pdata.get("cost"),
+                    core_charge=pdata.get("core_charge"),
+                    map_price=pdata.get("map_price"),
+                )
+            )
+        n_upserted = 0
+        if pricing_rows:
+            pgbulk.upsert(
+                src_models.MeyerCompanyPricing,
+                pricing_rows,
+                unique_fields=["part", "company"],
+                update_fields=["jobber_price", "cost", "core_charge", "map_price", "updated_at"],
+                returning=False,
+            )
+            n_upserted = len(pricing_rows)
+            total_upserted += n_upserted
+        batch_num += 1
+        connection.close()
+        buf.clear()
+        logger.info(
+            "{} MeyerCompanyPricing batch {}: upserted {} rows (total={}) company_provider_id={}.".format(
+                _LOG_PREFIX, batch_num, n_upserted, total_upserted, company_provider_id,
             )
         )
-    batch_total = 0
-    for j in range(0, len(pricing_to_upsert), MEYER_PRICING_UPSERT_BATCH):
-        batch = pricing_to_upsert[j : j + MEYER_PRICING_UPSERT_BATCH]
-        pgbulk.upsert(
-            src_models.MeyerCompanyPricing,
-            batch,
-            unique_fields=["part", "company"],
-            update_fields=["jobber_price", "cost", "core_charge", "map_price", "updated_at"],
-            returning=False,
-        )
-        batch_total += len(batch)
-        connection.close()
+
+    for row in _iter_records_from_csv(company_pricing_path):
+        mfg = _meyer_brand_key(row.get("MFG"))
+        meyer_part = _clean_csv_value(row.get("Meyer Part"))
+        if not mfg or not meyer_part:
+            continue
+        brand = brand_by_mfg.get(mfg)
+        if not brand:
+            continue
+        sku = meyer_part.strip()
+        buf[(brand.id, sku)] = _meyer_pricing_payload(row)
+        if len(buf) >= MEYER_COMPANY_PRICING_STREAM_BATCH:
+            _flush_buf()
+
+    _flush_buf()
+
     logger.info(
-        "{} MeyerCompanyPricing upserted {} rows for company_provider id={}.".format(
-            _LOG_PREFIX, batch_total, company_provider_id,
+        "{} MeyerCompanyPricing upserted {} rows total for company_provider id={}.".format(
+            _LOG_PREFIX, total_upserted, company_provider_id,
         )
     )

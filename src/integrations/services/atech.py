@@ -49,6 +49,7 @@ ATECH_STREAMING_BATCH_SIZE = 5000
 ATECH_PARTS_UPSERT_DELAY = 0.05
 
 ATECH_PRICING_UPSERT_BATCH = 15000
+ATECH_COMPANY_PRICING_STREAM_BATCH = 5000
 
 # ``feed_part_number__in`` lookups when building AtechCompanyPricing (max params per query).
 ATECH_FEED_KEY_LOOKUP_CHUNK = 15000
@@ -1073,9 +1074,8 @@ def sync_atech_company_pricing_for_company_provider(
 ) -> None:
     """
     Download A-Tech feed file for one ``CompanyProviders`` row and upsert ``AtechCompanyPricing``.
-    Resolves each file line to ``AtechParts`` by ``feed_part_number`` (full distributor line).
-    ``MasterPart`` uses ``AtechParts.part_number``; ``ProviderPart.provider_external_id`` is composite
-    (``atech_brand_id`` + part number); see ``sync_master_parts_from_atech``.
+    Streams the feed in ATECH_COMPANY_PRICING_STREAM_BATCH chunks — no full-file accumulation
+    in memory. Each batch does its own part-ID lookup and upsert before moving on.
     """
     cp = (
         src_models.CompanyProviders.objects.filter(
@@ -1102,10 +1102,7 @@ def sync_atech_company_pricing_for_company_provider(
         raise
     logger.info(
         "{} Downloading company feed: company_id={} company_provider_id={} force_download={}.".format(
-            _LOG_PREFIX,
-            cp.company_id,
-            cp.id,
-            force_download,
+            _LOG_PREFIX, cp.company_id, cp.id, force_download,
         )
     )
     try:
@@ -1117,96 +1114,92 @@ def sync_atech_company_pricing_for_company_provider(
         raise
 
     logger.info(
-        "{} Building per-company pricing map: company_id={} company_provider_id={} path={} "
-        "(progress every {} rows).".format(
-            _LOG_PREFIX,
-            cp.company_id,
-            cp.id,
-            company_feed_path,
-            ATECH_PARSE_PROGRESS_EVERY,
+        "{} Streaming company pricing company_id={} company_provider_id={} "
+        "(batch_size={}).".format(
+            _LOG_PREFIX, cp.company_id, cp.id, ATECH_COMPANY_PRICING_STREAM_BATCH,
         )
     )
-    pmap = _atech_pricing_map_from_iterable(
-        _iter_atech_csv_rows(company_feed_path),
-        progress_every=ATECH_PARSE_PROGRESS_EVERY,
-        progress_label="company_id={}".format(cp.company_id),
-    )
-    if not pmap:
-        logger.warning(
-            "{} No pricing rows parsed for A-Tech company_provider id={}.".format(_LOG_PREFIX, company_provider_id)
-        )
-        return
 
-    feed_keys = list(pmap.keys())
-    id_by_feed = _id_by_feed_keys_parallel(feed_keys, _LOG_PREFIX, company_provider_id)
+    # Stream CSV, buffer by feed_part_number (last row per key wins within batch),
+    # flush every ATECH_COMPANY_PRICING_STREAM_BATCH rows.
+    buf: typing.Dict[str, typing.Dict[str, typing.Any]] = {}
+    total_upserted = 0
+    batch_num = 0
 
-    pricing_to_upsert: typing.List[src_models.AtechCompanyPricing] = []
-    for feed_fn, pdata in pmap.items():
-        k = (feed_fn or "").strip()
-        part_id = id_by_feed.get(k)
-        if not part_id:
-            continue
-        pricing_to_upsert.append(
-            src_models.AtechCompanyPricing(
-                part_id=part_id,
-                company=cp.company,
-                cost=pdata.get("cost"),
-                retail_price=pdata.get("retail_price"),
-                jobber_price=pdata.get("jobber_price"),
-                core_charge=pdata.get("core_charge"),
-                fee_hazmat=pdata.get("fee_hazmat"),
-                fee_truck_us=pdata.get("fee_truck_us"),
-                fee_handling_ground=pdata.get("fee_handling_ground"),
-                fee_handling_air=pdata.get("fee_handling_air"),
-            )
-        )
-    batch_total = 0
-    n_price_batches = (
-        (len(pricing_to_upsert) + ATECH_PRICING_UPSERT_BATCH - 1) // ATECH_PRICING_UPSERT_BATCH
-        if pricing_to_upsert
-        else 0
-    )
-    upsert_workers = (
-        max(1, min(ATECH_COMPANY_PRICING_UPSERT_MAX_WORKERS, n_price_batches))
-        if n_price_batches
-        else 1
-    )
-    if n_price_batches:
-        logger.info(
-            "{} AtechCompanyPricing upsert start: {} batch(es), workers={} (company_provider id={}).".format(
-                _LOG_PREFIX, n_price_batches, upsert_workers, company_provider_id
-            )
-        )
-    batches = [
-        pricing_to_upsert[j : j + ATECH_PRICING_UPSERT_BATCH]
-        for j in range(0, len(pricing_to_upsert), ATECH_PRICING_UPSERT_BATCH)
-    ]
-    if upsert_workers == 1:
-        price_batch_num = 0
-        for batch in batches:
-            price_batch_num += 1
-            batch_total += _upsert_atech_company_pricing_batch(batch)
-            if n_price_batches and (price_batch_num % 10 == 0 or price_batch_num == n_price_batches):
-                logger.info(
-                    "{} AtechCompanyPricing upsert progress: {}/{} batches (company_provider id={}).".format(
-                        _LOG_PREFIX, price_batch_num, n_price_batches, company_provider_id
-                    )
+    def _flush_buf() -> None:
+        nonlocal total_upserted, batch_num
+        if not buf:
+            return
+        keys = list(buf.keys())
+        id_by_feed: typing.Dict[str, int] = {}
+        for fn, pid in src_models.AtechParts.objects.filter(
+            feed_part_number__in=keys
+        ).values_list("feed_part_number", "id"):
+            k = (fn or "").strip()
+            if k:
+                id_by_feed[k] = int(pid)
+        pricing_rows: typing.List[src_models.AtechCompanyPricing] = []
+        for feed_fn, pdata in buf.items():
+            k = (feed_fn or "").strip()
+            part_id = id_by_feed.get(k)
+            if not part_id:
+                continue
+            pricing_rows.append(
+                src_models.AtechCompanyPricing(
+                    part_id=part_id,
+                    company=cp.company,
+                    cost=pdata.get("cost"),
+                    retail_price=pdata.get("retail_price"),
+                    jobber_price=pdata.get("jobber_price"),
+                    core_charge=pdata.get("core_charge"),
+                    fee_hazmat=pdata.get("fee_hazmat"),
+                    fee_truck_us=pdata.get("fee_truck_us"),
+                    fee_handling_ground=pdata.get("fee_handling_ground"),
+                    fee_handling_air=pdata.get("fee_handling_air"),
                 )
-    else:
-        completed = 0
-        with ThreadPoolExecutor(max_workers=upsert_workers) as ex:
-            futs = [ex.submit(_upsert_atech_company_pricing_batch, batch) for batch in batches]
-            for fut in as_completed(futs):
-                batch_total += fut.result()
-                completed += 1
-                if n_price_batches and (completed % 10 == 0 or completed == n_price_batches):
-                    logger.info(
-                        "{} AtechCompanyPricing parallel upsert progress: {}/{} batches (company_provider id={}).".format(
-                            _LOG_PREFIX, completed, n_price_batches, company_provider_id
-                        )
-                    )
+            )
+        n_upserted = 0
+        if pricing_rows:
+            pgbulk.upsert(
+                src_models.AtechCompanyPricing,
+                pricing_rows,
+                unique_fields=["part", "company"],
+                update_fields=ATECH_COMPANY_PRICING_UPDATE_FIELDS,
+                returning=False,
+            )
+            n_upserted = len(pricing_rows)
+            total_upserted += n_upserted
+        batch_num += 1
+        connection.close()
+        buf.clear()
+        logger.info(
+            "{} AtechCompanyPricing batch {}: upserted {} rows (total={}) company_provider_id={}.".format(
+                _LOG_PREFIX, batch_num, n_upserted, total_upserted, company_provider_id,
+            )
+        )
+
+    for row in _iter_atech_csv_rows(company_feed_path):
+        fn = _clean_csv_value(row.get("part_number"))
+        if not fn:
+            continue
+        key = fn.strip()
+        buf[key] = {
+            "cost": _safe_decimal(row.get("price_atech_current")),
+            "retail_price": _safe_decimal(row.get("price_current_month")),
+            "jobber_price": _safe_decimal(row.get("cost_current_sheet")),
+            "core_charge": _safe_decimal(row.get("cost_core")),
+            "fee_hazmat": _safe_decimal(row.get("fee_hazmat")),
+            "fee_truck_us": _safe_decimal(row.get("fee_truck_us")),
+            "fee_handling_ground": _safe_decimal(row.get("fee_handling_ground")),
+            "fee_handling_air": _safe_decimal(row.get("fee_handling_air")),
+        }
+        if len(buf) >= ATECH_COMPANY_PRICING_STREAM_BATCH:
+            _flush_buf()
+
+    _flush_buf()
+
     logger.info(
-        "{} AtechCompanyPricing upserted {} rows for company_provider id={}.".format(
-            _LOG_PREFIX, batch_total, company_provider_id,
+        "{} AtechCompanyPricing upserted {} rows total for company_provider id={}.".format(
+            _LOG_PREFIX, total_upserted, company_provider_id,
         )
     )
