@@ -81,9 +81,9 @@ ATECH_DC_QTY_FIELD_TO_LOCATION_LABEL = {
 }
 # Premier Performance (APG Wholesale) warehouse qty fields -> user-facing location labels (FE display).
 PREMIER_WAREHOUSE_QTY_FIELD_TO_LOCATION_LABEL = {
-    "nv_qty": "Las Vegas, NV",
-    "ky_qty": "Louisville, KY",
-    "wa_qty": "Silverdale, WA",
+    "nv_qty": "Nevada",
+    "ky_qty": "Kentucky",
+    "wa_qty": "Washington",
 }
 ROUGH_COUNTRY_INVENTORY_SEARCH_URL_TEMPLATE = "https://www.roughcountry.com/search/{sku}"
 
