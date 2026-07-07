@@ -134,6 +134,10 @@ def _safe_decimal(value: typing.Any) -> typing.Optional[Decimal]:
         return None
 
 
+_PG_INT_MAX = 2_147_483_647
+_PG_INT_MIN = -2_147_483_648
+
+
 def _safe_int(value: typing.Any) -> typing.Optional[int]:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return None
@@ -141,7 +145,9 @@ def _safe_int(value: typing.Any) -> typing.Optional[int]:
         s = _clean_csv_value(value)
         if s is None or s == "":
             return None
-        return int(float(s))
+        v = int(float(s))
+        # Clamp to PostgreSQL integer range to avoid "integer out of range" errors
+        return max(_PG_INT_MIN, min(_PG_INT_MAX, v))
     except Exception:
         return None
 
