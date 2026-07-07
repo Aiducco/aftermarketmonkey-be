@@ -1961,6 +1961,9 @@ def _rough_country_product_details(row: typing.Dict) -> typing.List[typing.Dict]
     repl = (row.get("replacement_sku") or "").strip() or None
 
     return [
+        {"key": "sku",               "label": "SKU",                 "value": row.get("sku") or None},
+        {"key": "brand",             "label": "Brand",               "value": row.get("manufacturer") or None},
+        {"key": "description",       "label": "Description",         "value": row.get("title") or None},
         {"key": "link",              "label": "Product Page URL",    "value": row.get("link") or None},
         {"key": "is_discontinued",   "label": "Discontinued",        "value": "Yes" if is_disc else None},
         {"key": "discontinued_date", "label": "Discontinued Date",   "value": disc_date_str if is_disc else None},
@@ -2010,6 +2013,7 @@ def sync_provider_inventory_from_rough_country() -> None:
                 .values(
                     "id", "brand_id", "sku", "nv_stock", "tn_stock",
                     "link", "is_discontinued", "discontinued_date", "replacement_sku",
+                    "manufacturer", "title",
                 )[:BATCH_SIZE_INVENTORY]
             )
             if not batch:
@@ -2100,6 +2104,8 @@ def sync_provider_inventory_from_dlg() -> None:
         logger.info("{} No BrandDlgBrandMapping found.".format(_LOG_PREFIX))
         return
 
+    dlg_brand_id_to_name = {m.dlg_brand_id: m.dlg_brand.name for m in mappings}
+
     provider_parts = {
         row["provider_external_id"]: src_models.ProviderPart(id=row["id"])
         for row in src_models.ProviderPart.objects.filter(provider=dlg_provider).values("id", "provider_external_id")
@@ -2118,7 +2124,7 @@ def sync_provider_inventory_from_dlg() -> None:
             batch = list(
                 src_models.DlgParts.objects.filter(id__gt=last_id, brand_id__in=catalog_ids)
                 .order_by("id")
-                .values("id", "brand_id", "part_number", "available_on_hand", "units")[:BATCH_SIZE_INVENTORY]
+                .values("id", "brand_id", "part_number", "available_on_hand", "units", "display_name")[:BATCH_SIZE_INVENTORY]
             )
             if not batch:
                 break
@@ -2191,7 +2197,10 @@ def sync_provider_inventory_from_dlg() -> None:
                 pp = provider_parts.get(ext_id)
                 if pp:
                     pp.product_details = [
-                        {"key": "units", "label": "Unit", "value": row.get("units") or None},
+                        {"key": "sku",         "label": "SKU",         "value": pn or None},
+                        {"key": "brand",       "label": "Brand",       "value": dlg_brand_id_to_name.get(row.get("brand_id")) or None},
+                        {"key": "description", "label": "Description", "value": row.get("display_name") or None},
+                        {"key": "units",       "label": "Unit",        "value": row.get("units") or None},
                     ]
                     pp_details_to_update.append(pp)
             if pp_details_to_update:
@@ -2211,7 +2220,7 @@ def sync_provider_inventory_from_dlg() -> None:
     logger.info("{} Synced {} DLG inventory records total.".format(_LOG_PREFIX, total_upserted))
 
 
-def _atech_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
+def _atech_product_details(row: typing.Dict, brand_name: typing.Optional[str] = None) -> typing.List[typing.Dict]:
     """
     Build the product_details list for an AtechParts row.
     Fee fields: None when value is 0 or null (no charge).
@@ -2226,6 +2235,9 @@ def _atech_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
             return None
 
     return [
+        {"key": "sku",                 "label": "SKU",                 "value": row.get("part_number") or None},
+        {"key": "brand",               "label": "Brand",               "value": brand_name or None},
+        {"key": "description",         "label": "Description",         "value": row.get("description") or None},
         {"key": "fee_hazmat",          "label": "HAZMAT Fee",          "value": _fee(row.get("fee_hazmat"))},
         {"key": "fee_ground_shipping",  "label": "Ground Shipping Fee", "value": _fee(row.get("fee_truck_us"))},
         {"key": "fee_air_shipping",     "label": "Air Shipping Fee",    "value": _fee(row.get("fee_handling_air"))},
@@ -2275,6 +2287,8 @@ def sync_provider_inventory_from_atech() -> None:
         logger.info("{} No BrandAtechBrandMapping found.".format(_LOG_PREFIX))
         return
 
+    atech_brand_id_to_name = {m.atech_brand_id: m.atech_brand.name for m in mappings}
+
     provider_parts = {
         row["provider_external_id"]: src_models.ProviderPart(id=row["id"])
         for row in src_models.ProviderPart.objects.filter(provider=atech_provider).values("id", "provider_external_id")
@@ -2297,6 +2311,7 @@ def sync_provider_inventory_from_atech() -> None:
                     "id",
                     "brand_id",
                     "part_number",
+                    "description",
                     "qty_tallmadge",
                     "qty_sparks",
                     "qty_mcdonough",
@@ -2371,7 +2386,7 @@ def sync_provider_inventory_from_atech() -> None:
                 ext_id = _atech_provider_external_id(int(bid), ext)
                 pp = provider_parts.get(ext_id)
                 if pp:
-                    pp.product_details = _atech_product_details(ap)
+                    pp.product_details = _atech_product_details(ap, brand_name=atech_brand_id_to_name.get(ap.get("brand_id")))
                     pp_details_to_update.append(pp)
             if pp_details_to_update:
                 src_models.ProviderPart.objects.bulk_update(
@@ -3099,7 +3114,7 @@ _WHEELPROS_INV_ORDER_TYPE_LABELS: typing.Dict[str, str] = {
 }
 
 
-def _wheelpros_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
+def _wheelpros_product_details(row: typing.Dict, brand_name: typing.Optional[str] = None) -> typing.List[typing.Dict]:
     """
     Build the product_details list for a WheelProsPart row.
     inv_order_type is mapped to a human-readable label.
@@ -3116,6 +3131,9 @@ def _wheelpros_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
     inv_type_label = _WHEELPROS_INV_ORDER_TYPE_LABELS.get(raw_inv_type, raw_inv_type) if raw_inv_type else None
 
     return [
+        {"key": "sku",             "label": "SKU",              "value": row.get("part_number") or None},
+        {"key": "brand",           "label": "Brand",            "value": brand_name or None},
+        {"key": "description",     "label": "Description",      "value": row.get("part_description") or None},
         {"key": "image_url",       "label": "Image",            "value": row.get("image_url") or None},
         {"key": "inv_order_type",  "label": "Inventory Type",   "value": inv_type_label},
         {"key": "shipping_weight", "label": "Shipping Weight",  "value": _decimal(row.get("shipping_weight"))},
@@ -3149,6 +3167,8 @@ def sync_provider_inventory_from_wheelpros() -> None:
         logger.info("{} No BrandWheelProsBrandMapping found.".format(_LOG_PREFIX))
         return
 
+    wheelpros_brand_id_to_name = {m.wheelpros_brand_id: m.wheelpros_brand.name for m in mappings}
+
     provider_parts_by_ext_id, provider_parts_by_brand_sku = _wheelpros_provider_part_lookup(wp_provider)
 
     now = timezone.now()
@@ -3166,7 +3186,7 @@ def sync_provider_inventory_from_wheelpros() -> None:
                 .order_by("id")
                 .values(
                     "id", "brand_id", "part_number", "total_qoh", "warehouse_availability",
-                    "image_url", "inv_order_type", "shipping_weight",
+                    "part_description", "image_url", "inv_order_type", "shipping_weight",
                     "finish", "size", "bolt_pattern", "offset", "center_bore", "load_rating",
                 )[:BATCH_SIZE_INVENTORY]
             )
@@ -3238,7 +3258,7 @@ def sync_provider_inventory_from_wheelpros() -> None:
                     (row["brand_id"], part_number)
                 )
                 if provider_part:
-                    provider_part.product_details = _wheelpros_product_details(row)
+                    provider_part.product_details = _wheelpros_product_details(row, brand_name=wheelpros_brand_id_to_name.get(row.get("brand_id")))
                     provider_part.is_discontinued = (row.get("inv_order_type") or "").strip() == "N2"
                     pp_details_to_update.append(provider_part)
             if pp_details_to_update:
@@ -4334,7 +4354,10 @@ def _turn14_product_details(item_row: typing.Dict) -> typing.List[typing.Dict]:
     Build the product_details list for a Turn14Items row.
     """
     return [
-        {"key": "ltl_freight_required", "label": "LTL (Freight)",  "value": bool(item_row.get("ltl_freight_required"))},
+        {"key": "sku",                   "label": "SKU",             "value": item_row.get("part_number") or None},
+        {"key": "brand",                 "label": "Brand",           "value": item_row.get("brand_name") or None},
+        {"key": "description",           "label": "Description",     "value": item_row.get("part_description") or None},
+        {"key": "ltl_freight_required",  "label": "LTL (Freight)",   "value": bool(item_row.get("ltl_freight_required"))},
         {"key": "clearance_item",        "label": "Final Sale",      "value": bool(item_row.get("clearance_item"))},
     ]
 
@@ -4425,7 +4448,7 @@ def _sync_turn14_provider_inventory_batches(
                 row["external_id"]: row
                 for row in src_models.Turn14Items.objects.filter(
                     external_id__in=batch_ext_ids
-                ).values("external_id", "ltl_freight_required", "clearance_item")
+                ).values("external_id", "part_number", "brand_name", "part_description", "ltl_freight_required", "clearance_item")
             }
             pp_details_to_update = []
             for inv in batch:
@@ -4532,7 +4555,7 @@ def _keystone_warehouse_availability(row: typing.Dict) -> typing.Optional[typing
     return None
 
 
-def _keystone_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
+def _keystone_product_details(row: typing.Dict, brand_name: typing.Optional[str] = None) -> typing.List[typing.Dict]:
     """
     Build the product_details list for a KeystoneParts row.
     Each entry: {key, label, value} — ready for FE to iterate and render.
@@ -4546,6 +4569,9 @@ def _keystone_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
     kit_html = kit_raw.replace("|", "<br>") if kit_raw else None
 
     details = [
+        {"key": "sku",              "label": "SKU",                       "value": row.get("vcpn") or None},
+        {"key": "brand",            "label": "Brand",                     "value": brand_name or None},
+        {"key": "description",      "label": "Description",               "value": row.get("long_description") or None},
         {"key": "parcel_eligible",  "label": "Parcel Eligible",           "value": upsable},
     ]
 
@@ -4598,6 +4624,8 @@ def sync_provider_inventory_from_keystone() -> None:
         logger.info("{} No BrandKeystoneBrandMapping found.".format(_LOG_PREFIX))
         return
 
+    keystone_brand_id_to_name = {m.keystone_brand_id: m.keystone_brand.name for m in mappings}
+
     provider_parts = {
         row["provider_external_id"]: src_models.ProviderPart(id=row["id"])
         for row in src_models.ProviderPart.objects.filter(provider=keystone_provider).values("id", "provider_external_id")
@@ -4617,7 +4645,7 @@ def sync_provider_inventory_from_keystone() -> None:
                 src_models.KeystoneParts.objects.filter(id__gt=last_id, brand_id__in=catalog_ids)
                 .order_by("id")
                 .values(
-                    "id", "vcpn", "total_qty",
+                    "id", "brand_id", "vcpn", "long_description", "total_qty",
                     "east_qty", "midwest_qty", "california_qty", "southeast_qty",
                     "pacific_nw_qty", "texas_qty", "great_lakes_qty", "florida_qty",
                     # product_details fields
@@ -4668,7 +4696,7 @@ def sync_provider_inventory_from_keystone() -> None:
             for kp in batch:
                 if kp["vcpn"] in provider_parts:
                     pp = provider_parts[kp["vcpn"]]
-                    pp.product_details = _keystone_product_details(kp)
+                    pp.product_details = _keystone_product_details(kp, brand_name=keystone_brand_id_to_name.get(kp.get("brand_id")))
                     pp_details_to_update.append(pp)
             if pp_details_to_update:
                 src_models.ProviderPart.objects.bulk_update(
@@ -4688,7 +4716,7 @@ def sync_provider_inventory_from_keystone() -> None:
     logger.info("{} Synced {} Keystone inventory records total.".format(_LOG_PREFIX, total_upserted))
 
 
-def _meyer_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
+def _meyer_product_details(row: typing.Dict, brand_name: typing.Optional[str] = None) -> typing.List[typing.Dict]:
     """
     Build the product_details list for a MeyerParts row.
     Boolean flags are stored as True/False; dimensions as float or None.
@@ -4702,7 +4730,10 @@ def _meyer_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
             return None
 
     return [
-        {"key": "is_discontinued",       "label": "Discontinued",                "value": bool(row.get("is_discontinued"))},
+        {"key": "sku",                    "label": "SKU",                         "value": row.get("meyer_part") or None},
+        {"key": "brand",                  "label": "Brand",                       "value": brand_name or None},
+        {"key": "description",            "label": "Description",                 "value": row.get("description") or None},
+        {"key": "is_discontinued",        "label": "Discontinued",                "value": bool(row.get("is_discontinued"))},
         {"key": "addtl_handling_charge",  "label": "Additional Handling Charge",  "value": bool(row.get("addtl_handling_charge"))},
         {"key": "is_oversize",            "label": "Oversize Parcel",             "value": bool(row.get("is_oversize"))},
         {"key": "is_ltl",                 "label": "LTL (Freight)",               "value": bool(row.get("is_ltl"))},
@@ -4763,6 +4794,8 @@ def sync_provider_inventory_from_meyer() -> None:
         logger.info("{} No BrandMeyerBrandMapping found.".format(_LOG_PREFIX))
         return
 
+    meyer_brand_id_to_name = {m.meyer_brand_id: m.meyer_brand.name for m in mappings}
+
     # Load only id + provider_external_id to avoid materialising ~950k full ORM objects (~1-2 GB).
     provider_parts = {
         row["provider_external_id"]: src_models.ProviderPart(id=row["id"])
@@ -4784,7 +4817,9 @@ def sync_provider_inventory_from_meyer() -> None:
                 .order_by("id")
                 .values(
                     "id",
+                    "brand_id",
                     "meyer_part",
+                    "description",
                     "available_qty",
                     "mfg_qty_available",
                     "is_stocking",
@@ -4866,7 +4901,7 @@ def sync_provider_inventory_from_meyer() -> None:
                     ext = str(ext or "").strip()
                 pp = provider_parts.get(ext)
                 if pp:
-                    pp.product_details = _meyer_product_details(mp)
+                    pp.product_details = _meyer_product_details(mp, brand_name=meyer_brand_id_to_name.get(mp.get("brand_id")))
                     pp.is_discontinued = bool(mp.get("is_discontinued"))
                     pp_details_to_update.append(pp)
             if pp_details_to_update:
@@ -5666,7 +5701,7 @@ def _premier_warehouse_availability(row: typing.Dict) -> typing.Optional[typing.
     return avail if avail else None
 
 
-def _premier_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
+def _premier_product_details(row: typing.Dict, brand_name: typing.Optional[str] = None) -> typing.List[typing.Dict]:
     def _decimal(val):
         return float(val) if val is not None else None
 
@@ -5681,6 +5716,9 @@ def _premier_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
     kit_html = kit_raw.replace("|", "<br>") if isinstance(kit_raw, str) and kit_raw else None
 
     return [
+        {"key": "sku",                 "label": "SKU",                         "value": row.get("premier_part_number") or None},
+        {"key": "brand",               "label": "Brand",                       "value": brand_name or None},
+        {"key": "description",         "label": "Description",                 "value": row.get("long_description") or None},
         {"key": "ships_ltl",           "label": "Ships LTL",                   "value": _bool(row.get("ships_ltl"))},
         {"key": "drop_ship_fee",        "label": "Drop Ship Fee",               "value": _decimal(row.get("drop_ship_fee"))},
         {"key": "length_in",            "label": "Length (in)",                 "value": _decimal(row.get("length"))},
@@ -5969,6 +6007,8 @@ def sync_provider_inventory_from_premier() -> None:
         logger.info("{} No BrandPremierBrandMapping found.".format(_LOG_PREFIX))
         return
 
+    premier_brand_id_to_name = {m.premier_brand_id: m.premier_brand.name for m in mappings}
+
     provider_parts = {
         row["provider_external_id"]: src_models.ProviderPart(id=row["id"])
         for row in src_models.ProviderPart.objects.filter(provider=premier_provider).values("id", "provider_external_id")
@@ -5994,6 +6034,7 @@ def sync_provider_inventory_from_premier() -> None:
                     "id",
                     "brand_id",
                     "premier_part_number",
+                    "long_description",
                     "nv_qty",
                     "ky_qty",
                     "wa_qty",
@@ -6053,7 +6094,7 @@ def sync_provider_inventory_from_premier() -> None:
                         updated_at=now,
                     )
                 )
-                pp.product_details = _premier_product_details(kp)
+                pp.product_details = _premier_product_details(kp, brand_name=premier_brand_id_to_name.get(kp.get("brand_id")))
                 pp_details_to_update.append(pp)
 
             if to_upsert:
