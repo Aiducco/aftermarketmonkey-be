@@ -5811,8 +5811,7 @@ def _ingest_premier_parts_for_mapped_brands(
                     UPDATE master_parts mp SET
                         aaia_code = v.aaia_code,
                         image_url = CASE
-                            WHEN (mp.image_url IS NULL OR mp.image_url = '')
-                                AND v.image_url IS NOT NULL AND v.image_url != ''
+                            WHEN v.image_url IS NOT NULL AND v.image_url != ''
                             THEN v.image_url
                             ELSE mp.image_url
                         END

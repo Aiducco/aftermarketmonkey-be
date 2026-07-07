@@ -137,6 +137,8 @@ def _get_mappings_for_brand(brand):
         out.append("atech")
     if src_models.BrandDlgBrandMapping.objects.filter(brand=brand).exists():
         out.append("dlg")
+    if src_models.BrandPremierBrandMapping.objects.filter(brand=brand).exists():
+        out.append("premier")
     return out
 
 
@@ -265,6 +267,29 @@ def merge_brands(brand_to_keep, brand_to_delete, confirm=_confirm):
             if confirm(
                 "  Update mapping id={} brand_id {} -> {} (dlg_brand={})?".format(
                     m.id, delete_id, keep_id, m.dlg_brand.name
+                )
+            ):
+                m.brand_id = keep_id
+                m.save()
+
+    # 5c. BrandPremierBrandMapping
+    premier_list = list(
+        src_models.BrandPremierBrandMapping.objects.filter(brand_id=delete_id).select_related("premier_brand")
+    )
+    print("\n--- BrandPremierBrandMapping: {} to process ---".format(len(premier_list)))
+    for m in premier_list:
+        existing = src_models.BrandPremierBrandMapping.objects.filter(
+            brand_id=keep_id, premier_brand=m.premier_brand
+        ).first()
+        if existing:
+            if confirm(
+                "  Delete mapping id={} (premier_brand={})? Keep already has.".format(m.id, m.premier_brand.name)
+            ):
+                m.delete()
+        else:
+            if confirm(
+                "  Update mapping id={} brand_id {} -> {} (premier_brand={})?".format(
+                    m.id, delete_id, keep_id, m.premier_brand.name
                 )
             ):
                 m.brand_id = keep_id

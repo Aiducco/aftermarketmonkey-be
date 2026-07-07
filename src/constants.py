@@ -84,7 +84,6 @@ PREMIER_WAREHOUSE_QTY_FIELD_TO_LOCATION_LABEL = {
     "nv_qty": "Las Vegas, NV",
     "ky_qty": "Louisville, KY",
     "wa_qty": "Silverdale, WA",
-    "mfg_qty": "Manufacturer Inventory",
 }
 ROUGH_COUNTRY_INVENTORY_SEARCH_URL_TEMPLATE = "https://www.roughcountry.com/search/{sku}"
 

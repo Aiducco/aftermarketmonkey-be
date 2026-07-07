@@ -230,14 +230,16 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
         "updated_at": part.updated_at.isoformat() if part.updated_at else None,
     }
 
-    connected_provider_ids: typing.Set[int] = set()
+    company_provider_map: typing.Dict[int, bool] = {}
     if company_id is not None:
-        connected_provider_ids = set(
-            src_models.CompanyProviders.objects.filter(
+        company_provider_map = {
+            row["provider_id"]: row["initial_sync_completed"]
+            for row in src_models.CompanyProviders.objects.filter(
                 company_id=company_id,
                 provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
-            ).values_list("provider_id", flat=True)
-        )
+            ).values("provider_id", "initial_sync_completed")
+        }
+    connected_provider_ids: typing.Set[int] = set(company_provider_map)
 
     provider_parts = list(
         src_models.ProviderPart.objects.filter(master_part=part)
@@ -301,7 +303,10 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
                 pp.provider_external_id or "",
                 turn14_vmm,
             ),
-            "company_integration": {"connected": integrated},
+            "company_integration": {
+                "connected": integrated,
+                "initial_sync_completed": company_provider_map.get(pp.provider_id) if integrated else None,
+            },
             "is_discontinued": pp.is_discontinued,
             "inventory": None,
             "pricing": None,
