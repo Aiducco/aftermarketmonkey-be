@@ -1128,6 +1128,22 @@ def _fetch_and_save_turn_14_brand_pricing_for_company_provider(
         while page is not None:
             try:
                 pricing_data, next_page = api_client.get_pricelists(brand_id=brand_id, page=page)
+            except turn_14_exceptions.Turn14APIBadResponseCodeError as e:
+                if e.code == 403:
+                    # Account-level restriction — all brands will fail the same way.
+                    # Raise immediately so the job is marked FAILED with a clear error.
+                    msg = (
+                        'Turn14 account for company={} does not have access to the pricing endpoint '
+                        '(HTTP 403). Contact Turn14 to enable pricing API access for this account. '
+                        'Error: {}'.format(company.name, e.message)
+                    )
+                    logger.error('{} {}'.format(_LOG_PREFIX, msg))
+                    raise ValueError(msg)
+                logger.error('{} Turn 14 API error company={} brand: {} (external_id: {}), page: {}. '
+                             'HTTP {}. Error: {}.'.format(
+                    _LOG_PREFIX, company.name, turn_14_brand.name, brand_id, page, e.code, e.message
+                ))
+                break
             except turn_14_exceptions.Turn14APIException as e:
                 logger.error('{} Turn 14 API error company={} brand: {} (external_id: {}), page: {}. Error: {}.'.format(
                     _LOG_PREFIX, company.name, turn_14_brand.name, brand_id, page, str(e)
@@ -1319,6 +1335,19 @@ def fetch_and_save_turn_14_brand_pricing_for_turn14_brands(
             while page is not None:
                 try:
                     pricing_data, next_page = api_client.get_pricelists(brand_id=brand_id, page=page)
+                except turn_14_exceptions.Turn14APIBadResponseCodeError as e:
+                    if e.code == 403:
+                        msg = (
+                            'Turn14 account for company={} does not have access to the pricing endpoint '
+                            '(HTTP 403). Contact Turn14 to enable pricing API access for this account. '
+                            'Error: {}'.format(company.name, e.message)
+                        )
+                        logger.error('{} {}'.format(_LOG_PREFIX, msg))
+                        raise ValueError(msg)
+                    logger.error('{} Turn 14 API error company={} brand: {} page: {}. HTTP {}. Error: {}.'.format(
+                        _LOG_PREFIX, company.name, turn_14_brand.name, page, e.code, e.message
+                    ))
+                    break
                 except turn_14_exceptions.Turn14APIException as e:
                     logger.error('{} Turn 14 API error company={} brand: {} page: {}. Error: {}.'.format(
                         _LOG_PREFIX, company.name, turn_14_brand.name, page, str(e)
