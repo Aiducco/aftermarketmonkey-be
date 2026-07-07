@@ -1419,8 +1419,14 @@ def sync_meyer_company_pricing_for_company_provider(
 ) -> None:
     """
     Download Meyer pricing CSV for one CompanyProviders row and upsert MeyerCompanyPricing.
-    Two-pass streaming: Pass 1 collects brand names only; Pass 2 streams rows in
-    MEYER_COMPANY_PRICING_STREAM_BATCH chunks — no full-file accumulation in memory.
+
+    Two-pass strategy — eliminates repeated per-batch DB lookups:
+      Pass 1: stream CSV once, collect brand name strings + all (mfg, sku) key pairs
+              (no pricing data stored — tiny memory footprint).
+              Build brand map, then do ONE bulk _meyer_part_ids_by_brand_sku call
+              across all pairs with full thread parallelism → id_by_brand_sku dict.
+      Pass 2: stream CSV again, buffer (brand_id, sku) → payload, look up part_id
+              via O(1) dict hit, upsert every MEYER_COMPANY_PRICING_STREAM_BATCH rows.
     """
     cp = (
         src_models.CompanyProviders.objects.filter(
@@ -1455,17 +1461,22 @@ def sync_meyer_company_pricing_for_company_provider(
         )
         raise
 
-    # Pass 1: stream CSV once to collect brand name strings only — O(n_brands) memory.
+    # Pass 1: stream CSV once — collect brand name strings AND raw (mfg, sku) key pairs.
+    # No pricing payload stored here, so memory is O(n_brands + n_unique_skus).
     logger.info(
-        "{} Pass 1 — collecting brand names company_id={} company_provider_id={}.".format(
+        "{} Pass 1 — collecting brand names + SKU keys company_id={} company_provider_id={}.".format(
             _LOG_PREFIX, cp.company_id, cp.id,
         )
     )
     mfg_names: typing.Set[str] = set()
+    raw_pairs: typing.Set[typing.Tuple[str, str]] = set()  # (mfg_key, sku)
     for row in _iter_records_from_csv(company_pricing_path):
         mfg = _meyer_brand_key(row.get("MFG"))
-        if mfg:
-            mfg_names.add(mfg)
+        meyer_part = _clean_csv_value(row.get("Meyer Part"))
+        if not mfg or not meyer_part:
+            continue
+        mfg_names.add(mfg)
+        raw_pairs.add((mfg, meyer_part.strip()))
 
     if not mfg_names:
         logger.warning(
@@ -1476,9 +1487,31 @@ def sync_meyer_company_pricing_for_company_provider(
     brand_by_mfg = _brand_map_for_names(mfg_names)
     _ensure_meyer_brands_for_mfgs(mfg_names, brand_by_mfg)  # mutates brand_by_mfg in-place
 
-    # Pass 2: stream CSV, buffer (brand_id, sku) -> pricing payload, flush every batch.
+    # Convert (mfg, sku) → (brand_id, sku) and do ONE bulk DB lookup across all pairs.
+    all_pairs: typing.List[typing.Tuple[int, str]] = []
+    for mfg, sku in raw_pairs:
+        brand = brand_by_mfg.get(mfg)
+        if brand:
+            all_pairs.append((brand.id, sku))
+    del raw_pairs  # free immediately
+
     logger.info(
-        "{} Pass 2 — streaming company pricing company_id={} company_provider_id={} "
+        "{} Bulk part-ID lookup: {} unique (brand_id, sku) pairs company_provider_id={}.".format(
+            _LOG_PREFIX, len(all_pairs), company_provider_id,
+        )
+    )
+    id_by_brand_sku = _meyer_part_ids_by_brand_sku(all_pairs, company_provider_id=company_provider_id)
+    del all_pairs  # free immediately
+    logger.info(
+        "{} Part-ID lookup done: {} matched part IDs company_provider_id={}.".format(
+            _LOG_PREFIX, len(id_by_brand_sku), company_provider_id,
+        )
+    )
+
+    # Pass 2: stream CSV, buffer (brand_id, sku) → payload, upsert every batch.
+    # part_id lookups are O(1) against the pre-built dict — no per-batch DB queries.
+    logger.info(
+        "{} Pass 2 — streaming upsert company_id={} company_provider_id={} "
         "(batch_size={}).".format(
             _LOG_PREFIX, cp.company_id, cp.id, MEYER_COMPANY_PRICING_STREAM_BATCH,
         )
@@ -1491,10 +1524,9 @@ def sync_meyer_company_pricing_for_company_provider(
         nonlocal total_upserted, batch_num
         if not buf:
             return
-        id_map = _meyer_part_ids_by_brand_sku(list(buf.keys()), company_provider_id=company_provider_id)
         pricing_rows: typing.List[src_models.MeyerCompanyPricing] = []
         for (bid, sku), pdata in buf.items():
-            part_id = id_map.get((bid, sku))
+            part_id = id_by_brand_sku.get((bid, sku))
             if not part_id:
                 continue
             pricing_rows.append(

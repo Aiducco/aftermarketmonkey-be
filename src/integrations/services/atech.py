@@ -1113,15 +1113,52 @@ def sync_atech_company_pricing_for_company_provider(
         )
         raise
 
+    # Pass 1: stream CSV once — collect all feed_part_number keys only (no pricing data).
+    # Then do ONE bulk AtechParts lookup across all keys with full thread parallelism.
     logger.info(
-        "{} Streaming company pricing company_id={} company_provider_id={} "
+        "{} Pass 1 — collecting feed_part_number keys company_id={} company_provider_id={}.".format(
+            _LOG_PREFIX, cp.company_id, cp.id,
+        )
+    )
+    all_keys: typing.List[str] = []
+    seen_keys: typing.Set[str] = set()
+    for row in _iter_atech_csv_rows(company_feed_path):
+        fn = _clean_csv_value(row.get("part_number"))
+        if not fn:
+            continue
+        key = fn.strip()
+        if key and key not in seen_keys:
+            seen_keys.add(key)
+            all_keys.append(key)
+    del seen_keys
+
+    if not all_keys:
+        logger.warning(
+            "{} No pricing rows parsed for A-Tech company_provider id={}.".format(_LOG_PREFIX, company_provider_id)
+        )
+        return
+
+    logger.info(
+        "{} Bulk part-ID lookup: {} unique feed_part_number keys company_provider_id={}.".format(
+            _LOG_PREFIX, len(all_keys), company_provider_id,
+        )
+    )
+    id_by_feed = _id_by_feed_keys_parallel(all_keys, _LOG_PREFIX, company_provider_id)
+    del all_keys
+    logger.info(
+        "{} Part-ID lookup done: {} matched part IDs company_provider_id={}.".format(
+            _LOG_PREFIX, len(id_by_feed), company_provider_id,
+        )
+    )
+
+    # Pass 2: stream CSV again, buffer by feed_part_number, upsert every batch.
+    # part_id lookups are O(1) against the pre-built dict — no per-batch DB queries.
+    logger.info(
+        "{} Pass 2 — streaming upsert company_id={} company_provider_id={} "
         "(batch_size={}).".format(
             _LOG_PREFIX, cp.company_id, cp.id, ATECH_COMPANY_PRICING_STREAM_BATCH,
         )
     )
-
-    # Stream CSV, buffer by feed_part_number (last row per key wins within batch),
-    # flush every ATECH_COMPANY_PRICING_STREAM_BATCH rows.
     buf: typing.Dict[str, typing.Dict[str, typing.Any]] = {}
     total_upserted = 0
     batch_num = 0
@@ -1130,14 +1167,6 @@ def sync_atech_company_pricing_for_company_provider(
         nonlocal total_upserted, batch_num
         if not buf:
             return
-        keys = list(buf.keys())
-        id_by_feed: typing.Dict[str, int] = {}
-        for fn, pid in src_models.AtechParts.objects.filter(
-            feed_part_number__in=keys
-        ).values_list("feed_part_number", "id"):
-            k = (fn or "").strip()
-            if k:
-                id_by_feed[k] = int(pid)
         pricing_rows: typing.List[src_models.AtechCompanyPricing] = []
         for feed_fn, pdata in buf.items():
             k = (feed_fn or "").strip()
