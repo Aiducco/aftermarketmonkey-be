@@ -96,17 +96,44 @@ def get_master_part_brand_filter_options(
 ) -> typing.List[typing.Dict[str, typing.Union[int, str]]]:
     """
     Distinct brands that have at least one MasterPart, ordered by name.
-    ``name`` matches Meilisearch ``brand_name`` / :func:`master_part_to_index_shape` for filters.
-
-    Optional ``q`` applies case-insensitive substring match (for typeahead in a combobox).
+    Reads from BrandFilterCache, which is rebuilt after every master-parts sync.
     """
     cap = min(max(limit, 1), 2000)
-    brand_ids = src_models.MasterPart.objects.values_list("brand_id", flat=True).distinct()
-    brands = src_models.Brands.objects.filter(id__in=brand_ids).order_by("name")
     sq = (q or "").strip()
+    qs = src_models.BrandFilterCache.objects.order_by("name")
     if sq:
-        brands = brands.filter(name__icontains=sq)
-    return [{"id": row["id"], "name": row["name"]} for row in brands.values("id", "name")[:cap]]
+        qs = qs.filter(name__icontains=sq)
+    return [{"id": row["brand_id"], "name": row["name"]} for row in qs.values("brand_id", "name")[:cap]]
+
+
+def refresh_brand_filter_cache() -> int:
+    """
+    Rebuilds BrandFilterCache from master_parts in a single upsert + prune.
+    Called at the end of every master-parts sync.
+    Returns the number of brands in the cache after refresh.
+    """
+    from django.db import connection
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO brand_filter_cache (brand_id, name, updated_at)
+            SELECT DISTINCT mp.brand_id, b.name, NOW()
+            FROM master_parts mp
+            JOIN brands b ON b.id = mp.brand_id
+            ON CONFLICT (brand_id) DO UPDATE
+                SET name = EXCLUDED.name,
+                    updated_at = EXCLUDED.updated_at
+            """
+        )
+        cursor.execute(
+            """
+            DELETE FROM brand_filter_cache
+            WHERE brand_id NOT IN (SELECT DISTINCT brand_id FROM master_parts)
+            """
+        )
+        cursor.execute("SELECT COUNT(*) FROM brand_filter_cache")
+        return cursor.fetchone()[0]
 
 
 def get_master_part_category_filter_options(

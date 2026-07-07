@@ -1,5 +1,6 @@
 from django.core.management.base import BaseCommand
 
+from src.api.services.parts import refresh_brand_filter_cache
 from src.audit import scheduled_tasks as audit_scheduled_tasks
 from src.integrations.services import master_parts
 from src.search.meilisearch_client import is_configured, reindex_all_master_parts
@@ -34,6 +35,9 @@ class Command(BaseCommand):
         try:
             master_parts.sync_all_master_parts()
             self.stdout.write(self.style.SUCCESS("Successfully completed master parts sync."))
+
+            n = refresh_brand_filter_cache()
+            self.stdout.write(self.style.SUCCESS("Brand filter cache refreshed ({} brands).".format(n)))
 
             if options.get("reindex_meilisearch") and is_configured():
                 self.stdout.write("Reindexing Meilisearch...")

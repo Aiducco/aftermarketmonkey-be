@@ -42,6 +42,7 @@ from django.db import connection
 
 from django.core.management.base import BaseCommand
 
+from src.api.services.parts import refresh_brand_filter_cache
 from src.audit import scheduled_tasks as audit_scheduled_tasks
 from src.integrations.services import (
     atech,
@@ -187,6 +188,9 @@ class Command(BaseCommand):
                 )
                 master_parts.sync_all_master_parts_global()
             self.stdout.write(self.style.SUCCESS("Master parts global sync completed."))
+
+            n_brands = refresh_brand_filter_cache()
+            self.stdout.write(self.style.SUCCESS("Brand filter cache refreshed ({} brands).".format(n_brands)))
 
             # ----------------------------------------------------------------
             # Phase 3: Enqueue per-company pricing sync jobs.

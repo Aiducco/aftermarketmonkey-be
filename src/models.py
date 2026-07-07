@@ -1664,3 +1664,24 @@ class LeadEmail(django_db_models.Model):
 
     def __str__(self):
         return f"{self.email} ({self.status})"
+
+
+class BrandFilterCache(django_db_models.Model):
+    """
+    Materialised list of brands that have at least one MasterPart.
+    Rebuilt at the end of every master-parts sync so the /parts/search/brands/
+    endpoint can do a simple table scan instead of an expensive DISTINCT subquery.
+    """
+
+    brand = django_db_models.OneToOneField(
+        Brands,
+        on_delete=django_db_models.CASCADE,
+        related_name="filter_cache",
+        primary_key=True,
+    )
+    name = django_db_models.CharField(max_length=255, db_index=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "brand_filter_cache"
+        ordering = ["name"]
