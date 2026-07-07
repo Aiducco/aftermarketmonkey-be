@@ -5697,8 +5697,13 @@ def _premier_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
         {"key": "inventory_status",     "label": "Inventory Status",            "value": row.get("inventory_status")},
         {"key": "pies_ems_code",        "label": "PIES EMS Code",               "value": row.get("pies_ems_code")},
         {"key": "minimum_order_qty",    "label": "Minimum Order Qty",           "value": row.get("minimum_order_qty")},
-        {"key": "drop_shippable_mfg",   "label": "Drop Shippable from MFG",    "value": _bool(row.get("drop_shippable_from_mfg"))},
-        {"key": "freight_cost",         "label": "Freight Cost",                "value": _decimal(row.get("freight_cost"))},
+        {"key": "drop_shippable_mfg",              "label": "Drop Shippable from MFG",       "value": _bool(row.get("drop_shippable_from_mfg"))},
+        {"key": "freight_cost",                    "label": "Freight Cost",                  "value": _decimal(row.get("freight_cost"))},
+        {"key": "line_code",                       "label": "Line Code",                     "value": row.get("line_code") or None},
+        {"key": "part_category",                   "label": "Part Category",                 "value": row.get("part_category") or None},
+        {"key": "part_subcategory",                "label": "Part Subcategory",              "value": row.get("part_subcategory") or None},
+        {"key": "part_terminology",                "label": "Part Terminology",              "value": row.get("part_terminology") or None},
+        {"key": "vendor_enhanced_emissions_code",  "label": "Vendor Enhanced Emissions Code","value": row.get("vendor_enhanced_emissions_code") or None},
     ]
 
 
@@ -6012,6 +6017,11 @@ def sync_provider_inventory_from_premier() -> None:
                     "minimum_order_qty",
                     "drop_shippable_from_mfg",
                     "freight_cost",
+                    "line_code",
+                    "part_category",
+                    "part_subcategory",
+                    "part_terminology",
+                    "vendor_enhanced_emissions_code",
                 )[:BATCH_SIZE_INVENTORY]
             )
             if not batch:
