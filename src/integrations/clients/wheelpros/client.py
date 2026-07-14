@@ -1,6 +1,7 @@
 import csv
 import logging
 import os
+import socket
 import time
 import typing
 
@@ -18,6 +19,11 @@ DEFAULT_SFTP_PORT = 22
 DEFAULT_SFTP_PATH = "CommonFeed/USD/WHEEL/wheelInvPriceData.csv"
 DEFAULT_LOCAL_FILE_NAME = "wheelpros_wheel_inventory.csv"
 DEFAULT_FILE_MAX_AGE_SECONDS = 6 * 60 * 60
+
+# paramiko.Transport((host, port)) opens the socket with no timeout, so a bad host/firewall
+# could hang the calling thread indefinitely — matters now that test_connection() runs
+# synchronously inside an HTTP request.
+DEFAULT_CONNECT_TIMEOUT_SECONDS = 15
 
 
 class WheelProsSFTPClient:
@@ -62,7 +68,10 @@ class WheelProsSFTPClient:
     def _connect(self) -> None:
         """Establish SFTP connection (same pattern as WheelProsAccessoriesProvider)."""
         try:
-            self._transport = paramiko.Transport((self.sftp_server, self.sftp_port))
+            sock = socket.create_connection(
+                (self.sftp_server, self.sftp_port), timeout=DEFAULT_CONNECT_TIMEOUT_SECONDS
+            )
+            self._transport = paramiko.Transport(sock)
             self._transport.connect(username=self.sftp_user, password=self.sftp_password)
             self._sftp = paramiko.SFTPClient.from_transport(self._transport)
         except Exception as e:
@@ -83,6 +92,31 @@ class WheelProsSFTPClient:
             logger.warning("{} Error during disconnect: {}.".format(_LOG_PREFIX, str(e)))
             self._sftp = None
             self._transport = None
+
+    def test_connection(self, remote_paths: typing.Optional[typing.Iterable[str]] = None) -> None:
+        """
+        Log in, then confirm each of ``remote_paths`` (defaults to ``self.sftp_path``) is
+        actually readable — some accounts authenticate over SFTP successfully but lack
+        permission on a specific feed's directory, which would otherwise only surface later
+        as a failed pricing sync. Uses ``stat()`` so nothing is downloaded.
+        """
+        self._connect()
+        try:
+            paths = [p for p in (remote_paths or [self.sftp_path]) if p]
+            inaccessible: typing.List[str] = []
+            for path in paths:
+                remote_path = path if path.startswith("/") else "/" + path
+                try:
+                    self._sftp.stat(remote_path)
+                except (FileNotFoundError, IOError, OSError) as e:
+                    inaccessible.append("{} ({})".format(remote_path, str(e)))
+            if inaccessible:
+                raise exceptions.WheelProsSFTPConnectionError(
+                    "Connected, but could not access: {}. Contact Wheel Pros support to confirm "
+                    "your account has access to these feeds.".format("; ".join(inaccessible))
+                )
+        finally:
+            self._disconnect()
 
     def is_file_outdated(self, local_path: typing.Optional[str] = None) -> bool:
         path = local_path or self.local_file_path

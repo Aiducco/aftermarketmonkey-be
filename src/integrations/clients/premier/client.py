@@ -20,6 +20,10 @@ DEFAULT_INVENTORY_ZIP_FILENAME = "premier_data_feed_master.zip"
 DEFAULT_INVENTORY_CSV_FILENAME = "premier_data_feed_master.csv"
 DEFAULT_FILE_MAX_AGE_SECONDS = 6 * 60 * 60  # 6 hours
 
+# ftp.connect() had no timeout before, so a bad host/firewall could hang the calling thread
+# indefinitely — matters now that test_connection() runs synchronously inside an HTTP request.
+DEFAULT_CONNECT_TIMEOUT_SECONDS = 15
+
 
 class PremierFTPClient:
     """
@@ -54,7 +58,7 @@ class PremierFTPClient:
     def _connect(self) -> ftplib.FTP:
         try:
             ftp = ftplib.FTP()
-            ftp.connect(host=self.ftp_host, port=self.ftp_port)
+            ftp.connect(host=self.ftp_host, port=self.ftp_port, timeout=DEFAULT_CONNECT_TIMEOUT_SECONDS)
             ftp.login(user=self.ftp_user, passwd=self.ftp_pass)
             ftp.set_pasv(True)
             logger.debug(
@@ -73,6 +77,11 @@ class PremierFTPClient:
                 logger.debug("{} Disconnected from FTP server.".format(_LOG_PREFIX))
         except Exception as e:
             logger.warning("{} Error during disconnect: {}.".format(_LOG_PREFIX, str(e)))
+
+    def test_connection(self) -> None:
+        """Log in and immediately disconnect — validates credentials without downloading anything."""
+        ftp = self._connect()
+        self._disconnect(ftp)
 
     def is_file_outdated(self) -> bool:
         if not os.path.exists(self.local_file_path):

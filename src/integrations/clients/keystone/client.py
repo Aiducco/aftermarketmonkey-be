@@ -22,6 +22,10 @@ DEFAULT_INVENTORY_ZIP_FILENAME = "Inventory.zip"
 DEFAULT_INVENTORY_CSV_FILENAME = "Inventory.csv"
 DEFAULT_FILE_MAX_AGE_SECONDS = 6 * 60 * 60  # 6 hours
 
+# ftp.connect() had no timeout before, so a bad host/firewall could hang the calling thread
+# indefinitely — matters now that test_connection() runs synchronously inside an HTTP request.
+DEFAULT_CONNECT_TIMEOUT_SECONDS = 15
+
 
 class ImplicitFTP_TLS(ftplib.FTP_TLS):
     """FTP_TLS subclass that automatically wraps sockets in SSL to support implicit FTPS."""
@@ -81,7 +85,7 @@ class KeystoneFTPClient:
         """Establish FTP connection."""
         try:
             ftp = ImplicitFTP_TLS()
-            ftp.connect(host=self.ftp_host, port=self.ftp_port)
+            ftp.connect(host=self.ftp_host, port=self.ftp_port, timeout=DEFAULT_CONNECT_TIMEOUT_SECONDS)
             ftp.login(user=self.ftp_user, passwd=self.ftp_pass)
             ftp.set_pasv(True)
             logger.debug(
@@ -103,6 +107,11 @@ class KeystoneFTPClient:
                 logger.debug("{} Disconnected from FTP server.".format(_LOG_PREFIX))
         except Exception as e:
             logger.warning("{} Error during disconnect: {}.".format(_LOG_PREFIX, str(e)))
+
+    def test_connection(self) -> None:
+        """Log in and immediately disconnect — validates credentials without downloading anything."""
+        ftp = self._connect()
+        self._disconnect(ftp)
 
     def is_file_outdated(self) -> bool:
         """Check if the local inventory file is older than the allowed maximum age."""

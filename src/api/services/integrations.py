@@ -4,7 +4,18 @@ import typing
 from django.core.paginator import Paginator
 
 from src import constants as src_constants
+from src import enums as src_enums
 from src import models as src_models
+from src.integrations.clients.keystone import client as keystone_client
+from src.integrations.clients.keystone import exceptions as keystone_exceptions
+from src.integrations.clients.premier import client as premier_client
+from src.integrations.clients.premier import exceptions as premier_exceptions
+from src.integrations.clients.rough_country import client as rough_country_client
+from src.integrations.clients.rough_country import exceptions as rough_country_exceptions
+from src.integrations.clients.turn_14 import client as turn14_client
+from src.integrations.clients.turn_14 import exceptions as turn14_exceptions
+from src.integrations.clients.wheelpros import client as wheelpros_client
+from src.integrations.clients.wheelpros import exceptions as wheelpros_exceptions
 from src.integrations.services import integration_pricing_sync_jobs, relay_sftp_provisioning
 
 logger = logging.getLogger(__name__)
@@ -241,6 +252,105 @@ def _get_catalog_entry_for_provider(provider_id: int) -> typing.Optional[typing.
     return None
 
 
+def _validate_wheelpros_markup_fields(credentials: typing.Dict[str, typing.Any]) -> typing.Optional[str]:
+    """wheel_markup / tire_markup / accessories_markup must be numeric percentages in [0, 100]."""
+    for key in ("wheel_markup", "tire_markup", "accessories_markup"):
+        raw = credentials.get(key)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return "{} must be a number between 0 and 100.".format(key)
+        if not (0 <= value <= 100):
+            return "{} must be between 0 and 100 (got {}).".format(key, raw)
+    return None
+
+
+def _validate_turn14_connection(credentials: typing.Dict[str, typing.Any]) -> typing.Optional[str]:
+    try:
+        client = turn14_client.Turn14ApiClient(credentials=credentials)
+        client.test_connection()
+    except turn14_exceptions.Turn14APIBadResponseCodeError as e:
+        return e.message
+    except (turn14_exceptions.Turn14APIException, ValueError) as e:
+        return str(e)
+    return None
+
+
+def _validate_keystone_connection(credentials: typing.Dict[str, typing.Any]) -> typing.Optional[str]:
+    try:
+        client = keystone_client.KeystoneFTPClient(credentials=credentials)
+        client.test_connection()
+    except (keystone_exceptions.KeystoneException, ValueError) as e:
+        return str(e)
+    return None
+
+
+def _validate_premier_connection(credentials: typing.Dict[str, typing.Any]) -> typing.Optional[str]:
+    try:
+        client = premier_client.PremierFTPClient(credentials=credentials)
+        client.test_connection()
+    except (premier_exceptions.PremierException, ValueError) as e:
+        return str(e)
+    return None
+
+
+def _validate_wheelpros_connection(credentials: typing.Dict[str, typing.Any]) -> typing.Optional[str]:
+    markup_error = _validate_wheelpros_markup_fields(credentials)
+    if markup_error:
+        return markup_error
+    try:
+        client = wheelpros_client.WheelProsSFTPClient(credentials=credentials)
+        # Check auth against all three feeds (wheel/tire/accessories), not just a bare login —
+        # some accounts authenticate fine but lack permission on a specific feed's directory.
+        client.test_connection(remote_paths=src_constants.WHEELPROS_FEED_PATHS.values())
+    except (wheelpros_exceptions.WheelProsException, ValueError) as e:
+        return str(e)
+    return None
+
+
+def _validate_rough_country_connection(credentials: typing.Dict[str, typing.Any]) -> typing.Optional[str]:
+    url = credentials.get(src_constants.ROUGH_COUNTRY_CREDENTIALS_FEED_URL)
+    try:
+        client = rough_country_client.RoughCountryFeedClient(file_url=url)
+        client.test_connection()
+    except (rough_country_exceptions.RoughCountryException, ValueError) as e:
+        return str(e)
+    return None
+
+
+# Connection validators run synchronously at connect/update time, before credentials are saved,
+# so bad credentials fail the request instead of silently failing the first background sync.
+# Kinds without an entry here are not validated (relay-provisioned kinds, where credentials are
+# system-generated rather than user-entered, and providers with no real backend client yet —
+# see get_distributor_credentials_info for what each kind needs).
+_CONNECTION_VALIDATORS: typing.Dict[int, typing.Callable[[typing.Dict[str, typing.Any]], typing.Optional[str]]] = {
+    src_enums.BrandProviderKind.TURN_14.value: _validate_turn14_connection,
+    src_enums.BrandProviderKind.KEYSTONE.value: _validate_keystone_connection,
+    src_enums.BrandProviderKind.PREMIER_PERFORMANCE.value: _validate_premier_connection,
+    src_enums.BrandProviderKind.WHEELPROS.value: _validate_wheelpros_connection,
+    src_enums.BrandProviderKind.ROUGH_COUNTRY.value: _validate_rough_country_connection,
+}
+
+
+def _validate_connection(
+    kind: int, credentials: typing.Dict[str, typing.Any]
+) -> typing.Tuple[typing.Optional[bool], typing.Optional[str]]:
+    """
+    Run the connection validator for this provider kind, if one exists.
+    Returns (validated, error):
+      (True, None)   — validator ran and the connection is good.
+      (False, error) — validator ran and the connection failed; caller should reject the request.
+      (None, None)   — no validator for this kind yet; not attempted.
+    """
+    validator = _CONNECTION_VALIDATORS.get(kind)
+    if not validator:
+        return None, None
+    error = validator(credentials)
+    if error:
+        return False, error
+    return True, None
+
+
 def connect_provider(
     company_id: int,
     provider_id: int,
@@ -275,10 +385,14 @@ def connect_provider(
                 return None, "Your SFTP account could not be created. Please contact info@aftermarketscout.com."
         user_field, password_field = catalog_entry.get("relay_credential_fields", ("sftp_user", "sftp_password"))
         creds = {user_field: company.relay_sftp_username, password_field: company.relay_sftp_password}
+        validated = None
     else:
         creds, err = _build_credentials_from_catalog_entry(catalog_entry, credentials)
         if err:
             return None, err
+        validated, val_error = _validate_connection(provider.kind, creds)
+        if val_error:
+            return None, val_error
 
     # Check if already connected
     existing = src_models.CompanyProviders.objects.filter(
@@ -308,6 +422,7 @@ def connect_provider(
         "provider_name": provider.name,
         "credentials": cp.credentials,
         "primary": cp.primary,
+        "connection_validated": validated,
         "created_at": cp.created_at.isoformat() if cp.created_at else None,
         "updated_at": cp.updated_at.isoformat() if cp.updated_at else None,
     }, None
@@ -343,6 +458,13 @@ def update_connection(
     if err:
         return None, err
 
+    if catalog_entry.get("relay_provisioned"):
+        validated = None
+    else:
+        validated, val_error = _validate_connection(cp.provider.kind, creds)
+        if val_error:
+            return None, val_error
+
     cp.credentials = creds
     cp.save()
 
@@ -357,6 +479,7 @@ def update_connection(
         "provider_name": cp.provider.name,
         "credentials": cp.credentials,
         "primary": cp.primary,
+        "connection_validated": validated,
         "created_at": cp.created_at.isoformat() if cp.created_at else None,
         "updated_at": cp.updated_at.isoformat() if cp.updated_at else None,
     }, None

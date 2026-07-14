@@ -102,6 +102,40 @@ class RoughCountryFeedClient:
             logger.error("{} {}".format(_LOG_PREFIX, msg))
             raise exceptions.RoughCountryDownloadError(msg)
 
+    def test_connection(self, timeout: int = 20) -> None:
+        """
+        Confirm feed_url is reachable without downloading the full Excel file — requests only
+        the first KB via a Range header (servers that ignore Range just send more than we read;
+        we stop after the first chunk either way).
+        """
+        if not self.file_url:
+            raise ValueError("feed_url is required.")
+        req = urllib.request.Request(
+            self.file_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; AfterMarketScout/1.0; +https://aftermarketscout.com)",
+                "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,*/*",
+                "Range": "bytes=0-1023",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                status = resp.status if hasattr(resp, "status") else resp.getcode()
+                chunk = resp.read(1024)
+        except urllib.error.HTTPError as e:
+            msg = "HTTP {} when checking feed_url: {}.".format(e.code, e.reason)
+            logger.error("{} {}".format(_LOG_PREFIX, msg))
+            raise exceptions.RoughCountryDownloadError(msg)
+        except urllib.error.URLError as e:
+            msg = "Could not reach feed_url: {}.".format(e.reason)
+            logger.error("{} {}".format(_LOG_PREFIX, msg))
+            raise exceptions.RoughCountryDownloadError(msg)
+
+        if status not in (200, 206) or not chunk:
+            msg = "Unexpected response (status={}) when checking feed_url.".format(status)
+            logger.error("{} {}".format(_LOG_PREFIX, msg))
+            raise exceptions.RoughCountryDownloadError(msg)
+
     def get_feed_data(
         self,
         download_if_missing: bool = True,

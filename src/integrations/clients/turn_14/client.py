@@ -21,6 +21,11 @@ DAY_LIMIT = 30000
 # Token expiration buffer (refresh token 60 seconds before it expires)
 TOKEN_EXPIRATION_BUFFER_SECONDS = 60
 
+# requests.request() had no timeout at all before, so a stalled Turn 14 response could hang
+# the calling thread indefinitely — this matters now that test_connection() runs synchronously
+# inside the connect/update-connection HTTP request.
+REQUEST_TIMEOUT_SECONDS = 30
+
 
 class Turn14ApiClient(object):
     API_BASE_URL = settings.TURN14_BASE_URL
@@ -91,6 +96,29 @@ class Turn14ApiClient(object):
         
         return self._cached_token
 
+    def test_connection(self) -> None:
+        """
+        Validate credentials by requesting a token, then confirm the account can actually
+        read Items data. Some Turn 14 accounts have valid API credentials but lack Items
+        API permission (a separate grant from Turn 14 support), which otherwise only
+        surfaces later as a failed catalog sync — catch it here instead.
+        """
+        self._get_valid_token()
+
+        try:
+            self.get_items_updates(page=1, days=1)
+        except exceptions.Turn14APIBadResponseCodeError as e:
+            if e.code in (401, 403):
+                raise exceptions.Turn14APIBadResponseCodeError(
+                    message=(
+                        "Connected to Turn 14, but this account does not have permission to "
+                        "access Items data (required for catalog sync). Contact Turn 14 support "
+                        "to enable Items API access for your client_id."
+                    ),
+                    code=e.code,
+                )
+            raise
+
     @sleep_and_retry
     @limits(calls=20, period=60)
     def _create_authorization_token(self) -> typing.Dict:
@@ -109,7 +137,8 @@ class Turn14ApiClient(object):
                     "grant_type": "client_credentials",
                     "client_id": self.client_id,
                     "client_secret": self.client_secret,
-                }
+                },
+                timeout=REQUEST_TIMEOUT_SECONDS,
             )
 
             if response.status_code not in self.VALID_STATUS_CODES:
@@ -325,6 +354,7 @@ class Turn14ApiClient(object):
                 params=params,
                 json=payload,
                 headers=headers,
+                timeout=REQUEST_TIMEOUT_SECONDS,
             )
 
             # Handle 401 Unauthorized - token might be invalid
