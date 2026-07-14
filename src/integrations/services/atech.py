@@ -122,6 +122,10 @@ def _clean_csv_value(value: typing.Any) -> typing.Optional[str]:
     return s
 
 
+_NUMERIC_14_5_MAX = Decimal("999999999.99999")
+_NUMERIC_14_5_MIN = -_NUMERIC_14_5_MAX
+
+
 def _safe_decimal(value: typing.Any) -> typing.Optional[Decimal]:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return None
@@ -129,7 +133,12 @@ def _safe_decimal(value: typing.Any) -> typing.Optional[Decimal]:
         s = _clean_csv_value(value)
         if s is None or s == "":
             return None
-        return Decimal(str(s))
+        d = Decimal(str(s))
+        # Reject values outside the NUMERIC(14, 5) range used by Atech pricing columns
+        # to avoid "numeric field overflow" errors from malformed/misaligned feed values.
+        if d > _NUMERIC_14_5_MAX or d < _NUMERIC_14_5_MIN:
+            return None
+        return d
     except Exception:
         return None
 
