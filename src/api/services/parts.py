@@ -258,14 +258,14 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
         "updated_at": part.updated_at.isoformat() if part.updated_at else None,
     }
 
-    company_provider_map: typing.Dict[int, bool] = {}
+    company_provider_map: typing.Dict[int, typing.Dict[str, typing.Any]] = {}
     if company_id is not None:
         company_provider_map = {
-            row["provider_id"]: row["initial_sync_completed"]
+            row["provider_id"]: row
             for row in src_models.CompanyProviders.objects.filter(
                 company_id=company_id,
                 provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
-            ).values("provider_id", "initial_sync_completed")
+            ).values("provider_id", "initial_sync_completed", "status", "status_name")
         }
     connected_provider_ids: typing.Set[int] = set(company_provider_map)
 
@@ -333,7 +333,11 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
             ),
             "company_integration": {
                 "connected": integrated,
-                "initial_sync_completed": company_provider_map.get(pp.provider_id) if integrated else None,
+                "initial_sync_completed": (
+                    company_provider_map[pp.provider_id]["initial_sync_completed"] if integrated else None
+                ),
+                "status": company_provider_map[pp.provider_id]["status"] if integrated else None,
+                "status_name": company_provider_map[pp.provider_id]["status_name"] if integrated else None,
             },
             "is_discontinued": pp.is_discontinued,
             "inventory": None,
