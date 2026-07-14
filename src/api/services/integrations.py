@@ -2,12 +2,17 @@ import logging
 import typing
 
 from django.core.paginator import Paginator
+from django.utils import timezone
 
 from src import constants as src_constants
 from src import enums as src_enums
 from src import models as src_models
+from src.integrations.clients.atech import client as atech_client
+from src.integrations.clients.atech import exceptions as atech_exceptions
 from src.integrations.clients.keystone import client as keystone_client
 from src.integrations.clients.keystone import exceptions as keystone_exceptions
+from src.integrations.clients.meyer import client as meyer_client
+from src.integrations.clients.meyer import exceptions as meyer_exceptions
 from src.integrations.clients.premier import client as premier_client
 from src.integrations.clients.premier import exceptions as premier_exceptions
 from src.integrations.clients.rough_country import client as rough_country_client
@@ -396,6 +401,73 @@ def _validate_connection(
     return True, None, None
 
 
+# Relay-provisioned kinds we know an expected filename for — see _relay_feed_connection_status.
+# Other relay-provisioned kinds (CTP, Crown, DIX, The Wheel Group) have no ingest client built
+# yet, so there's no known filename to check against.
+_RELAY_FEED_CHECK_KINDS = {
+    src_enums.BrandProviderKind.MEYER.value,
+    src_enums.BrandProviderKind.ATECH.value,
+}
+
+
+def _relay_feed_connection_status(
+    company: typing.Optional[src_models.Company], kind: int
+) -> typing.Tuple[typing.Optional["src_enums.CompanyProviderConnectionStatus"], typing.Optional[str]]:
+    """
+    For relay-provisioned kinds in _RELAY_FEED_CHECK_KINDS: log into our relay with the
+    company's own relay credentials and check whether the expected feed file(s) have arrived.
+    Returns (None, None) for any other kind — nothing to check. Single source of truth for this
+    logic — used both here (to set an initial status at connect time) and by the
+    check_company_provider_connections cron (to keep it fresh afterwards).
+    """
+    if kind not in _RELAY_FEED_CHECK_KINDS:
+        return None, None
+    if not company or not company.relay_sftp_username or not company.relay_sftp_password:
+        return (
+            src_enums.CompanyProviderConnectionStatus.WAITING,
+            "Your relay SFTP account is still being created.",
+        )
+
+    creds = {"sftp_user": company.relay_sftp_username, "sftp_password": company.relay_sftp_password}
+    try:
+        if kind == src_enums.BrandProviderKind.MEYER.value:
+            client = meyer_client.MeyerSFTPClient(credentials=creds)
+        else:
+            client = atech_client.AtechSFTPClient(credentials=creds)
+        present = client.feed_present()
+    except (meyer_exceptions.MeyerException, atech_exceptions.AtechException, ValueError) as e:
+        return (
+            src_enums.CompanyProviderConnectionStatus.FAILING,
+            "Could not reach our relay to check for your file: {}".format(e),
+        )
+
+    if present:
+        return (
+            src_enums.CompanyProviderConnectionStatus.INGESTING,
+            "File received — waiting for it to be processed.",
+        )
+    return (
+        src_enums.CompanyProviderConnectionStatus.WAITING,
+        "Waiting for your first file to arrive on our relay.",
+    )
+
+
+def _connection_status_fields(
+    status: typing.Optional["src_enums.CompanyProviderConnectionStatus"],
+    reason: typing.Optional[str],
+) -> typing.Dict[str, typing.Any]:
+    """
+    Field values for CompanyProviders.status/status_name/status_reason/status_checked_at —
+    a dict so it works both as ``.create(**fields)`` kwargs and via setattr on an existing row.
+    """
+    return {
+        "status": status.value if status else None,
+        "status_name": status.name if status else None,
+        "status_reason": reason,
+        "status_checked_at": timezone.now() if status else None,
+    }
+
+
 def connect_provider(
     company_id: int,
     provider_id: int,
@@ -437,6 +509,7 @@ def connect_provider(
         user_field, password_field = catalog_entry.get("relay_credential_fields", ("sftp_user", "sftp_password"))
         creds = {user_field: company.relay_sftp_username, password_field: company.relay_sftp_password}
         validated = None
+        status_enum, status_reason = _relay_feed_connection_status(company, provider.kind)
     else:
         creds, err, err_code = _build_credentials_from_catalog_entry(catalog_entry, credentials)
         if err:
@@ -444,6 +517,12 @@ def connect_provider(
         validated, val_error, val_error_code = _validate_connection(provider.kind, creds)
         if val_error:
             return None, val_error, val_error_code
+        # validated is True (validator ran and passed) or None (no validator for this kind) —
+        # a False result would already have returned above via val_error.
+        status_enum = src_enums.CompanyProviderConnectionStatus.INGESTING if validated else None
+        status_reason = None
+
+    status_fields = _connection_status_fields(status_enum, status_reason)
 
     # Check if already connected
     existing = src_models.CompanyProviders.objects.filter(
@@ -452,6 +531,8 @@ def connect_provider(
     ).first()
     if existing:
         existing.credentials = creds
+        for field, value in status_fields.items():
+            setattr(existing, field, value)
         existing.save()
         cp = existing
     else:
@@ -460,6 +541,7 @@ def connect_provider(
             provider_id=provider_id,
             credentials=creds,
             primary=False,
+            **status_fields,
         )
 
     if integration_pricing_sync_jobs.should_enqueue_pricing_sync(provider.kind):
@@ -474,6 +556,10 @@ def connect_provider(
         "credentials": cp.credentials,
         "primary": cp.primary,
         "connection_validated": validated,
+        "status": cp.status,
+        "status_name": cp.status_name,
+        "status_reason": cp.status_reason,
+        "status_checked_at": cp.status_checked_at.isoformat() if cp.status_checked_at else None,
         "created_at": cp.created_at.isoformat() if cp.created_at else None,
         "updated_at": cp.updated_at.isoformat() if cp.updated_at else None,
     }, None, None
@@ -494,7 +580,7 @@ def update_connection(
     cp = src_models.CompanyProviders.objects.filter(
         id=company_provider_id,
         company_id=company_id,
-    ).select_related("provider").first()
+    ).select_related("provider", "company").first()
     if not cp or not cp.provider:
         return None, "Connection not found", CONNECTION_ERROR_NOT_FOUND
 
@@ -512,12 +598,19 @@ def update_connection(
 
     if catalog_entry.get("relay_provisioned"):
         validated = None
+        status_enum, status_reason = _relay_feed_connection_status(cp.company, cp.provider.kind)
     else:
         validated, val_error, val_error_code = _validate_connection(cp.provider.kind, creds)
         if val_error:
             return None, val_error, val_error_code
+        # validated is True (validator ran and passed) or None (no validator for this kind) —
+        # a False result would already have returned above via val_error.
+        status_enum = src_enums.CompanyProviderConnectionStatus.INGESTING if validated else None
+        status_reason = None
 
     cp.credentials = creds
+    for field, value in _connection_status_fields(status_enum, status_reason).items():
+        setattr(cp, field, value)
     cp.save()
 
     if integration_pricing_sync_jobs.should_enqueue_pricing_sync(cp.provider.kind):
@@ -532,6 +625,10 @@ def update_connection(
         "credentials": cp.credentials,
         "primary": cp.primary,
         "connection_validated": validated,
+        "status": cp.status,
+        "status_name": cp.status_name,
+        "status_reason": cp.status_reason,
+        "status_checked_at": cp.status_checked_at.isoformat() if cp.status_checked_at else None,
         "created_at": cp.created_at.isoformat() if cp.created_at else None,
         "updated_at": cp.updated_at.isoformat() if cp.updated_at else None,
     }, None, None

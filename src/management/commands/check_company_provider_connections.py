@@ -8,11 +8,10 @@ For each such row:
     stored credentials.
       passes -> INGESTING (connectivity fine, sync just hasn't finished yet)
       fails  -> FAILING, reason = the validator's message
-  - Relay-provisioned kinds we have a known expected filename for (Meyer, A-Tech): SFTP into
-    our own relay with the company's relay credentials and stat() the expected file(s).
-      relay login fails -> FAILING (our own relay account broken — should not normally happen)
-      file(s) present    -> INGESTING (data has landed, waiting on our sync job to process it)
-      file(s) missing    -> WAITING (waiting on the distributor's rep to send it)
+  - Relay-provisioned kinds we have a known expected filename for (Meyer, A-Tech): via
+    integrations_services._relay_feed_connection_status — same helper connect_provider/
+    update_connection use to set the initial status, so there's one source of truth for
+    what "file arrived" means.
   - Everything else (no ingest client built yet — CTP, Crown, DIX, Wheel Group, and the rest
     of the catalog-only distributors): left untouched, nothing to check against.
 
@@ -30,21 +29,11 @@ from src import enums as src_enums
 from src import models as src_models
 from src.api.services import integrations as integrations_services
 from src.audit import scheduled_tasks as audit_scheduled_tasks
-from src.integrations.clients.atech import client as atech_client
-from src.integrations.clients.atech import exceptions as atech_exceptions
-from src.integrations.clients.meyer import client as meyer_client
-from src.integrations.clients.meyer import exceptions as meyer_exceptions
 
 logger = logging.getLogger(__name__)
 
 _TASK_NAME = "check_company_provider_connections"
 _LOG_PREFIX = "[CHECK-COMPANY-PROVIDER-CONNECTIONS]"
-
-# Relay-provisioned kinds we have a known expected filename for — see module docstring.
-_RELAY_FEED_KINDS = {
-    src_enums.BrandProviderKind.MEYER.value,
-    src_enums.BrandProviderKind.ATECH.value,
-}
 
 
 class Command(BaseCommand):
@@ -74,7 +63,7 @@ class Command(BaseCommand):
                     if kind in integrations_services._CONNECTION_VALIDATORS:
                         self._check_validated(cp, kind)
                         checked += 1
-                    elif kind in _RELAY_FEED_KINDS:
+                    elif kind in integrations_services._RELAY_FEED_CHECK_KINDS:
                         self._check_relay_feed(cp, kind)
                         checked += 1
                     else:
@@ -117,39 +106,6 @@ class Command(BaseCommand):
             self._save_status(cp, src_enums.CompanyProviderConnectionStatus.INGESTING, None)
 
     def _check_relay_feed(self, cp: src_models.CompanyProviders, kind: int) -> None:
-        company = cp.company
-        if not company or not company.relay_sftp_username or not company.relay_sftp_password:
-            self._save_status(
-                cp,
-                src_enums.CompanyProviderConnectionStatus.WAITING,
-                "Your relay SFTP account is still being created.",
-            )
-            return
-
-        creds = {"sftp_user": company.relay_sftp_username, "sftp_password": company.relay_sftp_password}
-        try:
-            if kind == src_enums.BrandProviderKind.MEYER.value:
-                client = meyer_client.MeyerSFTPClient(credentials=creds)
-            else:
-                client = atech_client.AtechSFTPClient(credentials=creds)
-            present = client.feed_present()
-        except (meyer_exceptions.MeyerException, atech_exceptions.AtechException, ValueError) as e:
-            self._save_status(
-                cp,
-                src_enums.CompanyProviderConnectionStatus.FAILING,
-                "Could not reach our relay to check for your file: {}".format(e),
-            )
-            return
-
-        if present:
-            self._save_status(
-                cp,
-                src_enums.CompanyProviderConnectionStatus.INGESTING,
-                "File received — waiting for it to be processed.",
-            )
-        else:
-            self._save_status(
-                cp,
-                src_enums.CompanyProviderConnectionStatus.WAITING,
-                "Waiting for your first file to arrive on our relay.",
-            )
+        status, reason = integrations_services._relay_feed_connection_status(cp.company, kind)
+        if status is not None:
+            self._save_status(cp, status, reason)
