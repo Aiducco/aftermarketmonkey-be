@@ -118,31 +118,17 @@ class Turn14ApiClient(object):
     def test_connection(self) -> None:
         """
         Validate credentials by requesting a token, then confirm the account can actually
-        read Items data. Some Turn 14 accounts have valid API credentials but lack Items
-        API permission (a separate grant from Turn 14 support), which otherwise only
-        surfaces later as a failed catalog sync — catch it here instead.
-
-        Uses items/brand/<id> (one page, scoped to a single brand) rather than the
-        account-wide items/updates endpoint, which scans the last day of changes across
-        every brand and is noticeably slower for a synchronous connect-time check.
+        read Brands data. Some Turn 14 accounts have valid API credentials but lack API
+        permission (a separate grant from Turn 14 support), which otherwise only surfaces
+        later as a failed catalog sync — catch it here instead. Brands is used because it's
+        the cheapest real endpoint to check against — a single, unscoped, unpaginated call.
         """
         self._get_valid_token()
 
         try:
-            brands = self.get_brands()
+            self.get_brands()
         except exceptions.Turn14APIBadResponseCodeError as e:
             raise self._permission_or_reraise(e, "Brands")
-
-        if not brands:
-            # Nothing assigned to this account to scope an Items call to — token + Brands
-            # both succeeded, which is as much as we can validate.
-            return
-
-        brand_id = brands[0].get("id")
-        try:
-            self.get_items_for_brand(brand_id=brand_id, page=1)
-        except exceptions.Turn14APIBadResponseCodeError as e:
-            raise self._permission_or_reraise(e, "Items")
 
     @sleep_and_retry
     @limits(calls=20, period=60)

@@ -68,7 +68,7 @@ show the customer as-is, but its exact wording varies per distributor — don't 
 | `missing_fields` | 400 | A required field was left empty. Example: `"Missing required fields: client_id, client_secret"` | Highlight the empty field(s) — names are comma-separated in the message. Should be caught by client-side validation before submit; this is the server backstop. |
 | `invalid_input` | 400 | A field was filled in but malformed or out of range (markup % outside 0–100, feed URL wrong prefix, unknown field on a patch). Example: `"wheel_markup must be between 0 and 100 (got 150)."` | Inline validation error on the specific field, same tier as a client-side format error. |
 | `invalid_credentials` | 400 | The distributor's server actively rejected the login. Example: `"Login rejected by FTP server. Error: 530 Login or password incorrect!"` | Focus the username/password fields: "Check your credentials and try again." Confirmed distinct from a network failure — never a false positive from a slow server. |
-| `permission_denied` | 400 | Login succeeded, but the account can't reach a resource we need (Turn 14 Brands/Items API, a Wheel Pros feed directory). Example: `"Connected to Turn 14, but this account does not have permission to access Items data…"` | Don't blame the form — show `message` verbatim in a banner; it already names who to contact. Credentials are correct, this is an account-entitlement problem on the distributor's side. |
+| `permission_denied` | 400 | Login succeeded, but the account can't reach a resource we need (Turn 14 Brands API, a Wheel Pros feed directory). Example: `"Connected to Turn 14, but this account does not have permission to access Brands data…"` | Don't blame the form — show `message` verbatim in a banner; it already names who to contact. Credentials are correct, this is an account-entitlement problem on the distributor's side. |
 | `connection_failed` | 400 | Could not reach the distributor at all — timeout, DNS, unexpected response, or (for relay-provisioned providers) our own SFTP account provisioning failed. | "Something went wrong connecting — try again," with a retry action. Not a field problem. |
 | `not_found` | 400 connect · 404 patch | The provider or connection id doesn't exist. | Shouldn't happen from normal UI flow — treat as a generic error, log it. |
 
@@ -82,15 +82,12 @@ immediately with `connection_validated: null` — not a failure, just "not teste
 ### Turn 14 — API, OAuth2
 Fields: `client_id`, `client_secret`
 
-Fetches a token, then a brand list, then one page of items for the first brand — some
-accounts have valid credentials but no Items permission, which otherwise only surfaced as a
-failed catalog sync. Scoped to a single brand/page deliberately: the account-wide
-`items/updates` endpoint (last 24h of changes across the whole catalog) was tried first and
-dropped for being noticeably slower on a synchronous request.
+Fetches a token, then calls Brands — a single, unscoped, unpaginated call, the cheapest real
+endpoint that still confirms API access beyond the token exchange. Some accounts have valid
+credentials but no API permission grant, which otherwise only surfaced as a failed catalog
+sync.
 - `invalid_credentials` — bad token request
-- `permission_denied` — token OK, Brands or Items call rejected
-- If the account has zero brands assigned, only Brands access is confirmed (nothing to scope
-  an Items call to) — this still passes; token + Brands succeeding is as much as we can test.
+- `permission_denied` — token OK, Brands call rejected
 
 ### Keystone — FTPS
 Fields: `ftp_user`, `ftp_password`
