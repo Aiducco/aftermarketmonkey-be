@@ -1089,7 +1089,15 @@ def _transform_brand_data(data_items: typing.List[typing.Dict], turn_14_brand: s
 def _fetch_and_save_turn_14_brand_pricing_for_company_provider(
     company_provider: src_models.CompanyProviders,
     all_brands,
+    only_external_ids: typing.Optional[typing.Set[str]] = None,
 ) -> None:
+    """
+    ``only_external_ids``, when given, drops every fetched item not in that set before
+    upserting — used by the delta path so a brand-level re-fetch (unavoidable; Turn14's
+    pricing API has no per-item lookup, only brand+page) doesn't write pricing rows for
+    items this company was never tracking in the first place. Leave ``None`` for the full
+    sync, where nothing is "already tracked" yet.
+    """
     company = company_provider.company
     try:
         api_client = turn_14_client.Turn14ApiClient(credentials=company_provider.credentials)
@@ -1162,6 +1170,16 @@ def _fetch_and_save_turn_14_brand_pricing_for_company_provider(
             ))
 
             pricing_instances = _transform_pricing_data(pricing_data, turn_14_brand, company)
+
+            if only_external_ids is not None:
+                before = len(pricing_instances)
+                pricing_instances = [pi for pi in pricing_instances if pi.external_id in only_external_ids]
+                logger.info(
+                    '{} Filtered to already-tracked items company={} brand: {} page: {}: '
+                    '{} of {} kept.'.format(
+                        _LOG_PREFIX, company.name, turn_14_brand.name, page, len(pricing_instances), before
+                    )
+                )
 
             if not pricing_instances:
                 logger.warning('{} No valid pricing instances company={} brand: {} (external_id: {}), page: {}.'.format(
@@ -1282,11 +1300,17 @@ def fetch_and_save_turn_14_brand_pricing_delta_for_company_provider(
     slow for companies with a large catalog (multi-hour, observed). This instead:
       1. Calls GET /v1/pricing/changes for this company for the last `days` day(s) to get the
          set of item codes that actually changed.
-      2. Narrows that down to just the Turn14 brands those items belong to (typically a small
-         subset of the full ~460).
+      2. Intersects that with Turn14BrandPricing rows this company already has — NOT "any
+         brand Turn14 says has a changed item somewhere in its global catalog" (a brand can
+         carry thousands of items this company never carries). Turn14's pricing API has no
+         per-item lookup (verified: the items endpoint carries no pricing fields at all), only
+         brand+page, so a brand-level re-fetch is unavoidable once it's in scope — but at
+         least only brands with an item this company actually tracks get re-fetched at all.
       3. Reuses the same tested per-brand pagination + upsert logic
-         (_fetch_and_save_turn_14_brand_pricing_for_company_provider), just scoped to that
-         narrower brand list instead of every mapped brand.
+         (_fetch_and_save_turn_14_brand_pricing_for_company_provider), scoped to that narrower
+         brand list, and passes only_external_ids so pages for in-scope brands still only write
+         rows for the already-tracked changed items — not every other item Turn14 returns on
+         the same page.
 
     Intended for the recurring ingest_all_providers cycle. Use the full (non-delta) function
     for the initial connect/reconnect sync, where there's no prior state to diff against.
@@ -1371,19 +1395,29 @@ def fetch_and_save_turn_14_brand_pricing_delta_for_company_provider(
         _LOG_PREFIX, len(item_ids), company_provider.company.name
     ))
 
-    changed_turn14_brand_ids = set(
-        src_models.Turn14Brand.objects.filter(
-            items__external_id__in=item_ids
-        ).values_list('id', flat=True).distinct()
+    # Scope to items this company already has pricing for — NOT "any brand Turn14 says has a
+    # changed item somewhere in its global catalog" (a brand can carry thousands of items this
+    # company never touches). Turn14BrandPricing.brand_id is the Turn14Brand id, matching what
+    # _fetch_and_save_turn_14_brand_pricing_for_company_provider expects downstream.
+    tracked_changed_rows = list(
+        src_models.Turn14BrandPricing.objects.filter(
+            company_id=company_provider.company_id,
+            external_id__in=item_ids,
+        ).values_list('brand_id', 'external_id')
     )
-    if not changed_turn14_brand_ids:
-        logger.warning('{} No Turn14Brand found for changed item ids company={}. Skipping sync.'.format(
-            _LOG_PREFIX, company_provider.company.name
-        ))
+    if not tracked_changed_rows:
+        logger.info(
+            '{} None of the {} changed item(s) are already tracked for company={}. Nothing to sync.'.format(
+                _LOG_PREFIX, len(item_ids), company_provider.company.name
+            )
+        )
         return
 
+    tracked_changed_brand_ids = {row[0] for row in tracked_changed_rows}
+    tracked_changed_external_ids = {row[1] for row in tracked_changed_rows}
+
     mapped_brand_ids = src_models.BrandTurn14BrandMapping.objects.filter(
-        turn14_brand_id__in=changed_turn14_brand_ids
+        turn14_brand_id__in=tracked_changed_brand_ids
     ).values_list('brand_id', flat=True)
 
     changed_brand_providers = src_models.BrandProviders.objects.filter(
@@ -1391,17 +1425,21 @@ def fetch_and_save_turn_14_brand_pricing_delta_for_company_provider(
         brand_id__in=mapped_brand_ids,
     ).select_related('brand')
     if not changed_brand_providers.exists():
-        logger.warning('{} No mapped brands for changed items company={}. Skipping sync.'.format(
+        logger.warning('{} No mapped brands for changed+tracked items company={}. Skipping sync.'.format(
             _LOG_PREFIX, company_provider.company.name
         ))
         return
 
-    logger.info('{} Syncing {} changed brand(s) (of {} mapped) company={}.'.format(
-        _LOG_PREFIX, changed_brand_providers.count(),
-        src_models.BrandProviders.objects.filter(provider=turn_14_provider).count(),
-        company_provider.company.name,
-    ))
-    _fetch_and_save_turn_14_brand_pricing_for_company_provider(company_provider, changed_brand_providers)
+    logger.info(
+        '{} Syncing {} brand(s) (of {} mapped) for {} already-tracked changed item(s) company={}.'.format(
+            _LOG_PREFIX, changed_brand_providers.count(),
+            src_models.BrandProviders.objects.filter(provider=turn_14_provider).count(),
+            len(tracked_changed_external_ids), company_provider.company.name,
+        )
+    )
+    _fetch_and_save_turn_14_brand_pricing_for_company_provider(
+        company_provider, changed_brand_providers, only_external_ids=tracked_changed_external_ids
+    )
 
 
 def fetch_and_save_turn_14_brand_pricing_for_turn14_brands(
