@@ -195,6 +195,14 @@ DEFAULT_FROM_EMAIL = "noreply@jsoncargo.com"
 LOGGING_EMAIL_RECIPIENT_LIST = ["hajdukbet@gmail.com"]
 SUPPORT_EMAIL_RECIPIENT_LIST = ["hajdukbet@gmail.com"]
 
+# Resend (transactional notification emails, e.g. "first sync completed") — https://resend.com
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+NOTIFICATIONS_FROM_EMAIL = os.environ.get("NOTIFICATIONS_FROM_EMAIL", "no-reply@aftermarketscout.com")
+
+# Frontend app base URL, used to build links in transactional emails. Must be set per
+# environment — there's no safe default since it varies between staging/production.
+FRONTEND_BASE_URL = os.environ.get("FRONTEND_BASE_URL", "")
+
 TURN14_BASE_URL = 'https://api.turn14.com/v1'
 
 # Keystone FTP (implicit FTPS, port 990)

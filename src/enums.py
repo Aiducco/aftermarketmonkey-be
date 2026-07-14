@@ -93,3 +93,13 @@ class CompanyProviderConnectionStatus(enum.Enum):
     INGESTING = 2  # credentials valid (or relay file received); initial sync not finished yet
     WAITING = 3    # credentials valid, but relay-provisioned and the distributor's file hasn't arrived yet
     FAILING = 4    # credentials/connectivity check failed
+
+
+class NotificationEmailType(enum.Enum):
+    """Kind of transactional notification email logged in NotificationEmailLog."""
+    FIRST_SYNC_COMPLETED = 1
+
+
+class NotificationEmailStatus(enum.Enum):
+    SENT = 1
+    FAILED = 2

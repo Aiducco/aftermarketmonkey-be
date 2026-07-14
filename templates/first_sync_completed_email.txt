@@ -1,0 +1,19 @@
+Your {{ provider_name }} is live
+
+Good news -- we've completed the first sync for {{ provider_name }} on
+{{ company_name }}'s account. Parts sourced from this distributor now show
+live inventory and pricing across AftermarketScout.
+
+Distributor: {{ provider_name }}
+Account: {{ company_name }}
+Status: Connected
+
+View synced parts: {{ app_url }}
+
+From here, pricing for this distributor will stay in sync automatically.
+Questions? Reach us at support@aftermarketscout.com.
+
+--
+AftermarketScout
+This is a one-time notification sent the first time a distributor
+integration finishes syncing.

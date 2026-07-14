@@ -25,6 +25,7 @@ from src.integrations.services import master_parts
 from src.integrations.services import atech as atech_services
 from src.integrations.services import dlg as dlg_services
 from src.integrations.services import meyer as meyer_services
+from src.integrations.services import notifications as notifications_services
 from src.integrations.services import premier as premier_services
 from src.integrations.services import rough_country as rough_country_services
 from src.integrations.services import turn_14 as turn_14_services
@@ -332,6 +333,7 @@ def run_integration_pricing_sync_job(job: src_models.IntegrationPricingSyncJob) 
                 _LOG_PREFIX, job.id, cp.id
             )
         )
+        notifications_services.send_first_sync_completed_email(cp)
 
 
 def process_pricing_sync_jobs(limit: int = 10, workers: int = 1) -> int:

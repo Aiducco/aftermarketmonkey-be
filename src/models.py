@@ -1706,3 +1706,42 @@ class BrandFilterCache(django_db_models.Model):
     class Meta:
         db_table = "brand_filter_cache"
         ordering = ["name"]
+
+
+class NotificationEmailLog(django_db_models.Model):
+    """
+    Audit log of transactional notification emails sent via Resend (e.g. the
+    "first sync completed" email). One row per send attempt, success or failure.
+    """
+    email_type = django_db_models.PositiveSmallIntegerField()
+    email_type_name = django_db_models.CharField(max_length=64)
+
+    to_email = django_db_models.EmailField(max_length=255)
+    from_email = django_db_models.EmailField(max_length=255)
+    subject = django_db_models.CharField(max_length=255)
+
+    company = django_db_models.ForeignKey(
+        Company,
+        on_delete=django_db_models.SET_NULL,
+        related_name="notification_email_logs",
+        null=True,
+        blank=True,
+    )
+    company_provider = django_db_models.ForeignKey(
+        CompanyProviders,
+        on_delete=django_db_models.SET_NULL,
+        related_name="notification_email_logs",
+        null=True,
+        blank=True,
+    )
+
+    status = django_db_models.PositiveSmallIntegerField()
+    status_name = django_db_models.CharField(max_length=32)
+    provider_message_id = django_db_models.CharField(max_length=255, null=True, blank=True)
+    error_message = django_db_models.TextField(null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "notification_email_log"
+        ordering = ["-id"]

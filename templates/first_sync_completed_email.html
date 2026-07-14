@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta http-equiv="X-UA-Compatible" content="IE=edge" />
+<title>AftermarketScout</title>
+<!--[if mso]>
+<noscript>
+<xml>
+<o:OfficeDocumentSettings>
+<o:PixelsPerInch>96</o:PixelsPerInch>
+</o:OfficeDocumentSettings>
+</xml>
+</noscript>
+<![endif]-->
+<style>
+  body, table, td, a { -webkit-text-size-adjust: 100%; -ms-text-size-adjust: 100%; }
+  table, td { mso-table-lspace: 0pt; mso-table-rspace: 0pt; }
+  img { -ms-interpolation-mode: bicubic; border: 0; height: auto; line-height: 100%; outline: none; text-decoration: none; }
+  body { margin: 0; padding: 0; width: 100% !important; height: 100% !important; }
+  a { text-decoration: none; }
+
+  @media only screen and (max-width: 600px) {
+    .container { width: 100% !important; }
+    .stack { display: block !important; width: 100% !important; }
+    .px { padding-left: 20px !important; padding-right: 20px !important; }
+  }
+</style>
+</head>
+<body style="margin:0; padding:0; background-color:#F5EFE8; font-family:'DM Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;">
+
+<span style="display:none; font-size:1px; color:#F5EFE8; line-height:1px; max-height:0; max-width:0; opacity:0; overflow:hidden;">
+  {{ provider_name }} is now live for {{ company_name }} &nbsp;&#8203;&#847; &#8203;&#847; &#8203;&#847; &#8203;&#847;
+</span>
+
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#F5EFE8;">
+  <tr>
+    <td align="center" style="padding:32px 16px;">
+
+      <table role="presentation" class="container" width="600" cellpadding="0" cellspacing="0" border="0" style="width:600px; max-width:600px;">
+
+        <!-- Logo -->
+        <tr>
+          <td align="center" style="padding-bottom:24px; font-size:19px; font-weight:700; color:#1A1E27;">
+            Aftermarket<span style="color:#E07830;">Scout</span>
+          </td>
+        </tr>
+
+        <!-- Card -->
+        <tr>
+          <td style="background-color:#FFFFFF; border-radius:12px; overflow:hidden; box-shadow:0 1px 3px rgba(26,30,39,0.08);">
+
+            <!-- Accent top bar -->
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+              <tr>
+                <td height="6" style="background:linear-gradient(135deg, #E07830, #F26430); background-color:#E07830; font-size:6px; line-height:6px;">&nbsp;</td>
+              </tr>
+            </table>
+
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+              <tr>
+                <td class="px" style="padding:40px 40px 0 40px; font-size:21px; line-height:28px; font-weight:700; color:#1A1E27;">
+                  Your {{ provider_name }} is live
+                </td>
+              </tr>
+              <tr>
+                <td class="px" style="padding:12px 40px 0 40px; font-size:15px; line-height:24px; color:#4A4F5A;">
+                  Good news &mdash; we've completed the first sync for <strong style="color:#1A1E27;">{{ provider_name }}</strong> on {{ company_name }}'s account. Parts sourced from this distributor now show live inventory and pricing across AftermarketScout.
+                </td>
+              </tr>
+
+              <!-- Details box -->
+              <tr>
+                <td class="px" style="padding:24px 40px 0 40px;">
+                  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#FAF6F1; border:1px solid #EFE6DB; border-radius:8px;">
+                    <tr>
+                      <td style="padding:16px 20px; font-size:13px; line-height:20px; color:#4A4F5A;">
+                        <strong style="color:#1A1E27;">Distributor:</strong> {{ provider_name }}<br />
+                        <strong style="color:#1A1E27;">Account:</strong> {{ company_name }}<br />
+                        <strong style="color:#1A1E27;">Status:</strong> <span style="color:#E07830; font-weight:600;">Connected</span>
+                      </td>
+                    </tr>
+                  </table>
+                </td>
+              </tr>
+
+              <!-- CTA -->
+              <tr>
+                <td class="px" align="left" style="padding:28px 40px 8px 40px;">
+                  <table role="presentation" cellpadding="0" cellspacing="0" border="0">
+                    <tr>
+                      <td align="center" style="border-radius:8px; background-color:#E07830;">
+                        <a href="{{ app_url }}" target="_blank" style="display:inline-block; padding:13px 28px; font-size:14px; font-weight:700; color:#FFFFFF; letter-spacing:0.2px;">View synced parts</a>
+                      </td>
+                    </tr>
+                  </table>
+                </td>
+              </tr>
+
+              <tr>
+                <td class="px" style="padding:24px 40px 40px 40px; font-size:13px; line-height:20px; color:#8A8F99; border-top:1px solid #F0EDE8; margin-top:24px;">
+                  <div style="padding-top:20px;">
+                    From here, pricing for this distributor will stay in sync automatically. Questions? Reach us at
+                    <a href="mailto:support@aftermarketscout.com" style="color:#E07830; font-weight:600;">support@aftermarketscout.com</a>.
+                  </div>
+                </td>
+              </tr>
+            </table>
+
+          </td>
+        </tr>
+
+        <!-- Footer -->
+        <tr>
+          <td align="center" style="padding:24px 20px 8px 20px; font-size:12px; line-height:18px; color:#A3A8B0;">
+            AftermarketScout &middot; This is a one-time notification sent the first time a distributor integration finishes syncing.
+          </td>
+        </tr>
+
+      </table>
+
+    </td>
+  </tr>
+</table>
+
+</body>
+</html>
