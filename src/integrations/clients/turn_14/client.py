@@ -109,7 +109,7 @@ class Turn14ApiClient(object):
             self.get_items_updates(page=1, days=1)
         except exceptions.Turn14APIBadResponseCodeError as e:
             if e.code in (401, 403):
-                raise exceptions.Turn14APIBadResponseCodeError(
+                raise exceptions.Turn14PermissionError(
                     message=(
                         "Connected to Turn 14, but this account does not have permission to "
                         "access Items data (required for catalog sync). Contact Turn 14 support "

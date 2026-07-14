@@ -6,6 +6,14 @@ class WheelProsSFTPConnectionError(WheelProsException):
     """Raised when the SFTP connection fails."""
 
 
+class WheelProsAuthError(WheelProsException):
+    """Server actively rejected the login (bad sftp_user/sftp_password)."""
+
+
+class WheelProsPermissionError(WheelProsException):
+    """Authenticated successfully, but the account lacks access to a required feed path."""
+
+
 class WheelProsDownloadError(WheelProsException):
     """Raised when the WheelPros CSV cannot be downloaded."""
 

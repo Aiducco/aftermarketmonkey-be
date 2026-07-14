@@ -22,6 +22,16 @@ logger = logging.getLogger(__name__)
 
 _LOG_PREFIX = '[INTEGRATIONS-SERVICES]'
 
+# Stable error codes returned alongside a human-readable "message" from connect_provider /
+# update_connection, so the frontend can branch on `error_code` (e.g. highlight the password
+# field, or show a "contact distributor support" banner) instead of parsing message text.
+CONNECTION_ERROR_MISSING_FIELDS = "missing_fields"
+CONNECTION_ERROR_INVALID_INPUT = "invalid_input"
+CONNECTION_ERROR_INVALID_CREDENTIALS = "invalid_credentials"
+CONNECTION_ERROR_PERMISSION_DENIED = "permission_denied"
+CONNECTION_ERROR_CONNECTION_FAILED = "connection_failed"
+CONNECTION_ERROR_NOT_FOUND = "not_found"
+
 
 def _render_relay_instructions_html(
     catalog_entry: typing.Dict[str, typing.Any],
@@ -67,16 +77,21 @@ def _credential_key_sensitive(key: str) -> bool:
 def _build_credentials_from_catalog_entry(
     catalog_entry: typing.Dict[str, typing.Any],
     credentials: typing.Dict[str, typing.Any],
-) -> typing.Tuple[typing.Optional[typing.Dict[str, typing.Any]], typing.Optional[str]]:
+) -> typing.Tuple[typing.Optional[typing.Dict[str, typing.Any]], typing.Optional[str], typing.Optional[str]]:
     """
     Validate connection_required_fields and merge optional non-empty values from connection_optional_fields.
+    Returns (credentials, error_message, error_code).
     """
     required = catalog_entry.get("connection_required_fields", []) or []
     optional = catalog_entry.get("connection_optional_fields", []) or []
     if required:
         missing = [f for f in required if not _normalize_credential_value(credentials.get(f))]
         if missing:
-            return None, "Missing required fields: {}".format(", ".join(missing))
+            return (
+                None,
+                "Missing required fields: {}".format(", ".join(missing)),
+                CONNECTION_ERROR_MISSING_FIELDS,
+            )
     creds: typing.Dict[str, typing.Any] = {}
     for k in required:
         v = _normalize_credential_value(credentials.get(k))
@@ -86,19 +101,19 @@ def _build_credentials_from_catalog_entry(
         v = _normalize_credential_value(credentials.get(k))
         if v is not None:
             creds[k] = v
-    return creds, None
+    return creds, None, None
 
 
 def _merge_update_credentials(
     catalog_entry: typing.Dict[str, typing.Any],
     existing: typing.Optional[typing.Dict[str, typing.Any]],
     patch: typing.Dict[str, typing.Any],
-) -> typing.Tuple[typing.Optional[typing.Dict[str, typing.Any]], typing.Optional[str]]:
+) -> typing.Tuple[typing.Optional[typing.Dict[str, typing.Any]], typing.Optional[str], typing.Optional[str]]:
     """
     Apply a partial credential patch onto stored credentials. Only keys in the catalog
     (required + optional) are allowed. Non-empty values overwrite. Empty / null for a
     **sensitive** key (password, secret) leaves the previous value unchanged so clients
-    can update other fields without resubmitting secrets.
+    can update other fields without resubmitting secrets. Returns (credentials, error_message, error_code).
     """
     required = [str(f) for f in (catalog_entry.get("connection_required_fields") or [])]
     optional = [str(f) for f in (catalog_entry.get("connection_optional_fields") or [])]
@@ -108,7 +123,7 @@ def _merge_update_credentials(
     for k, v in (patch or {}).items():
         key = str(k)
         if key not in allowed:
-            return None, "Unknown credential field: {}".format(key)
+            return None, "Unknown credential field: {}".format(key), CONNECTION_ERROR_INVALID_INPUT
         nv = _normalize_credential_value(v)
         if nv is not None:
             out[key] = nv
@@ -119,8 +134,12 @@ def _merge_update_credentials(
 
     missing = [f for f in required if not _normalize_credential_value(out.get(f))]
     if missing:
-        return None, "Missing required fields: {}".format(", ".join(missing))
-    return out, None
+        return (
+            None,
+            "Missing required fields: {}".format(", ".join(missing)),
+            CONNECTION_ERROR_MISSING_FIELDS,
+        )
+    return out, None, None
 
 
 def _provider_ui_metadata(provider: src_models.Providers) -> typing.Dict[str, typing.Optional[str]]:
@@ -265,57 +284,78 @@ def _validate_wheelpros_markup_fields(credentials: typing.Dict[str, typing.Any])
     return None
 
 
-def _validate_turn14_connection(credentials: typing.Dict[str, typing.Any]) -> typing.Optional[str]:
+_ValidatorResult = typing.Tuple[typing.Optional[str], typing.Optional[str]]  # (error_message, error_code)
+
+
+def _validate_turn14_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
     try:
         client = turn14_client.Turn14ApiClient(credentials=credentials)
         client.test_connection()
+    except turn14_exceptions.Turn14PermissionError as e:
+        return e.message, CONNECTION_ERROR_PERMISSION_DENIED
     except turn14_exceptions.Turn14APIBadResponseCodeError as e:
-        return e.message
+        code = (
+            CONNECTION_ERROR_INVALID_CREDENTIALS
+            if e.code in (401, 403)
+            else CONNECTION_ERROR_CONNECTION_FAILED
+        )
+        return e.message, code
     except (turn14_exceptions.Turn14APIException, ValueError) as e:
-        return str(e)
-    return None
+        return str(e), CONNECTION_ERROR_CONNECTION_FAILED
+    return None, None
 
 
-def _validate_keystone_connection(credentials: typing.Dict[str, typing.Any]) -> typing.Optional[str]:
+def _validate_keystone_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
     try:
         client = keystone_client.KeystoneFTPClient(credentials=credentials)
         client.test_connection()
+    except keystone_exceptions.KeystoneFTPAuthError as e:
+        return str(e), CONNECTION_ERROR_INVALID_CREDENTIALS
     except (keystone_exceptions.KeystoneException, ValueError) as e:
-        return str(e)
-    return None
+        return str(e), CONNECTION_ERROR_CONNECTION_FAILED
+    return None, None
 
 
-def _validate_premier_connection(credentials: typing.Dict[str, typing.Any]) -> typing.Optional[str]:
+def _validate_premier_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
     try:
         client = premier_client.PremierFTPClient(credentials=credentials)
         client.test_connection()
+    except premier_exceptions.PremierFTPAuthError as e:
+        return str(e), CONNECTION_ERROR_INVALID_CREDENTIALS
     except (premier_exceptions.PremierException, ValueError) as e:
-        return str(e)
-    return None
+        return str(e), CONNECTION_ERROR_CONNECTION_FAILED
+    return None, None
 
 
-def _validate_wheelpros_connection(credentials: typing.Dict[str, typing.Any]) -> typing.Optional[str]:
+def _validate_wheelpros_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
     markup_error = _validate_wheelpros_markup_fields(credentials)
     if markup_error:
-        return markup_error
+        return markup_error, CONNECTION_ERROR_INVALID_INPUT
     try:
         client = wheelpros_client.WheelProsSFTPClient(credentials=credentials)
         # Check auth against all three feeds (wheel/tire/accessories), not just a bare login —
         # some accounts authenticate fine but lack permission on a specific feed's directory.
         client.test_connection(remote_paths=src_constants.WHEELPROS_FEED_PATHS.values())
+    except wheelpros_exceptions.WheelProsAuthError as e:
+        return str(e), CONNECTION_ERROR_INVALID_CREDENTIALS
+    except wheelpros_exceptions.WheelProsPermissionError as e:
+        return str(e), CONNECTION_ERROR_PERMISSION_DENIED
     except (wheelpros_exceptions.WheelProsException, ValueError) as e:
-        return str(e)
-    return None
+        return str(e), CONNECTION_ERROR_CONNECTION_FAILED
+    return None, None
 
 
-def _validate_rough_country_connection(credentials: typing.Dict[str, typing.Any]) -> typing.Optional[str]:
+def _validate_rough_country_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
     url = credentials.get(src_constants.ROUGH_COUNTRY_CREDENTIALS_FEED_URL)
     try:
         client = rough_country_client.RoughCountryFeedClient(file_url=url)
+    except ValueError as e:
+        return str(e), CONNECTION_ERROR_INVALID_INPUT
+    try:
         client.test_connection()
     except (rough_country_exceptions.RoughCountryException, ValueError) as e:
-        return str(e)
-    return None
+        return str(e), CONNECTION_ERROR_CONNECTION_FAILED
+    return None, None
 
 
 # Connection validators run synchronously at connect/update time, before credentials are saved,
@@ -323,7 +363,7 @@ def _validate_rough_country_connection(credentials: typing.Dict[str, typing.Any]
 # Kinds without an entry here are not validated (relay-provisioned kinds, where credentials are
 # system-generated rather than user-entered, and providers with no real backend client yet —
 # see get_distributor_credentials_info for what each kind needs).
-_CONNECTION_VALIDATORS: typing.Dict[int, typing.Callable[[typing.Dict[str, typing.Any]], typing.Optional[str]]] = {
+_CONNECTION_VALIDATORS: typing.Dict[int, typing.Callable[[typing.Dict[str, typing.Any]], _ValidatorResult]] = {
     src_enums.BrandProviderKind.TURN_14.value: _validate_turn14_connection,
     src_enums.BrandProviderKind.KEYSTONE.value: _validate_keystone_connection,
     src_enums.BrandProviderKind.PREMIER_PERFORMANCE.value: _validate_premier_connection,
@@ -334,47 +374,49 @@ _CONNECTION_VALIDATORS: typing.Dict[int, typing.Callable[[typing.Dict[str, typin
 
 def _validate_connection(
     kind: int, credentials: typing.Dict[str, typing.Any]
-) -> typing.Tuple[typing.Optional[bool], typing.Optional[str]]:
+) -> typing.Tuple[typing.Optional[bool], typing.Optional[str], typing.Optional[str]]:
     """
     Run the connection validator for this provider kind, if one exists.
-    Returns (validated, error):
-      (True, None)   — validator ran and the connection is good.
-      (False, error) — validator ran and the connection failed; caller should reject the request.
-      (None, None)   — no validator for this kind yet; not attempted.
+    Returns (validated, error_message, error_code):
+      (True, None, None)     — validator ran and the connection is good.
+      (False, message, code) — validator ran and the connection failed; caller should reject the request.
+      (None, None, None)     — no validator for this kind yet; not attempted.
     """
     validator = _CONNECTION_VALIDATORS.get(kind)
     if not validator:
-        return None, None
-    error = validator(credentials)
-    if error:
-        return False, error
-    return True, None
+        return None, None, None
+    message, code = validator(credentials)
+    if message:
+        return False, message, code
+    return True, None, None
 
 
 def connect_provider(
     company_id: int,
     provider_id: int,
     credentials: typing.Dict[str, typing.Any],
-) -> typing.Tuple[typing.Optional[typing.Dict], typing.Optional[str]]:
+) -> typing.Tuple[typing.Optional[typing.Dict], typing.Optional[str], typing.Optional[str]]:
     """
     Create or replace credentials for a ``CompanyProviders`` row (keyed by company + provider).
-    Validates required fields from the catalog, saves, and enqueues
+    Validates required fields from the catalog, tests the connection for kinds with a validator
+    (see :data:`_CONNECTION_VALIDATORS`), saves, and enqueues
     ``integration_pricing_sync_jobs.enqueue_company_provider_pricing_sync`` when the provider
     has per-company pricing sync. Use :func:`update_connection` for partial PATCH updates by
-    connection id.
+    connection id. Returns (data, error_message, error_code) — error_code is one of the
+    ``CONNECTION_ERROR_*`` constants, for the frontend to branch on.
     """
     provider = src_models.Providers.objects.filter(id=provider_id).first()
     if not provider:
-        return None, "Provider not found"
+        return None, "Provider not found", CONNECTION_ERROR_NOT_FOUND
 
     catalog_entry = _get_catalog_entry_for_provider(provider_id)
     if not catalog_entry:
-        return None, "Provider not found in catalog"
+        return None, "Provider not found in catalog", CONNECTION_ERROR_NOT_FOUND
 
     if catalog_entry.get("relay_provisioned"):
         company = src_models.Company.objects.filter(id=company_id).first()
         if not company:
-            return None, "Company not found"
+            return None, "Company not found", CONNECTION_ERROR_NOT_FOUND
         if not company.relay_sftp_username or not company.relay_sftp_password:
             try:
                 relay_sftp_provisioning.provision_company_sftp_account(company)
@@ -382,17 +424,21 @@ def connect_provider(
                 logger.error("{} Relay SFTP provisioning failed for company_id={}: {}".format(
                     _LOG_PREFIX, company_id, e
                 ))
-                return None, "Your SFTP account could not be created. Please contact info@aftermarketscout.com."
+                return (
+                    None,
+                    "Your SFTP account could not be created. Please contact info@aftermarketscout.com.",
+                    CONNECTION_ERROR_CONNECTION_FAILED,
+                )
         user_field, password_field = catalog_entry.get("relay_credential_fields", ("sftp_user", "sftp_password"))
         creds = {user_field: company.relay_sftp_username, password_field: company.relay_sftp_password}
         validated = None
     else:
-        creds, err = _build_credentials_from_catalog_entry(catalog_entry, credentials)
+        creds, err, err_code = _build_credentials_from_catalog_entry(catalog_entry, credentials)
         if err:
-            return None, err
-        validated, val_error = _validate_connection(provider.kind, creds)
+            return None, err, err_code
+        validated, val_error, val_error_code = _validate_connection(provider.kind, creds)
         if val_error:
-            return None, val_error
+            return None, val_error, val_error_code
 
     # Check if already connected
     existing = src_models.CompanyProviders.objects.filter(
@@ -425,45 +471,46 @@ def connect_provider(
         "connection_validated": validated,
         "created_at": cp.created_at.isoformat() if cp.created_at else None,
         "updated_at": cp.updated_at.isoformat() if cp.updated_at else None,
-    }, None
+    }, None, None
 
 
 def update_connection(
     company_id: int,
     company_provider_id: int,
     credentials: typing.Dict[str, typing.Any],
-) -> typing.Tuple[typing.Optional[typing.Dict], typing.Optional[str]]:
+) -> typing.Tuple[typing.Optional[typing.Dict], typing.Optional[str], typing.Optional[str]]:
     """
     Patch credentials for an existing connection (``CompanyProviders`` by id and company).
     Merges with stored JSON (see :func:`_merge_update_credentials`); re-enqueues
     :func:`integration_pricing_sync_jobs.enqueue_company_provider_pricing_sync` the same
-    way as :func:`connect_provider` on success.
+    way as :func:`connect_provider` on success. Returns (data, error_message, error_code) —
+    error_code is one of the ``CONNECTION_ERROR_*`` constants, for the frontend to branch on.
     """
     cp = src_models.CompanyProviders.objects.filter(
         id=company_provider_id,
         company_id=company_id,
     ).select_related("provider").first()
     if not cp or not cp.provider:
-        return None, "Connection not found"
+        return None, "Connection not found", CONNECTION_ERROR_NOT_FOUND
 
     catalog_entry = _get_catalog_entry_for_provider(cp.provider_id)
     if not catalog_entry:
-        return None, "Provider not found in catalog"
+        return None, "Provider not found in catalog", CONNECTION_ERROR_NOT_FOUND
 
-    creds, err = _merge_update_credentials(
+    creds, err, err_code = _merge_update_credentials(
         catalog_entry,
         cp.credentials,
         credentials,
     )
     if err:
-        return None, err
+        return None, err, err_code
 
     if catalog_entry.get("relay_provisioned"):
         validated = None
     else:
-        validated, val_error = _validate_connection(cp.provider.kind, creds)
+        validated, val_error, val_error_code = _validate_connection(cp.provider.kind, creds)
         if val_error:
-            return None, val_error
+            return None, val_error, val_error_code
 
     cp.credentials = creds
     cp.save()
@@ -482,7 +529,7 @@ def update_connection(
         "connection_validated": validated,
         "created_at": cp.created_at.isoformat() if cp.created_at else None,
         "updated_at": cp.updated_at.isoformat() if cp.updated_at else None,
-    }, None
+    }, None, None
 
 
 def disconnect_provider(

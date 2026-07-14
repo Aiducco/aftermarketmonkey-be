@@ -88,7 +88,7 @@ class ProviderConnectView(views.View):
             )
 
         credentials = body if isinstance(body, dict) else {}
-        data, err = integrations_services.connect_provider(
+        data, err, error_code = integrations_services.connect_provider(
             company_id=company_id,
             provider_id=provider_id,
             credentials=credentials,
@@ -96,7 +96,7 @@ class ProviderConnectView(views.View):
         if err:
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
-                content=simplejson.dumps({"message": err}),
+                content=simplejson.dumps({"message": err, "error_code": error_code}),
                 status=400,
             )
 
@@ -195,16 +195,16 @@ class ProviderConnectionView(views.View):
             )
 
         patch = body if isinstance(body, dict) else {}
-        data, err = integrations_services.update_connection(
+        data, err, error_code = integrations_services.update_connection(
             company_id=company_id,
             company_provider_id=cpi,
             credentials=patch,
         )
         if err:
-            status = 404 if err == "Connection not found" else 400
+            status = 404 if error_code == integrations_services.CONNECTION_ERROR_NOT_FOUND else 400
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
-                content=simplejson.dumps({"message": err}),
+                content=simplejson.dumps({"message": err, "error_code": error_code}),
                 status=status,
             )
 

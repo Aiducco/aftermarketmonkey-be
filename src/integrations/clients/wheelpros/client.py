@@ -74,6 +74,12 @@ class WheelProsSFTPClient:
             self._transport = paramiko.Transport(sock)
             self._transport.connect(username=self.sftp_user, password=self.sftp_password)
             self._sftp = paramiko.SFTPClient.from_transport(self._transport)
+        except paramiko.AuthenticationException as e:
+            # Distinct from an unreachable host/timeout, so callers can tell bad credentials
+            # apart from a connectivity problem.
+            msg = "Login rejected by SFTP server. Error: {}".format(str(e))
+            logger.error("{} {}".format(_LOG_PREFIX, msg))
+            raise exceptions.WheelProsAuthError(msg)
         except Exception as e:
             msg = "Failed to connect to SFTP server. Error: {}".format(str(e))
             logger.error("{} {}".format(_LOG_PREFIX, msg))
@@ -111,7 +117,7 @@ class WheelProsSFTPClient:
                 except (FileNotFoundError, IOError, OSError) as e:
                     inaccessible.append("{} ({})".format(remote_path, str(e)))
             if inaccessible:
-                raise exceptions.WheelProsSFTPConnectionError(
+                raise exceptions.WheelProsPermissionError(
                     "Connected, but could not access: {}. Contact Wheel Pros support to confirm "
                     "your account has access to these feeds.".format("; ".join(inaccessible))
                 )

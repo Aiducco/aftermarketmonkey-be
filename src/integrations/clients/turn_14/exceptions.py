@@ -7,3 +7,7 @@ class Turn14APIBadResponseCodeError(Turn14APIException):
         Turn14APIException.__init__(self)
         self.message = message
         self.code = code
+
+
+class Turn14PermissionError(Turn14APIBadResponseCodeError):
+    """Credentials are valid, but the account lacks permission for the requested resource."""

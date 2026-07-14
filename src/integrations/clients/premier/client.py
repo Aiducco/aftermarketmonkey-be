@@ -65,6 +65,13 @@ class PremierFTPClient:
                 "{} Connected to FTP server {}:{}.".format(_LOG_PREFIX, self.ftp_host, self.ftp_port)
             )
             return ftp
+        except ftplib.error_perm as e:
+            # Server actively rejected the login (e.g. "530 Login or password incorrect!") —
+            # distinct from an unreachable host/timeout, so callers can tell bad credentials
+            # apart from a connectivity problem.
+            msg = "Login rejected by FTP server. Error: {}".format(str(e))
+            logger.error("{} {}.".format(_LOG_PREFIX, msg))
+            raise exceptions.PremierFTPAuthError(msg)
         except ftplib.all_errors as e:
             msg = "Failed to connect to FTP server. Error: {}".format(str(e))
             logger.error("{} {}.".format(_LOG_PREFIX, msg))
