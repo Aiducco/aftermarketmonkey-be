@@ -61,10 +61,13 @@ class RegisterView(views.View):
                 last_name=validated["last_name"],
                 email=validated["email"],
                 password=validated["password"],
+                role=validated.get("role"),
                 company_name=validated["company_name"],
                 business_type=validated.get("business_type"),
                 country=validated.get("country"),
                 state_province=validated.get("state_province"),
+                city=validated.get("city"),
+                postal_code=validated.get("postal_code"),
                 tax_id=validated.get("tax_id"),
             )
         except ValueError as e:
@@ -109,6 +112,8 @@ class CompanyDetailsView(views.View):
                 business_type=validated.get("business_type"),
                 country=validated.get("country"),
                 state_province=validated.get("state_province"),
+                city=validated.get("city"),
+                postal_code=validated.get("postal_code"),
                 tax_id=validated.get("tax_id"),
             )
         except src_models.Company.DoesNotExist:
@@ -151,7 +156,6 @@ class PersonalizationView(views.View):
                 company_id=company_id,
                 preferred_distributor_ids=validated.get("preferred_distributor_ids"),
                 top_categories=validated.get("top_categories"),
-                distributor_credentials=validated.get("distributor_credentials"),
             )
         except src_models.Company.DoesNotExist:
             return _json_response({"message": "Company not found"}, status=404)
@@ -178,7 +182,7 @@ class OnboardingStatusView(views.View):
             return _json_response({"message": "No company found in token"}, status=400)
 
         try:
-            data = onboarding_services.get_onboarding_status(company_id=company_id)
+            data = onboarding_services.get_onboarding_status(company_id=company_id, user=request.user)
         except Exception as e:
             logger.exception("%s Status error: %s", _LOG_PREFIX, str(e))
             return _json_response({"message": "Failed to get status"}, status=500)

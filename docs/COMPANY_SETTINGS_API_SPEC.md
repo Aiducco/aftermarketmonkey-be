@@ -117,9 +117,11 @@ At least one field required. Email must be unique.
     "id": 1,
     "name": "Acme Parts LLC",
     "slug": "acme-parts-abc123",
-    "business_type": "retail_store",
+    "business_type": ["retail_store"],
     "country": "US",
     "state_province": "California",
+    "city": "Los Angeles",
+    "postal_code": "90001",
     "tax_id": "12-3456789",
     "is_admin": true
   }
@@ -140,9 +142,11 @@ At least one field required. Email must be unique.
 ```json
 {
   "name": "Acme Parts LLC",
-  "business_type": "retail_store",
+  "business_type": ["retail_store", "dealership"],
   "country": "US",
   "state_province": "California",
+  "city": "Los Angeles",
+  "postal_code": "90001",
   "tax_id": "12-3456789"
 }
 ```
@@ -150,9 +154,11 @@ At least one field required. Email must be unique.
 | Field | Type | Required |
 |-------|------|----------|
 | name | string | No |
-| business_type | string | No |
+| business_type | string[] | No |
 | country | string | No |
 | state_province | string | No |
+| city | string | No |
+| postal_code | string | No |
 | tax_id | string | No |
 
 **Success (200):**

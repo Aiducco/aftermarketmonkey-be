@@ -9,9 +9,11 @@ class Company(django_db_models.Model):
     status_name = django_db_models.CharField(max_length=255)
 
     # Onboarding / B2B fields (Step 2)
-    business_type = django_db_models.CharField(max_length=64, null=True, blank=True)
+    business_type = django_db_models.JSONField(default=list, blank=True)  # list[str], e.g. ["retail_store", "dealership"]
     country = django_db_models.CharField(max_length=64, null=True, blank=True)
     state_province = django_db_models.CharField(max_length=128, null=True, blank=True)
+    city = django_db_models.CharField(max_length=128, null=True, blank=True)
+    postal_code = django_db_models.CharField(max_length=32, null=True, blank=True)
     tax_id = django_db_models.CharField(max_length=64, null=True, blank=True)
 
     # Onboarding progress: 0=not_started, 1=account_created, 2=company_details, 3=personalization, 4=complete
@@ -206,6 +208,9 @@ class UserProfile(django_db_models.Model):
         blank=True,
     )
     is_company_admin = django_db_models.BooleanField(default=False)
+    # Job function within the company (owner, parts_manager, service_advisor, technician, other).
+    # Free CharField; allowed values enforced at the schema layer (see onboarding.USER_ROLES).
+    role = django_db_models.CharField(max_length=32, null=True, blank=True)
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)

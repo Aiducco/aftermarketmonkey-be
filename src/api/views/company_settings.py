@@ -135,6 +135,8 @@ class CompanySettingsView(views.View):
             business_type=validated.get("business_type"),
             country=validated.get("country"),
             state_province=validated.get("state_province"),
+            city=validated.get("city"),
+            postal_code=validated.get("postal_code"),
             tax_id=validated.get("tax_id"),
         )
         if data is None:

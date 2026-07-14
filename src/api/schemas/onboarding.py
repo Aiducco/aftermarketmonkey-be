@@ -1,5 +1,13 @@
 from marshmallow import Schema, fields, validate
 
+USER_ROLE_CHOICES = [
+    "owner",
+    "parts_manager",
+    "service_advisor",
+    "technician",
+    "other",
+]
+
 
 class RegisterSchema(Schema):
     """
@@ -11,89 +19,60 @@ class RegisterSchema(Schema):
     last_name = fields.String(required=True, validate=validate.Length(min=1, max=150))
     email = fields.Email(required=True)
     password = fields.String(required=True, validate=validate.Length(min=8))
+    role = fields.String(required=False, allow_none=True, validate=validate.OneOf(USER_ROLE_CHOICES))
     # Company (required for atomic creation)
     company_name = fields.String(required=True, validate=validate.Length(min=1, max=255))
-    business_type = fields.String(required=False, allow_none=True, validate=validate.Length(max=64))
+    business_type = fields.List(fields.String(validate=validate.Length(max=64)), required=False, load_default=list)
     country = fields.String(required=False, allow_none=True, validate=validate.Length(max=64))
     state_province = fields.String(required=False, allow_none=True, validate=validate.Length(max=128))
+    city = fields.String(required=False, allow_none=True, validate=validate.Length(max=128))
+    postal_code = fields.String(required=False, allow_none=True, validate=validate.Length(max=32))
     tax_id = fields.String(required=False, allow_none=True, validate=validate.Length(max=64))
 
 
 class CompanyDetailsSchema(Schema):
     """Step 2: Company details & verification."""
     company_name = fields.String(required=True, validate=validate.Length(min=1, max=255))
-    business_type = fields.String(
-        required=False,
-        allow_none=True,
-        validate=validate.OneOf(
-            [
-                "retail_store",
-                "installation_repair_shop",
-                "ecommerce",
-                "dealership",
-                "fleet_manager",
-            ]
+    business_type = fields.List(
+        fields.String(
+            validate=validate.OneOf(
+                [
+                    "retail_store",
+                    "installation_repair_shop",
+                    "ecommerce",
+                    "dealership",
+                    "fleet_manager",
+                ]
+            ),
         ),
+        required=False,
+        load_default=list,
     )
     country = fields.String(required=False, allow_none=True, validate=validate.Length(max=64))
     state_province = fields.String(required=False, allow_none=True, validate=validate.Length(max=128))
+    city = fields.String(required=False, allow_none=True, validate=validate.Length(max=128))
+    postal_code = fields.String(required=False, allow_none=True, validate=validate.Length(max=32))
     tax_id = fields.String(required=False, allow_none=True, validate=validate.Length(max=64))
 
 
 class CompanyDetailsSchemaAllowAny(Schema):
-    """Step 2: Allow any business_type string for flexibility."""
+    """Step 2: Allow any business_type strings for flexibility."""
     company_name = fields.String(required=True, validate=validate.Length(min=1, max=255))
-    business_type = fields.String(required=False, allow_none=True, validate=validate.Length(max=64))
+    business_type = fields.List(fields.String(validate=validate.Length(max=64)), required=False, load_default=list)
     country = fields.String(required=False, allow_none=True, validate=validate.Length(max=64))
     state_province = fields.String(required=False, allow_none=True, validate=validate.Length(max=128))
+    city = fields.String(required=False, allow_none=True, validate=validate.Length(max=128))
+    postal_code = fields.String(required=False, allow_none=True, validate=validate.Length(max=32))
     tax_id = fields.String(required=False, allow_none=True, validate=validate.Length(max=64))
 
 
-class DistributorCredentialsSchema(Schema):
-    """Turn14 credentials."""
-    client_id = fields.String(required=True)
-    client_secret = fields.String(required=True)
-
-
-class KeystoneCredentialsSchema(Schema):
-    """Keystone credentials."""
-    ftp_user = fields.String(required=True)
-    ftp_password = fields.String(required=True)
-
-
-class MeyerCredentialsSchema(Schema):
-    """Meyer relay SFTP — credentials from info@aftermarketscout.com; host/path/files from settings."""
-
-    sftp_user = fields.String(required=True)
-    sftp_password = fields.String(required=True)
-
-
-class AtechCredentialsSchema(Schema):
-    """A-Tech relay SFTP — credentials from info@aftermarketscout.com; combined catalog, multi-DC inventory, and pricing feed (remote name configurable via settings or credentials)."""
-
-    sftp_user = fields.String(required=True)
-    sftp_password = fields.String(required=True)
-
-
-class DlgCredentialsSchema(Schema):
-    """DLG: dealer address that receives DLG’s inventory email (ingest from relay uses app settings, not this row)."""
-
-    email_from = fields.String(required=True)
-
-
-class WheelProsCredentialsSchema(Schema):
-    """Wheel Pros SFTP: user/password; optional path and per-feed % off MSRP for dealer cost."""
-
-    sftp_user = fields.String(required=True)
-    sftp_password = fields.String(required=True)
-    sftp_path = fields.String(required=False, allow_none=True)
-    wheel_markup = fields.String(required=False, allow_none=True)
-    tire_markup = fields.String(required=False, allow_none=True)
-    accessories_markup = fields.String(required=False, allow_none=True)
-
-
 class PersonalizationSchema(Schema):
-    """Step 3: Tool personalization."""
+    """
+    Step 3: Personalization preferences only — which distributors/categories the
+    company is interested in. No credentials here; connecting real distributor
+    credentials to unlock pricing/inventory happens later via the integrations flow
+    (POST /integrations/catalog/<id>/connect/), not during onboarding.
+    """
     preferred_distributor_ids = fields.List(
         fields.Integer(),
         required=False,
@@ -103,10 +82,4 @@ class PersonalizationSchema(Schema):
         fields.String(),
         required=False,
         load_default=list,
-    )
-    # Optional: credentials per distributor. Keys: turn_14, keystone, meyer, atech, dlg, wheelpros
-    distributor_credentials = fields.Dict(
-        required=False,
-        allow_none=True,
-        load_default=dict,
     )

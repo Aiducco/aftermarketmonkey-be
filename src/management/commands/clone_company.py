@@ -108,6 +108,8 @@ class Command(BaseCommand):
                 business_type=source.business_type,
                 country=source.country,
                 state_province=source.state_province,
+                city=source.city,
+                postal_code=source.postal_code,
                 tax_id=source.tax_id,
                 onboarding_step=source.onboarding_step,
                 subscription_plan=source.subscription_plan,

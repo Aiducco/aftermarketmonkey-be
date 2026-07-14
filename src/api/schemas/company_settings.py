@@ -9,9 +9,11 @@ class UpdateProfileSchema(Schema):
 
 class UpdateCompanySettingsSchema(Schema):
     name = fields.String(required=False, validate=validate.Length(max=255))
-    business_type = fields.String(required=False, allow_none=True, validate=validate.Length(max=64))
+    business_type = fields.List(fields.String(validate=validate.Length(max=64)), required=False)
     country = fields.String(required=False, allow_none=True, validate=validate.Length(max=64))
     state_province = fields.String(required=False, allow_none=True, validate=validate.Length(max=128))
+    city = fields.String(required=False, allow_none=True, validate=validate.Length(max=128))
+    postal_code = fields.String(required=False, allow_none=True, validate=validate.Length(max=32))
     tax_id = fields.String(required=False, allow_none=True, validate=validate.Length(max=64))
 
 

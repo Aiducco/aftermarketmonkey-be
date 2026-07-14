@@ -13,7 +13,6 @@ from django.db import transaction
 from src import constants as src_constants
 from src import enums as src_enums
 from src import models as src_models
-from src.integrations.services import integration_pricing_sync_jobs
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +25,15 @@ BUSINESS_TYPES = [
     {"value": "ecommerce", "label": "E-commerce solely"},
     {"value": "dealership", "label": "Dealership"},
     {"value": "fleet_manager", "label": "Fleet Manager"},
+]
+
+# User role display names (job function within the company)
+USER_ROLES = [
+    {"value": "owner", "label": "Owner"},
+    {"value": "parts_manager", "label": "Parts Manager"},
+    {"value": "service_advisor", "label": "Service Advisor"},
+    {"value": "technician", "label": "Technician"},
+    {"value": "other", "label": "Other"},
 ]
 
 # Top categories for personalization
@@ -54,9 +62,12 @@ def register_user(
     email: str,
     password: str,
     company_name: str,
-    business_type: str | None = None,
+    role: str | None = None,
+    business_type: list | None = None,
     country: str | None = None,
     state_province: str | None = None,
+    city: str | None = None,
+    postal_code: str | None = None,
     tax_id: str | None = None,
 ) -> dict:
     """
@@ -81,9 +92,11 @@ def register_user(
         slug=_generate_slug(company_name),
         status=src_enums.CompanyStatus.ACTIVE.value,
         status_name=src_enums.CompanyStatus.ACTIVE.name,
-        business_type=_opt(business_type),
+        business_type=[str(bt).strip() for bt in (business_type or []) if str(bt).strip()],
         country=_opt(country),
         state_province=_opt(state_province),
+        city=_opt(city),
+        postal_code=_opt(postal_code),
         tax_id=_opt(tax_id),
         onboarding_step=2,  # Step 1+2 done; next is step 3 (personalization)
     )
@@ -101,11 +114,12 @@ def register_user(
     # Create UserProfile (signal may not be loaded; create explicitly and set as admin)
     profile, created = src_models.UserProfile.objects.get_or_create(
         user=user,
-        defaults={"company": company, "is_company_admin": True},
+        defaults={"company": company, "is_company_admin": True, "role": _opt(role)},
     )
     if not created:
         profile.company = company
         profile.is_company_admin = True
+        profile.role = _opt(role)
         profile.save()
 
     # Create JWT (same as login)
@@ -123,9 +137,11 @@ def register_user(
 def update_company_details(
     company_id: int,
     company_name: str,
-    business_type: str | None = None,
+    business_type: list | None = None,
     country: str | None = None,
     state_province: str | None = None,
+    city: str | None = None,
+    postal_code: str | None = None,
     tax_id: str | None = None,
 ) -> dict:
     """
@@ -136,11 +152,15 @@ def update_company_details(
     # Update slug to reflect company name (unique suffix ensures no collision)
     company.slug = _generate_slug(company_name)
     if business_type is not None:
-        company.business_type = business_type.strip() or None
+        company.business_type = [str(bt).strip() for bt in business_type if str(bt).strip()]
     if country is not None:
         company.country = country.strip() or None
     if state_province is not None:
         company.state_province = state_province.strip() or None
+    if city is not None:
+        company.city = city.strip() or None
+    if postal_code is not None:
+        company.postal_code = postal_code.strip() or None
     if tax_id is not None:
         company.tax_id = tax_id.strip() or None
     company.onboarding_step = 2
@@ -156,24 +176,15 @@ def save_personalization(
     company_id: int,
     preferred_distributor_ids: list | None = None,
     top_categories: list | None = None,
-    distributor_credentials: dict | None = None,
 ) -> dict:
     """
-    Step 3: Save preferences and optionally create CompanyProviders with credentials.
+    Step 3: Save distributor/category preferences.
 
-    distributor_credentials format:
-    {
-        "turn_14": {"client_id": "...", "client_secret": "..."},
-        "keystone": {"ftp_user": "...", "ftp_password": "..."},
-        "meyer": {"sftp_user": "...", "sftp_password": "..."},
-        "atech": {"sftp_user": "...", "sftp_password": "..."},
-        "dlg": {"email_from": "dealer@example.com"},
-        "wheelpros": {
-            "sftp_user": "...",
-            "sftp_password": "...",
-            "sftp_path": "optional remote CSV path",
-        },
-    }
+    This stores intent only (which distributors/categories the company cares about)
+    to personalize search & prompts. It does not create real distributor connections —
+    unlocking live pricing/inventory requires connecting real credentials via the
+    integrations flow (POST /integrations/catalog/<id>/connect/), handled separately
+    from onboarding.
     """
     company = src_models.Company.objects.get(id=company_id)
 
@@ -192,10 +203,6 @@ def save_personalization(
         prefs.top_categories = [str(x).strip() for x in top_categories if x]
     prefs.save()
 
-    # Create/update CompanyProviders for distributors with credentials
-    if distributor_credentials:
-        _upsert_company_providers(company, distributor_credentials)
-
     company.onboarding_step = 4
     company.save()
 
@@ -205,148 +212,8 @@ def save_personalization(
     }
 
 
-def _upsert_company_providers(company: src_models.Company, credentials: dict) -> None:
-    """Create or update CompanyProviders from distributor_credentials."""
-    # Turn14: kind=1 (TURN_14)
-    if "turn_14" in credentials:
-        creds = credentials["turn_14"]
-        if creds.get("client_id") and creds.get("client_secret"):
-            provider = src_models.Providers.objects.filter(
-                kind=src_enums.BrandProviderKind.TURN_14.value
-            ).first()
-            if provider:
-                cp, _ = src_models.CompanyProviders.objects.update_or_create(
-                    company=company,
-                    provider=provider,
-                    defaults={
-                        "credentials": {
-                            "client_id": creds["client_id"],
-                            "client_secret": creds["client_secret"],
-                        },
-                        "primary": True,
-                    },
-                )
-                integration_pricing_sync_jobs.enqueue_company_provider_pricing_sync(cp.id)
-
-    # Keystone: kind=3 (KEYSTONE)
-    if "keystone" in credentials:
-        creds = credentials["keystone"]
-        if creds.get("ftp_user") and creds.get("ftp_password"):
-            provider = src_models.Providers.objects.filter(
-                kind=src_enums.BrandProviderKind.KEYSTONE.value
-            ).first()
-            if provider:
-                cp, _ = src_models.CompanyProviders.objects.update_or_create(
-                    company=company,
-                    provider=provider,
-                    defaults={
-                        "credentials": {
-                            "ftp_user": creds["ftp_user"],
-                            "ftp_password": creds["ftp_password"],
-                        },
-                        "primary": False,
-                    },
-                )
-                integration_pricing_sync_jobs.enqueue_company_provider_pricing_sync(cp.id)
-
-    # Meyer: kind=6 (MEYER) — user/password; host/port/dir/files default from MEYER_SFTP_* settings in MeyerSFTPClient
-    if "meyer" in credentials:
-        creds = credentials["meyer"]
-        user_ok = str(creds.get("sftp_user") or "").strip()
-        pass_ok = str(creds.get("sftp_password") or "").strip()
-        if user_ok and pass_ok:
-            provider = src_models.Providers.objects.filter(
-                kind=src_enums.BrandProviderKind.MEYER.value
-            ).first()
-            if provider:
-                cred_dict = {
-                    "sftp_user": user_ok,
-                    "sftp_password": pass_ok,
-                }
-                cp, _ = src_models.CompanyProviders.objects.update_or_create(
-                    company=company,
-                    provider=provider,
-                    defaults={
-                        "credentials": cred_dict,
-                        "primary": False,
-                    },
-                )
-                integration_pricing_sync_jobs.enqueue_company_provider_pricing_sync(cp.id)
-
-    # A-Tech: kind=7 (ATECH) — user/password; host/port/dir/feed file from ATECH_SFTP_* / ATECH_FEED_REMOTE_FILE
-    if "atech" in credentials:
-        creds = credentials["atech"]
-        user_ok = str(creds.get("sftp_user") or "").strip()
-        pass_ok = str(creds.get("sftp_password") or "").strip()
-        if user_ok and pass_ok:
-            provider = src_models.Providers.objects.filter(
-                kind=src_enums.BrandProviderKind.ATECH.value
-            ).first()
-            if provider:
-                cred_dict = {
-                    "sftp_user": user_ok,
-                    "sftp_password": pass_ok,
-                }
-                cp, _ = src_models.CompanyProviders.objects.update_or_create(
-                    company=company,
-                    provider=provider,
-                    defaults={
-                        "credentials": cred_dict,
-                        "primary": False,
-                    },
-                )
-                integration_pricing_sync_jobs.enqueue_company_provider_pricing_sync(cp.id)
-
-    # DLG: kind=8 — email_from only; relay SFTP auth is in settings (DLG_RELAY_SFTP_USER / DLG_RELAY_SFTP_PASSWORD).
-    if "dlg" in credentials:
-        creds = credentials["dlg"]
-        email_from_ok = str(creds.get(src_constants.DLG_CREDENTIALS_EMAIL_FROM) or "").strip()
-        if email_from_ok:
-            provider = src_models.Providers.objects.filter(
-                kind=src_enums.BrandProviderKind.DLG.value
-            ).first()
-            if provider:
-                cred_dict = {
-                    src_constants.DLG_CREDENTIALS_EMAIL_FROM: email_from_ok,
-                }
-                cp, _ = src_models.CompanyProviders.objects.update_or_create(
-                    company=company,
-                    provider=provider,
-                    defaults={
-                        "credentials": cred_dict,
-                        "primary": False,
-                    },
-                )
-                integration_pricing_sync_jobs.enqueue_company_provider_pricing_sync(cp.id)
-
-    # Wheel Pros: SFTP user/password only; host/port from settings (WHEELPROS_SFTP_HOST / PORT).
-    if "wheelpros" in credentials:
-        creds = credentials["wheelpros"]
-        if creds.get("sftp_user") and creds.get("sftp_password"):
-            provider = src_models.Providers.objects.filter(
-                kind=src_enums.BrandProviderKind.WHEELPROS.value
-            ).first()
-            if provider:
-                cred_dict = {
-                    "sftp_user": str(creds["sftp_user"]).strip(),
-                    "sftp_password": str(creds["sftp_password"]).strip(),
-                }
-                v = creds.get("sftp_path")
-                if v is not None and str(v).strip():
-                    cred_dict["sftp_path"] = str(v).strip()
-                cp, _ = src_models.CompanyProviders.objects.update_or_create(
-                    company=company,
-                    provider=provider,
-                    defaults={
-                        "credentials": cred_dict,
-                        "primary": False,
-                    },
-                )
-                integration_pricing_sync_jobs.enqueue_company_provider_pricing_sync(cp.id)
-
-
-def get_onboarding_status(company_id: int) -> dict:
-    """Get current onboarding status and available options."""
+def get_onboarding_status(company_id: int, user=None) -> dict:
+    """Get current onboarding step, saved details, and available options."""
     try:
         company = src_models.Company.objects.get(id=company_id)
     except src_models.Company.DoesNotExist:
@@ -374,6 +241,14 @@ def get_onboarding_status(company_id: int) -> dict:
         preferred_ids = []
         top_cats = []
 
+    role = None
+    if user is not None and getattr(user, "is_authenticated", False):
+        role = (
+            src_models.UserProfile.objects.filter(user=user, company_id=company_id)
+            .values_list("role", flat=True)
+            .first()
+        )
+
     return {
         "company_id": company.id,
         "onboarding_step": company.onboarding_step or 0,
@@ -381,16 +256,20 @@ def get_onboarding_status(company_id: int) -> dict:
         "business_type": company.business_type,
         "country": company.country,
         "state_province": company.state_province,
+        "city": company.city,
+        "postal_code": company.postal_code,
+        "role": role,
         "preferred_distributor_ids": preferred_ids,
         "top_categories": top_cats,
         "available_distributors": available_distributors,
         "business_types": BUSINESS_TYPES,
         "categories_options": TOP_CATEGORIES,
+        "roles": USER_ROLES,
     }
 
 
 def get_distributor_credentials_info() -> dict:
-    """Return what credentials each distributor needs (for API docs / frontend)."""
+    """Return what credentials each distributor needs (for the post-onboarding integrations connect flow)."""
     return {
         "turn_14": {
             "required": ["client_id", "client_secret"],

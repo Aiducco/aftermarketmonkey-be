@@ -99,6 +99,8 @@ def get_company_settings(company_id: int, user) -> dict | None:
         "business_type": company.business_type,
         "country": company.country,
         "state_province": company.state_province,
+        "city": company.city,
+        "postal_code": company.postal_code,
         "tax_id": company.tax_id,
         "is_admin": profile.is_company_admin,
     }
@@ -108,9 +110,11 @@ def update_company_settings(
     company_id: int,
     user,
     name: str | None = None,
-    business_type: str | None = None,
+    business_type: list | None = None,
     country: str | None = None,
     state_province: str | None = None,
+    city: str | None = None,
+    postal_code: str | None = None,
     tax_id: str | None = None,
 ) -> dict | None:
     """Update company. User must be company admin."""
@@ -126,11 +130,15 @@ def update_company_settings(
     if name is not None:
         company.name = name.strip()
     if business_type is not None:
-        company.business_type = business_type.strip() or None
+        company.business_type = [str(bt).strip() for bt in business_type if str(bt).strip()]
     if country is not None:
         company.country = country.strip() or None
     if state_province is not None:
         company.state_province = state_province.strip() or None
+    if city is not None:
+        company.city = city.strip() or None
+    if postal_code is not None:
+        company.postal_code = postal_code.strip() or None
     if tax_id is not None:
         company.tax_id = tax_id.strip() or None
     company.save()
