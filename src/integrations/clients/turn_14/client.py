@@ -96,28 +96,53 @@ class Turn14ApiClient(object):
         
         return self._cached_token
 
+    def _permission_or_reraise(
+        self, e: exceptions.Turn14APIBadResponseCodeError, resource: str
+    ) -> exceptions.Turn14APIBadResponseCodeError:
+        """
+        A 401/403 here means the token itself was already accepted (test_connection got this
+        far), so it's the account lacking a permission grant, not bad credentials — convert to
+        Turn14PermissionError with a resource-specific message. Any other status is left as-is.
+        """
+        if e.code in (401, 403):
+            return exceptions.Turn14PermissionError(
+                message=(
+                    "Connected to Turn 14, but this account does not have permission to "
+                    "access {} data. Contact Turn 14 support to enable API access for "
+                    "your client_id.".format(resource)
+                ),
+                code=e.code,
+            )
+        return e
+
     def test_connection(self) -> None:
         """
         Validate credentials by requesting a token, then confirm the account can actually
         read Items data. Some Turn 14 accounts have valid API credentials but lack Items
         API permission (a separate grant from Turn 14 support), which otherwise only
         surfaces later as a failed catalog sync — catch it here instead.
+
+        Uses items/brand/<id> (one page, scoped to a single brand) rather than the
+        account-wide items/updates endpoint, which scans the last day of changes across
+        every brand and is noticeably slower for a synchronous connect-time check.
         """
         self._get_valid_token()
 
         try:
-            self.get_items_updates(page=1, days=1)
+            brands = self.get_brands()
         except exceptions.Turn14APIBadResponseCodeError as e:
-            if e.code in (401, 403):
-                raise exceptions.Turn14PermissionError(
-                    message=(
-                        "Connected to Turn 14, but this account does not have permission to "
-                        "access Items data (required for catalog sync). Contact Turn 14 support "
-                        "to enable Items API access for your client_id."
-                    ),
-                    code=e.code,
-                )
-            raise
+            raise self._permission_or_reraise(e, "Brands")
+
+        if not brands:
+            # Nothing assigned to this account to scope an Items call to — token + Brands
+            # both succeeded, which is as much as we can validate.
+            return
+
+        brand_id = brands[0].get("id")
+        try:
+            self.get_items_for_brand(brand_id=brand_id, page=1)
+        except exceptions.Turn14APIBadResponseCodeError as e:
+            raise self._permission_or_reraise(e, "Items")
 
     @sleep_and_retry
     @limits(calls=20, period=60)
