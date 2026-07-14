@@ -170,12 +170,12 @@ def get_providers_catalog(company_id: int) -> typing.Dict:
 
     company = src_models.Company.objects.filter(id=company_id).first()
 
-    # Get company's connected provider IDs
-    connected_provider_ids = set(
-        src_models.CompanyProviders.objects.filter(
-            company_id=company_id
-        ).values_list('provider_id', flat=True)
-    )
+    # All connections for this company, keyed by provider_id — avoids an N+1 query in the
+    # catalog loop below (one query total instead of one per connected provider).
+    company_providers_by_provider_id = {
+        cp.provider_id: cp
+        for cp in src_models.CompanyProviders.objects.filter(company_id=company_id)
+    }
 
     # Get all providers from DB (by kind)
     providers_by_kind = {
@@ -191,14 +191,8 @@ def get_providers_catalog(company_id: int) -> typing.Dict:
         if not provider:
             continue
 
-        connected = provider.id in connected_provider_ids
-        company_provider = None
-        if connected:
-            cp = src_models.CompanyProviders.objects.filter(
-                company_id=company_id,
-                provider_id=provider.id
-            ).first()
-            company_provider = cp
+        company_provider = company_providers_by_provider_id.get(provider.id)
+        connected = company_provider is not None
 
         kind_name = provider.kind_name or ""
         display_name = src_constants.PROVIDER_DISPLAY_NAMES.get(
@@ -222,6 +216,17 @@ def get_providers_catalog(company_id: int) -> typing.Dict:
             "kind_name": kind_name,
             "coming_soon": False,
             "integration_time": entry.get("integration_time") or None,
+            # Live connectivity/sync status — see CompanyProviderConnectionStatus. Null when
+            # not connected, or when connected but not checked yet (e.g. just created, cron
+            # hasn't run). "connected"/"ingesting"/"waiting"/"failing".
+            "status": company_provider.status if company_provider else None,
+            "status_name": company_provider.status_name if company_provider else None,
+            "status_reason": company_provider.status_reason if company_provider else None,
+            "status_checked_at": (
+                company_provider.status_checked_at.isoformat()
+                if company_provider and company_provider.status_checked_at
+                else None
+            ),
         })
 
     # Coming soon distributors — driven by COMING_SOON_PROVIDERS
@@ -751,6 +756,12 @@ def get_company_provider_connection_detail(
         "provider_kind": provider.kind,
         "provider_kind_name": provider.kind_name,
         "primary": company_provider.primary,
+        "status": company_provider.status,
+        "status_name": company_provider.status_name,
+        "status_reason": company_provider.status_reason,
+        "status_checked_at": (
+            company_provider.status_checked_at.isoformat() if company_provider.status_checked_at else None
+        ),
         "created_at": company_provider.created_at.isoformat() if company_provider.created_at else None,
         "updated_at": company_provider.updated_at.isoformat() if company_provider.updated_at else None,
     }

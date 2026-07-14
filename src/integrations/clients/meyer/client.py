@@ -1,5 +1,6 @@
 import logging
 import os
+import socket
 import time
 import typing
 from urllib.parse import urlparse
@@ -16,6 +17,11 @@ _LOG_PREFIX = "[MEYER-SFTP-CLIENT]"
 DEFAULT_LOCAL_PRICING = "/tmp/meyer_pricing.csv"
 DEFAULT_LOCAL_INVENTORY = "/tmp/meyer_inventory.csv"
 DEFAULT_FILE_MAX_AGE_SECONDS = 6 * 60 * 60
+
+# paramiko.Transport((host, port)) opens the socket with no timeout, so a bad host/firewall
+# could hang the calling thread indefinitely — matters now that feed_present() runs
+# periodically from a cron command.
+DEFAULT_CONNECT_TIMEOUT_SECONDS = 15
 
 # If Django settings omit MEYER_SFTP_* (older deploys) or values are blank, use relay defaults.
 _DEFAULT_MEYER_RELAY_HOST = "5.161.121.143"
@@ -187,7 +193,10 @@ class MeyerSFTPClient:
 
     def _connect(self) -> None:
         try:
-            self._transport = paramiko.Transport((self.sftp_server, self.sftp_port))
+            sock = socket.create_connection(
+                (self.sftp_server, self.sftp_port), timeout=DEFAULT_CONNECT_TIMEOUT_SECONDS
+            )
+            self._transport = paramiko.Transport(sock)
             self._transport.connect(username=self.sftp_user, password=self.sftp_password)
             self._sftp = paramiko.SFTPClient.from_transport(self._transport)
         except Exception as e:
@@ -261,3 +270,23 @@ class MeyerSFTPClient:
             self.local_inventory_path,
             force_download,
         )
+
+    def feed_present(self) -> bool:
+        """
+        True if both the pricing and inventory files exist on the relay. Single connection,
+        stat() only — doesn't download anything. Connection failures (e.g. relay account
+        broken) propagate as MeyerSFTPConnectionError rather than returning False, so callers
+        can tell "not there yet" apart from "couldn't check."
+        """
+        self._connect()
+        try:
+            pricing_path = _remote_join(self.sftp_directory, self.pricing_remote_file)
+            inventory_path = _remote_join(self.sftp_directory, self.inventory_remote_file)
+            try:
+                self._sftp.stat(pricing_path)
+                self._sftp.stat(inventory_path)
+                return True
+            except FileNotFoundError:
+                return False
+        finally:
+            self._disconnect()

@@ -119,14 +119,54 @@ downloading the full spreadsheet. Prefix format is checked before any network ca
 - `connection_failed` — unreachable / bad HTTP status
 
 ### Meyer, A-Tech — relay-provisioned SFTP
-**Not validated.** Credentials are ours, generated at connect time — there's no user-entered
-password to get wrong. `connection_validated: null`. A future check will confirm the
-distributor's feed actually arrives on our relay, which is a data-freshness problem, not a
+**Not validated at connect time.** Credentials are ours, generated at connect time — there's
+no user-entered password to get wrong, so `connection_validated: null` on connect/update.
+Instead these are covered by the periodic `status` check described below, which confirms the
+distributor's feed file has actually arrived on our relay — a data-freshness problem, not a
 credentials one.
 
 ### Everything else (~18 distributors) — catalog only
 **Not validated.** No backend fetch client exists yet for these, so there's nothing to test
 a connection against. Connect always succeeds today with `connection_validated: null`.
+
+---
+
+## Live status (catalog + connection detail)
+
+Separate from the connect/update-time checks above: every `CompanyProviders` connection
+also carries a background-refreshed `status`, exposed directly on the endpoints you already
+call — no new endpoint needed.
+
+- `GET /api/integrations/catalog/` — each catalog row includes `status` fields for
+  distributors the company has connected.
+- `GET /api/integrations/connections/<company_provider_id>/detail/` — same fields on the
+  single-connection view.
+
+```json
+{
+  "status": 1,
+  "status_name": "CONNECTED",
+  "status_reason": null,
+  "status_checked_at": "2026-07-14T08:13:05.321224Z"
+}
+```
+
+| `status_name` | Meaning |
+|---|---|
+| `null` | Not connected, or connected but not checked yet (just created, next cron run hasn't happened). Treat like a loading/pending state, not an error. |
+| `CONNECTED` | Initial sync has completed — live data available. Set once, directly, the moment the first pricing sync job finishes; never re-checked after that. |
+| `INGESTING` | Connectivity confirmed good (or, for relay distributors, the feed file has arrived), but the initial sync hasn't finished processing it yet. |
+| `WAITING` | Relay-provisioned distributor (Meyer, A-Tech) — connectivity to our own relay is fine, but the distributor's feed file hasn't arrived yet. Nothing wrong on the customer's end; `status_reason` says as much. |
+| `FAILING` | Live check failed — bad credentials, or (rarely, for relay distributors) our own relay account is broken. `status_reason` has the detail, same messages as the `error_code` table above for the five validated distributors. |
+
+**How it's kept fresh:** a cron-scheduled command
+(`check_company_provider_connections`, every ~5 minutes) re-checks every connection where
+the initial sync hasn't completed yet — live credential check for Turn 14/Keystone/Wheel
+Pros/Premier/Rough Country, relay file presence check for Meyer/A-Tech. Once a connection
+reaches `CONNECTED` it's no longer touched by this job — if credentials break *after* the
+first successful sync, `status` will not reflect that (a known gap, not yet built).
+Everything outside those seven kinds is left with `status: null` — no live check exists for
+it yet.
 
 ---
 
@@ -160,6 +200,15 @@ export interface ConnectSuccessResponse {
     created_at: string;
     updated_at: string;
   };
+}
+
+export type ConnectionStatusName = "CONNECTED" | "INGESTING" | "WAITING" | "FAILING";
+
+export interface ConnectionStatusFields {
+  status: 1 | 2 | 3 | 4 | null;
+  status_name: ConnectionStatusName | null;
+  status_reason: string | null;
+  status_checked_at: string | null;
 }
 ```
 

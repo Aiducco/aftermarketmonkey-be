@@ -111,6 +111,15 @@ class CompanyProviders(django_db_models.Model):
     # Existing rows are migrated to True so only newly-connected providers start as False.
     initial_sync_completed = django_db_models.BooleanField(default=False)
 
+    # Live connectivity/sync status (see src.enums.CompanyProviderConnectionStatus). Null
+    # until first checked. Refreshed periodically by check_company_provider_connections for
+    # rows where initial_sync_completed is False; set to CONNECTED directly once that flips
+    # True. Exposed on the integrations catalog and connection detail endpoints.
+    status = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+    status_name = django_db_models.CharField(max_length=32, null=True, blank=True)
+    status_reason = django_db_models.TextField(null=True, blank=True)
+    status_checked_at = django_db_models.DateTimeField(null=True, blank=True)
+
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
 

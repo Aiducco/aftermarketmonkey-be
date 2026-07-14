@@ -1,5 +1,6 @@
 import logging
 import os
+import socket
 import time
 import typing
 from urllib.parse import urlparse
@@ -16,6 +17,11 @@ _LOG_PREFIX = "[ATECH-SFTP-CLIENT]"
 
 DEFAULT_LOCAL_FEED = "/tmp/atechfile.txt"
 DEFAULT_FILE_MAX_AGE_SECONDS = 6 * 60 * 60
+
+# paramiko.Transport((host, port)) opens the socket with no timeout, so a bad host/firewall
+# could hang the calling thread indefinitely — matters now that feed_present() runs
+# periodically from a cron command.
+DEFAULT_CONNECT_TIMEOUT_SECONDS = 15
 
 _DEFAULT_ATECH_RELAY_HOST = "5.161.121.143"
 _DEFAULT_ATECH_RELAY_PORT = 22
@@ -177,7 +183,10 @@ class AtechSFTPClient:
 
     def _connect(self) -> None:
         try:
-            self._transport = paramiko.Transport((self.sftp_server, self.sftp_port))
+            sock = socket.create_connection(
+                (self.sftp_server, self.sftp_port), timeout=DEFAULT_CONNECT_TIMEOUT_SECONDS
+            )
+            self._transport = paramiko.Transport(sock)
             self._transport.connect(username=self.sftp_user, password=self.sftp_password)
             self._sftp = paramiko.SFTPClient.from_transport(self._transport)
         except Exception as e:
@@ -245,3 +254,21 @@ class AtechSFTPClient:
     def download_feed_file(self, force_download: bool = False) -> str:
         """Download the combined A-Tech feed to the configured local path."""
         return self._download(self.feed_remote_file, self.local_feed_path, force_download)
+
+    def feed_present(self) -> bool:
+        """
+        True if the combined feed file exists on the relay. stat() only — doesn't download
+        anything. Connection failures (e.g. relay account broken) propagate as
+        AtechSFTPConnectionError rather than returning False, so callers can tell "not there
+        yet" apart from "couldn't check."
+        """
+        self._connect()
+        try:
+            remote_path = _remote_join(self.sftp_directory, self.feed_remote_file)
+            try:
+                self._sftp.stat(remote_path)
+                return True
+            except FileNotFoundError:
+                return False
+        finally:
+            self._disconnect()

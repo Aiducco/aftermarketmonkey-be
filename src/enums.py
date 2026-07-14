@@ -81,3 +81,15 @@ class IntegrationPricingSyncJobStatus(enum.Enum):
     RUNNING = 2
     COMPLETED = 3
     FAILED = 4
+
+
+class CompanyProviderConnectionStatus(enum.Enum):
+    """
+    Live connectivity/sync status for a CompanyProviders connection. Refreshed by the
+    check_company_provider_connections cron for rows where initial_sync_completed is False;
+    set to CONNECTED directly by integration_pricing_sync_jobs once that flips True.
+    """
+    CONNECTED = 1  # credentials valid and the initial pricing sync has completed
+    INGESTING = 2  # credentials valid (or relay file received); initial sync not finished yet
+    WAITING = 3    # credentials valid, but relay-provisioned and the distributor's file hasn't arrived yet
+    FAILING = 4    # credentials/connectivity check failed
