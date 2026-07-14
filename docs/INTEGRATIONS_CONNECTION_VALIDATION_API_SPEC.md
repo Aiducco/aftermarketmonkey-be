@@ -153,20 +153,23 @@ call — no new endpoint needed.
 
 | `status_name` | Meaning |
 |---|---|
-| `null` | Not connected, or connected but not checked yet (just created, next cron run hasn't happened). Treat like a loading/pending state, not an error. |
+| `null` | Not connected, or connected but for a distributor with no live check built yet (see below). Treat like "unknown," not an error. |
 | `CONNECTED` | Initial sync has completed — live data available. Set once, directly, the moment the first pricing sync job finishes; never re-checked after that. |
 | `INGESTING` | Connectivity confirmed good (or, for relay distributors, the feed file has arrived), but the initial sync hasn't finished processing it yet. |
 | `WAITING` | Relay-provisioned distributor (Meyer, A-Tech) — connectivity to our own relay is fine, but the distributor's feed file hasn't arrived yet. Nothing wrong on the customer's end; `status_reason` says as much. |
 | `FAILING` | Live check failed — bad credentials, or (rarely, for relay distributors) our own relay account is broken. `status_reason` has the detail, same messages as the `error_code` table above for the five validated distributors. |
 
-**How it's kept fresh:** a cron-scheduled command
+**Set immediately on connect/update, then kept fresh by cron.** `connect_provider`/
+`update_connection` compute and save `status` the moment the connection is created or
+patched — for the five validated distributors it's a free byproduct of the validation that
+already ran to accept the request (no extra network call); for Meyer/A-Tech it runs one relay
+check. So the response from the connect button itself already carries a real status, not
+`null` while waiting for the next cron tick. After that, a cron-scheduled command
 (`check_company_provider_connections`, every ~5 minutes) re-checks every connection where
-the initial sync hasn't completed yet — live credential check for Turn 14/Keystone/Wheel
-Pros/Premier/Rough Country, relay file presence check for Meyer/A-Tech. Once a connection
-reaches `CONNECTED` it's no longer touched by this job — if credentials break *after* the
-first successful sync, `status` will not reflect that (a known gap, not yet built).
-Everything outside those seven kinds is left with `status: null` — no live check exists for
-it yet.
+the initial sync hasn't completed yet, the same way. Once a connection reaches `CONNECTED`
+it's no longer touched by this job — if credentials break *after* the first successful sync,
+`status` will not reflect that (a known gap, not yet built). Everything outside those seven
+kinds is left with `status: null` — no live check exists for it yet.
 
 ---
 
