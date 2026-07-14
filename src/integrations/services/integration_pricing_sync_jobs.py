@@ -63,6 +63,11 @@ def enqueue_all_active_company_provider_pricing_jobs() -> int:
     the master pricing layer.  Phase 1 only fetches global catalog data, never per-company
     pricing, so there is nothing to skip here.
 
+    Turn 14 rows are enqueued with ``use_delta_fetch=True``: a full fetch pages through every
+    mapped brand's complete pricing regardless of what changed, which is multi-hour for
+    companies with a large catalog — the recurring cycle only needs what changed since last
+    time. Every other kind is unaffected (use_delta_fetch is a no-op for them).
+
     Idempotent: any existing OPEN job for the same company-provider is removed before
     creating a fresh one (same behaviour as ``enqueue_company_provider_pricing_sync``).
 
@@ -71,11 +76,12 @@ def enqueue_all_active_company_provider_pricing_jobs() -> int:
     qs = (
         src_models.CompanyProviders.objects.select_related("provider")
         .filter(provider__kind__in=list(_PRICING_SYNC_KINDS))
-        .values_list("id", flat=True)
+        .values_list("id", "provider__kind")
     )
     enqueued = 0
-    for cp_id in qs:
-        enqueue_company_provider_pricing_sync(cp_id, skip_raw_fetch=False)
+    for cp_id, kind in qs:
+        use_delta_fetch = kind == src_enums.BrandProviderKind.TURN_14.value
+        enqueue_company_provider_pricing_sync(cp_id, skip_raw_fetch=False, use_delta_fetch=use_delta_fetch)
         enqueued += 1
     logger.info(
         "{} enqueue_all_active_company_provider_pricing_jobs: enqueued {} job(s).".format(
@@ -88,14 +94,19 @@ def enqueue_all_active_company_provider_pricing_jobs() -> int:
 def enqueue_company_provider_pricing_sync(
     company_provider_id: int,
     skip_raw_fetch: bool = False,
+    use_delta_fetch: bool = False,
 ) -> None:
     """
     Queue a pricing sync for this company_provider. Any existing OPEN row for the same
     connection is removed so repeated credential saves always schedule the latest snapshot.
 
     Pass ``skip_raw_fetch=True`` when raw pricing data was already fetched upstream (nightly
-    pipeline).  Leave ``False`` (default) for on-demand new-company onboarding so the full
-    fetch + sync cycle runs.
+    pipeline).  Leave ``False`` (default) for on-demand new-company onboarding/reconnect so the
+    full fetch + sync cycle runs.
+
+    Pass ``use_delta_fetch=True`` (Turn 14 only, currently) for the recurring cycle so the raw
+    fetch only re-pulls brands with recent pricing changes instead of the full catalog. Leave
+    ``False`` (default) for connect/reconnect, where there's no prior state to diff against.
     """
     src_models.IntegrationPricingSyncJob.objects.filter(
         company_provider_id=company_provider_id,
@@ -106,6 +117,7 @@ def enqueue_company_provider_pricing_sync(
         status=src_enums.IntegrationPricingSyncJobStatus.OPEN.value,
         status_name=src_enums.IntegrationPricingSyncJobStatus.OPEN.name,
         skip_raw_fetch=skip_raw_fetch,
+        use_delta_fetch=use_delta_fetch,
     )
     logger.info(
         "{} Enqueued pricing sync job for company_provider_id={} skip_raw_fetch={}.".format(
@@ -114,16 +126,26 @@ def enqueue_company_provider_pricing_sync(
     )
 
 
-def _fetch_raw_pricing(cp: src_models.CompanyProviders) -> None:
+def _fetch_raw_pricing(cp: src_models.CompanyProviders, use_delta_fetch: bool = False) -> None:
     """
     Download raw pricing data from the distributor for this company-provider.
-    Only called when skip_raw_fetch=False (new-company onboarding or manual re-sync).
-    Each provider uses its own API/SFTP/CSV mechanism with company-specific credentials.
+    Only called when skip_raw_fetch=False (new-company onboarding, manual re-sync, or the
+    recurring cycle for kinds without a delta option). Each provider uses its own API/SFTP/CSV
+    mechanism with company-specific credentials.
+
+    use_delta_fetch is currently only honored for Turn 14: a full fetch pages through every
+    mapped brand's complete pricing regardless of what changed (multi-hour for large catalogs);
+    the delta fetch instead asks Turn 14 what changed and only re-fetches those brands. Ignored
+    for every other kind — set it only from the recurring ingest_all_providers path, never from
+    connect/reconnect, which should always get a full fetch (no prior state to diff against).
     """
     kind = cp.provider.kind
 
     if kind == src_enums.BrandProviderKind.TURN_14.value:
-        turn_14_services.fetch_and_save_turn_14_brand_pricing_for_company_provider(cp.id)
+        if use_delta_fetch:
+            turn_14_services.fetch_and_save_turn_14_brand_pricing_delta_for_company_provider(cp.id)
+        else:
+            turn_14_services.fetch_and_save_turn_14_brand_pricing_for_company_provider(cp.id)
 
     elif kind == src_enums.BrandProviderKind.KEYSTONE.value:
         keystone_services.sync_keystone_catalog_and_company_pricing_for_company_provider(cp.id)
@@ -253,11 +275,12 @@ def run_integration_pricing_sync_job(job: src_models.IntegrationPricingSyncJob) 
     try:
         if not job.skip_raw_fetch:
             logger.info(
-                "{} Job id={} company_provider={} provider={}: fetching raw pricing data.".format(
-                    _LOG_PREFIX, job.id, cp.id, cp.provider.kind
+                "{} Job id={} company_provider={} provider={}: fetching raw pricing data "
+                "(use_delta_fetch={}).".format(
+                    _LOG_PREFIX, job.id, cp.id, cp.provider.kind, job.use_delta_fetch
                 )
             )
-            _fetch_raw_pricing(cp)
+            _fetch_raw_pricing(cp, use_delta_fetch=job.use_delta_fetch)
 
         logger.info(
             "{} Job id={} company_provider={} provider={}: syncing master pricing layer "
@@ -286,7 +309,7 @@ def run_integration_pricing_sync_job(job: src_models.IntegrationPricingSyncJob) 
 
     job.status = src_enums.IntegrationPricingSyncJobStatus.COMPLETED.value
     job.status_name = src_enums.IntegrationPricingSyncJobStatus.COMPLETED.name
-    job.message = "OK (skip_raw_fetch={})".format(job.skip_raw_fetch)
+    job.message = "OK (skip_raw_fetch={}, use_delta_fetch={})".format(job.skip_raw_fetch, job.use_delta_fetch)
     job.completed_at = timezone.now()
     job.save(
         update_fields=["status", "status_name", "message", "completed_at", "updated_at"]

@@ -1,7 +1,7 @@
 import logging
 import time
 import typing
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from django.db.models.functions import Upper
 from django.utils import timezone
@@ -1269,6 +1269,139 @@ def fetch_and_save_turn_14_brand_pricing_for_company_provider(company_provider_i
         return
 
     _fetch_and_save_turn_14_brand_pricing_for_company_provider(company_provider, all_brands)
+
+
+def fetch_and_save_turn_14_brand_pricing_delta_for_company_provider(
+    company_provider_id: int, days: int = 1
+) -> None:
+    """
+    Delta version of fetch_and_save_turn_14_brand_pricing_for_company_provider.
+
+    A full sync pages through every one of the ~460 globally-mapped Turn14 brands' complete
+    pricing for this company, regardless of whether anything changed — that's what makes it
+    slow for companies with a large catalog (multi-hour, observed). This instead:
+      1. Calls GET /v1/pricing/changes for this company for the last `days` day(s) to get the
+         set of item codes that actually changed.
+      2. Narrows that down to just the Turn14 brands those items belong to (typically a small
+         subset of the full ~460).
+      3. Reuses the same tested per-brand pagination + upsert logic
+         (_fetch_and_save_turn_14_brand_pricing_for_company_provider), just scoped to that
+         narrower brand list instead of every mapped brand.
+
+    Intended for the recurring ingest_all_providers cycle. Use the full (non-delta) function
+    for the initial connect/reconnect sync, where there's no prior state to diff against.
+    """
+    turn_14_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.TURN_14.value,
+    ).first()
+    if not turn_14_provider:
+        logger.info('{} No Turn 14 provider found.'.format(_LOG_PREFIX))
+        return
+
+    company_provider = (
+        src_models.CompanyProviders.objects.filter(
+            id=company_provider_id,
+            provider_id=turn_14_provider.id,
+            provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
+        )
+        .select_related('company')
+        .first()
+    )
+    if not company_provider:
+        logger.warning(
+            '{} No Turn 14 CompanyProviders id={} (active). Skipping delta fetch.'.format(
+                _LOG_PREFIX, company_provider_id
+            )
+        )
+        return
+
+    try:
+        api_client = turn_14_client.Turn14ApiClient(credentials=company_provider.credentials)
+    except ValueError as e:
+        logger.error('{} Invalid Turn 14 credentials for company: {}. Error: {}. Skipping delta fetch.'.format(
+            _LOG_PREFIX, company_provider.company.name, str(e)
+        ))
+        return
+
+    end_date = timezone.now().date()
+    start_date = end_date - timedelta(days=days)
+    start_str = start_date.strftime('%Y-%m-%d')
+    end_str = end_date.strftime('%Y-%m-%d')
+
+    logger.info('{} Fetching pricing changes company={} from {} to {}.'.format(
+        _LOG_PREFIX, company_provider.company.name, start_str, end_str
+    ))
+
+    item_ids: typing.Set[str] = set()
+    page = 1
+    while page is not None:
+        try:
+            data, next_page = api_client.get_pricing_changes(
+                start_date=start_str,
+                end_date=end_str,
+                page=page,
+            )
+        except turn_14_exceptions.Turn14APIException as e:
+            logger.error('{} Turn 14 pricing changes API error company={} page: {}. Error: {}.'.format(
+                _LOG_PREFIX, company_provider.company.name, page, str(e)
+            ))
+            raise
+
+        for item in data or []:
+            attrs = item.get('attributes', {})
+            item_id = attrs.get('itemcode') or item.get('id')
+            if item_id is not None:
+                item_ids.add(str(item_id))
+
+        logger.info(
+            '{} Pricing changes company={} page={} -> {} item(s) this page, {} unique so far, '
+            'next_page={}.'.format(
+                _LOG_PREFIX, company_provider.company.name, page, len(data or []), len(item_ids), next_page
+            )
+        )
+        page = next_page
+
+    if not item_ids:
+        logger.info('{} No pricing changes company={} for {} to {}. Nothing to sync.'.format(
+            _LOG_PREFIX, company_provider.company.name, start_str, end_str
+        ))
+        return
+
+    logger.info('{} Found {} changed item id(s) company={}.'.format(
+        _LOG_PREFIX, len(item_ids), company_provider.company.name
+    ))
+
+    changed_turn14_brand_ids = set(
+        src_models.Turn14Brand.objects.filter(
+            items__external_id__in=item_ids
+        ).values_list('id', flat=True).distinct()
+    )
+    if not changed_turn14_brand_ids:
+        logger.warning('{} No Turn14Brand found for changed item ids company={}. Skipping sync.'.format(
+            _LOG_PREFIX, company_provider.company.name
+        ))
+        return
+
+    mapped_brand_ids = src_models.BrandTurn14BrandMapping.objects.filter(
+        turn14_brand_id__in=changed_turn14_brand_ids
+    ).values_list('brand_id', flat=True)
+
+    changed_brand_providers = src_models.BrandProviders.objects.filter(
+        provider=turn_14_provider,
+        brand_id__in=mapped_brand_ids,
+    ).select_related('brand')
+    if not changed_brand_providers.exists():
+        logger.warning('{} No mapped brands for changed items company={}. Skipping sync.'.format(
+            _LOG_PREFIX, company_provider.company.name
+        ))
+        return
+
+    logger.info('{} Syncing {} changed brand(s) (of {} mapped) company={}.'.format(
+        _LOG_PREFIX, changed_brand_providers.count(),
+        src_models.BrandProviders.objects.filter(provider=turn_14_provider).count(),
+        company_provider.company.name,
+    ))
+    _fetch_and_save_turn_14_brand_pricing_for_company_provider(company_provider, changed_brand_providers)
 
 
 def fetch_and_save_turn_14_brand_pricing_for_turn14_brands(

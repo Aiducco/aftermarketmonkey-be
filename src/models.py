@@ -1447,11 +1447,18 @@ class IntegrationPricingSyncJob(django_db_models.Model):
     error_message = django_db_models.TextField(null=True, blank=True)
 
     # When True the job skips the raw distributor data fetch (API / SFTP / CSV download)
-    # and only runs the master-parts pricing sync layer.  Set to True by the nightly
-    # ingest_all_providers pipeline which already fetched all raw data in Phase 1.
-    # Leave False (default) for on-demand jobs triggered by new-company onboarding so the
-    # full fetch + sync cycle runs.
+    # and only runs the master-parts pricing sync layer.  Leave False (default) for
+    # on-demand jobs triggered by new-company onboarding/reconnect so the full fetch + sync
+    # cycle runs. NOTE: the nightly ingest_all_providers pipeline does NOT actually set this
+    # True today — per-company pricing is never fetched in Phase 1, so there's nothing to
+    # skip; see use_delta_fetch below for how the recurring cycle avoids a full re-fetch.
     skip_raw_fetch = django_db_models.BooleanField(default=False)
+
+    # When True (currently only meaningful for Turn 14), the raw fetch uses the distributor's
+    # pricing-changes endpoint scoped to the brands with recent changes, instead of paging
+    # through every mapped brand's full pricing. Set by the recurring ingest_all_providers
+    # cycle; left False for the initial connect/reconnect sync, which still wants a full fetch.
+    use_delta_fetch = django_db_models.BooleanField(default=False)
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
