@@ -24,7 +24,12 @@ DEFAULT_FILE_MAX_AGE_SECONDS = 6 * 60 * 60  # 6 hours
 
 # ftp.connect() had no timeout before, so a bad host/firewall could hang the calling thread
 # indefinitely — matters now that test_connection() runs synchronously inside an HTTP request.
-DEFAULT_CONNECT_TIMEOUT_SECONDS = 15
+# This timeout persists on the socket for every subsequent op (login, etc), not just connect —
+# Keystone's server (identifies as FileZilla Server) consistently takes ~11-11.5s to respond to
+# the first command after connecting, measured from production (near-instant from other
+# networks), most likely a slow reverse-DNS lookup of the client IP on their end. 20s gives
+# headroom above that observed ceiling without leaving the timeout effectively unbounded.
+DEFAULT_CONNECT_TIMEOUT_SECONDS = 20
 
 
 class ImplicitFTP_TLS(ftplib.FTP_TLS):
@@ -107,10 +112,16 @@ class KeystoneFTPClient:
             raise exceptions.KeystoneFTPConnectionError(msg)
 
     def _disconnect(self, ftp: typing.Optional[ImplicitFTP_TLS]) -> None:
-        """Close FTP connection."""
+        """
+        Close the FTP connection without the QUIT handshake — ftp.quit() sends "QUIT" and
+        blocks waiting for the server's "221" response, which costs another ~8s on Keystone's
+        server (same slow-first-response pattern as login). ftp.close() just tears down the
+        socket locally; the server will notice the dropped connection on its own. Safe here
+        since any real transfer has already fully completed before we disconnect.
+        """
         try:
             if ftp:
-                ftp.quit()
+                ftp.close()
                 logger.debug("{} Disconnected from FTP server.".format(_LOG_PREFIX))
         except Exception as e:
             logger.warning("{} Error during disconnect: {}.".format(_LOG_PREFIX, str(e)))
