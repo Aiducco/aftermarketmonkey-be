@@ -120,36 +120,49 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
         except turn14_client_exceptions.Turn14APIBadResponseCodeError as e:
             self._handle_error(e)
 
-        attrs = response.get("data", {}).get("attributes", {})
-        by_external_id = {li.provider_part.provider_external_id: li for li in line_items}
+        logger.info("{} Quote response: {}".format(_LOG_PREFIX, repr(response)[:4000]))
 
-        lines: typing.List[base.ShippingQuoteLine] = []
-        for shipment in attrs.get("shipment", []):
-            shipping_block = shipment.get("shipping", {}) or {}
-            ship_option = base.ShipOption(
-                service_level_code=str(shipping_block.get("shipping_code", "")),
-                service_level_name=shipping_block.get("verbose_eta", ""),
-                cost=(
-                    decimal.Decimal(str(shipping_block["cost"]))
-                    if shipping_block.get("cost") is not None
-                    else None
-                ),
-            )
-            for item in shipment.get("items", []):
-                external_id = str(item.get("item_id", ""))
-                li = by_external_id.get(external_id)
-                lines.append(
-                    base.ShippingQuoteLine(
-                        line_item_id=li.line_item_id if li else 0,
-                        provider_external_id=external_id,
-                        quantity_available=item.get("quantity", 0),
-                        warehouse_code=shipment.get("location"),
-                        ship_options=[ship_option],
-                        flags=(
-                            ["backorder"] if shipment.get("type") == "out_of_stock" else []
-                        ),
-                    )
+        try:
+            attrs = response.get("data", {}).get("attributes", {})
+            by_external_id = {li.provider_part.provider_external_id: li for li in line_items}
+
+            lines: typing.List[base.ShippingQuoteLine] = []
+            for shipment in attrs.get("shipment", []):
+                shipping_block = shipment.get("shipping", {}) or {}
+                ship_option = base.ShipOption(
+                    service_level_code=str(shipping_block.get("shipping_code", "")),
+                    service_level_name=shipping_block.get("verbose_eta", ""),
+                    cost=(
+                        decimal.Decimal(str(shipping_block["cost"]))
+                        if shipping_block.get("cost") is not None
+                        else None
+                    ),
                 )
+                for item in shipment.get("items", []):
+                    external_id = str(item.get("item_id", ""))
+                    li = by_external_id.get(external_id)
+                    lines.append(
+                        base.ShippingQuoteLine(
+                            line_item_id=li.line_item_id if li else 0,
+                            provider_external_id=external_id,
+                            quantity_available=item.get("quantity", 0),
+                            warehouse_code=shipment.get("location"),
+                            ship_options=[ship_option],
+                            flags=(
+                                ["backorder"] if shipment.get("type") == "out_of_stock" else []
+                            ),
+                        )
+                    )
+        except (AttributeError, TypeError, KeyError, IndexError) as e:
+            # Response came back 200 (no Turn14APIBadResponseCodeError), but didn't match the
+            # shape we expected to parse — surface the actual payload instead of a bare
+            # AttributeError, so the real shape is visible in PurchaseOrder.error_message
+            # without needing server-log access to diagnose it.
+            raise order_exceptions.OrderValidationError(
+                "Unexpected quote response shape from Turn14 ({}: {}). Raw response: {}".format(
+                    type(e).__name__, e, repr(response)[:2000]
+                )
+            )
 
         return base.ShippingQuoteResult(lines=lines, raw_response=response)
 
@@ -215,25 +228,32 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
     def _parse_order_response(
         response: typing.Dict, line_items: typing.List[base.OrderLineItemRequest]
     ) -> base.DistributorOrderResult:
-        by_external_id = {li.provider_part.provider_external_id: li for li in line_items}
-        order_data = response.get("data", {})
-        order_id = str(order_data.get("id", ""))
-        attrs = order_data.get("attributes", {})
+        try:
+            by_external_id = {li.provider_part.provider_external_id: li for li in line_items}
+            order_data = response.get("data", {})
+            order_id = str(order_data.get("id", ""))
+            attrs = order_data.get("attributes", {})
 
-        placements: typing.List[base.LineItemPlacement] = []
-        for shipment in attrs.get("shipment", []):
-            for item in shipment.get("items", []):
-                external_id = str(item.get("item_id", ""))
-                li = by_external_id.get(external_id)
-                placements.append(
-                    base.LineItemPlacement(
-                        line_item_id=li.line_item_id if li else 0,
-                        distributor_order_number=order_id,
-                        quantity_confirmed=item.get("quantity", 0),
-                        warehouse_code=shipment.get("location"),
-                        status_message=shipment.get("type"),
+            placements: typing.List[base.LineItemPlacement] = []
+            for shipment in attrs.get("shipment", []):
+                for item in shipment.get("items", []):
+                    external_id = str(item.get("item_id", ""))
+                    li = by_external_id.get(external_id)
+                    placements.append(
+                        base.LineItemPlacement(
+                            line_item_id=li.line_item_id if li else 0,
+                            distributor_order_number=order_id,
+                            quantity_confirmed=item.get("quantity", 0),
+                            warehouse_code=shipment.get("location"),
+                            status_message=shipment.get("type"),
+                        )
                     )
+        except (AttributeError, TypeError, KeyError, IndexError) as e:
+            raise order_exceptions.OrderValidationError(
+                "Unexpected order response shape from Turn14 ({}: {}). Raw response: {}".format(
+                    type(e).__name__, e, repr(response)[:2000]
                 )
+            )
 
         return base.DistributorOrderResult(
             distributor_order_numbers=[order_id] if order_id else [],
@@ -247,20 +267,27 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
         except turn14_client_exceptions.Turn14APIBadResponseCodeError as e:
             self._handle_error(e)
 
-        raw_orders = response.get("data", [])
-        if isinstance(raw_orders, dict):
-            raw_orders = [raw_orders]
+        try:
+            raw_orders = response.get("data", [])
+            if isinstance(raw_orders, dict):
+                raw_orders = [raw_orders]
 
-        orders = []
-        for order in raw_orders:
-            attrs = order.get("attributes", {}) or {}
-            orders.append(
-                base.DistributorOrderStatus(
-                    distributor_order_number=str(order.get("id", "")),
-                    status_code=str(attrs.get("status", "")),
-                    tracking_numbers=attrs.get("tracking_numbers", []) or [],
-                    carrier=attrs.get("carrier"),
-                    raw_response=order,
+            orders = []
+            for order in raw_orders:
+                attrs = order.get("attributes", {}) or {}
+                orders.append(
+                    base.DistributorOrderStatus(
+                        distributor_order_number=str(order.get("id", "")),
+                        status_code=str(attrs.get("status", "")),
+                        tracking_numbers=attrs.get("tracking_numbers", []) or [],
+                        carrier=attrs.get("carrier"),
+                        raw_response=order,
+                    )
+                )
+        except (AttributeError, TypeError, KeyError, IndexError) as e:
+            raise order_exceptions.OrderValidationError(
+                "Unexpected order-status response shape from Turn14 ({}: {}). Raw response: {}".format(
+                    type(e).__name__, e, repr(response)[:2000]
                 )
             )
         return base.OrderStatusResult(orders=orders)
