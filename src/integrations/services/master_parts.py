@@ -374,6 +374,33 @@ def _dedupe_provider_part_inventory_for_upsert(
     return out
 
 
+def _dedupe_master_part_fitments_for_upsert(
+    rows: typing.List[src_models.MasterPartFitment],
+    context: str = "",
+) -> typing.List[src_models.MasterPartFitment]:
+    """
+    One row per (master_part_id, year_start, year_end, make, model, submodel, engine, drive_type);
+    last wins. PostgreSQL rejects INSERT .. ON CONFLICT when the same conflict key appears twice
+    in one batch.
+    """
+    by_key: typing.Dict[typing.Tuple, src_models.MasterPartFitment] = {}
+    merged_dup_rows = 0
+    for r in rows:
+        k = (r.master_part_id, r.year_start, r.year_end, r.make, r.model, r.submodel, r.engine, r.drive_type)
+        if k in by_key:
+            merged_dup_rows += 1
+        by_key[k] = r
+    out = list(by_key.values())
+    if merged_dup_rows:
+        ctx = " {}".format(context) if context else ""
+        logger.info(
+            "{} Upsert dedupe MasterPartFitment{}: input_rows={} unique_keys={} merged_duplicate_rows={}".format(
+                _LOG_PREFIX, ctx, len(rows), len(out), merged_dup_rows
+            )
+        )
+    return out
+
+
 def _dedupe_provider_part_company_pricing_for_upsert(
     rows: typing.List[src_models.ProviderPartCompanyPricing],
     context: str = "",
@@ -2084,6 +2111,111 @@ def sync_provider_inventory_from_rough_country() -> None:
 
     total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "rough_country_brand", _worker)
     logger.info("{} Synced {} Rough Country inventory records total.".format(_LOG_PREFIX, total_upserted))
+
+
+def sync_master_part_fitments_from_rough_country() -> None:
+    """
+    Sync MasterPartFitment from RoughCountryFitment (Vehicle Fitment tab feed), joined via
+    ProviderPart.provider_external_id - same rc_brand_id+sku composite key used by inventory and
+    pricing above. Same cursor-batched, parallel-by-brand-partition pattern as
+    sync_provider_inventory_from_rough_country.
+
+    RoughCountryFitment has no engine field, so MasterPartFitment.engine is always left at its
+    default ("") for rows synced from this source.
+    """
+    logger.info("{} Syncing master part fitments from Rough Country.".format(_LOG_PREFIX))
+
+    rc_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.ROUGH_COUNTRY.value,
+    ).first()
+    if not rc_provider:
+        logger.info("{} No Rough Country provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandRoughCountryBrandMapping.objects.select_related("brand", "rough_country_brand")
+    )
+    if not mappings:
+        logger.info("{} No BrandRoughCountryBrandMapping found.".format(_LOG_PREFIX))
+        return
+
+    master_part_id_by_ext_id = {
+        row["provider_external_id"]: row["master_part_id"]
+        for row in src_models.ProviderPart.objects.filter(provider=rc_provider).values(
+            "provider_external_id", "master_part_id"
+        )
+    }
+
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            batch = list(
+                src_models.RoughCountryFitment.objects.filter(id__gt=last_id, part__brand_id__in=catalog_ids)
+                .order_by("id")
+                .values(
+                    "id", "part__brand_id", "part__sku",
+                    "start_year", "end_year", "make", "model", "submodel", "drive",
+                )[:BATCH_SIZE_INVENTORY]
+            )
+            if not batch:
+                break
+
+            last_id = batch[-1]["id"]
+            to_upsert = []
+            for row in batch:
+                ext_id = _rough_country_provider_external_id(row["part__brand_id"], row["part__sku"])
+                master_part_id = master_part_id_by_ext_id.get(ext_id)
+                if not master_part_id:
+                    continue
+                if row["start_year"] is None or row["end_year"] is None:
+                    continue
+                make = (row["make"] or "").strip()
+                model = (row["model"] or "").strip()
+                if not make or not model:
+                    continue
+                to_upsert.append(
+                    src_models.MasterPartFitment(
+                        master_part_id=master_part_id,
+                        year_start=row["start_year"],
+                        year_end=row["end_year"],
+                        make=make,
+                        model=model,
+                        submodel=(row["submodel"] or "").strip(),
+                        drive_type=(row["drive"] or "").strip(),
+                        source_provider=rc_provider,
+                    )
+                )
+
+            if to_upsert:
+                to_upsert = _dedupe_master_part_fitments_for_upsert(
+                    to_upsert, context="Rough Country fitment batch={}".format(batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.MasterPartFitment,
+                    to_upsert,
+                    unique_fields=[
+                        "master_part", "year_start", "year_end", "make", "model",
+                        "submodel", "engine", "drive_type",
+                    ],
+                    update_fields=["source_provider"],
+                )
+                total_upserted += len(to_upsert)
+
+            logger.info("{} Rough Country fitment batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_INVENTORY:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "rough_country_brand", _worker)
+    logger.info("{} Synced {} Rough Country master part fitment records total.".format(_LOG_PREFIX, total_upserted))
 
 
 def sync_provider_inventory_from_dlg() -> None:
@@ -5511,10 +5643,10 @@ def sync_derived_from_keystone(*, reindex_meilisearch: bool = False, skip_master
 def sync_derived_from_rough_country(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False, skip_pricing: bool = False) -> None:
     """
     Propagate Rough Country source data into MasterPart, ProviderPart, ProviderPartInventory,
-    and ProviderPartCompanyPricing. Call after Rough Country feed ingest.
+    MasterPartFitment, and ProviderPartCompanyPricing. Call after Rough Country feed ingest.
 
-    Pass ``skip_master_parts=True`` to run only inventory + pricing (fast incremental path).
-    Pass ``skip_pricing=True`` to run only master parts + inventory (global catalog sync path).
+    Pass ``skip_master_parts=True`` to run only inventory + fitment + pricing (fast incremental path).
+    Pass ``skip_pricing=True`` to run only master parts + inventory + fitment (global catalog sync path).
     """
     logger.info("{} Starting Rough Country-only derived sync ({}).".format(
         _LOG_PREFIX,
@@ -5526,6 +5658,8 @@ def sync_derived_from_rough_country(*, reindex_meilisearch: bool = False, skip_m
 
     def _cont() -> None:
         sync_provider_inventory_from_rough_country()
+        connection.close()
+        sync_master_part_fitments_from_rough_country()
         connection.close()
         if not skip_pricing:
             sync_provider_pricing_from_rough_country()
