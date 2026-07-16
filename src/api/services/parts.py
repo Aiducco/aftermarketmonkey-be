@@ -242,7 +242,7 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
     """
     try:
         part = (
-            src_models.MasterPart.objects.select_related("brand", "data", "data__source_provider")
+            src_models.MasterPart.objects.select_related("brand", "data")
             .prefetch_related(
                 Prefetch(
                     "fitments",
@@ -298,10 +298,6 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
                 "field_specs": part_data.field_specs,
                 "youtube_video": part_data.youtube_video,
                 "installation_instructions": part_data.installation_instructions,
-                "source_provider_kind": (
-                    part_data.source_provider.kind_name if part_data.source_provider_id else None
-                ),
-                "source_external_id": part_data.source_external_id,
             }
             if part_data is not None
             else {}
