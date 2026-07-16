@@ -128,29 +128,32 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
 
             lines: typing.List[base.ShippingQuoteLine] = []
             for shipment in attrs.get("shipment", []):
-                shipping_block = shipment.get("shipping", {}) or {}
-                ship_option = base.ShipOption(
-                    service_level_code=str(shipping_block.get("shipping_code", "")),
-                    service_level_name=shipping_block.get("verbose_eta", ""),
-                    cost=(
-                        decimal.Decimal(str(shipping_block["cost"]))
-                        if shipping_block.get("cost") is not None
-                        else None
-                    ),
-                )
+                # Contrary to the docs' single-object example, an unfiltered quote actually
+                # returns a LIST of priced shipping options per shipment here (confirmed
+                # against a live response) — this is what lets the FE offer a real picker
+                # with live prices from one quote call, no re-quoting needed.
+                ship_options = [
+                    base.ShipOption(
+                        service_level_code=str(opt.get("shipping_code", "")),
+                        service_level_name=opt.get("verbose_eta") or "",
+                        cost=(decimal.Decimal(str(opt["cost"])) if opt.get("cost") is not None else None),
+                    )
+                    for opt in (shipment.get("shipping") or [])
+                ]
+                is_out_of_stock = shipment.get("type") == "out_of_stock"
                 for item in shipment.get("items", []):
                     external_id = str(item.get("item_id", ""))
                     li = by_external_id.get(external_id)
+                    quantity = item.get("quantity", 0)
                     lines.append(
                         base.ShippingQuoteLine(
                             line_item_id=li.line_item_id if li else 0,
                             provider_external_id=external_id,
-                            quantity_available=item.get("quantity", 0),
+                            quantity_available=0 if is_out_of_stock else quantity,
+                            quantity_backordered=quantity if is_out_of_stock else 0,
                             warehouse_code=shipment.get("location"),
-                            ship_options=[ship_option],
-                            flags=(
-                                ["backorder"] if shipment.get("type") == "out_of_stock" else []
-                            ),
+                            ship_options=ship_options,
+                            flags=(["backorder"] if is_out_of_stock else []),
                         )
                     )
         except (AttributeError, TypeError, KeyError, IndexError) as e:
@@ -177,7 +180,7 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
 
         try:
             if quote_id:
-                shipping_ids = self._extract_shipping_quote_ids(quote_raw)
+                shipping_ids = self._extract_shipping_quote_ids(quote_raw, ship_method=purchase_order.ship_method)
                 response = self._client.promote_quote_to_order(
                     {
                         "environment": self._client.environment,
@@ -208,12 +211,31 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
         return self._parse_order_response(response, line_items)
 
     @staticmethod
-    def _extract_shipping_quote_ids(quote_raw: typing.Dict) -> typing.List[typing.Dict]:
+    def _extract_shipping_quote_ids(
+        quote_raw: typing.Dict, ship_method: typing.Optional[str] = None
+    ) -> typing.List[typing.Dict]:
+        """
+        Each shipment in the quote carries a LIST of priced options (see get_shipping_quote) —
+        exactly one must be picked per shipment to promote to an order. Picks the option whose
+        shipping_code matches ``ship_method`` (the user's choice from
+        GET .../shipping-methods/) when given; otherwise defaults to the cheapest, matching
+        Turn 14's own recommendation ("we recommend you not [pre-select] ... to ensure you're
+        always selecting the best possible option").
+        """
         attrs = quote_raw.get("data", {}).get("attributes", {})
         shipping_ids = []
         for shipment in attrs.get("shipment", []):
-            shipping_block = shipment.get("shipping", {}) or {}
-            quote_id = shipping_block.get("shipping_quote_id")
+            options = shipment.get("shipping") or []
+            if not options:
+                continue
+            chosen = None
+            if ship_method is not None:
+                chosen = next(
+                    (o for o in options if str(o.get("shipping_code")) == str(ship_method)), None
+                )
+            if chosen is None:
+                chosen = min(options, key=lambda o: o.get("cost", float("inf")))
+            quote_id = chosen.get("shipping_quote_id")
             if quote_id is not None:
                 shipping_ids.append(
                     {
