@@ -6,11 +6,14 @@ quote/submit/status/cancel operation is enqueued as a PurchaseOrderJob and proce
 ``process_purchase_order_jobs`` management command; see
 ``src.integrations.services.purchase_order_jobs``.
 """
+import datetime
 import decimal
 import logging
 import typing
 
+from django.conf import settings
 from django.db import IntegrityError, transaction
+from django.utils import timezone as django_timezone
 
 from src import enums as src_enums
 from src import models as src_models
@@ -103,6 +106,9 @@ def _serialize_purchase_order(po: src_models.PurchaseOrder, include_line_items: 
         "error_message": po.error_message,
         "notes": po.notes,
         "quoted_at": po.quoted_at.isoformat() if po.quoted_at else None,
+        "quote_is_stale": (
+            _quote_is_stale(po) if po.status == src_enums.PurchaseOrderStatus.QUOTED.value else None
+        ),
         "submitted_at": po.submitted_at.isoformat() if po.submitted_at else None,
         "created_at": po.created_at.isoformat(),
         "updated_at": po.updated_at.isoformat(),
@@ -267,10 +273,20 @@ def review_cart(
     ship_to: typing.Dict,
     purchase_order_ids: typing.Optional[typing.List[int]] = None,
     group_reference: typing.Optional[str] = None,
+    ship_methods: typing.Optional[typing.Dict[str, str]] = None,
 ) -> typing.Dict:
+    """
+    ``ship_methods``: optional {purchase_order_id (as string): shipping_method_code}. Method
+    codes are distributor-specific (see GET .../shipping-methods/?company_provider_id=), so
+    this is keyed per-PO rather than a single value on ``ship_to`` — a cross-distributor
+    checkout can legitimately want UPS Ground from one distributor and a different carrier's
+    equivalent from another. Omit a PO's entry (or the whole map) to use that distributor's
+    own default/cheapest pick.
+    """
     missing = [f for f in _REQUIRED_SHIP_TO_FIELDS if not ship_to.get(f)]
     if missing:
         raise PurchaseOrderServiceError("Missing required ship-to field(s): {}.".format(", ".join(missing)))
+    ship_methods = ship_methods or {}
 
     qs = src_models.PurchaseOrder.objects.filter(
         company_id=company_id, status=src_enums.PurchaseOrderStatus.DRAFT.value
@@ -298,7 +314,7 @@ def review_cart(
         po.ship_to_postal_code = ship_to["postal_code"]
         po.ship_to_country = ship_to["country"]
         po.ship_to_phone = ship_to.get("phone")
-        po.ship_method = ship_to.get("ship_method")
+        po.ship_method = ship_methods.get(str(po.id))
         po.save(
             update_fields=[
                 "group",
@@ -375,6 +391,13 @@ def get_purchase_order_group_detail(company_id: int, group_id: int) -> typing.Di
 # -- Submit / cancel / status -----------------------------------------------------------------
 
 
+def _quote_is_stale(po: src_models.PurchaseOrder) -> bool:
+    if not po.quoted_at:
+        return True
+    ttl = datetime.timedelta(minutes=settings.PURCHASE_ORDER_QUOTE_TTL_MINUTES)
+    return django_timezone.now() - po.quoted_at > ttl
+
+
 def submit_purchase_order(company_id: int, purchase_order_id: int) -> typing.Dict:
     po = src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id).first()
     if not po:
@@ -385,10 +408,39 @@ def submit_purchase_order(company_id: int, purchase_order_id: int) -> typing.Dic
                 po.status_name
             )
         )
+    if _quote_is_stale(po):
+        raise PurchaseOrderServiceError(
+            "This quote is more than {} minute(s) old and may no longer reflect current "
+            "price/availability. Re-quote before submitting.".format(
+                settings.PURCHASE_ORDER_QUOTE_TTL_MINUTES
+            )
+        )
     po.status = src_enums.PurchaseOrderStatus.SUBMITTING.value
     po.status_name = src_enums.PurchaseOrderStatus.SUBMITTING.name
     po.save(update_fields=["status", "status_name", "updated_at"])
     job = purchase_order_jobs.enqueue_submit_job(po.id)
+    return {"purchase_order_id": po.id, "job_id": job.id}
+
+
+def requote_purchase_order(company_id: int, purchase_order_id: int) -> typing.Dict:
+    """Re-runs the quote for an already-reviewed PO (stale QUOTED, or a FAILED quote attempt)
+    without rebuilding the cart — reuses the ship-to/ship-method already stored on it."""
+    po = src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id).first()
+    if not po:
+        raise PurchaseOrderServiceError("Purchase order not found.")
+    requotable = {
+        src_enums.PurchaseOrderStatus.QUOTED.value,
+        src_enums.PurchaseOrderStatus.FAILED.value,
+    }
+    if po.status not in requotable:
+        raise PurchaseOrderServiceError(
+            "Purchase order can only be re-quoted from QUOTED or FAILED (current status: {}).".format(
+                po.status_name
+            )
+        )
+    if not po.ship_to_address1:
+        raise PurchaseOrderServiceError("Purchase order has no ship-to address on file yet — review the cart first.")
+    job = purchase_order_jobs.enqueue_quote_job(po.id)
     return {"purchase_order_id": po.id, "job_id": job.id}
 
 
@@ -456,13 +508,38 @@ def get_order_capabilities(company_id: int) -> typing.List[typing.Dict]:
     company_providers = src_models.CompanyProviders.objects.filter(
         company_id=company_id, active=True
     ).select_related("provider")
+    results = []
+    for cp in company_providers:
+        can_order = order_registry.supports_ordering(cp.provider.kind)
+        supports_shipping_selection = False
+        if can_order:
+            adapter = order_registry.get_adapter(cp)
+            supports_shipping_selection = bool(adapter and adapter.supports_shipping_method_selection())
+        results.append(
+            {
+                "company_provider_id": cp.id,
+                "provider_id": cp.provider_id,
+                "provider_kind_name": cp.provider.kind_name,
+                "provider_name": cp.provider.name,
+                "can_order_in_app": can_order,
+                "supports_shipping_method_selection": supports_shipping_selection,
+            }
+        )
+    return results
+
+
+def get_shipping_methods(company_id: int, company_provider_id: int) -> typing.List[typing.Dict]:
+    cp = (
+        src_models.CompanyProviders.objects.filter(id=company_provider_id, company_id=company_id)
+        .select_related("provider")
+        .first()
+    )
+    if not cp:
+        raise PurchaseOrderServiceError("Distributor connection not found for this company.")
+    adapter = order_registry.get_adapter(cp)
+    if not adapter or not adapter.supports_shipping_method_selection():
+        raise PurchaseOrderServiceError("{} does not support choosing a shipping method.".format(cp.provider.name))
     return [
-        {
-            "company_provider_id": cp.id,
-            "provider_id": cp.provider_id,
-            "provider_kind_name": cp.provider.kind_name,
-            "provider_name": cp.provider.name,
-            "can_order_in_app": order_registry.supports_ordering(cp.provider.kind),
-        }
-        for cp in company_providers
+        {"code": m.code, "name": m.name, "carrier_name": m.carrier_name}
+        for m in adapter.list_shipping_methods()
     ]

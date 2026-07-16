@@ -59,10 +59,12 @@ from src.api.views.purchase_orders import (
     PurchaseOrderSubmitView,
     PurchaseOrderCancelView,
     PurchaseOrderRefreshStatusView,
+    PurchaseOrderRequoteView,
     PurchaseOrderJobView,
     PurchaseOrderGroupDetailView,
     PurchaseOrderGroupSubmitView,
     PurchaseOrderCapabilitiesView,
+    ShippingMethodsView,
 )
 
 urlpatterns = [
@@ -237,6 +239,11 @@ urlpatterns = [
         name="purchase_orders_capabilities",
     ),
     path(
+        "purchase-orders/shipping-methods/",
+        ShippingMethodsView.as_view(),
+        name="purchase_orders_shipping_methods",
+    ),
+    path(
         "purchase-orders/groups/<int:id>/",
         PurchaseOrderGroupDetailView.as_view(),
         name="purchase_order_group_detail",
@@ -265,6 +272,11 @@ urlpatterns = [
         "purchase-orders/<int:id>/refresh-status/",
         PurchaseOrderRefreshStatusView.as_view(),
         name="purchase_order_refresh_status",
+    ),
+    path(
+        "purchase-orders/<int:id>/requote/",
+        PurchaseOrderRequoteView.as_view(),
+        name="purchase_order_requote",
     ),
     path(
         "purchase-orders/<int:id>/",

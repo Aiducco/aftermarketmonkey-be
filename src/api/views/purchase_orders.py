@@ -144,8 +144,11 @@ class CartItemDetailView(views.View):
 
 
 class CartReviewView(views.View):
-    """POST /purchase-orders/cart/review/ — {ship_to: {...}, purchase_order_ids?: [...], reference?}
-    Groups the current DRAFT carts into a PurchaseOrderGroup and enqueues a QUOTE job for each."""
+    """POST /purchase-orders/cart/review/ — {ship_to: {...}, purchase_order_ids?: [...],
+    reference?, ship_methods?: {"<purchase_order_id>": "<method_code>"}}.
+    Groups the current DRAFT carts into a PurchaseOrderGroup and enqueues a QUOTE job for
+    each. ship_methods is per-PO (not per-request) since method codes are distributor-specific
+    — see GET .../shipping-methods/?company_provider_id="""
 
     def post(self, request: http.HttpRequest, *args, **kwargs) -> http.HttpResponse:
         company_id, user_id, err = _require_auth(request)
@@ -162,6 +165,7 @@ class CartReviewView(views.View):
                 ship_to=body.get("ship_to") or {},
                 purchase_order_ids=body.get("purchase_order_ids"),
                 group_reference=body.get("reference"),
+                ship_methods=body.get("ship_methods"),
             )
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e))
@@ -277,6 +281,27 @@ class PurchaseOrderRefreshStatusView(views.View):
         return _json_response(result, status=202)
 
 
+class PurchaseOrderRequoteView(views.View):
+    """POST /purchase-orders/<id>/requote/ — re-run the quote (e.g. after quote_is_stale is
+    true) without rebuilding the cart. Reuses the ship-to/ship-method already on the PO."""
+
+    def post(self, request: http.HttpRequest, *args, **kwargs) -> http.HttpResponse:
+        company_id, _user_id, err = _require_auth(request)
+        if err:
+            return err
+
+        po_id = kwargs.get("id")
+        try:
+            result = purchase_orders_services.requote_purchase_order(company_id=company_id, purchase_order_id=po_id)
+        except purchase_orders_services.PurchaseOrderServiceError as e:
+            return _error_response(str(e))
+        except Exception:
+            logger.exception("{} Error re-quoting purchase order id={}".format(_LOG_PREFIX, po_id))
+            return _error_response("Error re-quoting purchase order", status=500)
+
+        return _json_response(result, status=202)
+
+
 class PurchaseOrderJobView(views.View):
     """GET /purchase-orders/<id>/jobs/<job_id>/ — poll job status."""
 
@@ -353,5 +378,36 @@ class PurchaseOrderCapabilitiesView(views.View):
         except Exception:
             logger.exception("{} Error fetching order capabilities for company_id={}".format(_LOG_PREFIX, company_id))
             return _error_response("Error fetching order capabilities", status=500)
+
+        return _json_response(result)
+
+
+class ShippingMethodsView(views.View):
+    """GET /purchase-orders/shipping-methods/?company_provider_id= — catalog of selectable
+    shipping method names for this distributor connection (not priced — see the plan notes
+    on get_shipping_quote's ship_method param)."""
+
+    def get(self, request: http.HttpRequest, *args, **kwargs) -> http.HttpResponse:
+        company_id, _user_id, err = _require_auth(request)
+        if err:
+            return err
+
+        company_provider_id = request.GET.get("company_provider_id")
+        if not company_provider_id:
+            return _error_response("company_provider_id query param is required")
+
+        try:
+            result = purchase_orders_services.get_shipping_methods(
+                company_id=company_id, company_provider_id=int(company_provider_id)
+            )
+        except purchase_orders_services.PurchaseOrderServiceError as e:
+            return _error_response(str(e))
+        except Exception:
+            logger.exception(
+                "{} Error fetching shipping methods for company_provider_id={}".format(
+                    _LOG_PREFIX, company_provider_id
+                )
+            )
+            return _error_response("Error fetching shipping methods", status=500)
 
         return _json_response(result)

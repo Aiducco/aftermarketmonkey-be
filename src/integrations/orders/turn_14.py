@@ -104,10 +104,15 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
         self,
         line_items: typing.List[base.OrderLineItemRequest],
         ship_to: base.ShipToAddress,
+        ship_method: typing.Optional[str] = None,
     ) -> base.ShippingQuoteResult:
+        # Per Turn 14's docs: on a "default" location quote, providing a shipping_code
+        # doesn't select it outright — it filters the computed rate to that carrier only
+        # (e.g. shipping_code=3 -> only UPS rates considered). There is no single call that
+        # returns multiple priced options; comparing methods means re-quoting per method.
         data = {
             "environment": self._client.environment,
-            "locations": self._build_locations(line_items),
+            "locations": self._build_locations(line_items, shipping_code=ship_method),
             "recipient": self._build_recipient(ship_to),
         }
         try:
@@ -267,3 +272,24 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
 
     def supports_cancel(self) -> bool:
         return False
+
+    def supports_shipping_method_selection(self) -> bool:
+        return True
+
+    def list_shipping_methods(self) -> typing.List[base.ShippingMethod]:
+        try:
+            response = self._client.get_shipping_options()
+        except turn14_client_exceptions.Turn14APIBadResponseCodeError as e:
+            self._handle_error(e)
+
+        methods = []
+        for row in response.get("data", []):
+            attrs = row.get("attributes", {}) or {}
+            methods.append(
+                base.ShippingMethod(
+                    code=str(row.get("id", "")),
+                    name=attrs.get("transportation_name", ""),
+                    carrier_name=attrs.get("carrier_name"),
+                )
+            )
+        return methods

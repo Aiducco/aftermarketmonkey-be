@@ -110,6 +110,18 @@ class OrderStatusResult:
     orders: typing.List[DistributorOrderStatus]
 
 
+@dataclasses.dataclass
+class ShippingMethod:
+    """One entry in a distributor's catalog of selectable shipping methods (e.g. from
+    Turn14's GET /v1/shipping). This is a name/carrier catalog, not a priced quote — most
+    distributor APIs (Turn14 included) only compute an actual price for ONE method per
+    quote call, so picking a method here is "filter the next quote to this carrier," not
+    "compare live prices across methods in one call"."""
+    code: str
+    name: str
+    carrier_name: typing.Optional[str] = None
+
+
 class DistributorOrderAdapter(abc.ABC):
     """
     One instance per CompanyProviders connection (holds that connection's credentials).
@@ -126,8 +138,17 @@ class DistributorOrderAdapter(abc.ABC):
         self,
         line_items: typing.List[OrderLineItemRequest],
         ship_to: ShipToAddress,
+        ship_method: typing.Optional[str] = None,
     ) -> ShippingQuoteResult:
-        """Non-committal availability/pricing/shipping lookup. Safe to call repeatedly."""
+        """
+        Non-committal availability/pricing/shipping lookup. Safe to call repeatedly.
+
+        ``ship_method``, when given, is a code from list_shipping_methods() — implementations
+        should use it to FILTER the quote to that carrier/method (some distributors, Turn14
+        included, only compute a price for one method per call; there is no live
+        cross-method comparison within a single quote). Leave None to get the distributor's
+        own default/cheapest pick.
+        """
         raise NotImplementedError
 
     @abc.abstractmethod
@@ -163,3 +184,17 @@ class DistributorOrderAdapter(abc.ABC):
     def supports_cancel(self) -> bool:
         """Override to return False for distributors with no cancel endpoint at all."""
         return True
+
+    def supports_shipping_method_selection(self) -> bool:
+        """Override to return True for distributors whose adapter implements
+        list_shipping_methods(). False by default — the UI should hide the picker and rely
+        on the distributor's own default/cheapest pick."""
+        return False
+
+    def list_shipping_methods(self) -> typing.List[ShippingMethod]:
+        """
+        Catalog of selectable shipping method codes/names for this connection. Only called
+        when supports_shipping_method_selection() is True. Not priced — see
+        get_shipping_quote's ``ship_method`` param for how a selection actually affects cost.
+        """
+        raise NotImplementedError

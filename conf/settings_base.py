@@ -214,6 +214,11 @@ TURN14_ORDER_TEST_BASE_URL = 'https://apitest.turn14.com/v1'
 TURN14_ORDER_PRODUCTION_BASE_URL = 'https://api.turn14.com/v1'
 TURN14_ORDER_ENVIRONMENT = os.environ.get("TURN14_ORDER_ENVIRONMENT", "testing")
 
+# How long a PurchaseOrder's quote stays valid before submit is blocked and a re-quote is
+# required. Distributor pricing/availability can shift between quote and submit; this stops
+# a stale quote from being submitted against materially different real-world stock/pricing.
+PURCHASE_ORDER_QUOTE_TTL_MINUTES = int(os.environ.get("PURCHASE_ORDER_QUOTE_TTL_MINUTES", "15"))
+
 # Keystone FTP (implicit FTPS, port 990)
 KEYSTONE_FTP_HOST = 'ftp.ekeystone.com'
 KEYSTONE_FTP_PORT = 990

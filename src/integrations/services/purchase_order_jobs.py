@@ -166,7 +166,7 @@ def _run_quote(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrde
 
     started = time.monotonic()
     try:
-        result = adapter.get_shipping_quote(line_items, ship_to)
+        result = adapter.get_shipping_quote(line_items, ship_to, ship_method=po.ship_method)
     except order_exceptions.OrderAdapterError as e:
         _record_attempt(po, src_enums.PurchaseOrderOperation.QUOTE, False, error_message=str(e))
         raise
