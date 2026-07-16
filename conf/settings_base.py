@@ -373,6 +373,14 @@ DLG_SFTP_DIRECTORY = os.environ.get("DLG_SFTP_DIRECTORY") or "uploads"
 DLG_INVENTORY_REMOTE_FILE = os.environ.get("DLG_INVENTORY_REMOTE_FILE") or "dlg_inventory.csv"
 DLG_INVENTORY_LOCAL_PATH = os.environ.get("DLG_INVENTORY_LOCAL_PATH", "/tmp/dlg_inventory.csv")
 
+# ASAP Network: paid catalog API, global token (not per-company — see CompanyProviders docstring
+# for why this isn't stored there). No documented rate limit; keep concurrency modest by default.
+ASAP_NETWORK_API_TOKEN = os.environ.get("ASAP_NETWORK_API_TOKEN", "")
+try:
+    ASAP_NETWORK_MAX_CONCURRENT_REQUESTS = int(os.environ.get("ASAP_NETWORK_MAX_CONCURRENT_REQUESTS", "8"))
+except ValueError:
+    ASAP_NETWORK_MAX_CONCURRENT_REQUESTS = 8
+
 # Meilisearch (backend: master key for indexing; FE will use a public read-only key)
 MEILISEARCH_HOST = "http://localhost:7700"
 MEILISEARCH_MASTER_KEY = ""  # Set via env; required for indexing. Create a separate search-only key for FE.

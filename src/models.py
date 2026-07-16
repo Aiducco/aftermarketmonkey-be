@@ -1414,6 +1414,89 @@ class ProviderPartCompanyPricing(django_db_models.Model):
         unique_together = [["provider_part", "company"]]
 
 
+class AsapBrand(django_db_models.Model):
+    """
+    Raw ASAP Network brand catalog (GET /webapi/brands). ``brand`` is resolved directly on this
+    row (no separate ``Brand<X>BrandMapping`` join table) since ASAP is an enrichment-only data
+    catalog, not a distributor a company connects to.
+    """
+    external_id = django_db_models.CharField(max_length=64, unique=True)
+    term_name = django_db_models.CharField(max_length=255)
+    name = django_db_models.CharField(max_length=255)
+    brand = django_db_models.ForeignKey(
+        Brands, on_delete=django_db_models.SET_NULL, null=True, blank=True, related_name="asap_brands"
+    )
+    last_synced_at = django_db_models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Set once a full product sync for this brand completes; skipped on future runs unless --force (ASAP is a paid API).",
+    )
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "asap_brands"
+
+
+class MasterPartData(django_db_models.Model):
+    """
+    Source-agnostic enrichment data for a MasterPart (images, description, specs, etc.),
+    populated by catalog sources such as ASAP Network. Fields are filled-in only when currently
+    blank, so different sources can enrich different brands (or different fields of the same
+    part) without clobbering each other.
+    """
+    master_part = django_db_models.OneToOneField(MasterPart, on_delete=django_db_models.CASCADE, related_name="data")
+    images = django_db_models.JSONField(null=True, blank=True)
+    description = django_db_models.TextField(null=True, blank=True)
+    color = django_db_models.CharField(max_length=255, null=True, blank=True)
+    material = django_db_models.CharField(max_length=255, null=True, blank=True)
+    series = django_db_models.CharField(max_length=255, null=True, blank=True)
+    warranty = django_db_models.CharField(max_length=255, null=True, blank=True)
+    vehicle_type = django_db_models.JSONField(null=True, blank=True)
+    field_specs = django_db_models.JSONField(null=True, blank=True)
+    youtube_video = django_db_models.CharField(max_length=500, null=True, blank=True)
+    installation_instructions = django_db_models.JSONField(null=True, blank=True)
+    source_provider = django_db_models.ForeignKey(
+        Providers, on_delete=django_db_models.SET_NULL, null=True, blank=True, related_name="master_part_data"
+    )
+    source_external_id = django_db_models.CharField(max_length=255, null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "master_part_data"
+
+
+class MasterPartFitment(django_db_models.Model):
+    """
+    Canonical vehicle fitment for a MasterPart. Year ranges are stored as-is (not exploded into
+    per-year rows) since Postgres isn't the query layer for YMM search; per-year expansion only
+    happens when building Meilisearch documents.
+    """
+    master_part = django_db_models.ForeignKey(MasterPart, on_delete=django_db_models.CASCADE, related_name="fitments")
+    year_start = django_db_models.IntegerField()
+    year_end = django_db_models.IntegerField()
+    make = django_db_models.CharField(max_length=128)
+    model = django_db_models.CharField(max_length=128)
+    # blank=True, default="" (not null=True): Postgres treats each NULL as distinct for
+    # uniqueness, which would break pgbulk.upsert dedup on unique_together below.
+    submodel = django_db_models.CharField(max_length=255, blank=True, default="")
+    engine = django_db_models.CharField(max_length=255, blank=True, default="")
+    drive_type = django_db_models.CharField(max_length=64, blank=True, default="")
+    source_provider = django_db_models.ForeignKey(
+        Providers, on_delete=django_db_models.SET_NULL, null=True, blank=True, related_name="fitments"
+    )
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "master_part_fitments"
+        unique_together = [["master_part", "year_start", "year_end", "make", "model", "submodel", "engine", "drive_type"]]
+
+
 class CategoryMapping(django_db_models.Model):
     """
     Map a distributor or feed ``source_category`` string to normalized ``category`` and ``overview_category``.
