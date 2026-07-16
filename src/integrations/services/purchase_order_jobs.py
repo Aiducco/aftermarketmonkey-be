@@ -64,15 +64,23 @@ def _enqueue(
     return job
 
 
-def claim_next_open_job() -> typing.Optional[src_models.PurchaseOrderJob]:
-    """Atomically mark one OPEN job as RUNNING. Returns None if none available."""
+def claim_next_open_job(
+    allowed_operations: typing.Optional[typing.List[int]] = None,
+) -> typing.Optional[src_models.PurchaseOrderJob]:
+    """
+    Atomically mark one OPEN job as RUNNING. Returns None if none available.
+
+    ``allowed_operations``, when given, restricts which PurchaseOrderOperation values this
+    claim will pick up — e.g. cron only ever claims QUOTE/STATUS_CHECK (non-mutating, safe to
+    automate); SUBMIT/CANCEL are left OPEN for a human to process on demand while watching.
+    """
     with transaction.atomic():
-        job = (
-            src_models.PurchaseOrderJob.objects.select_for_update(skip_locked=True)
-            .filter(status=src_enums.PurchaseOrderJobStatus.OPEN.value)
-            .order_by("id")
-            .first()
+        qs = src_models.PurchaseOrderJob.objects.select_for_update(skip_locked=True).filter(
+            status=src_enums.PurchaseOrderJobStatus.OPEN.value
         )
+        if allowed_operations is not None:
+            qs = qs.filter(operation__in=allowed_operations)
+        job = qs.order_by("id").first()
         if not job:
             return None
         job.status = src_enums.PurchaseOrderJobStatus.RUNNING.value
@@ -381,16 +389,25 @@ def run_purchase_order_job(job: src_models.PurchaseOrderJob) -> None:
     job.save(update_fields=["status", "status_name", "message", "completed_at", "updated_at"])
 
 
-def process_purchase_order_jobs(limit: int = 10, workers: int = 1) -> int:
+def process_purchase_order_jobs(
+    limit: int = 10,
+    workers: int = 1,
+    allowed_operations: typing.Optional[typing.List[int]] = None,
+) -> int:
     """
     Claim and run up to ``limit`` OPEN PurchaseOrderJob rows. Mirrors
     integration_pricing_sync_jobs.process_pricing_sync_jobs's claim/run loop and
     ThreadPoolExecutor fan-out.
+
+    ``allowed_operations``: see claim_next_open_job — pass e.g. [QUOTE, STATUS_CHECK] to run
+    this safely on an unattended cron schedule without ever touching SUBMIT/CANCEL jobs.
+    Leave None only when running by hand under supervision (this is what the management
+    command's default requires an explicit --operations flag to avoid).
     """
     if workers <= 1:
         processed = 0
         while processed < limit:
-            job = claim_next_open_job()
+            job = claim_next_open_job(allowed_operations=allowed_operations)
             if not job:
                 break
             run_purchase_order_job(job)
@@ -409,7 +426,7 @@ def process_purchase_order_jobs(limit: int = 10, workers: int = 1) -> int:
                 if processed_count >= limit:
                     break
                 processed_count += 1
-            job = claim_next_open_job()
+            job = claim_next_open_job(allowed_operations=allowed_operations)
             if not job:
                 with lock:
                     processed_count -= 1
