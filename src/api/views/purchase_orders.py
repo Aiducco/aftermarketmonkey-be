@@ -232,16 +232,26 @@ class PurchaseOrderDetailView(views.View):
 
 
 class PurchaseOrderSubmitView(views.View):
-    """POST /purchase-orders/<id>/submit/ — enqueues a SUBMIT job (places a real order)."""
+    """POST /purchase-orders/<id>/submit/ — enqueues a SUBMIT job (places a real order).
+    Optional body: {ship_method?}. A quote returns every available shipping method's live
+    price, so the user picks one AFTER seeing the quote, not before — pass their choice here
+    (the shipping_code from that PO's line items' ship_options) to apply it just before
+    submitting. Omit to keep whatever was set at review time / the distributor's default."""
 
     def post(self, request: http.HttpRequest, *args, **kwargs) -> http.HttpResponse:
         company_id, _user_id, err = _require_auth(request)
         if err:
             return err
 
+        body, err = _parse_json_body(request) if request.body else ({}, None)
+        if err:
+            return err
+
         po_id = kwargs.get("id")
         try:
-            result = purchase_orders_services.submit_purchase_order(company_id=company_id, purchase_order_id=po_id)
+            result = purchase_orders_services.submit_purchase_order(
+                company_id=company_id, purchase_order_id=po_id, ship_method=body.get("ship_method")
+            )
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e))
         except Exception:
@@ -359,16 +369,24 @@ class PurchaseOrderGroupDetailView(views.View):
 
 
 class PurchaseOrderGroupSubmitView(views.View):
-    """POST /purchase-orders/groups/<id>/submit/ — submits every QUOTED PO in the group."""
+    """POST /purchase-orders/groups/<id>/submit/ — submits every QUOTED PO in the group.
+    Optional body: {ship_methods?: {"<purchase_order_id>": "<method_code>"}} — same per-PO
+    keying as cart/review/, since each distributor has its own method-code namespace."""
 
     def post(self, request: http.HttpRequest, *args, **kwargs) -> http.HttpResponse:
         company_id, _user_id, err = _require_auth(request)
         if err:
             return err
 
+        body, err = _parse_json_body(request) if request.body else ({}, None)
+        if err:
+            return err
+
         group_id = kwargs.get("id")
         try:
-            result = purchase_orders_services.submit_purchase_order_group(company_id=company_id, group_id=group_id)
+            result = purchase_orders_services.submit_purchase_order_group(
+                company_id=company_id, group_id=group_id, ship_methods=body.get("ship_methods")
+            )
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e))
         except Exception:

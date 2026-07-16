@@ -468,10 +468,22 @@ def _quote_is_stale(po: src_models.PurchaseOrder) -> bool:
     return django_timezone.now() - po.quoted_at > ttl
 
 
-def submit_purchase_order(company_id: int, purchase_order_id: int) -> typing.Dict:
+def submit_purchase_order(
+    company_id: int, purchase_order_id: int, ship_method: typing.Optional[str] = None
+) -> typing.Dict:
+    """
+    ``ship_method``, when given, is applied to the PO right before submitting — this is how
+    the user's shipping choice, made *after* seeing the quote's real priced options (a quote
+    call returns every available method's live price/ETA, not just one), reaches the
+    distributor. Leave unset to keep whatever was set at review time (or the distributor's
+    default/cheapest, if nothing was ever set).
+    """
     po = src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id).first()
     if not po:
         raise PurchaseOrderServiceError("Purchase order not found.")
+    if ship_method is not None:
+        po.ship_method = ship_method
+        po.save(update_fields=["ship_method", "updated_at"])
     if po.status != src_enums.PurchaseOrderStatus.QUOTED.value:
         raise PurchaseOrderServiceError(
             "Purchase order must be quoted before it can be submitted (current status: {}).".format(
@@ -514,7 +526,12 @@ def requote_purchase_order(company_id: int, purchase_order_id: int) -> typing.Di
     return _serialize_purchase_order(quoted_po)
 
 
-def submit_purchase_order_group(company_id: int, group_id: int) -> typing.Dict:
+def submit_purchase_order_group(
+    company_id: int, group_id: int, ship_methods: typing.Optional[typing.Dict[str, str]] = None
+) -> typing.Dict:
+    """``ship_methods``: optional {purchase_order_id (as string): shipping_method_code} —
+    same per-PO keying as review_cart, since each distributor has its own method-code
+    namespace."""
     group = src_models.PurchaseOrderGroup.objects.filter(id=group_id, company_id=company_id).first()
     if not group:
         raise PurchaseOrderServiceError("Purchase order group not found.")
@@ -523,7 +540,11 @@ def submit_purchase_order_group(company_id: int, group_id: int) -> typing.Dict:
     )
     if not quoted_ids:
         raise PurchaseOrderServiceError("No quoted purchase orders in this group to submit.")
-    results = [submit_purchase_order(company_id, po_id) for po_id in quoted_ids]
+    ship_methods = ship_methods or {}
+    results = [
+        submit_purchase_order(company_id, po_id, ship_method=ship_methods.get(str(po_id)))
+        for po_id in quoted_ids
+    ]
     return {"group_id": group_id, "purchase_orders": results}
 
 
