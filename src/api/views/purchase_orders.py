@@ -74,7 +74,9 @@ class CartView(views.View):
 
 
 class CartItemsView(views.View):
-    """POST /purchase-orders/cart/items/ — {company_provider_id, provider_part_id, quantity}"""
+    """POST /purchase-orders/cart/items/ — {provider_id, master_part_id, quantity}.
+    Both ids are exactly what GET /parts/<id>/ already returns (providers[].provider_id and
+    the part's own id) — no separate lookup needed to add something to the cart."""
 
     def post(self, request: http.HttpRequest, *args, **kwargs) -> http.HttpResponse:
         company_id, user_id, err = _require_auth(request)
@@ -88,8 +90,8 @@ class CartItemsView(views.View):
             result = purchase_orders_services.add_cart_item(
                 company_id=company_id,
                 user_id=user_id,
-                company_provider_id=body.get("company_provider_id"),
-                provider_part_id=body.get("provider_part_id"),
+                provider_id=body.get("provider_id"),
+                master_part_id=body.get("master_part_id"),
                 quantity=body.get("quantity"),
             )
         except purchase_orders_services.PurchaseOrderServiceError as e:

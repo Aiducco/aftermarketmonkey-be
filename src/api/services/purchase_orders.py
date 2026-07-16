@@ -132,19 +132,30 @@ def _resolve_user_profile_id(user_id: typing.Optional[int]) -> typing.Optional[i
     return profile.id if profile else None
 
 
-def _get_or_create_draft(company_id: int, user_id: typing.Optional[int], company_provider_id: int) -> src_models.PurchaseOrder:
+def _get_company_provider(company_id: int, provider_id: int) -> src_models.CompanyProviders:
+    """
+    Resolve this company's connection (CompanyProviders) to a distributor, from the
+    distributor's public catalog id (Providers.id — what part-detail responses expose as
+    provider_id, and what the FE naturally has on hand). Raises if not connected, or if the
+    distributor doesn't support in-app ordering.
+    """
     cp = (
-        src_models.CompanyProviders.objects.filter(id=company_provider_id, company_id=company_id)
+        src_models.CompanyProviders.objects.filter(company_id=company_id, provider_id=provider_id)
         .select_related("provider")
         .first()
     )
     if not cp:
-        raise PurchaseOrderServiceError("Distributor connection not found for this company.")
+        raise PurchaseOrderServiceError("This distributor isn't connected for your company.")
     if not order_registry.supports_ordering(cp.provider.kind):
         raise PurchaseOrderServiceError(
             "{} does not support in-app ordering yet.".format(cp.provider.name)
         )
+    return cp
 
+
+def _get_or_create_draft(
+    company_id: int, user_id: typing.Optional[int], cp: src_models.CompanyProviders
+) -> src_models.PurchaseOrder:
     created_by_id = _resolve_user_profile_id(user_id)
     try:
         with transaction.atomic():
@@ -169,20 +180,31 @@ def _get_or_create_draft(company_id: int, user_id: typing.Optional[int], company
 def add_cart_item(
     company_id: int,
     user_id: typing.Optional[int],
-    company_provider_id: int,
-    provider_part_id: int,
+    provider_id: int,
+    master_part_id: int,
     quantity: int,
 ) -> typing.Dict:
+    """
+    ``provider_id`` and ``master_part_id`` are exactly what GET /parts/<id>/ already exposes
+    per provider row (providers[].provider_id and the part's own id) — the FE never needs to
+    know about internal CompanyProviders/ProviderPart row ids to add something to a cart.
+    """
+    if not provider_id:
+        raise PurchaseOrderServiceError("provider_id is required.")
+    if not master_part_id:
+        raise PurchaseOrderServiceError("master_part_id is required.")
     if not isinstance(quantity, int) or quantity <= 0:
         raise PurchaseOrderServiceError("Quantity must be a positive integer.")
 
-    po = _get_or_create_draft(company_id, user_id, company_provider_id)
+    cp = _get_company_provider(company_id, provider_id)
 
     provider_part = src_models.ProviderPart.objects.filter(
-        id=provider_part_id, provider_id=po.company_provider.provider_id
+        master_part_id=master_part_id, provider_id=provider_id
     ).first()
     if not provider_part:
         raise PurchaseOrderServiceError("Part not found for this distributor.")
+
+    po = _get_or_create_draft(company_id, user_id, cp)
 
     pricing = src_models.ProviderPartCompanyPricing.objects.filter(
         provider_part=provider_part, company_id=company_id
