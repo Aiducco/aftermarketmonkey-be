@@ -343,6 +343,11 @@ def review_cart(
         company_id=company_id, created_by_id=created_by_id, reference=group_reference
     )
 
+    # Quoting is called synchronously (see run_quote_synchronously's docstring for why this is
+    # safe to do inline, unlike submit) — for a single-distributor cart this is one real HTTP
+    # round-trip to that distributor; for a multi-distributor group it's currently sequential
+    # (one distributor at a time). Revisit with a thread pool if/when that latency matters —
+    # not worth the complexity while Turn14 is the only live adapter.
     results = []
     for po in purchase_orders:
         po.group = group
@@ -372,8 +377,8 @@ def review_cart(
                 "updated_at",
             ]
         )
-        job = purchase_order_jobs.enqueue_quote_job(po.id)
-        results.append({"purchase_order_id": po.id, "job_id": job.id})
+        quoted_po = purchase_order_jobs.run_quote_synchronously(po.id)
+        results.append(_serialize_purchase_order(quoted_po))
 
     return {"group_id": group.id, "purchase_orders": results}
 
@@ -505,8 +510,8 @@ def requote_purchase_order(company_id: int, purchase_order_id: int) -> typing.Di
         )
     if not po.ship_to_address1:
         raise PurchaseOrderServiceError("Purchase order has no ship-to address on file yet — review the cart first.")
-    job = purchase_order_jobs.enqueue_quote_job(po.id)
-    return {"purchase_order_id": po.id, "job_id": job.id}
+    quoted_po = purchase_order_jobs.run_quote_synchronously(po.id)
+    return _serialize_purchase_order(quoted_po)
 
 
 def submit_purchase_order_group(company_id: int, group_id: int) -> typing.Dict:

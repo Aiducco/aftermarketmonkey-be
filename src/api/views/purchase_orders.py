@@ -148,11 +148,15 @@ class CartItemDetailView(views.View):
 class CartReviewView(views.View):
     """POST /purchase-orders/cart/review/ — {ship_to: {...}, purchase_order_ids?: [...],
     reference?, ship_methods?: {"<purchase_order_id>": "<method_code>"}}.
-    Groups the current DRAFT carts into a PurchaseOrderGroup and enqueues a QUOTE job for
-    each. ship_methods is per-PO (not per-request) since method codes are distributor-specific
-    — see GET .../shipping-methods/?company_provider_id=. Also accepts purchase_order_id
-    (singular) and shipping_method_id (singular) as shorthand when reviewing just one PO —
-    see review_cart's docstring for the exact aliasing rules."""
+    Groups the current DRAFT carts into a PurchaseOrderGroup and quotes each one
+    SYNCHRONOUSLY (quoting is non-mutating on the distributor's side, so there's no need to
+    poll a job for it — see run_quote_synchronously's docstring). Returns the full quoted
+    PurchaseOrder(s) directly; a PO whose quote failed comes back with status=FAILED and
+    error_message set rather than aborting the whole request. ship_methods is per-PO (not
+    per-request) since method codes are distributor-specific — see GET
+    .../shipping-methods/?company_provider_id=. Also accepts purchase_order_id (singular) and
+    shipping_method_id (singular) as shorthand when reviewing just one PO — see
+    review_cart's docstring for the exact aliasing rules."""
 
     def post(self, request: http.HttpRequest, *args, **kwargs) -> http.HttpResponse:
         company_id, user_id, err = _require_auth(request)
@@ -179,7 +183,7 @@ class CartReviewView(views.View):
             logger.exception("{} Error reviewing cart for company_id={}".format(_LOG_PREFIX, company_id))
             return _error_response("Error reviewing cart", status=500)
 
-        return _json_response(result, status=202)
+        return _json_response(result, status=200)
 
 
 class PurchaseOrdersView(views.View):
@@ -290,8 +294,9 @@ class PurchaseOrderRefreshStatusView(views.View):
 
 
 class PurchaseOrderRequoteView(views.View):
-    """POST /purchase-orders/<id>/requote/ — re-run the quote (e.g. after quote_is_stale is
-    true) without rebuilding the cart. Reuses the ship-to/ship-method already on the PO."""
+    """POST /purchase-orders/<id>/requote/ — re-run the quote SYNCHRONOUSLY (e.g. after
+    quote_is_stale is true) without rebuilding the cart. Reuses the ship-to/ship-method
+    already on the PO. Returns the updated PurchaseOrder directly."""
 
     def post(self, request: http.HttpRequest, *args, **kwargs) -> http.HttpResponse:
         company_id, _user_id, err = _require_auth(request)
@@ -307,7 +312,7 @@ class PurchaseOrderRequoteView(views.View):
             logger.exception("{} Error re-quoting purchase order id={}".format(_LOG_PREFIX, po_id))
             return _error_response("Error re-quoting purchase order", status=500)
 
-        return _json_response(result, status=202)
+        return _json_response(result, status=200)
 
 
 class PurchaseOrderJobView(views.View):

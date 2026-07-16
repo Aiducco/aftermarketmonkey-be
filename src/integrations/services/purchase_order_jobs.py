@@ -30,10 +30,6 @@ logger = logging.getLogger(__name__)
 _LOG_PREFIX = "[PURCHASE-ORDER-JOBS]"
 
 
-def enqueue_quote_job(purchase_order_id: int) -> src_models.PurchaseOrderJob:
-    return _enqueue(purchase_order_id, src_enums.PurchaseOrderOperation.QUOTE)
-
-
 def enqueue_submit_job(purchase_order_id: int) -> src_models.PurchaseOrderJob:
     return _enqueue(purchase_order_id, src_enums.PurchaseOrderOperation.SUBMIT)
 
@@ -329,27 +325,62 @@ _RUNNERS = {
 }
 
 
-def run_purchase_order_job(job: src_models.PurchaseOrderJob) -> None:
+def _resolve_po_and_adapter(
+    purchase_order_id: int,
+) -> typing.Tuple[typing.Optional[src_models.PurchaseOrder], typing.Optional[order_base.DistributorOrderAdapter], typing.Optional[str]]:
+    """Returns (po, adapter, error_message). error_message is set (and the other two may be
+    None/partial) when resolution failed — same lookup used by both the job runner and the
+    synchronous quote path so they fail the same way."""
     po = (
         src_models.PurchaseOrder.objects.select_related("company_provider__provider")
-        .filter(id=job.purchase_order_id)
+        .filter(id=purchase_order_id)
         .first()
     )
     if not po:
-        job.status = src_enums.PurchaseOrderJobStatus.FAILED.value
-        job.status_name = src_enums.PurchaseOrderJobStatus.FAILED.name
-        job.error_message = "PurchaseOrder no longer exists."
-        job.completed_at = timezone.now()
-        job.save(update_fields=["status", "status_name", "error_message", "completed_at", "updated_at"])
-        return
+        return None, None, "PurchaseOrder no longer exists."
 
     adapter = order_registry.get_adapter(po.company_provider)
     if adapter is None:
+        return po, None, "No order adapter registered for provider kind={}.".format(po.company_provider.provider.kind)
+
+    return po, adapter, None
+
+
+def run_quote_synchronously(purchase_order_id: int) -> src_models.PurchaseOrder:
+    """
+    Quoting is non-mutating on the distributor's side (Turn 14's own docs: a quote "cannot be
+    viewed from the Turn 14 website until promoted to an order"), so unlike submit/cancel it
+    doesn't need the job queue's deliberate-gating — it's called directly in the request/
+    response cycle for fast feedback. Never raises: on failure the returned PO has
+    status=FAILED and error_message set, so a multi-distributor review can keep quoting the
+    other POs in the group instead of aborting the whole request.
+    """
+    po, adapter, error_message = _resolve_po_and_adapter(purchase_order_id)
+    if error_message:
+        if po:
+            po.status = src_enums.PurchaseOrderStatus.FAILED.value
+            po.status_name = src_enums.PurchaseOrderStatus.FAILED.name
+            po.error_message = error_message
+            po.save(update_fields=["status", "status_name", "error_message", "updated_at"])
+        return po
+
+    try:
+        _run_quote(po, adapter)
+    except Exception as e:
+        logger.exception("{} Synchronous quote failed for purchase_order_id={}.".format(_LOG_PREFIX, purchase_order_id))
+        po.status = src_enums.PurchaseOrderStatus.FAILED.value
+        po.status_name = src_enums.PurchaseOrderStatus.FAILED.name
+        po.error_message = str(e)[:4000]
+        po.save(update_fields=["status", "status_name", "error_message", "updated_at"])
+    return po
+
+
+def run_purchase_order_job(job: src_models.PurchaseOrderJob) -> None:
+    po, adapter, error_message = _resolve_po_and_adapter(job.purchase_order_id)
+    if error_message:
         job.status = src_enums.PurchaseOrderJobStatus.FAILED.value
         job.status_name = src_enums.PurchaseOrderJobStatus.FAILED.name
-        job.error_message = "No order adapter registered for provider kind={}.".format(
-            po.company_provider.provider.kind
-        )
+        job.error_message = error_message
         job.completed_at = timezone.now()
         job.save(update_fields=["status", "status_name", "error_message", "completed_at", "updated_at"])
         return
