@@ -1,5 +1,6 @@
 import enum
 from django.contrib.auth import models as auth_models
+from django.core.serializers.json import DjangoJSONEncoder
 from django.db import models as django_db_models
 
 class Company(django_db_models.Model):
@@ -1913,7 +1914,7 @@ class PurchaseOrder(django_db_models.Model):
     ship_method = django_db_models.CharField(max_length=64, null=True, blank=True)
 
     # Quote snapshot from the distributor adapter's get_shipping_quote(), before submit.
-    quote_raw_response = django_db_models.JSONField(null=True, blank=True)
+    quote_raw_response = django_db_models.JSONField(null=True, blank=True, encoder=DjangoJSONEncoder)
     quoted_at = django_db_models.DateTimeField(null=True, blank=True)
 
     subtotal = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
@@ -1967,6 +1968,13 @@ class PurchaseOrderLineItem(django_db_models.Model):
     quantity_confirmed = django_db_models.PositiveIntegerField(null=True, blank=True)
     quantity_backordered = django_db_models.PositiveIntegerField(null=True, blank=True)
     manufacturer_esd = django_db_models.DateField(null=True, blank=True)
+    warehouse_code = django_db_models.CharField(max_length=64, null=True, blank=True)
+
+    # Normalized (distributor-agnostic) shipping options for this line's shipment, from the
+    # last quote: [{code, name, cost, estimated_delivery_date}]. This is what the FE's
+    # shipping-method picker reads — never the distributor's raw quote response, which has a
+    # different shape per distributor.
+    ship_options = django_db_models.JSONField(null=True, blank=True, encoder=DjangoJSONEncoder)
 
     # Which distributor-side order slice this line ended up on. Nullable because a PO can
     # fan out across several distributor orders (Meyer's Orders array, Keystone/Turn14
@@ -2006,10 +2014,10 @@ class PurchaseOrderDistributorOrder(django_db_models.Model):
     status = django_db_models.PositiveSmallIntegerField()
     status_name = django_db_models.CharField(max_length=32)
 
-    tracking_numbers = django_db_models.JSONField(default=list, blank=True)
+    tracking_numbers = django_db_models.JSONField(default=list, blank=True, encoder=DjangoJSONEncoder)
     carrier = django_db_models.CharField(max_length=64, null=True, blank=True)
 
-    raw_response = django_db_models.JSONField(null=True, blank=True)
+    raw_response = django_db_models.JSONField(null=True, blank=True, encoder=DjangoJSONEncoder)
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
@@ -2034,8 +2042,8 @@ class PurchaseOrderSubmissionAttempt(django_db_models.Model):
     success = django_db_models.BooleanField()
 
     # Credentials must be redacted before storing here.
-    request_payload = django_db_models.JSONField(null=True, blank=True)
-    response_payload = django_db_models.JSONField(null=True, blank=True)
+    request_payload = django_db_models.JSONField(null=True, blank=True, encoder=DjangoJSONEncoder)
+    response_payload = django_db_models.JSONField(null=True, blank=True, encoder=DjangoJSONEncoder)
     error_message = django_db_models.TextField(null=True, blank=True)
     duration_ms = django_db_models.IntegerField(null=True, blank=True)
 

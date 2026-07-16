@@ -179,7 +179,32 @@ def _run_quote(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrde
         li.quantity_confirmed = quote_line.quantity_available
         li.quantity_backordered = quote_line.quantity_backordered
         li.manufacturer_esd = quote_line.manufacturer_esd
-        li.save(update_fields=["quantity_confirmed", "quantity_backordered", "manufacturer_esd", "updated_at"])
+        li.warehouse_code = quote_line.warehouse_code
+        li.ship_options = [
+            {
+                "code": opt.service_level_code,
+                "name": opt.service_level_name,
+                # Stored as float, not Decimal: this JSON blob is for display/selection, not
+                # financial calculation (those still go through unit_cost/line_total
+                # DecimalFields) — a plain number round-trips through JSON cleanly, whereas
+                # DjangoJSONEncoder would otherwise write Decimal out as a string.
+                "cost": float(opt.cost) if opt.cost is not None else None,
+                "estimated_delivery_date": (
+                    opt.estimated_delivery_date.isoformat() if opt.estimated_delivery_date else None
+                ),
+            }
+            for opt in quote_line.ship_options
+        ]
+        li.save(
+            update_fields=[
+                "quantity_confirmed",
+                "quantity_backordered",
+                "manufacturer_esd",
+                "warehouse_code",
+                "ship_options",
+                "updated_at",
+            ]
+        )
 
     po.quote_raw_response = result.raw_response
     po.quoted_at = timezone.now()

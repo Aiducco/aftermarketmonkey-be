@@ -57,6 +57,8 @@ def _serialize_line_item(li: src_models.PurchaseOrderLineItem) -> typing.Dict:
         "quantity_confirmed": li.quantity_confirmed,
         "quantity_backordered": li.quantity_backordered,
         "manufacturer_esd": li.manufacturer_esd.isoformat() if li.manufacturer_esd else None,
+        "warehouse_code": li.warehouse_code,
+        "ship_options": li.ship_options,
         "distributor_order_id": li.distributor_order_id,
     }
 
