@@ -241,7 +241,18 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
     ``company_integration.connected`` is false.
     """
     try:
-        part = src_models.MasterPart.objects.select_related("brand").get(id=master_part_id)
+        part = (
+            src_models.MasterPart.objects.select_related("brand")
+            .prefetch_related(
+                Prefetch(
+                    "fitments",
+                    queryset=src_models.MasterPartFitment.objects.select_related("source_provider").order_by(
+                        "year_start", "make", "model"
+                    ),
+                )
+            )
+            .get(id=master_part_id)
+        )
     except src_models.MasterPart.DoesNotExist:
         return None
 
@@ -257,6 +268,19 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
         "gtin": part.gtin,
         "created_at": part.created_at.isoformat() if part.created_at else None,
         "updated_at": part.updated_at.isoformat() if part.updated_at else None,
+        "fitments": [
+            {
+                "year_start": f.year_start,
+                "year_end": f.year_end,
+                "make": f.make,
+                "model": f.model,
+                "submodel": f.submodel or None,
+                "engine": f.engine or None,
+                "drive_type": f.drive_type or None,
+                "source_provider_kind": f.source_provider.kind_name if f.source_provider_id else None,
+            }
+            for f in part.fitments.all()
+        ],
     }
 
     company_provider_map: typing.Dict[int, typing.Dict[str, typing.Any]] = {}
