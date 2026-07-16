@@ -150,7 +150,9 @@ class CartReviewView(views.View):
     reference?, ship_methods?: {"<purchase_order_id>": "<method_code>"}}.
     Groups the current DRAFT carts into a PurchaseOrderGroup and enqueues a QUOTE job for
     each. ship_methods is per-PO (not per-request) since method codes are distributor-specific
-    — see GET .../shipping-methods/?company_provider_id="""
+    — see GET .../shipping-methods/?company_provider_id=. Also accepts purchase_order_id
+    (singular) and shipping_method_id (singular) as shorthand when reviewing just one PO —
+    see review_cart's docstring for the exact aliasing rules."""
 
     def post(self, request: http.HttpRequest, *args, **kwargs) -> http.HttpResponse:
         company_id, user_id, err = _require_auth(request)
@@ -166,8 +168,10 @@ class CartReviewView(views.View):
                 user_id=user_id,
                 ship_to=body.get("ship_to") or {},
                 purchase_order_ids=body.get("purchase_order_ids"),
+                purchase_order_id=body.get("purchase_order_id"),
                 group_reference=body.get("reference"),
                 ship_methods=body.get("ship_methods"),
+                shipping_method_id=body.get("shipping_method_id"),
             )
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e))

@@ -294,8 +294,10 @@ def review_cart(
     user_id: typing.Optional[int],
     ship_to: typing.Dict,
     purchase_order_ids: typing.Optional[typing.List[int]] = None,
+    purchase_order_id: typing.Optional[int] = None,
     group_reference: typing.Optional[str] = None,
     ship_methods: typing.Optional[typing.Dict[str, str]] = None,
+    shipping_method_id: typing.Optional[str] = None,
 ) -> typing.Dict:
     """
     ``ship_methods``: optional {purchase_order_id (as string): shipping_method_code}. Method
@@ -304,11 +306,28 @@ def review_cart(
     checkout can legitimately want UPS Ground from one distributor and a different carrier's
     equivalent from another. Omit a PO's entry (or the whole map) to use that distributor's
     own default/cheapest pick.
+
+    A few aliases are accepted for convenience since they're reasonable shapes a caller might
+    reach for: ``ship_to.address`` for ``ship_to.address1`` (single-line address forms are
+    common), ``purchase_order_id`` (singular) for a one-element ``purchase_order_ids``, and
+    ``shipping_method_id`` (singular) for a one-entry ``ship_methods`` map — the last one only
+    applies when exactly one PO is being reviewed, since a single method id can't sensibly
+    apply across distributors with different method-code namespaces.
     """
+    ship_to = dict(ship_to or {})
+    if not ship_to.get("address1") and ship_to.get("address"):
+        ship_to["address1"] = ship_to["address"]
+
     missing = [f for f in _REQUIRED_SHIP_TO_FIELDS if not ship_to.get(f)]
     if missing:
         raise PurchaseOrderServiceError("Missing required ship-to field(s): {}.".format(", ".join(missing)))
-    ship_methods = ship_methods or {}
+
+    if not purchase_order_ids and purchase_order_id:
+        purchase_order_ids = [purchase_order_id]
+
+    ship_methods = dict(ship_methods or {})
+    if shipping_method_id and not ship_methods and purchase_order_ids and len(purchase_order_ids) == 1:
+        ship_methods[str(purchase_order_ids[0])] = shipping_method_id
 
     qs = src_models.PurchaseOrder.objects.filter(
         company_id=company_id, status=src_enums.PurchaseOrderStatus.DRAFT.value
