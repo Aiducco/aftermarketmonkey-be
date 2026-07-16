@@ -603,9 +603,11 @@ def get_order_capabilities(company_id: int) -> typing.List[typing.Dict]:
     for cp in company_providers:
         can_order = order_registry.supports_ordering(cp.provider.kind)
         supports_shipping_selection = False
+        supports_cancel = False
         if can_order:
             adapter = order_registry.get_adapter(cp)
             supports_shipping_selection = bool(adapter and adapter.supports_shipping_method_selection())
+            supports_cancel = bool(adapter and adapter.supports_cancel())
         results.append(
             {
                 "company_provider_id": cp.id,
@@ -614,6 +616,7 @@ def get_order_capabilities(company_id: int) -> typing.List[typing.Dict]:
                 "provider_name": cp.provider.name,
                 "can_order_in_app": can_order,
                 "supports_shipping_method_selection": supports_shipping_selection,
+                "supports_cancel": supports_cancel,
             }
         )
     return results
