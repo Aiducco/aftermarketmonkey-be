@@ -374,11 +374,35 @@ def get_purchase_order_detail(company_id: int, purchase_order_id: int) -> typing
     return _serialize_purchase_order(po)
 
 
+def _parse_status_filter(value: typing.Optional[typing.Union[int, str]]) -> typing.Optional[int]:
+    """
+    Accepts either the numeric status code or the status name (e.g. "CONFIRMED", matching the
+    status_name field every PO/line-item/job response already returns) — case-insensitive.
+    Every serialized response exposes status_name, so filtering by that same string is the
+    natural thing for a caller to do; this must not 500 just because it isn't an int.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    if text.lstrip("-").isdigit():
+        return int(text)
+    try:
+        return src_enums.PurchaseOrderStatus[text.upper()].value
+    except KeyError:
+        valid = ", ".join(m.name for m in src_enums.PurchaseOrderStatus)
+        raise PurchaseOrderServiceError(
+            "Unknown status '{}'. Valid values: {} (or their numeric codes).".format(value, valid)
+        )
+
+
 def list_purchase_orders(
     company_id: int,
-    status: typing.Optional[int] = None,
+    status: typing.Optional[typing.Union[int, str]] = None,
     company_provider_id: typing.Optional[int] = None,
 ) -> typing.List[typing.Dict]:
+    status_value = _parse_status_filter(status)
     qs = (
         src_models.PurchaseOrder.objects.filter(company_id=company_id)
         .exclude(status=src_enums.PurchaseOrderStatus.DRAFT.value)
@@ -386,8 +410,8 @@ def list_purchase_orders(
         .prefetch_related("distributor_orders")
         .order_by("-created_at")
     )
-    if status is not None:
-        qs = qs.filter(status=status)
+    if status_value is not None:
+        qs = qs.filter(status=status_value)
     if company_provider_id is not None:
         qs = qs.filter(company_provider_id=company_provider_id)
     return [_serialize_purchase_order(po, include_line_items=False) for po in qs[:200]]

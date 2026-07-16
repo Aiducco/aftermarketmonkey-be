@@ -191,9 +191,11 @@ class PurchaseOrdersView(views.View):
         try:
             result = purchase_orders_services.list_purchase_orders(
                 company_id=company_id,
-                status=int(status_param) if status_param else None,
+                status=status_param,
                 company_provider_id=int(cp_param) if cp_param else None,
             )
+        except purchase_orders_services.PurchaseOrderServiceError as e:
+            return _error_response(str(e))
         except Exception:
             logger.exception("{} Error listing purchase orders for company_id={}".format(_LOG_PREFIX, company_id))
             return _error_response("Error listing purchase orders", status=500)
