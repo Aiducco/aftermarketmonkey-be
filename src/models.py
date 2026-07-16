@@ -1744,4 +1744,251 @@ class NotificationEmailLog(django_db_models.Model):
 
     class Meta:
         db_table = "notification_email_log"
-        ordering = ["-id"]
+
+
+class PurchaseOrderGroup(django_db_models.Model):
+    """
+    Groups sibling PurchaseOrders created from one cross-distributor checkout (a shop's
+    cart can span several distributors, each becoming its own PurchaseOrder). Purely
+    organisational — distributors never see this, only the internal "review & quote"
+    and PO-history screens do.
+    """
+    company = django_db_models.ForeignKey(
+        Company, on_delete=django_db_models.CASCADE, related_name="purchase_order_groups"
+    )
+    created_by = django_db_models.ForeignKey(
+        UserProfile,
+        on_delete=django_db_models.SET_NULL,
+        related_name="po_groups_created",
+        null=True,
+        blank=True,
+    )
+    reference = django_db_models.CharField(max_length=64, null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "purchase_order_groups"
+
+
+class PurchaseOrder(django_db_models.Model):
+    """
+    A distributor-agnostic internal purchase order. See src.enums.PurchaseOrderStatus.
+
+    A DRAFT row doubles as the per-distributor "Add to PO" cart: at most one DRAFT
+    PurchaseOrder may exist per (company, company_provider) at a time (enforced below),
+    and adding an item to the cart finds-or-creates that row rather than ever risking a
+    second concurrent draft. po_number/ship_to_*/quote fields are populated once the cart
+    is reviewed (quoted), not at add-to-cart time.
+    """
+    company = django_db_models.ForeignKey(
+        Company, on_delete=django_db_models.CASCADE, related_name="purchase_orders"
+    )
+    company_provider = django_db_models.ForeignKey(
+        CompanyProviders, on_delete=django_db_models.PROTECT, related_name="purchase_orders"
+    )
+    group = django_db_models.ForeignKey(
+        PurchaseOrderGroup,
+        on_delete=django_db_models.SET_NULL,
+        related_name="purchase_orders",
+        null=True,
+        blank=True,
+    )
+
+    # Our own PO number, sent to distributors that accept one (Meyer's CustPO,
+    # Keystone's PONumber, Turn 14's po_number). Assigned when the cart is reviewed/quoted,
+    # not when the draft is first created.
+    po_number = django_db_models.CharField(max_length=64, unique=True, null=True, blank=True)
+
+    status = django_db_models.PositiveSmallIntegerField()
+    status_name = django_db_models.CharField(max_length=32)
+
+    source = django_db_models.PositiveSmallIntegerField()
+    source_name = django_db_models.CharField(max_length=32)
+    # Free-text external reference for non-staff sources (e.g. a future SMS repair-order id).
+    source_reference = django_db_models.CharField(max_length=255, null=True, blank=True)
+
+    created_by = django_db_models.ForeignKey(
+        UserProfile,
+        on_delete=django_db_models.SET_NULL,
+        related_name="purchase_orders_created",
+        null=True,
+        blank=True,
+    )
+
+    # Ship-to snapshot. Company has no address/ship-to model today, so this is captured
+    # directly on the PO rather than inherited. Null while still a DRAFT cart.
+    ship_to_name = django_db_models.CharField(max_length=255, null=True, blank=True)
+    ship_to_attention = django_db_models.CharField(max_length=255, null=True, blank=True)
+    ship_to_address1 = django_db_models.CharField(max_length=255, null=True, blank=True)
+    ship_to_address2 = django_db_models.CharField(max_length=255, null=True, blank=True)
+    ship_to_city = django_db_models.CharField(max_length=128, null=True, blank=True)
+    ship_to_state = django_db_models.CharField(max_length=64, null=True, blank=True)
+    ship_to_postal_code = django_db_models.CharField(max_length=32, null=True, blank=True)
+    ship_to_country = django_db_models.CharField(max_length=64, null=True, blank=True)
+    ship_to_phone = django_db_models.CharField(max_length=32, null=True, blank=True)
+    ship_method = django_db_models.CharField(max_length=64, null=True, blank=True)
+
+    # Quote snapshot from the distributor adapter's get_shipping_quote(), before submit.
+    quote_raw_response = django_db_models.JSONField(null=True, blank=True)
+    quoted_at = django_db_models.DateTimeField(null=True, blank=True)
+
+    subtotal = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    estimated_shipping = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    total = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+
+    error_message = django_db_models.TextField(null=True, blank=True)
+    notes = django_db_models.TextField(null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+    submitted_at = django_db_models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "purchase_orders"
+        indexes = [
+            django_db_models.Index(fields=["company", "status"], name="po_company_status_idx"),
+            django_db_models.Index(fields=["company_provider", "status"], name="po_company_provider_status_idx"),
+        ]
+        constraints = [
+            # At most one open cart (DRAFT=1, see src.enums.PurchaseOrderStatus) per
+            # distributor connection at a time — "Add to PO" always finds-or-creates this row.
+            django_db_models.UniqueConstraint(
+                fields=["company", "company_provider"],
+                condition=django_db_models.Q(status=1),
+                name="po_one_open_draft_per_company_provider",
+            ),
+        ]
+
+
+class PurchaseOrderLineItem(django_db_models.Model):
+    purchase_order = django_db_models.ForeignKey(
+        PurchaseOrder, on_delete=django_db_models.CASCADE, related_name="line_items"
+    )
+    provider_part = django_db_models.ForeignKey(
+        ProviderPart, on_delete=django_db_models.PROTECT, related_name="po_line_items"
+    )
+
+    quantity = django_db_models.PositiveIntegerField()
+
+    # Frozen at add-to-cart time from ProviderPartCompanyPricing, since that changes over time.
+    unit_cost = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    line_total = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+
+    status = django_db_models.PositiveSmallIntegerField()
+    status_name = django_db_models.CharField(max_length=32)
+
+    # Distributor-side per-line detail, filled in after quote/submit.
+    distributor_line_status_code = django_db_models.CharField(max_length=64, null=True, blank=True)
+    distributor_line_status_message = django_db_models.TextField(null=True, blank=True)
+    quantity_confirmed = django_db_models.PositiveIntegerField(null=True, blank=True)
+    quantity_backordered = django_db_models.PositiveIntegerField(null=True, blank=True)
+    manufacturer_esd = django_db_models.DateField(null=True, blank=True)
+
+    # Which distributor-side order slice this line ended up on. Nullable because a PO can
+    # fan out across several distributor orders (Meyer's Orders array, Keystone/Turn14
+    # multi-warehouse) — set once submit_order() resolves it.
+    distributor_order = django_db_models.ForeignKey(
+        "PurchaseOrderDistributorOrder",
+        on_delete=django_db_models.SET_NULL,
+        related_name="line_items",
+        null=True,
+        blank=True,
+    )
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "purchase_order_line_items"
+        unique_together = [["purchase_order", "provider_part"]]
+        indexes = [
+            django_db_models.Index(fields=["purchase_order"], name="po_line_items_po_idx"),
+        ]
+
+
+class PurchaseOrderDistributorOrder(django_db_models.Model):
+    """
+    One distributor-side order/shipment slice for a PurchaseOrder. A single PurchaseOrder
+    can map to several of these (Meyer's Orders array of genuinely separate order numbers;
+    Keystone/Turn14's multi-warehouse fan-out within one order).
+    """
+    purchase_order = django_db_models.ForeignKey(
+        PurchaseOrder, on_delete=django_db_models.CASCADE, related_name="distributor_orders"
+    )
+
+    distributor_order_number = django_db_models.CharField(max_length=128)
+    warehouse_code = django_db_models.CharField(max_length=64, null=True, blank=True)
+
+    status = django_db_models.PositiveSmallIntegerField()
+    status_name = django_db_models.CharField(max_length=32)
+
+    tracking_numbers = django_db_models.JSONField(default=list, blank=True)
+    carrier = django_db_models.CharField(max_length=64, null=True, blank=True)
+
+    raw_response = django_db_models.JSONField(null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "purchase_order_distributor_orders"
+        unique_together = [["purchase_order", "distributor_order_number"]]
+
+
+class PurchaseOrderSubmissionAttempt(django_db_models.Model):
+    """
+    Audit log of every quote/submit/status-check/cancel call made to a distributor's order
+    API for a PurchaseOrder — one row per attempt (success or failure), not a mutable field,
+    since submission is retried and each attempt's raw payload matters for diagnosing
+    distributor rejections. Mirrors NotificationEmailLog's one-row-per-event style.
+    """
+    purchase_order = django_db_models.ForeignKey(
+        PurchaseOrder, on_delete=django_db_models.CASCADE, related_name="submission_attempts"
+    )
+    operation = django_db_models.PositiveSmallIntegerField()
+    operation_name = django_db_models.CharField(max_length=32)
+    success = django_db_models.BooleanField()
+
+    # Credentials must be redacted before storing here.
+    request_payload = django_db_models.JSONField(null=True, blank=True)
+    response_payload = django_db_models.JSONField(null=True, blank=True)
+    error_message = django_db_models.TextField(null=True, blank=True)
+    duration_ms = django_db_models.IntegerField(null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "purchase_order_submission_attempts"
+
+
+class PurchaseOrderJob(django_db_models.Model):
+    """
+    Queue row processed by a cron management command, same shape as
+    IntegrationPricingSyncJob but scoped to a single PurchaseOrder + operation
+    (see src.enums.PurchaseOrderOperation). Submission is bounded by attempt_count/
+    max_attempts since distributor order APIs can rate-limit (e.g. Meyer's "try again in
+    15 minutes" response) and must never be retried unboundedly.
+    """
+    purchase_order = django_db_models.ForeignKey(
+        PurchaseOrder, on_delete=django_db_models.CASCADE, related_name="jobs"
+    )
+    operation = django_db_models.PositiveSmallIntegerField()
+    operation_name = django_db_models.CharField(max_length=32)
+
+    status = django_db_models.PositiveSmallIntegerField()
+    status_name = django_db_models.CharField(max_length=32)
+    message = django_db_models.TextField(null=True, blank=True)
+    error_message = django_db_models.TextField(null=True, blank=True)
+
+    attempt_count = django_db_models.PositiveSmallIntegerField(default=0)
+    max_attempts = django_db_models.PositiveSmallIntegerField(default=3)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+    started_at = django_db_models.DateTimeField(null=True, blank=True)
+    completed_at = django_db_models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "purchase_order_jobs"
+        ordering = ["id"]

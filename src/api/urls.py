@@ -49,6 +49,21 @@ from src.api.views.parts import (
     PartsSearchView,
 )
 from src.api.views.turn14_locations import Turn14LocationsView
+from src.api.views.purchase_orders import (
+    CartView,
+    CartItemsView,
+    CartItemDetailView,
+    CartReviewView,
+    PurchaseOrdersView,
+    PurchaseOrderDetailView,
+    PurchaseOrderSubmitView,
+    PurchaseOrderCancelView,
+    PurchaseOrderRefreshStatusView,
+    PurchaseOrderJobView,
+    PurchaseOrderGroupDetailView,
+    PurchaseOrderGroupSubmitView,
+    PurchaseOrderCapabilitiesView,
+)
 
 urlpatterns = [
     path(
@@ -195,6 +210,71 @@ urlpatterns = [
         "turn14/locations/",
         Turn14LocationsView.as_view(),
         name="turn14_locations",
+    ),
+    path(
+        "purchase-orders/cart/",
+        CartView.as_view(),
+        name="purchase_orders_cart",
+    ),
+    path(
+        "purchase-orders/cart/items/",
+        CartItemsView.as_view(),
+        name="purchase_orders_cart_items",
+    ),
+    path(
+        "purchase-orders/cart/items/<int:line_item_id>/",
+        CartItemDetailView.as_view(),
+        name="purchase_orders_cart_item_detail",
+    ),
+    path(
+        "purchase-orders/cart/review/",
+        CartReviewView.as_view(),
+        name="purchase_orders_cart_review",
+    ),
+    path(
+        "purchase-orders/capabilities/",
+        PurchaseOrderCapabilitiesView.as_view(),
+        name="purchase_orders_capabilities",
+    ),
+    path(
+        "purchase-orders/groups/<int:id>/",
+        PurchaseOrderGroupDetailView.as_view(),
+        name="purchase_order_group_detail",
+    ),
+    path(
+        "purchase-orders/groups/<int:id>/submit/",
+        PurchaseOrderGroupSubmitView.as_view(),
+        name="purchase_order_group_submit",
+    ),
+    path(
+        "purchase-orders/<int:id>/jobs/<int:job_id>/",
+        PurchaseOrderJobView.as_view(),
+        name="purchase_order_job_detail",
+    ),
+    path(
+        "purchase-orders/<int:id>/submit/",
+        PurchaseOrderSubmitView.as_view(),
+        name="purchase_order_submit",
+    ),
+    path(
+        "purchase-orders/<int:id>/cancel/",
+        PurchaseOrderCancelView.as_view(),
+        name="purchase_order_cancel",
+    ),
+    path(
+        "purchase-orders/<int:id>/refresh-status/",
+        PurchaseOrderRefreshStatusView.as_view(),
+        name="purchase_order_refresh_status",
+    ),
+    path(
+        "purchase-orders/<int:id>/",
+        PurchaseOrderDetailView.as_view(),
+        name="purchase_order_detail",
+    ),
+    path(
+        "purchase-orders/",
+        PurchaseOrdersView.as_view(),
+        name="purchase_orders_list",
     ),
     path(
         "settings/profile/",

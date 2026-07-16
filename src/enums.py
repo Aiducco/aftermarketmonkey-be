@@ -103,3 +103,64 @@ class NotificationEmailType(enum.Enum):
 class NotificationEmailStatus(enum.Enum):
     SENT = 1
     FAILED = 2
+
+
+class PurchaseOrderStatus(enum.Enum):
+    """
+    Lifecycle status for an internal PurchaseOrder. DRAFT doubles as the per-distributor
+    "Add to PO" cart (see purchase_order_jobs / cart API) until a staff user reviews and
+    quotes it — it is not just a pre-submission state.
+    """
+    DRAFT = 1
+    QUOTED = 2
+    SUBMITTING = 3
+    SUBMITTED = 4
+    CONFIRMED = 5
+    PARTIALLY_FULFILLED = 6
+    FULFILLED = 7
+    CANCELLED = 8
+    FAILED = 9
+
+
+class PurchaseOrderLineItemStatus(enum.Enum):
+    PENDING = 1
+    CONFIRMED = 2
+    BACKORDERED = 3
+    REJECTED = 4
+    PARTIALLY_SHIPPED = 5
+    SHIPPED = 6
+    CANCELLED = 7
+
+
+class PurchaseOrderSource(enum.Enum):
+    """Where a PurchaseOrder originated. Only STAFF_MANUAL is used today; the others are
+    reserved for a future shop-management-system webhook / public API integration."""
+    STAFF_MANUAL = 1
+    SMS_WEBHOOK = 2
+    API = 3
+
+
+class PurchaseOrderOperation(enum.Enum):
+    """Which DistributorOrderAdapter call a PurchaseOrderJob / PurchaseOrderSubmissionAttempt performs."""
+    QUOTE = 1
+    SUBMIT = 2
+    STATUS_CHECK = 3
+    CANCEL = 4
+
+
+class PurchaseOrderJobStatus(enum.Enum):
+    """Queue status for PurchaseOrderJob rows (cron-processed), same shape as
+    IntegrationPricingSyncJobStatus."""
+    OPEN = 1
+    RUNNING = 2
+    COMPLETED = 3
+    FAILED = 4
+
+
+class PurchaseOrderDistributorOrderStatus(enum.Enum):
+    """Status of one distributor-side order slice (PurchaseOrderDistributorOrder)."""
+    SUBMITTED = 1
+    CONFIRMED = 2
+    PARTIALLY_SHIPPED = 3
+    SHIPPED = 4
+    CANCELLED = 5

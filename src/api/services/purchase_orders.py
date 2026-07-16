@@ -1,0 +1,468 @@
+"""
+Business logic for the Purchase Orders feature: the per-distributor "Add to PO" cart (a DRAFT
+PurchaseOrder doubles as the cart — see src.models.PurchaseOrder), cart review/checkout, and
+PO/job status reads. Distributor calls themselves are never made synchronously here — every
+quote/submit/status/cancel operation is enqueued as a PurchaseOrderJob and processed by the
+``process_purchase_order_jobs`` management command; see
+``src.integrations.services.purchase_order_jobs``.
+"""
+import decimal
+import logging
+import typing
+
+from django.db import IntegrityError, transaction
+
+from src import enums as src_enums
+from src import models as src_models
+from src.integrations.orders import registry as order_registry
+from src.integrations.services import purchase_order_jobs
+
+logger = logging.getLogger(__name__)
+_LOG_PREFIX = "[PURCHASE-ORDERS-API]"
+
+_REQUIRED_SHIP_TO_FIELDS = ("name", "address1", "city", "state", "postal_code", "country")
+
+
+class PurchaseOrderServiceError(Exception):
+    """Raised for any client-correctable error (bad input, not found, wrong state)."""
+    pass
+
+
+# -- Serialization ------------------------------------------------------------------------
+
+
+def _decimal_to_float(value: typing.Optional[decimal.Decimal]) -> typing.Optional[float]:
+    return float(value) if value is not None else None
+
+
+def _serialize_line_item(li: src_models.PurchaseOrderLineItem) -> typing.Dict:
+    master_part = li.provider_part.master_part
+    return {
+        "id": li.id,
+        "provider_part_id": li.provider_part_id,
+        "part_number": master_part.part_number if master_part else None,
+        "brand_name": master_part.brand.name if master_part and master_part.brand_id else None,
+        "description": master_part.description if master_part else None,
+        "image_url": master_part.image_url if master_part else None,
+        "quantity": li.quantity,
+        "unit_cost": _decimal_to_float(li.unit_cost),
+        "line_total": _decimal_to_float(li.line_total),
+        "status": li.status,
+        "status_name": li.status_name,
+        "distributor_line_status_code": li.distributor_line_status_code,
+        "distributor_line_status_message": li.distributor_line_status_message,
+        "quantity_confirmed": li.quantity_confirmed,
+        "quantity_backordered": li.quantity_backordered,
+        "manufacturer_esd": li.manufacturer_esd.isoformat() if li.manufacturer_esd else None,
+        "distributor_order_id": li.distributor_order_id,
+    }
+
+
+def _serialize_distributor_order(pdo: src_models.PurchaseOrderDistributorOrder) -> typing.Dict:
+    return {
+        "id": pdo.id,
+        "distributor_order_number": pdo.distributor_order_number,
+        "warehouse_code": pdo.warehouse_code,
+        "status": pdo.status,
+        "status_name": pdo.status_name,
+        "tracking_numbers": pdo.tracking_numbers,
+        "carrier": pdo.carrier,
+    }
+
+
+def _serialize_purchase_order(po: src_models.PurchaseOrder, include_line_items: bool = True) -> typing.Dict:
+    provider = po.company_provider.provider
+    result = {
+        "id": po.id,
+        "po_number": po.po_number,
+        "status": po.status,
+        "status_name": po.status_name,
+        "source": po.source,
+        "source_name": po.source_name,
+        "company_provider_id": po.company_provider_id,
+        "provider_kind_name": provider.kind_name,
+        "provider_name": provider.name,
+        "group_id": po.group_id,
+        "ship_to": {
+            "name": po.ship_to_name,
+            "attention": po.ship_to_attention,
+            "address1": po.ship_to_address1,
+            "address2": po.ship_to_address2,
+            "city": po.ship_to_city,
+            "state": po.ship_to_state,
+            "postal_code": po.ship_to_postal_code,
+            "country": po.ship_to_country,
+            "phone": po.ship_to_phone,
+        }
+        if po.ship_to_address1
+        else None,
+        "ship_method": po.ship_method,
+        "subtotal": _decimal_to_float(po.subtotal),
+        "estimated_shipping": _decimal_to_float(po.estimated_shipping),
+        "total": _decimal_to_float(po.total),
+        "error_message": po.error_message,
+        "notes": po.notes,
+        "quoted_at": po.quoted_at.isoformat() if po.quoted_at else None,
+        "submitted_at": po.submitted_at.isoformat() if po.submitted_at else None,
+        "created_at": po.created_at.isoformat(),
+        "updated_at": po.updated_at.isoformat(),
+        "distributor_orders": [_serialize_distributor_order(pdo) for pdo in po.distributor_orders.all()],
+    }
+    if include_line_items:
+        result["line_items"] = [_serialize_line_item(li) for li in po.line_items.select_related(
+            "provider_part__master_part__brand"
+        ).all()]
+        result["item_count"] = sum(li["quantity"] for li in result["line_items"])
+    return result
+
+
+# -- Cart -----------------------------------------------------------------------------------
+
+
+def _resolve_user_profile_id(user_id: typing.Optional[int]) -> typing.Optional[int]:
+    if not user_id:
+        return None
+    profile = src_models.UserProfile.objects.filter(user_id=user_id).first()
+    return profile.id if profile else None
+
+
+def _get_or_create_draft(company_id: int, user_id: typing.Optional[int], company_provider_id: int) -> src_models.PurchaseOrder:
+    cp = (
+        src_models.CompanyProviders.objects.filter(id=company_provider_id, company_id=company_id)
+        .select_related("provider")
+        .first()
+    )
+    if not cp:
+        raise PurchaseOrderServiceError("Distributor connection not found for this company.")
+    if not order_registry.supports_ordering(cp.provider.kind):
+        raise PurchaseOrderServiceError(
+            "{} does not support in-app ordering yet.".format(cp.provider.name)
+        )
+
+    created_by_id = _resolve_user_profile_id(user_id)
+    try:
+        with transaction.atomic():
+            po, _created = src_models.PurchaseOrder.objects.get_or_create(
+                company_id=company_id,
+                company_provider=cp,
+                status=src_enums.PurchaseOrderStatus.DRAFT.value,
+                defaults={
+                    "status_name": src_enums.PurchaseOrderStatus.DRAFT.name,
+                    "source": src_enums.PurchaseOrderSource.STAFF_MANUAL.value,
+                    "source_name": src_enums.PurchaseOrderSource.STAFF_MANUAL.name,
+                    "created_by_id": created_by_id,
+                },
+            )
+    except IntegrityError:
+        po = src_models.PurchaseOrder.objects.get(
+            company_id=company_id, company_provider=cp, status=src_enums.PurchaseOrderStatus.DRAFT.value
+        )
+    return po
+
+
+def add_cart_item(
+    company_id: int,
+    user_id: typing.Optional[int],
+    company_provider_id: int,
+    provider_part_id: int,
+    quantity: int,
+) -> typing.Dict:
+    if not isinstance(quantity, int) or quantity <= 0:
+        raise PurchaseOrderServiceError("Quantity must be a positive integer.")
+
+    po = _get_or_create_draft(company_id, user_id, company_provider_id)
+
+    provider_part = src_models.ProviderPart.objects.filter(
+        id=provider_part_id, provider_id=po.company_provider.provider_id
+    ).first()
+    if not provider_part:
+        raise PurchaseOrderServiceError("Part not found for this distributor.")
+
+    pricing = src_models.ProviderPartCompanyPricing.objects.filter(
+        provider_part=provider_part, company_id=company_id
+    ).first()
+    unit_cost = pricing.cost if pricing else None
+
+    with transaction.atomic():
+        li = (
+            src_models.PurchaseOrderLineItem.objects.select_for_update()
+            .filter(purchase_order=po, provider_part=provider_part)
+            .first()
+        )
+        if li:
+            li.quantity += quantity
+            if unit_cost is not None:
+                li.unit_cost = unit_cost
+                li.line_total = unit_cost * li.quantity
+            li.save(update_fields=["quantity", "unit_cost", "line_total", "updated_at"])
+        else:
+            src_models.PurchaseOrderLineItem.objects.create(
+                purchase_order=po,
+                provider_part=provider_part,
+                quantity=quantity,
+                unit_cost=unit_cost,
+                line_total=(unit_cost * quantity) if unit_cost is not None else None,
+                status=src_enums.PurchaseOrderLineItemStatus.PENDING.value,
+                status_name=src_enums.PurchaseOrderLineItemStatus.PENDING.name,
+            )
+
+    return get_cart(company_id)
+
+
+def update_cart_item(company_id: int, line_item_id: int, quantity: int) -> typing.Dict:
+    if not isinstance(quantity, int) or quantity <= 0:
+        raise PurchaseOrderServiceError("Quantity must be a positive integer.")
+
+    li = src_models.PurchaseOrderLineItem.objects.filter(
+        id=line_item_id,
+        purchase_order__company_id=company_id,
+        purchase_order__status=src_enums.PurchaseOrderStatus.DRAFT.value,
+    ).first()
+    if not li:
+        raise PurchaseOrderServiceError("Cart item not found.")
+
+    li.quantity = quantity
+    if li.unit_cost is not None:
+        li.line_total = li.unit_cost * quantity
+    li.save(update_fields=["quantity", "line_total", "updated_at"])
+    return get_cart(company_id)
+
+
+def remove_cart_item(company_id: int, line_item_id: int) -> typing.Dict:
+    deleted, _ = src_models.PurchaseOrderLineItem.objects.filter(
+        id=line_item_id,
+        purchase_order__company_id=company_id,
+        purchase_order__status=src_enums.PurchaseOrderStatus.DRAFT.value,
+    ).delete()
+    if not deleted:
+        raise PurchaseOrderServiceError("Cart item not found.")
+    return get_cart(company_id)
+
+
+def get_cart(company_id: int) -> typing.Dict:
+    drafts = (
+        src_models.PurchaseOrder.objects.filter(
+            company_id=company_id, status=src_enums.PurchaseOrderStatus.DRAFT.value
+        )
+        .select_related("company_provider__provider")
+        .prefetch_related("line_items__provider_part__master_part__brand", "distributor_orders")
+        .order_by("company_provider__provider__name")
+    )
+    serialized = [_serialize_purchase_order(po) for po in drafts]
+    # Only carts that actually have line items count toward the badge/review flow — an empty
+    # DRAFT can exist momentarily (e.g. after removing the last item) without being "active".
+    active = [po for po in serialized if po["line_items"]]
+    return {
+        "purchase_orders": active,
+        "item_count": sum(po["item_count"] for po in active),
+    }
+
+
+# -- Review / checkout ------------------------------------------------------------------------
+
+
+def review_cart(
+    company_id: int,
+    user_id: typing.Optional[int],
+    ship_to: typing.Dict,
+    purchase_order_ids: typing.Optional[typing.List[int]] = None,
+    group_reference: typing.Optional[str] = None,
+) -> typing.Dict:
+    missing = [f for f in _REQUIRED_SHIP_TO_FIELDS if not ship_to.get(f)]
+    if missing:
+        raise PurchaseOrderServiceError("Missing required ship-to field(s): {}.".format(", ".join(missing)))
+
+    qs = src_models.PurchaseOrder.objects.filter(
+        company_id=company_id, status=src_enums.PurchaseOrderStatus.DRAFT.value
+    ).filter(line_items__isnull=False)
+    if purchase_order_ids:
+        qs = qs.filter(id__in=purchase_order_ids)
+    purchase_orders = list(qs.distinct())
+    if not purchase_orders:
+        raise PurchaseOrderServiceError("No cart items to review.")
+
+    created_by_id = _resolve_user_profile_id(user_id)
+    group = src_models.PurchaseOrderGroup.objects.create(
+        company_id=company_id, created_by_id=created_by_id, reference=group_reference
+    )
+
+    results = []
+    for po in purchase_orders:
+        po.group = group
+        po.ship_to_name = ship_to["name"]
+        po.ship_to_attention = ship_to.get("attention")
+        po.ship_to_address1 = ship_to["address1"]
+        po.ship_to_address2 = ship_to.get("address2")
+        po.ship_to_city = ship_to["city"]
+        po.ship_to_state = ship_to["state"]
+        po.ship_to_postal_code = ship_to["postal_code"]
+        po.ship_to_country = ship_to["country"]
+        po.ship_to_phone = ship_to.get("phone")
+        po.ship_method = ship_to.get("ship_method")
+        po.save(
+            update_fields=[
+                "group",
+                "ship_to_name",
+                "ship_to_attention",
+                "ship_to_address1",
+                "ship_to_address2",
+                "ship_to_city",
+                "ship_to_state",
+                "ship_to_postal_code",
+                "ship_to_country",
+                "ship_to_phone",
+                "ship_method",
+                "updated_at",
+            ]
+        )
+        job = purchase_order_jobs.enqueue_quote_job(po.id)
+        results.append({"purchase_order_id": po.id, "job_id": job.id})
+
+    return {"group_id": group.id, "purchase_orders": results}
+
+
+# -- PO / group reads -----------------------------------------------------------------------
+
+
+def get_purchase_order_detail(company_id: int, purchase_order_id: int) -> typing.Dict:
+    po = (
+        src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id)
+        .select_related("company_provider__provider")
+        .prefetch_related("line_items__provider_part__master_part__brand", "distributor_orders")
+        .first()
+    )
+    if not po:
+        raise PurchaseOrderServiceError("Purchase order not found.")
+    return _serialize_purchase_order(po)
+
+
+def list_purchase_orders(
+    company_id: int,
+    status: typing.Optional[int] = None,
+    company_provider_id: typing.Optional[int] = None,
+) -> typing.List[typing.Dict]:
+    qs = (
+        src_models.PurchaseOrder.objects.filter(company_id=company_id)
+        .exclude(status=src_enums.PurchaseOrderStatus.DRAFT.value)
+        .select_related("company_provider__provider")
+        .prefetch_related("distributor_orders")
+        .order_by("-created_at")
+    )
+    if status is not None:
+        qs = qs.filter(status=status)
+    if company_provider_id is not None:
+        qs = qs.filter(company_provider_id=company_provider_id)
+    return [_serialize_purchase_order(po, include_line_items=False) for po in qs[:200]]
+
+
+def get_purchase_order_group_detail(company_id: int, group_id: int) -> typing.Dict:
+    group = src_models.PurchaseOrderGroup.objects.filter(id=group_id, company_id=company_id).first()
+    if not group:
+        raise PurchaseOrderServiceError("Purchase order group not found.")
+    pos = (
+        group.purchase_orders.select_related("company_provider__provider")
+        .prefetch_related("line_items__provider_part__master_part__brand", "distributor_orders")
+        .all()
+    )
+    return {
+        "id": group.id,
+        "reference": group.reference,
+        "created_at": group.created_at.isoformat(),
+        "purchase_orders": [_serialize_purchase_order(po) for po in pos],
+    }
+
+
+# -- Submit / cancel / status -----------------------------------------------------------------
+
+
+def submit_purchase_order(company_id: int, purchase_order_id: int) -> typing.Dict:
+    po = src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id).first()
+    if not po:
+        raise PurchaseOrderServiceError("Purchase order not found.")
+    if po.status != src_enums.PurchaseOrderStatus.QUOTED.value:
+        raise PurchaseOrderServiceError(
+            "Purchase order must be quoted before it can be submitted (current status: {}).".format(
+                po.status_name
+            )
+        )
+    po.status = src_enums.PurchaseOrderStatus.SUBMITTING.value
+    po.status_name = src_enums.PurchaseOrderStatus.SUBMITTING.name
+    po.save(update_fields=["status", "status_name", "updated_at"])
+    job = purchase_order_jobs.enqueue_submit_job(po.id)
+    return {"purchase_order_id": po.id, "job_id": job.id}
+
+
+def submit_purchase_order_group(company_id: int, group_id: int) -> typing.Dict:
+    group = src_models.PurchaseOrderGroup.objects.filter(id=group_id, company_id=company_id).first()
+    if not group:
+        raise PurchaseOrderServiceError("Purchase order group not found.")
+    quoted_ids = list(
+        group.purchase_orders.filter(status=src_enums.PurchaseOrderStatus.QUOTED.value).values_list("id", flat=True)
+    )
+    if not quoted_ids:
+        raise PurchaseOrderServiceError("No quoted purchase orders in this group to submit.")
+    results = [submit_purchase_order(company_id, po_id) for po_id in quoted_ids]
+    return {"group_id": group_id, "purchase_orders": results}
+
+
+def get_job_status(company_id: int, purchase_order_id: int, job_id: int) -> typing.Dict:
+    job = src_models.PurchaseOrderJob.objects.filter(
+        id=job_id, purchase_order_id=purchase_order_id, purchase_order__company_id=company_id
+    ).first()
+    if not job:
+        raise PurchaseOrderServiceError("Job not found.")
+    return {
+        "id": job.id,
+        "purchase_order_id": job.purchase_order_id,
+        "operation": job.operation,
+        "operation_name": job.operation_name,
+        "status": job.status,
+        "status_name": job.status_name,
+        "message": job.message,
+        "error_message": job.error_message,
+        "attempt_count": job.attempt_count,
+        "created_at": job.created_at.isoformat(),
+        "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+    }
+
+
+def cancel_purchase_order(company_id: int, purchase_order_id: int) -> typing.Dict:
+    po = src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id).first()
+    if not po:
+        raise PurchaseOrderServiceError("Purchase order not found.")
+    terminal = {
+        src_enums.PurchaseOrderStatus.CANCELLED.value,
+        src_enums.PurchaseOrderStatus.FAILED.value,
+        src_enums.PurchaseOrderStatus.FULFILLED.value,
+    }
+    if po.status in terminal:
+        raise PurchaseOrderServiceError("Purchase order is already {}.".format(po.status_name.lower()))
+    job = purchase_order_jobs.enqueue_cancel_job(po.id)
+    return {"purchase_order_id": po.id, "job_id": job.id}
+
+
+def refresh_purchase_order_status(company_id: int, purchase_order_id: int) -> typing.Dict:
+    po = src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id).first()
+    if not po:
+        raise PurchaseOrderServiceError("Purchase order not found.")
+    job = purchase_order_jobs.enqueue_status_check_job(po.id)
+    return {"purchase_order_id": po.id, "job_id": job.id}
+
+
+# -- Capabilities ---------------------------------------------------------------------------
+
+
+def get_order_capabilities(company_id: int) -> typing.List[typing.Dict]:
+    company_providers = src_models.CompanyProviders.objects.filter(
+        company_id=company_id, active=True
+    ).select_related("provider")
+    return [
+        {
+            "company_provider_id": cp.id,
+            "provider_id": cp.provider_id,
+            "provider_kind_name": cp.provider.kind_name,
+            "provider_name": cp.provider.name,
+            "can_order_in_app": order_registry.supports_ordering(cp.provider.kind),
+        }
+        for cp in company_providers
+    ]

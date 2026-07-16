@@ -11,6 +11,7 @@ from django.db.models import Prefetch
 from src import constants as src_constants
 from src import enums as src_enums
 from src import models as src_models
+from src.integrations.orders import registry as order_registry
 from src.search import meilisearch_client as meilisearch_client
 
 logger = logging.getLogger(__name__)
@@ -330,6 +331,12 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
                 part,
                 pp.provider_external_id or "",
                 turn14_vmm,
+            ),
+            # Whether "Add to PO" (in-app ordering) is available for this distributor row —
+            # see src.integrations.orders.registry. False for every distributor whose order
+            # adapter phase hasn't landed yet; those rows keep provider_go_to_link only.
+            "can_order_in_app": bool(
+                integrated and pp.provider_id and order_registry.supports_ordering(pp.provider.kind)
             ),
             "company_integration": {
                 "connected": integrated,

@@ -199,11 +199,20 @@ SUPPORT_EMAIL_RECIPIENT_LIST = ["hajdukbet@gmail.com"]
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 NOTIFICATIONS_FROM_EMAIL = os.environ.get("NOTIFICATIONS_FROM_EMAIL", "no-reply@aftermarketscout.com")
 
-# Frontend app base URL, used to build links in transactional emails. Must be set per
-# environment — there's no safe default since it varies between staging/production.
-FRONTEND_BASE_URL = os.environ.get("FRONTEND_BASE_URL", "")
+# Frontend app base URL, used to build links in transactional emails.
+FRONTEND_BASE_URL = os.environ.get("FRONTEND_BASE_URL", "https://app.aftermarketscout.com")
 
 TURN14_BASE_URL = 'https://api.turn14.com/v1'
+
+# Turn 14 Electronic Order API (quote/order/status) — separate hosts for their "testing" and
+# "production" environments; the "environment" value must also be set to match in every
+# request body. Per Turn 14's docs, the testing environment is open to all API users
+# immediately; production order submission requires a separate access grant from
+# apisupport@turn14.com plus a completed test-mode order. Default to testing so nothing can
+# hit production by accident until that access is confirmed and this is deliberately flipped.
+TURN14_ORDER_TEST_BASE_URL = 'https://apitest.turn14.com/v1'
+TURN14_ORDER_PRODUCTION_BASE_URL = 'https://api.turn14.com/v1'
+TURN14_ORDER_ENVIRONMENT = os.environ.get("TURN14_ORDER_ENVIRONMENT", "testing")
 
 # Keystone FTP (implicit FTPS, port 990)
 KEYSTONE_FTP_HOST = 'ftp.ekeystone.com'
