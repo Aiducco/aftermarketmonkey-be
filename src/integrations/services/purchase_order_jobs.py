@@ -17,6 +17,7 @@ import logging
 import time
 import typing
 
+from django.core.cache import cache
 from django.db import connection, transaction
 from django.utils import timezone
 
@@ -25,6 +26,12 @@ from src import models as src_models
 from src.integrations.orders import base as order_base
 from src.integrations.orders import exceptions as order_exceptions
 from src.integrations.orders import registry as order_registry
+
+# The shipping-method catalog (code -> name/carrier) is near-static reference data, not
+# something that changes between quotes — cache it instead of calling the distributor's
+# method-list endpoint on every single quote just to fill in names.
+_SHIPPING_METHOD_NAMES_CACHE_TTL_SECONDS = 3600
+_SHIPPING_METHOD_NAMES_CACHE_KEY = "po_shipping_method_names:{}"
 
 logger = logging.getLogger(__name__)
 _LOG_PREFIX = "[PURCHASE-ORDER-JOBS]"
@@ -155,6 +162,36 @@ def _record_attempt(
     )
 
 
+def _get_shipping_method_names(
+    adapter: order_base.DistributorOrderAdapter, company_provider_id: int
+) -> typing.Dict[str, str]:
+    """
+    {code: name} lookup for this distributor connection, used to backfill ship_options
+    entries whose name came back blank in the quote itself (Turn 14's quote response often
+    omits verbose_eta, unlike GET /v1/shipping which always has a name) — so the FE never has
+    to show a bare code like "Method 20" or do its own cross-call merge.
+    """
+    if not adapter.supports_shipping_method_selection():
+        return {}
+    cache_key = _SHIPPING_METHOD_NAMES_CACHE_KEY.format(company_provider_id)
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        methods = adapter.list_shipping_methods()
+    except order_exceptions.OrderAdapterError:
+        logger.exception(
+            "{} Failed to fetch shipping method catalog for company_provider_id={}; "
+            "ship_options names may be blank for unnamed codes this run.".format(
+                _LOG_PREFIX, company_provider_id
+            )
+        )
+        return {}
+    names = {m.code: m.name for m in methods if m.name}
+    cache.set(cache_key, names, _SHIPPING_METHOD_NAMES_CACHE_TTL_SECONDS)
+    return names
+
+
 def _run_quote(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrderAdapter) -> None:
     _ensure_po_number(po)
     ship_to = _ship_to_from_purchase_order(po)
@@ -171,6 +208,8 @@ def _run_quote(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrde
         po, src_enums.PurchaseOrderOperation.QUOTE, True, response_payload=result.raw_response, duration_ms=duration_ms
     )
 
+    method_names = _get_shipping_method_names(adapter, po.company_provider_id)
+
     by_line_item_id = {li.id: li for li in po.line_items.all()}
     for quote_line in result.lines:
         li = by_line_item_id.get(quote_line.line_item_id)
@@ -183,7 +222,10 @@ def _run_quote(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrde
         li.ship_options = [
             {
                 "code": opt.service_level_code,
-                "name": opt.service_level_name,
+                # Falls back to the distributor's method-name catalog when the quote itself
+                # didn't name this option (e.g. Turn14 often omits verbose_eta) — the FE
+                # should never need to show a bare code.
+                "name": opt.service_level_name or method_names.get(opt.service_level_code, ""),
                 # Stored as float, not Decimal: this JSON blob is for display/selection, not
                 # financial calculation (those still go through unit_cost/line_total
                 # DecimalFields) — a plain number round-trips through JSON cleanly, whereas
