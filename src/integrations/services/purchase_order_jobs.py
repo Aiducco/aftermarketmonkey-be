@@ -170,13 +170,27 @@ def _get_shipping_method_names(
     entries whose name came back blank in the quote itself (Turn 14's quote response often
     omits verbose_eta, unlike GET /v1/shipping which always has a name) — so the FE never has
     to show a bare code like "Method 20" or do its own cross-call merge.
+
+    This is a display nicety layered on top of quoting, not part of quoting itself — a broken
+    cache backend must never be able to fail an otherwise-successful quote. Every cache access
+    is therefore best-effort: on any cache error, skip caching and fall through to a live
+    (uncached) name lookup rather than propagating the exception.
     """
     if not adapter.supports_shipping_method_selection():
         return {}
+
     cache_key = _SHIPPING_METHOD_NAMES_CACHE_KEY.format(company_provider_id)
-    cached = cache.get(cache_key)
+    try:
+        cached = cache.get(cache_key)
+    except Exception:
+        logger.warning(
+            "{} Cache unavailable reading shipping method names for company_provider_id={}; "
+            "falling back to a live (uncached) lookup.".format(_LOG_PREFIX, company_provider_id)
+        )
+        cached = None
     if cached is not None:
         return cached
+
     try:
         methods = adapter.list_shipping_methods()
     except order_exceptions.OrderAdapterError:
@@ -187,8 +201,17 @@ def _get_shipping_method_names(
             )
         )
         return {}
+
     names = {m.code: m.name for m in methods if m.name}
-    cache.set(cache_key, names, _SHIPPING_METHOD_NAMES_CACHE_TTL_SECONDS)
+    try:
+        cache.set(cache_key, names, _SHIPPING_METHOD_NAMES_CACHE_TTL_SECONDS)
+    except Exception:
+        logger.warning(
+            "{} Cache unavailable writing shipping method names for company_provider_id={}; "
+            "will re-fetch live next time instead of using the cache.".format(
+                _LOG_PREFIX, company_provider_id
+            )
+        )
     return names
 
 
