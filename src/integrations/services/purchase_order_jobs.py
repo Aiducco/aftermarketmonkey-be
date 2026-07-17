@@ -13,6 +13,7 @@ developer running the management command by hand) is responsible for only creati
 jobs from an explicit, user-approved action. Never invoke this path speculatively.
 """
 import concurrent.futures
+import decimal
 import logging
 import time
 import typing
@@ -276,7 +277,61 @@ def _run_quote(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrde
     po.status = src_enums.PurchaseOrderStatus.QUOTED.value
     po.status_name = src_enums.PurchaseOrderStatus.QUOTED.name
     po.error_message = None
-    po.save(update_fields=["quote_raw_response", "quoted_at", "status", "status_name", "error_message", "updated_at"])
+    _compute_totals(po)
+    po.save(
+        update_fields=[
+            "quote_raw_response",
+            "quoted_at",
+            "status",
+            "status_name",
+            "error_message",
+            "subtotal",
+            "estimated_shipping",
+            "total",
+            "updated_at",
+        ]
+    )
+
+
+def _compute_totals(po: src_models.PurchaseOrder) -> None:
+    """
+    Sets po.subtotal/estimated_shipping/total from the just-quoted line items (mutates po
+    in place; caller is responsible for saving). subtotal is our own catalog pricing
+    (line_total, frozen at add-to-cart time) — a distributor quote confirms availability and
+    shipping, not unit price. estimated_shipping is summed once per shipment, not once per
+    line: lines sharing a warehouse_code are the same shipment and quote identical
+    ship_options, so summing per line would double/triple-count it. Uses po.ship_method's cost
+    for a shipment when set and offered there, else that shipment's cheapest option — the same
+    default submit_order() falls back to when no method was explicitly chosen.
+    """
+    line_items = list(po.line_items.all())
+    subtotal = (
+        sum((li.line_total for li in line_items if li.line_total is not None), decimal.Decimal("0"))
+        if line_items
+        else None
+    )
+
+    shipment_costs = {}
+    for li in line_items:
+        if not li.ship_options:
+            continue
+        shipment_key = li.warehouse_code or "line-{}".format(li.id)
+        if shipment_key in shipment_costs:
+            continue
+        priced_options = [opt for opt in li.ship_options if opt.get("cost") is not None]
+        chosen = None
+        if po.ship_method:
+            chosen = next((opt for opt in priced_options if opt.get("code") == po.ship_method), None)
+        if chosen is None and priced_options:
+            chosen = min(priced_options, key=lambda opt: opt["cost"])
+        if chosen is not None:
+            shipment_costs[shipment_key] = decimal.Decimal(str(chosen["cost"]))
+
+    estimated_shipping = sum(shipment_costs.values(), decimal.Decimal("0")) if shipment_costs else None
+
+    po.subtotal = subtotal
+    po.estimated_shipping = estimated_shipping
+    po.total = (subtotal or decimal.Decimal("0")) + estimated_shipping if estimated_shipping is not None else subtotal
 
 
 def _run_submit(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrderAdapter) -> None:
