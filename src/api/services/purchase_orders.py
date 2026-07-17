@@ -1,9 +1,12 @@
 """
-Business logic for the Purchase Orders feature: the per-distributor "Add to PO" cart (a DRAFT
-PurchaseOrder doubles as the cart — see src.models.PurchaseOrder), cart review/checkout, and
-PO/job status reads. Distributor calls themselves are never made synchronously here — every
-quote/submit/status/cancel operation is enqueued as a PurchaseOrderJob and processed by the
-``process_purchase_order_jobs`` management command; see
+Business logic for the Purchase Orders feature: the per-distributor "Add to PO" cart (a
+DRAFT/QUOTED PurchaseOrder doubles as the cart — see src.models.PurchaseOrder and
+_cart_queryset below), cart review/checkout, and PO/job status reads. Requesting a quote does
+not create a separate "order" record — it only attaches quote data to the same cart row, which
+stays fully editable and invisible to order history until it's actually submitted. Distributor
+calls themselves are never made synchronously here except quoting (see
+run_quote_synchronously) — submit/status/cancel are enqueued as a PurchaseOrderJob and
+processed by the ``process_purchase_order_jobs`` management command; see
 ``src.integrations.services.purchase_order_jobs``.
 """
 import datetime
@@ -13,6 +16,7 @@ import typing
 
 from django.conf import settings
 from django.db import IntegrityError, transaction
+from django.db.models import Exists, OuterRef, Q
 from django.utils import timezone as django_timezone
 
 from src import enums as src_enums
@@ -155,9 +159,79 @@ def _get_company_provider(company_id: int, provider_id: int) -> src_models.Compa
     return cp
 
 
+def _cart_queryset(company_id: int):
+    """
+    POs that still belong to the "cart" world, as opposed to order history: never-submitted
+    DRAFT/QUOTED carts, plus a quote attempt that failed before ever reaching submit (still
+    editable/retryable from the cart, not a real order attempt). A FAILED PO that *did* reach
+    submit (a real, failed order attempt) is deliberately excluded — that belongs in order
+    history, not the cart. "Ever reached submit" is determined by whether a SUBMIT
+    PurchaseOrderJob was ever enqueued for it (see submit_purchase_order), not by status alone,
+    since both failure modes land on the same FAILED status.
+    """
+    ever_submitted = src_models.PurchaseOrderJob.objects.filter(
+        purchase_order_id=OuterRef("pk"), operation=src_enums.PurchaseOrderOperation.SUBMIT.value
+    )
+    return src_models.PurchaseOrder.objects.filter(company_id=company_id).annotate(
+        _ever_submitted=Exists(ever_submitted)
+    ).filter(
+        Q(
+            status__in=[
+                src_enums.PurchaseOrderStatus.DRAFT.value,
+                src_enums.PurchaseOrderStatus.QUOTED.value,
+            ]
+        )
+        | Q(status=src_enums.PurchaseOrderStatus.FAILED.value, _ever_submitted=False)
+    )
+
+
+def _revert_to_draft(po: src_models.PurchaseOrder) -> None:
+    """
+    Un-quotes a cart whose contents just changed (item added/edited/removed) — status drops
+    back to DRAFT and the previous quote's numbers are cleared so the FE never shows shipping
+    options/totals that no longer match what's actually in the cart; a fresh review is required
+    before it can be submitted again. ship_to/ship_method are left alone since they're still a
+    reasonable default for the next review.
+    """
+    po.status = src_enums.PurchaseOrderStatus.DRAFT.value
+    po.status_name = src_enums.PurchaseOrderStatus.DRAFT.name
+    po.quote_raw_response = None
+    po.quoted_at = None
+    po.subtotal = None
+    po.estimated_shipping = None
+    po.total = None
+    po.error_message = None
+    po.save(
+        update_fields=[
+            "status",
+            "status_name",
+            "quote_raw_response",
+            "quoted_at",
+            "subtotal",
+            "estimated_shipping",
+            "total",
+            "error_message",
+            "updated_at",
+        ]
+    )
+    po.line_items.update(
+        ship_options=None,
+        warehouse_code=None,
+        quantity_confirmed=None,
+        quantity_backordered=None,
+        manufacturer_esd=None,
+    )
+
+
 def _get_or_create_draft(
     company_id: int, user_id: typing.Optional[int], cp: src_models.CompanyProviders
 ) -> src_models.PurchaseOrder:
+    existing = _cart_queryset(company_id).filter(company_provider=cp).order_by("-created_at").first()
+    if existing:
+        if existing.status != src_enums.PurchaseOrderStatus.DRAFT.value:
+            _revert_to_draft(existing)
+        return existing
+
     created_by_id = _resolve_user_profile_id(user_id)
     try:
         with transaction.atomic():
@@ -244,10 +318,8 @@ def update_cart_item(company_id: int, line_item_id: int, quantity: int) -> typin
         raise PurchaseOrderServiceError("Quantity must be a positive integer.")
 
     li = src_models.PurchaseOrderLineItem.objects.filter(
-        id=line_item_id,
-        purchase_order__company_id=company_id,
-        purchase_order__status=src_enums.PurchaseOrderStatus.DRAFT.value,
-    ).first()
+        id=line_item_id, purchase_order_id__in=_cart_queryset(company_id).values("id")
+    ).select_related("purchase_order").first()
     if not li:
         raise PurchaseOrderServiceError("Cart item not found.")
 
@@ -255,25 +327,27 @@ def update_cart_item(company_id: int, line_item_id: int, quantity: int) -> typin
     if li.unit_cost is not None:
         li.line_total = li.unit_cost * quantity
     li.save(update_fields=["quantity", "line_total", "updated_at"])
+    if li.purchase_order.status != src_enums.PurchaseOrderStatus.DRAFT.value:
+        _revert_to_draft(li.purchase_order)
     return get_cart(company_id)
 
 
 def remove_cart_item(company_id: int, line_item_id: int) -> typing.Dict:
-    deleted, _ = src_models.PurchaseOrderLineItem.objects.filter(
-        id=line_item_id,
-        purchase_order__company_id=company_id,
-        purchase_order__status=src_enums.PurchaseOrderStatus.DRAFT.value,
-    ).delete()
-    if not deleted:
+    li = src_models.PurchaseOrderLineItem.objects.filter(
+        id=line_item_id, purchase_order_id__in=_cart_queryset(company_id).values("id")
+    ).select_related("purchase_order").first()
+    if not li:
         raise PurchaseOrderServiceError("Cart item not found.")
+    po = li.purchase_order
+    li.delete()
+    if po.status != src_enums.PurchaseOrderStatus.DRAFT.value:
+        _revert_to_draft(po)
     return get_cart(company_id)
 
 
 def get_cart(company_id: int) -> typing.Dict:
     drafts = (
-        src_models.PurchaseOrder.objects.filter(
-            company_id=company_id, status=src_enums.PurchaseOrderStatus.DRAFT.value
-        )
+        _cart_queryset(company_id)
         .select_related("company_provider__provider")
         .prefetch_related("line_items__provider_part__master_part__brand", "distributor_orders")
         .order_by("company_provider__provider__name")
@@ -331,8 +405,11 @@ def review_cart(
     if shipping_method_id and not ship_methods and purchase_order_ids and len(purchase_order_ids) == 1:
         ship_methods[str(purchase_order_ids[0])] = shipping_method_id
 
-    qs = src_models.PurchaseOrder.objects.filter(
-        company_id=company_id, status=src_enums.PurchaseOrderStatus.DRAFT.value
+    # DRAFT (never quoted) or FAILED (a previous quote attempt failed) — both are still cart
+    # territory. An already-QUOTED PO isn't picked up here: it either already has a usable
+    # quote (nothing to do) or is stale/needs retrying, which is requote_purchase_order's job.
+    qs = _cart_queryset(company_id).filter(
+        status__in=[src_enums.PurchaseOrderStatus.DRAFT.value, src_enums.PurchaseOrderStatus.FAILED.value]
     ).filter(line_items__isnull=False)
     if purchase_order_ids:
         qs = qs.filter(id__in=purchase_order_ids)
@@ -428,10 +505,13 @@ def list_purchase_orders(
     status: typing.Optional[typing.Union[int, str]] = None,
     company_provider_id: typing.Optional[int] = None,
 ) -> typing.List[typing.Dict]:
+    """Order history: everything that isn't still cart territory (see _cart_queryset) — a
+    quote, even a stale or failed one, is never "an order" here on its own; only a submit
+    attempt (successful or failed) is."""
     status_value = _parse_status_filter(status)
     qs = (
         src_models.PurchaseOrder.objects.filter(company_id=company_id)
-        .exclude(status=src_enums.PurchaseOrderStatus.DRAFT.value)
+        .exclude(id__in=_cart_queryset(company_id).values("id"))
         .select_related("company_provider__provider")
         .prefetch_related("distributor_orders")
         .order_by("-created_at")

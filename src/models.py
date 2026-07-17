@@ -1859,11 +1859,14 @@ class PurchaseOrder(django_db_models.Model):
     """
     A distributor-agnostic internal purchase order. See src.enums.PurchaseOrderStatus.
 
-    A DRAFT row doubles as the per-distributor "Add to PO" cart: at most one DRAFT
-    PurchaseOrder may exist per (company, company_provider) at a time (enforced below),
-    and adding an item to the cart finds-or-creates that row rather than ever risking a
-    second concurrent draft. po_number/ship_to_*/quote fields are populated once the cart
-    is reviewed (quoted), not at add-to-cart time.
+    A DRAFT/QUOTED row doubles as the per-distributor "Add to PO" cart: requesting a quote
+    does not turn a cart into a real order by itself, it only attaches quote data to the same
+    row (see src.api.services.purchase_orders._cart_queryset) — it still shows up in the cart,
+    is still fully editable (editing reverts it back to DRAFT since the quote no longer
+    matches), and is still invisible to order history. Only submit_order() moves a PO out of
+    cart territory for good. At most one open cart (DRAFT or QUOTED) may exist per
+    (company, company_provider) at a time (enforced below); "Add to PO" always finds-or-creates
+    this row rather than ever risking a second concurrent draft.
     """
     company = django_db_models.ForeignKey(
         Company, on_delete=django_db_models.CASCADE, related_name="purchase_orders"
@@ -1935,11 +1938,14 @@ class PurchaseOrder(django_db_models.Model):
             django_db_models.Index(fields=["company_provider", "status"], name="po_company_provider_status_idx"),
         ]
         constraints = [
-            # At most one open cart (DRAFT=1, see src.enums.PurchaseOrderStatus) per
-            # distributor connection at a time — "Add to PO" always finds-or-creates this row.
+            # At most one open cart (DRAFT=1 or QUOTED=2, see src.enums.PurchaseOrderStatus)
+            # per distributor connection at a time — "Add to PO" always finds-or-creates this
+            # row. A quote-failed cart (status=FAILED) isn't covered here since that requires
+            # a subquery a partial index can't express; the application layer
+            # (_get_or_create_draft) is responsible for finding and reusing that row too.
             django_db_models.UniqueConstraint(
                 fields=["company", "company_provider"],
-                condition=django_db_models.Q(status=1),
+                condition=django_db_models.Q(status__in=[1, 2]),
                 name="po_one_open_draft_per_company_provider",
             ),
         ]
