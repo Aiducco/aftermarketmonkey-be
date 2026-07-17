@@ -2,6 +2,7 @@
 Meilisearch client for parts search index.
 Backend uses master key for indexing; frontend will use a public read-only key.
 """
+import hashlib
 import logging
 import time
 import typing
@@ -267,11 +268,24 @@ def _build_docs_for_batch(
     return docs
 
 
-def _upload_raw_docs(docs: typing.List[typing.Dict], index_name: str = INDEX_NAME) -> bool:
+def _upload_raw_docs(
+    docs: typing.List[typing.Dict],
+    index_name: str = INDEX_NAME,
+    wait_for_completion: bool = False,
+) -> bool:
     """
     Upload pre-built document dicts to Meilisearch with retries.
     Returns True on success. Workers and single-threaded paths both use this.
     Pass ``index_name`` to target a staging index during zero-downtime reindex.
+
+    Meilisearch's add_documents() only enqueues an async task - a successful call here does
+    NOT mean the documents were actually accepted (e.g. an invalid document id fails
+    asynchronously, after this call already returned). Pass ``wait_for_completion=True`` to
+    poll the task and treat a non-"succeeded" status as a real failure instead of a false
+    positive. Off by default for the large parts-index bulk reindex (waiting per-batch would
+    meaningfully slow down a ~2.9M-row run, and its document ids are always plain MasterPart
+    integers so this specific failure mode can't occur there); the small vehicles index turns
+    it on since correctness matters more than throughput at that scale.
     """
     if not docs:
         return True
@@ -280,7 +294,17 @@ def _upload_raw_docs(docs: typing.List[typing.Dict], index_name: str = INDEX_NAM
         try:
             client = _get_client()
             index = client.index(index_name)
-            index.add_documents(docs, primary_key="id")
+            task = index.add_documents(docs, primary_key="id")
+            if wait_for_completion:
+                result = client.wait_for_task(task.task_uid, timeout_in_ms=300_000)
+                if result.status != "succeeded":
+                    logger.error(
+                        "Meilisearch _upload_raw_docs: task did not succeed | index=%s len=%s "
+                        "task_uid=%s status=%s error=%s",
+                        index_name, len(docs), task.task_uid, result.status,
+                        getattr(result, "error", None),
+                    )
+                    return False
             return True
         except Exception as e:
             last_err = e
@@ -703,9 +727,15 @@ def reindex_vehicles_index(batch_size: int = 5000) -> typing.Tuple[int, int]:
     docs_by_id: typing.Dict[str, typing.Dict] = {}
     for row in combos:
         for year in range(row["year_start"], row["year_end"] + 1):
-            doc_id = "{}|{}|{}|{}|{}|{}".format(
+            # Meilisearch document ids must be alphanumeric/hyphen/underscore only - vehicle
+            # make/model/submodel values routinely contain spaces, slashes, etc. (e.g. "TRX520FA6
+            # FourTrax Foreman Rubicon Auto DCT EPS"), so hash the natural composite key instead
+            # of using it directly as the id. year/make/model/etc. stay as separate filterable
+            # fields below, which is all the FE's facet queries actually need.
+            natural_key = "{}|{}|{}|{}|{}|{}".format(
                 year, row["make"], row["model"], row["submodel"], row["drive_type"], row["engine"],
             )
+            doc_id = hashlib.sha1(natural_key.encode("utf-8")).hexdigest()
             if doc_id not in docs_by_id:
                 docs_by_id[doc_id] = {
                     "id": doc_id,
@@ -728,11 +758,24 @@ def reindex_vehicles_index(batch_size: int = 5000) -> typing.Tuple[int, int]:
     total_fail = 0
     for i in range(0, len(docs), batch_size):
         chunk = docs[i:i + batch_size]
-        ok = _upload_raw_docs(chunk, index_name=INDEX_NAME_VEHICLES)
+        # wait_for_completion=True: small index, worth the wait to catch real failures instead
+        # of just an "enqueued OK" false positive (exactly what went wrong before this fix).
+        ok = _upload_raw_docs(chunk, index_name=INDEX_NAME_VEHICLES, wait_for_completion=True)
         if ok:
             total_ok += len(chunk)
         else:
             total_fail += len(chunk)
+
+    try:
+        actual_count = _get_client().index(INDEX_NAME_VEHICLES).get_stats().number_of_documents
+        logger.info("Meilisearch vehicles reindex: index now reports %s documents (sanity check).", actual_count)
+        if actual_count != total_ok:
+            logger.error(
+                "Meilisearch vehicles reindex: MISMATCH - uploaded %s ok but index reports %s documents.",
+                total_ok, actual_count,
+            )
+    except Exception:
+        logger.exception("Meilisearch vehicles reindex: failed to fetch index stats for sanity check.")
 
     logger.info(
         "Meilisearch vehicles reindex: done | indexed=%s failed=%s total_elapsed_s=%.1f",
