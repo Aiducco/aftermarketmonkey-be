@@ -385,6 +385,10 @@ except ValueError:
 MEILISEARCH_HOST = "http://localhost:7700"
 MEILISEARCH_MASTER_KEY = ""  # Set via env; required for indexing. Create a separate search-only key for FE.
 MEILISEARCH_INDEX_PARTS = "parts"
+# Small reference index driving the FE's Year/Make/Model cascading selector via facet search
+# (Meilisearch has no "value within range" filter, so this is built from MasterPartFitment
+# ranges expanded per-year, same as the parts index's fitment_keys field).
+MEILISEARCH_INDEX_VEHICLES = "vehicles"
 try:
     MEILISEARCH_REINDEX_BATCH_SIZE = int(os.environ.get("MEILISEARCH_REINDEX_BATCH_SIZE", "5000"))
 except ValueError:

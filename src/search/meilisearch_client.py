@@ -12,6 +12,7 @@ from django.conf import settings
 logger = logging.getLogger(__name__)
 
 INDEX_NAME = getattr(settings, "MEILISEARCH_INDEX_PARTS", "parts")
+INDEX_NAME_VEHICLES = getattr(settings, "MEILISEARCH_INDEX_VEHICLES", "vehicles")
 
 # Full reindex: tune via MEILISEARCH_REINDEX_BATCH_SIZE and MEILISEARCH_REINDEX_UPLOAD_WORKERS.
 # Larger batches + multiple parallel upload threads are faster; retries still cover transient HTTP errors.
@@ -40,7 +41,16 @@ def _transient_meilisearch_error(exc: BaseException) -> bool:
 SEARCHABLE_ATTRIBUTES = ["part_number", "sku", "description", "aaia_code"]
 
 # Filterable: for sidebar / API filters; categories come from first ProviderPart with non-empty category
-FILTERABLE_ATTRIBUTES = ["brand_name", "category", "overview_category"]
+# fitment_keys: one entry per (year, make, model) the part fits, plus a more specific
+# (year, make, model, submodel, drive_type, engine) entry when that data exists - see
+# _bulk_fitment_keys_map_for_ids().
+FILTERABLE_ATTRIBUTES = ["brand_name", "category", "overview_category", "fitment_keys"]
+
+# vehicles index: one doc per distinct (year, make, model, submodel, drive_type, engine) combo
+# from MasterPartFitment (expanded per-year). No searchable attributes - the FE drives this
+# purely through facet distribution + filters (cascading Year -> Make -> Model, then an optional
+# Submodel/Drivetrain/Engine refinement) to power the fitment_keys filter above.
+VEHICLES_FILTERABLE_ATTRIBUTES = ["year", "make", "model", "submodel", "drive_type", "engine"]
 
 
 def _get_client():
@@ -81,6 +91,27 @@ def setup_index() -> bool:
         return True
     except Exception as e:
         logger.exception("Meilisearch setup failed: %s", str(e))
+        return False
+
+
+def setup_vehicles_index() -> bool:
+    """
+    Create/configure the small ``vehicles`` reference index (filterable attributes only, no
+    searchable attributes - see VEHICLES_FILTERABLE_ATTRIBUTES). Idempotent.
+    """
+    if not is_configured():
+        logger.warning("Meilisearch not configured (MEILISEARCH_HOST empty). Skipping vehicles setup.")
+        return False
+
+    try:
+        client = _get_client()
+        index = client.index(INDEX_NAME_VEHICLES)
+        index.update_filterable_attributes(VEHICLES_FILTERABLE_ATTRIBUTES)
+        logger.info("Meilisearch index '%s' configured: filterable=%s",
+                    INDEX_NAME_VEHICLES, VEHICLES_FILTERABLE_ATTRIBUTES)
+        return True
+    except Exception as e:
+        logger.exception("Meilisearch vehicles setup failed: %s", str(e))
         return False
 
 
@@ -149,15 +180,70 @@ def _bulk_category_map_for_ids(
     return result
 
 
+def _fitment_keys_for_row(
+    year_start: int,
+    year_end: int,
+    make: str,
+    model: str,
+    submodel: str,
+    drive_type: str,
+    engine: str,
+) -> typing.List[str]:
+    """
+    Expand one MasterPartFitment row's year range into per-year keys. Always emits the coarse
+    "year|make|model" key; additionally emits the detailed key (with submodel/drive_type/engine)
+    when at least one of those three is non-blank, so the common all-blank case doesn't double
+    every entry for no reason. See the module-level design note in the fitment plan for why
+    per-year expansion (vs. storing the range) is needed to avoid cross-contamination in
+    Meilisearch's array filtering.
+    """
+    has_detail = bool((submodel or "").strip() or (drive_type or "").strip() or (engine or "").strip())
+    keys = []
+    for year in range(year_start, year_end + 1):
+        keys.append("{}|{}|{}".format(year, make, model))
+        if has_detail:
+            keys.append("{}|{}|{}|{}|{}|{}".format(year, make, model, submodel, drive_type, engine))
+    return keys
+
+
+def _bulk_fitment_keys_map_for_ids(
+    master_part_ids: typing.List[int],
+) -> typing.Dict[int, typing.List[str]]:
+    """
+    Single query: returns {master_part_id: [fitment_key, ...]} for all MasterPartFitment rows
+    belonging to the given ids, expanded per-year and deduped. Mirrors
+    _bulk_category_map_for_ids() — one query, grouped in Python, no per-part N+1.
+    """
+    from src.models import MasterPartFitment
+
+    result: typing.Dict[int, typing.Set[str]] = {}
+    if not master_part_ids:
+        return {}
+    qs = MasterPartFitment.objects.filter(master_part_id__in=master_part_ids).values(
+        "master_part_id", "year_start", "year_end", "make", "model", "submodel", "drive_type", "engine",
+    )
+    for row in qs:
+        mpid = row["master_part_id"]
+        keys = _fitment_keys_for_row(
+            row["year_start"], row["year_end"], row["make"], row["model"],
+            row["submodel"], row["drive_type"], row["engine"],
+        )
+        result.setdefault(mpid, set()).update(keys)
+    return {mpid: sorted(keys) for mpid, keys in result.items()}
+
+
 def _build_docs_for_batch(
     parts: typing.List,
     cat_map: typing.Dict[int, typing.Tuple[str, str]],
+    fitment_map: typing.Optional[typing.Dict[int, typing.List[str]]] = None,
 ) -> typing.List[typing.Dict]:
     """
     Build Meilisearch document dicts for a batch of MasterPart instances.
-    ``cat_map`` comes from _bulk_category_map_for_ids() — pre-computed in the main thread
-    so worker threads only do the HTTP upload, not DB queries.
+    ``cat_map`` comes from _bulk_category_map_for_ids(), ``fitment_map`` from
+    _bulk_fitment_keys_map_for_ids() — both pre-computed in the main thread so worker threads
+    only do the HTTP upload, not DB queries.
     """
+    fitment_map = fitment_map or {}
     docs = []
     for part in parts:
         brand_name = _get_brand_name(part)
@@ -174,6 +260,7 @@ def _build_docs_for_batch(
             "gtin": part.gtin or "",
             "category": category,
             "overview_category": overview_category,
+            "fitment_keys": fitment_map.get(part.id, []),
             "created_at": part.created_at.isoformat() if part.created_at else None,
             "updated_at": part.updated_at.isoformat() if part.updated_at else None,
         })
@@ -232,6 +319,7 @@ def master_part_to_index_shape(part) -> typing.Dict:
     """
     brand_name = _get_brand_name(part)
     category, overview_category = _index_categories_for_master_part(part)
+    fitment_keys = _bulk_fitment_keys_map_for_ids([part.id]).get(part.id, []) if getattr(part, "id", None) else []
     return {
         "id": part.id,
         "brand_id": part.brand_id,
@@ -244,6 +332,7 @@ def master_part_to_index_shape(part) -> typing.Dict:
         "gtin": part.gtin or "",
         "category": category or "",
         "overview_category": overview_category or "",
+        "fitment_keys": fitment_keys,
         "created_at": part.created_at.isoformat() if part.created_at else None,
         "updated_at": part.updated_at.isoformat() if part.updated_at else None,
     }
@@ -347,7 +436,8 @@ def add_documents_in_batches(
             id_first, id_last = batch[0].id, batch[-1].id
             batch_t0 = time.monotonic()
             cat_map = _bulk_category_map_for_ids([p.id for p in batch])
-            docs = _build_docs_for_batch(batch, cat_map)
+            fitment_map = _bulk_fitment_keys_map_for_ids([p.id for p in batch])
+            docs = _build_docs_for_batch(batch, cat_map, fitment_map)
             ok = _upload_raw_docs(docs, index_name=target_index_name)
             batch_dt = time.monotonic() - batch_t0
             if ok:
@@ -503,7 +593,8 @@ def add_documents_in_batches(
             id_first, id_last = batch[0].id, batch[-1].id
             # Build docs in the main thread (DB queries) so workers only handle HTTP.
             cat_map = _bulk_category_map_for_ids([p.id for p in batch])
-            docs = _build_docs_for_batch(batch, cat_map)
+            fitment_map = _bulk_fitment_keys_map_for_ids([p.id for p in batch])
+            docs = _build_docs_for_batch(batch, cat_map, fitment_map)
             in_flight.append(executor.submit(_upload_batch, docs, batch_index, id_first, id_last))
             while len(in_flight) >= max_in_flight:
                 done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
@@ -542,6 +633,79 @@ def add_documents_in_batches(
         total_fail,
         par_elapsed,
         par_rate,
+    )
+    return total_ok, total_fail
+
+
+def reindex_vehicles_index(batch_size: int = 5000) -> typing.Tuple[int, int]:
+    """
+    Rebuild the small ``vehicles`` reference index from MasterPartFitment: query distinct
+    (year_start, year_end, make, model, submodel, drive_type, engine) combos, expand each range
+    into individual years, dedupe, and replace the index wholesale (delete + upload). Cheap
+    enough (tens of thousands of docs at most, vs. millions in the parts index) that a brief
+    empty window during rebuild isn't worth zero-downtime staging/swap complexity.
+    Returns (total_indexed, total_failed). No-op (0, 0) if Meilisearch is not configured.
+    """
+    if not is_configured():
+        logger.warning("Meilisearch not configured; skipping vehicles reindex.")
+        return 0, 0
+
+    from src.models import MasterPartFitment
+
+    if not setup_vehicles_index():
+        logger.error("Meilisearch setup_vehicles_index failed; skipping vehicles reindex.")
+        return 0, 0
+
+    if not delete_all_documents(index_name=INDEX_NAME_VEHICLES):
+        logger.error("Meilisearch delete_all_documents (vehicles) failed; skipping vehicles reindex.")
+        return 0, 0
+
+    t0 = time.monotonic()
+    combos = list(
+        MasterPartFitment.objects.values(
+            "year_start", "year_end", "make", "model", "submodel", "drive_type", "engine",
+        ).distinct()
+    )
+
+    docs_by_id: typing.Dict[str, typing.Dict] = {}
+    for row in combos:
+        for year in range(row["year_start"], row["year_end"] + 1):
+            doc_id = "{}|{}|{}|{}|{}|{}".format(
+                year, row["make"], row["model"], row["submodel"], row["drive_type"], row["engine"],
+            )
+            if doc_id not in docs_by_id:
+                docs_by_id[doc_id] = {
+                    "id": doc_id,
+                    "year": year,
+                    "make": row["make"],
+                    "model": row["model"],
+                    "submodel": row["submodel"],
+                    "drive_type": row["drive_type"],
+                    "engine": row["engine"],
+                }
+    docs = list(docs_by_id.values())
+    logger.info(
+        "Meilisearch vehicles reindex: expanded %s distinct fitment combos into %s vehicle documents in %.1fs",
+        len(combos),
+        len(docs),
+        time.monotonic() - t0,
+    )
+
+    total_ok = 0
+    total_fail = 0
+    for i in range(0, len(docs), batch_size):
+        chunk = docs[i:i + batch_size]
+        ok = _upload_raw_docs(chunk, index_name=INDEX_NAME_VEHICLES)
+        if ok:
+            total_ok += len(chunk)
+        else:
+            total_fail += len(chunk)
+
+    logger.info(
+        "Meilisearch vehicles reindex: done | indexed=%s failed=%s total_elapsed_s=%.1f",
+        total_ok,
+        total_fail,
+        time.monotonic() - t0,
     )
     return total_ok, total_fail
 
@@ -750,26 +914,26 @@ def delete_document(part_id: int) -> bool:
         return False
 
 
-def delete_all_documents() -> bool:
+def delete_all_documents(index_name: str = INDEX_NAME) -> bool:
     """
-    Clear all documents from the parts index and wait for the async task to complete.
-    Meilisearch delete_all_documents() is asynchronous — without waiting, new documents
-    can be indexed into the index while the delete is still in progress.
+    Clear all documents from the given index (defaults to the parts index) and wait for the
+    async task to complete. Meilisearch delete_all_documents() is asynchronous — without
+    waiting, new documents can be indexed into the index while the delete is still in progress.
     """
     if not is_configured():
         return False
 
     try:
         client = _get_client()
-        index = client.index(INDEX_NAME)
+        index = client.index(index_name)
         task = index.delete_all_documents()
         logger.info(
             "Meilisearch: delete_all_documents enqueued | index=%s task_uid=%s; waiting for completion…",
-            INDEX_NAME,
+            index_name,
             task.task_uid,
         )
         client.wait_for_task(task.task_uid, timeout_in_ms=300_000)
-        logger.info("Meilisearch: all documents deleted from '%s'", INDEX_NAME)
+        logger.info("Meilisearch: all documents deleted from '%s'", index_name)
         return True
     except Exception as e:
         logger.exception("Meilisearch delete_all_documents failed: %s", str(e))
