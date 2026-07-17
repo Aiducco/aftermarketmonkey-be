@@ -637,6 +637,39 @@ def add_documents_in_batches(
     return total_ok, total_fail
 
 
+def reindex_master_parts_with_fitment(
+    batch_size: int = REINDEX_DEFAULT_BATCH_SIZE,
+    max_upload_workers: int = REINDEX_DEFAULT_UPLOAD_WORKERS,
+) -> typing.Tuple[int, int]:
+    """
+    Re-index only the MasterPart rows that have at least one MasterPartFitment row, instead of
+    the whole ~2.9M-row catalog. Useful right after adding fitment_keys to the index (only a
+    small fraction of parts have any fitment data) or after a fitment sync (ASAP/Rough Country)
+    when you want updated fitment_keys live before the nightly full index_parts_meilisearch cron
+    runs. Writes directly into the live index (add_documents replaces existing docs by id) -
+    no delete_all_documents, no staging swap, since every other document is untouched.
+    Returns (total_indexed, total_failed). No-op (0, 0) if Meilisearch is not configured.
+    """
+    if not is_configured():
+        logger.warning("Meilisearch not configured; skipping fitment-only reindex.")
+        return 0, 0
+
+    from src.models import MasterPart
+
+    queryset = (
+        MasterPart.objects.filter(fitments__isnull=False)
+        .distinct()
+        .select_related("brand")
+        .order_by("id")
+    )
+    total = queryset.count()
+    logger.info(
+        "Meilisearch fitment-only reindex: %s MasterPart(s) with fitment data (of the full catalog).",
+        total,
+    )
+    return add_documents_in_batches(queryset, batch_size=batch_size, max_upload_workers=max_upload_workers)
+
+
 def reindex_vehicles_index(batch_size: int = 5000) -> typing.Tuple[int, int]:
     """
     Rebuild the small ``vehicles`` reference index from MasterPartFitment: query distinct

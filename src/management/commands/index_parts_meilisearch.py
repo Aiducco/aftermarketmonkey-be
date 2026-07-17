@@ -7,6 +7,7 @@ from src.search.meilisearch_client import (
     is_configured,
     reindex_all_master_parts,
     reindex_all_master_parts_zero_downtime,
+    reindex_master_parts_with_fitment,
     setup_index,
 )
 
@@ -41,6 +42,16 @@ class Command(BaseCommand):
             action="store_true",
             help="Use legacy delete-then-reindex instead of zero-downtime swap_indexes.",
         )
+        parser.add_argument(
+            "--fitment-only",
+            action="store_true",
+            help=(
+                "Only re-index MasterParts that have fitment data (a small fraction of the "
+                "catalog), instead of the full ~2.9M-row reindex. Writes directly into the live "
+                "index (no delete/staging). Use this to get fresh fitment_keys live without "
+                "waiting for the next full nightly reindex."
+            ),
+        )
 
     def handle(self, *args, **options):
         if not is_configured():
@@ -54,6 +65,17 @@ class Command(BaseCommand):
         batch_size = options["batch_size"] or REINDEX_DEFAULT_BATCH_SIZE
         upload_workers = options.get("upload_workers") or REINDEX_DEFAULT_UPLOAD_WORKERS
         no_zero_downtime = options.get("no_zero_downtime", False)
+
+        if options.get("fitment_only"):
+            self.stdout.write("Fitment-only reindex (MasterParts with fitment data, live index)...")
+            ok, fail = reindex_master_parts_with_fitment(
+                batch_size=batch_size,
+                max_upload_workers=upload_workers,
+            )
+            self.stdout.write(
+                self.style.SUCCESS("Indexed {} parts. Failed: {}.".format(ok, fail))
+            )
+            return
 
         total = src_models.MasterPart.objects.count()
 
