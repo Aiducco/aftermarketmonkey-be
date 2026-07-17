@@ -335,12 +335,15 @@ def _compute_totals(po: src_models.PurchaseOrder) -> None:
 
 
 def _run_submit(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrderAdapter) -> None:
-    _ensure_po_number(po)
-    ship_to = _ship_to_from_purchase_order(po)
-    line_items = _line_item_requests(po)
-
     started = time.monotonic()
     try:
+        # Pre-flight (po_number/ship_to/line_items) is inside the try, not before it: it can
+        # raise OrderValidationError just like the distributor call can, and if it did so
+        # outside this block the PO would be left stuck at SUBMITTING with no error_message —
+        # silently un-actionable instead of visibly FAILED.
+        _ensure_po_number(po)
+        ship_to = _ship_to_from_purchase_order(po)
+        line_items = _line_item_requests(po)
         result = adapter.submit_order(po, line_items, ship_to)
     except order_exceptions.OrderAdapterError as e:
         _record_attempt(po, src_enums.PurchaseOrderOperation.SUBMIT, False, error_message=str(e))
@@ -469,6 +472,14 @@ _RUNNERS = {
     src_enums.PurchaseOrderOperation.CANCEL.value: _run_cancel,
 }
 
+# Only operations that are safe to silently retry unattended: read-only (STATUS_CHECK) or
+# non-mutating on the distributor's side (QUOTE). SUBMIT/CANCEL are deliberately excluded —
+# see the comment at the re-queue site in run_purchase_order_job.
+_AUTO_RETRYABLE_OPERATIONS = {
+    src_enums.PurchaseOrderOperation.QUOTE.value,
+    src_enums.PurchaseOrderOperation.STATUS_CHECK.value,
+}
+
 
 def _resolve_po_and_adapter(
     purchase_order_id: int,
@@ -543,10 +554,17 @@ def run_purchase_order_job(job: src_models.PurchaseOrderJob) -> None:
         job.save(
             update_fields=["status", "status_name", "attempt_count", "error_message", "completed_at", "updated_at"]
         )
-        if job.attempt_count < job.max_attempts:
+        if job.operation in _AUTO_RETRYABLE_OPERATIONS and job.attempt_count < job.max_attempts:
             # Re-queue as a fresh OPEN job rather than retrying in place, so
             # claim_next_open_job's FIFO ordering keeps working and other jobs aren't
-            # starved by a stuck retry.
+            # starved by a stuck retry. SUBMIT/CANCEL are deliberately excluded from
+            # _AUTO_RETRYABLE_OPERATIONS: neither Turn 14 nor most distributors document an
+            # idempotency guarantee on our po_number, so a failure that happened *after* the
+            # distributor actually created/cancelled the order (e.g. a timeout on the response
+            # leg) could silently place or cancel a real order a second time if auto-retried.
+            # A failed SUBMIT/CANCEL job stays FAILED — a human decides the next step (for
+            # SUBMIT that's normally requote_purchase_order for a fresh quote_id, then submit
+            # again, never blindly resubmitting the same one).
             src_models.PurchaseOrderJob.objects.create(
                 purchase_order_id=job.purchase_order_id,
                 operation=job.operation,
