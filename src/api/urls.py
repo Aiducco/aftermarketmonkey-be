@@ -2,6 +2,7 @@ from django.contrib import admin
 from django.urls import path, include
 from src.api.views.authentication import LoginView, ChangePasswordView
 from src.api.views.company import CompanyDestinationsView
+from src.api.views.company_locations import CompanyLocationsView, CompanyLocationDetailView
 from src.api.views.integrations import (
     ProvidersCatalogView,
     ProviderConnectView,
@@ -297,6 +298,16 @@ urlpatterns = [
         "settings/company/",
         CompanySettingsView.as_view(),
         name="company_settings",
+    ),
+    path(
+        "settings/company/locations/",
+        CompanyLocationsView.as_view(),
+        name="company_locations",
+    ),
+    path(
+        "settings/company/locations/<int:id>/",
+        CompanyLocationDetailView.as_view(),
+        name="company_location_detail",
     ),
     path(
         "settings/company/team/",

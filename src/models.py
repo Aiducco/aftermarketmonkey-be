@@ -62,6 +62,36 @@ class CompanyOnboardingPreferences(django_db_models.Model):
         db_table = "company_onboarding_preferences"
 
 
+class CompanyLocation(django_db_models.Model):
+    """
+    A shop/warehouse address book entry for a company — e.g. "Main Warehouse", "Store #2".
+    Lets the checkout flow offer "ship to one of my locations" instead of typing the address
+    every time; fields mirror PurchaseOrder.ship_to_* so a location can be copied straight
+    into a quote's ship_to payload.
+    """
+    company = django_db_models.ForeignKey(Company, on_delete=django_db_models.CASCADE, related_name="locations")
+
+    label = django_db_models.CharField(max_length=100)
+
+    name = django_db_models.CharField(max_length=255)
+    attention = django_db_models.CharField(max_length=255, null=True, blank=True)
+    address1 = django_db_models.CharField(max_length=255)
+    address2 = django_db_models.CharField(max_length=255, null=True, blank=True)
+    city = django_db_models.CharField(max_length=128)
+    state = django_db_models.CharField(max_length=64)
+    postal_code = django_db_models.CharField(max_length=32)
+    country = django_db_models.CharField(max_length=64)
+    phone = django_db_models.CharField(max_length=32, null=True, blank=True)
+
+    is_primary = django_db_models.BooleanField(default=False)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "company_locations"
+
+
 class CompanyDestinations(django_db_models.Model):
     status = django_db_models.PositiveSmallIntegerField()
     status_name = django_db_models.CharField(max_length=255)

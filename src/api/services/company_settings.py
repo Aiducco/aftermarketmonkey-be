@@ -379,6 +379,7 @@ def delete_all_company_data(user, company_id: int) -> tuple[bool, str | None]:
         src_models.IntegrationRequest.objects.filter(company_id=company_id).delete()
         src_models.CompanyProviders.objects.filter(company_id=company_id).delete()
         src_models.CompanyDestinations.objects.filter(company_id=company_id).delete()
+        src_models.CompanyLocation.objects.filter(company_id=company_id).delete()
         src_models.CompanyBrands.objects.filter(company_id=company_id).delete()
         src_models.CompanyOnboardingPreferences.objects.filter(company_id=company_id).delete()
 
