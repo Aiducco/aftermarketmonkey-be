@@ -206,13 +206,14 @@ TURN14_BASE_URL = 'https://api.turn14.com/v1'
 
 # Turn 14 Electronic Order API (quote/order/status) — separate hosts for their "testing" and
 # "production" environments; the "environment" value must also be set to match in every
-# request body. Per Turn 14's docs, the testing environment is open to all API users
-# immediately; production order submission requires a separate access grant from
-# apisupport@turn14.com plus a completed test-mode order. Default to testing so nothing can
-# hit production by accident until that access is confirmed and this is deliberately flipped.
+# request body. Deliberately flipped to production: Turn 14 access confirmed, same
+# credentials work against both hosts. submit/cancel still only ever run from a manual,
+# human-watched invocation of process_purchase_order_jobs — cron never processes them
+# regardless of environment, so this doesn't change who can place a real order, only which
+# Turn 14 backend a manually-approved submit actually reaches.
 TURN14_ORDER_TEST_BASE_URL = 'https://apitest.turn14.com/v1'
 TURN14_ORDER_PRODUCTION_BASE_URL = 'https://api.turn14.com/v1'
-TURN14_ORDER_ENVIRONMENT = os.environ.get("TURN14_ORDER_ENVIRONMENT", "testing")
+TURN14_ORDER_ENVIRONMENT = os.environ.get("TURN14_ORDER_ENVIRONMENT", "production")
 
 # How long a PurchaseOrder's quote stays valid before submit is blocked and a re-quote is
 # required. Distributor pricing/availability can shift between quote and submit; this stops
