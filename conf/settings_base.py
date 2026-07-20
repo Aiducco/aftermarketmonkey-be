@@ -374,12 +374,20 @@ DLG_INVENTORY_REMOTE_FILE = os.environ.get("DLG_INVENTORY_REMOTE_FILE") or "dlg_
 DLG_INVENTORY_LOCAL_PATH = os.environ.get("DLG_INVENTORY_LOCAL_PATH", "/tmp/dlg_inventory.csv")
 
 # ASAP Network: paid catalog API, global token (not per-company — see CompanyProviders docstring
-# for why this isn't stored there). No documented rate limit; keep concurrency modest by default.
+# for why this isn't stored there). No documented rate limit. Lowered from an earlier default of
+# 8 concurrent workers after a full-catalog run hit repeated read timeouts - likely us overloading
+# their API, not just transient flakiness - so this also caps requests/second on top of
+# concurrency (see ASAP_NETWORK_MAX_REQUESTS_PER_SECOND). Paid per call; tune down further if
+# timeouts persist, or up once real limits are confirmed.
 ASAP_NETWORK_API_TOKEN = os.environ.get("ASAP_NETWORK_API_TOKEN", "")
 try:
-    ASAP_NETWORK_MAX_CONCURRENT_REQUESTS = int(os.environ.get("ASAP_NETWORK_MAX_CONCURRENT_REQUESTS", "8"))
+    ASAP_NETWORK_MAX_CONCURRENT_REQUESTS = int(os.environ.get("ASAP_NETWORK_MAX_CONCURRENT_REQUESTS", "4"))
 except ValueError:
-    ASAP_NETWORK_MAX_CONCURRENT_REQUESTS = 8
+    ASAP_NETWORK_MAX_CONCURRENT_REQUESTS = 4
+try:
+    ASAP_NETWORK_MAX_REQUESTS_PER_SECOND = int(os.environ.get("ASAP_NETWORK_MAX_REQUESTS_PER_SECOND", "5"))
+except ValueError:
+    ASAP_NETWORK_MAX_REQUESTS_PER_SECOND = 5
 
 # Meilisearch (backend: master key for indexing; FE will use a public read-only key)
 MEILISEARCH_HOST = "http://localhost:7700"

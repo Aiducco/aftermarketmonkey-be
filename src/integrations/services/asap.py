@@ -186,12 +186,21 @@ def sync_asap_products_for_brand(asap_brand: src_models.AsapBrand, force: bool =
     client = AsapApiClient()
     raw_products = client.get_products(asap_brand.external_id)  # {sku: {sku, title, changed}}
     skus = list(raw_products.keys())
+    total = len(skus)
 
     provider = _get_asap_provider()
     category_mapping = _load_category_mapping_by_source()
-    max_workers = max(1, int(getattr(settings, "ASAP_NETWORK_MAX_CONCURRENT_REQUESTS", 8) or 8))
+    max_workers = max(1, int(getattr(settings, "ASAP_NETWORK_MAX_CONCURRENT_REQUESTS", 4) or 4))
+
+    logger.info(
+        "{} Brand {!r}: {} product(s) found via ASAP; starting fetch (max_workers={}).".format(
+            _LOG_PREFIX, asap_brand.name, total, max_workers
+        )
+    )
 
     stats = {"processed": 0, "matched": 0, "unmatched": 0, "fetch_failed": 0, "fitments": 0}
+    completed = 0
+    progress_every = 25
 
     # Fetch product details concurrently (pure network I/O, independent per SKU); DB writes stay
     # on the main thread as each fetch completes, avoiding any concurrent-write races on
@@ -200,11 +209,19 @@ def sync_asap_products_for_brand(asap_brand: src_models.AsapBrand, force: bool =
         futures = {ex.submit(client.get_product_detail, sku): sku for sku in skus}
         for fut in as_completed(futures):
             sku = futures[fut]
+            completed += 1
             try:
                 product = fut.result()
             except Exception:
                 logger.exception("{} Failed to fetch ASAP product sku={}.".format(_LOG_PREFIX, sku))
                 stats["fetch_failed"] += 1
+                if completed % progress_every == 0 or completed == total:
+                    logger.info(
+                        "{} Brand {!r}: {}/{} fetched (matched={} unmatched={} fetch_failed={}).".format(
+                            _LOG_PREFIX, asap_brand.name, completed, total,
+                            stats["matched"], stats["unmatched"], stats["fetch_failed"],
+                        )
+                    )
                 continue
 
             stats["processed"] += 1
@@ -212,12 +229,20 @@ def sync_asap_products_for_brand(asap_brand: src_models.AsapBrand, force: bool =
                 matched = _process_asap_product(asap_brand, provider, product, category_mapping)
             except Exception:
                 logger.exception("{} Failed to process ASAP product sku={}.".format(_LOG_PREFIX, sku))
-                continue
+                matched = None
             if matched:
                 stats["matched"] += 1
                 stats["fitments"] += len(product.get("fitment") or [])
-            else:
+            elif matched is not None:
                 stats["unmatched"] += 1
+
+            if completed % progress_every == 0 or completed == total:
+                logger.info(
+                    "{} Brand {!r}: {}/{} fetched (matched={} unmatched={} fetch_failed={}).".format(
+                        _LOG_PREFIX, asap_brand.name, completed, total,
+                        stats["matched"], stats["unmatched"], stats["fetch_failed"],
+                    )
+                )
 
     asap_brand.last_synced_at = timezone.now()
     asap_brand.save(update_fields=["last_synced_at", "updated_at"])
