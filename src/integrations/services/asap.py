@@ -12,6 +12,7 @@ import typing
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from django.conf import settings
+from django.db import transaction
 from django.db.models.functions import Upper
 from django.utils import timezone
 
@@ -290,9 +291,14 @@ def _process_asap_product(
         )
         return False
 
-    _patch_master_part_core_fields(master_part, product, category_mapping)
-    _upsert_master_part_data(master_part, provider, product)
-    _upsert_master_part_fitments(master_part, provider, product)
+    # Atomic: if a later step fails (e.g. the fitment upsert), earlier writes for this same
+    # product (core-field patch, MasterPartData) shouldn't silently commit as a half-written
+    # product - that product would then count as "processed" without ever getting retried, since
+    # the brand-level last_synced_at checkpoint has no per-SKU granularity.
+    with transaction.atomic():
+        _patch_master_part_core_fields(master_part, product, category_mapping)
+        _upsert_master_part_data(master_part, provider, product)
+        _upsert_master_part_fitments(master_part, provider, product)
     return True
 
 
@@ -383,7 +389,14 @@ def _upsert_master_part_fitments(
     if not fitments:
         return
 
-    rows = []
+    # Keyed by the full unique_together tuple, last-wins: a single product's own fitment array
+    # can list the same application twice (confirmed against real ASAP data - e.g. a duplicate
+    # year/make/model/sub entry), and pgbulk.upsert's ON CONFLICT DO UPDATE raises
+    # psycopg2.errors.CardinalityViolation if the same conflict key appears twice in one
+    # statement. Same dedup reasoning as _dedupe_master_part_fitments_for_upsert in
+    # master_parts.py's Rough Country batch path, just inline since this list is always small
+    # (one product's fitment array, not a multi-thousand-row batch).
+    rows_by_key: typing.Dict[typing.Tuple, src_models.MasterPartFitment] = {}
     for f in fitments:
         try:
             year_start = int(f.get("from_year"))
@@ -399,18 +412,19 @@ def _upsert_master_part_fitments(
         model = (f.get("model") or "").strip()
         if not make or not model:
             continue
-        rows.append(
-            src_models.MasterPartFitment(
-                master_part=master_part,
-                year_start=year_start,
-                year_end=year_end,
-                make=make,
-                model=model,
-                submodel=(f.get("sub") or "").strip(),
-                source_provider=provider,
-            )
+        submodel = (f.get("sub") or "").strip()
+        key = (master_part.id, year_start, year_end, make, model, submodel, "", "")
+        rows_by_key[key] = src_models.MasterPartFitment(
+            master_part=master_part,
+            year_start=year_start,
+            year_end=year_end,
+            make=make,
+            model=model,
+            submodel=submodel,
+            source_provider=provider,
         )
 
+    rows = list(rows_by_key.values())
     if rows:
         pgbulk.upsert(
             src_models.MasterPartFitment,
