@@ -415,14 +415,45 @@ def add_documents(parts: typing.List) -> bool:
     return False
 
 
+def _batches(queryset, batch_size: int, ids: typing.Optional[typing.List[int]] = None):
+    """
+    Yields lists of model instances in batches of ``batch_size``. Default: cursor-based
+    pagination by id (``queryset.filter(id__gt=last_id)``) — fine for a plain indexed range
+    scan. Pass ``ids`` (a pre-materialized, already-deduped list of every id the caller wants)
+    to instead chunk that list directly and fetch each chunk via ``queryset.filter(id__in=chunk)``.
+
+    Use ``ids`` whenever ``queryset`` involves a JOIN+DISTINCT (or anything else expensive to
+    re-derive) that doesn't compose with keyset pagination: DISTINCT can't "resume where it
+    left off" the way a plain indexed range scan can, so re-running it on every single page
+    gets more expensive as the underlying tables grow. See reindex_master_parts_with_fitment
+    for the motivating case and the EXPLAIN numbers behind this.
+    """
+    if ids is not None:
+        for i in range(0, len(ids), batch_size):
+            chunk = ids[i:i + batch_size]
+            batch = list(queryset.filter(id__in=chunk).order_by("id"))
+            if batch:
+                yield batch
+        return
+    last_id = 0
+    while True:
+        batch = list(queryset.filter(id__gt=last_id).order_by("id")[:batch_size])
+        if not batch:
+            return
+        last_id = batch[-1].id
+        yield batch
+
+
 def add_documents_in_batches(
     queryset,
     batch_size: int = 10000,
     max_upload_workers: int = 1,
     target_index_name: str = INDEX_NAME,
+    ids: typing.Optional[typing.List[int]] = None,
 ) -> typing.Tuple[int, int]:
     """
-    Index all parts from a MasterPart queryset in batches (cursor-based by id).
+    Index all parts from a MasterPart queryset in batches (cursor-based by id by default — see
+    ``ids`` to batch over a pre-materialized id list instead).
     When ``max_upload_workers`` > 1, upload batches concurrently (each worker uses its own
     Meilisearch client). Main thread reads from Django; workers only serialize and POST.
     Pass ``target_index_name`` to write into a staging index (used by zero-downtime reindex).
@@ -441,7 +472,6 @@ def add_documents_in_batches(
     if max_upload_workers <= 1:
         total_ok = 0
         total_fail = 0
-        last_id = 0
         batch_num = 0
         loop_t0 = time.monotonic()
         last_progress_t = loop_t0
@@ -452,10 +482,7 @@ def add_documents_in_batches(
             batch_size,
         )
 
-        while True:
-            batch = list(queryset.filter(id__gt=last_id).order_by("id")[:batch_size])
-            if not batch:
-                break
+        for batch in _batches(queryset, batch_size, ids=ids):
             batch_num += 1
             id_first, id_last = batch[0].id, batch[-1].id
             batch_t0 = time.monotonic()
@@ -468,7 +495,6 @@ def add_documents_in_batches(
                 total_ok += len(batch)
             else:
                 total_fail += len(batch)
-            last_id = id_last
             dps = len(batch) / batch_dt if batch_dt > 0 else 0.0
             logger.info(
                 "Meilisearch bulk index: batch | num=%s id_range=%s..%s size=%s ok=%s "
@@ -591,7 +617,6 @@ def add_documents_in_batches(
 
     total_ok = 0
     total_fail = 0
-    last_id = 0
     max_in_flight = max(2, max_upload_workers * 2)
     in_flight = []
     batch_index = 0
@@ -608,11 +633,7 @@ def add_documents_in_batches(
     )
 
     with ThreadPoolExecutor(max_workers=max_upload_workers) as executor:
-        while True:
-            batch = list(queryset.filter(id__gt=last_id).order_by("id")[:batch_size])
-            if not batch:
-                break
-            last_id = batch[-1].id
+        for batch in _batches(queryset, batch_size, ids=ids):
             batch_index += 1
             id_first, id_last = batch[0].id, batch[-1].id
             # Build docs in the main thread (DB queries) so workers only handle HTTP.
@@ -672,26 +693,37 @@ def reindex_master_parts_with_fitment(
     when you want updated fitment_keys live before the nightly full index_parts_meilisearch cron
     runs. Writes directly into the live index (add_documents replaces existing docs by id) -
     no delete_all_documents, no staging swap, since every other document is untouched.
+
+    The distinct MasterPart ids with fitment data are computed once, from the fitment table's
+    own (much cheaper, index-only) side, rather than via the equivalent
+    ``MasterPart.objects.filter(fitments__isnull=False).distinct()`` re-run on every batch:
+    DISTINCT across an 18M+-row JOIN doesn't compose with keyset (id__gt) pagination the way a
+    plain indexed range scan does, so that version got more expensive on every single page as
+    the fitment table grew — confirmed via EXPLAIN: ~2.7M cost per page for the JOIN+DISTINCT
+    version (paid ~once per batch) vs. ~300K paid once, total, for this.
+
     Returns (total_indexed, total_failed). No-op (0, 0) if Meilisearch is not configured.
     """
     if not is_configured():
         logger.warning("Meilisearch not configured; skipping fitment-only reindex.")
         return 0, 0
 
-    from src.models import MasterPart
+    from src.models import MasterPart, MasterPartFitment
 
-    queryset = (
-        MasterPart.objects.filter(fitments__isnull=False)
-        .distinct()
-        .select_related("brand")
-        .order_by("id")
+    fitment_part_ids = list(
+        MasterPartFitment.objects.order_by().values_list("master_part_id", flat=True).distinct()
     )
-    total = queryset.count()
     logger.info(
         "Meilisearch fitment-only reindex: %s MasterPart(s) with fitment data (of the full catalog).",
-        total,
+        len(fitment_part_ids),
     )
-    return add_documents_in_batches(queryset, batch_size=batch_size, max_upload_workers=max_upload_workers)
+    if not fitment_part_ids:
+        return 0, 0
+
+    queryset = MasterPart.objects.select_related("brand")
+    return add_documents_in_batches(
+        queryset, batch_size=batch_size, max_upload_workers=max_upload_workers, ids=fitment_part_ids
+    )
 
 
 def reindex_vehicles_index(batch_size: int = 5000) -> typing.Tuple[int, int]:
