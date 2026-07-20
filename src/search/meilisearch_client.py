@@ -53,6 +53,13 @@ FILTERABLE_ATTRIBUTES = ["brand_name", "category", "overview_category", "fitment
 # Submodel/Drivetrain/Engine refinement) to power the fitment_keys filter above.
 VEHICLES_FILTERABLE_ATTRIBUTES = ["year", "make", "model", "submodel", "drive_type", "engine"]
 
+# Meilisearch's default maxValuesPerFacet (100) silently truncates facetDistribution once a
+# facet has more than 100 distinct values, keeping only the first 100 in sort order - for
+# "year" (118 distinct values spanning 1909-2026, sorted alphabetically/ascending) that cut off
+# every year from 2009 onward, making the newest and most commonly filtered-on model years
+# disappear from the FE's year dropdown even though the underlying data was always there.
+VEHICLES_MAX_VALUES_PER_FACET = 150
+
 
 def _get_client():
     """Lazy import to avoid import errors when meilisearch is not installed."""
@@ -108,8 +115,9 @@ def setup_vehicles_index() -> bool:
         client = _get_client()
         index = client.index(INDEX_NAME_VEHICLES)
         index.update_filterable_attributes(VEHICLES_FILTERABLE_ATTRIBUTES)
-        logger.info("Meilisearch index '%s' configured: filterable=%s",
-                    INDEX_NAME_VEHICLES, VEHICLES_FILTERABLE_ATTRIBUTES)
+        index.update_faceting_settings({"maxValuesPerFacet": VEHICLES_MAX_VALUES_PER_FACET})
+        logger.info("Meilisearch index '%s' configured: filterable=%s, maxValuesPerFacet=%s",
+                    INDEX_NAME_VEHICLES, VEHICLES_FILTERABLE_ATTRIBUTES, VEHICLES_MAX_VALUES_PER_FACET)
         return True
     except Exception as e:
         logger.exception("Meilisearch vehicles setup failed: %s", str(e))
