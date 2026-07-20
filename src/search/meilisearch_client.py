@@ -9,6 +9,7 @@ import typing
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 from django.conf import settings
+from django.db import connection
 
 logger = logging.getLogger(__name__)
 
@@ -462,8 +463,17 @@ def add_documents_in_batches(
     """
     Index all parts from a MasterPart queryset in batches (cursor-based by id by default — see
     ``ids`` to batch over a pre-materialized id list instead).
-    When ``max_upload_workers`` > 1, upload batches concurrently (each worker uses its own
-    Meilisearch client). Main thread reads from Django; workers only serialize and POST.
+
+    When ``max_upload_workers`` > 1:
+    - with ``ids=None`` (cursor pagination), only the *upload* is parallelized — each page's
+      starting point depends on the previous page's max id, so pages must be fetched in order
+      on a single thread; workers just serialize and POST.
+    - with ``ids`` given, each worker runs the entire per-batch pipeline (fetch, category/
+      fitment lookups, build, upload) independently on its own DB connection — see
+      _add_documents_parallel_by_ids. A pre-materialized id list has no ordering dependency
+      between chunks, so the DB work (usually the actual bottleneck, not the upload) overlaps
+      across workers too instead of serializing on one thread.
+
     Pass ``target_index_name`` to write into a staging index (used by zero-downtime reindex).
     Returns (total_indexed, total_failed).
     """
@@ -544,84 +554,10 @@ def add_documents_in_batches(
         )
         return total_ok, total_fail
 
-    def _upload_batch(
-        docs: typing.List[typing.Dict],
-        batch_index: int,
-        id_first: int,
-        id_last: int,
-    ) -> typing.Tuple[int, int]:
-        """Upload pre-built doc dicts. DB queries are done in the main thread; worker only does HTTP."""
-        if not docs:
-            return 0, 0
-        last_err: typing.Optional[BaseException] = None
-        upload_t0 = time.monotonic()
-        for attempt in range(_REINDEX_ADD_RETRIES):
-            try:
-                client = _get_client()
-                index = client.index(target_index_name)
-                index.add_documents(docs, primary_key="id")
-                upload_dt = time.monotonic() - upload_t0
-                dps = len(docs) / upload_dt if upload_dt > 0 else 0.0
-                if attempt > 0:
-                    logger.info(
-                        "Meilisearch parallel batch: success after retries | batch=%s id_range=%s..%s "
-                        "size=%s attempts=%s batch_s=%.3f dps=%.0f",
-                        batch_index,
-                        id_first,
-                        id_last,
-                        len(docs),
-                        attempt + 1,
-                        upload_dt,
-                        dps,
-                    )
-                else:
-                    logger.info(
-                        "Meilisearch parallel batch: ok | batch=%s id_range=%s..%s size=%s batch_s=%.3f dps=%.0f",
-                        batch_index,
-                        id_first,
-                        id_last,
-                        len(docs),
-                        upload_dt,
-                        dps,
-                    )
-                return len(docs), 0
-            except Exception as e:
-                last_err = e
-                if attempt < _REINDEX_ADD_RETRIES - 1 and _transient_meilisearch_error(e):
-                    wait_s = min(30.0, 2.0 ** attempt)
-                    logger.warning(
-                        "Meilisearch parallel batch: transient (will retry) | batch=%s id_range=%s..%s "
-                        "size=%s attempt=%s/%s wait_s=%.1f err_type=%s err=%s",
-                        batch_index,
-                        id_first,
-                        id_last,
-                        len(docs),
-                        attempt + 1,
-                        _REINDEX_ADD_RETRIES,
-                        wait_s,
-                        type(e).__name__,
-                        e,
-                    )
-                    time.sleep(wait_s)
-                    continue
-                logger.exception(
-                    "Meilisearch parallel batch: failed | batch=%s id_range=%s..%s size=%s err_type=%s",
-                    batch_index,
-                    id_first,
-                    id_last,
-                    len(docs),
-                    type(e).__name__,
-                )
-                return 0, len(docs)
-        if last_err:
-            logger.exception(
-                "Meilisearch parallel batch: exhausted retries | batch=%s id_range=%s..%s err=%s",
-                batch_index,
-                id_first,
-                id_last,
-                last_err,
-            )
-        return 0, len(docs)
+    if ids is not None:
+        return _add_documents_parallel_by_ids(
+            queryset, ids, batch_size, max_upload_workers, target_index_name
+        )
 
     total_ok = 0
     total_fail = 0
@@ -648,7 +584,11 @@ def add_documents_in_batches(
             cat_map = _bulk_category_map_for_ids([p.id for p in batch])
             fitment_map = _bulk_fitment_keys_map_for_ids([p.id for p in batch])
             docs = _build_docs_for_batch(batch, cat_map, fitment_map)
-            in_flight.append(executor.submit(_upload_batch, docs, batch_index, id_first, id_last))
+            in_flight.append(
+                executor.submit(
+                    _upload_docs_with_retries, docs, target_index_name, batch_index, id_first, id_last
+                )
+            )
             while len(in_flight) >= max_in_flight:
                 done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
                 for fut in done:
@@ -681,6 +621,190 @@ def add_documents_in_batches(
     logger.info(
         "Meilisearch bulk index: finished (parallel) | batches_submitted=%s total_ok=%s total_fail=%s "
         "elapsed_s=%.1f overall_dps=%.0f",
+        batch_index,
+        total_ok,
+        total_fail,
+        par_elapsed,
+        par_rate,
+    )
+    return total_ok, total_fail
+
+
+def _upload_docs_with_retries(
+    docs: typing.List[typing.Dict],
+    target_index_name: str,
+    batch_index: int,
+    id_first: int,
+    id_last: int,
+) -> typing.Tuple[int, int]:
+    """Upload pre-built doc dicts to Meilisearch, retrying transient errors. Standalone (not a
+    closure) so both the cursor-based parallel path (upload-only workers) and the id-list
+    parallel path (fetch+build+upload workers, see _add_documents_parallel_by_ids) can share it."""
+    if not docs:
+        return 0, 0
+    last_err: typing.Optional[BaseException] = None
+    upload_t0 = time.monotonic()
+    for attempt in range(_REINDEX_ADD_RETRIES):
+        try:
+            client = _get_client()
+            index = client.index(target_index_name)
+            index.add_documents(docs, primary_key="id")
+            upload_dt = time.monotonic() - upload_t0
+            dps = len(docs) / upload_dt if upload_dt > 0 else 0.0
+            if attempt > 0:
+                logger.info(
+                    "Meilisearch parallel batch: success after retries | batch=%s id_range=%s..%s "
+                    "size=%s attempts=%s batch_s=%.3f dps=%.0f",
+                    batch_index,
+                    id_first,
+                    id_last,
+                    len(docs),
+                    attempt + 1,
+                    upload_dt,
+                    dps,
+                )
+            else:
+                logger.info(
+                    "Meilisearch parallel batch: ok | batch=%s id_range=%s..%s size=%s batch_s=%.3f dps=%.0f",
+                    batch_index,
+                    id_first,
+                    id_last,
+                    len(docs),
+                    upload_dt,
+                    dps,
+                )
+            return len(docs), 0
+        except Exception as e:
+            last_err = e
+            if attempt < _REINDEX_ADD_RETRIES - 1 and _transient_meilisearch_error(e):
+                wait_s = min(30.0, 2.0 ** attempt)
+                logger.warning(
+                    "Meilisearch parallel batch: transient (will retry) | batch=%s id_range=%s..%s "
+                    "size=%s attempt=%s/%s wait_s=%.1f err_type=%s err=%s",
+                    batch_index,
+                    id_first,
+                    id_last,
+                    len(docs),
+                    attempt + 1,
+                    _REINDEX_ADD_RETRIES,
+                    wait_s,
+                    type(e).__name__,
+                    e,
+                )
+                time.sleep(wait_s)
+                continue
+            logger.exception(
+                "Meilisearch parallel batch: failed | batch=%s id_range=%s..%s size=%s err_type=%s",
+                batch_index,
+                id_first,
+                id_last,
+                len(docs),
+                type(e).__name__,
+            )
+            return 0, len(docs)
+    if last_err:
+        logger.exception(
+            "Meilisearch parallel batch: exhausted retries | batch=%s id_range=%s..%s err=%s",
+            batch_index,
+            id_first,
+            id_last,
+            last_err,
+        )
+    return 0, len(docs)
+
+
+def _add_documents_parallel_by_ids(
+    queryset,
+    ids: typing.List[int],
+    batch_size: int,
+    max_upload_workers: int,
+    target_index_name: str,
+) -> typing.Tuple[int, int]:
+    """
+    Like the cursor-based parallel path in add_documents_in_batches, but each worker runs the
+    FULL per-batch pipeline (fetch MasterParts for this chunk's ids, fetch category/fitment
+    maps, build docs, upload) on its own DB connection - not just the upload.
+
+    The cursor-based path only parallelizes the upload because each page's starting point
+    depends on the previous page's max id, so pages can't be fetched out of order. A
+    pre-materialized id list has no such dependency - any chunk can be fetched independently -
+    so here the DB work (the actual bottleneck: the fitment lookup pulls from a table that can
+    have well over a hundred rows per part) overlaps across workers too, instead of every
+    batch's fetch serializing on a single thread while workers mostly wait for input.
+
+    Each worker must close its own DB connection when done: Django hands each thread its own
+    connection automatically, and an unclosed one leaks for the life of the thread pool.
+    """
+
+    def _process_chunk(chunk: typing.List[int], batch_index: int) -> typing.Tuple[int, int]:
+        try:
+            batch = list(queryset.filter(id__in=chunk).order_by("id"))
+            if not batch:
+                return 0, 0
+            id_first, id_last = batch[0].id, batch[-1].id
+            cat_map = _bulk_category_map_for_ids([p.id for p in batch])
+            fitment_map = _bulk_fitment_keys_map_for_ids([p.id for p in batch])
+            docs = _build_docs_for_batch(batch, cat_map, fitment_map)
+        finally:
+            connection.close()
+        return _upload_docs_with_retries(docs, target_index_name, batch_index, id_first, id_last)
+
+    total_ok = 0
+    total_fail = 0
+    max_in_flight = max(2, max_upload_workers * 2)
+    in_flight = []
+    batch_index = 0
+    par_t0 = time.monotonic()
+    last_par_heartbeat = par_t0
+    chunks = [ids[i:i + batch_size] for i in range(0, len(ids), batch_size)]
+
+    logger.info(
+        "Meilisearch bulk index: started (parallel, db-side) | index=%s batch_size=%s "
+        "max_upload_workers=%s max_in_flight=%s total_ids=%s chunks=%s",
+        target_index_name,
+        batch_size,
+        max_upload_workers,
+        max_in_flight,
+        len(ids),
+        len(chunks),
+    )
+
+    with ThreadPoolExecutor(max_workers=max_upload_workers) as executor:
+        for chunk in chunks:
+            batch_index += 1
+            in_flight.append(executor.submit(_process_chunk, chunk, batch_index))
+            while len(in_flight) >= max_in_flight:
+                done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    in_flight.remove(fut)
+                    ok, fail = fut.result()
+                    total_ok += ok
+                    total_fail += fail
+                    now = time.monotonic()
+                    if now - last_par_heartbeat >= 60.0:
+                        elapsed = now - par_t0
+                        rate = total_ok / elapsed if elapsed > 0 else 0.0
+                        logger.info(
+                            "Meilisearch bulk index: heartbeat (parallel, db-side) | elapsed_s=%.0f "
+                            "total_ok=%s total_fail=%s overall_dps=%.0f in_flight=%s",
+                            elapsed,
+                            total_ok,
+                            total_fail,
+                            rate,
+                            len(in_flight),
+                        )
+                        last_par_heartbeat = now
+
+        for fut in in_flight:
+            ok, fail = fut.result()
+            total_ok += ok
+            total_fail += fail
+
+    par_elapsed = time.monotonic() - par_t0
+    par_rate = total_ok / par_elapsed if par_elapsed > 0 else 0.0
+    logger.info(
+        "Meilisearch bulk index: finished (parallel, db-side) | batches_submitted=%s total_ok=%s "
+        "total_fail=%s elapsed_s=%.1f overall_dps=%.0f",
         batch_index,
         total_ok,
         total_fail,
