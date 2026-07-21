@@ -109,7 +109,8 @@ class ProviderConnectView(views.View):
 
 class ProviderConnectionView(views.View):
     """
-    DELETE /integrations/connections/<company_provider_id>/ — disconnect.
+    DELETE /integrations/connections/<company_provider_id>/ — disconnect, optionally scoped to
+    one namespace via ?namespace=feed|order (omit to disconnect the whole connection).
     PATCH /integrations/connections/<company_provider_id>/ — partial credential update, same pricing sync enqueue as connect.
     """
 
@@ -138,9 +139,18 @@ class ProviderConnectionView(views.View):
                 status=400,
             )
 
+        namespace = request.GET.get("namespace") or None
+        if namespace is not None and namespace not in ("feed", "order"):
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": 'namespace must be "feed" or "order"'}),
+                status=400,
+            )
+
         success, err = integrations_services.disconnect_provider(
             company_id=company_id,
             company_provider_id=company_provider_id,
+            namespace=namespace,
         )
         if not success:
             return http.HttpResponse(

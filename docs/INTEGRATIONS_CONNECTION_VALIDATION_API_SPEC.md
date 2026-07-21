@@ -26,6 +26,7 @@ credentials** below for the full per-distributor field list.
 |--------|----------|------|
 | Connect (create) | `POST /api/integrations/catalog/<provider_id>/connect/` | Yes (Bearer) |
 | Update (partial patch) | `PATCH /api/integrations/connections/<company_provider_id>/` | Yes (Bearer) |
+| Disconnect | `DELETE /api/integrations/connections/<company_provider_id>/` | Yes (Bearer) |
 
 ---
 
@@ -237,6 +238,30 @@ and `order_connection_required_fields`/`order_connection_optional_fields`:
 Rotating Turn 14's `feed` credentials (client secret regenerated, etc.) does **not** touch
 `order` — PATCH each namespace explicitly, even when you're resubmitting the same new values to
 both.
+
+---
+
+## Disconnecting
+
+`DELETE /api/integrations/connections/<company_provider_id>/` — namespace-scoped, matching
+connect/PATCH:
+
+- **No query string** — disconnects the whole connection (deletes the row). This is the
+  original, still-default behavior; existing FE code calling this with no changes keeps working
+  exactly as before.
+- **`?namespace=feed`** — clears only the feed credentials and feed status
+  (`status`/`status_name`/`status_reason`/`status_checked_at` all go back to `null`), leaving
+  `order` untouched if it's configured. If `order` was `CONNECTED`, it's demoted to `WAITING`
+  (the order credentials themselves are still fine, they just can't be `CONNECTED` without a
+  live feed — see **Live status** below).
+- **`?namespace=order`** — clears only the order credentials and order status, leaving `feed`
+  untouched.
+- **If clearing a namespace leaves both `feed` and `order` empty**, the whole row is deleted —
+  same end state as the no-`namespace` call. An all-empty connection has no reason to exist, so
+  disconnecting the last configured namespace *is* disconnecting the connection.
+- An invalid `namespace` value (anything other than `feed`/`order`) returns `400`.
+- Success is `204 No Content` either way — check with a `GET` afterward if you need to know
+  whether the row still exists (i.e., whether the other namespace survived) or was deleted.
 
 ---
 

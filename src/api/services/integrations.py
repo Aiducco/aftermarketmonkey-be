@@ -1014,9 +1014,19 @@ def update_connection(
 def disconnect_provider(
     company_id: int,
     company_provider_id: int,
+    namespace: typing.Optional[str] = None,
 ) -> typing.Tuple[bool, typing.Optional[str]]:
     """
-    Delete CompanyProviders record. Must belong to company.
+    Disconnect a ``CompanyProviders`` connection. Must belong to company.
+
+    ``namespace=None`` (default): delete the whole row — the original, still-default behavior.
+
+    ``namespace="feed"`` / ``namespace="order"``: clear just that namespace's credentials and
+    status fields, leaving the other namespace's connection intact — the disconnect-side
+    counterpart to being able to save "feed" and "order" independently via connect/PATCH (see
+    connect_provider). If clearing a namespace leaves BOTH empty, the whole row is deleted, same
+    as the no-namespace case — an all-empty connection has no reason to exist.
+
     Returns (success, error_message). On success error_message is None.
     """
     cp = src_models.CompanyProviders.objects.filter(
@@ -1025,7 +1035,42 @@ def disconnect_provider(
     ).first()
     if not cp:
         return False, "Connection not found"
-    cp.delete()
+
+    if namespace is None:
+        cp.delete()
+        return True, None
+
+    if namespace not in ("feed", "order"):
+        return False, 'namespace must be "feed" or "order"'
+
+    creds = dict(cp.credentials or {})
+    creds[namespace] = {}
+    other_namespace = "order" if namespace == "feed" else "feed"
+
+    if namespace == "feed":
+        cp.status = None
+        cp.status_name = None
+        cp.status_reason = None
+        cp.status_checked_at = None
+        # Order can never be CONNECTED once feed isn't — demote rather than clear, since the
+        # order credentials themselves are still valid/unaffected by disconnecting feed.
+        if cp.order_status == src_enums.CompanyProviderOrderConnectionStatus.CONNECTED.value:
+            cp.order_status = src_enums.CompanyProviderOrderConnectionStatus.WAITING.value
+            cp.order_status_name = src_enums.CompanyProviderOrderConnectionStatus.WAITING.name
+            cp.order_status_reason = _ORDER_WAITING_ON_FEED_REASON
+            cp.order_status_checked_at = timezone.now()
+    else:
+        cp.order_status = None
+        cp.order_status_name = None
+        cp.order_status_reason = None
+        cp.order_status_checked_at = None
+
+    if not creds.get(other_namespace):
+        cp.delete()
+        return True, None
+
+    cp.credentials = creds
+    cp.save()
     return True, None
 
 
