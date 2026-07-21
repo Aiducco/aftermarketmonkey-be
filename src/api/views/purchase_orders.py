@@ -232,11 +232,14 @@ class PurchaseOrderDetailView(views.View):
 
 
 class PurchaseOrderSubmitView(views.View):
-    """POST /purchase-orders/<id>/submit/ — enqueues a SUBMIT job (places a real order).
-    Optional body: {ship_method?}. A quote returns every available shipping method's live
-    price, so the user picks one AFTER seeing the quote, not before — pass their choice here
-    (the shipping_code from that PO's line items' ship_options) to apply it just before
-    submitting. Omit to keep whatever was set at review time / the distributor's default."""
+    """POST /purchase-orders/<id>/submit/ — submits SYNCHRONOUSLY, placing a real order with
+    the distributor in the request/response cycle (see run_submit_synchronously). Optional
+    body: {ship_method?}. A quote returns every available shipping method's live price, so the
+    user picks one AFTER seeing the quote, not before — pass their choice here (the
+    shipping_code from that PO's line items' ship_options) to apply it just before submitting.
+    Omit to keep whatever was set at review time / the distributor's default. Returns the
+    updated PurchaseOrder directly — check status/error_message, since a distributor-side
+    failure doesn't raise here (same contract as .../requote/)."""
 
     def post(self, request: http.HttpRequest, *args, **kwargs) -> http.HttpResponse:
         company_id, _user_id, err = _require_auth(request)
@@ -258,7 +261,7 @@ class PurchaseOrderSubmitView(views.View):
             logger.exception("{} Error submitting purchase order id={}".format(_LOG_PREFIX, po_id))
             return _error_response("Error submitting purchase order", status=500)
 
-        return _json_response(result, status=202)
+        return _json_response(result, status=200)
 
 
 class PurchaseOrderCancelView(views.View):
@@ -369,9 +372,12 @@ class PurchaseOrderGroupDetailView(views.View):
 
 
 class PurchaseOrderGroupSubmitView(views.View):
-    """POST /purchase-orders/groups/<id>/submit/ — submits every QUOTED PO in the group.
-    Optional body: {ship_methods?: {"<purchase_order_id>": "<method_code>"}} — same per-PO
-    keying as cart/review/, since each distributor has its own method-code namespace."""
+    """POST /purchase-orders/groups/<id>/submit/ — submits every QUOTED PO in the group,
+    SYNCHRONOUSLY and sequentially (one real distributor call per PO, in the request/response
+    cycle — see submit_purchase_order). Optional body: {ship_methods?: {"<purchase_order_id>":
+    "<method_code>"}} — same per-PO keying as cart/review/, since each distributor has its own
+    method-code namespace. A per-PO failure doesn't abort the rest of the group; check each
+    result's status/error_message."""
 
     def post(self, request: http.HttpRequest, *args, **kwargs) -> http.HttpResponse:
         company_id, _user_id, err = _require_auth(request)
@@ -393,7 +399,7 @@ class PurchaseOrderGroupSubmitView(views.View):
             logger.exception("{} Error submitting purchase order group id={}".format(_LOG_PREFIX, group_id))
             return _error_response("Error submitting purchase order group", status=500)
 
-        return _json_response(result, status=202)
+        return _json_response(result, status=200)
 
 
 class PurchaseOrderCapabilitiesView(views.View):

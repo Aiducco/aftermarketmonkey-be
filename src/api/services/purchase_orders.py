@@ -3,10 +3,12 @@ Business logic for the Purchase Orders feature: the per-distributor "Add to PO" 
 DRAFT/QUOTED PurchaseOrder doubles as the cart — see src.models.PurchaseOrder and
 _cart_queryset below), cart review/checkout, and PO/job status reads. Requesting a quote does
 not create a separate "order" record — it only attaches quote data to the same cart row, which
-stays fully editable and invisible to order history until it's actually submitted. Distributor
-calls themselves are never made synchronously here except quoting (see
-run_quote_synchronously) — submit/status/cancel are enqueued as a PurchaseOrderJob and
-processed by the ``process_purchase_order_jobs`` management command; see
+stays fully editable and invisible to order history until it's actually submitted. Quote and
+submit are both called synchronously, directly in the request/response cycle (see
+run_quote_synchronously / run_submit_synchronously) — neither benefits from queue-and-poll, and
+gating submit on an explicit user request is what makes it safe to call a distributor's
+order-placement endpoint at all. Only status-check/cancel are enqueued as a PurchaseOrderJob
+and processed by the ``process_purchase_order_jobs`` management command; see
 ``src.integrations.services.purchase_order_jobs``.
 """
 import datetime
@@ -166,10 +168,14 @@ def _cart_queryset(company_id: int):
     editable/retryable from the cart, not a real order attempt). A FAILED PO that *did* reach
     submit (a real, failed order attempt) is deliberately excluded — that belongs in order
     history, not the cart. "Ever reached submit" is determined by whether a SUBMIT
-    PurchaseOrderJob was ever enqueued for it (see submit_purchase_order), not by status alone,
-    since both failure modes land on the same FAILED status.
+    PurchaseOrderSubmissionAttempt was ever recorded for it (see _run_submit's ``_record_attempt``
+    calls, which fire on both success and failure), not by status alone, since both failure
+    modes land on the same FAILED status. This used to check for an enqueued SUBMIT
+    PurchaseOrderJob instead, back when submit was job-queued — now that submit_purchase_order
+    calls the distributor directly (see run_submit_synchronously), the submission-attempt audit
+    row is the only record that a real submit was ever tried.
     """
-    ever_submitted = src_models.PurchaseOrderJob.objects.filter(
+    ever_submitted = src_models.PurchaseOrderSubmissionAttempt.objects.filter(
         purchase_order_id=OuterRef("pk"), operation=src_enums.PurchaseOrderOperation.SUBMIT.value
     )
     return src_models.PurchaseOrder.objects.filter(company_id=company_id).annotate(
@@ -554,11 +560,21 @@ def submit_purchase_order(
     company_id: int, purchase_order_id: int, ship_method: typing.Optional[str] = None
 ) -> typing.Dict:
     """
+    Places a REAL order with the distributor, synchronously — the caller (a POST to
+    .../submit/) is the only gate on this: it's what makes calling the distributor's
+    order-placement endpoint safe to do inline instead of behind a job queue a human has to
+    run by hand. See run_submit_synchronously for the safety rationale in full.
+
     ``ship_method``, when given, is applied to the PO right before submitting — this is how
     the user's shipping choice, made *after* seeing the quote's real priced options (a quote
     call returns every available method's live price/ETA, not just one), reaches the
     distributor. Leave unset to keep whatever was set at review time (or the distributor's
     default/cheapest, if nothing was ever set).
+
+    Never raises for a distributor-side failure — same contract as run_quote_synchronously —
+    so submit_purchase_order_group can keep submitting the rest of a multi-distributor group
+    instead of aborting the whole request. Returns the serialized PurchaseOrder either way;
+    check status/error_message to see whether it actually went through.
     """
     po = src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id).first()
     if not po:
@@ -582,8 +598,8 @@ def submit_purchase_order(
     po.status = src_enums.PurchaseOrderStatus.SUBMITTING.value
     po.status_name = src_enums.PurchaseOrderStatus.SUBMITTING.name
     po.save(update_fields=["status", "status_name", "updated_at"])
-    job = purchase_order_jobs.enqueue_submit_job(po.id)
-    return {"purchase_order_id": po.id, "job_id": job.id}
+    submitted_po = purchase_order_jobs.run_submit_synchronously(po.id)
+    return _serialize_purchase_order(submitted_po)
 
 
 def requote_purchase_order(company_id: int, purchase_order_id: int) -> typing.Dict:

@@ -207,10 +207,11 @@ TURN14_BASE_URL = 'https://api.turn14.com/v1'
 # Turn 14 Electronic Order API (quote/order/status) — separate hosts for their "testing" and
 # "production" environments; the "environment" value must also be set to match in every
 # request body. Deliberately flipped to production: Turn 14 access confirmed, same
-# credentials work against both hosts. submit/cancel still only ever run from a manual,
-# human-watched invocation of process_purchase_order_jobs — cron never processes them
-# regardless of environment, so this doesn't change who can place a real order, only which
-# Turn 14 backend a manually-approved submit actually reaches.
+# credentials work against both hosts. Submit is only ever triggered by an explicit,
+# authenticated POST .../submit/ request (run_submit_synchronously) and cancel still only ever
+# runs from a manual, human-watched invocation of process_purchase_order_jobs — cron never
+# processes cancel jobs regardless of environment, so this doesn't change who can place a real
+# order, only which Turn 14 backend a submit/cancel actually reaches.
 TURN14_ORDER_TEST_BASE_URL = 'https://apitest.turn14.com/v1'
 TURN14_ORDER_PRODUCTION_BASE_URL = 'https://api.turn14.com/v1'
 TURN14_ORDER_ENVIRONMENT = os.environ.get("TURN14_ORDER_ENVIRONMENT", "production")

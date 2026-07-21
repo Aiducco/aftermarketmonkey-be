@@ -1,16 +1,21 @@
 """
 Enqueue and run PurchaseOrderJob rows (no Celery) — same claim/run/process shape as
 ``integration_pricing_sync_jobs.py``, but scoped to a single PurchaseOrder + operation
-(quote / submit / status check / cancel) rather than a whole company-provider pricing sync.
+(status check / cancel) rather than a whole company-provider pricing sync. Quote and submit
+are both called synchronously (see run_quote_synchronously / run_submit_synchronously) —
+neither is mutating in a way that benefits from queue-and-poll, and submit in particular is
+only ever invoked from an explicit, user-approved request, so the queue added latency without
+adding a safety property of its own.
 
 Every distributor call is dispatched through ``src.integrations.orders.registry``, so this
 module has no distributor-specific logic of its own — it only knows how to translate a
 PurchaseOrder + its line items into the adapter's dataclasses and write the result back.
 
-SAFETY: run_purchase_order_job() for a SUBMIT operation places a REAL order with the
-distributor. This module does not gate that on its own — the caller (the API layer, or a
-developer running the management command by hand) is responsible for only creating SUBMIT
-jobs from an explicit, user-approved action. Never invoke this path speculatively.
+SAFETY: run_submit_synchronously() and run_purchase_order_job() for a CANCEL operation place
+or affect a REAL order with the distributor. Neither is gated internally — the caller (the API
+layer, or a developer running the management command by hand for CANCEL) is responsible for
+only invoking them from an explicit, user-approved action. Never invoke either path
+speculatively (e.g. from a batch job or cron).
 """
 import concurrent.futures
 import decimal
@@ -36,10 +41,6 @@ _SHIPPING_METHOD_NAMES_CACHE_KEY = "po_shipping_method_names:{}"
 
 logger = logging.getLogger(__name__)
 _LOG_PREFIX = "[PURCHASE-ORDER-JOBS]"
-
-
-def enqueue_submit_job(purchase_order_id: int) -> src_models.PurchaseOrderJob:
-    return _enqueue(purchase_order_id, src_enums.PurchaseOrderOperation.SUBMIT)
 
 
 def enqueue_status_check_job(purchase_order_id: int) -> src_models.PurchaseOrderJob:
@@ -75,8 +76,9 @@ def claim_next_open_job(
     Atomically mark one OPEN job as RUNNING. Returns None if none available.
 
     ``allowed_operations``, when given, restricts which PurchaseOrderOperation values this
-    claim will pick up — e.g. cron only ever claims QUOTE/STATUS_CHECK (non-mutating, safe to
-    automate); SUBMIT/CANCEL are left OPEN for a human to process on demand while watching.
+    claim will pick up — e.g. cron only ever claims STATUS_CHECK (non-mutating, safe to
+    automate); CANCEL is left OPEN for a human to process on demand while watching. SUBMIT is
+    no longer job-queued at all — see run_submit_synchronously.
     """
     with transaction.atomic():
         qs = src_models.PurchaseOrderJob.objects.select_for_update(skip_locked=True).filter(
@@ -473,8 +475,10 @@ _RUNNERS = {
 }
 
 # Only operations that are safe to silently retry unattended: read-only (STATUS_CHECK) or
-# non-mutating on the distributor's side (QUOTE). SUBMIT/CANCEL are deliberately excluded —
-# see the comment at the re-queue site in run_purchase_order_job.
+# non-mutating on the distributor's side (QUOTE). CANCEL is deliberately excluded — see the
+# comment at the re-queue site in run_purchase_order_job. (SUBMIT no longer flows through
+# PurchaseOrderJob at all — see run_submit_synchronously — but stays out of this set too,
+# since _RUNNERS still carries a SUBMIT entry for symmetry/defensiveness.)
 _AUTO_RETRYABLE_OPERATIONS = {
     src_enums.PurchaseOrderOperation.QUOTE.value,
     src_enums.PurchaseOrderOperation.STATUS_CHECK.value,
@@ -505,8 +509,8 @@ def _resolve_po_and_adapter(
 def run_quote_synchronously(purchase_order_id: int) -> src_models.PurchaseOrder:
     """
     Quoting is non-mutating on the distributor's side (Turn 14's own docs: a quote "cannot be
-    viewed from the Turn 14 website until promoted to an order"), so unlike submit/cancel it
-    doesn't need the job queue's deliberate-gating — it's called directly in the request/
+    viewed from the Turn 14 website until promoted to an order"), so unlike cancel it doesn't
+    need the job queue's deliberate-gating — it's called directly in the request/
     response cycle for fast feedback. Never raises: on failure the returned PO has
     status=FAILED and error_message set, so a multi-distributor review can keep quoting the
     other POs in the group instead of aborting the whole request.
@@ -528,6 +532,40 @@ def run_quote_synchronously(purchase_order_id: int) -> src_models.PurchaseOrder:
         po.status_name = src_enums.PurchaseOrderStatus.FAILED.name
         po.error_message = str(e)[:4000]
         po.save(update_fields=["status", "status_name", "error_message", "updated_at"])
+    return po
+
+
+def run_submit_synchronously(purchase_order_id: int) -> src_models.PurchaseOrder:
+    """
+    Places a REAL order, called directly in the request/response cycle of POST .../submit/ —
+    there is no queue insulating this call, so the only thing standing between a caller and a
+    real distributor order is that endpoint requiring an explicit, authenticated, user-initiated
+    request. Never call this speculatively or from anything unattended (cron, a retry loop,
+    etc.). Never raises: on failure the returned PO has status=FAILED and error_message set,
+    same contract as run_quote_synchronously, so the caller can always render the result instead
+    of handling a thrown exception.
+    """
+    po, adapter, error_message = _resolve_po_and_adapter(purchase_order_id)
+    if error_message:
+        if po:
+            po.status = src_enums.PurchaseOrderStatus.FAILED.value
+            po.status_name = src_enums.PurchaseOrderStatus.FAILED.name
+            po.error_message = error_message
+            po.save(update_fields=["status", "status_name", "error_message", "updated_at"])
+        return po
+
+    try:
+        _run_submit(po, adapter)
+    except Exception as e:
+        logger.exception("{} Synchronous submit failed for purchase_order_id={}.".format(_LOG_PREFIX, purchase_order_id))
+        # _run_submit already marks FAILED (with error_message) for OrderAdapterError before
+        # re-raising; this only covers an unexpected non-adapter bug, so the PO never gets
+        # stuck at SUBMITTING if that happens.
+        if po.status == src_enums.PurchaseOrderStatus.SUBMITTING.value:
+            po.status = src_enums.PurchaseOrderStatus.FAILED.value
+            po.status_name = src_enums.PurchaseOrderStatus.FAILED.name
+            po.error_message = str(e)[:4000]
+            po.save(update_fields=["status", "status_name", "error_message", "updated_at"])
     return po
 
 
@@ -557,14 +595,14 @@ def run_purchase_order_job(job: src_models.PurchaseOrderJob) -> None:
         if job.operation in _AUTO_RETRYABLE_OPERATIONS and job.attempt_count < job.max_attempts:
             # Re-queue as a fresh OPEN job rather than retrying in place, so
             # claim_next_open_job's FIFO ordering keeps working and other jobs aren't
-            # starved by a stuck retry. SUBMIT/CANCEL are deliberately excluded from
+            # starved by a stuck retry. CANCEL is deliberately excluded from
             # _AUTO_RETRYABLE_OPERATIONS: neither Turn 14 nor most distributors document an
             # idempotency guarantee on our po_number, so a failure that happened *after* the
-            # distributor actually created/cancelled the order (e.g. a timeout on the response
-            # leg) could silently place or cancel a real order a second time if auto-retried.
-            # A failed SUBMIT/CANCEL job stays FAILED — a human decides the next step (for
-            # SUBMIT that's normally requote_purchase_order for a fresh quote_id, then submit
-            # again, never blindly resubmitting the same one).
+            # distributor actually cancelled the order (e.g. a timeout on the response leg)
+            # could silently cancel it a second time (or worse, race a real cancel) if
+            # auto-retried. A failed CANCEL job stays FAILED — a human decides the next step.
+            # (The same non-idempotency concern is why run_submit_synchronously never retries
+            # a failed submit either — see its docstring.)
             src_models.PurchaseOrderJob.objects.create(
                 purchase_order_id=job.purchase_order_id,
                 operation=job.operation,
@@ -593,10 +631,10 @@ def process_purchase_order_jobs(
     integration_pricing_sync_jobs.process_pricing_sync_jobs's claim/run loop and
     ThreadPoolExecutor fan-out.
 
-    ``allowed_operations``: see claim_next_open_job — pass e.g. [QUOTE, STATUS_CHECK] to run
-    this safely on an unattended cron schedule without ever touching SUBMIT/CANCEL jobs.
-    Leave None only when running by hand under supervision (this is what the management
-    command's default requires an explicit --operations flag to avoid).
+    ``allowed_operations``: see claim_next_open_job — pass e.g. [STATUS_CHECK] to run this
+    safely on an unattended cron schedule without ever touching a CANCEL job. Leave None only
+    when running by hand under supervision (this is what the management command's default
+    requires an explicit --operations flag to avoid).
     """
     if workers <= 1:
         processed = 0

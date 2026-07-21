@@ -8,11 +8,12 @@ _OPERATION_CHOICES = {op.name.lower(): op.value for op in src_enums.PurchaseOrde
 
 class Command(BaseCommand):
     help = (
-        "Process OPEN PurchaseOrderJob rows (quote/submit/status-check/cancel against a "
-        "distributor's order API). --operations is REQUIRED and has no default on purpose: "
-        "SUBMIT places a real order and CANCEL can affect a real order, so cron should only "
-        "ever be configured with --operations quote,status_check — never submit or cancel. "
-        "Run with --operations submit (or cancel) by hand, while watching, for those."
+        "Process OPEN PurchaseOrderJob rows (status-check/cancel against a distributor's order "
+        "API — quote and submit are both called synchronously from the request that triggers "
+        "them and never reach this queue; see src.integrations.services.purchase_order_jobs). "
+        "--operations is REQUIRED and has no default on purpose: CANCEL can affect a real "
+        "order, so cron should only ever be configured with --operations status_check — never "
+        "cancel. Run with --operations cancel by hand, while watching, for that."
     )
 
     def add_arguments(self, parser):
@@ -21,8 +22,9 @@ class Command(BaseCommand):
             type=str,
             required=True,
             help=(
-                "Required, comma-separated. One or more of: {}. "
-                "Cron entries must only ever use quote,status_check.".format(
+                "Required, comma-separated. One or more of: {}. Cron entries must only ever "
+                "use status_check. (quote/submit are accepted for backwards compatibility but "
+                "are always a no-op now — no job of either kind is ever enqueued.)".format(
                     ",".join(_OPERATION_CHOICES.keys())
                 )
             ),
@@ -60,12 +62,20 @@ class Command(BaseCommand):
             )
         allowed_operations = [_OPERATION_CHOICES[o] for o in raw_operations]
 
-        if "submit" in raw_operations or "cancel" in raw_operations:
+        if "cancel" in raw_operations:
             self.stdout.write(
                 self.style.WARNING(
-                    "--operations includes {} — this can place/affect a REAL order. "
-                    "Only run this manually while watching, never from cron.".format(
-                        ", ".join(o for o in raw_operations if o in ("submit", "cancel"))
+                    "--operations includes cancel — this can affect a REAL order. "
+                    "Only run this manually while watching, never from cron."
+                )
+            )
+        if "submit" in raw_operations or "quote" in raw_operations:
+            self.stdout.write(
+                self.style.WARNING(
+                    "--operations includes {} — this is a permanent no-op: quote and submit "
+                    "are both called synchronously and no job of either kind is ever enqueued "
+                    "for this command to claim.".format(
+                        ", ".join(o for o in raw_operations if o in ("submit", "quote"))
                     )
                 )
             )
