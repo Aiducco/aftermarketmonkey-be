@@ -32,6 +32,12 @@ services:
       - "7700:7700"
     environment:
       - MEILI_ENV=development
+      # Was previously missing here entirely — the container had been running with a key
+      # from whenever it was first started outside of this compose file, so recreating it
+      # (e.g. for the volume move above) came up with NO master key and accepted
+      # unauthenticated requests on a port that's open to the public internet. Must match
+      # MEILISEARCH_MASTER_KEY in .env.app.<env>, which is what the Django app itself uses.
+      - MEILI_MASTER_KEY=${MEILISEARCH_MASTER_KEY}
     restart: always
 
 
