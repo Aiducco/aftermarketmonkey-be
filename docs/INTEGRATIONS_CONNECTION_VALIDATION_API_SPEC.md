@@ -41,13 +41,23 @@ bare field names:
 }
 ```
 
-- `feed` — required on connect; on PATCH, omit it entirely to leave feed credentials
-  untouched.
-- `order` — always optional. Omit it to connect/update the feed only. If the distributor has
-  no distinct order fields (see **Ordering credentials** below) and you don't send `order`,
-  the backend auto-derives it from `feed` for you — don't send a duplicate copy.
-- A flat, unwrapped body (e.g. `{"client_id": "..."}`) is rejected with `invalid_input` — it's
-  not a legacy alias for `feed`, it's just invalid.
+- **Both `feed` and `order` are independently optional on both endpoints** — send either one
+  alone, or both together. The only rule is **at least one of the two must be present**; a body
+  with neither (`{}`, or a flat/unwrapped body like `{"client_id": "..."}`) is rejected with
+  `invalid_input`.
+- This is what makes Connect and Manage the same flow: a never-connected distributor can be
+  "connected" via the Ordering section alone (`POST .../connect/` with just `order`), with
+  Product feed filled in later via a separate call — in either order, and neither has to go
+  first. Whichever section is saved first creates the `company_provider_id`; every save after
+  that (from either section) goes through `PATCH .../connections/<id>/` the same way Manage
+  already works.
+- **`POST .../connect/` is idempotent** — calling it again for a company+provider that's already
+  connected does not error or duplicate the row; it updates the existing connection in place.
+  Critically, it **merges** the submitted namespace(s) onto what's already stored rather than
+  replacing the whole credentials blob — so calling `/connect/` with only `order` on a
+  connection that already has `feed` configured cannot wipe the feed credentials, and vice
+  versa. In practice this means Connect and `PATCH` behave identically once a connection
+  exists; feel free to call either.
 
 ---
 
@@ -86,8 +96,12 @@ their real stored value. Use `secrets_configured`/`order_secrets_configured` to 
 
 `connection_validated` / `order_connection_validated` are each:
 - `true` — we actually tested that namespace's connection and it passed
-- `null` — this distributor (or this namespace) isn't validated yet (see Coverage below). A
-  save can succeed with `null`; that's expected, not a bug.
+- `null` — one of: this distributor (or namespace) isn't validated yet (see Coverage below), or
+  that namespace hasn't been submitted at all yet on this connection (e.g. `order` was never
+  sent, so there's nothing to test). Same for `status`/`status_name` when `feed` hasn't been
+  submitted yet — `null` there just as it would be for "not connected." A save can succeed with
+  `null`; that's expected, not a bug, and is how an order-only (or feed-only) connection looks
+  before its other half is filled in.
 
 **Failure** (`400`, or `404` for `not_found` on the PATCH endpoint):
 ```json

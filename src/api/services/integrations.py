@@ -95,92 +95,6 @@ def _credential_key_sensitive(key: str) -> bool:
     return any(s in lower for s in _SENSITIVE_CREDENTIAL_KEY_SUBSTRINGS)
 
 
-def _build_namespace_credentials(
-    required: typing.List[str],
-    optional: typing.List[str],
-    raw: typing.Dict[str, typing.Any],
-) -> typing.Tuple[typing.Optional[typing.Dict[str, typing.Any]], typing.Optional[str], typing.Optional[str]]:
-    """Validate `required` and collect non-empty values from `required` + `optional` out of one
-    namespace's raw section (e.g. the "feed" or "order" sub-dict of a connect/update request)."""
-    if required:
-        missing = [f for f in required if not _normalize_credential_value(raw.get(f))]
-        if missing:
-            return (
-                None,
-                "Missing required fields: {}".format(", ".join(missing)),
-                CONNECTION_ERROR_MISSING_FIELDS,
-            )
-    creds: typing.Dict[str, typing.Any] = {}
-    for k in required:
-        v = _normalize_credential_value(raw.get(k))
-        if v is not None:
-            creds[k] = v
-    for k in optional:
-        v = _normalize_credential_value(raw.get(k))
-        if v is not None:
-            creds[k] = v
-    return creds, None, None
-
-
-def _build_credentials_from_catalog_entry(
-    catalog_entry: typing.Dict[str, typing.Any],
-    payload: typing.Dict[str, typing.Any],
-) -> typing.Tuple[typing.Optional[typing.Dict[str, typing.Any]], typing.Optional[str], typing.Optional[str]]:
-    """
-    Build the namespaced ``{"feed": {...}, "order": {...}}`` credentials dict from a connect-time
-    request body shaped the same way — ``payload["feed"]``/``payload["order"]`` are each validated
-    against their own required/optional field lists from the catalog entry
-    (``connection_required_fields``/``connection_optional_fields`` for feed,
-    ``order_connection_required_fields``/``order_connection_optional_fields`` for order).
-
-    "order" is always optional at connect time — a company can connect the feed without opting
-    into ordering yet. Every currently-registered order adapter (Turn14, Keystone) declares its
-    own order field list and is validated as its own namespace, even when the values happen to
-    match "feed" (Turn14). If a future adapter genuinely has no distinct order fields at all,
-    this falls back to auto-mirroring "order" from "feed" when the request omits it — see the
-    ``elif`` branches below — but nothing currently exercises that path.
-
-    Returns (credentials, error_message, error_code).
-    """
-    feed_creds, err, err_code = _build_namespace_credentials(
-        catalog_entry.get("connection_required_fields", []) or [],
-        catalog_entry.get("connection_optional_fields", []) or [],
-        payload.get("feed") or {},
-    )
-    if err:
-        return None, err, err_code
-
-    order_required = catalog_entry.get("order_connection_required_fields", []) or []
-    order_optional = catalog_entry.get("order_connection_optional_fields", []) or []
-    order_raw = payload.get("order")
-    if order_required or order_optional:
-        if order_raw:
-            order_creds, err, err_code = _build_namespace_credentials(order_required, order_optional, order_raw)
-            if err:
-                return None, err, err_code
-        else:
-            order_creds = {}
-    elif order_raw:
-        # No distinct order field list is declared for this provider — its order credentials are
-        # always meant to mirror "feed" (see the mirror branch below). An explicitly-submitted
-        # "order" payload here can only be a client resending feed-shaped fields, so validate it
-        # against the FEED field list rather than storing arbitrary submitted keys verbatim (which
-        # would let a client persist unvalidated junk into credentials).
-        order_creds, err, err_code = _build_namespace_credentials(
-            catalog_entry.get("connection_required_fields", []) or [],
-            catalog_entry.get("connection_optional_fields", []) or [],
-            order_raw,
-        )
-        if err:
-            return None, err, err_code
-    elif order_registry.supports_ordering(catalog_entry["kind"].value):
-        order_creds = dict(feed_creds)
-    else:
-        order_creds = {}
-
-    return {"feed": feed_creds, "order": order_creds}, None, None
-
-
 def _merge_namespace_credentials(
     section: typing.Dict[str, typing.Any],
     required: typing.List[str],
@@ -213,15 +127,19 @@ def _merge_update_credentials(
     Apply a partial patch shaped ``{"feed": {...}, "order": {...}}`` onto the existing namespaced
     credentials dict. Either namespace may be omitted from the patch entirely, in which case that
     namespace is left untouched (this is how a feed-only update leaves an already-configured
-    "order" section alone, and vice versa). Returns (credentials, error_message, error_code).
+    "order" section alone, and vice versa) — at least one of the two must be present, though.
+    ``existing`` may itself be ``None``/``{}`` with no prior "feed" data at all: this is also how
+    a brand-new connection can be created order-first, with "feed" configured later in a separate
+    call — see :func:`connect_provider`, which uses this same function (not a separate "build"
+    path) for exactly that reason. Returns (credentials, error_message, error_code).
     """
     patch = patch or {}
-    if patch and "feed" not in patch and "order" not in patch:
-        # A legacy/flat-shaped patch (bare credential fields, no "feed"/"order" wrapper) matches
-        # neither branch below and would otherwise silently apply no changes at all — the caller
-        # gets a 200 with nothing actually updated. Credentials are namespaced now; reject rather
-        # than no-op so a stale client finds out immediately instead of believing a rotation
-        # succeeded.
+    if "feed" not in patch and "order" not in patch:
+        # Neither namespace present — covers both a legacy/flat-shaped patch (bare credential
+        # fields, no "feed"/"order" wrapper) and a plain empty body ({} or None). Either would
+        # otherwise silently apply no changes at all and return a 200 with nothing actually
+        # saved/created. Credentials are namespaced now; reject rather than no-op so a stale
+        # client finds out immediately instead of believing a save succeeded.
         return (
             None,
             'Credentials must be nested under "feed" and/or "order".',
@@ -256,13 +174,18 @@ def _merge_update_credentials(
         # id/secret) doesn't leave "order" silently pointing at the old, now-invalid value.
         out["order"] = dict(out["feed"])
 
-    missing = [f for f in feed_required if not _normalize_credential_value(out["feed"].get(f))]
-    if missing:
-        return (
-            None,
-            "Missing required fields: {}".format(", ".join(missing)),
-            CONNECTION_ERROR_MISSING_FIELDS,
-        )
+    # Feed fields are all-or-nothing, same as order below: if the section has anything set at
+    # all, every required feed field must be present. An entirely empty "feed" (never submitted,
+    # by this request or any prior one) is valid — that's an order-only connection, feed just
+    # isn't configured yet.
+    if out["feed"] and feed_required:
+        missing = [f for f in feed_required if not _normalize_credential_value(out["feed"].get(f))]
+        if missing:
+            return (
+                None,
+                "Missing required fields: {}".format(", ".join(missing)),
+                CONNECTION_ERROR_MISSING_FIELDS,
+            )
 
     # Order fields are all-or-nothing: if the section has anything set at all, every required
     # order field must be present, or every order-placement call against it would fail anyway.
@@ -459,7 +382,7 @@ def _catalog_order_credentials_mirror_feed(catalog_entry: typing.Dict[str, typin
     """
     True only when the catalog entry declares NO distinct order field list at all for a
     registered order adapter — i.e. its order credentials would be silently auto-mirrored from
-    "feed" (see _build_credentials_from_catalog_entry's fallback ``elif`` branches). As of this
+    "feed" (see _merge_update_credentials's fallback ``elif`` branch). As of this
     writing every registered adapter (Turn14, Keystone) declares its own order fields and is
     validated independently — even Turn14, whose order credential *values* happen to be the
     same OAuth client_id/client_secret as its feed, still requires them to be entered and
@@ -658,9 +581,10 @@ def _validate_premier_order_connection(credentials: typing.Dict[str, typing.Any]
 
 
 # Order-credential validators — parallel to _CONNECTION_VALIDATORS but for the "order" namespace,
-# only run when a company actually submits order credentials (see _build_credentials_from_catalog_entry/
-# _merge_update_credentials — the "order" section is optional at connect/update time). Populated
-# per vendor as each order adapter's transport client is built (see src/integrations/orders/).
+# only run when a company actually submits order credentials (see _merge_update_credentials —
+# both "feed" and "order" are optional at connect/update time, either may be submitted alone).
+# Populated per vendor as each order adapter's transport client is built (see
+# src/integrations/orders/).
 _ORDER_CONNECTION_VALIDATORS: typing.Dict[int, typing.Callable[[typing.Dict[str, typing.Any]], _ValidatorResult]] = {
     src_enums.BrandProviderKind.TURN_14.value: _validate_turn14_order_connection,
     src_enums.BrandProviderKind.KEYSTONE.value: _validate_keystone_order_connection,
@@ -794,20 +718,53 @@ def _resolve_order_status(
     return None, None
 
 
+def _validate_and_resolve_order_status(
+    kind: int,
+    order_creds: typing.Optional[typing.Dict[str, typing.Any]],
+    feed_status_enum: typing.Optional["src_enums.CompanyProviderConnectionStatus"],
+) -> typing.Tuple[
+    typing.Optional[bool],
+    typing.Optional["src_enums.CompanyProviderOrderConnectionStatus"],
+    typing.Optional[str],
+]:
+    """
+    Shared by connect_provider and update_connection's relay AND non-relay branches (four call
+    sites, identical order-side handling regardless of how the feed side is validated): runs the
+    order validator when order credentials are present, then resolves order_status from the
+    result. A bad order credential never blocks a feed save — it only affects the returned
+    order_status fields. Returns (order_validated, order_status_enum, order_status_reason).
+    """
+    if not order_creds:
+        return None, None, None
+    order_validated, order_val_error, _order_val_error_code = _validate_order_connection(kind, order_creds)
+    order_status_enum, order_status_reason = _resolve_order_status(order_validated, order_val_error, feed_status_enum)
+    return order_validated, order_status_enum, order_status_reason
+
+
 def connect_provider(
     company_id: int,
     provider_id: int,
     credentials: typing.Dict[str, typing.Any],
 ) -> typing.Tuple[typing.Optional[typing.Dict], typing.Optional[str], typing.Optional[str]]:
     """
-    Create or replace credentials for a ``CompanyProviders`` row (keyed by company + provider).
-    ``credentials`` is shaped ``{"feed": {...}, "order": {...}}`` — "order" is optional (a company
-    can connect the feed without opting into order placement). Validates required fields from the
-    catalog per namespace, tests each namespace's connection with a validator when one exists
-    (see :data:`_CONNECTION_VALIDATORS` / :data:`_ORDER_CONNECTION_VALIDATORS`), saves, and
-    enqueues ``integration_pricing_sync_jobs.enqueue_company_provider_pricing_sync`` when the
-    provider has per-company pricing sync. Use :func:`update_connection` for partial PATCH
-    updates by connection id. Returns (data, error_message, error_code) — error_code is one of
+    Create, or idempotently update, a ``CompanyProviders`` row (keyed by company + provider).
+    ``credentials`` is shaped ``{"feed": {...}, "order": {...}}`` — either namespace may be
+    omitted (at least one must be present), and each is validated/stored independently via
+    :func:`_merge_update_credentials`, the same merge this uses for PATCH. This is what lets a
+    never-connected distributor be "connected" via Ordering alone, with Product feed filled in
+    later (or vice versa) — there is no requirement that "feed" exist first.
+
+    Calling this again for a company+provider pair that's already connected does NOT replace
+    the whole credentials blob — it merges the submitted namespace(s) onto what's already
+    stored, exactly like PATCH does, so e.g. resubmitting "order" here after "feed" was already
+    connected can't silently wipe the feed credentials. Use :func:`update_connection` (PATCH by
+    connection id) when you already know the ``company_provider_id``; this is for "connect via
+    catalog by provider id," which also happens to be idempotent.
+
+    Tests each namespace's connection with a validator when one exists (see
+    :data:`_CONNECTION_VALIDATORS` / :data:`_ORDER_CONNECTION_VALIDATORS`) and enqueues
+    ``integration_pricing_sync_jobs.enqueue_company_provider_pricing_sync`` when the provider has
+    per-company pricing sync. Returns (data, error_message, error_code) — error_code is one of
     the ``CONNECTION_ERROR_*`` constants, for the frontend to branch on.
     """
     provider = src_models.Providers.objects.filter(id=provider_id).first()
@@ -818,9 +775,12 @@ def connect_provider(
     if not catalog_entry:
         return None, "Provider not found in catalog", CONNECTION_ERROR_NOT_FOUND
 
-    order_validated = None
-    order_status_enum = None
-    order_status_reason = None
+    existing = src_models.CompanyProviders.objects.filter(
+        company_id=company_id,
+        provider_id=provider_id,
+    ).first()
+    existing_creds = existing.credentials if existing else None
+
     if catalog_entry.get("relay_provisioned"):
         company = src_models.Company.objects.filter(id=company_id).first()
         if not company:
@@ -837,19 +797,50 @@ def connect_provider(
                     "Your SFTP account could not be created. Please contact info@aftermarketscout.com.",
                     CONNECTION_ERROR_CONNECTION_FAILED,
                 )
+        # "feed" is always system-generated for relay providers — never user-submitted, so it's
+        # not run through _merge_update_credentials. "order" (e.g. Meyer's order API creds) is
+        # still a normal user-submitted, independently-saveable namespace, same as non-relay.
         user_field, password_field = catalog_entry.get("relay_credential_fields", ("sftp_user", "sftp_password"))
-        creds = {"feed": {user_field: company.relay_sftp_username, password_field: company.relay_sftp_password}}
+        order_required = [str(f) for f in (catalog_entry.get("order_connection_required_fields") or [])]
+        order_optional = [str(f) for f in (catalog_entry.get("order_connection_optional_fields") or [])]
+        order_creds = dict((existing_creds or {}).get("order") or {})
+        order_raw = credentials.get("order") if isinstance(credentials, dict) else None
+        if order_raw:
+            err, err_code = _merge_namespace_credentials(order_creds, order_required, order_optional, order_raw)
+            if err:
+                return None, err, err_code
+        if order_creds and order_required:
+            missing_order = [f for f in order_required if not _normalize_credential_value(order_creds.get(f))]
+            if missing_order:
+                return (
+                    None,
+                    "Missing required order fields: {}".format(", ".join(missing_order)),
+                    CONNECTION_ERROR_MISSING_FIELDS,
+                )
+        creds = {
+            "feed": {user_field: company.relay_sftp_username, password_field: company.relay_sftp_password},
+            "order": order_creds,
+        }
         validated = None
         status_enum, status_reason = _relay_feed_connection_status(company, provider.kind)
+        order_validated, order_status_enum, order_status_reason = _validate_and_resolve_order_status(
+            provider.kind, order_creds, status_enum
+        )
     else:
-        creds, err, err_code = _build_credentials_from_catalog_entry(catalog_entry, credentials)
+        creds, err, err_code = _merge_update_credentials(catalog_entry, existing_creds, credentials)
         if err:
             return None, err, err_code
-        validated, val_error, val_error_code = _validate_connection(provider.kind, creds["feed"])
-        if val_error:
-            return None, val_error, val_error_code
-        # validated is True (validator ran and passed) or None (no validator for this kind) —
-        # a False result would already have returned above via val_error.
+
+        if creds.get("feed"):
+            validated, val_error, val_error_code = _validate_connection(provider.kind, creds["feed"])
+            if val_error:
+                return None, val_error, val_error_code
+        else:
+            # "feed" was never submitted (by this call or any prior one) — nothing to validate
+            # yet, distinct from a real feed failure (which would have returned above).
+            validated = None
+        # validated is True (validator ran and passed) or None (no validator for this kind, or
+        # no feed data yet) — a False result would already have returned above via val_error.
         status_enum = src_enums.CompanyProviderConnectionStatus.INGESTING if validated else None
         status_reason = None
 
@@ -857,22 +848,13 @@ def connect_provider(
         # different client, different failure modes — e.g. Keystone's FTP feed vs its SOAP order
         # API). A bad order credential must NOT block an otherwise-valid feed connection from
         # saving; it only affects order_status below.
-        if creds.get("order"):
-            order_validated, order_val_error, _order_val_error_code = _validate_order_connection(
-                provider.kind, creds["order"]
-            )
-            order_status_enum, order_status_reason = _resolve_order_status(
-                order_validated, order_val_error, status_enum
-            )
+        order_validated, order_status_enum, order_status_reason = _validate_and_resolve_order_status(
+            provider.kind, creds.get("order"), status_enum
+        )
 
     status_fields = _connection_status_fields(status_enum, status_reason)
     status_fields.update(_order_connection_status_fields(order_status_enum, order_status_reason))
 
-    # Check if already connected
-    existing = src_models.CompanyProviders.objects.filter(
-        company_id=company_id,
-        provider_id=provider_id,
-    ).first()
     if existing:
         existing.credentials = creds
         for field, value in status_fields.items():
@@ -946,30 +928,35 @@ def update_connection(
     if err:
         return None, err, err_code
 
-    order_validated = None
-    order_status_enum = None
-    order_status_reason = None
     if catalog_entry.get("relay_provisioned"):
+        # "feed" is system-generated for relay providers (never part of `credentials`/`creds`
+        # here), but "order" (e.g. Meyer's order API creds) is a normal user-submitted namespace
+        # and must still be validated on every PATCH, same as the non-relay branch below — it
+        # was previously skipped entirely for relay-provisioned connections.
         validated = None
         status_enum, status_reason = _relay_feed_connection_status(cp.company, cp.provider.kind)
+        order_validated, order_status_enum, order_status_reason = _validate_and_resolve_order_status(
+            cp.provider.kind, creds.get("order"), status_enum
+        )
     else:
-        validated, val_error, val_error_code = _validate_connection(cp.provider.kind, creds["feed"])
-        if val_error:
-            return None, val_error, val_error_code
-        # validated is True (validator ran and passed) or None (no validator for this kind) —
-        # a False result would already have returned above via val_error.
+        if creds.get("feed"):
+            validated, val_error, val_error_code = _validate_connection(cp.provider.kind, creds["feed"])
+            if val_error:
+                return None, val_error, val_error_code
+        else:
+            # "feed" isn't configured on this connection yet (order-only so far) — nothing to
+            # validate, distinct from a real feed failure (which would have returned above).
+            validated = None
+        # validated is True (validator ran and passed) or None (no validator for this kind, or
+        # no feed data yet) — a False result would already have returned above via val_error.
         status_enum = src_enums.CompanyProviderConnectionStatus.INGESTING if validated else None
         status_reason = None
 
         # Order credentials validate independently of feed credentials — a bad order credential
         # must not block a valid feed update from saving; see connect_provider for the same logic.
-        if creds.get("order"):
-            order_validated, order_val_error, _order_val_error_code = _validate_order_connection(
-                cp.provider.kind, creds["order"]
-            )
-            order_status_enum, order_status_reason = _resolve_order_status(
-                order_validated, order_val_error, status_enum
-            )
+        order_validated, order_status_enum, order_status_reason = _validate_and_resolve_order_status(
+            cp.provider.kind, creds.get("order"), status_enum
+        )
 
     cp.credentials = creds
     status_fields = _connection_status_fields(status_enum, status_reason)
@@ -1200,28 +1187,31 @@ def _redacted_credentials_for_catalog_entry(
     feed_credentials/secrets_configured/order_credentials/order_secrets_configured for one
     connection, built the same way as get_company_provider_connection_detail — factored out so
     every endpoint that returns a connection's credentials redacts them the same way, instead
-    of some endpoints returning cp.credentials raw. Relay-provisioned connections are the one
-    exception (shown plainly, not redacted — see get_company_provider_connection_detail's
-    comment on why).
+    of some endpoints returning cp.credentials raw. Relay-provisioned connections' FEED is the
+    one exception (shown plainly, not redacted — see get_company_provider_connection_detail's
+    comment on why: these are AMS-generated, meant to be handed to the distributor rep, not
+    secret from the company itself). ORDER is always redacted normally against the catalog's
+    order field lists, relay-provisioned or not — Meyer's order credentials (relay-provisioned
+    feed, but real user-entered order API creds) are genuine secrets like any other provider's.
     """
     stored = stored or {}
+    order_redacted, order_secrets = _redacted_credentials(
+        catalog_entry.get("order_connection_required_fields") or [],
+        catalog_entry.get("order_connection_optional_fields") or [],
+        stored.get("order"),
+    )
     if catalog_entry.get("relay_provisioned"):
         feed_stored = stored.get("feed") or {}
         return {
             "feed_credentials": dict(feed_stored),
             "secrets_configured": {k: True for k in feed_stored.keys()},
-            "order_credentials": {},
-            "order_secrets_configured": {},
+            "order_credentials": order_redacted,
+            "order_secrets_configured": order_secrets,
         }
     feed_redacted, feed_secrets = _redacted_credentials(
         catalog_entry.get("connection_required_fields") or [],
         catalog_entry.get("connection_optional_fields") or [],
         stored.get("feed"),
-    )
-    order_redacted, order_secrets = _redacted_credentials(
-        catalog_entry.get("order_connection_required_fields") or [],
-        catalog_entry.get("order_connection_optional_fields") or [],
-        stored.get("order"),
     )
     return {
         "feed_credentials": feed_redacted,
