@@ -50,6 +50,16 @@ class ShipOption:
 
 
 @dataclasses.dataclass
+class LinePromotion:
+    """A distributor-applied discount on a quoted line (e.g. Turn14's per-item pricing
+    promos) — informational for the buyer, already netted into the distributor's own
+    unit_price/line_total in the raw response, so this is display-only and never feeds back
+    into our own subtotal math (that's still our frozen catalog pricing)."""
+    description: str
+    amount: typing.Optional[decimal.Decimal] = None
+
+
+@dataclasses.dataclass
 class ShippingQuoteLine:
     line_item_id: int
     provider_external_id: str
@@ -60,6 +70,9 @@ class ShippingQuoteLine:
     ship_options: typing.List[ShipOption] = dataclasses.field(default_factory=list)
     # Normalized flags, e.g. "kit", "backorder", "must_order_case_qty", "blocked".
     flags: typing.List[str] = dataclasses.field(default_factory=list)
+    # Per-item promos active on this quote (see LinePromotion) — same list on every shipment
+    # line for a given item_id, since the promo applies to the item as a whole, not per-shipment.
+    promotions: typing.List[LinePromotion] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass

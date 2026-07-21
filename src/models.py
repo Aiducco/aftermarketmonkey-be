@@ -2064,7 +2064,13 @@ class PurchaseOrderLineItem(django_db_models.Model):
     status = django_db_models.PositiveSmallIntegerField()
     status_name = django_db_models.CharField(max_length=32)
 
-    # Distributor-side per-line detail, filled in after quote/submit.
+    # Distributor-side per-line detail, filled in after quote/submit. A single line item can be
+    # fulfilled from more than one distributor shipment/warehouse at quote time (e.g. Turn14
+    # splitting a qty=4 request into 1@warehouse-59 + 2@warehouse-02 + 1 backordered@warehouse-01)
+    # — these four fields are the AGGREGATE across every shipment (summed confirmed/backordered,
+    # earliest ESD, warehouse_code only when there's exactly one shipment). The per-shipment
+    # breakdown itself lives in ``shipments`` below; these aggregates exist so callers that don't
+    # care about the split (e.g. a simple "x of y available" badge) don't have to compute it.
     distributor_line_status_code = django_db_models.CharField(max_length=64, null=True, blank=True)
     distributor_line_status_message = django_db_models.TextField(null=True, blank=True)
     quantity_confirmed = django_db_models.PositiveIntegerField(null=True, blank=True)
@@ -2072,11 +2078,22 @@ class PurchaseOrderLineItem(django_db_models.Model):
     manufacturer_esd = django_db_models.DateField(null=True, blank=True)
     warehouse_code = django_db_models.CharField(max_length=64, null=True, blank=True)
 
-    # Normalized (distributor-agnostic) shipping options for this line's shipment, from the
-    # last quote: [{code, name, cost, estimated_delivery_date}]. This is what the FE's
-    # shipping-method picker reads — never the distributor's raw quote response, which has a
-    # different shape per distributor.
-    ship_options = django_db_models.JSONField(null=True, blank=True, encoder=DjangoJSONEncoder)
+    # Normalized (distributor-agnostic) per-shipment breakdown for this line item's last quote:
+    # [{warehouse_code, quantity_confirmed, quantity_backordered, manufacturer_esd, ship_options:
+    # [{code, name, cost, estimated_delivery_date}]}]. Almost always a single-entry list; more
+    # than one entry means the distributor is fulfilling this line from multiple
+    # warehouses/shipments, each with its own priced shipping options — see the aggregate fields
+    # above for the common case, use this when the split itself needs to be shown/selected on.
+    # This is what the FE's shipping-method picker reads — never the distributor's raw quote
+    # response, which has a different shape per distributor.
+    shipments = django_db_models.JSONField(null=True, blank=True, encoder=DjangoJSONEncoder)
+
+    # Distributor-applied discounts on this line from the last quote (e.g. Turn14's per-item
+    # pricing promos): [{description, amount}]. Display-only — already netted into the
+    # distributor's own price in quote_raw_response, never fed back into unit_cost/line_total
+    # (those stay our frozen catalog price). Empty/null for distributors that don't have this
+    # concept.
+    promotions = django_db_models.JSONField(null=True, blank=True, encoder=DjangoJSONEncoder)
 
     # Which distributor-side order slice this line ended up on. Nullable because a PO can
     # fan out across several distributor orders (Meyer's Orders array, Keystone/Turn14

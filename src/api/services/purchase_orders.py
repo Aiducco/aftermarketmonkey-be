@@ -64,7 +64,15 @@ def _serialize_line_item(li: src_models.PurchaseOrderLineItem) -> typing.Dict:
         "quantity_backordered": li.quantity_backordered,
         "manufacturer_esd": li.manufacturer_esd.isoformat() if li.manufacturer_esd else None,
         "warehouse_code": li.warehouse_code,
-        "ship_options": li.ship_options,
+        # ``shipments``: [{warehouse_code, quantity_confirmed, quantity_backordered,
+        # manufacturer_esd, ship_options: [{code, name, cost, estimated_delivery_date}]}] — one
+        # entry per distributor shipment this line was split across. Almost always length 1;
+        # the aggregate quantity_confirmed/quantity_backordered/warehouse_code/manufacturer_esd
+        # fields above cover the common case, use this when the split itself needs rendering
+        # (see PurchaseOrderLineItem.shipments for the full contract).
+        "shipments": li.shipments,
+        "is_split_shipment": len(li.shipments or []) > 1,
+        "promotions": li.promotions,
         "distributor_order_id": li.distributor_order_id,
     }
 
@@ -221,7 +229,8 @@ def _revert_to_draft(po: src_models.PurchaseOrder) -> None:
         ]
     )
     po.line_items.update(
-        ship_options=None,
+        shipments=None,
+        promotions=None,
         warehouse_code=None,
         quantity_confirmed=None,
         quantity_backordered=None,

@@ -35,6 +35,13 @@ _DEFAULT_LOCATION = "default"
 _DEFAULT_SHIPPING_GROUP_CODE = "7002"
 
 
+def _normalize_warehouse_code(location: typing.Any) -> typing.Optional[str]:
+    """Turn14's ``location`` comes back as a JSON string for some warehouses ("02") but a bare
+    number for others (59, confirmed against a live quote) — normalize to str so warehouse_code
+    is consistently typed everywhere it's compared/keyed on (our own JSON responses, the FE)."""
+    return str(location) if location is not None else None
+
+
 class Turn14OrderAdapter(base.DistributorOrderAdapter):
     provider_kind = src_enums.BrandProviderKind.TURN_14.value
 
@@ -127,6 +134,23 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
             attrs = response.get("data", {}).get("attributes", {})
             by_external_id = {li.provider_part.provider_external_id: li for li in line_items}
 
+            # Per-item pricing promos (e.g. "6% Added Overstock Item Discount") are a top-level
+            # array keyed by item_id, not nested under each shipment — collect them once and
+            # attach the same list to every shipment line for that item below.
+            promotions_by_item_id: typing.Dict[str, typing.List[base.LinePromotion]] = {}
+            for promo in attrs.get("promos", []):
+                item_id = str(promo.get("item_id", ""))
+                promotions_by_item_id.setdefault(item_id, []).append(
+                    base.LinePromotion(
+                        description=promo.get("promo_description") or "",
+                        amount=(
+                            decimal.Decimal(str(promo["promo_amount"]))
+                            if promo.get("promo_amount") is not None
+                            else None
+                        ),
+                    )
+                )
+
             lines: typing.List[base.ShippingQuoteLine] = []
             for shipment in attrs.get("shipment", []):
                 # Contrary to the docs' single-object example, an unfiltered quote actually
@@ -152,9 +176,10 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
                             provider_external_id=external_id,
                             quantity_available=0 if is_out_of_stock else quantity,
                             quantity_backordered=quantity if is_out_of_stock else 0,
-                            warehouse_code=shipment.get("location"),
+                            warehouse_code=_normalize_warehouse_code(shipment.get("location")),
                             ship_options=ship_options,
                             flags=(["backorder"] if is_out_of_stock else []),
+                            promotions=promotions_by_item_id.get(external_id, []),
                         )
                     )
         except (AttributeError, TypeError, KeyError, IndexError) as e:
@@ -267,7 +292,7 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
                             line_item_id=li.line_item_id if li else 0,
                             distributor_order_number=order_id,
                             quantity_confirmed=item.get("quantity", 0),
-                            warehouse_code=shipment.get("location"),
+                            warehouse_code=_normalize_warehouse_code(shipment.get("location")),
                             status_message=shipment.get("type"),
                         )
                     )

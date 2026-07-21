@@ -236,40 +236,71 @@ def _run_quote(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrde
 
     method_names = _get_shipping_method_names(adapter, po.company_provider_id)
 
-    by_line_item_id = {li.id: li for li in po.line_items.all()}
+    # A single line item can come back split across more than one shipment/warehouse (e.g. a
+    # qty=4 request fulfilled as 1@warehouse-59 + 2@warehouse-02 + 1 backordered@warehouse-01,
+    # confirmed against a live Turn14 quote) — group by line_item_id first. Overwriting per
+    # quote_line (the previous approach) silently dropped every shipment but the last one that
+    # touched a given line item.
+    quote_lines_by_item: typing.Dict[int, typing.List[order_base.ShippingQuoteLine]] = {}
     for quote_line in result.lines:
-        li = by_line_item_id.get(quote_line.line_item_id)
+        quote_lines_by_item.setdefault(quote_line.line_item_id, []).append(quote_line)
+
+    by_line_item_id = {li.id: li for li in po.line_items.all()}
+    for line_item_id, quote_lines in quote_lines_by_item.items():
+        li = by_line_item_id.get(line_item_id)
         if not li:
             continue
-        li.quantity_confirmed = quote_line.quantity_available
-        li.quantity_backordered = quote_line.quantity_backordered
-        li.manufacturer_esd = quote_line.manufacturer_esd
-        li.warehouse_code = quote_line.warehouse_code
-        li.ship_options = [
+
+        li.quantity_confirmed = sum(ql.quantity_available for ql in quote_lines)
+        li.quantity_backordered = sum(ql.quantity_backordered for ql in quote_lines)
+        # Earliest ESD among shipments that have one — the soonest a backordered unit could
+        # arrive is the most useful single date to surface when there's more than one shipment.
+        esds = [ql.manufacturer_esd for ql in quote_lines if ql.manufacturer_esd]
+        li.manufacturer_esd = min(esds) if esds else None
+        # Only meaningful as a single value when there's exactly one shipment — with more than
+        # one, see li.shipments for the per-warehouse breakdown.
+        li.warehouse_code = quote_lines[0].warehouse_code if len(quote_lines) == 1 else None
+        li.shipments = [
             {
-                "code": opt.service_level_code,
-                # Falls back to the distributor's method-name catalog when the quote itself
-                # didn't name this option (e.g. Turn14 often omits verbose_eta) — the FE
-                # should never need to show a bare code.
-                "name": opt.service_level_name or method_names.get(opt.service_level_code, ""),
-                # Stored as float, not Decimal: this JSON blob is for display/selection, not
-                # financial calculation (those still go through unit_cost/line_total
-                # DecimalFields) — a plain number round-trips through JSON cleanly, whereas
-                # DjangoJSONEncoder would otherwise write Decimal out as a string.
-                "cost": float(opt.cost) if opt.cost is not None else None,
-                "estimated_delivery_date": (
-                    opt.estimated_delivery_date.isoformat() if opt.estimated_delivery_date else None
-                ),
+                "warehouse_code": ql.warehouse_code,
+                "quantity_confirmed": ql.quantity_available,
+                "quantity_backordered": ql.quantity_backordered,
+                "manufacturer_esd": ql.manufacturer_esd.isoformat() if ql.manufacturer_esd else None,
+                "ship_options": [
+                    {
+                        "code": opt.service_level_code,
+                        # Falls back to the distributor's method-name catalog when the quote
+                        # itself didn't name this option (e.g. Turn14 often omits verbose_eta)
+                        # — the FE should never need to show a bare code.
+                        "name": opt.service_level_name or method_names.get(opt.service_level_code, ""),
+                        # Stored as float, not Decimal: this JSON blob is for display/selection,
+                        # not financial calculation (those still go through unit_cost/line_total
+                        # DecimalFields) — a plain number round-trips through JSON cleanly,
+                        # whereas DjangoJSONEncoder would otherwise write Decimal out as a string.
+                        "cost": float(opt.cost) if opt.cost is not None else None,
+                        "estimated_delivery_date": (
+                            opt.estimated_delivery_date.isoformat() if opt.estimated_delivery_date else None
+                        ),
+                    }
+                    for opt in ql.ship_options
+                ],
             }
-            for opt in quote_line.ship_options
+            for ql in quote_lines
         ]
+        # Promos apply to the item as a whole, not per-shipment — every quote_line for this
+        # item_id carries the same list (see turn_14.py), so the first one is representative.
+        li.promotions = [
+            {"description": promo.description, "amount": float(promo.amount) if promo.amount is not None else None}
+            for promo in quote_lines[0].promotions
+        ] or None
         li.save(
             update_fields=[
                 "quantity_confirmed",
                 "quantity_backordered",
                 "manufacturer_esd",
                 "warehouse_code",
-                "ship_options",
+                "shipments",
+                "promotions",
                 "updated_at",
             ]
         )
@@ -301,10 +332,15 @@ def _compute_totals(po: src_models.PurchaseOrder) -> None:
     in place; caller is responsible for saving). subtotal is our own catalog pricing
     (line_total, frozen at add-to-cart time) — a distributor quote confirms availability and
     shipping, not unit price. estimated_shipping is summed once per shipment, not once per
-    line: lines sharing a warehouse_code are the same shipment and quote identical
-    ship_options, so summing per line would double/triple-count it. Uses po.ship_method's cost
-    for a shipment when set and offered there, else that shipment's cheapest option — the same
-    default submit_order() falls back to when no method was explicitly chosen.
+    line item: a line item can itself carry more than one shipment (see li.shipments), and
+    several line items can share the same shipment (a distributor may combine multiple items
+    shipping from the same warehouse into one box/quote) — either way each distinct shipment's
+    cost must only be counted once. Dedup key is (warehouse_code, is_backordered) rather than
+    warehouse_code alone: an in-stock shipment and a backordered one can legitimately come from
+    the same warehouse in the same quote and are billed as separate shipments. Uses
+    po.ship_method's cost for a shipment when set and offered there, else that shipment's
+    cheapest option — the same default submit_order() falls back to when no method was
+    explicitly chosen.
     """
     line_items = list(po.line_items.all())
     subtotal = (
@@ -315,19 +351,25 @@ def _compute_totals(po: src_models.PurchaseOrder) -> None:
 
     shipment_costs = {}
     for li in line_items:
-        if not li.ship_options:
-            continue
-        shipment_key = li.warehouse_code or "line-{}".format(li.id)
-        if shipment_key in shipment_costs:
-            continue
-        priced_options = [opt for opt in li.ship_options if opt.get("cost") is not None]
-        chosen = None
-        if po.ship_method:
-            chosen = next((opt for opt in priced_options if opt.get("code") == po.ship_method), None)
-        if chosen is None and priced_options:
-            chosen = min(priced_options, key=lambda opt: opt["cost"])
-        if chosen is not None:
-            shipment_costs[shipment_key] = decimal.Decimal(str(chosen["cost"]))
+        for idx, shipment in enumerate(li.shipments or []):
+            options = shipment.get("ship_options") or []
+            if not options:
+                continue
+            warehouse_code = shipment.get("warehouse_code")
+            is_backordered = bool(shipment.get("quantity_backordered"))
+            shipment_key = (
+                (warehouse_code, is_backordered) if warehouse_code else "line-{}-{}".format(li.id, idx)
+            )
+            if shipment_key in shipment_costs:
+                continue
+            priced_options = [opt for opt in options if opt.get("cost") is not None]
+            chosen = None
+            if po.ship_method:
+                chosen = next((opt for opt in priced_options if opt.get("code") == po.ship_method), None)
+            if chosen is None and priced_options:
+                chosen = min(priced_options, key=lambda opt: opt["cost"])
+            if chosen is not None:
+                shipment_costs[shipment_key] = decimal.Decimal(str(chosen["cost"]))
 
     estimated_shipping = sum(shipment_costs.values(), decimal.Decimal("0")) if shipment_costs else None
 
