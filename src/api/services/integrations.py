@@ -365,6 +365,16 @@ def get_providers_catalog(company_id: int) -> typing.Dict:
                 if company_provider and company_provider.status_checked_at
                 else None
             ),
+            # Order-placement connectivity — see CompanyProviderOrderConnectionStatus. Null when
+            # not connected, or connected but order credentials not configured.
+            "order_status": company_provider.order_status if company_provider else None,
+            "order_status_name": company_provider.order_status_name if company_provider else None,
+            "order_status_reason": company_provider.order_status_reason if company_provider else None,
+            "order_status_checked_at": (
+                company_provider.order_status_checked_at.isoformat()
+                if company_provider and company_provider.order_status_checked_at
+                else None
+            ),
         })
 
     # Coming soon distributors — driven by COMING_SOON_PROVIDERS
@@ -711,6 +721,51 @@ def _connection_status_fields(
     }
 
 
+_ORDER_WAITING_ON_FEED_REASON = (
+    "Order credentials are valid, but ordering stays disabled until the feed connection "
+    "finishes syncing."
+)
+
+
+def _order_connection_status_fields(
+    status: typing.Optional["src_enums.CompanyProviderOrderConnectionStatus"],
+    reason: typing.Optional[str],
+) -> typing.Dict[str, typing.Any]:
+    """
+    Field values for CompanyProviders.order_status/order_status_name/order_status_reason/
+    order_status_checked_at — parallel to :func:`_connection_status_fields` but for the order
+    namespace. ``status=None`` (order credentials not submitted, or no validator for this kind)
+    leaves all four fields null/unset rather than touching them.
+    """
+    return {
+        "order_status": status.value if status else None,
+        "order_status_name": status.name if status else None,
+        "order_status_reason": reason,
+        "order_status_checked_at": timezone.now() if status else None,
+    }
+
+
+def _resolve_order_status(
+    order_validated: typing.Optional[bool],
+    order_val_error: typing.Optional[str],
+    feed_status_enum: typing.Optional["src_enums.CompanyProviderConnectionStatus"],
+) -> typing.Tuple[typing.Optional["src_enums.CompanyProviderOrderConnectionStatus"], typing.Optional[str]]:
+    """
+    Turn an order validator's result into an order status, gated on feed status: ordering can
+    never be CONNECTED while the feed itself isn't — see CompanyProviderOrderConnectionStatus.
+      order_val_error set        -> ERROR, that message.
+      order_validated True       -> CONNECTED if feed is CONNECTED, else WAITING.
+      order_validated None       -> (None, None) — no validator for this kind; leave untouched.
+    """
+    if order_val_error:
+        return src_enums.CompanyProviderOrderConnectionStatus.ERROR, order_val_error
+    if order_validated:
+        if feed_status_enum == src_enums.CompanyProviderConnectionStatus.CONNECTED:
+            return src_enums.CompanyProviderOrderConnectionStatus.CONNECTED, None
+        return src_enums.CompanyProviderOrderConnectionStatus.WAITING, _ORDER_WAITING_ON_FEED_REASON
+    return None, None
+
+
 def connect_provider(
     company_id: int,
     provider_id: int,
@@ -736,6 +791,8 @@ def connect_provider(
         return None, "Provider not found in catalog", CONNECTION_ERROR_NOT_FOUND
 
     order_validated = None
+    order_status_enum = None
+    order_status_reason = None
     if catalog_entry.get("relay_provisioned"):
         company = src_models.Company.objects.filter(id=company_id).first()
         if not company:
@@ -763,18 +820,25 @@ def connect_provider(
         validated, val_error, val_error_code = _validate_connection(provider.kind, creds["feed"])
         if val_error:
             return None, val_error, val_error_code
-        if creds.get("order"):
-            order_validated, order_val_error, order_val_error_code = _validate_order_connection(
-                provider.kind, creds["order"]
-            )
-            if order_val_error:
-                return None, order_val_error, order_val_error_code
         # validated is True (validator ran and passed) or None (no validator for this kind) —
         # a False result would already have returned above via val_error.
         status_enum = src_enums.CompanyProviderConnectionStatus.INGESTING if validated else None
         status_reason = None
 
+        # Order credentials are validated separately from feed credentials (different transport,
+        # different client, different failure modes — e.g. Keystone's FTP feed vs its SOAP order
+        # API). A bad order credential must NOT block an otherwise-valid feed connection from
+        # saving; it only affects order_status below.
+        if creds.get("order"):
+            order_validated, order_val_error, _order_val_error_code = _validate_order_connection(
+                provider.kind, creds["order"]
+            )
+            order_status_enum, order_status_reason = _resolve_order_status(
+                order_validated, order_val_error, status_enum
+            )
+
     status_fields = _connection_status_fields(status_enum, status_reason)
+    status_fields.update(_order_connection_status_fields(order_status_enum, order_status_reason))
 
     # Check if already connected
     existing = src_models.CompanyProviders.objects.filter(
@@ -812,6 +876,10 @@ def connect_provider(
         "status_name": cp.status_name,
         "status_reason": cp.status_reason,
         "status_checked_at": cp.status_checked_at.isoformat() if cp.status_checked_at else None,
+        "order_status": cp.order_status,
+        "order_status_name": cp.order_status_name,
+        "order_status_reason": cp.order_status_reason,
+        "order_status_checked_at": cp.order_status_checked_at.isoformat() if cp.order_status_checked_at else None,
         "created_at": cp.created_at.isoformat() if cp.created_at else None,
         "updated_at": cp.updated_at.isoformat() if cp.updated_at else None,
     }
@@ -851,6 +919,8 @@ def update_connection(
         return None, err, err_code
 
     order_validated = None
+    order_status_enum = None
+    order_status_reason = None
     if catalog_entry.get("relay_provisioned"):
         validated = None
         status_enum, status_reason = _relay_feed_connection_status(cp.company, cp.provider.kind)
@@ -858,19 +928,25 @@ def update_connection(
         validated, val_error, val_error_code = _validate_connection(cp.provider.kind, creds["feed"])
         if val_error:
             return None, val_error, val_error_code
-        if creds.get("order"):
-            order_validated, order_val_error, order_val_error_code = _validate_order_connection(
-                cp.provider.kind, creds["order"]
-            )
-            if order_val_error:
-                return None, order_val_error, order_val_error_code
         # validated is True (validator ran and passed) or None (no validator for this kind) —
         # a False result would already have returned above via val_error.
         status_enum = src_enums.CompanyProviderConnectionStatus.INGESTING if validated else None
         status_reason = None
 
+        # Order credentials validate independently of feed credentials — a bad order credential
+        # must not block a valid feed update from saving; see connect_provider for the same logic.
+        if creds.get("order"):
+            order_validated, order_val_error, _order_val_error_code = _validate_order_connection(
+                cp.provider.kind, creds["order"]
+            )
+            order_status_enum, order_status_reason = _resolve_order_status(
+                order_validated, order_val_error, status_enum
+            )
+
     cp.credentials = creds
-    for field, value in _connection_status_fields(status_enum, status_reason).items():
+    status_fields = _connection_status_fields(status_enum, status_reason)
+    status_fields.update(_order_connection_status_fields(order_status_enum, order_status_reason))
+    for field, value in status_fields.items():
         setattr(cp, field, value)
     cp.save()
 
@@ -890,6 +966,10 @@ def update_connection(
         "status_name": cp.status_name,
         "status_reason": cp.status_reason,
         "status_checked_at": cp.status_checked_at.isoformat() if cp.status_checked_at else None,
+        "order_status": cp.order_status,
+        "order_status_name": cp.order_status_name,
+        "order_status_reason": cp.order_status_reason,
+        "order_status_checked_at": cp.order_status_checked_at.isoformat() if cp.order_status_checked_at else None,
         "created_at": cp.created_at.isoformat() if cp.created_at else None,
         "updated_at": cp.updated_at.isoformat() if cp.updated_at else None,
     }
@@ -1174,6 +1254,13 @@ def get_company_provider_connection_detail(
         "status_reason": company_provider.status_reason,
         "status_checked_at": (
             company_provider.status_checked_at.isoformat() if company_provider.status_checked_at else None
+        ),
+        "order_status": company_provider.order_status,
+        "order_status_name": company_provider.order_status_name,
+        "order_status_reason": company_provider.order_status_reason,
+        "order_status_checked_at": (
+            company_provider.order_status_checked_at.isoformat()
+            if company_provider.order_status_checked_at else None
         ),
         "created_at": company_provider.created_at.isoformat() if company_provider.created_at else None,
         "updated_at": company_provider.updated_at.isoformat() if company_provider.updated_at else None,
