@@ -726,19 +726,30 @@ def _validate_and_resolve_order_status(
     typing.Optional[bool],
     typing.Optional["src_enums.CompanyProviderOrderConnectionStatus"],
     typing.Optional[str],
+    typing.Optional[str],
+    typing.Optional[str],
 ]:
     """
     Shared by connect_provider and update_connection's relay AND non-relay branches (four call
     sites, identical order-side handling regardless of how the feed side is validated): runs the
     order validator when order credentials are present, then resolves order_status from the
-    result. A bad order credential never blocks a feed save — it only affects the returned
-    order_status fields. Returns (order_validated, order_status_enum, order_status_reason).
+    result. Submitted order credentials that fail live validation reject the whole request, the
+    same way feed credential failures already do — callers must check the last two return values
+    and return early when set, mirroring the existing ``if val_error: return None, val_error,
+    val_error_code`` pattern used for feed. (The cron connectivity re-check
+    (check_company_provider_connections) calls :func:`_resolve_order_status` directly instead of
+    this wrapper — it can't "reject" a background check, so it still records ERROR status on an
+    already-saved connection rather than blocking anything.)
+
+    Returns (order_validated, order_status_enum, order_status_reason, error_message, error_code).
     """
     if not order_creds:
-        return None, None, None
-    order_validated, order_val_error, _order_val_error_code = _validate_order_connection(kind, order_creds)
-    order_status_enum, order_status_reason = _resolve_order_status(order_validated, order_val_error, feed_status_enum)
-    return order_validated, order_status_enum, order_status_reason
+        return None, None, None, None, None
+    order_validated, order_val_error, order_val_error_code = _validate_order_connection(kind, order_creds)
+    if order_val_error:
+        return False, None, None, order_val_error, order_val_error_code
+    order_status_enum, order_status_reason = _resolve_order_status(order_validated, None, feed_status_enum)
+    return order_validated, order_status_enum, order_status_reason, None, None
 
 
 def connect_provider(
@@ -823,9 +834,11 @@ def connect_provider(
         }
         validated = None
         status_enum, status_reason = _relay_feed_connection_status(company, provider.kind)
-        order_validated, order_status_enum, order_status_reason = _validate_and_resolve_order_status(
-            provider.kind, order_creds, status_enum
+        order_validated, order_status_enum, order_status_reason, order_val_error, order_val_error_code = (
+            _validate_and_resolve_order_status(provider.kind, order_creds, status_enum)
         )
+        if order_val_error:
+            return None, order_val_error, order_val_error_code
     else:
         creds, err, err_code = _merge_update_credentials(catalog_entry, existing_creds, credentials)
         if err:
@@ -846,11 +859,13 @@ def connect_provider(
 
         # Order credentials are validated separately from feed credentials (different transport,
         # different client, different failure modes — e.g. Keystone's FTP feed vs its SOAP order
-        # API). A bad order credential must NOT block an otherwise-valid feed connection from
-        # saving; it only affects order_status below.
-        order_validated, order_status_enum, order_status_reason = _validate_and_resolve_order_status(
-            provider.kind, creds.get("order"), status_enum
+        # API) but a failure here rejects the whole request too, same as feed above — invalid
+        # order credentials aren't saved just because the feed happened to be fine.
+        order_validated, order_status_enum, order_status_reason, order_val_error, order_val_error_code = (
+            _validate_and_resolve_order_status(provider.kind, creds.get("order"), status_enum)
         )
+        if order_val_error:
+            return None, order_val_error, order_val_error_code
 
     status_fields = _connection_status_fields(status_enum, status_reason)
     status_fields.update(_order_connection_status_fields(order_status_enum, order_status_reason))
@@ -935,9 +950,11 @@ def update_connection(
         # was previously skipped entirely for relay-provisioned connections.
         validated = None
         status_enum, status_reason = _relay_feed_connection_status(cp.company, cp.provider.kind)
-        order_validated, order_status_enum, order_status_reason = _validate_and_resolve_order_status(
-            cp.provider.kind, creds.get("order"), status_enum
+        order_validated, order_status_enum, order_status_reason, order_val_error, order_val_error_code = (
+            _validate_and_resolve_order_status(cp.provider.kind, creds.get("order"), status_enum)
         )
+        if order_val_error:
+            return None, order_val_error, order_val_error_code
     else:
         if creds.get("feed"):
             validated, val_error, val_error_code = _validate_connection(cp.provider.kind, creds["feed"])
@@ -952,11 +969,13 @@ def update_connection(
         status_enum = src_enums.CompanyProviderConnectionStatus.INGESTING if validated else None
         status_reason = None
 
-        # Order credentials validate independently of feed credentials — a bad order credential
-        # must not block a valid feed update from saving; see connect_provider for the same logic.
-        order_validated, order_status_enum, order_status_reason = _validate_and_resolve_order_status(
-            cp.provider.kind, creds.get("order"), status_enum
+        # Order credentials validate independently of feed credentials — a failure here rejects
+        # the whole request too, same as feed above; see connect_provider for the same logic.
+        order_validated, order_status_enum, order_status_reason, order_val_error, order_val_error_code = (
+            _validate_and_resolve_order_status(cp.provider.kind, creds.get("order"), status_enum)
         )
+        if order_val_error:
+            return None, order_val_error, order_val_error_code
 
     cp.credentials = creds
     status_fields = _connection_status_fields(status_enum, status_reason)

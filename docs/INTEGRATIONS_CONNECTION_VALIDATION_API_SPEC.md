@@ -127,6 +127,14 @@ show the customer as-is, but its exact wording varies per distributor — don't 
 | `connection_failed` | 400 | Could not reach the distributor at all — timeout, DNS, unexpected response, or (for relay-provisioned providers) our own SFTP account provisioning failed. | "Something went wrong connecting — try again," with a retry action. Not a field problem. |
 | `not_found` | 400 connect · 404 patch | The provider or connection id doesn't exist. | Shouldn't happen from normal UI flow — treat as a generic error, log it. |
 
+**These codes apply per-namespace, not just to `feed`.** If your request includes `order` and
+those credentials fail their own live check (see **Ordering credentials** below for which
+distributors validate order credentials), the whole request is rejected with the same
+`invalid_credentials`/`permission_denied`/`connection_failed` codes — nothing gets saved, same
+as a `feed` failure. This applies even when `feed` wasn't touched by the request at all (an
+order-only save/update with bad order credentials still rejects, it doesn't silently save with
+an error status attached).
+
 ---
 
 ## Coverage — which distributors are actually checked
@@ -212,11 +220,15 @@ and `order_connection_required_fields`/`order_connection_optional_fields`:
   permission grants on Turn 14's side. Pre-filling the order form with the feed values the user
   already entered is a reasonable UX shortcut, but always submit and validate them under `order`
   explicitly; nothing is auto-copied server-side.
-  Note: some of these distributors (Meyer, Wheel Pros, Premier/APG as of this writing) report
-  `supports_ordering: true` and declare their required order fields even though in-app order
-  *placement* isn't wired up on the backend yet — showing the credentials form now just lets
-  companies get ahead of it; submitting an actual order for these will fail until the backend
-  adapter ships.
+  As of this writing, Turn 14, Keystone, Meyer, and Premier/APG all live-validate submitted
+  `order` credentials the same way `feed` is validated — bad credentials reject the whole
+  request (`invalid_credentials`/`permission_denied`/`connection_failed`), nothing gets saved.
+  **Wheel Pros is the one exception**: it declares `order_connection_required_fields` (so
+  `supports_ordering: true` and the form should still be shown) but has no live order validator
+  yet, so submitted Wheel Pros order credentials save with `order_connection_validated: null` —
+  same as how some `feed`-only distributors work today (see Coverage above). In-app order
+  *placement* for Wheel Pros isn't wired up on the backend yet either; showing the credentials
+  form now just lets companies get ahead of it.
 - **`order_credentials_mirror_feed`** — reserved for a future distributor whose order
   credentials would be silently auto-derived from `feed` with no separate form at all. Always
   `false` today; every currently order-capable distributor (Turn 14 included, as of this
