@@ -24,7 +24,10 @@ services:
   meilisearch:
     image: getmeili/meilisearch:v1.11
     volumes:
-      - meilisearch_data:/meili_data
+      # Bind mount to the larger secondary volume, not a named Docker volume on the root
+      # disk — Meilisearch's data grew to ~22GB and the root disk is only 38GB, which
+      # caused repeated 100%-full incidents. Moved 2026-07-21.
+      - /mnt/HC_Volume_105491695/meilisearch_data:/meili_data
     ports:
       - "7700:7700"
     environment:
@@ -34,4 +37,3 @@ services:
 
 volumes:
   redis_data:
-  meilisearch_data:
