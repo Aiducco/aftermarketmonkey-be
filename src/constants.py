@@ -219,6 +219,16 @@ PROVIDER_CATALOG = [
         ],
         # Remote CSV path per feed (wheel/tire/accessories); defaults in settings if omitted
         "connection_optional_fields": ["sftp_path"],
+        # Order-placement credentials (Wheel Pros Orders API, https://api.wheelpros.com) — a
+        # completely separate REST API/login from the SFTP feed above. "username"/"password" are
+        # the Product Data Portal account credentials, exchanged for a short-lived (1hr) Bearer
+        # token via POST /auth/v1/authorize; the adapter re-authenticates as needed rather than
+        # storing the token itself. No separate customer/dealer number is needed here — the
+        # Orders API auto-populates it from the authenticated account (the "customer" query param
+        # only exists to override that for Wheel Pros' own internal service accounts, which
+        # doesn't apply to a dealer connection). Optional: a company can connect the SFTP feed
+        # without ever filling these in; order placement simply stays unavailable until they do.
+        "order_connection_required_fields": ["username", "password"],
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
             "<p><strong>Wheel Pros</strong> inventory and pricing CSVs (wheels, tires, accessories) are on Wheel "
@@ -233,6 +243,15 @@ PROVIDER_CATALOG = [
             "<li>If your agreement uses non-default remote paths, set optional <strong>sftp_path</strong>.</li>"
             "<li>Save the connection. Company-specific pricing is read from SFTP after catalog sync.</li>"
             "</ol>"
+            "<p><strong>Optional: place orders through AfterMarketScout</strong></p>"
+            "<ol>"
+            "<li>Register (or use your existing) <a href=\"https://developer.wheelpros.com/\" target=\"_blank\" "
+            "rel=\"noopener noreferrer\">Wheel Pros Product Data Portal</a> account and request Orders API access "
+            "from Wheel Pros. This is a separate login from the SFTP feed above.</li>"
+            "<li>Enter that account's <strong>username</strong> and <strong>password</strong> below and save. "
+            "This is separate from the SFTP catalog connection above — you can skip it if you don't plan to "
+            "place orders through AfterMarketScout.</li>"
+            "</ol>"
         ),
     },
     {
@@ -245,6 +264,15 @@ PROVIDER_CATALOG = [
         "connection_optional_fields": [],
         "relay_provisioned": True,
         "relay_credential_fields": ("sftp_user", "sftp_password"),
+        # Order-placement credentials (Meyer REST API, https://meyerapi.meyerdistributing.com) —
+        # entirely separate from the SFTP relay feed above. "username"/"password" are exchanged
+        # for a 30-day API key via Meyer's Authentication endpoint (POST .../v2/Authentication);
+        # the adapter re-authenticates as needed rather than storing the short-lived key itself.
+        # "customer_number" is required on every order call (CreateOrder, CancelOrder, and most
+        # read calls) as a separate account identifier from the login itself. Optional: a company
+        # can connect the feed without ever filling these in; order placement simply stays
+        # unavailable until they do.
+        "order_connection_required_fields": ["username", "password", "customer_number"],
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
             "<p>AfterMarketScout has already created a dedicated SFTP account for your company. "
@@ -261,6 +289,17 @@ PROVIDER_CATALOG = [
             "</ul>"
             "<p>No credentials to enter here &mdash; just click <strong>Connect</strong>. "
             "For help, contact <a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a>.</p>"
+            "<p><strong>Optional: place orders through AfterMarketScout</strong></p>"
+            "<ol>"
+            "<li>Ask your Meyer rep for API access — they'll provide a <strong>username</strong> and "
+            "<strong>password</strong> for the Meyer order API, separate from the SFTP feed above.</li>"
+            "<li>Ask your rep for your <strong>customer number</strong>, which Meyer requires on every "
+            "order.</li>"
+            "<li>Enter your <strong>username</strong>, <strong>password</strong>, and "
+            "<strong>customer_number</strong> below and save. This is separate from the SFTP catalog "
+            "connection above — you can skip it if you don't plan to place orders through "
+            "AfterMarketScout.</li>"
+            "</ol>"
         ),
     },
     {
@@ -639,6 +678,15 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/apg_wholesale_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["ftp_user", "ftp_password"],
+        # Order-placement credentials (Premier REST API, https://api.premierwd.com) — entirely
+        # separate from the FTP catalog feed above. A single "api_key" (issued by a Premier
+        # regional rep) is exchanged for a session token via GET /authenticate?apiKey=...; the
+        # adapter re-authenticates as needed rather than storing the session token itself. No
+        # separate customer/account number is needed — the API key alone identifies the account,
+        # and backorder/dropship preferences are configured server-side against it by Premier.
+        # Optional: a company can connect the FTP feed without ever filling this in; order
+        # placement simply stays unavailable until they do.
+        "order_connection_required_fields": ["api_key"],
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
             "<p><strong>APG Wholesale (Premier)</strong> delivers a daily inventory and pricing feed via their FTP server. "
@@ -653,6 +701,13 @@ PROVIDER_CATALOG = [
             "<p>No host or port to enter — those are fixed and managed by AfterMarketScout. "
             "For assistance contact: "
             "<a href=\"mailto:datateam@premierwd.com\">datateam@premierwd.com</a>.</p>"
+            "<p><strong>Optional: place orders through AfterMarketScout</strong></p>"
+            "<ol>"
+            "<li>Ask your regional Premier rep for an <strong>API key</strong> for the Premier Sales Orders API — "
+            "separate from the FTP feed access above.</li>"
+            "<li>Enter your <strong>api_key</strong> below and save. This is separate from the FTP catalog "
+            "connection above — you can skip it if you don't plan to place orders through AfterMarketScout.</li>"
+            "</ol>"
         ),
     },
     {
