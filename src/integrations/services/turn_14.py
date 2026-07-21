@@ -2528,3 +2528,183 @@ def _transform_inventory_update_data(inventory_data: typing.List[typing.Dict]) -
             continue
 
     return inventory_instances
+
+
+def fetch_and_save_turn_14_fitment_for_all_brands(resume: bool = False) -> None:
+    """
+    On-demand fetch of raw item/vehicle fitment pairs for every Turn14 brand via
+    GET /v1/items/fitment/brand/{brand_id}, using the primary company's Turn14 credentials.
+
+    Not wired to any schedule — intended to be run manually (fetch_turn_14_all_brand_fitment
+    command) since it walks the full Turn14 brand catalog, not just brands a company has
+    onboarded. Saved as flat (item, vehicle_id) pairs; the vehicle_id itself isn't resolved to
+    year/make/model yet — that requires a VCDB dataset we don't have.
+
+    With resume=True, brands that already have at least one Turn14ItemFitment row are skipped,
+    so an interrupted run (e.g. laptop went to sleep mid-fetch) can pick back up without
+    re-fetching brands that already finished and without burning extra Turn14 API quota on them.
+    A brand that failed partway through (e.g. hit an API error mid-pagination) may have only
+    partial data saved and would be skipped too on resume — rerun without resume=True later if
+    you need to force a full brand-by-brand refresh.
+    """
+    logger.info('{} Fetching Turn 14 fitment for all brands (resume={}).'.format(_LOG_PREFIX, resume))
+
+    turn_14_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.TURN_14.value
+    ).first()
+    if not turn_14_provider:
+        logger.info('{} No Turn 14 provider found.'.format(_LOG_PREFIX))
+        return
+
+    primary_provider = src_models.CompanyProviders.objects.filter(
+        provider=turn_14_provider,
+        provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
+        primary=True,
+    ).first()
+    if not primary_provider:
+        logger.info('{} No Turn 14 active primary provider found.'.format(_LOG_PREFIX))
+        return
+
+    credentials = primary_provider.credentials
+    try:
+        api_client = turn_14_client.Turn14ApiClient(credentials=credentials)
+    except ValueError as e:
+        logger.error('{} Invalid credentials or configuration: {}'.format(_LOG_PREFIX, str(e)))
+        raise
+
+    turn14_brands = list(src_models.Turn14Brand.objects.all().order_by('name'))
+    if not turn14_brands:
+        logger.info('{} No Turn14 brands found. Skipping fitment fetch.'.format(_LOG_PREFIX))
+        return
+
+    if resume:
+        brands_with_data = set(
+            src_models.Turn14ItemFitment.objects.values_list('brand_id', flat=True).distinct()
+        )
+        before_count = len(turn14_brands)
+        turn14_brands = [b for b in turn14_brands if b.id not in brands_with_data]
+        skipped_count = before_count - len(turn14_brands)
+        logger.info('{} Resume: skipping {} brand(s) that already have fitment data.'.format(
+            _LOG_PREFIX, skipped_count
+        ))
+        if not turn14_brands:
+            logger.info('{} All brands already have fitment data. Nothing to do.'.format(_LOG_PREFIX))
+            return
+
+    total_brands = len(turn14_brands)
+    logger.info('{} Fetching fitment for {} Turn 14 brand(s).'.format(_LOG_PREFIX, total_brands))
+
+    for brand_index, turn_14_brand in enumerate(turn14_brands, start=1):
+        try:
+            brand_id = int(turn_14_brand.external_id)
+        except (TypeError, ValueError):
+            logger.warning('{} Brand {} has a non-numeric external_id ({!r}). Skipping.'.format(
+                _LOG_PREFIX, turn_14_brand.name, turn_14_brand.external_id
+            ))
+            continue
+
+        page = 1
+        brand_pairs_saved = 0
+
+        logger.info('{} ({}/{}) Fetching fitment for brand: {} (external_id: {}).'.format(
+            _LOG_PREFIX, brand_index, total_brands, turn_14_brand.name, brand_id
+        ))
+
+        while page is not None:
+            try:
+                fitment_data, next_page = api_client.get_item_fitment_for_brand(brand_id=brand_id, page=page)
+            except turn_14_exceptions.Turn14APIException as e:
+                logger.error(
+                    '{} Turn 14 API error for brand: {} (external_id: {}), page: {}. Error: {}. '
+                    'Skipping remainder of brand.'.format(
+                        _LOG_PREFIX, turn_14_brand.name, brand_id, page, str(e)
+                    )
+                )
+                break
+
+            if not fitment_data:
+                page = next_page
+                continue
+
+            fitment_instances = _transform_fitment_data(fitment_data, turn_14_brand)
+            if not fitment_instances:
+                page = next_page
+                continue
+
+            try:
+                pgbulk.upsert(
+                    src_models.Turn14ItemFitment,
+                    fitment_instances,
+                    unique_fields=['item_external_id', 'vehicle_id'],
+                    update_fields=['brand', 'late_models_only', 'updated_at'],
+                )
+                brand_pairs_saved += len(fitment_instances)
+            except Exception as e:
+                logger.error('{} Error during bulk upsert for brand: {} (external_id: {}), page: {}. Error: {}.'.format(
+                    _LOG_PREFIX, turn_14_brand.name, brand_id, page, str(e)
+                ))
+                page = next_page
+                continue
+
+            logger.info('{} Brand {!r}: page {} fetched, {} fitment pair(s) upserted so far.'.format(
+                _LOG_PREFIX, turn_14_brand.name, page, brand_pairs_saved
+            ))
+
+            page = next_page
+
+        logger.info('{} ({}/{}) Completed fitment fetch for brand: {} (external_id: {}) — {} pair(s) saved.'.format(
+            _LOG_PREFIX, brand_index, total_brands, turn_14_brand.name, brand_id, brand_pairs_saved
+        ))
+
+    logger.info('{} Completed fetching fitment for {} Turn 14 brand(s).'.format(_LOG_PREFIX, total_brands))
+
+
+def _transform_fitment_data(
+    fitment_data: typing.List[typing.Dict], turn_14_brand: src_models.Turn14Brand
+) -> typing.List[src_models.Turn14ItemFitment]:
+    fitment_instances = []
+
+    for fitment_item in fitment_data:
+        try:
+            item_external_id = str(fitment_item.get('id', ''))
+
+            if not item_external_id:
+                logger.warning('{} Skipping fitment item with missing id: {}'.format(
+                    _LOG_PREFIX, fitment_item
+                ))
+                continue
+
+            attributes = fitment_item.get('attributes', {})
+            late_models_only = bool(attributes.get('late_models_only', False))
+
+            # vehicle_ids from the live API is a flat list of id strings (e.g. ["123", "456"]),
+            # though Turn14's own docs show it nested (e.g. [[123, 456]]) — accept both shapes
+            # and flatten/dedupe either way, since we don't yet have the VCDB mapping to know
+            # what any grouping would mean.
+            vehicle_ids = set()
+            for entry in attributes.get('vehicle_ids') or []:
+                candidates = entry if isinstance(entry, list) else [entry]
+                for vehicle_id in candidates:
+                    try:
+                        vehicle_ids.add(int(vehicle_id))
+                    except (TypeError, ValueError):
+                        continue
+
+            for vehicle_id in vehicle_ids:
+                fitment_instances.append(
+                    src_models.Turn14ItemFitment(
+                        item_external_id=item_external_id,
+                        brand=turn_14_brand,
+                        vehicle_id=vehicle_id,
+                        late_models_only=late_models_only,
+                        updated_at=timezone.now(),
+                    )
+                )
+
+        except Exception as e:
+            logger.warning('{} Error transforming fitment data {}: {}. Skipping.'.format(
+                _LOG_PREFIX, fitment_item, str(e)
+            ))
+            continue
+
+    return fitment_instances

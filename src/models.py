@@ -455,6 +455,63 @@ class Turn14BrandInventory(django_db_models.Model):
         unique_together = ["external_id"]
 
 
+class Turn14ItemFitment(django_db_models.Model):
+    """
+    Raw per-part/per-vehicle fitment pairs from GET /v1/items/fitment/brand/{brand_id}.
+    vehicle_id is Turn14's own vehicle config id, not yet resolved to year/make/model —
+    that mapping requires a VCDB dataset we don't have yet. Kept as a flat (item, vehicle_id)
+    pair for now; each row is one id pulled out of the response's nested vehicle_ids arrays.
+    """
+    item_external_id = django_db_models.CharField(max_length=255)
+    brand = django_db_models.ForeignKey(Turn14Brand, on_delete=django_db_models.CASCADE, related_name="item_fitments")
+    vehicle_id = django_db_models.PositiveIntegerField(db_index=True)
+    late_models_only = django_db_models.BooleanField(default=False)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "turn14_item_fitments"
+        unique_together = ["item_external_id", "vehicle_id"]
+
+
+class VcdbVehicle(django_db_models.Model):
+    """
+    Flattened Auto Care Association VCdb vehicle reference data: VehicleID joined against
+    BaseVehicle/Make/Model/SubModel into a single year/make/model/submodel row. Populated by
+    the `import_vcdb_vehicles` management command from the AutoCare VCdb JSON dataset.
+    Standalone lookup table — not wired into Turn14ItemFitment or any other model.
+
+    ``engine``/``drive_type`` are filled in only when VCdb's VehicleToEngineConfig/
+    VehicleToDriveType join has exactly one option for this VehicleID — left blank ("") when a
+    vehicle has multiple engine/drivetrain options, since a bare VehicleID can't disambiguate
+    which one applies (real ACES fitment data pins that down with extra qualifier IDs on the
+    `<App>` row, not the VehicleID alone). Roughly 76% of VCdb vehicles have an unambiguous
+    engine and 89% an unambiguous drive type.
+    """
+    vehicle_id = django_db_models.PositiveIntegerField(unique=True)
+    base_vehicle_id = django_db_models.PositiveIntegerField(db_index=True)
+    year = django_db_models.PositiveSmallIntegerField(db_index=True)
+    make = django_db_models.CharField(max_length=128, db_index=True)
+    model = django_db_models.CharField(max_length=128, db_index=True)
+    submodel = django_db_models.CharField(max_length=255, blank=True, default="")
+    region_id = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+    engine = django_db_models.CharField(max_length=255, blank=True, default="")
+    drive_type = django_db_models.CharField(max_length=64, blank=True, default="")
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "vcdb_vehicles"
+        indexes = [
+            django_db_models.Index(fields=["year", "make", "model"], name="vcdb_veh_ymm_idx"),
+        ]
+
+    def __str__(self):
+        return f"{self.year} {self.make} {self.model} {self.submodel}".strip()
+
+
 class BigCommerceParts(django_db_models.Model):
     external_id = django_db_models.CharField(max_length=255)
     sku = django_db_models.TextField(max_length=255)

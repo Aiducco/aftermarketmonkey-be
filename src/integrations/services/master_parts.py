@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 
 from django.db import close_old_connections, connection
-from django.db.models import Q
+from django.db.models import Max, Min, Q
 from django.utils import timezone
 
 import pgbulk
@@ -127,6 +127,9 @@ WHEELPROS_LOOKUP_CHUNK = 200
 BATCH_SIZE_INVENTORY = 10000
 BATCH_SIZE_PRICING = 10000
 BATCH_DELAY_SECONDS = 0.1  # Reduced from 0.3 - was adding ~30s per 100 batches
+# Turn14 VCdb fitment sync batches by item (not by raw fitment row) so every vehicle_id for a
+# given item is seen together before years are collapsed into ranges.
+FITMENT_ITEM_CHUNK_SIZE = 2000
 
 # Partition ``sync_master_parts_from_*`` by internal ``Brands.id`` so workers never compete on the same
 # ``(brand_id, part_number)`` upsert. Tune down if PostgreSQL connection pool is tight.
@@ -372,6 +375,26 @@ def _dedupe_provider_part_inventory_for_upsert(
             )
         )
     return out
+
+
+def _collapse_years_to_ranges(years: typing.Iterable[int]) -> typing.List[typing.Tuple[int, int]]:
+    """
+    Collapse a set of individual years into the minimal list of contiguous
+    ``(year_start, year_end)`` ranges, e.g. {1998, 1999, 2000, 2005} -> [(1998, 2000), (2005, 2005)].
+    """
+    sorted_years = sorted(set(years))
+    if not sorted_years:
+        return []
+    ranges = []
+    range_start = prev = sorted_years[0]
+    for y in sorted_years[1:]:
+        if y == prev + 1:
+            prev = y
+            continue
+        ranges.append((range_start, prev))
+        range_start = prev = y
+    ranges.append((range_start, prev))
+    return ranges
 
 
 def _dedupe_master_part_fitments_for_upsert(
@@ -2216,6 +2239,309 @@ def sync_master_part_fitments_from_rough_country() -> None:
 
     total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "rough_country_brand", _worker)
     logger.info("{} Synced {} Rough Country master part fitment records total.".format(_LOG_PREFIX, total_upserted))
+
+
+def sync_master_part_fitments_from_turn14_vcdb() -> None:
+    """
+    Sync MasterPartFitment from Turn14ItemFitment, decoding each row's Turn14 vehicle_id via
+    VcdbVehicle (year/make/model/submodel/engine/drive_type) and joining to MasterPart directly
+    via (catalog Brand, part_number) — part_number on MasterPart is Turn14Items.mfr_part_number
+    (see _ingest_turn14_items_for_mapped_brands), not routed through ProviderPart.
+
+    On-demand only: not wired into any scheduled pipeline (never called from
+    sync_master_parts_from_turn14, sync_master_parts, or ingest_all_providers). Requires
+    sync_master_parts_from_turn14 (for MasterPart + BrandTurn14BrandMapping) and
+    import_vcdb_vehicles (for the VcdbVehicle lookup) to have already run.
+
+    Parallelized across disjoint Turn14-brand partitions using the same
+    _partition_mapped_brands_for_parallel_ingest / _run_parallel_mapped_brand_int_worker split
+    sync_master_parts_from_turn14 itself uses, so concurrent workers never race on the same
+    MasterPartFitment (master_part, year_start, year_end, make, model, submodel, engine,
+    drive_type) upsert key.
+
+    Turn14 gives one discrete VCdb vehicle per row, not a year range. Batches are built per item
+    (every vehicle_id for an item is loaded together) so all years for a given (master_part, make,
+    model, submodel, engine, drive_type) combination are seen before being collapsed into the
+    minimal set of contiguous (year_start, year_end) ranges via _collapse_years_to_ranges -
+    batching by raw fitment row instead would risk splitting one item's years across batches and
+    under-collapsing.
+    """
+    logger.info("{} Syncing master part fitments from Turn14 (via VCdb).".format(_LOG_PREFIX))
+
+    turn14_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.TURN_14.value,
+    ).first()
+    if not turn14_provider:
+        logger.info("{} No Turn14 provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(src_models.BrandTurn14BrandMapping.objects.select_related("brand", "turn14_brand"))
+    if not mappings:
+        logger.info("{} No BrandTurn14BrandMapping found.".format(_LOG_PREFIX))
+        return
+    t14_brand_id_to_catalog_brand_id = {m.turn14_brand_id: m.brand_id for m in mappings}
+
+    logger.info("{} Loading MasterPart (brand, part_number) lookup...".format(_LOG_PREFIX))
+    master_part_id_by_brand_partnum = {
+        (row["brand_id"], row["part_number"]): row["id"]
+        for row in src_models.MasterPart.objects.values("id", "brand_id", "part_number")
+    }
+    logger.info("{} Loaded {} MasterPart rows.".format(_LOG_PREFIX, len(master_part_id_by_brand_partnum)))
+
+    logger.info("{} Resolving Turn14Items -> MasterPart lookup...".format(_LOG_PREFIX))
+    item_ext_id_to_master_part_id: typing.Dict[str, int] = {}
+    for row in src_models.Turn14Items.objects.values("external_id", "mfr_part_number", "brand_id"):
+        pn = (row["mfr_part_number"] or "").strip()
+        if not pn:
+            continue
+        catalog_brand_id = t14_brand_id_to_catalog_brand_id.get(row["brand_id"])
+        if not catalog_brand_id:
+            continue
+        master_part_id = master_part_id_by_brand_partnum.get((catalog_brand_id, pn))
+        if not master_part_id:
+            continue
+        item_ext_id_to_master_part_id[row["external_id"]] = master_part_id
+    logger.info(
+        "{} Resolved {} Turn14Items to a MasterPart.".format(_LOG_PREFIX, len(item_ext_id_to_master_part_id))
+    )
+
+    vcdb_by_vehicle_id = {
+        row["vehicle_id"]: row
+        for row in src_models.VcdbVehicle.objects.all().values(
+            "vehicle_id", "year", "make", "model", "submodel", "engine", "drive_type"
+        )
+    }
+    if not vcdb_by_vehicle_id:
+        logger.info("{} VcdbVehicle table is empty. Run import_vcdb_vehicles first.".format(_LOG_PREFIX))
+        return
+    logger.info("{} Loaded {} VcdbVehicle rows.".format(_LOG_PREFIX, len(vcdb_by_vehicle_id)))
+
+    total_fitment_rows = src_models.Turn14ItemFitment.objects.count()
+    num_partitions = min(MASTER_PARTS_SYNC_MAX_WORKERS, len({m.brand_id for m in mappings}))
+    logger.info(
+        "{} Starting parallel sync over {} Turn14ItemFitment rows across up to {} worker partition(s).".format(
+            _LOG_PREFIX, total_fitment_rows, num_partitions
+        )
+    )
+
+    def _worker(turn14_brand_ids: typing.Set[int]) -> int:
+        if not turn14_brand_ids:
+            return 0
+        worker_label = "brands={}".format(sorted(turn14_brand_ids)[:5])
+        total_upserted = 0
+        skipped_no_master_part = 0
+        skipped_no_vcdb = 0
+
+        item_external_ids = list(
+            src_models.Turn14Items.objects.filter(brand_id__in=turn14_brand_ids)
+            .values_list("external_id", flat=True)
+        )
+        logger.info(
+            "{} [{}] {} Turn14Items to process.".format(_LOG_PREFIX, worker_label, len(item_external_ids))
+        )
+
+        batch_num = 0
+        for chunk_start in range(0, len(item_external_ids), FITMENT_ITEM_CHUNK_SIZE):
+            batch_num += 1
+            item_chunk = item_external_ids[chunk_start : chunk_start + FITMENT_ITEM_CHUNK_SIZE]
+            fitment_rows = list(
+                src_models.Turn14ItemFitment.objects.filter(item_external_id__in=item_chunk).values(
+                    "item_external_id", "vehicle_id"
+                )
+            )
+
+            years_by_key: typing.Dict[typing.Tuple, typing.Set[int]] = {}
+            for row in fitment_rows:
+                master_part_id = item_ext_id_to_master_part_id.get(row["item_external_id"])
+                if not master_part_id:
+                    skipped_no_master_part += 1
+                    continue
+                vcdb = vcdb_by_vehicle_id.get(row["vehicle_id"])
+                if not vcdb:
+                    skipped_no_vcdb += 1
+                    continue
+                key = (
+                    master_part_id,
+                    vcdb["make"],
+                    vcdb["model"],
+                    vcdb["submodel"] or "",
+                    vcdb["engine"] or "",
+                    vcdb["drive_type"] or "",
+                )
+                years_by_key.setdefault(key, set()).add(vcdb["year"])
+
+            to_upsert = []
+            for (master_part_id, make, model, submodel, engine, drive_type), years in years_by_key.items():
+                for year_start, year_end in _collapse_years_to_ranges(years):
+                    to_upsert.append(
+                        src_models.MasterPartFitment(
+                            master_part_id=master_part_id,
+                            year_start=year_start,
+                            year_end=year_end,
+                            make=make,
+                            model=model,
+                            submodel=submodel,
+                            engine=engine,
+                            drive_type=drive_type,
+                            source_provider=turn14_provider,
+                        )
+                    )
+
+            if to_upsert:
+                to_upsert = _dedupe_master_part_fitments_for_upsert(
+                    to_upsert, context="Turn14 VCdb fitment [{}] batch={}".format(worker_label, batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.MasterPartFitment,
+                    to_upsert,
+                    unique_fields=[
+                        "master_part", "year_start", "year_end", "make", "model",
+                        "submodel", "engine", "drive_type",
+                    ],
+                    update_fields=["source_provider"],
+                )
+                total_upserted += len(to_upsert)
+
+            logger.info(
+                "{} [{}] batch {}: {} items, {} fitment rows -> {} ranges upserted, running_total={} "
+                "(skipped: no_master_part={} no_vcdb={})".format(
+                    _LOG_PREFIX, worker_label, batch_num, len(item_chunk), len(fitment_rows), len(to_upsert),
+                    total_upserted, skipped_no_master_part, skipped_no_vcdb,
+                )
+            )
+            connection.close()
+            if len(item_chunk) == FITMENT_ITEM_CHUNK_SIZE:
+                time.sleep(BATCH_DELAY_SECONDS)
+
+        logger.info(
+            "{} [{}] Done: {} upserted total (skipped: no_master_part={} no_vcdb={}).".format(
+                _LOG_PREFIX, worker_label, total_upserted, skipped_no_master_part, skipped_no_vcdb,
+            )
+        )
+        return total_upserted
+
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "turn14_brand", _worker)
+    logger.info("{} Synced {} Turn14 master part fitment records via VCdb total.".format(_LOG_PREFIX, total_upserted))
+
+
+FITMENT_DELETE_BATCH_SIZE = 20000
+
+
+def _delete_fitments_for_provider_in_id_range(
+    provider: src_models.Providers,
+    id_range: typing.Optional[typing.Tuple[int, int]],
+    batch_size: int,
+    label: str,
+) -> int:
+    """Batched delete loop scoped to one ``id`` slice (or the whole table when ``id_range`` is None)."""
+    base_qs = src_models.MasterPartFitment.objects.filter(source_provider=provider)
+    if id_range is not None:
+        base_qs = base_qs.filter(id__gte=id_range[0], id__lte=id_range[1])
+
+    total_deleted = 0
+    while True:
+        # Each pass re-queries the lowest remaining ids in this slice - rows already deleted
+        # (by this worker or, at the boundary, none other since slices are disjoint) simply
+        # drop out, so no id cursor bookkeeping is needed between batches.
+        ids = list(base_qs.order_by("id").values_list("id", flat=True)[:batch_size])
+        if not ids:
+            break
+        src_models.MasterPartFitment.objects.filter(id__in=ids).delete()
+        total_deleted += len(ids)
+        logger.info(
+            "{} [{}] Deleted {} MasterPartFitment rows (worker_total={}).".format(
+                _LOG_PREFIX, label, len(ids), total_deleted
+            )
+        )
+        connection.close()
+        time.sleep(BATCH_DELAY_SECONDS)
+    return total_deleted
+
+
+def delete_master_part_fitments_by_provider_kind(
+    kind: str,
+    *,
+    batch_size: int = FITMENT_DELETE_BATCH_SIZE,
+    dry_run: bool = True,
+    workers: int = 1,
+) -> int:
+    """
+    Batched delete of every MasterPartFitment row whose source_provider matches the given
+    provider kind (e.g. "TURN_14"), deleting ``batch_size`` rows per statement rather than one
+    huge DELETE, to avoid a long lock hold / WAL spike on a table this size.
+
+    ``workers`` > 1 splits the matching rows' id span into that many disjoint, equal-width id
+    ranges and runs one delete loop per range concurrently (ThreadPoolExecutor) - safe because
+    ranges never overlap, so two workers never contend for the same row. Each worker still
+    deletes in the same ``batch_size`` commits as the single-worker path; only the number of
+    concurrent delete statements against Postgres changes. Higher worker counts trade more
+    concurrent I/O/WAL/lock pressure on a table that's still serving live app traffic for a
+    shorter total wall-clock time - keep this modest (a handful) rather than maxing it out.
+
+    Written to clear the ~17.9M single-year-per-row backlog that
+    sync_master_part_fitments_from_turn14_vcdb wrote before it started collapsing years into
+    ranges (see that function's docstring). Intended usage: run this once for kind="TURN_14",
+    then re-run sync_master_part_fitments_from_turn14_vcdb to repopulate with proper year
+    ranges. NOT wired into any scheduled pipeline - run manually via the
+    delete_master_part_fitments_by_provider management command. Defaults to dry_run=True; the
+    command's --apply flag is required to actually delete.
+    """
+    provider = src_models.Providers.objects.filter(kind_name=kind).first()
+    if not provider:
+        logger.info("{} No provider found for kind_name={}.".format(_LOG_PREFIX, kind))
+        return 0
+
+    base_qs = src_models.MasterPartFitment.objects.filter(source_provider=provider)
+    total_matching = base_qs.count()
+    logger.info(
+        "{} {} MasterPartFitment rows match source_provider kind={} ({}, workers={}).".format(
+            _LOG_PREFIX, total_matching, kind, "dry-run, nothing will be deleted" if dry_run else "deleting", workers
+        )
+    )
+    if dry_run or not total_matching:
+        return total_matching
+
+    workers = max(1, int(workers))
+    if workers == 1:
+        total_deleted = _delete_fitments_for_provider_in_id_range(provider, None, batch_size, "all")
+        logger.info(
+            "{} Done: deleted {} MasterPartFitment rows for kind={}.".format(_LOG_PREFIX, total_deleted, kind)
+        )
+        return total_deleted
+
+    id_bounds = base_qs.aggregate(min_id=Min("id"), max_id=Max("id"))
+    lo, hi = id_bounds["min_id"], id_bounds["max_id"]
+    span = hi - lo + 1
+    workers = min(workers, span)
+    step = -(-span // workers)  # ceil division, so ranges cover [lo, hi] fully
+    id_ranges = []
+    start = lo
+    while start <= hi:
+        end = min(start + step - 1, hi)
+        id_ranges.append((start, end))
+        start = end + 1
+
+    def run_range(id_range: typing.Tuple[int, int]) -> int:
+        close_old_connections()
+        try:
+            return _delete_fitments_for_provider_in_id_range(
+                provider, id_range, batch_size, "id {}-{}".format(id_range[0], id_range[1])
+            )
+        finally:
+            connection.close()
+
+    total_deleted = 0
+    with ThreadPoolExecutor(max_workers=len(id_ranges)) as ex:
+        futs = [ex.submit(run_range, r) for r in id_ranges]
+        for fut in futs:
+            total_deleted += fut.result()
+
+    logger.info(
+        "{} Done: deleted {} MasterPartFitment rows for kind={} using {} workers.".format(
+            _LOG_PREFIX, total_deleted, kind, len(id_ranges)
+        )
+    )
+    return total_deleted
 
 
 def sync_provider_inventory_from_dlg() -> None:

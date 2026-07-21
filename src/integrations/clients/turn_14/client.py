@@ -294,6 +294,25 @@ class Turn14ApiClient(object):
 
         return data, next_page
 
+    def get_item_fitment_for_brand(
+            self, brand_id: int, page: int = 1
+    ) -> typing.Tuple[typing.List[typing.Dict], typing.Optional[int]]:
+        response = simplejson.loads(
+            self._request(
+                endpoint="items/fitment/brand/{}".format(brand_id),
+                method=common_enums.HttpMethod.GET,
+                params={
+                    "page": page,
+                },
+            ).content
+        )
+
+        data = response.get("data", [])
+        potential_next_page = page + 1
+        next_page = None if page == response.get("meta", {}).get("total_pages", 1) else potential_next_page
+
+        return data, next_page
+
     def get_brand_media(self, brand_id: str, page: int = 1) -> typing.Tuple[
         typing.List[typing.Dict], typing.Optional[int]]:
         response = simplejson.loads(
