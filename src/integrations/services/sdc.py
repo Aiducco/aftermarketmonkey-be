@@ -9,6 +9,7 @@ import pgbulk
 
 from src import enums as src_enums
 from src import models as src_models
+from src.integrations import credentials as credentials_helper
 from src.integrations.clients.sdc import client as sdc_client
 from src.integrations.clients.sdc import exceptions as sdc_exceptions
 
@@ -76,7 +77,7 @@ def fetch_and_save_all_sdc_brand_items() -> None:
             ))
             continue
         
-        credentials = company_provider.credentials
+        credentials = credentials_helper.get_feed_credentials(company_provider)
         
         try:
             sftp_client = sdc_client.SDCSFTPClient(credentials=credentials)
@@ -333,7 +334,7 @@ def fetch_and_save_all_sdc_brand_fitments() -> None:
             ))
             continue
         
-        credentials = company_provider.credentials
+        credentials = credentials_helper.get_feed_credentials(company_provider)
         
         try:
             sftp_client = sdc_client.SDCSFTPClient(credentials=credentials)

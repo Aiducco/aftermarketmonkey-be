@@ -10,6 +10,7 @@ import pgbulk
 
 from src import enums as src_enums
 from src import models as src_models
+from src.integrations import credentials as credentials_helper
 from src.integrations.clients.turn_14 import client as turn_14_client
 from src.integrations.clients.turn_14 import exceptions as turn_14_exceptions
 
@@ -64,7 +65,7 @@ def fetch_and_save_turn_14_brands() -> None:
         logger.info('{} No turn 14 active provider found.'.format(_LOG_PREFIX))
         return
 
-    credentials = primary_provider.credentials
+    credentials = credentials_helper.get_feed_credentials(primary_provider)
     logger.debug('{} Initializing Turn 14 API client for company: {}'.format(
         _LOG_PREFIX, primary_provider.company.name
     ))
@@ -327,7 +328,7 @@ def fetch_and_save_turn_14_locations() -> None:
         logger.info('{} No Turn 14 active provider found.'.format(_LOG_PREFIX))
         return
 
-    credentials = primary_provider.credentials
+    credentials = credentials_helper.get_feed_credentials(primary_provider)
     try:
         api_client = turn_14_client.Turn14ApiClient(credentials=credentials)
     except ValueError as e:
@@ -495,7 +496,7 @@ def fetch_and_save_all_turn_14_brand_items() -> None:
             ))
             continue
         
-        credentials = company_provider.credentials
+        credentials = credentials_helper.get_feed_credentials(company_provider)
         
         try:
             api_client = turn_14_client.Turn14ApiClient(credentials=credentials)
@@ -637,7 +638,7 @@ def fetch_and_save_turn_14_items_for_turn14_brands(
             ))
             continue
 
-        credentials = company_provider.credentials
+        credentials = credentials_helper.get_feed_credentials(company_provider)
         try:
             api_client = turn_14_client.Turn14ApiClient(credentials=credentials)
         except ValueError as e:
@@ -843,7 +844,7 @@ def fetch_and_save_all_turn_14_brand_data() -> None:
             ))
             continue
         
-        credentials = company_provider.credentials
+        credentials = credentials_helper.get_feed_credentials(company_provider)
         
         try:
             api_client = turn_14_client.Turn14ApiClient(credentials=credentials)
@@ -977,7 +978,7 @@ def fetch_and_save_turn_14_brand_data_for_turn14_brands(
             ))
             continue
 
-        credentials = company_provider.credentials
+        credentials = credentials_helper.get_feed_credentials(company_provider)
         try:
             api_client = turn_14_client.Turn14ApiClient(credentials=credentials)
         except ValueError as e:
@@ -1100,7 +1101,9 @@ def _fetch_and_save_turn_14_brand_pricing_for_company_provider(
     """
     company = company_provider.company
     try:
-        api_client = turn_14_client.Turn14ApiClient(credentials=company_provider.credentials)
+        api_client = turn_14_client.Turn14ApiClient(
+            credentials=credentials_helper.get_feed_credentials(company_provider)
+        )
     except ValueError as e:
         logger.error('{} Invalid Turn 14 credentials for company: {}. Error: {}. Skipping company.'.format(
             _LOG_PREFIX, company.name, str(e)
@@ -1340,7 +1343,9 @@ def fetch_and_save_turn_14_brand_pricing_delta_for_company_provider(
         return
 
     try:
-        api_client = turn_14_client.Turn14ApiClient(credentials=company_provider.credentials)
+        api_client = turn_14_client.Turn14ApiClient(
+            credentials=credentials_helper.get_feed_credentials(company_provider)
+        )
     except ValueError as e:
         logger.error('{} Invalid Turn 14 credentials for company: {}. Error: {}. Skipping delta fetch.'.format(
             _LOG_PREFIX, company_provider.company.name, str(e)
@@ -1491,7 +1496,9 @@ def fetch_and_save_turn_14_brand_pricing_for_turn14_brands(
             company = company_provider.company
 
             try:
-                api_client = turn_14_client.Turn14ApiClient(credentials=company_provider.credentials)
+                api_client = turn_14_client.Turn14ApiClient(
+                    credentials=credentials_helper.get_feed_credentials(company_provider)
+                )
             except ValueError as e:
                 logger.error('{} Invalid Turn 14 credentials company={} brand: {}. Error: {}. Skipping.'.format(
                     _LOG_PREFIX, company.name, turn_14_brand.name, str(e)
@@ -1687,7 +1694,7 @@ def fetch_and_save_all_turn_14_brand_inventory() -> None:
             ))
             continue
         
-        credentials = company_provider.credentials
+        credentials = credentials_helper.get_feed_credentials(company_provider)
         
         try:
             api_client = turn_14_client.Turn14ApiClient(credentials=credentials)
@@ -1832,7 +1839,7 @@ def fetch_and_save_turn_14_brand_inventory_for_turn14_brands(
             ))
             continue
 
-        credentials = company_provider.credentials
+        credentials = credentials_helper.get_feed_credentials(company_provider)
         try:
             api_client = turn_14_client.Turn14ApiClient(credentials=credentials)
         except ValueError as e:
@@ -1991,7 +1998,7 @@ def fetch_and_save_turn_14_items_updates() -> None:
         logger.info('{} No turn 14 active primary provider found.'.format(_LOG_PREFIX))
         return
 
-    credentials = primary_provider.credentials
+    credentials = credentials_helper.get_feed_credentials(primary_provider)
     
     try:
         api_client = turn_14_client.Turn14ApiClient(credentials=credentials)
@@ -2293,7 +2300,9 @@ def fetch_and_save_turn_14_pricing_changes(start_date: str, end_date: str) -> No
     item_ids = set()
     for company_provider in company_providers:
         try:
-            api_client = turn_14_client.Turn14ApiClient(credentials=company_provider.credentials)
+            api_client = turn_14_client.Turn14ApiClient(
+                credentials=credentials_helper.get_feed_credentials(company_provider)
+            )
         except ValueError as e:
             logger.warning('{} Invalid Turn 14 credentials for company {}: {}. Skipping for pricing changes discovery.'.format(
                 _LOG_PREFIX, company_provider.company.name, str(e)
@@ -2369,7 +2378,7 @@ def fetch_and_save_turn_14_inventory_updates() -> None:
         logger.info('{} No turn 14 active primary provider found.'.format(_LOG_PREFIX))
         return
 
-    credentials = primary_provider.credentials
+    credentials = credentials_helper.get_feed_credentials(primary_provider)
     
     try:
         api_client = turn_14_client.Turn14ApiClient(credentials=credentials)
@@ -2565,7 +2574,7 @@ def fetch_and_save_turn_14_fitment_for_all_brands(resume: bool = False) -> None:
         logger.info('{} No Turn 14 active primary provider found.'.format(_LOG_PREFIX))
         return
 
-    credentials = primary_provider.credentials
+    credentials = credentials_helper.get_feed_credentials(primary_provider)
     try:
         api_client = turn_14_client.Turn14ApiClient(credentials=credentials)
     except ValueError as e:

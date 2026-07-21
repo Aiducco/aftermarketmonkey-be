@@ -16,6 +16,7 @@ from django.utils import timezone
 
 from src import enums as src_enums
 from src import models as src_models
+from src.integrations import credentials as credentials_helper
 from src.integrations.clients.atech import client as atech_client
 from src.integrations.clients.atech import exceptions as atech_exceptions
 from src.integrations.services.meyer import normalize_brand_match_key
@@ -968,7 +969,7 @@ def fetch_and_save_atech_catalog(force_download: bool = False) -> None:
 
     prefix_to_brand = _load_prefix_to_brand_id()
 
-    credentials = catalog_cp.credentials
+    credentials = credentials_helper.get_feed_credentials(catalog_cp)
     try:
         sftp = atech_client.AtechSFTPClient(credentials=credentials)
     except ValueError as e:
@@ -1107,7 +1108,7 @@ def sync_atech_company_pricing_for_company_provider(
         )
         return
 
-    creds = dict(cp.credentials or {})
+    creds = dict(credentials_helper.get_feed_credentials(cp))
     if not str(creds.get("local_feed_path") or "").strip():
         creds["local_feed_path"] = "/tmp/atech_feed_company_{}.txt".format(cp.company_id)
     try:

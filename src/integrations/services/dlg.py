@@ -15,6 +15,7 @@ from django.utils import timezone
 
 from src import enums as src_enums
 from src import models as src_models
+from src.integrations import credentials as credentials_helper
 from src.integrations.clients.dlg import client as dlg_client
 from src.integrations.clients.dlg import exceptions as dlg_exceptions
 from src.integrations.utils.brand_matching import (
@@ -726,7 +727,7 @@ def sync_dlg_company_pricing_for_company_provider(
         )
         return
 
-    creds = dict(cp.credentials or {})
+    creds = dict(credentials_helper.get_feed_credentials(cp))
     lf = str(creds.get("local_feed_path") or "").strip()
     if not lf:
         creds["local_feed_path"] = "/tmp/dlg_inventory_company_{}.csv".format(cp.company_id)
@@ -779,7 +780,7 @@ def fetch_and_save_dlg_catalog(force_download: bool = False) -> None:
         return
 
     try:
-        sftp = dlg_client.DlgSFTPClient(credentials=catalog_cp.credentials)
+        sftp = dlg_client.DlgSFTPClient(credentials=credentials_helper.get_feed_credentials(catalog_cp))
     except ValueError as e:
         logger.error("{} {}".format(_LOG_PREFIX, str(e)))
         raise

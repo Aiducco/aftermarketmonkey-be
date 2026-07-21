@@ -19,6 +19,7 @@ import pgbulk
 from src import constants as src_constants
 from src import enums as src_enums
 from src import models as src_models
+from src.integrations import credentials as credentials_helper
 from src.integrations.services.wheelpros import dealer_cost_from_msrp
 
 logger = logging.getLogger(__name__)
@@ -3800,7 +3801,7 @@ def sync_provider_pricing_from_wheelpros() -> None:
                     company_id__in=batch_company_ids,
                     provider_id=wp_provider.id,
                 ):
-                    creds_by_company[cpr.company_id] = cpr.credentials or {}
+                    creds_by_company[cpr.company_id] = credentials_helper.get_feed_credentials(cpr)
             master_keys = []
             for row in batch:
                 wb = wp_brand_to_brand.get(row.get("part__brand_id"))
@@ -4632,7 +4633,7 @@ def sync_provider_pricing_from_wheelpros_for_company(company_id: int) -> None:
         company_id=company_id,
         provider_id=wp_provider.id,
     ).first()
-    company_creds = (company_cp.credentials or {}) if company_cp else {}
+    company_creds = credentials_helper.get_feed_credentials(company_cp) if company_cp else {}
 
     def _worker(catalog_ids: typing.Set[int]) -> int:
         if not catalog_ids:

@@ -227,6 +227,13 @@ KEYSTONE_FTP_USER = ''  # Set via env or CompanyProviders.credentials
 KEYSTONE_FTP_PASSWORD = ''
 KEYSTONE_INVENTORY_LOCAL_PATH = '/tmp/keystone_inventory.csv'
 
+# Keystone Electronic Order Web Service (SOAP order placement) — a single fixed endpoint for
+# both test and production use; unlike Turn14, there's no separate host per environment, only a
+# different `security_key` value (see CompanyProviders.credentials["order"]).
+KEYSTONE_ORDER_ELECTRONIC_ORDER_URL = os.environ.get(
+    "KEYSTONE_ORDER_ELECTRONIC_ORDER_URL", "http://order.ekeystone.com/wselectronicorder/electronicorder.asmx"
+)
+
 # Rough Country jobber feed (Excel). Override ROUGH_COUNTRY_FEED_URL if the default returns 403.
 ROUGH_COUNTRY_FEED_URL = "https://feeds.roughcountry.com/jobber_pc2A.xlsx"
 

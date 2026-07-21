@@ -683,22 +683,25 @@ def get_order_capabilities(company_id: int) -> typing.List[typing.Dict]:
     ).select_related("provider")
     results = []
     for cp in company_providers:
-        can_order = order_registry.supports_ordering(cp.provider.kind)
-        supports_shipping_selection = False
-        supports_cancel = False
-        if can_order:
-            adapter = order_registry.get_adapter(cp)
-            supports_shipping_selection = bool(adapter and adapter.supports_shipping_method_selection())
-            supports_cancel = bool(adapter and adapter.supports_cancel())
+        # get_adapter() itself is the source of truth for "can THIS connection order right
+        # now" — it returns None both when no adapter is registered for the provider kind and
+        # when one is but this connection's order credentials aren't configured yet (e.g.
+        # Keystone's order credentials are a separate, optional namespace from its catalog
+        # feed). Reporting can_order_in_app from supports_ordering() alone (registered in the
+        # abstract) would tell the FE ordering is available for connections that would
+        # actually fail the moment a quote/order was attempted.
+        adapter = order_registry.get_adapter(cp)
         results.append(
             {
                 "company_provider_id": cp.id,
                 "provider_id": cp.provider_id,
                 "provider_kind_name": cp.provider.kind_name,
                 "provider_name": cp.provider.name,
-                "can_order_in_app": can_order,
-                "supports_shipping_method_selection": supports_shipping_selection,
-                "supports_cancel": supports_cancel,
+                "can_order_in_app": bool(adapter),
+                "supports_shipping_method_selection": bool(
+                    adapter and adapter.supports_shipping_method_selection()
+                ),
+                "supports_cancel": bool(adapter and adapter.supports_cancel()),
             }
         )
     return results

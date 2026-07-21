@@ -497,7 +497,7 @@ def _resolve_po_and_adapter(
 
     adapter = order_registry.get_adapter(po.company_provider)
     if adapter is None:
-        return po, None, "No order adapter registered for provider kind={}.".format(po.company_provider.provider.kind)
+        return po, None, order_registry.get_adapter_unavailable_reason(po.company_provider)
 
     return po, adapter, None
 

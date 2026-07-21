@@ -10,6 +10,13 @@ As of this build, five distributors are checked live before credentials are save
 input now fails the request with a specific error instead of silently failing the first
 background sync.
 
+**Credentials are namespaced into `feed` and `order`.** A connection's catalog/pricing-sync
+credentials (`feed`) and its order-placement credentials (`order`) are stored and submitted
+separately — they're the same value today for some distributors (e.g. Turn 14, whose OAuth
+client id/secret double as both) and genuinely different for others (e.g. Keystone, whose
+order-placement API needs a separate `account_number`/`security_key`). See **Ordering
+credentials** below for how to tell which case you're in.
+
 ---
 
 ## Endpoints
@@ -18,6 +25,28 @@ background sync.
 |--------|----------|------|
 | Connect (create) | `POST /api/integrations/catalog/<provider_id>/connect/` | Yes (Bearer) |
 | Update (partial patch) | `PATCH /api/integrations/connections/<company_provider_id>/` | Yes (Bearer) |
+
+---
+
+## Request body
+
+Both endpoints take credentials nested under `feed` and/or `order` — **not** a flat object of
+bare field names:
+
+```json
+{
+  "feed": { "client_id": "...", "client_secret": "..." },
+  "order": { "account_number": "...", "security_key": "..." }
+}
+```
+
+- `feed` — required on connect; on PATCH, omit it entirely to leave feed credentials
+  untouched.
+- `order` — always optional. Omit it to connect/update the feed only. If the distributor has
+  no distinct order fields (see **Ordering credentials** below) and you don't send `order`,
+  the backend auto-derives it from `feed` for you — don't send a duplicate copy.
+- A flat, unwrapped body (e.g. `{"client_id": "..."}`) is rejected with `invalid_input` — it's
+  not a legacy alias for `feed`, it's just invalid.
 
 ---
 
@@ -34,19 +63,30 @@ Same body shape on both endpoints.
     "company_id": 7,
     "provider_id": 3,
     "provider_name": "Turn 14",
-    "credentials": { "client_id": "...", "client_secret": "..." },
+    "feed_credentials": { "client_id": "abc123" },
+    "secrets_configured": { "client_id": true, "client_secret": true },
+    "order_credentials": { "account_number": "999" },
+    "order_secrets_configured": { "account_number": true, "security_key": true },
     "primary": false,
     "connection_validated": true,
+    "order_connection_validated": null,
     "created_at": "2026-07-14T09:12:03Z",
     "updated_at": "2026-07-14T09:12:03Z"
   }
 }
 ```
 
-`connection_validated` is:
-- `true` — we actually tested the connection and it passed
-- `null` — this distributor isn't validated yet (see Coverage below). A save can succeed
-  with `null`; that's expected, not a bug.
+Credentials in the response are **redacted, never echoed in plaintext**: for a field
+considered sensitive (name contains `password`, `secret`, `key`, or `token`), the value in
+`*_credentials` is always `null` and `*_secrets_configured[field]` is `true` if a value is
+stored. Non-sensitive fields (e.g. `client_id`, `account_number`, `ftp_host`) are returned as
+their real stored value. Use `secrets_configured`/`order_secrets_configured` to render
+"•••• (set)" for secret fields you can't prefill.
+
+`connection_validated` / `order_connection_validated` are each:
+- `true` — we actually tested that namespace's connection and it passed
+- `null` — this distributor (or this namespace) isn't validated yet (see Coverage below). A
+  save can succeed with `null`; that's expected, not a bug.
 
 **Failure** (`400`, or `404` for `not_found` on the PATCH endpoint):
 ```json
@@ -131,6 +171,39 @@ a connection against. Connect always succeeds today with `connection_validated: 
 
 ---
 
+## Ordering credentials — when to show a separate form
+
+Each catalog entry (`GET /api/integrations/catalog/`, and the connect/update responses via
+`order_connection_required_fields`/`order_connection_optional_fields`) tells you whether a
+distributor needs its own order-credentials form or reuses the feed form:
+
+```json
+{
+  "supports_ordering": true,
+  "order_connection_required_fields": [],
+  "order_connection_optional_fields": []
+}
+```
+
+- **`supports_ordering: false`** — this distributor has no in-app ordering at all. Don't show
+  any order-credentials UI.
+- **`supports_ordering: true` and both order field lists are empty** — order placement reuses
+  the feed credentials verbatim (e.g. Turn 14's OAuth client id/secret). **Don't show a
+  separate "enter ordering credentials" step** — connecting the feed is enough; the backend
+  auto-mirrors `feed` into `order` for you. If you explicitly pass `order` anyway, it's
+  validated against the *feed* field list, not stored as-is.
+- **`supports_ordering: true` and either order field list is non-empty** — this distributor
+  needs its own order credentials (e.g. Keystone's order API `account_number`/`security_key`,
+  separate from its FTPS catalog-feed login). Show a distinct form built from
+  `order_connection_required_fields`/`order_connection_optional_fields`, and submit it under
+  the `order` key.
+
+Rotating a mirrored distributor's `feed` credentials (PATCH with only `feed` in the body)
+automatically re-mirrors into `order` too — you don't need to resend `order` to keep it in
+sync.
+
+---
+
 ## Live status (catalog + connection detail)
 
 Separate from the connect/update-time checks above: every `CompanyProviders` connection
@@ -196,10 +269,16 @@ export interface ConnectSuccessResponse {
     company_id: number;
     provider_id: number;
     provider_name: string;
-    credentials: Record<string, unknown>;
+    // Sensitive fields (password/secret/key/token in the name) are always null here —
+    // check secrets_configured[field] instead.
+    feed_credentials: Record<string, unknown>;
+    secrets_configured: Record<string, boolean>;
+    order_credentials: Record<string, unknown>;
+    order_secrets_configured: Record<string, boolean>;
     primary: boolean;
-    // true = tested and passed · null = not validated for this distributor
+    // true = tested and passed · null = not validated for this distributor/namespace
     connection_validated: boolean | null;
+    order_connection_validated: boolean | null;
     created_at: string;
     updated_at: string;
   };

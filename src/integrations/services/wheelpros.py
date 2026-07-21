@@ -19,6 +19,7 @@ from django.utils import timezone
 from src import constants as src_constants
 from src import enums as src_enums
 from src import models as src_models
+from src.integrations import credentials as credentials_helper
 from src.integrations.clients.wheelpros import client as wheelpros_client
 from src.integrations.clients.wheelpros import exceptions as wheelpros_exceptions
 from src.integrations.utils.brand_matching import (
@@ -613,9 +614,10 @@ def _get_wheelpros_credentials() -> typing.Optional[typing.Dict]:
             company=tick,
             provider=provider,
         ).first()
-    if not cp or not cp.credentials:
+    feed_credentials = credentials_helper.get_feed_credentials(cp) if cp else {}
+    if not feed_credentials:
         return None
-    return cp.credentials
+    return feed_credentials
 
 
 def _wheelpros_credentials_for_catalog(
@@ -623,8 +625,9 @@ def _wheelpros_credentials_for_catalog(
 ) -> typing.Dict:
     """Prefer primary / first active WheelPros CompanyProvider; else TICK_PERFORMANCE legacy lookup."""
     cp = _catalog_wheelpros_company_provider(wp_provider)
-    if cp and cp.credentials:
-        return dict(cp.credentials)
+    feed_credentials = credentials_helper.get_feed_credentials(cp) if cp else {}
+    if feed_credentials:
+        return dict(feed_credentials)
     return dict(_get_wheelpros_credentials() or {})
 
 
@@ -846,7 +849,7 @@ def sync_wheelpros_company_pricing_for_company_provider(
             continue
         local_path = "/tmp/wheelpros_{}_cp_{}.csv".format(feed_type, company_provider_id)
 
-        creds = dict(cp.credentials or {})
+        creds = dict(credentials_helper.get_feed_credentials(cp))
         creds["sftp_path"] = sftp_path
         pc = wheelpros_client.WheelProsSFTPClient(
             credentials=creds,
@@ -910,7 +913,7 @@ def sync_wheelpros_company_pricing_for_company_provider(
             if not part_id:
                 continue
             pricing_by_part_id[int(part_id)] = pdata
-        creds_for_cost = dict(cp.credentials or {})
+        creds_for_cost = dict(credentials_helper.get_feed_credentials(cp))
         pricing_to_upsert = [
             src_models.WheelProsCompanyPricing(
                 part_id=pid,

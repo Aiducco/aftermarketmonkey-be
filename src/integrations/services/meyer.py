@@ -17,6 +17,7 @@ from django.utils import timezone
 
 from src import enums as src_enums
 from src import models as src_models
+from src.integrations import credentials as credentials_helper
 from src.integrations.clients.meyer import client as meyer_client
 from src.integrations.clients.meyer import exceptions as meyer_exceptions
 from src.integrations.utils.brand_matching import (
@@ -217,7 +218,7 @@ def fetch_and_save_meyer_brands() -> None:
         logger.info("{} No active primary Meyer CompanyProviders row. Skipping.".format(_LOG_PREFIX))
         return
 
-    credentials = primary_provider.credentials
+    credentials = credentials_helper.get_feed_credentials(primary_provider)
     try:
         sftp = meyer_client.MeyerSFTPClient(credentials=credentials)
     except ValueError as e:
@@ -1199,7 +1200,7 @@ def fetch_and_save_meyer_catalog_and_inventory(force_download: bool = False) -> 
     # Per-company pricing (MeyerCompanyPricing) is handled by IntegrationPricingSyncJob
     # (Phase 3) for each CompanyProvider independently.
 
-    credentials = catalog_cp.credentials
+    credentials = credentials_helper.get_feed_credentials(catalog_cp)
     try:
         sftp = meyer_client.MeyerSFTPClient(credentials=credentials)
     except ValueError as e:
@@ -1443,7 +1444,7 @@ def sync_meyer_company_pricing_for_company_provider(
         )
         return
 
-    creds = dict(cp.credentials or {})
+    creds = dict(credentials_helper.get_feed_credentials(cp))
     if not str(creds.get("local_pricing_path") or "").strip():
         creds["local_pricing_path"] = "/tmp/meyer_pricing_company_{}.csv".format(cp.company_id)
     try:

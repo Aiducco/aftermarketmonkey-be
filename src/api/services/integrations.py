@@ -11,6 +11,7 @@ from src.integrations.clients.atech import client as atech_client
 from src.integrations.clients.atech import exceptions as atech_exceptions
 from src.integrations.clients.keystone import client as keystone_client
 from src.integrations.clients.keystone import exceptions as keystone_exceptions
+from src.integrations.clients.keystone import order_client as keystone_order_client
 from src.integrations.clients.meyer import client as meyer_client
 from src.integrations.clients.meyer import exceptions as meyer_exceptions
 from src.integrations.clients.premier import client as premier_client
@@ -21,6 +22,7 @@ from src.integrations.clients.turn_14 import client as turn14_client
 from src.integrations.clients.turn_14 import exceptions as turn14_exceptions
 from src.integrations.clients.wheelpros import client as wheelpros_client
 from src.integrations.clients.wheelpros import exceptions as wheelpros_exceptions
+from src.integrations.orders import registry as order_registry
 from src.integrations.services import integration_pricing_sync_jobs, relay_sftp_provisioning
 
 logger = logging.getLogger(__name__)
@@ -72,25 +74,32 @@ def _normalize_credential_value(value: typing.Any) -> typing.Optional[typing.Any
     return s if s else None
 
 
+_SENSITIVE_CREDENTIAL_KEY_SUBSTRINGS = ("password", "secret", "key", "token")
+
+
 def _credential_key_sensitive(key: str) -> bool:
+    """
+    Substring match against the field NAME (not a fixed allow-list), since every provider's
+    credential fields are declared per-entry in PROVIDER_CATALOG and new ones get added as
+    distributors are onboarded — a fixed list would silently miss a new provider's secret
+    field the same way "password"/"secret" alone missed Keystone's "security_key" and
+    "api_key"/"access_token" (neither contains "password" or "secret"). "key" and "token" are
+    broad on purpose: over-redacting a field that turns out not to be secret is a harmless
+    display nuisance, under-redacting a real secret is a credential leak.
+    """
     lower = (key or "").lower()
-    if "password" in lower or "secret" in lower:
-        return True
-    return False
+    return any(s in lower for s in _SENSITIVE_CREDENTIAL_KEY_SUBSTRINGS)
 
 
-def _build_credentials_from_catalog_entry(
-    catalog_entry: typing.Dict[str, typing.Any],
-    credentials: typing.Dict[str, typing.Any],
+def _build_namespace_credentials(
+    required: typing.List[str],
+    optional: typing.List[str],
+    raw: typing.Dict[str, typing.Any],
 ) -> typing.Tuple[typing.Optional[typing.Dict[str, typing.Any]], typing.Optional[str], typing.Optional[str]]:
-    """
-    Validate connection_required_fields and merge optional non-empty values from connection_optional_fields.
-    Returns (credentials, error_message, error_code).
-    """
-    required = catalog_entry.get("connection_required_fields", []) or []
-    optional = catalog_entry.get("connection_optional_fields", []) or []
+    """Validate `required` and collect non-empty values from `required` + `optional` out of one
+    namespace's raw section (e.g. the "feed" or "order" sub-dict of a connect/update request)."""
     if required:
-        missing = [f for f in required if not _normalize_credential_value(credentials.get(f))]
+        missing = [f for f in required if not _normalize_credential_value(raw.get(f))]
         if missing:
             return (
                 None,
@@ -99,14 +108,94 @@ def _build_credentials_from_catalog_entry(
             )
     creds: typing.Dict[str, typing.Any] = {}
     for k in required:
-        v = _normalize_credential_value(credentials.get(k))
+        v = _normalize_credential_value(raw.get(k))
         if v is not None:
             creds[k] = v
     for k in optional:
-        v = _normalize_credential_value(credentials.get(k))
+        v = _normalize_credential_value(raw.get(k))
         if v is not None:
             creds[k] = v
     return creds, None, None
+
+
+def _build_credentials_from_catalog_entry(
+    catalog_entry: typing.Dict[str, typing.Any],
+    payload: typing.Dict[str, typing.Any],
+) -> typing.Tuple[typing.Optional[typing.Dict[str, typing.Any]], typing.Optional[str], typing.Optional[str]]:
+    """
+    Build the namespaced ``{"feed": {...}, "order": {...}}`` credentials dict from a connect-time
+    request body shaped the same way — ``payload["feed"]``/``payload["order"]`` are each validated
+    against their own required/optional field lists from the catalog entry
+    (``connection_required_fields``/``connection_optional_fields`` for feed,
+    ``order_connection_required_fields``/``order_connection_optional_fields`` for order).
+
+    "order" is always optional at connect time — a company can connect the feed without opting
+    into ordering yet. If the catalog entry declares an order adapter (``supports_ordering``) but
+    has no *distinct* order fields (i.e. one credential set serves both, like Turn14's OAuth
+    client_id/secret), "order" is auto-mirrored from "feed" when the request omits it.
+
+    Returns (credentials, error_message, error_code).
+    """
+    feed_creds, err, err_code = _build_namespace_credentials(
+        catalog_entry.get("connection_required_fields", []) or [],
+        catalog_entry.get("connection_optional_fields", []) or [],
+        payload.get("feed") or {},
+    )
+    if err:
+        return None, err, err_code
+
+    order_required = catalog_entry.get("order_connection_required_fields", []) or []
+    order_optional = catalog_entry.get("order_connection_optional_fields", []) or []
+    order_raw = payload.get("order")
+    if order_required or order_optional:
+        if order_raw:
+            order_creds, err, err_code = _build_namespace_credentials(order_required, order_optional, order_raw)
+            if err:
+                return None, err, err_code
+        else:
+            order_creds = {}
+    elif order_raw:
+        # No distinct order field list is declared for this provider — its order credentials are
+        # always meant to mirror "feed" (see the mirror branch below). An explicitly-submitted
+        # "order" payload here can only be a client resending feed-shaped fields, so validate it
+        # against the FEED field list rather than storing arbitrary submitted keys verbatim (which
+        # would let a client persist unvalidated junk into credentials).
+        order_creds, err, err_code = _build_namespace_credentials(
+            catalog_entry.get("connection_required_fields", []) or [],
+            catalog_entry.get("connection_optional_fields", []) or [],
+            order_raw,
+        )
+        if err:
+            return None, err, err_code
+    elif order_registry.supports_ordering(catalog_entry["kind"].value):
+        order_creds = dict(feed_creds)
+    else:
+        order_creds = {}
+
+    return {"feed": feed_creds, "order": order_creds}, None, None
+
+
+def _merge_namespace_credentials(
+    section: typing.Dict[str, typing.Any],
+    required: typing.List[str],
+    optional: typing.List[str],
+    patch: typing.Dict[str, typing.Any],
+) -> typing.Tuple[typing.Optional[str], typing.Optional[str]]:
+    """Merges `patch` onto `section` in place. Only keys in required+optional are allowed.
+    Non-empty values overwrite; empty/null for a **sensitive** key (password, secret) leaves the
+    previous value unchanged so clients can update other fields without resubmitting secrets;
+    empty/null for a non-sensitive key clears it. Returns (error_message, error_code)."""
+    allowed = set(required) | set(optional)
+    for k, v in (patch or {}).items():
+        key = str(k)
+        if key not in allowed:
+            return "Unknown credential field: {}".format(key), CONNECTION_ERROR_INVALID_INPUT
+        nv = _normalize_credential_value(v)
+        if nv is not None:
+            section[key] = nv
+        elif not _credential_key_sensitive(key):
+            section.pop(key, None)
+    return None, None
 
 
 def _merge_update_credentials(
@@ -115,35 +204,71 @@ def _merge_update_credentials(
     patch: typing.Dict[str, typing.Any],
 ) -> typing.Tuple[typing.Optional[typing.Dict[str, typing.Any]], typing.Optional[str], typing.Optional[str]]:
     """
-    Apply a partial credential patch onto stored credentials. Only keys in the catalog
-    (required + optional) are allowed. Non-empty values overwrite. Empty / null for a
-    **sensitive** key (password, secret) leaves the previous value unchanged so clients
-    can update other fields without resubmitting secrets. Returns (credentials, error_message, error_code).
+    Apply a partial patch shaped ``{"feed": {...}, "order": {...}}`` onto the existing namespaced
+    credentials dict. Either namespace may be omitted from the patch entirely, in which case that
+    namespace is left untouched (this is how a feed-only update leaves an already-configured
+    "order" section alone, and vice versa). Returns (credentials, error_message, error_code).
     """
-    required = [str(f) for f in (catalog_entry.get("connection_required_fields") or [])]
-    optional = [str(f) for f in (catalog_entry.get("connection_optional_fields") or [])]
-    allowed: typing.Set[str] = set(required) | set(optional)
-    out: typing.Dict[str, typing.Any] = dict(existing or {})
+    patch = patch or {}
+    if patch and "feed" not in patch and "order" not in patch:
+        # A legacy/flat-shaped patch (bare credential fields, no "feed"/"order" wrapper) matches
+        # neither branch below and would otherwise silently apply no changes at all — the caller
+        # gets a 200 with nothing actually updated. Credentials are namespaced now; reject rather
+        # than no-op so a stale client finds out immediately instead of believing a rotation
+        # succeeded.
+        return (
+            None,
+            'Credentials must be nested under "feed" and/or "order".',
+            CONNECTION_ERROR_INVALID_INPUT,
+        )
 
-    for k, v in (patch or {}).items():
-        key = str(k)
-        if key not in allowed:
-            return None, "Unknown credential field: {}".format(key), CONNECTION_ERROR_INVALID_INPUT
-        nv = _normalize_credential_value(v)
-        if nv is not None:
-            out[key] = nv
-        else:
-            if _credential_key_sensitive(key):
-                continue
-            out.pop(key, None)
+    existing = existing or {}
+    out = {"feed": dict(existing.get("feed") or {}), "order": dict(existing.get("order") or {})}
 
-    missing = [f for f in required if not _normalize_credential_value(out.get(f))]
+    feed_required = [str(f) for f in (catalog_entry.get("connection_required_fields") or [])]
+    feed_optional = [str(f) for f in (catalog_entry.get("connection_optional_fields") or [])]
+    if "feed" in patch:
+        err, err_code = _merge_namespace_credentials(out["feed"], feed_required, feed_optional, patch.get("feed"))
+        if err:
+            return None, err, err_code
+
+    order_required = [str(f) for f in (catalog_entry.get("order_connection_required_fields") or [])]
+    order_optional = [str(f) for f in (catalog_entry.get("order_connection_optional_fields") or [])]
+    if "order" in patch:
+        err, err_code = _merge_namespace_credentials(out["order"], order_required, order_optional, patch.get("order"))
+        if err:
+            return None, err, err_code
+    elif (
+        "feed" in patch
+        and not order_required
+        and not order_optional
+        and order_registry.supports_ordering(catalog_entry["kind"].value)
+    ):
+        # This provider's order credentials mirror "feed" (no distinct order field list declared)
+        # — if the patch touched "feed" and didn't explicitly touch "order", re-derive "order" from
+        # the freshly patched "feed" so rotating a shared credential (e.g. Turn14's client
+        # id/secret) doesn't leave "order" silently pointing at the old, now-invalid value.
+        out["order"] = dict(out["feed"])
+
+    missing = [f for f in feed_required if not _normalize_credential_value(out["feed"].get(f))]
     if missing:
         return (
             None,
             "Missing required fields: {}".format(", ".join(missing)),
             CONNECTION_ERROR_MISSING_FIELDS,
         )
+
+    # Order fields are all-or-nothing: if the section has anything set at all, every required
+    # order field must be present, or every order-placement call against it would fail anyway.
+    if out["order"] and order_required:
+        missing_order = [f for f in order_required if not _normalize_credential_value(out["order"].get(f))]
+        if missing_order:
+            return (
+                None,
+                "Missing required order fields: {}".format(", ".join(missing_order)),
+                CONNECTION_ERROR_MISSING_FIELDS,
+            )
+
     return out, None, None
 
 
@@ -213,6 +338,9 @@ def get_providers_catalog(company_id: int) -> typing.Dict:
             "category": entry.get("category", ""),
             "connection_required_fields": entry.get("connection_required_fields", []),
             "connection_optional_fields": entry.get("connection_optional_fields", []),
+            "supports_ordering": order_registry.supports_ordering(kind_value),
+            "order_connection_required_fields": entry.get("order_connection_required_fields", []),
+            "order_connection_optional_fields": entry.get("order_connection_optional_fields", []),
             "installation_instructions_html": _render_relay_instructions_html(entry, company),
             "relay_provisioned": bool(entry.get("relay_provisioned")),
             "connected": connected,
@@ -386,13 +514,49 @@ def _validate_connection(
     kind: int, credentials: typing.Dict[str, typing.Any]
 ) -> typing.Tuple[typing.Optional[bool], typing.Optional[str], typing.Optional[str]]:
     """
-    Run the connection validator for this provider kind, if one exists.
+    Run the feed connection validator for this provider kind, if one exists.
     Returns (validated, error_message, error_code):
       (True, None, None)     — validator ran and the connection is good.
       (False, message, code) — validator ran and the connection failed; caller should reject the request.
       (None, None, None)     — no validator for this kind yet; not attempted.
     """
     validator = _CONNECTION_VALIDATORS.get(kind)
+    if not validator:
+        return None, None, None
+    message, code = validator(credentials)
+    if message:
+        return False, message, code
+    return True, None, None
+
+
+def _validate_keystone_order_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
+    try:
+        client = keystone_order_client.KeystoneOrderApiClient(credentials=credentials)
+        client.test_connection()
+    except (
+        keystone_exceptions.KeystoneOrderAuthError,
+        keystone_exceptions.KeystoneOrderPermissionError,
+    ) as e:
+        return str(e), CONNECTION_ERROR_INVALID_CREDENTIALS
+    except (keystone_exceptions.KeystoneException, ValueError) as e:
+        return str(e), CONNECTION_ERROR_CONNECTION_FAILED
+    return None, None
+
+
+# Order-credential validators — parallel to _CONNECTION_VALIDATORS but for the "order" namespace,
+# only run when a company actually submits order credentials (see _build_credentials_from_catalog_entry/
+# _merge_update_credentials — the "order" section is optional at connect/update time). Populated
+# per vendor as each order adapter's transport client is built (see src/integrations/orders/).
+_ORDER_CONNECTION_VALIDATORS: typing.Dict[int, typing.Callable[[typing.Dict[str, typing.Any]], _ValidatorResult]] = {
+    src_enums.BrandProviderKind.KEYSTONE.value: _validate_keystone_order_connection,
+}
+
+
+def _validate_order_connection(
+    kind: int, credentials: typing.Dict[str, typing.Any]
+) -> typing.Tuple[typing.Optional[bool], typing.Optional[str], typing.Optional[str]]:
+    """Same contract as _validate_connection, but against _ORDER_CONNECTION_VALIDATORS."""
+    validator = _ORDER_CONNECTION_VALIDATORS.get(kind)
     if not validator:
         return None, None, None
     message, code = validator(credentials)
@@ -475,12 +639,14 @@ def connect_provider(
 ) -> typing.Tuple[typing.Optional[typing.Dict], typing.Optional[str], typing.Optional[str]]:
     """
     Create or replace credentials for a ``CompanyProviders`` row (keyed by company + provider).
-    Validates required fields from the catalog, tests the connection for kinds with a validator
-    (see :data:`_CONNECTION_VALIDATORS`), saves, and enqueues
-    ``integration_pricing_sync_jobs.enqueue_company_provider_pricing_sync`` when the provider
-    has per-company pricing sync. Use :func:`update_connection` for partial PATCH updates by
-    connection id. Returns (data, error_message, error_code) — error_code is one of the
-    ``CONNECTION_ERROR_*`` constants, for the frontend to branch on.
+    ``credentials`` is shaped ``{"feed": {...}, "order": {...}}`` — "order" is optional (a company
+    can connect the feed without opting into order placement). Validates required fields from the
+    catalog per namespace, tests each namespace's connection with a validator when one exists
+    (see :data:`_CONNECTION_VALIDATORS` / :data:`_ORDER_CONNECTION_VALIDATORS`), saves, and
+    enqueues ``integration_pricing_sync_jobs.enqueue_company_provider_pricing_sync`` when the
+    provider has per-company pricing sync. Use :func:`update_connection` for partial PATCH
+    updates by connection id. Returns (data, error_message, error_code) — error_code is one of
+    the ``CONNECTION_ERROR_*`` constants, for the frontend to branch on.
     """
     provider = src_models.Providers.objects.filter(id=provider_id).first()
     if not provider:
@@ -490,6 +656,7 @@ def connect_provider(
     if not catalog_entry:
         return None, "Provider not found in catalog", CONNECTION_ERROR_NOT_FOUND
 
+    order_validated = None
     if catalog_entry.get("relay_provisioned"):
         company = src_models.Company.objects.filter(id=company_id).first()
         if not company:
@@ -507,16 +674,22 @@ def connect_provider(
                     CONNECTION_ERROR_CONNECTION_FAILED,
                 )
         user_field, password_field = catalog_entry.get("relay_credential_fields", ("sftp_user", "sftp_password"))
-        creds = {user_field: company.relay_sftp_username, password_field: company.relay_sftp_password}
+        creds = {"feed": {user_field: company.relay_sftp_username, password_field: company.relay_sftp_password}}
         validated = None
         status_enum, status_reason = _relay_feed_connection_status(company, provider.kind)
     else:
         creds, err, err_code = _build_credentials_from_catalog_entry(catalog_entry, credentials)
         if err:
             return None, err, err_code
-        validated, val_error, val_error_code = _validate_connection(provider.kind, creds)
+        validated, val_error, val_error_code = _validate_connection(provider.kind, creds["feed"])
         if val_error:
             return None, val_error, val_error_code
+        if creds.get("order"):
+            order_validated, order_val_error, order_val_error_code = _validate_order_connection(
+                provider.kind, creds["order"]
+            )
+            if order_val_error:
+                return None, order_val_error, order_val_error_code
         # validated is True (validator ran and passed) or None (no validator for this kind) —
         # a False result would already have returned above via val_error.
         status_enum = src_enums.CompanyProviderConnectionStatus.INGESTING if validated else None
@@ -547,22 +720,24 @@ def connect_provider(
     if integration_pricing_sync_jobs.should_enqueue_pricing_sync(provider.kind):
         integration_pricing_sync_jobs.enqueue_company_provider_pricing_sync(cp.id)
 
-    return {
+    result = {
         "id": cp.id,
         "company_provider_id": cp.id,
         "company_id": cp.company_id,
         "provider_id": cp.provider_id,
         "provider_name": provider.name,
-        "credentials": cp.credentials,
         "primary": cp.primary,
         "connection_validated": validated,
+        "order_connection_validated": order_validated,
         "status": cp.status,
         "status_name": cp.status_name,
         "status_reason": cp.status_reason,
         "status_checked_at": cp.status_checked_at.isoformat() if cp.status_checked_at else None,
         "created_at": cp.created_at.isoformat() if cp.created_at else None,
         "updated_at": cp.updated_at.isoformat() if cp.updated_at else None,
-    }, None, None
+    }
+    result.update(_redacted_credentials_for_catalog_entry(catalog_entry, cp.credentials))
+    return result, None, None
 
 
 def update_connection(
@@ -596,13 +771,20 @@ def update_connection(
     if err:
         return None, err, err_code
 
+    order_validated = None
     if catalog_entry.get("relay_provisioned"):
         validated = None
         status_enum, status_reason = _relay_feed_connection_status(cp.company, cp.provider.kind)
     else:
-        validated, val_error, val_error_code = _validate_connection(cp.provider.kind, creds)
+        validated, val_error, val_error_code = _validate_connection(cp.provider.kind, creds["feed"])
         if val_error:
             return None, val_error, val_error_code
+        if creds.get("order"):
+            order_validated, order_val_error, order_val_error_code = _validate_order_connection(
+                cp.provider.kind, creds["order"]
+            )
+            if order_val_error:
+                return None, order_val_error, order_val_error_code
         # validated is True (validator ran and passed) or None (no validator for this kind) —
         # a False result would already have returned above via val_error.
         status_enum = src_enums.CompanyProviderConnectionStatus.INGESTING if validated else None
@@ -616,22 +798,24 @@ def update_connection(
     if integration_pricing_sync_jobs.should_enqueue_pricing_sync(cp.provider.kind):
         integration_pricing_sync_jobs.enqueue_company_provider_pricing_sync(cp.id)
 
-    return {
+    result = {
         "id": cp.id,
         "company_provider_id": cp.id,
         "company_id": cp.company_id,
         "provider_id": cp.provider_id,
         "provider_name": cp.provider.name,
-        "credentials": cp.credentials,
         "primary": cp.primary,
         "connection_validated": validated,
+        "order_connection_validated": order_validated,
         "status": cp.status,
         "status_name": cp.status_name,
         "status_reason": cp.status_reason,
         "status_checked_at": cp.status_checked_at.isoformat() if cp.status_checked_at else None,
         "created_at": cp.created_at.isoformat() if cp.created_at else None,
         "updated_at": cp.updated_at.isoformat() if cp.updated_at else None,
-    }, None, None
+    }
+    result.update(_redacted_credentials_for_catalog_entry(catalog_entry, cp.credentials))
+    return result, None, None
 
 
 def disconnect_provider(
@@ -685,11 +869,17 @@ def get_company_providers(company_id: int) -> typing.List[typing.Dict]:
             "provider_type_name": provider.type_name if provider else None,
             "provider_kind": provider.kind if provider else None,
             "provider_kind_name": provider.kind_name if provider else None,
-            "credentials": cp.credentials,
             "primary": cp.primary,
             "created_at": cp.created_at.isoformat() if cp.created_at else None,
             "updated_at": cp.updated_at.isoformat() if cp.updated_at else None,
         }
+        catalog_entry = {}
+        if provider:
+            for entry in src_constants.PROVIDER_CATALOG:
+                if entry["kind"].value == provider.kind:
+                    catalog_entry = entry
+                    break
+        row.update(_redacted_credentials_for_catalog_entry(catalog_entry, cp.credentials))
         if provider:
             row.update(_provider_ui_metadata(provider))
         data.append(row)
@@ -747,13 +937,16 @@ def get_company_provider_by_id(company_id: int, provider_id: int) -> typing.Opti
             "provider_type_name": provider.type_name if provider else None,
             "provider_kind": provider.kind if provider else None,
             "provider_kind_name": provider.kind_name if provider else None,
-            "credentials": company_provider.credentials,
             "primary": company_provider.primary,
             "connection_required_fields": list(catalog_entry.get("connection_required_fields") or []),
             "connection_optional_fields": list(catalog_entry.get("connection_optional_fields") or []),
+            "order_connection_required_fields": list(catalog_entry.get("order_connection_required_fields") or []),
+            "order_connection_optional_fields": list(catalog_entry.get("order_connection_optional_fields") or []),
+            "supports_ordering": order_registry.supports_ordering(provider.kind) if provider else False,
             "created_at": company_provider.created_at.isoformat() if company_provider.created_at else None,
             "updated_at": company_provider.updated_at.isoformat() if company_provider.updated_at else None,
         }
+        data.update(_redacted_credentials_for_catalog_entry(catalog_entry, company_provider.credentials))
         if provider:
             data.update(_provider_ui_metadata(provider))
         
@@ -769,17 +962,19 @@ def get_company_provider_by_id(company_id: int, provider_id: int) -> typing.Opti
         raise
 
 
-def _redacted_credentials_for_connection_detail(
-    catalog_entry: typing.Dict[str, typing.Any],
+def _redacted_credentials(
+    required: typing.List[str],
+    optional: typing.List[str],
     raw: typing.Optional[typing.Dict[str, typing.Any]],
 ) -> typing.Tuple[typing.Dict[str, typing.Any], typing.Dict[str, bool]]:
     """
-    Keys: catalog required + optional (in order), then any other keys in storage.
-    Non-sensitive: stored values. Sensitive: always ``null`` in ``credentials``; if a value is stored,
-    ``secrets_configured[key]`` is True (so the FE can show “password set” without echoing the secret).
+    Keys: `required` + `optional` (in order), then any other keys in storage.
+    Non-sensitive: stored values. Sensitive: always ``null`` in the returned dict; if a value is
+    stored, ``secrets_configured[key]`` is True (so the FE can show "password set" without
+    echoing the secret). Used for both the "feed" and "order" namespaces of a connection.
     """
-    required = list(catalog_entry.get("connection_required_fields") or [])
-    optional = list(catalog_entry.get("connection_optional_fields") or [])
+    required = list(required or [])
+    optional = list(optional or [])
     raw = raw or {}
     key_order: typing.List[str] = []
     seen: typing.Set[str] = set()
@@ -805,6 +1000,45 @@ def _redacted_credentials_for_connection_detail(
         else:
             credentials[key] = val
     return credentials, secrets_configured
+
+
+def _redacted_credentials_for_catalog_entry(
+    catalog_entry: typing.Dict[str, typing.Any],
+    stored: typing.Optional[typing.Dict[str, typing.Any]],
+) -> typing.Dict[str, typing.Any]:
+    """
+    feed_credentials/secrets_configured/order_credentials/order_secrets_configured for one
+    connection, built the same way as get_company_provider_connection_detail — factored out so
+    every endpoint that returns a connection's credentials redacts them the same way, instead
+    of some endpoints returning cp.credentials raw. Relay-provisioned connections are the one
+    exception (shown plainly, not redacted — see get_company_provider_connection_detail's
+    comment on why).
+    """
+    stored = stored or {}
+    if catalog_entry.get("relay_provisioned"):
+        feed_stored = stored.get("feed") or {}
+        return {
+            "feed_credentials": dict(feed_stored),
+            "secrets_configured": {k: True for k in feed_stored.keys()},
+            "order_credentials": {},
+            "order_secrets_configured": {},
+        }
+    feed_redacted, feed_secrets = _redacted_credentials(
+        catalog_entry.get("connection_required_fields") or [],
+        catalog_entry.get("connection_optional_fields") or [],
+        stored.get("feed"),
+    )
+    order_redacted, order_secrets = _redacted_credentials(
+        catalog_entry.get("order_connection_required_fields") or [],
+        catalog_entry.get("order_connection_optional_fields") or [],
+        stored.get("order"),
+    )
+    return {
+        "feed_credentials": feed_redacted,
+        "secrets_configured": feed_secrets,
+        "order_credentials": order_redacted,
+        "order_secrets_configured": order_secrets,
+    }
 
 
 def get_company_provider_connection_detail(
@@ -869,23 +1103,19 @@ def get_company_provider_connection_detail(
     out["category"] = catalog_entry.get("category", "")
     out["connection_required_fields"] = list(catalog_entry.get("connection_required_fields") or [])
     out["connection_optional_fields"] = list(catalog_entry.get("connection_optional_fields") or [])
+    out["order_connection_required_fields"] = list(catalog_entry.get("order_connection_required_fields") or [])
+    out["order_connection_optional_fields"] = list(catalog_entry.get("order_connection_optional_fields") or [])
     out["relay_provisioned"] = bool(catalog_entry.get("relay_provisioned"))
+    out["supports_ordering"] = order_registry.supports_ordering(provider.kind)
 
     if catalog_entry.get("relay_provisioned"):
         # These credentials are meant to be handed to the distributor's rep, not kept secret from
         # the company itself — show them plainly instead of redacting like a normal password field.
         company = src_models.Company.objects.filter(id=company_provider.company_id).first()
         out["installation_instructions_html"] = _render_relay_instructions_html(catalog_entry, company)
-        out["credentials"] = dict(company_provider.credentials or {})
-        out["secrets_configured"] = {k: True for k in (company_provider.credentials or {}).keys()}
     else:
         out["installation_instructions_html"] = catalog_entry.get("installation_instructions_html") or None
-        creds_redacted, secrets_configured = _redacted_credentials_for_connection_detail(
-            catalog_entry,
-            company_provider.credentials,
-        )
-        out["credentials"] = creds_redacted
-        out["secrets_configured"] = secrets_configured
+    out.update(_redacted_credentials_for_catalog_entry(catalog_entry, company_provider.credentials))
     return out
 
 

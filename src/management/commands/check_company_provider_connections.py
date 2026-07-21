@@ -28,6 +28,7 @@ from django.utils import timezone
 from src import enums as src_enums
 from src import models as src_models
 from src.api.services import integrations as integrations_services
+from src.integrations import credentials as credentials_helper
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +93,7 @@ class Command(BaseCommand):
 
     def _check_validated(self, cp: src_models.CompanyProviders, kind: int) -> None:
         validator = integrations_services._CONNECTION_VALIDATORS[kind]
-        message, _code = validator(cp.credentials or {})
+        message, _code = validator(credentials_helper.get_feed_credentials(cp))
         if message:
             self._save_status(cp, src_enums.CompanyProviderConnectionStatus.FAILING, message)
         else:

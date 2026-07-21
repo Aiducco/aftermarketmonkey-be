@@ -16,6 +16,7 @@ from django.conf import settings
 
 from src import enums as src_enums
 from src import models as src_models
+from src.integrations import credentials as credentials_helper
 from src.integrations.clients.turn_14 import exceptions as turn14_client_exceptions
 from src.integrations.clients.turn_14.order_client import Turn14OrderApiClient
 from src.integrations.orders import base
@@ -41,7 +42,7 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
         base.DistributorOrderAdapter.__init__(self, company_provider)
         environment = getattr(settings, "TURN14_ORDER_ENVIRONMENT", "testing")
         self._client = Turn14OrderApiClient(
-            credentials=company_provider.credentials or {},
+            credentials=credentials_helper.get_order_credentials(company_provider),
             environment=environment,
         )
 

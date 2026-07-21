@@ -154,6 +154,10 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/keystone.png",
         "category": "Distributors",
         "connection_required_fields": ["ftp_user", "ftp_password"],
+        # Order-placement credentials (Electronic Order Web Service, SOAP) — entirely separate
+        # from the FTP catalog feed above. Optional: a company can connect the FTP feed without
+        # ever filling these in; order placement simply stays unavailable until they do.
+        "order_connection_required_fields": ["account_number", "security_key"],
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
             "<p><strong>Keystone</strong> data is loaded from their FTP inventory feed using your account credentials.</p>"
@@ -162,6 +166,18 @@ PROVIDER_CATALOG = [
             "(from Keystone onboarding or your rep).</li>"
             "<li>Enter them exactly as provided—no <code>ftp://</code> prefix in the username field.</li>"
             "<li>Save the connection. We will pull inventory and pricing from the standard Keystone CSV layouts.</li>"
+            "</ol>"
+            "<p><strong>Optional: place orders through AfterMarketScout</strong></p>"
+            "<ol>"
+            "<li>Ask your Keystone rep for access to the <strong>Electronic Order Web Service (SDK)</strong>, "
+            "and for your <strong>account number</strong> and <strong>security key</strong>. Keystone issues "
+            "separate test and production security keys—use the production key for live orders.</li>"
+            "<li>Keystone requires the IP address AfterMarketScout uses to reach their API to be "
+            "whitelisted for your key; contact <a href=\"mailto:info@aftermarketscout.com\">"
+            "info@aftermarketscout.com</a> for that IP if your rep asks for it.</li>"
+            "<li>Enter your <strong>account_number</strong> and <strong>security_key</strong> below and save. "
+            "This is separate from the FTP catalog connection above—you can skip it if you don't plan to place "
+            "orders through AfterMarketScout.</li>"
             "</ol>"
         ),
     },

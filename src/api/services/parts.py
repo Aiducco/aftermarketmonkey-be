@@ -305,13 +305,22 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
     }
 
     company_provider_map: typing.Dict[int, typing.Dict[str, typing.Any]] = {}
+    company_provider_objs: typing.Dict[int, src_models.CompanyProviders] = {}
     if company_id is not None:
-        company_provider_map = {
-            row["provider_id"]: row
-            for row in src_models.CompanyProviders.objects.filter(
+        company_provider_objs = {
+            cp.provider_id: cp
+            for cp in src_models.CompanyProviders.objects.filter(
                 company_id=company_id,
                 provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
-            ).values("provider_id", "initial_sync_completed", "status", "status_name")
+            ).select_related("provider")
+        }
+        company_provider_map = {
+            provider_id: {
+                "initial_sync_completed": cp.initial_sync_completed,
+                "status": cp.status,
+                "status_name": cp.status_name,
+            }
+            for provider_id, cp in company_provider_objs.items()
         }
     connected_provider_ids: typing.Set[int] = set(company_provider_map)
 
@@ -379,9 +388,17 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
             ),
             # Whether "Add to PO" (in-app ordering) is available for this distributor row —
             # see src.integrations.orders.registry. False for every distributor whose order
-            # adapter phase hasn't landed yet; those rows keep provider_go_to_link only.
+            # adapter phase hasn't landed yet, AND false for a connection that supports
+            # ordering in the abstract but hasn't configured order credentials yet (e.g.
+            # Keystone's order credentials are a separate, optional namespace from its catalog
+            # feed) — get_adapter() returns None in both cases, so this is the actual "can
+            # this specific connection order right now" signal, not just "does this provider
+            # kind support ordering at all". Those rows keep provider_go_to_link only.
             "can_order_in_app": bool(
-                integrated and pp.provider_id and order_registry.supports_ordering(pp.provider.kind)
+                integrated
+                and pp.provider_id
+                and order_registry.supports_ordering(pp.provider.kind)
+                and order_registry.get_adapter(company_provider_objs[pp.provider_id])
             ),
             "company_integration": {
                 "connected": integrated,

@@ -15,6 +15,7 @@ from django.utils import timezone
 from src import enums as src_enums
 from src import models as src_models
 
+from src.integrations import credentials as credentials_helper
 from src.integrations.clients.keystone import client as keystone_client
 from src.integrations.clients.keystone import exceptions as keystone_exceptions
 from src.integrations.utils.brand_matching import (
@@ -99,7 +100,7 @@ def fetch_and_save_keystone_brands() -> None:
         logger.info("{} No Keystone active primary provider found.".format(_LOG_PREFIX))
         return
 
-    credentials = primary_provider.credentials
+    credentials = credentials_helper.get_feed_credentials(primary_provider)
     try:
         ftp_client = keystone_client.KeystoneFTPClient(credentials=credentials)
     except ValueError as e:
@@ -607,7 +608,9 @@ def fetch_and_save_all_keystone_brand_parts() -> None:
     for company_provider in primary_providers:
         company = company_provider.company
         try:
-            ftp_client = keystone_client.KeystoneFTPClient(credentials=company_provider.credentials)
+            ftp_client = keystone_client.KeystoneFTPClient(
+                credentials=credentials_helper.get_feed_credentials(company_provider)
+            )
         except ValueError as e:
             logger.error("{} Invalid Keystone credentials company={}: {}.".format(
                 _LOG_PREFIX, company.name, str(e),
@@ -737,7 +740,9 @@ def fetch_and_save_all_keystone_brands_and_parts() -> None:
     for company_provider in company_providers_ordered:
         company = company_provider.company
         try:
-            ftp_client = keystone_client.KeystoneFTPClient(credentials=company_provider.credentials)
+            ftp_client = keystone_client.KeystoneFTPClient(
+                credentials=credentials_helper.get_feed_credentials(company_provider)
+            )
         except ValueError as e:
             logger.error("{} Invalid Keystone credentials company={}: {}.".format(
                 _LOG_PREFIX, company.name, str(e),
@@ -1018,7 +1023,9 @@ def sync_keystone_catalog_and_company_pricing_for_company_provider(company_provi
     company = company_provider.company
 
     try:
-        ftp_client = keystone_client.KeystoneFTPClient(credentials=company_provider.credentials)
+        ftp_client = keystone_client.KeystoneFTPClient(
+            credentials=credentials_helper.get_feed_credentials(company_provider)
+        )
     except ValueError as e:
         logger.error("{} Invalid Keystone credentials company={}: {}.".format(
             _LOG_PREFIX, company.name, str(e),

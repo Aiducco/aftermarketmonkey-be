@@ -19,6 +19,7 @@ from django.utils import timezone
 from src import constants as src_constants
 from src import enums as src_enums
 from src import models as src_models
+from src.integrations import credentials as credentials_helper
 from src.integrations.clients.rough_country import client as rough_country_client
 from src.integrations.clients.rough_country import exceptions as rough_country_exceptions
 from src.integrations.utils.brand_matching import (
@@ -518,7 +519,7 @@ def fetch_and_save_rough_country(
     # (Phase 3) for each CompanyProvider independently.
 
     catalog_cp = _catalog_company_provider(rc_provider)
-    catalog_creds = (catalog_cp.credentials if catalog_cp else {}) or {}
+    catalog_creds = credentials_helper.get_feed_credentials(catalog_cp) if catalog_cp else {}
     if catalog_cp:
         logger.info(
             "{} Catalog feed using company_id={} (primary={}).".format(
@@ -803,7 +804,7 @@ def sync_rough_country_company_pricing_for_company_provider(
         return
 
     price_client = _rough_country_feed_client_for_credentials(
-        cp.credentials or {},
+        credentials_helper.get_feed_credentials(cp),
         file_url,
         local_file_path,
         local_file_name,

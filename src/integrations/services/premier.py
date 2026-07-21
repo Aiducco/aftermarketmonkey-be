@@ -13,6 +13,7 @@ from django.utils import timezone
 
 from src import enums as src_enums
 from src import models as src_models
+from src.integrations import credentials as credentials_helper
 from src.integrations.clients.premier import client as premier_client
 from src.integrations.clients.premier import exceptions as premier_exceptions
 from src.integrations.utils.brand_matching import (
@@ -119,7 +120,9 @@ def fetch_and_save_premier_brands() -> None:
         return
 
     try:
-        ftp_client = premier_client.PremierFTPClient(credentials=primary_provider.credentials)
+        ftp_client = premier_client.PremierFTPClient(
+            credentials=credentials_helper.get_feed_credentials(primary_provider)
+        )
     except ValueError as e:
         logger.error("{} Invalid credentials: {}.".format(_LOG_PREFIX, str(e)))
         raise
@@ -566,7 +569,9 @@ def fetch_and_save_all_premier_brand_parts() -> None:
         company = company_provider.company
 
         try:
-            ftp_client = premier_client.PremierFTPClient(credentials=company_provider.credentials)
+            ftp_client = premier_client.PremierFTPClient(
+                credentials=credentials_helper.get_feed_credentials(company_provider)
+            )
         except ValueError as e:
             logger.error("{} Invalid credentials company={}: {}.".format(_LOG_PREFIX, company.name, str(e)))
             continue
