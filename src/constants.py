@@ -129,13 +129,18 @@ PROVIDER_CATALOG = [
     {
         "kind": enums.BrandProviderKind.TURN_14,
         "name": "Turn 14",
-        "description": (
-            "Access real-time inventory, pricing, and product data from Turn 14 Distribution. "
-            "These same credentials are also used to place orders — no separate ordering setup needed."
-        ),
+        "description": "Access real-time inventory, pricing, and product data from Turn 14 Distribution.",
         "icon_url": "https://api.aftermarketscout.com/uploads/t14_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["client_id", "client_secret"],
+        # Order-placement credentials (Turn 14 Electronic Order API) — same OAuth2 client
+        # id/secret shape as the feed above, but declared and validated as a distinct namespace
+        # like every other distributor: catalog-API and order-API access are separate permission
+        # grants on Turn 14's side even when the credential *values* are the same pair, so
+        # entering (and validating) them again here confirms order placement actually works
+        # instead of assuming it does because the feed connected fine. See
+        # _validate_turn14_order_connection in src/api/services/integrations.py.
+        "order_connection_required_fields": ["client_id", "client_secret"],
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
             "<p>Turn 14 connections use OAuth2. Your <strong>client ID</strong> and <strong>client secret</strong> "
@@ -147,9 +152,16 @@ PROVIDER_CATALOG = [
             "<li>Copy the <strong>client ID</strong> and <strong>client secret</strong> from that page.</li>"
             "<li>Paste them into the fields below and save. AfterMarketScout uses them only to call Turn 14 on your behalf.</li>"
             "</ul>"
-            "<p>These credentials are also used to place orders through AfterMarketScout — there's no separate "
-            "ordering connection to set up.</p>"
             "<p>If you cannot access that page or the credentials are missing, contact Turn 14 support or your account manager.</p>"
+            "<p><strong>Optional: place orders through AfterMarketScout</strong></p>"
+            "<ol>"
+            "<li>Ask Turn 14 support (or your account manager) to confirm your API credentials also have "
+            "<strong>order placement</strong> access — this is a separate grant from catalog/pricing access, "
+            "even though it uses the same client ID and secret.</li>"
+            "<li>Enter your <strong>client_id</strong> and <strong>client_secret</strong> again below (order "
+            "credentials are stored and validated separately from the feed connection above) and save. "
+            "You can skip it if you don't plan to place orders through AfterMarketScout.</li>"
+            "</ol>"
         ),
     },
     {

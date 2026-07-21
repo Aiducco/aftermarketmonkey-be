@@ -142,6 +142,31 @@ class Turn14OrderApiClient(object):
 
         return simplejson.loads(response.content, parse_float=decimal.Decimal)
 
+    # -- Connection test ------------------------------------------------------------------
+
+    def test_connection(self) -> None:
+        """
+        Validate order-API credentials by requesting a token, then confirming the account can
+        read shipping options — the cheapest real, read-only call on the Order API. A Turn 14
+        account can have valid catalog-API access (see clients/turn_14/client.py) without a
+        separate grant for order placement, or vice versa; this catches that at connect time
+        instead of surfacing later as a failed submit_order().
+        """
+        self._get_valid_token()
+        try:
+            self.get_shipping_options()
+        except exceptions.Turn14APIBadResponseCodeError as e:
+            if e.code in (401, 403):
+                raise exceptions.Turn14PermissionError(
+                    message=(
+                        "Connected to Turn 14, but this account does not have permission to "
+                        "place orders via the API ({} environment). Contact Turn 14 support to "
+                        "enable order API access for this account.".format(self.environment)
+                    ),
+                    code=e.code,
+                )
+            raise
+
     # -- Quote --------------------------------------------------------------------------
 
     def create_quote(self, data: typing.Dict) -> typing.Dict:

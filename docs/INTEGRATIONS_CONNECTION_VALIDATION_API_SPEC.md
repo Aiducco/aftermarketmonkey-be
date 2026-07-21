@@ -11,11 +11,12 @@ input now fails the request with a specific error instead of silently failing th
 background sync.
 
 **Credentials are namespaced into `feed` and `order`.** A connection's catalog/pricing-sync
-credentials (`feed`) and its order-placement credentials (`order`) are stored and submitted
-separately — they're the same value today for some distributors (e.g. Turn 14, whose OAuth
-client id/secret double as both) and genuinely different for others (e.g. Keystone, whose
-order-placement API needs a separate `account_number`/`security_key`). See **Ordering
-credentials** below for how to tell which case you're in.
+credentials (`feed`) and its order-placement credentials (`order`) are always stored, submitted,
+and validated separately — even for Turn 14, where the `order` values happen to be the exact
+same OAuth client id/secret as `feed` (catalog-API and order-API access are separate permission
+grants on Turn 14's side, so entering and validating them again is what actually confirms order
+placement works, rather than assuming it does because the feed connected). See **Ordering
+credentials** below for the full per-distributor field list.
 
 ---
 
@@ -181,34 +182,35 @@ and `order_connection_required_fields`/`order_connection_optional_fields`:
 ```json
 {
   "supports_ordering": true,
-  "order_credentials_mirror_feed": true,
-  "order_connection_required_fields": [],
+  "order_credentials_mirror_feed": false,
+  "order_connection_required_fields": ["client_id", "client_secret"],
   "order_connection_optional_fields": []
 }
 ```
 
 - **`supports_ordering: false`** — this distributor has no in-app ordering at all. Don't show
   any order-credentials UI.
-- **`supports_ordering: true` and `order_credentials_mirror_feed: true`** — order placement
-  reuses the feed credentials verbatim (Turn 14's OAuth client id/secret is the only distributor
-  like this today). **Don't show a separate "enter ordering credentials" step** — connecting the
-  feed is enough; the backend auto-mirrors `feed` into `order` for you, and re-mirrors
-  automatically if you later rotate `feed` via PATCH. If you explicitly pass `order` anyway,
-  it's validated against the *feed* field list, not stored as-is.
-- **`supports_ordering: true` and `order_credentials_mirror_feed: false`** — this distributor
-  needs its own order credentials, distinct from its feed login (e.g. Keystone's order API
-  `account_number`/`security_key`, separate from its FTPS catalog-feed login; same for Meyer,
-  Wheel Pros, and Premier/APG). Show a distinct form built from
-  `order_connection_required_fields`/`order_connection_optional_fields`, and submit it under
-  the `order` key. Note: some of these distributors (Meyer, Wheel Pros, Premier/APG as of this
-  writing) report `supports_ordering: true` and declare their required order fields even though
-  in-app order *placement* isn't wired up on the backend yet — showing the credentials form now
-  just lets companies get ahead of it; submitting an actual order for these will fail until the
-  backend adapter ships.
+- **`supports_ordering: true`** — show a distinct order-credentials form built from
+  `order_connection_required_fields`/`order_connection_optional_fields`, and submit it under the
+  `order` key. This applies even to Turn 14, whose order fields (`client_id`, `client_secret`)
+  happen to be named and valued identically to its feed fields — the two are still entered and
+  validated as separate submissions, because catalog-API and order-API access are independent
+  permission grants on Turn 14's side. Pre-filling the order form with the feed values the user
+  already entered is a reasonable UX shortcut, but always submit and validate them under `order`
+  explicitly; nothing is auto-copied server-side.
+  Note: some of these distributors (Meyer, Wheel Pros, Premier/APG as of this writing) report
+  `supports_ordering: true` and declare their required order fields even though in-app order
+  *placement* isn't wired up on the backend yet — showing the credentials form now just lets
+  companies get ahead of it; submitting an actual order for these will fail until the backend
+  adapter ships.
+- **`order_credentials_mirror_feed`** — reserved for a future distributor whose order
+  credentials would be silently auto-derived from `feed` with no separate form at all. Always
+  `false` today; every currently order-capable distributor (Turn 14 included, as of this
+  change) needs its own explicit `order` submission.
 
-Rotating a mirrored distributor's `feed` credentials (PATCH with only `feed` in the body)
-automatically re-mirrors into `order` too — you don't need to resend `order` to keep it in
-sync.
+Rotating Turn 14's `feed` credentials (client secret regenerated, etc.) does **not** touch
+`order` — PATCH each namespace explicitly, even when you're resubmitting the same new values to
+both.
 
 ---
 

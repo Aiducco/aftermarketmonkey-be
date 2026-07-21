@@ -1,6 +1,7 @@
 import logging
 import typing
 
+from django.conf import settings
 from django.core.paginator import Paginator
 from django.utils import timezone
 
@@ -20,6 +21,7 @@ from src.integrations.clients.rough_country import client as rough_country_clien
 from src.integrations.clients.rough_country import exceptions as rough_country_exceptions
 from src.integrations.clients.turn_14 import client as turn14_client
 from src.integrations.clients.turn_14 import exceptions as turn14_exceptions
+from src.integrations.clients.turn_14 import order_client as turn14_order_client
 from src.integrations.clients.wheelpros import client as wheelpros_client
 from src.integrations.clients.wheelpros import exceptions as wheelpros_exceptions
 from src.integrations.orders import registry as order_registry
@@ -130,9 +132,11 @@ def _build_credentials_from_catalog_entry(
     ``order_connection_required_fields``/``order_connection_optional_fields`` for order).
 
     "order" is always optional at connect time — a company can connect the feed without opting
-    into ordering yet. If the catalog entry declares an order adapter (``supports_ordering``) but
-    has no *distinct* order fields (i.e. one credential set serves both, like Turn14's OAuth
-    client_id/secret), "order" is auto-mirrored from "feed" when the request omits it.
+    into ordering yet. Every currently-registered order adapter (Turn14, Keystone) declares its
+    own order field list and is validated as its own namespace, even when the values happen to
+    match "feed" (Turn14). If a future adapter genuinely has no distinct order fields at all,
+    this falls back to auto-mirroring "order" from "feed" when the request omits it — see the
+    ``elif`` branches below — but nothing currently exercises that path.
 
     Returns (credentials, error_message, error_code).
     """
@@ -436,13 +440,15 @@ def _catalog_supports_ordering_display(catalog_entry: typing.Dict[str, typing.An
 
 def _catalog_order_credentials_mirror_feed(catalog_entry: typing.Dict[str, typing.Any]) -> bool:
     """
-    True when this provider's order credentials are the same values as its feed credentials
-    (Turn14: one OAuth client_id/client_secret pair serves both) rather than a distinct field
-    set the company has to fill in separately (Keystone/Meyer/Wheel Pros/Premier all need their
-    own order-specific fields). Mirrors the condition in _build_credentials_from_catalog_entry
-    that actually performs the copy at connect/update time — this is purely a read-side signal
-    so the FE can render "your feed credentials are also used for ordering" instead of asking
-    for the same values twice; it does not itself affect what gets stored.
+    True only when the catalog entry declares NO distinct order field list at all for a
+    registered order adapter — i.e. its order credentials would be silently auto-mirrored from
+    "feed" (see _build_credentials_from_catalog_entry's fallback ``elif`` branches). As of this
+    writing every registered adapter (Turn14, Keystone) declares its own order fields and is
+    validated independently — even Turn14, whose order credential *values* happen to be the
+    same OAuth client_id/client_secret as its feed, still requires them to be entered and
+    validated separately (catalog-API and order-API access are separate permission grants on
+    Turn14's side) — so this is currently always False. Kept for any future adapter that
+    genuinely has nothing distinct to validate.
     """
     if catalog_entry.get("order_connection_required_fields") or catalog_entry.get("order_connection_optional_fields"):
         return False
@@ -583,11 +589,39 @@ def _validate_keystone_order_connection(credentials: typing.Dict[str, typing.Any
     return None, None
 
 
+def _validate_turn14_order_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
+    """
+    Tests the submitted client_id/client_secret against Turn 14's ORDER API specifically (not
+    the catalog API — see clients/turn_14/client.py's own validator), since the two are
+    separate permission grants even when the credential values happen to be identical. Order
+    credentials are entered explicitly for Turn 14 like every other distributor now — they are
+    no longer silently mirrored from "feed" without being independently confirmed to work for
+    order placement.
+    """
+    try:
+        environment = getattr(settings, "TURN14_ORDER_ENVIRONMENT", "production")
+        client = turn14_order_client.Turn14OrderApiClient(credentials=credentials, environment=environment)
+        client.test_connection()
+    except turn14_exceptions.Turn14PermissionError as e:
+        return e.message, CONNECTION_ERROR_PERMISSION_DENIED
+    except turn14_exceptions.Turn14APIBadResponseCodeError as e:
+        code = (
+            CONNECTION_ERROR_INVALID_CREDENTIALS
+            if e.code in (401, 403)
+            else CONNECTION_ERROR_CONNECTION_FAILED
+        )
+        return e.message, code
+    except (turn14_exceptions.Turn14APIException, ValueError) as e:
+        return str(e), CONNECTION_ERROR_CONNECTION_FAILED
+    return None, None
+
+
 # Order-credential validators — parallel to _CONNECTION_VALIDATORS but for the "order" namespace,
 # only run when a company actually submits order credentials (see _build_credentials_from_catalog_entry/
 # _merge_update_credentials — the "order" section is optional at connect/update time). Populated
 # per vendor as each order adapter's transport client is built (see src/integrations/orders/).
 _ORDER_CONNECTION_VALIDATORS: typing.Dict[int, typing.Callable[[typing.Dict[str, typing.Any]], _ValidatorResult]] = {
+    src_enums.BrandProviderKind.TURN_14.value: _validate_turn14_order_connection,
     src_enums.BrandProviderKind.KEYSTONE.value: _validate_keystone_order_connection,
 }
 
