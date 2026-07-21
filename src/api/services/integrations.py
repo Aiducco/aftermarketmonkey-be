@@ -15,8 +15,10 @@ from src.integrations.clients.keystone import exceptions as keystone_exceptions
 from src.integrations.clients.keystone import order_client as keystone_order_client
 from src.integrations.clients.meyer import client as meyer_client
 from src.integrations.clients.meyer import exceptions as meyer_exceptions
+from src.integrations.clients.meyer import order_client as meyer_order_client
 from src.integrations.clients.premier import client as premier_client
 from src.integrations.clients.premier import exceptions as premier_exceptions
+from src.integrations.clients.premier import order_client as premier_order_client
 from src.integrations.clients.rough_country import client as rough_country_client
 from src.integrations.clients.rough_country import exceptions as rough_country_exceptions
 from src.integrations.clients.turn_14 import client as turn14_client
@@ -631,6 +633,30 @@ def _validate_turn14_order_connection(credentials: typing.Dict[str, typing.Any])
     return None, None
 
 
+def _validate_meyer_order_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
+    try:
+        environment = getattr(settings, "MEYER_ORDER_ENVIRONMENT", "production")
+        client = meyer_order_client.MeyerOrderApiClient(credentials=credentials, environment=environment)
+        client.test_connection()
+    except meyer_exceptions.MeyerOrderAuthError as e:
+        return str(e), CONNECTION_ERROR_INVALID_CREDENTIALS
+    except (meyer_exceptions.MeyerException, ValueError) as e:
+        return str(e), CONNECTION_ERROR_CONNECTION_FAILED
+    return None, None
+
+
+def _validate_premier_order_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
+    try:
+        environment = getattr(settings, "PREMIER_ORDER_ENVIRONMENT", "production")
+        client = premier_order_client.PremierOrderApiClient(credentials=credentials, environment=environment)
+        client.test_connection()
+    except premier_exceptions.PremierOrderAuthError as e:
+        return str(e), CONNECTION_ERROR_INVALID_CREDENTIALS
+    except (premier_exceptions.PremierException, ValueError) as e:
+        return str(e), CONNECTION_ERROR_CONNECTION_FAILED
+    return None, None
+
+
 # Order-credential validators — parallel to _CONNECTION_VALIDATORS but for the "order" namespace,
 # only run when a company actually submits order credentials (see _build_credentials_from_catalog_entry/
 # _merge_update_credentials — the "order" section is optional at connect/update time). Populated
@@ -638,6 +664,8 @@ def _validate_turn14_order_connection(credentials: typing.Dict[str, typing.Any])
 _ORDER_CONNECTION_VALIDATORS: typing.Dict[int, typing.Callable[[typing.Dict[str, typing.Any]], _ValidatorResult]] = {
     src_enums.BrandProviderKind.TURN_14.value: _validate_turn14_order_connection,
     src_enums.BrandProviderKind.KEYSTONE.value: _validate_keystone_order_connection,
+    src_enums.BrandProviderKind.MEYER.value: _validate_meyer_order_connection,
+    src_enums.BrandProviderKind.PREMIER_PERFORMANCE.value: _validate_premier_order_connection,
 }
 
 

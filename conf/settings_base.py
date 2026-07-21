@@ -310,6 +310,16 @@ MEYER_INVENTORY_REMOTE_FILE = os.environ.get("MEYER_INVENTORY_REMOTE_FILE") or "
 MEYER_PRICING_LOCAL_PATH = os.environ.get("MEYER_PRICING_LOCAL_PATH", "/tmp/meyer_pricing.csv")
 MEYER_INVENTORY_LOCAL_PATH = os.environ.get("MEYER_INVENTORY_LOCAL_PATH", "/tmp/meyer_inventory.csv")
 
+# Meyer Order API (REST, username/password -> 30-day Espresso apikey) — separate hosts for their
+# "testing" and "production" environments, same pattern as Turn14's order API split.
+MEYER_ORDER_TEST_BASE_URL = os.environ.get(
+    "MEYER_ORDER_TEST_BASE_URL", "https://meyerapitest.meyerdistributing.com/http/default/TestAPI/v2"
+)
+MEYER_ORDER_PRODUCTION_BASE_URL = os.environ.get(
+    "MEYER_ORDER_PRODUCTION_BASE_URL", "https://meyerapi.meyerdistributing.com/http/default/ProdAPI/v2"
+)
+MEYER_ORDER_ENVIRONMENT = os.environ.get("MEYER_ORDER_ENVIRONMENT", "production")
+
 # A-Tech relay SFTP: same pattern as Meyer — per-company sftp_user/sftp_password in CompanyProviders.
 try:
     _atech_port = int(os.environ.get("ATECH_SFTP_PORT") or "22")
@@ -415,3 +425,12 @@ try:
     MEILISEARCH_REINDEX_UPLOAD_WORKERS = int(os.environ.get("MEILISEARCH_REINDEX_UPLOAD_WORKERS", "4"))
 except ValueError:
     MEILISEARCH_REINDEX_UPLOAD_WORKERS = 4
+
+# Premier (APG Wholesale) Order API (REST, apiKey -> Bearer JWT session token) — separate hosts
+# for their "testing" and "production" environments. Note the test host is plain HTTP, not
+# HTTPS, per Premier's own docs.
+PREMIER_ORDER_TEST_BASE_URL = os.environ.get("PREMIER_ORDER_TEST_BASE_URL", "http://api-test.premierwd.com/api/v5")
+PREMIER_ORDER_PRODUCTION_BASE_URL = os.environ.get(
+    "PREMIER_ORDER_PRODUCTION_BASE_URL", "https://api.premierwd.com/api/v5"
+)
+PREMIER_ORDER_ENVIRONMENT = os.environ.get("PREMIER_ORDER_ENVIRONMENT", "production")

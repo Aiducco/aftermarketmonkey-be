@@ -80,7 +80,11 @@ def get_adapter_unavailable_reason(company_provider: src_models.CompanyProviders
 # AppConfig.ready() hook, which this project doesn't use) so registration happens as soon as
 # anything imports this module.
 from src.integrations.orders import keystone as _keystone  # noqa: E402
+from src.integrations.orders import meyer as _meyer  # noqa: E402
+from src.integrations.orders import premier as _premier  # noqa: E402
 from src.integrations.orders import turn_14 as _turn_14  # noqa: E402
 
 register(src_enums.BrandProviderKind.TURN_14.value, _turn_14.Turn14OrderAdapter)
 register(src_enums.BrandProviderKind.KEYSTONE.value, _keystone.KeystoneOrderAdapter)
+register(src_enums.BrandProviderKind.MEYER.value, _meyer.MeyerOrderAdapter)
+register(src_enums.BrandProviderKind.PREMIER_PERFORMANCE.value, _premier.PremierOrderAdapter)
