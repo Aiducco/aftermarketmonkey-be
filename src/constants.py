@@ -25,7 +25,7 @@ PROVIDER_DISPLAY_NAMES = {
     "PARTS_AUTHORITY": "Parts Authority",
     "PARTS_CANADA": "Parts Canada",
     "PARTS_UNLIMITED": "Parts Unlimited",
-    "PREMIER_PERFORMANCE": "APG Wholesale (Premier)",
+    "PREMIER_PERFORMANCE": "APG (Premier)",
     "SSF_IMPORTED_AUTO_PARTS": "SSF Imported Auto Parts",
     "THE_WHEEL_GROUP": "The Wheel Group",
     "THIBERT": "Thibert",
