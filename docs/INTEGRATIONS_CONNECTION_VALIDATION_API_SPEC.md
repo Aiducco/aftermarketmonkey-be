@@ -173,13 +173,15 @@ a connection against. Connect always succeeds today with `connection_validated: 
 
 ## Ordering credentials — when to show a separate form
 
-Each catalog entry (`GET /api/integrations/catalog/`, and the connect/update responses via
-`order_connection_required_fields`/`order_connection_optional_fields`) tells you whether a
-distributor needs its own order-credentials form or reuses the feed form:
+Each catalog entry (`GET /api/integrations/catalog/`, and the connect/update/connection-detail
+responses) tells you whether a distributor needs its own order-credentials form, reuses the
+feed form, or has no ordering at all — via `supports_ordering`, `order_credentials_mirror_feed`,
+and `order_connection_required_fields`/`order_connection_optional_fields`:
 
 ```json
 {
   "supports_ordering": true,
+  "order_credentials_mirror_feed": true,
   "order_connection_required_fields": [],
   "order_connection_optional_fields": []
 }
@@ -187,16 +189,22 @@ distributor needs its own order-credentials form or reuses the feed form:
 
 - **`supports_ordering: false`** — this distributor has no in-app ordering at all. Don't show
   any order-credentials UI.
-- **`supports_ordering: true` and both order field lists are empty** — order placement reuses
-  the feed credentials verbatim (e.g. Turn 14's OAuth client id/secret). **Don't show a
-  separate "enter ordering credentials" step** — connecting the feed is enough; the backend
-  auto-mirrors `feed` into `order` for you. If you explicitly pass `order` anyway, it's
-  validated against the *feed* field list, not stored as-is.
-- **`supports_ordering: true` and either order field list is non-empty** — this distributor
-  needs its own order credentials (e.g. Keystone's order API `account_number`/`security_key`,
-  separate from its FTPS catalog-feed login). Show a distinct form built from
+- **`supports_ordering: true` and `order_credentials_mirror_feed: true`** — order placement
+  reuses the feed credentials verbatim (Turn 14's OAuth client id/secret is the only distributor
+  like this today). **Don't show a separate "enter ordering credentials" step** — connecting the
+  feed is enough; the backend auto-mirrors `feed` into `order` for you, and re-mirrors
+  automatically if you later rotate `feed` via PATCH. If you explicitly pass `order` anyway,
+  it's validated against the *feed* field list, not stored as-is.
+- **`supports_ordering: true` and `order_credentials_mirror_feed: false`** — this distributor
+  needs its own order credentials, distinct from its feed login (e.g. Keystone's order API
+  `account_number`/`security_key`, separate from its FTPS catalog-feed login; same for Meyer,
+  Wheel Pros, and Premier/APG). Show a distinct form built from
   `order_connection_required_fields`/`order_connection_optional_fields`, and submit it under
-  the `order` key.
+  the `order` key. Note: some of these distributors (Meyer, Wheel Pros, Premier/APG as of this
+  writing) report `supports_ordering: true` and declare their required order fields even though
+  in-app order *placement* isn't wired up on the backend yet — showing the credentials form now
+  just lets companies get ahead of it; submitting an actual order for these will fail until the
+  backend adapter ships.
 
 Rotating a mirrored distributor's `feed` credentials (PATCH with only `feed` in the body)
 automatically re-mirrors into `order` too — you don't need to resend `order` to keep it in
