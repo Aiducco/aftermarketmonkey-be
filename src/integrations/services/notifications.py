@@ -71,7 +71,7 @@ def send_first_sync_completed_email(company_provider: src_models.CompanyProvider
     context = {
         "provider_name": provider.name,
         "company_name": company.name,
-        "app_url": settings.FRONTEND_BASE_URL,
+        "app_url": "{}/parts".format(settings.FRONTEND_BASE_URL.rstrip("/")),
     }
 
     try:

@@ -28,11 +28,9 @@ from django.utils import timezone
 from src import enums as src_enums
 from src import models as src_models
 from src.api.services import integrations as integrations_services
-from src.audit import scheduled_tasks as audit_scheduled_tasks
 
 logger = logging.getLogger(__name__)
 
-_TASK_NAME = "check_company_provider_connections"
 _LOG_PREFIX = "[CHECK-COMPANY-PROVIDER-CONNECTIONS]"
 
 
@@ -43,9 +41,6 @@ class Command(BaseCommand):
     )
 
     def handle(self, *args: typing.Any, **options: typing.Any) -> None:
-        audit_scheduled_tasks.cleanup_stale_started_executions([_TASK_NAME])
-        execution = audit_scheduled_tasks.start_scheduled_task_execution(_TASK_NAME)
-
         checked = 0
         skipped = 0
         try:
@@ -76,10 +71,8 @@ class Command(BaseCommand):
             message = "Checked {} connection(s), skipped {} (no check available).".format(
                 checked, skipped
             )
-            audit_scheduled_tasks.mark_scheduled_task_completed(execution, message=message)
             self.stdout.write(self.style.SUCCESS(message))
         except Exception as e:
-            audit_scheduled_tasks.mark_scheduled_task_failed(execution, error_message=str(e))
             self.stdout.write(self.style.ERROR("Error: {}".format(str(e))))
             raise
 
