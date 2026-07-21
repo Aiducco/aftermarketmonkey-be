@@ -966,7 +966,7 @@ def get_company_provider_by_id(company_id: int, provider_id: int) -> typing.Opti
             "connection_optional_fields": list(catalog_entry.get("connection_optional_fields") or []),
             "order_connection_required_fields": list(catalog_entry.get("order_connection_required_fields") or []),
             "order_connection_optional_fields": list(catalog_entry.get("order_connection_optional_fields") or []),
-            "supports_ordering": order_registry.supports_ordering(provider.kind) if provider else False,
+            "supports_ordering": _catalog_supports_ordering_display(catalog_entry) if catalog_entry else False,
             "created_at": company_provider.created_at.isoformat() if company_provider.created_at else None,
             "updated_at": company_provider.updated_at.isoformat() if company_provider.updated_at else None,
         }
@@ -1130,7 +1130,7 @@ def get_company_provider_connection_detail(
     out["order_connection_required_fields"] = list(catalog_entry.get("order_connection_required_fields") or [])
     out["order_connection_optional_fields"] = list(catalog_entry.get("order_connection_optional_fields") or [])
     out["relay_provisioned"] = bool(catalog_entry.get("relay_provisioned"))
-    out["supports_ordering"] = order_registry.supports_ordering(provider.kind)
+    out["supports_ordering"] = _catalog_supports_ordering_display(catalog_entry)
 
     if catalog_entry.get("relay_provisioned"):
         # These credentials are meant to be handed to the distributor's rep, not kept secret from
