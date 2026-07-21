@@ -339,6 +339,7 @@ def get_providers_catalog(company_id: int) -> typing.Dict:
             "connection_required_fields": entry.get("connection_required_fields", []),
             "connection_optional_fields": entry.get("connection_optional_fields", []),
             "supports_ordering": _catalog_supports_ordering_display(entry),
+            "order_credentials_mirror_feed": _catalog_order_credentials_mirror_feed(entry),
             "order_connection_required_fields": entry.get("order_connection_required_fields", []),
             "order_connection_optional_fields": entry.get("order_connection_optional_fields", []),
             "installation_instructions_html": _render_relay_instructions_html(entry, company),
@@ -431,6 +432,21 @@ def _catalog_supports_ordering_display(catalog_entry: typing.Dict[str, typing.An
         catalog_entry.get("order_connection_required_fields")
         or catalog_entry.get("order_connection_optional_fields")
     )
+
+
+def _catalog_order_credentials_mirror_feed(catalog_entry: typing.Dict[str, typing.Any]) -> bool:
+    """
+    True when this provider's order credentials are the same values as its feed credentials
+    (Turn14: one OAuth client_id/client_secret pair serves both) rather than a distinct field
+    set the company has to fill in separately (Keystone/Meyer/Wheel Pros/Premier all need their
+    own order-specific fields). Mirrors the condition in _build_credentials_from_catalog_entry
+    that actually performs the copy at connect/update time — this is purely a read-side signal
+    so the FE can render "your feed credentials are also used for ordering" instead of asking
+    for the same values twice; it does not itself affect what gets stored.
+    """
+    if catalog_entry.get("order_connection_required_fields") or catalog_entry.get("order_connection_optional_fields"):
+        return False
+    return order_registry.supports_ordering(catalog_entry["kind"].value)
 
 
 def _validate_wheelpros_markup_fields(credentials: typing.Dict[str, typing.Any]) -> typing.Optional[str]:
@@ -967,6 +983,9 @@ def get_company_provider_by_id(company_id: int, provider_id: int) -> typing.Opti
             "order_connection_required_fields": list(catalog_entry.get("order_connection_required_fields") or []),
             "order_connection_optional_fields": list(catalog_entry.get("order_connection_optional_fields") or []),
             "supports_ordering": _catalog_supports_ordering_display(catalog_entry) if catalog_entry else False,
+            "order_credentials_mirror_feed": (
+                _catalog_order_credentials_mirror_feed(catalog_entry) if catalog_entry else False
+            ),
             "created_at": company_provider.created_at.isoformat() if company_provider.created_at else None,
             "updated_at": company_provider.updated_at.isoformat() if company_provider.updated_at else None,
         }
@@ -1131,6 +1150,7 @@ def get_company_provider_connection_detail(
     out["order_connection_optional_fields"] = list(catalog_entry.get("order_connection_optional_fields") or [])
     out["relay_provisioned"] = bool(catalog_entry.get("relay_provisioned"))
     out["supports_ordering"] = _catalog_supports_ordering_display(catalog_entry)
+    out["order_credentials_mirror_feed"] = _catalog_order_credentials_mirror_feed(catalog_entry)
 
     if catalog_entry.get("relay_provisioned"):
         # These credentials are meant to be handed to the distributor's rep, not kept secret from
