@@ -391,6 +391,11 @@ def get_providers_catalog(company_id: int) -> typing.Dict:
             "coming_soon": True,
         })
 
+    # Order-capable distributors first (stable sort — preserves PROVIDER_CATALOG's declared
+    # order within each group, and keeps coming-soon entries, which have no "supports_ordering"
+    # key at all, at the back where they already were).
+    catalog.sort(key=lambda row: not row.get("supports_ordering", False))
+
     logger.info('{} Found {} providers in catalog for company_id: {}.'.format(
         _LOG_PREFIX, len(catalog), company_id
     ))
