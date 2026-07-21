@@ -263,6 +263,9 @@ def _run_quote(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrde
         li.shipments = [
             {
                 "warehouse_code": ql.warehouse_code,
+                # Human-readable label (e.g. "Hatfield, PA"), when the adapter can decode it —
+                # null for adapters/warehouses with no location catalog to check against.
+                "warehouse_name": ql.warehouse_name,
                 "quantity_confirmed": ql.quantity_available,
                 "quantity_backordered": ql.quantity_backordered,
                 "manufacturer_esd": ql.manufacturer_esd.isoformat() if ql.manufacturer_esd else None,

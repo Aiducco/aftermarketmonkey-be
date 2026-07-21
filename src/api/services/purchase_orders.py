@@ -64,12 +64,19 @@ def _serialize_line_item(li: src_models.PurchaseOrderLineItem) -> typing.Dict:
         "quantity_backordered": li.quantity_backordered,
         "manufacturer_esd": li.manufacturer_esd.isoformat() if li.manufacturer_esd else None,
         "warehouse_code": li.warehouse_code,
-        # ``shipments``: [{warehouse_code, quantity_confirmed, quantity_backordered,
-        # manufacturer_esd, ship_options: [{code, name, cost, estimated_delivery_date}]}] — one
-        # entry per distributor shipment this line was split across. Almost always length 1;
-        # the aggregate quantity_confirmed/quantity_backordered/warehouse_code/manufacturer_esd
-        # fields above cover the common case, use this when the split itself needs rendering
-        # (see PurchaseOrderLineItem.shipments for the full contract).
+        # Human-readable label for warehouse_code (e.g. "Hatfield, PA" — same convention
+        # Turn14's own ordering portal uses, grouping by state). Only set when there's exactly
+        # one shipment, same rule as warehouse_code itself; for a split shipment use each
+        # entry's own warehouse_name in ``shipments`` below instead.
+        "warehouse_name": (
+            li.shipments[0].get("warehouse_name") if li.shipments and len(li.shipments) == 1 else None
+        ),
+        # ``shipments``: [{warehouse_code, warehouse_name, quantity_confirmed,
+        # quantity_backordered, manufacturer_esd, ship_options: [{code, name, cost,
+        # estimated_delivery_date}]}] — one entry per distributor shipment this line was split
+        # across. Almost always length 1; the aggregate fields above cover the common case, use
+        # this when the split itself needs rendering (see PurchaseOrderLineItem.shipments for
+        # the full contract).
         "shipments": li.shipments,
         "is_split_shipment": len(li.shipments or []) > 1,
         "promotions": li.promotions,

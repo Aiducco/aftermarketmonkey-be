@@ -42,6 +42,28 @@ def _normalize_warehouse_code(location: typing.Any) -> typing.Optional[str]:
     return str(location) if location is not None else None
 
 
+def _load_warehouse_names() -> typing.Dict[str, str]:
+    """
+    {external_id: "City, ST"} from Turn14Location (populated by fetch_turn14_locations from
+    GET /v1/locations), so quote responses can show a real place instead of a bare code — this
+    is exactly what Turn14's own ordering portal does (it groups shipping options by state, e.g.
+    "PA In Stock Items" for warehouse "01"). Same zero-pad tolerance as
+    master_parts._get_turn14_location_map, since a quote's ``location`` can come back
+    unpadded (e.g. int 59) after _normalize_warehouse_code.
+    """
+    names = {}
+    for row in src_models.Turn14Location.objects.all().values("external_id", "name", "state"):
+        external_id = (row.get("external_id") or "").strip()
+        if not external_id:
+            continue
+        label = ", ".join(part for part in (row.get("name"), row.get("state")) if part)
+        names[external_id] = label
+        if external_id.isdigit():
+            names[external_id.zfill(2)] = label
+            names[str(int(external_id))] = label
+    return names
+
+
 class Turn14OrderAdapter(base.DistributorOrderAdapter):
     provider_kind = src_enums.BrandProviderKind.TURN_14.value
 
@@ -151,6 +173,8 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
                     )
                 )
 
+            warehouse_names = _load_warehouse_names()
+
             lines: typing.List[base.ShippingQuoteLine] = []
             for shipment in attrs.get("shipment", []):
                 # Contrary to the docs' single-object example, an unfiltered quote actually
@@ -170,13 +194,15 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
                     external_id = str(item.get("item_id", ""))
                     li = by_external_id.get(external_id)
                     quantity = item.get("quantity", 0)
+                    warehouse_code = _normalize_warehouse_code(shipment.get("location"))
                     lines.append(
                         base.ShippingQuoteLine(
                             line_item_id=li.line_item_id if li else 0,
                             provider_external_id=external_id,
                             quantity_available=0 if is_out_of_stock else quantity,
                             quantity_backordered=quantity if is_out_of_stock else 0,
-                            warehouse_code=_normalize_warehouse_code(shipment.get("location")),
+                            warehouse_code=warehouse_code,
+                            warehouse_name=warehouse_names.get(warehouse_code) if warehouse_code else None,
                             ship_options=ship_options,
                             flags=(["backorder"] if is_out_of_stock else []),
                             promotions=promotions_by_item_id.get(external_id, []),

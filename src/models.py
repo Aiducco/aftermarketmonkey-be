@@ -2079,8 +2079,11 @@ class PurchaseOrderLineItem(django_db_models.Model):
     warehouse_code = django_db_models.CharField(max_length=64, null=True, blank=True)
 
     # Normalized (distributor-agnostic) per-shipment breakdown for this line item's last quote:
-    # [{warehouse_code, quantity_confirmed, quantity_backordered, manufacturer_esd, ship_options:
-    # [{code, name, cost, estimated_delivery_date}]}]. Almost always a single-entry list; more
+    # [{warehouse_code, warehouse_name, quantity_confirmed, quantity_backordered,
+    # manufacturer_esd, ship_options: [{code, name, cost, estimated_delivery_date}]}].
+    # warehouse_name is a human-readable label (e.g. "Hatfield, PA") when the distributor's
+    # adapter can decode the code against a location catalog (Turn14Location for Turn14),
+    # else null. Almost always a single-entry list; more
     # than one entry means the distributor is fulfilling this line from multiple
     # warehouses/shipments, each with its own priced shipping options — see the aggregate fields
     # above for the common case, use this when the split itself needs to be shown/selected on.

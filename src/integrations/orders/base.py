@@ -66,6 +66,10 @@ class ShippingQuoteLine:
     quantity_available: int
     quantity_backordered: int = 0
     warehouse_code: typing.Optional[str] = None
+    # Human-readable label for warehouse_code (e.g. "Hatfield, PA"), when the distributor
+    # exposes a location catalog we can decode it against — null for distributors/adapters that
+    # don't have one. Display-only; warehouse_code remains the identifier for selection/dedup.
+    warehouse_name: typing.Optional[str] = None
     manufacturer_esd: typing.Optional[datetime.date] = None
     ship_options: typing.List[ShipOption] = dataclasses.field(default_factory=list)
     # Normalized flags, e.g. "kit", "backorder", "must_order_case_qty", "blocked".
