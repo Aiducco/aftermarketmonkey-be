@@ -319,6 +319,8 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
                 "initial_sync_completed": cp.initial_sync_completed,
                 "status": cp.status,
                 "status_name": cp.status_name,
+                "order_status": cp.order_status,
+                "order_status_name": cp.order_status_name,
             }
             for provider_id, cp in company_provider_objs.items()
         }
@@ -407,6 +409,10 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
                 ),
                 "status": company_provider_map[pp.provider_id]["status"] if integrated else None,
                 "status_name": company_provider_map[pp.provider_id]["status_name"] if integrated else None,
+                "order_status": company_provider_map[pp.provider_id]["order_status"] if integrated else None,
+                "order_status_name": (
+                    company_provider_map[pp.provider_id]["order_status_name"] if integrated else None
+                ),
             },
             "is_discontinued": pp.is_discontinued,
             "inventory": None,
