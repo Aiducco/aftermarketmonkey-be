@@ -614,7 +614,7 @@ def _validate_turn14_order_connection(credentials: typing.Dict[str, typing.Any])
     order placement.
     """
     try:
-        environment = getattr(settings, "TURN14_ORDER_ENVIRONMENT", "production")
+        environment = getattr(settings, "TURN14_ORDER_ENVIRONMENT", "testing")
         client = turn14_order_client.Turn14OrderApiClient(credentials=credentials, environment=environment)
         client.test_connection()
     except turn14_exceptions.Turn14PermissionError as e:
