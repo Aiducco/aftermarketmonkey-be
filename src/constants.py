@@ -129,7 +129,10 @@ PROVIDER_CATALOG = [
     {
         "kind": enums.BrandProviderKind.TURN_14,
         "name": "Turn 14",
-        "description": "Access real-time inventory, pricing, and product data from Turn 14 Distribution.",
+        "description": (
+            "Access real-time inventory, pricing, and product data from Turn 14 Distribution. "
+            "These same credentials are also used to place orders — no separate ordering setup needed."
+        ),
         "icon_url": "https://api.aftermarketscout.com/uploads/t14_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["client_id", "client_secret"],
@@ -144,6 +147,8 @@ PROVIDER_CATALOG = [
             "<li>Copy the <strong>client ID</strong> and <strong>client secret</strong> from that page.</li>"
             "<li>Paste them into the fields below and save. AfterMarketScout uses them only to call Turn 14 on your behalf.</li>"
             "</ul>"
+            "<p>These credentials are also used to place orders through AfterMarketScout — there's no separate "
+            "ordering connection to set up.</p>"
             "<p>If you cannot access that page or the credentials are missing, contact Turn 14 support or your account manager.</p>"
         ),
     },
