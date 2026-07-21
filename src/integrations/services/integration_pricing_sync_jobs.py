@@ -321,13 +321,25 @@ def run_integration_pricing_sync_job(job: src_models.IntegrationPricingSyncJob) 
     # connection status straight to CONNECTED — check_company_provider_connections only
     # covers rows still pending their first sync, so this is the only place that sets it.
     if not cp.initial_sync_completed:
-        src_models.CompanyProviders.objects.filter(id=cp.id).update(
+        update_fields = dict(
             initial_sync_completed=True,
             status=src_enums.CompanyProviderConnectionStatus.CONNECTED.value,
             status_name=src_enums.CompanyProviderConnectionStatus.CONNECTED.name,
             status_reason=None,
             status_checked_at=timezone.now(),
         )
+        # Order credentials may have already validated fine and been sitting in WAITING because
+        # the feed wasn't CONNECTED yet (see CompanyProviderOrderConnectionStatus) — now that it
+        # is, promote them to CONNECTED too. An ERROR order status is left alone; that's a real
+        # credential problem, unrelated to feed sync completing.
+        if cp.order_status == src_enums.CompanyProviderOrderConnectionStatus.WAITING.value:
+            update_fields.update(
+                order_status=src_enums.CompanyProviderOrderConnectionStatus.CONNECTED.value,
+                order_status_name=src_enums.CompanyProviderOrderConnectionStatus.CONNECTED.name,
+                order_status_reason=None,
+                order_status_checked_at=timezone.now(),
+            )
+        src_models.CompanyProviders.objects.filter(id=cp.id).update(**update_fields)
         logger.info(
             "{} Job id={}: marked company_provider_id={} initial_sync_completed=True.".format(
                 _LOG_PREFIX, job.id, cp.id

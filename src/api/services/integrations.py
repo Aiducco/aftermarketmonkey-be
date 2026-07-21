@@ -338,7 +338,7 @@ def get_providers_catalog(company_id: int) -> typing.Dict:
             "category": entry.get("category", ""),
             "connection_required_fields": entry.get("connection_required_fields", []),
             "connection_optional_fields": entry.get("connection_optional_fields", []),
-            "supports_ordering": order_registry.supports_ordering(kind_value),
+            "supports_ordering": _catalog_supports_ordering_display(entry),
             "order_connection_required_fields": entry.get("order_connection_required_fields", []),
             "order_connection_optional_fields": entry.get("order_connection_optional_fields", []),
             "installation_instructions_html": _render_relay_instructions_html(entry, company),
@@ -407,6 +407,30 @@ def _get_catalog_entry_for_provider(provider_id: int) -> typing.Optional[typing.
         if entry["kind"].value == provider.kind:
             return entry
     return None
+
+
+def _catalog_supports_ordering_display(catalog_entry: typing.Dict[str, typing.Any]) -> bool:
+    """
+    The "supports_ordering" flag shown on the catalog/connection-detail endpoints — this drives
+    whether the FE shows an ordering-credentials step, which is a *different* question from
+    "can this specific connection place an order right now" (that one stays gated on
+    order_registry.get_adapter() actually constructing an adapter — see get_order_capabilities()
+    and parts.py's can_order_in_app).
+
+    True when either:
+      - an order adapter is actually registered (order_registry.supports_ordering()), or
+      - the catalog entry declares order-specific credential fields, meaning we know what this
+        distributor's ordering API needs even before its adapter is built (Meyer, Wheel Pros,
+        Premier as of this writing) — staging the credentials form ahead of the adapter lets
+        companies fill these in now instead of after the fact.
+    """
+    kind_value = catalog_entry["kind"].value
+    if order_registry.supports_ordering(kind_value):
+        return True
+    return bool(
+        catalog_entry.get("order_connection_required_fields")
+        or catalog_entry.get("order_connection_optional_fields")
+    )
 
 
 def _validate_wheelpros_markup_fields(credentials: typing.Dict[str, typing.Any]) -> typing.Optional[str]:

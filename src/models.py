@@ -151,6 +151,15 @@ class CompanyProviders(django_db_models.Model):
     status_reason = django_db_models.TextField(null=True, blank=True)
     status_checked_at = django_db_models.DateTimeField(null=True, blank=True)
 
+    # Order-placement connectivity status (see src.enums.CompanyProviderOrderConnectionStatus).
+    # Independent of the feed status above — a company can have a working feed with no order
+    # credentials configured (null here), or order credentials that validate fine but sit in
+    # WAITING until the feed itself reaches CONNECTED. Null until order credentials are entered.
+    order_status = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+    order_status_name = django_db_models.CharField(max_length=32, null=True, blank=True)
+    order_status_reason = django_db_models.TextField(null=True, blank=True)
+    order_status_checked_at = django_db_models.DateTimeField(null=True, blank=True)
+
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
 

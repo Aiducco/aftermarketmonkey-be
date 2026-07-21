@@ -95,6 +95,21 @@ class CompanyProviderConnectionStatus(enum.Enum):
     FAILING = 4    # credentials/connectivity check failed
 
 
+class CompanyProviderOrderConnectionStatus(enum.Enum):
+    """
+    Order-placement connectivity status for a CompanyProviders connection — independent of
+    (and always a separate check from) the feed status above. Ordering is meaningless without
+    a live feed, so CONNECTED requires both valid order credentials AND the feed itself being
+    CompanyProviderConnectionStatus.CONNECTED; WAITING models "order credentials check out fine,
+    but the feed hasn't finished its initial sync yet". Refreshed at connect/update time and by
+    the check_company_provider_connections cron (independently of feed initial_sync_completed,
+    since order credentials can go stale on their own — e.g. a rotated API key).
+    """
+    CONNECTED = 1  # order credentials valid AND feed status is CONNECTED
+    WAITING = 2    # order credentials valid, but feed status isn't CONNECTED yet
+    ERROR = 3      # order credentials invalid, or the order connectivity check failed
+
+
 class NotificationEmailType(enum.Enum):
     """Kind of transactional notification email logged in NotificationEmailLog."""
     FIRST_SYNC_COMPLETED = 1
