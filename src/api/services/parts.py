@@ -326,6 +326,27 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
         }
     connected_provider_ids: typing.Set[int] = set(company_provider_map)
 
+    # Provider-kind -> catalog entry, precomputed once rather than scanning PROVIDER_CATALOG
+    # per row below. Used to answer "does this provider support ordering at all" independent of
+    # any one company's connection — see supports_ordering below.
+    _provider_catalog_by_kind = {entry["kind"].value: entry for entry in src_constants.PROVIDER_CATALOG}
+
+    def _provider_supports_ordering(kind: int) -> bool:
+        """
+        Whether this distributor supports in-app ordering at all — true whenever the catalog
+        declares an order adapter is registered OR declares its own order-specific credential
+        fields (Meyer/Wheel Pros/Premier all report true here ahead of their order adapter
+        actually being built, same policy as the catalog endpoint's own supports_ordering).
+        Distinct from can_order_in_app below, which additionally requires THIS connection to
+        have working order credentials right now.
+        """
+        if order_registry.supports_ordering(kind):
+            return True
+        entry = _provider_catalog_by_kind.get(kind)
+        if not entry:
+            return False
+        return bool(entry.get("order_connection_required_fields") or entry.get("order_connection_optional_fields"))
+
     provider_parts = list(
         src_models.ProviderPart.objects.filter(master_part=part)
         .select_related("provider")
@@ -402,6 +423,14 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
                 and order_registry.supports_ordering(pp.provider.kind)
                 and order_registry.get_adapter(company_provider_objs[pp.provider_id])
             ),
+            # Whether this DISTRIBUTOR supports in-app ordering at all, independent of any one
+            # company's connection — same "does the catalog offer it" question the integrations
+            # catalog endpoint answers via its own supports_ordering field. A row can have
+            # supports_ordering=true and can_order_in_app=false (ordering exists for this
+            # provider, but this company hasn't connected/configured order credentials yet, or
+            # isn't connected at all) — use this to decide whether to show an "ordering
+            # available" affordance/prompt versus hiding ordering entirely for this provider.
+            "supports_ordering": bool(pp.provider_id) and _provider_supports_ordering(pp.provider.kind),
             "company_integration": {
                 "connected": integrated,
                 "initial_sync_completed": (
