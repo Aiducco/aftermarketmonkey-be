@@ -26,6 +26,7 @@ from src.integrations.clients.turn_14 import exceptions as turn14_exceptions
 from src.integrations.clients.turn_14 import order_client as turn14_order_client
 from src.integrations.clients.wheelpros import client as wheelpros_client
 from src.integrations.clients.wheelpros import exceptions as wheelpros_exceptions
+from src.integrations.clients.wheelpros import order_client as wheelpros_order_client
 from src.integrations.orders import registry as order_registry
 from src.integrations.services import integration_pricing_sync_jobs, relay_sftp_provisioning
 
@@ -580,6 +581,26 @@ def _validate_premier_order_connection(credentials: typing.Dict[str, typing.Any]
     return None, None
 
 
+def _validate_wheelpros_order_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
+    """
+    Tests the submitted username/password against Wheel Pros' Orders API specifically (not the
+    SFTP feed — see clients/wheelpros/client.py's own validator), since order placement is a
+    separate permission grant from catalog/feed access on Wheel Pros' side, requested
+    independently per their onboarding docs.
+    """
+    try:
+        environment = getattr(settings, "WHEELPROS_ORDER_ENVIRONMENT", "production")
+        client = wheelpros_order_client.WheelProsOrderApiClient(credentials=credentials, environment=environment)
+        client.test_connection()
+    except wheelpros_exceptions.WheelProsOrderAuthError as e:
+        return str(e), CONNECTION_ERROR_INVALID_CREDENTIALS
+    except wheelpros_exceptions.WheelProsOrderPermissionError as e:
+        return str(e), CONNECTION_ERROR_PERMISSION_DENIED
+    except (wheelpros_exceptions.WheelProsException, ValueError) as e:
+        return str(e), CONNECTION_ERROR_CONNECTION_FAILED
+    return None, None
+
+
 # Order-credential validators — parallel to _CONNECTION_VALIDATORS but for the "order" namespace,
 # only run when a company actually submits order credentials (see _merge_update_credentials —
 # both "feed" and "order" are optional at connect/update time, either may be submitted alone).
@@ -590,6 +611,7 @@ _ORDER_CONNECTION_VALIDATORS: typing.Dict[int, typing.Callable[[typing.Dict[str,
     src_enums.BrandProviderKind.KEYSTONE.value: _validate_keystone_order_connection,
     src_enums.BrandProviderKind.MEYER.value: _validate_meyer_order_connection,
     src_enums.BrandProviderKind.PREMIER_PERFORMANCE.value: _validate_premier_order_connection,
+    src_enums.BrandProviderKind.WHEELPROS.value: _validate_wheelpros_order_connection,
 }
 
 
@@ -655,6 +677,20 @@ def _relay_feed_connection_status(
         src_enums.CompanyProviderConnectionStatus.WAITING,
         "Waiting for your first file to arrive on our relay.",
     )
+
+
+def _status_enum_from_stored(
+    raw_status: typing.Optional[int],
+) -> typing.Optional["src_enums.CompanyProviderConnectionStatus"]:
+    """
+    Reconstructs a CompanyProviderConnectionStatus enum from the raw int stored on
+    CompanyProviders.status — used when a request skipped re-validating "feed" (already synced,
+    not touched by this call) but order's CONNECTED-vs-WAITING gating still needs to know feed's
+    TRUE current status, not None (which would incorrectly read as "feed not connected").
+    """
+    if not raw_status:
+        return None
+    return src_enums.CompanyProviderConnectionStatus(raw_status)
 
 
 def _connection_status_fields(
@@ -832,43 +868,96 @@ def connect_provider(
             "feed": {user_field: company.relay_sftp_username, password_field: company.relay_sftp_password},
             "order": order_creds,
         }
-        validated = None
-        status_enum, status_reason = _relay_feed_connection_status(company, provider.kind)
-        order_validated, order_status_enum, order_status_reason, order_val_error, order_val_error_code = (
-            _validate_and_resolve_order_status(provider.kind, order_creds, status_enum)
+        # Once the initial sync has completed, don't keep re-running the relay file-presence
+        # check on every unrelated (e.g. order-only) call — it can only report WAITING/INGESTING,
+        # never CONNECTED, so re-running it after CONNECTED would regress the stored status for
+        # no reason. Still re-check on every call until sync completes, matching the cron's own
+        # scoping (see check_company_provider_connections / CompanyProviders.initial_sync_completed).
+        already_synced = bool(existing and existing.initial_sync_completed)
+        feed_fields_touched = existing is None or not already_synced
+        if feed_fields_touched:
+            validated = None
+            status_enum, status_reason = _relay_feed_connection_status(company, provider.kind)
+        else:
+            validated, status_enum, status_reason = None, None, None
+        effective_feed_status_enum = (
+            status_enum if feed_fields_touched
+            else _status_enum_from_stored(existing.status if existing else None)
         )
-        if order_val_error:
-            return None, order_val_error, order_val_error_code
+
+        order_fields_touched = isinstance(credentials, dict) and "order" in credentials
+        if order_fields_touched:
+            order_validated, order_status_enum, order_status_reason, order_val_error, order_val_error_code = (
+                _validate_and_resolve_order_status(provider.kind, order_creds, effective_feed_status_enum)
+            )
+            if order_val_error:
+                return None, order_val_error, order_val_error_code
+        else:
+            order_validated, order_status_enum, order_status_reason = None, None, None
     else:
         creds, err, err_code = _merge_update_credentials(catalog_entry, existing_creds, credentials)
         if err:
             return None, err, err_code
 
-        if creds.get("feed"):
-            validated, val_error, val_error_code = _validate_connection(provider.kind, creds["feed"])
-            if val_error:
-                return None, val_error, val_error_code
+        # Only re-validate "feed" (and touch its status fields) when this call actually
+        # submitted it, or the initial sync hasn't completed yet — otherwise an order-only call
+        # against an already-CONNECTED feed would re-test (and could regress) a connection
+        # nothing about this request touched. See _status_enum_from_stored for why order's
+        # CONNECTED-gating below still needs the TRUE current feed status even when skipped here.
+        already_synced = bool(existing and existing.initial_sync_completed)
+        feed_fields_touched = (isinstance(credentials, dict) and "feed" in credentials) or not already_synced
+        if feed_fields_touched:
+            if creds.get("feed"):
+                validated, val_error, val_error_code = _validate_connection(provider.kind, creds["feed"])
+                if val_error:
+                    return None, val_error, val_error_code
+            else:
+                # "feed" was never submitted (by this call or any prior one) — nothing to
+                # validate yet, distinct from a real feed failure (which returns above).
+                validated = None
+            # validated is True (validator ran and passed) or None (no validator for this kind,
+            # or no feed data yet) — False already returned above via val_error. A successful
+            # re-validation preserves CONNECTED if the initial sync already completed instead of
+            # regressing to INGESTING — nothing about the sync itself changed, just re-confirmed
+            # the same credentials still work (e.g. after a rotation).
+            status_enum = (
+                (
+                    src_enums.CompanyProviderConnectionStatus.CONNECTED if already_synced
+                    else src_enums.CompanyProviderConnectionStatus.INGESTING
+                )
+                if validated else None
+            )
+            status_reason = None
         else:
-            # "feed" was never submitted (by this call or any prior one) — nothing to validate
-            # yet, distinct from a real feed failure (which would have returned above).
-            validated = None
-        # validated is True (validator ran and passed) or None (no validator for this kind, or
-        # no feed data yet) — a False result would already have returned above via val_error.
-        status_enum = src_enums.CompanyProviderConnectionStatus.INGESTING if validated else None
-        status_reason = None
+            validated, status_enum, status_reason = None, None, None
+        effective_feed_status_enum = (
+            status_enum if feed_fields_touched
+            else _status_enum_from_stored(existing.status if existing else None)
+        )
 
         # Order credentials are validated separately from feed credentials (different transport,
         # different client, different failure modes — e.g. Keystone's FTP feed vs its SOAP order
         # API) but a failure here rejects the whole request too, same as feed above — invalid
-        # order credentials aren't saved just because the feed happened to be fine.
-        order_validated, order_status_enum, order_status_reason, order_val_error, order_val_error_code = (
-            _validate_and_resolve_order_status(provider.kind, creds.get("order"), status_enum)
-        )
-        if order_val_error:
-            return None, order_val_error, order_val_error_code
+        # order credentials aren't saved just because the feed happened to be fine. Only run
+        # this when "order" was actually part of THIS request, for the same reason as feed above.
+        order_fields_touched = isinstance(credentials, dict) and "order" in credentials
+        if order_fields_touched:
+            order_validated, order_status_enum, order_status_reason, order_val_error, order_val_error_code = (
+                _validate_and_resolve_order_status(provider.kind, creds.get("order"), effective_feed_status_enum)
+            )
+            if order_val_error:
+                return None, order_val_error, order_val_error_code
+        else:
+            order_validated, order_status_enum, order_status_reason = None, None, None
 
-    status_fields = _connection_status_fields(status_enum, status_reason)
-    status_fields.update(_order_connection_status_fields(order_status_enum, order_status_reason))
+    # Only include a namespace's status fields in what actually gets written when this call
+    # touched that namespace — otherwise leave the existing row's stored values alone entirely
+    # (as opposed to overwriting them with the None a skipped validation would otherwise produce).
+    status_fields = {}
+    if feed_fields_touched:
+        status_fields.update(_connection_status_fields(status_enum, status_reason))
+    if order_fields_touched:
+        status_fields.update(_order_connection_status_fields(order_status_enum, order_status_reason))
 
     if existing:
         existing.credentials = creds
@@ -885,7 +974,10 @@ def connect_provider(
             **status_fields,
         )
 
-    if integration_pricing_sync_jobs.should_enqueue_pricing_sync(provider.kind):
+    # Only (re-)enqueue a pricing sync when feed was actually part of this request (or the
+    # initial sync hasn't completed yet) — an order-only save has nothing to do with the feed
+    # and shouldn't trigger a full re-sync against the distributor's API.
+    if feed_fields_touched and integration_pricing_sync_jobs.should_enqueue_pricing_sync(provider.kind):
         integration_pricing_sync_jobs.enqueue_company_provider_pricing_sync(cp.id)
 
     result = {
@@ -943,48 +1035,99 @@ def update_connection(
     if err:
         return None, err, err_code
 
+    already_synced = cp.initial_sync_completed
+    feed_submitted = isinstance(credentials, dict) and "feed" in credentials
+    order_submitted = isinstance(credentials, dict) and "order" in credentials
+
     if catalog_entry.get("relay_provisioned"):
         # "feed" is system-generated for relay providers (never part of `credentials`/`creds`
-        # here), but "order" (e.g. Meyer's order API creds) is a normal user-submitted namespace
-        # and must still be validated on every PATCH, same as the non-relay branch below — it
-        # was previously skipped entirely for relay-provisioned connections.
-        validated = None
-        status_enum, status_reason = _relay_feed_connection_status(cp.company, cp.provider.kind)
-        order_validated, order_status_enum, order_status_reason, order_val_error, order_val_error_code = (
-            _validate_and_resolve_order_status(cp.provider.kind, creds.get("order"), status_enum)
-        )
-        if order_val_error:
-            return None, order_val_error, order_val_error_code
-    else:
-        if creds.get("feed"):
-            validated, val_error, val_error_code = _validate_connection(cp.provider.kind, creds["feed"])
-            if val_error:
-                return None, val_error, val_error_code
-        else:
-            # "feed" isn't configured on this connection yet (order-only so far) — nothing to
-            # validate, distinct from a real feed failure (which would have returned above).
+        # here). Once the initial sync has completed, don't keep re-running the relay
+        # file-presence check on every unrelated (e.g. order-only) PATCH — it can only report
+        # WAITING/INGESTING, never CONNECTED, so re-running it after CONNECTED would regress the
+        # stored status for no reason. "order" (e.g. Meyer's order API creds) is a normal
+        # user-submitted namespace and must still be validated on every PATCH that touches it,
+        # same as the non-relay branch below — it was previously validated unconditionally on
+        # every PATCH regardless of whether "order" was actually submitted.
+        feed_fields_touched = not already_synced
+        if feed_fields_touched:
             validated = None
-        # validated is True (validator ran and passed) or None (no validator for this kind, or
-        # no feed data yet) — a False result would already have returned above via val_error.
-        status_enum = src_enums.CompanyProviderConnectionStatus.INGESTING if validated else None
-        status_reason = None
+            status_enum, status_reason = _relay_feed_connection_status(cp.company, cp.provider.kind)
+        else:
+            validated, status_enum, status_reason = None, None, None
+        effective_feed_status_enum = (
+            status_enum if feed_fields_touched else _status_enum_from_stored(cp.status)
+        )
+
+        order_fields_touched = order_submitted
+        if order_fields_touched:
+            order_validated, order_status_enum, order_status_reason, order_val_error, order_val_error_code = (
+                _validate_and_resolve_order_status(cp.provider.kind, creds.get("order"), effective_feed_status_enum)
+            )
+            if order_val_error:
+                return None, order_val_error, order_val_error_code
+        else:
+            order_validated, order_status_enum, order_status_reason = None, None, None
+    else:
+        # Only re-validate "feed" (and touch its status fields) when this call actually
+        # submitted it, or the initial sync hasn't completed yet — otherwise an order-only PATCH
+        # against an already-CONNECTED feed would re-test (and could regress) a connection
+        # nothing about this request touched.
+        feed_fields_touched = feed_submitted or not already_synced
+        if feed_fields_touched:
+            if creds.get("feed"):
+                validated, val_error, val_error_code = _validate_connection(cp.provider.kind, creds["feed"])
+                if val_error:
+                    return None, val_error, val_error_code
+            else:
+                # "feed" isn't configured on this connection yet (order-only so far) — nothing
+                # to validate, distinct from a real feed failure (which returns above).
+                validated = None
+            # A successful re-validation preserves CONNECTED if the initial sync already
+            # completed instead of regressing to INGESTING — nothing about the sync itself
+            # changed, just re-confirmed the same credentials still work (e.g. after rotation).
+            status_enum = (
+                (
+                    src_enums.CompanyProviderConnectionStatus.CONNECTED if already_synced
+                    else src_enums.CompanyProviderConnectionStatus.INGESTING
+                )
+                if validated else None
+            )
+            status_reason = None
+        else:
+            validated, status_enum, status_reason = None, None, None
+        effective_feed_status_enum = (
+            status_enum if feed_fields_touched else _status_enum_from_stored(cp.status)
+        )
 
         # Order credentials validate independently of feed credentials — a failure here rejects
         # the whole request too, same as feed above; see connect_provider for the same logic.
-        order_validated, order_status_enum, order_status_reason, order_val_error, order_val_error_code = (
-            _validate_and_resolve_order_status(cp.provider.kind, creds.get("order"), status_enum)
-        )
-        if order_val_error:
-            return None, order_val_error, order_val_error_code
+        # Only run when "order" was actually part of THIS request, for the same reason as feed.
+        order_fields_touched = order_submitted
+        if order_fields_touched:
+            order_validated, order_status_enum, order_status_reason, order_val_error, order_val_error_code = (
+                _validate_and_resolve_order_status(cp.provider.kind, creds.get("order"), effective_feed_status_enum)
+            )
+            if order_val_error:
+                return None, order_val_error, order_val_error_code
+        else:
+            order_validated, order_status_enum, order_status_reason = None, None, None
 
     cp.credentials = creds
-    status_fields = _connection_status_fields(status_enum, status_reason)
-    status_fields.update(_order_connection_status_fields(order_status_enum, order_status_reason))
+    # Only include a namespace's status fields in what actually gets written when this call
+    # touched that namespace — otherwise leave the existing row's stored values alone entirely.
+    status_fields = {}
+    if feed_fields_touched:
+        status_fields.update(_connection_status_fields(status_enum, status_reason))
+    if order_fields_touched:
+        status_fields.update(_order_connection_status_fields(order_status_enum, order_status_reason))
     for field, value in status_fields.items():
         setattr(cp, field, value)
     cp.save()
 
-    if integration_pricing_sync_jobs.should_enqueue_pricing_sync(cp.provider.kind):
+    # Only (re-)enqueue a pricing sync when feed was actually part of this request (or the
+    # initial sync hasn't completed yet) — an order-only PATCH has nothing to do with the feed
+    # and shouldn't trigger a full re-sync against the distributor's API.
+    if feed_fields_touched and integration_pricing_sync_jobs.should_enqueue_pricing_sync(cp.provider.kind):
         integration_pricing_sync_jobs.enqueue_company_provider_pricing_sync(cp.id)
 
     result = {

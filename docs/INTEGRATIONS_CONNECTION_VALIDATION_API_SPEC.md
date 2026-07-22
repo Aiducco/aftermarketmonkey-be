@@ -364,11 +364,16 @@ export interface ConnectionStatusFields {
 2. **`permission_denied` is not a form error.** The user's credentials are correct; showing
    a red outline on the password field would be misleading. Show it as an informational
    banner instead.
-3. **PATCH re-validates the whole connection, not just changed fields.** If only a
-   non-secret field changes (e.g. Wheel Pros markup %), the stored password is reused and
-   re-validated anyway — every successful patch re-confirms the connection still works.
-   Occasionally slower than a pure field update, but a connection can't silently go stale
-   between edits.
+3. **PATCH re-validates a touched namespace in full, not just the changed fields within it** —
+   if only a non-secret field changes (e.g. Wheel Pros markup %), the stored password is reused
+   and the whole `feed` re-validated anyway, so that namespace can't silently go stale between
+   edits. This does **not** cross namespaces, though: patching only `order` does not re-validate
+   `feed`, and vice versa — each namespace's `status`/`order_status` (and
+   `status_checked_at`/`order_status_checked_at`) are left completely untouched when that
+   namespace isn't part of the request, rather than being reset. The one exception is `feed`
+   while its initial sync hasn't completed yet (`status` isn't `CONNECTED`) — it keeps
+   re-checking on every call, touched or not, until the sync finishes, matching how the
+   background connectivity cron already behaves.
 4. **`connection_validated: null` on success is normal**, not a partial failure — most of
    the catalog (relay-provisioned and not-yet-built distributors) isn't validated yet. Don't
    show an error state for `null`; a neutral "connected" is correct.
