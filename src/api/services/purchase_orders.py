@@ -545,6 +545,25 @@ def review_cart(
         quoted_po = purchase_order_jobs.run_quote_synchronously(po.id)
         results.append(_serialize_purchase_order(quoted_po))
 
+    # Any OTHER distributor's PO that's already QUOTED from an earlier review_cart call (e.g.
+    # the caller just added an item for a second distributor and is re-reviewing the cart) is
+    # still part of the same checkout session — re-point it at this new group too, without
+    # re-quoting it (its existing quote is still valid; requote_purchase_order is the path for
+    # a stale one). Without this, it would stay attached to its old, now-orphaned group, and
+    # submit_purchase_order_group(group_id=<this new one>) would silently miss it.
+    other_quoted = (
+        src_models.PurchaseOrder.objects.filter(
+            company_id=company_id, status=src_enums.PurchaseOrderStatus.QUOTED.value
+        )
+        .exclude(id__in=[po.id for po in purchase_orders])
+        .filter(line_items__isnull=False)
+        .distinct()
+    )
+    for po in other_quoted:
+        po.group = group
+        po.save(update_fields=["group", "updated_at"])
+        results.append(_serialize_purchase_order(po))
+
     return {"group_id": group.id, "purchase_orders": results}
 
 
