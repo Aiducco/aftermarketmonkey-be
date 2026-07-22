@@ -90,11 +90,9 @@ def _serialize_line_item(
         # (see PurchaseOrder.shipments) — for a split shipment, look up each of this line's
         # ``shipments[].shipment_id`` entries against the top-level ``shipments`` list instead.
         "warehouse_name": _single_shipment_warehouse_name(li, shipments_by_id),
-        # Lightweight references into the PO-level ``shipments`` list (see
-        # PurchaseOrder.shipments for the full item/ship_options contract):
-        # [{shipment_id, quantity_confirmed, quantity_backordered, manufacturer_esd}]. Almost
-        # always length 1; the aggregate fields above cover the common case.
-        "shipments": li.shipments,
+        # True when this line is fulfilled from more than one shipment (see PurchaseOrder.
+        # shipments — filter its items[] by this line_item_id for the per-shipment split; not
+        # repeated here so line_items[] stays a flat, single-copy summary per line).
         "is_split_shipment": len(li.shipments or []) > 1,
         "promotions": li.promotions,
         # Distributor's own quoted price for this item (gross, and net of the promotions

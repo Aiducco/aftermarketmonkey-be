@@ -236,12 +236,20 @@ def _run_quote(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrde
 
     method_names = _get_shipping_method_names(adapter, po.company_provider_id)
 
+    # Group every quote line by line_item_id FIRST — needed both to build po.shipments below
+    # AND to aggregate onto PurchaseOrderLineItem (further down) — built once, used both places.
+    quote_lines_by_item: typing.Dict[int, typing.List[order_base.ShippingQuoteLine]] = {}
+    for quote_line in result.lines:
+        quote_lines_by_item.setdefault(quote_line.line_item_id, []).append(quote_line)
+
     # -- Build po.shipments: one entry per distinct (warehouse, in-stock-vs-backordered) group,
     # across EVERY line item in this quote — not duplicated per line item. This is the single
     # source of truth for priced ship_options (each carrying the distributor's own
     # quote_option_id, the id submit_order must send back to select it) and for the default
     # shipping selection; PurchaseOrderLineItem.shipments (built below) only references these
-    # ids, it doesn't repeat the option list.
+    # ids, it doesn't repeat the option list. Pricing/promotions live on line_items[] only (see
+    # PurchaseOrderLineItem.distributor_unit_price/net_line_total/promotions) — shipment items
+    # stay a plain quantity/pricing summary, not a second copy of that breakdown.
     shipments_by_key: typing.Dict[typing.Tuple, typing.Dict] = {}
     quote_line_shipment_ids: typing.Dict[int, str] = {}  # id(quote_line) -> shipment id
     for idx, ql in enumerate(result.lines):
@@ -313,13 +321,9 @@ def _run_quote(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrde
 
     # A single line item can come back split across more than one shipment/warehouse (e.g. a
     # qty=4 request fulfilled as 1@warehouse-59 + 2@warehouse-02 + 1 backordered@warehouse-01,
-    # confirmed against a live Turn14 quote) — group by line_item_id first. Overwriting per
-    # quote_line (the previous approach) silently dropped every shipment but the last one that
-    # touched a given line item.
-    quote_lines_by_item: typing.Dict[int, typing.List[order_base.ShippingQuoteLine]] = {}
-    for quote_line in result.lines:
-        quote_lines_by_item.setdefault(quote_line.line_item_id, []).append(quote_line)
-
+    # confirmed against a live Turn14 quote) — quote_lines_by_item (built above) already groups
+    # by line_item_id, so every split is aggregated onto the line item below, not just the last
+    # one that touched it.
     by_line_item_id = {li.id: li for li in po.line_items.all()}
     for line_item_id, quote_lines in quote_lines_by_item.items():
         li = by_line_item_id.get(line_item_id)
