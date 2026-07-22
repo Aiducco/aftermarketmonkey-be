@@ -1,7 +1,7 @@
 """
 Maps a distributor's ``Providers.kind`` to its ``DistributorOrderAdapter`` implementation.
-Distributors with no entry here (today: SDC, A-Tech, DLG, Wheel Pros, Rough Country) have no
-in-app ordering — the API/frontend falls back to the existing catalog redirect link
+Distributors with no entry here (today: SDC, A-Tech, DLG, Rough Country) have no in-app
+ordering — the API/frontend falls back to the existing catalog redirect link
 (``_provider_go_to_link`` in ``src/api/services/parts.py``).
 
 Adapters are added one at a time as each distributor's phase lands (see the Purchase Orders
@@ -83,8 +83,10 @@ from src.integrations.orders import keystone as _keystone  # noqa: E402
 from src.integrations.orders import meyer as _meyer  # noqa: E402
 from src.integrations.orders import premier as _premier  # noqa: E402
 from src.integrations.orders import turn_14 as _turn_14  # noqa: E402
+from src.integrations.orders import wheelpros as _wheelpros  # noqa: E402
 
 register(src_enums.BrandProviderKind.TURN_14.value, _turn_14.Turn14OrderAdapter)
 register(src_enums.BrandProviderKind.KEYSTONE.value, _keystone.KeystoneOrderAdapter)
 register(src_enums.BrandProviderKind.MEYER.value, _meyer.MeyerOrderAdapter)
 register(src_enums.BrandProviderKind.PREMIER_PERFORMANCE.value, _premier.PremierOrderAdapter)
+register(src_enums.BrandProviderKind.WHEELPROS.value, _wheelpros.WheelProsOrderAdapter)

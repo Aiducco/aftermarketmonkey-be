@@ -294,6 +294,13 @@ WHEELPROS_ACCESSORIES_LOCAL_PATH = os.environ.get("WHEELPROS_ACCESSORIES_LOCAL_P
 # Set to False to verify host keys against ~/.ssh/known_hosts (recommended for production).
 WHEELPROS_SFTP_AUTO_ADD_HOST_KEY = os.environ.get("WHEELPROS_SFTP_AUTO_ADD_HOST_KEY", "true").lower() in ("true", "1", "yes")
 
+# Wheel Pros Order API (REST, Product Data Portal username/password -> 1hr Bearer JWT via
+# POST /auth/v1/authorize) — single host for both "auth" and "orders" API areas; "testing" points
+# at Wheel Pros' dev subdomain, same pattern as Turn14/Meyer/Premier's environment split.
+WHEELPROS_ORDER_TEST_BASE_URL = os.environ.get("WHEELPROS_ORDER_TEST_BASE_URL", "https://dev.api.wheelpros.com")
+WHEELPROS_ORDER_PRODUCTION_BASE_URL = os.environ.get("WHEELPROS_ORDER_PRODUCTION_BASE_URL", "https://api.wheelpros.com")
+WHEELPROS_ORDER_ENVIRONMENT = os.environ.get("WHEELPROS_ORDER_ENVIRONMENT", "production")
+
 # Meyer relay SFTP: AftermarketMonkey-hosted server; per-company sftp_user/sftp_password in CompanyProviders.
 # Env vars (all optional — sensible defaults if unset; use `or` below so empty string does not clear defaults):
 #   MEYER_SFTP_HOST, MEYER_SFTP_PORT, MEYER_SFTP_DIRECTORY,
