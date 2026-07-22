@@ -46,6 +46,40 @@ _COMMON_SHIPPING_METHODS = [
 # GetOrderHistory rows whose EKORD# holds one of these means "no matching order", not a real PO.
 _ORDER_HISTORY_ERROR_VALUES = {"NoData", "BadDate", "BadInDt"}
 
+# Keystone's own "List of Active Warehouses" reference table — the same warehouse-number
+# strings GetShippingOptionsMultiplePartsPerWarehouse's "Warehouse" column and its dynamically
+# named "Warehouse_<name>_<number>" rate tables use (see get_shipping_quote below). "City, ST"
+# to match the convention Turn14's warehouse_name already uses.
+_WAREHOUSE_NAMES = {
+    "1": "Exeter, PA",
+    "14": "Kansas City, KS",
+    "25": "Eastvale, CA",
+    "30": "Atlanta, GA",
+    "45": "Spokane, WA",
+    "50": "Flower Mound, TX",
+    "55": "Dallas, TX",
+    "60": "Brownstown, MI",
+    "70": "Ocoee, FL",
+}
+
+# Keystone's sentinel for "no estimate available" (seen on LTL quotes) — .NET's DateTime.MinValue
+# serialized as a date, not a real delivery date.
+_UNKNOWN_DATE_YEAR = 1
+
+
+def _days_in_transit(order_date: typing.Optional[str], thru_delivery: typing.Optional[str]) -> typing.Optional[int]:
+    """Keystone gives an OrderDate (order-placement cutoff) and a ThruDelivery (upper bound of
+    the estimated delivery window) per ship option, not a transit-day count directly — derive
+    one the same way Turn14's days_in_transit is used (days from placing the order to
+    delivery). Returns None when either date is missing or is Keystone's "unknown" sentinel
+    (0001-01-01, seen on LTL quotes with no estimate)."""
+    order = _parse_keystone_date(order_date)
+    thru = _parse_keystone_date(thru_delivery)
+    if not order or not thru or order.year == _UNKNOWN_DATE_YEAR or thru.year == _UNKNOWN_DATE_YEAR:
+        return None
+    delta = (thru - order).days
+    return delta if delta >= 0 else None
+
 
 def _parse_int(value: typing.Optional[str]) -> int:
     try:
@@ -70,6 +104,14 @@ def _parse_keystone_date(value: typing.Optional[str]) -> typing.Optional[datetim
         return datetime.date.fromisoformat(value[:10])
     except ValueError:
         return None
+
+
+def _parse_keystone_delivery_date(value: typing.Optional[str]) -> typing.Optional[datetime.date]:
+    """Same as _parse_keystone_date, but treats Keystone's "unknown estimate" sentinel
+    (0001-01-01, seen on LTL quotes) as no date at all, rather than leaking a garbage year-1
+    date through to the FE."""
+    parsed = _parse_keystone_date(value)
+    return None if parsed and parsed.year == _UNKNOWN_DATE_YEAR else parsed
 
 
 def _filter_options(
@@ -181,7 +223,10 @@ class KeystoneOrderAdapter(base.DistributorOrderAdapter):
                     base.ShipOption(
                         service_level_code=row.get("ServiceLevel", ""),
                         service_level_name=row.get("Description", ""),
-                        estimated_delivery_date=_parse_keystone_date(row.get("ToDelivery")),
+                        # ThruDelivery, not ToDelivery — that's the actual field name in
+                        # Keystone's response (confirmed against a live quote).
+                        estimated_delivery_date=_parse_keystone_delivery_date(row.get("ThruDelivery")),
+                        days_in_transit=_days_in_transit(row.get("OrderDate"), row.get("ThruDelivery")),
                         cost=_parse_decimal(row.get("TotalFreightCharge")),
                         # No separate quote-scoped id for Keystone — ShipOrderDropShipMultipleParts
                         # takes the same ServiceLevel code shown here directly.
@@ -205,6 +250,7 @@ class KeystoneOrderAdapter(base.DistributorOrderAdapter):
                         quantity_available=_parse_int(row.get("QTO")) if ship_flag in ("O", "T") else 0,
                         quantity_backordered=_parse_int(row.get("Backordered")),
                         warehouse_code=warehouse_number,
+                        warehouse_name=_WAREHOUSE_NAMES.get(warehouse_number),
                         ship_options=warehouse_options.get(warehouse_number, []),
                         flags=flags,
                     )
