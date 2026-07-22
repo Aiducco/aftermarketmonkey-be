@@ -209,6 +209,33 @@ class Turn14ApiClient(object):
 
         return data, next_page
 
+    def get_item(self, item_id: str) -> typing.Optional[typing.Dict]:
+        """
+        GET /v1/items/item/{item_id} - single item detail, for on-demand inventory refresh.
+        Turn14's numeric item id (what we store as ProviderPart.provider_external_id /
+        Turn14Items.external_id, taken from this same resource's top-level "id") is not what
+        the live inventory lookup keys on - inventory/item/{...} takes this item's own
+        "external_id" attribute instead, so a live refresh has to resolve that first via this
+        call. Returns the raw JSON:API "data" object, or None if Turn14 has no item record for
+        this id (404).
+        """
+        try:
+            response = simplejson.loads(
+                self._request(
+                    endpoint="items/item/{}".format(item_id),
+                    method=common_enums.HttpMethod.GET,
+                ).content
+            )
+        except exceptions.Turn14APIBadResponseCodeError as e:
+            if e.code == 404:
+                return None
+            raise
+
+        data = response.get("data")
+        if isinstance(data, list):
+            return data[0] if data else None
+        return data if isinstance(data, dict) else None
+
     def get_inventory_items_for_brand(
             self, brand_id: int, page: int = 1
     ) -> typing.Tuple[typing.List[typing.Dict], typing.Optional[int]]:
