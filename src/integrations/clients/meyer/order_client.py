@@ -133,6 +133,22 @@ class MeyerOrderApiClient(object):
         )
         return result if isinstance(result, list) else [result]
 
+    # -- Pricing ----------------------------------------------------------------------------
+
+    def get_item_information(self, item_numbers: typing.List[str], customer_number: str) -> typing.List[typing.Dict]:
+        """GET /ItemInformation. Returns part description, dimensions, inventory, and pricing
+        (CustomerPrice) for up to 100 items per call — Meyer's docs cap it there and don't
+        otherwise rate-limit this call (no "once per hour" warning like Keystone's
+        CheckPriceBulk), so callers don't need a caching layer in front of it; see
+        MeyerOrderAdapter._get_prices, the only caller, for chunking. Non-binding — safe to
+        call freely."""
+        result = self._request(
+            endpoint="ItemInformation",
+            method=common_enums.HttpMethod.GET,
+            params={"CustomerNumber": customer_number, "ItemNumber": ",".join(item_numbers)},
+        )
+        return result if isinstance(result, list) else [result]
+
     # -- Order (SUBMIT/CANCEL — real effect, see module docstring) ------------------------
 
     def create_order(self, customer_number: str, data: typing.Dict, consolidate: bool = True) -> typing.Dict:

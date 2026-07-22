@@ -33,6 +33,9 @@ _LOG_PREFIX = "[MEYER-ORDER-ADAPTER]"
 # Meyer's docs — cancel_order() must return False for these (per base.py's contract), not raise.
 _CANCEL_NOT_CANCELLABLE_CODES = {"60501", "60502"}
 
+# Meyer's own documented cap on how many item numbers ItemInformation accepts per call.
+_ITEM_INFORMATION_CHUNK_SIZE = 100
+
 
 def _parse_decimal(value: typing.Optional[typing.Any]) -> typing.Optional[decimal.Decimal]:
     if value in (None, ""):
@@ -90,6 +93,38 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
         code = getattr(e, "code", None)
         raise order_exceptions.OrderValidationError(message=str(e), code=str(code) if code else None)
 
+    def _get_prices(self, item_numbers: typing.List[str]) -> typing.Dict[str, decimal.Decimal]:
+        """
+        {item_number: CustomerPrice} via ItemInformation, so quoted line items carry Meyer's own
+        up-to-date price rather than only our (potentially stale) catalog-sync price — same role
+        Turn14's inline quote pricing already plays for that adapter, and the same gap
+        Keystone's CheckPriceBulk fills for that one.
+
+        No caching layer here, unlike Keystone: Meyer's docs cap ItemInformation at 100 items
+        per call but don't warn of any rate limit or account-suspension risk for calling it
+        often, so there's nothing to protect against — every quote can safely fetch live prices.
+        Best-effort: any failure degrades to no pricing for the affected item(s) rather than
+        failing the shipping quote — pricing is an enrichment, availability/shipping is the
+        core result.
+        """
+        prices: typing.Dict[str, decimal.Decimal] = {}
+        for i in range(0, len(item_numbers), _ITEM_INFORMATION_CHUNK_SIZE):
+            chunk = item_numbers[i : i + _ITEM_INFORMATION_CHUNK_SIZE]
+            try:
+                items = self._client.get_item_information(chunk, self._client.customer_number)
+            except meyer_client_exceptions.MeyerException:
+                logger.exception(
+                    "{} ItemInformation failed for item_numbers={}; those line(s) will have no "
+                    "distributor-quoted price this round.".format(_LOG_PREFIX, chunk)
+                )
+                continue
+            for item in items:
+                item_number = (item.get("ItemNumber") or "").strip()
+                price = _parse_decimal(item.get("CustomerPrice"))
+                if item_number and price is not None:
+                    prices[item_number] = price
+        return prices
+
     # -- DistributorOrderAdapter ------------------------------------------------------------
 
     def get_shipping_quote(
@@ -108,6 +143,8 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
             self._handle_error(e)
 
         logger.info("{} Quote response: {}".format(_LOG_PREFIX, repr(groups)[:4000]))
+
+        prices = self._get_prices([li.provider_part.provider_external_id for li in line_items])
 
         try:
             by_external_id = {li.provider_part.provider_external_id: li for li in line_items}
@@ -135,6 +172,8 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
                 for sku in skus:
                     li = by_external_id.get(sku)
                     seen.add(sku)
+                    quantity_available = li.quantity if li else 0
+                    unit_price = prices.get(sku)
                     lines.append(
                         base.ShippingQuoteLine(
                             line_item_id=li.line_item_id if li else 0,
@@ -144,9 +183,15 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
                             # absent from every group's "skus" list is our only stockout signal
                             # (handled below), so a present item is treated as fully available
                             # for the quantity we requested.
-                            quantity_available=li.quantity if li else 0,
+                            quantity_available=quantity_available,
                             warehouse_code=warehouse,
                             ship_options=ship_options,
+                            # From ItemInformation (see _get_prices) — Meyer's shipping-quote
+                            # endpoint itself never returns pricing, unlike Turn14's.
+                            distributor_unit_price=unit_price,
+                            distributor_line_total=(
+                                unit_price * quantity_available if unit_price is not None else None
+                            ),
                         )
                     )
 
