@@ -214,6 +214,15 @@ class Turn14OrderApiClient(object):
             method=common_enums.HttpMethod.GET,
         )
 
+    def get_invoices_by_po_number(self, po_number: str) -> typing.Dict:
+        """GET /v1/invoices/po/{purchase_order_number}. Invoices are only created once items
+        actually ship, so this can legitimately return an empty ``data`` list for a while
+        after an order is placed."""
+        return self._request(
+            endpoint="invoices/po/{}".format(po_number),
+            method=common_enums.HttpMethod.GET,
+        )
+
     def get_shipping_options(self) -> typing.Dict:
         """GET /v1/shipping. All shipping service levels available to the account."""
         return self._request(

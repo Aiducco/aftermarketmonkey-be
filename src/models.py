@@ -2197,6 +2197,49 @@ class PurchaseOrderDistributorOrder(django_db_models.Model):
         unique_together = [["purchase_order", "distributor_order_number"]]
 
 
+class PurchaseOrderInvoice(django_db_models.Model):
+    """
+    A distributor-issued invoice for (part of) a PurchaseOrder — created once items actually
+    ship, not at order-placement time (see base.DistributorInvoice), so a single PO commonly
+    accumulates more than one of these over its lifetime (e.g. an immediate shipment plus a
+    later backorder release — confirmed against Turn14's own invoice dashboard, which lists
+    multiple invoice numbers under the same P.O. #). Fetched during the same status-check job
+    that already polls order status (see purchase_order_jobs._run_status_check), for
+    distributors where supports_invoices() is True.
+    """
+    purchase_order = django_db_models.ForeignKey(
+        PurchaseOrder, on_delete=django_db_models.CASCADE, related_name="invoices"
+    )
+
+    invoice_number = django_db_models.CharField(max_length=128)
+    invoice_date = django_db_models.DateField(null=True, blank=True)
+    # The distributor's own order id this invoice was billed against (Turn14's relationships[].
+    # order.order_id) — informational only, not a FK to PurchaseOrderDistributorOrder: nothing
+    # here depends on that row already existing, or on ids lining up cleanly across the two.
+    distributor_order_number = django_db_models.CharField(max_length=128, null=True, blank=True)
+    website_order_number = django_db_models.CharField(max_length=128, null=True, blank=True)
+
+    total_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    freight = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    discount_amount = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    paid_amount = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    amount_due = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+
+    # [{ship_method, tracking_number}] — one entry per package; an invoice commonly ships as
+    # more than one package/tracking number.
+    tracking = django_db_models.JSONField(default=list, blank=True, encoder=DjangoJSONEncoder)
+    comments = django_db_models.TextField(null=True, blank=True)
+
+    raw_response = django_db_models.JSONField(null=True, blank=True, encoder=DjangoJSONEncoder)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "purchase_order_invoices"
+        unique_together = [["purchase_order", "invoice_number"]]
+
+
 class PurchaseOrderSubmissionAttempt(django_db_models.Model):
     """
     Audit log of every quote/submit/status-check/cancel call made to a distributor's order

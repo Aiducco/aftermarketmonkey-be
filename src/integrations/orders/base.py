@@ -172,6 +172,43 @@ class OrderStatusResult:
 
 
 @dataclasses.dataclass
+class InvoiceTrackingEntry:
+    """One tracking number on an invoice, paired with the ship method it actually went out on
+    (an invoice can carry more than one package/tracking number — e.g. Turn14's own invoice
+    dashboard lists each separately)."""
+    ship_method: typing.Optional[str] = None
+    tracking_number: typing.Optional[str] = None
+
+
+@dataclasses.dataclass
+class DistributorInvoice:
+    """
+    A distributor-issued invoice for (part of) a PurchaseOrder — created once items actually
+    ship, not at order-placement time, so a single PO commonly accumulates more than one of
+    these over its lifetime (e.g. an immediate shipment plus a later backorder release). Only
+    returned by adapters where supports_invoices() is True (currently Turn14 — see
+    GET /v1/invoices/po/{purchase_order_number}).
+    """
+    invoice_number: str
+    invoice_date: typing.Optional[datetime.date] = None
+    # The distributor's own order id this invoice was issued against, when the response states
+    # one — informational only, not used to look anything up (see PurchaseOrderInvoice).
+    distributor_order_number: typing.Optional[str] = None
+    # The distributor's customer-facing "website" order number, when distinct from its
+    # internal order id (Turn14's `website_order_number`) — the number a customer support
+    # rep on the distributor's side would actually recognize.
+    website_order_number: typing.Optional[str] = None
+    total_price: typing.Optional[decimal.Decimal] = None
+    freight: typing.Optional[decimal.Decimal] = None
+    discount_amount: typing.Optional[decimal.Decimal] = None
+    paid_amount: typing.Optional[decimal.Decimal] = None
+    amount_due: typing.Optional[decimal.Decimal] = None
+    tracking: typing.List[InvoiceTrackingEntry] = dataclasses.field(default_factory=list)
+    comments: typing.Optional[str] = None
+    raw_response: typing.Optional[typing.Dict] = None
+
+
+@dataclasses.dataclass
 class ShippingMethod:
     """One entry in a distributor's catalog of selectable shipping methods (e.g. from
     Turn14's GET /v1/shipping). This is a name/carrier catalog, not a priced quote — most
@@ -257,5 +294,18 @@ class DistributorOrderAdapter(abc.ABC):
         Catalog of selectable shipping method codes/names for this connection. Only called
         when supports_shipping_method_selection() is True. Not priced — see
         get_shipping_quote's ``ship_method`` param for how a selection actually affects cost.
+        """
+        raise NotImplementedError
+
+    def supports_invoices(self) -> bool:
+        """Override to return True for distributors whose adapter implements get_invoices()."""
+        return False
+
+    def get_invoices(self, purchase_order: src_models.PurchaseOrder) -> typing.List[DistributorInvoice]:
+        """
+        Fetch every invoice issued against this PO so far. Only called when
+        supports_invoices() is True — invoices are created once items actually ship (not at
+        order-placement time), so this can return an empty list for a while after submit, and
+        can grow over the PO's lifetime as backordered items eventually ship separately.
         """
         raise NotImplementedError

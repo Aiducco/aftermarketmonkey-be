@@ -119,6 +119,25 @@ def _serialize_distributor_order(pdo: src_models.PurchaseOrderDistributorOrder) 
     }
 
 
+def _serialize_invoice(inv: src_models.PurchaseOrderInvoice) -> typing.Dict:
+    return {
+        "id": inv.id,
+        "invoice_number": inv.invoice_number,
+        "invoice_date": inv.invoice_date.isoformat() if inv.invoice_date else None,
+        "distributor_order_number": inv.distributor_order_number,
+        "website_order_number": inv.website_order_number,
+        "total_price": _decimal_to_float(inv.total_price),
+        "freight": _decimal_to_float(inv.freight),
+        "discount_amount": _decimal_to_float(inv.discount_amount),
+        "paid_amount": _decimal_to_float(inv.paid_amount),
+        "amount_due": _decimal_to_float(inv.amount_due),
+        # [{ship_method, tracking_number}] — one entry per package; an invoice commonly ships
+        # as more than one.
+        "tracking": inv.tracking,
+        "comments": inv.comments,
+    }
+
+
 def _serialize_purchase_order(po: src_models.PurchaseOrder, include_line_items: bool = True) -> typing.Dict:
     provider = po.company_provider.provider
     result = {
@@ -174,6 +193,11 @@ def _serialize_purchase_order(po: src_models.PurchaseOrder, include_line_items: 
         "created_at": po.created_at.isoformat(),
         "updated_at": po.updated_at.isoformat(),
         "distributor_orders": [_serialize_distributor_order(pdo) for pdo in po.distributor_orders.all()],
+        # Distributor-issued invoices (see PurchaseOrderInvoice) — only populated for
+        # distributors whose adapter supports it (currently Turn14) and only once items
+        # actually ship, so this is commonly empty right after submit and fills in/grows over
+        # the PO's lifetime as a status-check job polls (POST .../refresh-status/).
+        "invoices": [_serialize_invoice(inv) for inv in po.invoices.all().order_by("-invoice_date")],
     }
     if include_line_items:
         shipments_by_id = {s["id"]: s for s in (po.shipments or [])}

@@ -588,6 +588,47 @@ def _run_status_check(po: src_models.PurchaseOrder, adapter: order_base.Distribu
     # phase until each distributor's exact status vocabulary has been confirmed against a
     # real (user-supervised) test order — see the Purchase Orders plan's verification section.
 
+    if adapter.supports_invoices():
+        _sync_invoices(po, adapter)
+
+
+def _sync_invoices(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrderAdapter) -> None:
+    """
+    Best-effort: an invoice-fetch failure doesn't fail the status check overall (that data —
+    order status/tracking — already succeeded and was recorded above) since invoices are
+    supplementary. A transient failure here just means this round's invoices are stale until
+    the next status-check run (STATUS_CHECK is auto-retryable, so there will be one).
+    """
+    try:
+        invoices = adapter.get_invoices(po)
+    except order_exceptions.OrderAdapterError as e:
+        logger.warning(
+            "{} Invoice fetch failed for purchase_order_id={}: {}".format(_LOG_PREFIX, po.id, e)
+        )
+        return
+
+    for invoice in invoices:
+        src_models.PurchaseOrderInvoice.objects.update_or_create(
+            purchase_order=po,
+            invoice_number=invoice.invoice_number,
+            defaults={
+                "invoice_date": invoice.invoice_date,
+                "distributor_order_number": invoice.distributor_order_number,
+                "website_order_number": invoice.website_order_number,
+                "total_price": invoice.total_price,
+                "freight": invoice.freight,
+                "discount_amount": invoice.discount_amount,
+                "paid_amount": invoice.paid_amount,
+                "amount_due": invoice.amount_due,
+                "tracking": [
+                    {"ship_method": t.ship_method, "tracking_number": t.tracking_number}
+                    for t in invoice.tracking
+                ],
+                "comments": invoice.comments,
+                "raw_response": invoice.raw_response,
+            },
+        )
+
 
 def _run_cancel(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrderAdapter) -> None:
     if not adapter.supports_cancel():

@@ -8,6 +8,7 @@ environment, per their docs this creates a real test order in their system, not 
 It must only ever be invoked from an explicit, user-approved submission — never from
 exploratory/dev code, automated tests, or ad-hoc scripts.
 """
+import datetime
 import decimal
 import logging
 import typing
@@ -433,6 +434,75 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
                 )
             )
         return base.OrderStatusResult(orders=orders)
+
+    def supports_invoices(self) -> bool:
+        return True
+
+    def get_invoices(self, purchase_order: src_models.PurchaseOrder) -> typing.List[base.DistributorInvoice]:
+        try:
+            response = self._client.get_invoices_by_po_number(self._turn14_po_number(purchase_order))
+        except turn14_client_exceptions.Turn14APIBadResponseCodeError as e:
+            self._handle_error(e)
+
+        try:
+            raw_invoices = response.get("data", [])
+            if isinstance(raw_invoices, dict):
+                raw_invoices = [raw_invoices]
+
+            invoices = []
+            for invoice in raw_invoices:
+                attrs = invoice.get("attributes", {}) or {}
+                invoice_date = attrs.get("date")
+                # relationships is a list of single-key dicts (see the raw example in Turn14's
+                # docs) — order_id is the distributor's own order id this invoice was billed
+                # against, informational only (see DistributorInvoice.distributor_order_number).
+                distributor_order_number = None
+                for rel in attrs.get("relationships", []) or []:
+                    order_rel = rel.get("order") if isinstance(rel, dict) else None
+                    if order_rel and order_rel.get("order_id") is not None:
+                        distributor_order_number = str(order_rel["order_id"])
+                        break
+                tracking = [
+                    base.InvoiceTrackingEntry(
+                        ship_method=t.get("ship_method"), tracking_number=t.get("tracking_number")
+                    )
+                    for t in (attrs.get("tracking") or [])
+                ]
+                invoices.append(
+                    base.DistributorInvoice(
+                        invoice_number=str(attrs.get("invoice_number", "")),
+                        invoice_date=(
+                            datetime.date.fromisoformat(invoice_date) if invoice_date else None
+                        ),
+                        distributor_order_number=distributor_order_number,
+                        website_order_number=attrs.get("website_order_number"),
+                        total_price=(
+                            decimal.Decimal(str(attrs["total_price"])) if attrs.get("total_price") is not None else None
+                        ),
+                        freight=decimal.Decimal(str(attrs["freight"])) if attrs.get("freight") is not None else None,
+                        discount_amount=(
+                            decimal.Decimal(str(attrs["discount_amount"]))
+                            if attrs.get("discount_amount") is not None
+                            else None
+                        ),
+                        paid_amount=(
+                            decimal.Decimal(str(attrs["paid_amount"])) if attrs.get("paid_amount") is not None else None
+                        ),
+                        amount_due=(
+                            decimal.Decimal(str(attrs["amount_due"])) if attrs.get("amount_due") is not None else None
+                        ),
+                        tracking=tracking,
+                        comments=attrs.get("comments"),
+                        raw_response=invoice,
+                    )
+                )
+        except (AttributeError, TypeError, KeyError, IndexError, ValueError) as e:
+            raise order_exceptions.OrderValidationError(
+                "Unexpected invoice response shape from Turn14 ({}: {}). Raw response: {}".format(
+                    type(e).__name__, e, repr(response)[:2000]
+                )
+            )
+        return invoices
 
     def cancel_order(self, purchase_order: src_models.PurchaseOrder) -> bool:
         raise order_exceptions.OrderNotSupportedError(
