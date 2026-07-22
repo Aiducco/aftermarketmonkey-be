@@ -59,6 +59,7 @@ from src.api.views.purchase_orders import (
     PurchaseOrdersView,
     PurchaseOrderDetailView,
     PurchaseOrderSubmitView,
+    PurchaseOrderShippingSelectionView,
     PurchaseOrderCancelView,
     PurchaseOrderRefreshStatusView,
     PurchaseOrderRequoteView,
@@ -269,6 +270,11 @@ urlpatterns = [
         "purchase-orders/<int:id>/submit/",
         PurchaseOrderSubmitView.as_view(),
         name="purchase_order_submit",
+    ),
+    path(
+        "purchase-orders/<int:id>/shipments/select/",
+        PurchaseOrderShippingSelectionView.as_view(),
+        name="purchase_order_shipping_selection",
     ),
     path(
         "purchase-orders/<int:id>/cancel/",

@@ -55,6 +55,13 @@ class ShipOption:
     # substitute for service_level_name: most options don't carry one at all, and where present
     # it describes eligibility/terms, not a clean carrier/method name.
     verbose_eta: typing.Optional[str] = None
+    # The identifier to send back when SELECTING this exact priced option — e.g. Turn14's
+    # shipping_quote_id, which is distinct from and more specific than service_level_code (one
+    # code can recur across many shipments/quotes; this id is unique to this one priced
+    # quote-line and is what submit_order must send to actually choose it). Distributors with
+    # no separate quote-scoped id (Keystone/Meyer/Premier — their create-order calls take one
+    # plain method code for the whole order) just set this equal to service_level_code.
+    quote_option_id: typing.Optional[str] = None
 
 
 @dataclasses.dataclass
@@ -63,7 +70,7 @@ class LinePromotion:
     promos) — already netted into the distributor's own unit_price/line_total in the raw
     response. Subtracted from ShippingQuoteLine.distributor_line_total to produce
     PurchaseOrderLineItem.distributor_net_line_total, which IS what feeds po.subtotal (see
-    _compute_totals) — this never touches unit_cost/line_total themselves, which stay our
+    compute_totals) — this never touches unit_cost/line_total themselves, which stay our
     frozen catalog pricing regardless."""
     description: str
     amount: typing.Optional[decimal.Decimal] = None
@@ -100,7 +107,7 @@ class ShippingQuoteLine:
     # Distributor's own quoted price for THIS shipment-split (gross, before promotions).
     # Summed across every split for this item_id and netted against promotions to produce
     # PurchaseOrderLineItem.distributor_net_line_total, which drives po.subtotal when present
-    # (see _compute_totals) — this is the authoritative billing price once a quote has
+    # (see compute_totals) — this is the authoritative billing price once a quote has
     # returned one; it never overwrites unit_cost/line_total themselves, which stay our frozen
     # catalog pricing (used as a fallback only for distributors that don't quote per-item
     # pricing). unit_price is normally stable across every split for the same item_id;

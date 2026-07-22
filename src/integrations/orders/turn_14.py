@@ -215,6 +215,11 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
                         # Only present on some options (e.g. the flat-rate "Preferred Access"
                         # one) — a marketing/eligibility blurb, not a clean method name.
                         verbose_eta=opt.get("verbose_eta") or None,
+                        # The id submit_order must send back to select THIS exact priced
+                        # option — distinct from shipping_code, which recurs across shipments.
+                        quote_option_id=(
+                            str(opt["shipping_quote_id"]) if opt.get("shipping_quote_id") is not None else None
+                        ),
                     )
                     for opt in (shipment.get("shipping") or [])
                 ]
@@ -273,18 +278,28 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
     ) -> base.DistributorOrderResult:
         quote_raw = purchase_order.quote_raw_response or {}
         quote_id = quote_raw.get("data", {}).get("id")
+        # Real Prop 65 acknowledgement, not a hardcoded False — is_prop_65 is set at quote time
+        # from Turn14's own top-level "prop_65" array (see get_shipping_quote). acknowledge_epa/
+        # acknowledge_carb stay hardcoded False for now — no confirmed evidence yet that
+        # Turn14's quote response carries a parallel array for either, and CARB would need a
+        # separate Turn14Items catalog lookup; flagged as a follow-up, not silently guessed at.
+        acknowledge_prop_65 = purchase_order.line_items.filter(is_prop_65=True).exists()
+        order_notes = purchase_order.notes or ""
+        phone_number = ship_to.phone or ""
 
         try:
             if quote_id:
-                shipping_ids = self._extract_shipping_quote_ids(quote_raw, ship_method=purchase_order.ship_method)
+                shipping_ids = self._build_shipping_selection(purchase_order)
                 response = self._client.promote_quote_to_order(
                     {
                         "environment": self._client.environment,
                         "quote_id": quote_id,
                         "po_number": purchase_order.po_number,
-                        "acknowledge_prop_65": False,
+                        "acknowledge_prop_65": acknowledge_prop_65,
                         "acknowledge_epa": False,
                         "acknowledge_carb": False,
+                        "order_notes": order_notes,
+                        "phone_number": phone_number,
                         "shipping": shipping_ids,
                     }
                 )
@@ -295,9 +310,11 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
                         "environment": self._client.environment,
                         "po_number": purchase_order.po_number,
                         "locations": self._build_locations(line_items, shipping_code=shipping_code),
-                        "acknowledge_prop_65": False,
+                        "acknowledge_prop_65": acknowledge_prop_65,
                         "acknowledge_epa": False,
                         "acknowledge_carb": False,
+                        "order_notes": order_notes,
+                        "phone_number": phone_number,
                         "recipient": self._build_recipient(ship_to),
                     }
                 )
@@ -307,39 +324,33 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
         return self._parse_order_response(response, line_items)
 
     @staticmethod
-    def _extract_shipping_quote_ids(
-        quote_raw: typing.Dict, ship_method: typing.Optional[str] = None
-    ) -> typing.List[typing.Dict]:
+    def _build_shipping_selection(purchase_order: src_models.PurchaseOrder) -> typing.List[typing.Dict]:
         """
-        Each shipment in the quote carries a LIST of priced options (see get_shipping_quote) —
-        exactly one must be picked per shipment to promote to an order. Picks the option whose
-        shipping_code matches ``ship_method`` (the user's choice from
-        GET .../shipping-methods/) when given; otherwise defaults to the cheapest, matching
-        Turn 14's own recommendation ("we recommend you not [pre-select] ... to ensure you're
-        always selecting the best possible option").
+        Builds promote_quote_to_order's "shipping" array directly from
+        ``purchase_order.shipments`` (the normalized, PO-level shipment list built at quote time
+        by ``_run_quote`` — see ``PurchaseOrder.shipments``). Each shipment's
+        ``selected_ship_option_id`` IS the distributor's real ``shipping_quote_id`` (see
+        ``base.ShipOption.quote_option_id``) — defaulted at quote time (match ``ship_method``'s
+        code when offered there, else cheapest) and possibly overridden per shipment via
+        ``POST .../shipments/select/`` before this runs. No re-deriving/guessing from
+        ``quote_raw_response`` needed anymore — this was the previous approach's whole problem:
+        it could only apply one global method choice, not a distinct one per shipment.
         """
-        attrs = quote_raw.get("data", {}).get("attributes", {})
         shipping_ids = []
-        for shipment in attrs.get("shipment", []):
-            options = shipment.get("shipping") or []
-            if not options:
+        for shipment in purchase_order.shipments or []:
+            selected_id = shipment.get("selected_ship_option_id")
+            if not selected_id:
                 continue
-            chosen = None
-            if ship_method is not None:
-                chosen = next(
-                    (o for o in options if str(o.get("shipping_code")) == str(ship_method)), None
-                )
-            if chosen is None:
-                chosen = min(options, key=lambda o: o.get("cost", float("inf")))
-            quote_id = chosen.get("shipping_quote_id")
-            if quote_id is not None:
-                shipping_ids.append(
-                    {
-                        "shipping_id": quote_id,
-                        "saturday_delivery": False,
-                        "signature_required": False,
-                    }
-                )
+            # Stored as a string throughout po.shipments (JSON-safe, consistent across
+            # distributors), but Turn14's API expects shipping_id as a bare number (confirmed
+            # against their raw request example) — cast back before sending.
+            try:
+                shipping_id = int(selected_id)
+            except (TypeError, ValueError):
+                shipping_id = selected_id
+            shipping_ids.append(
+                {"shipping_id": shipping_id, "saturday_delivery": False, "signature_required": False}
+            )
         return shipping_ids
 
     @staticmethod

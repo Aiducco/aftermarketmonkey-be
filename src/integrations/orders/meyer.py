@@ -124,6 +124,9 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
                             service_level_name=q.get("ServiceType", ""),
                             estimated_delivery_date=_parse_meyer_date(q.get("DeliveryDate")),
                             cost=_parse_decimal(q.get("Cost")),
+                            # No separate quote-scoped id for Meyer — CreateOrder takes the same
+                            # ShipMethod code shown here directly.
+                            quote_option_id=(q.get("ShipMethod") or "").strip(),
                         )
                         for q in group.get("quotes", [])
                     ],

@@ -2016,6 +2016,22 @@ class PurchaseOrder(django_db_models.Model):
     quote_raw_response = django_db_models.JSONField(null=True, blank=True, encoder=DjangoJSONEncoder)
     quoted_at = django_db_models.DateTimeField(null=True, blank=True)
 
+    # Normalized (distributor-agnostic), PO-level breakdown of the last quote's shipments —
+    # one entry per distinct (warehouse, in-stock-vs-backordered) group, built once here rather
+    # than duplicated inside every line item's own shipments (see PurchaseOrderLineItem.shipments,
+    # which now only holds a lightweight {shipment_id, quantity_confirmed, quantity_backordered}
+    # reference into this list):
+    # [{id, warehouse_code, warehouse_name, is_backordered,
+    #   items: [{line_item_id, provider_external_id, quantity, unit_price, line_total}],
+    #   ship_options: [{id, code, name, verbose_eta, days_in_transit, cost, estimated_delivery_date}],
+    #   selected_ship_option_id}].
+    # `ship_options[].id` is the distributor's own per-option identifier (base.ShipOption.
+    # quote_option_id) — what submit_order actually sends to select that option, not
+    # service_level_code (which can recur across shipments/quotes). `selected_ship_option_id`
+    # defaults at quote time (match po.ship_method's code if set, else cheapest) and can be
+    # overridden per shipment via POST .../shipments/select/ before submitting.
+    shipments = django_db_models.JSONField(null=True, blank=True, encoder=DjangoJSONEncoder)
+
     subtotal = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     estimated_shipping = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     total = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
@@ -2087,24 +2103,19 @@ class PurchaseOrderLineItem(django_db_models.Model):
     manufacturer_esd = django_db_models.DateField(null=True, blank=True)
     warehouse_code = django_db_models.CharField(max_length=64, null=True, blank=True)
 
-    # Normalized (distributor-agnostic) per-shipment breakdown for this line item's last quote:
-    # [{warehouse_code, warehouse_name, quantity_confirmed, quantity_backordered,
-    # manufacturer_esd, ship_options: [{code, name, cost, estimated_delivery_date}]}].
-    # warehouse_name is a human-readable label (e.g. "Hatfield, PA") when the distributor's
-    # adapter can decode the code against a location catalog (Turn14Location for Turn14),
-    # else null. Almost always a single-entry list; more
-    # than one entry means the distributor is fulfilling this line from multiple
-    # warehouses/shipments, each with its own priced shipping options — see the aggregate fields
-    # above for the common case, use this when the split itself needs to be shown/selected on.
-    # This is what the FE's shipping-method picker reads — never the distributor's raw quote
-    # response, which has a different shape per distributor.
+    # Lightweight references into PurchaseOrder.shipments (the full, deduplicated shipment
+    # records — items + priced ship_options — now live there once, not copied per line item):
+    # [{shipment_id, quantity_confirmed, quantity_backordered, manufacturer_esd}]. Almost always
+    # a single-entry list; more than one entry means the distributor is fulfilling this line
+    # from multiple shipments — see the aggregate fields above for the common case, use this to
+    # look up which PurchaseOrder.shipments entries this line participates in.
     shipments = django_db_models.JSONField(null=True, blank=True, encoder=DjangoJSONEncoder)
 
     # Distributor-applied discounts on this line from the last quote (e.g. Turn14's per-item
     # pricing promos): [{description, amount}]. Already netted into the distributor's own price
     # in quote_raw_response; subtracted from distributor_line_total below to produce
     # distributor_net_line_total, which IS what feeds po.subtotal (see
-    # purchase_order_jobs._compute_totals) — never fed back into unit_cost/line_total
+    # purchase_order_jobs.compute_totals) — never fed back into unit_cost/line_total
     # themselves, which stay our frozen catalog price regardless. Empty/null for distributors
     # that don't have this concept.
     promotions = django_db_models.JSONField(null=True, blank=True, encoder=DjangoJSONEncoder)
@@ -2113,7 +2124,7 @@ class PurchaseOrderLineItem(django_db_models.Model):
     # promotions). distributor_line_total is the sum of every shipment-split's line total for
     # this item; distributor_net_line_total is that total minus the promotions above — THIS is
     # the authoritative price fed into po.subtotal once a quote has returned one (see
-    # purchase_order_jobs._compute_totals/_effective_line_total), since a quote is exactly the
+    # purchase_order_jobs.compute_totals/effective_line_total), since a quote is exactly the
     # distributor telling us what they will actually charge. Falling back to unit_cost/line_total
     # (our frozen catalog price, left untouched by these fields) only happens for distributors
     # whose adapter doesn't return per-item pricing at quote time yet.

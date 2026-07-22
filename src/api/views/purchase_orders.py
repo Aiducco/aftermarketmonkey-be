@@ -234,12 +234,14 @@ class PurchaseOrderDetailView(views.View):
 class PurchaseOrderSubmitView(views.View):
     """POST /purchase-orders/<id>/submit/ — submits SYNCHRONOUSLY, placing a real order with
     the distributor in the request/response cycle (see run_submit_synchronously). Optional
-    body: {ship_method?}. A quote returns every available shipping method's live price, so the
-    user picks one AFTER seeing the quote, not before — pass their choice here (the
+    body: {ship_method?, notes?}. A quote returns every available shipping method's live price,
+    so the user picks one AFTER seeing the quote, not before — pass their choice here (the
     shipping_code from that PO's line items' ship_options) to apply it just before submitting.
-    Omit to keep whatever was set at review time / the distributor's default. Returns the
-    updated PurchaseOrder directly — check status/error_message, since a distributor-side
-    failure doesn't raise here (same contract as .../requote/)."""
+    ``notes``, when given, is set on the PO right before submit and passed through to the
+    distributor as order notes (e.g. Turn14's order_notes). Omit either to keep whatever was
+    set at review time / the distributor's default. Returns the updated PurchaseOrder directly
+    — check status/error_message, since a distributor-side failure doesn't raise here (same
+    contract as .../requote/)."""
 
     def post(self, request: http.HttpRequest, *args, **kwargs) -> http.HttpResponse:
         company_id, _user_id, err = _require_auth(request)
@@ -253,13 +255,49 @@ class PurchaseOrderSubmitView(views.View):
         po_id = kwargs.get("id")
         try:
             result = purchase_orders_services.submit_purchase_order(
-                company_id=company_id, purchase_order_id=po_id, ship_method=body.get("ship_method")
+                company_id=company_id,
+                purchase_order_id=po_id,
+                ship_method=body.get("ship_method"),
+                notes=body.get("notes"),
             )
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e))
         except Exception:
             logger.exception("{} Error submitting purchase order id={}".format(_LOG_PREFIX, po_id))
             return _error_response("Error submitting purchase order", status=500)
+
+        return _json_response(result, status=200)
+
+
+class PurchaseOrderShippingSelectionView(views.View):
+    """POST /purchase-orders/<id>/shipments/select/ — picks which priced ship option to use for
+    one or more of this PO's shipments (see PurchaseOrder.shipments), ahead of submit. Body:
+    {selections: {"<shipment_id>": "<ship_option_id>", ...}}. Returns the updated PurchaseOrder
+    directly, with estimated_shipping/total recomputed from the new selection(s)."""
+
+    def post(self, request: http.HttpRequest, *args, **kwargs) -> http.HttpResponse:
+        company_id, _user_id, err = _require_auth(request)
+        if err:
+            return err
+
+        body, err = _parse_json_body(request)
+        if err:
+            return err
+
+        selections = body.get("selections")
+        if not isinstance(selections, dict) or not selections:
+            return _error_response("'selections' must be a non-empty object of shipment_id -> ship_option_id")
+
+        po_id = kwargs.get("id")
+        try:
+            result = purchase_orders_services.select_shipping_options(
+                company_id=company_id, purchase_order_id=po_id, selections=selections
+            )
+        except purchase_orders_services.PurchaseOrderServiceError as e:
+            return _error_response(str(e))
+        except Exception:
+            logger.exception("{} Error selecting shipping options for purchase order id={}".format(_LOG_PREFIX, po_id))
+            return _error_response("Error selecting shipping options", status=500)
 
         return _json_response(result, status=200)
 

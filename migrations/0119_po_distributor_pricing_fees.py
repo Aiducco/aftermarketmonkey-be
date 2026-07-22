@@ -17,15 +17,7 @@ class Migration(migrations.Migration):
         migrations.AddField(
             model_name="purchaseorder",
             name="fees",
-            field=models.JSONField(
-                null=True,
-                blank=True,
-                encoder=DjangoJSONEncoder,
-                help_text=(
-                    "Order-level fees from the last quote not tied to any specific line item: "
-                    "[{fee_type, description, amount}]."
-                ),
-            ),
+            field=models.JSONField(null=True, blank=True, encoder=DjangoJSONEncoder),
         ),
         migrations.AddField(
             model_name="purchaseorderlineitem",

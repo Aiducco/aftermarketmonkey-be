@@ -44,8 +44,27 @@ def _decimal_to_float(value: typing.Optional[decimal.Decimal]) -> typing.Optiona
     return float(value) if value is not None else None
 
 
-def _serialize_line_item(li: src_models.PurchaseOrderLineItem) -> typing.Dict:
+def _single_shipment_warehouse_name(
+    li: src_models.PurchaseOrderLineItem, shipments_by_id: typing.Dict[str, typing.Dict]
+) -> typing.Optional[str]:
+    if not li.shipments or len(li.shipments) != 1:
+        return None
+    shipment = shipments_by_id.get(li.shipments[0].get("shipment_id"))
+    return shipment.get("warehouse_name") if shipment else None
+
+
+def _serialize_line_item(
+    li: src_models.PurchaseOrderLineItem, shipments_by_id: typing.Dict[str, typing.Dict]
+) -> typing.Dict:
     master_part = li.provider_part.master_part
+    # unit_cost/line_total now reflect the distributor's own quoted price (net of promotions)
+    # once a quote has returned one — a quote is exactly the distributor telling us what
+    # they'll actually charge, so that supersedes our frozen add-to-cart catalog snapshot for
+    # display purposes. Falls back to the catalog price unchanged for distributors whose
+    # adapter doesn't return per-item pricing at quote time yet. Same rule as po.subtotal —
+    # see purchase_order_jobs.effective_line_total/compute_totals.
+    effective_unit_cost = li.distributor_unit_price if li.distributor_unit_price is not None else li.unit_cost
+    effective_line_total = purchase_order_jobs.effective_line_total(li)
     return {
         "id": li.id,
         "provider_part_id": li.provider_part_id,
@@ -54,8 +73,8 @@ def _serialize_line_item(li: src_models.PurchaseOrderLineItem) -> typing.Dict:
         "description": master_part.description if master_part else None,
         "image_url": master_part.image_url if master_part else None,
         "quantity": li.quantity,
-        "unit_cost": _decimal_to_float(li.unit_cost),
-        "line_total": _decimal_to_float(li.line_total),
+        "unit_cost": _decimal_to_float(effective_unit_cost),
+        "line_total": _decimal_to_float(effective_line_total),
         "status": li.status,
         "status_name": li.status_name,
         "distributor_line_status_code": li.distributor_line_status_code,
@@ -66,23 +85,21 @@ def _serialize_line_item(li: src_models.PurchaseOrderLineItem) -> typing.Dict:
         "warehouse_code": li.warehouse_code,
         # Human-readable label for warehouse_code (e.g. "Hatfield, PA" — same convention
         # Turn14's own ordering portal uses, grouping by state). Only set when there's exactly
-        # one shipment, same rule as warehouse_code itself; for a split shipment use each
-        # entry's own warehouse_name in ``shipments`` below instead.
-        "warehouse_name": (
-            li.shipments[0].get("warehouse_name") if li.shipments and len(li.shipments) == 1 else None
-        ),
-        # ``shipments``: [{warehouse_code, warehouse_name, quantity_confirmed,
-        # quantity_backordered, manufacturer_esd, ship_options: [{code, name, cost,
-        # estimated_delivery_date}]}] — one entry per distributor shipment this line was split
-        # across. Almost always length 1; the aggregate fields above cover the common case, use
-        # this when the split itself needs rendering (see PurchaseOrderLineItem.shipments for
-        # the full contract).
+        # one shipment, same rule as warehouse_code itself; resolved via shipments_by_id since
+        # the full shipment record (including warehouse_name) now lives once at the PO level
+        # (see PurchaseOrder.shipments) — for a split shipment, look up each of this line's
+        # ``shipments[].shipment_id`` entries against the top-level ``shipments`` list instead.
+        "warehouse_name": _single_shipment_warehouse_name(li, shipments_by_id),
+        # Lightweight references into the PO-level ``shipments`` list (see
+        # PurchaseOrder.shipments for the full item/ship_options contract):
+        # [{shipment_id, quantity_confirmed, quantity_backordered, manufacturer_esd}]. Almost
+        # always length 1; the aggregate fields above cover the common case.
         "shipments": li.shipments,
         "is_split_shipment": len(li.shipments or []) > 1,
         "promotions": li.promotions,
         # Distributor's own quoted price for this item (gross, and net of the promotions
         # above) — the authoritative billing price once a quote has returned one; see
-        # PurchaseOrderLineItem.distributor_net_line_total / _compute_totals. Null for
+        # PurchaseOrderLineItem.distributor_net_line_total / compute_totals. Null for
         # distributors whose adapter doesn't return per-item pricing at quote time yet.
         "distributor_unit_price": _decimal_to_float(li.distributor_unit_price),
         "distributor_line_total": _decimal_to_float(li.distributor_line_total),
@@ -138,6 +155,13 @@ def _serialize_purchase_order(po: src_models.PurchaseOrder, include_line_items: 
         # the last quote — informational; subtotal/total above stay authoritative for billing.
         "distributor_quoted_total": _decimal_to_float(po.distributor_quoted_total),
         "fees": po.fees,
+        # Grouped shipment breakdown from the last quote — one entry per distinct (warehouse,
+        # in-stock-vs-backordered) group, each with its own items list and priced, ID-bearing
+        # ship_options (see PurchaseOrder.shipments). This is what the FE's shipping-method
+        # picker reads (one radio-group per shipment); use POST .../shipments/select/ to change
+        # a shipment's selected_ship_option_id before submitting. Kept separate from
+        # ``line_items`` below — neither needs to be reconstructed from the other.
+        "shipments": po.shipments,
         "error_message": po.error_message,
         "notes": po.notes,
         "quoted_at": po.quoted_at.isoformat() if po.quoted_at else None,
@@ -150,9 +174,11 @@ def _serialize_purchase_order(po: src_models.PurchaseOrder, include_line_items: 
         "distributor_orders": [_serialize_distributor_order(pdo) for pdo in po.distributor_orders.all()],
     }
     if include_line_items:
-        result["line_items"] = [_serialize_line_item(li) for li in po.line_items.select_related(
-            "provider_part__master_part__brand"
-        ).all()]
+        shipments_by_id = {s["id"]: s for s in (po.shipments or [])}
+        result["line_items"] = [
+            _serialize_line_item(li, shipments_by_id)
+            for li in po.line_items.select_related("provider_part__master_part__brand").all()
+        ]
         result["item_count"] = sum(li["quantity"] for li in result["line_items"])
     return result
 
@@ -585,7 +611,10 @@ def _quote_is_stale(po: src_models.PurchaseOrder) -> bool:
 
 
 def submit_purchase_order(
-    company_id: int, purchase_order_id: int, ship_method: typing.Optional[str] = None
+    company_id: int,
+    purchase_order_id: int,
+    ship_method: typing.Optional[str] = None,
+    notes: typing.Optional[str] = None,
 ) -> typing.Dict:
     """
     Places a REAL order with the distributor, synchronously — the caller (a POST to
@@ -599,6 +628,10 @@ def submit_purchase_order(
     distributor. Leave unset to keep whatever was set at review time (or the distributor's
     default/cheapest, if nothing was ever set).
 
+    ``notes``, when given, overwrites ``po.notes`` right before submitting — this is what
+    reaches the distributor as ``order_notes`` (see Turn14OrderAdapter.submit_order). Leave
+    unset to keep whatever note was already on the PO.
+
     Never raises for a distributor-side failure — same contract as run_quote_synchronously —
     so submit_purchase_order_group can keep submitting the rest of a multi-distributor group
     instead of aborting the whole request. Returns the serialized PurchaseOrder either way;
@@ -610,6 +643,9 @@ def submit_purchase_order(
     if ship_method is not None:
         po.ship_method = ship_method
         po.save(update_fields=["ship_method", "updated_at"])
+    if notes is not None:
+        po.notes = notes
+        po.save(update_fields=["notes", "updated_at"])
     if po.status != src_enums.PurchaseOrderStatus.QUOTED.value:
         raise PurchaseOrderServiceError(
             "Purchase order must be quoted before it can be submitted (current status: {}).".format(
@@ -628,6 +664,41 @@ def submit_purchase_order(
     po.save(update_fields=["status", "status_name", "updated_at"])
     submitted_po = purchase_order_jobs.run_submit_synchronously(po.id)
     return _serialize_purchase_order(submitted_po)
+
+
+def select_shipping_options(
+    company_id: int, purchase_order_id: int, selections: typing.Dict[str, str]
+) -> typing.Dict:
+    """
+    Applies the customer's per-shipment shipping-method choice, made after seeing the quote's
+    real priced options for each shipment (see PurchaseOrder.shipments). ``selections`` maps
+    shipment_id -> ship_option_id, both taken verbatim from that same po.shipments structure
+    (ids are opaque; only used to look each other up here). Every id must already exist there —
+    a quote must have run first. Recomputes estimated_shipping/total from the new selection(s)
+    before returning, so the UI can reflect the price change immediately without a re-quote.
+    """
+    po = src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id).first()
+    if not po:
+        raise PurchaseOrderServiceError("Purchase order not found.")
+    if not po.shipments:
+        raise PurchaseOrderServiceError("This purchase order has no quoted shipments yet — quote it first.")
+
+    shipments_by_id = {s["id"]: s for s in po.shipments}
+    for shipment_id, ship_option_id in selections.items():
+        shipment = shipments_by_id.get(shipment_id)
+        if shipment is None:
+            raise PurchaseOrderServiceError("Unknown shipment_id: {}".format(shipment_id))
+        valid_option_ids = {o.get("id") for o in (shipment.get("ship_options") or [])}
+        if ship_option_id not in valid_option_ids:
+            raise PurchaseOrderServiceError(
+                "Unknown ship_option_id '{}' for shipment '{}'.".format(ship_option_id, shipment_id)
+            )
+        shipment["selected_ship_option_id"] = ship_option_id
+
+    po.shipments = list(shipments_by_id.values())
+    purchase_order_jobs.compute_totals(po)
+    po.save(update_fields=["shipments", "subtotal", "estimated_shipping", "total", "updated_at"])
+    return _serialize_purchase_order(po)
 
 
 def requote_purchase_order(company_id: int, purchase_order_id: int) -> typing.Dict:

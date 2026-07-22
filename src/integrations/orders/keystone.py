@@ -183,6 +183,9 @@ class KeystoneOrderAdapter(base.DistributorOrderAdapter):
                         service_level_name=row.get("Description", ""),
                         estimated_delivery_date=_parse_keystone_date(row.get("ToDelivery")),
                         cost=_parse_decimal(row.get("TotalFreightCharge")),
+                        # No separate quote-scoped id for Keystone — ShipOrderDropShipMultipleParts
+                        # takes the same ServiceLevel code shown here directly.
+                        quote_option_id=row.get("ServiceLevel", ""),
                     )
                     for row in rows
                 ]
