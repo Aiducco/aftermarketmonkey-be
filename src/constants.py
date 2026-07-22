@@ -277,14 +277,15 @@ PROVIDER_CATALOG = [
         "relay_provisioned": True,
         "relay_credential_fields": ("sftp_user", "sftp_password"),
         # Order-placement credentials (Meyer REST API, https://meyerapi.meyerdistributing.com) —
-        # entirely separate from the SFTP relay feed above. "username"/"password" are exchanged
-        # for a 30-day API key via Meyer's Authentication endpoint (POST .../v2/Authentication);
-        # the adapter re-authenticates as needed rather than storing the short-lived key itself.
-        # "customer_number" is required on every order call (CreateOrder, CancelOrder, and most
-        # read calls) as a separate account identifier from the login itself. Optional: a company
-        # can connect the feed without ever filling these in; order placement simply stays
-        # unavailable until they do.
-        "order_connection_required_fields": ["username", "password", "customer_number"],
+        # entirely separate from the SFTP relay feed above. "api_key" is a static key issued
+        # directly by a Meyer rep — per Meyer's own docs, a company issued a static key never
+        # needs to call the username/password Authentication exchange at all, so we don't
+        # either; it's sent as-is in every call's Authorization header. "customer_number" is
+        # required on every order call (CreateOrder, CancelOrder, and most read calls) as a
+        # separate account identifier from the key itself. Optional: a company can connect the
+        # feed without ever filling these in; order placement simply stays unavailable until
+        # they do.
+        "order_connection_required_fields": ["api_key", "customer_number"],
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
             "<p>AfterMarketScout has already created a dedicated SFTP account for your company. "

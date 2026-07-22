@@ -559,7 +559,7 @@ def _validate_turn14_order_connection(credentials: typing.Dict[str, typing.Any])
 
 def _validate_meyer_order_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
     try:
-        environment = getattr(settings, "MEYER_ORDER_ENVIRONMENT", "production")
+        environment = getattr(settings, "MEYER_ORDER_ENVIRONMENT", "testing")
         client = meyer_order_client.MeyerOrderApiClient(credentials=credentials, environment=environment)
         client.test_connection()
     except meyer_exceptions.MeyerOrderAuthError as e:

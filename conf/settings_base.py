@@ -317,15 +317,17 @@ MEYER_INVENTORY_REMOTE_FILE = os.environ.get("MEYER_INVENTORY_REMOTE_FILE") or "
 MEYER_PRICING_LOCAL_PATH = os.environ.get("MEYER_PRICING_LOCAL_PATH", "/tmp/meyer_pricing.csv")
 MEYER_INVENTORY_LOCAL_PATH = os.environ.get("MEYER_INVENTORY_LOCAL_PATH", "/tmp/meyer_inventory.csv")
 
-# Meyer Order API (REST, username/password -> 30-day Espresso apikey) — separate hosts for their
-# "testing" and "production" environments, same pattern as Turn14's order API split.
+# Meyer Order API (REST, static Espresso apikey issued directly by a Meyer rep) — separate
+# hosts for their "testing" and "production" environments, same pattern as Turn14's order API
+# split. Defaults to "testing" for now — flip to "production" (or set MEYER_ORDER_ENVIRONMENT)
+# once Meyer order placement has been verified end-to-end against the test API.
 MEYER_ORDER_TEST_BASE_URL = os.environ.get(
     "MEYER_ORDER_TEST_BASE_URL", "https://meyerapitest.meyerdistributing.com/http/default/TestAPI/v2"
 )
 MEYER_ORDER_PRODUCTION_BASE_URL = os.environ.get(
     "MEYER_ORDER_PRODUCTION_BASE_URL", "https://meyerapi.meyerdistributing.com/http/default/ProdAPI/v2"
 )
-MEYER_ORDER_ENVIRONMENT = os.environ.get("MEYER_ORDER_ENVIRONMENT", "production")
+MEYER_ORDER_ENVIRONMENT = os.environ.get("MEYER_ORDER_ENVIRONMENT", "testing")
 
 # A-Tech relay SFTP: same pattern as Meyer — per-company sftp_user/sftp_password in CompanyProviders.
 try:
