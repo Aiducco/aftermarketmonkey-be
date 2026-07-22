@@ -367,25 +367,45 @@ def _run_quote(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrde
     )
 
 
+def _effective_line_total(li: src_models.PurchaseOrderLineItem) -> typing.Optional[decimal.Decimal]:
+    """
+    The price this line actually contributes to po.subtotal: the distributor's own quoted
+    price (net of promotions) when the last quote returned one, since that's what the
+    distributor will actually bill for this line — our frozen catalog line_total is only a
+    pre-quote estimate/fallback for distributors whose adapter doesn't return per-item pricing
+    at quote time yet (Keystone/Meyer/Premier, as of this writing).
+    """
+    if li.distributor_net_line_total is not None:
+        return li.distributor_net_line_total
+    if li.distributor_line_total is not None:
+        return li.distributor_line_total
+    return li.line_total
+
+
 def _compute_totals(po: src_models.PurchaseOrder) -> None:
     """
     Sets po.subtotal/estimated_shipping/total from the just-quoted line items (mutates po
-    in place; caller is responsible for saving). subtotal is our own catalog pricing
-    (line_total, frozen at add-to-cart time) — a distributor quote confirms availability and
-    shipping, not unit price. estimated_shipping is summed once per shipment, not once per
-    line item: a line item can itself carry more than one shipment (see li.shipments), and
-    several line items can share the same shipment (a distributor may combine multiple items
-    shipping from the same warehouse into one box/quote) — either way each distinct shipment's
-    cost must only be counted once. Dedup key is (warehouse_code, is_backordered) rather than
-    warehouse_code alone: an in-stock shipment and a backordered one can legitimately come from
-    the same warehouse in the same quote and are billed as separate shipments. Uses
-    po.ship_method's cost for a shipment when set and offered there, else that shipment's
-    cheapest option — the same default submit_order() falls back to when no method was
-    explicitly chosen.
+    in place; caller is responsible for saving). subtotal prefers each line's distributor-
+    quoted price (net of promotions) over our own frozen catalog line_total — see
+    _effective_line_total — since a quote is exactly the distributor telling us what they will
+    actually charge; falling back to catalog pricing is only for distributors whose adapter
+    doesn't return per-item pricing yet. estimated_shipping is summed once per shipment, not
+    once per line item: a line item can itself carry more than one shipment (see li.shipments),
+    and several line items can share the same shipment (a distributor may combine multiple
+    items shipping from the same warehouse into one box/quote) — either way each distinct
+    shipment's cost must only be counted once. Dedup key is (warehouse_code, is_backordered)
+    rather than warehouse_code alone: an in-stock shipment and a backordered one can
+    legitimately come from the same warehouse in the same quote and are billed as separate
+    shipments. Uses po.ship_method's cost for a shipment when set and offered there, else that
+    shipment's cheapest option — the same default submit_order() falls back to when no method
+    was explicitly chosen.
     """
     line_items = list(po.line_items.all())
     subtotal = (
-        sum((li.line_total for li in line_items if li.line_total is not None), decimal.Decimal("0"))
+        sum(
+            (t for t in (_effective_line_total(li) for li in line_items) if t is not None),
+            decimal.Decimal("0"),
+        )
         if line_items
         else None
     )

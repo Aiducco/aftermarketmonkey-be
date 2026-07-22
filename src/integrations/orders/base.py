@@ -60,9 +60,11 @@ class ShipOption:
 @dataclasses.dataclass
 class LinePromotion:
     """A distributor-applied discount on a quoted line (e.g. Turn14's per-item pricing
-    promos) — informational for the buyer, already netted into the distributor's own
-    unit_price/line_total in the raw response, so this is display-only and never feeds back
-    into our own subtotal math (that's still our frozen catalog pricing)."""
+    promos) — already netted into the distributor's own unit_price/line_total in the raw
+    response. Subtracted from ShippingQuoteLine.distributor_line_total to produce
+    PurchaseOrderLineItem.distributor_net_line_total, which IS what feeds po.subtotal (see
+    _compute_totals) — this never touches unit_cost/line_total themselves, which stay our
+    frozen catalog pricing regardless."""
     description: str
     amount: typing.Optional[decimal.Decimal] = None
 
@@ -95,10 +97,14 @@ class ShippingQuoteLine:
     # Per-item promos active on this quote (see LinePromotion) — same list on every shipment
     # line for a given item_id, since the promo applies to the item as a whole, not per-shipment.
     promotions: typing.List[LinePromotion] = dataclasses.field(default_factory=list)
-    # Distributor's own quoted price for THIS shipment-split (gross, before promotions) —
-    # display-only, never feeds into unit_cost/line_total (our own frozen catalog pricing).
-    # unit_price is normally stable across every split for the same item_id; line_total is
-    # per-split (unit_price * this split's quantity), not the item's overall total.
+    # Distributor's own quoted price for THIS shipment-split (gross, before promotions).
+    # Summed across every split for this item_id and netted against promotions to produce
+    # PurchaseOrderLineItem.distributor_net_line_total, which drives po.subtotal when present
+    # (see _compute_totals) — this is the authoritative billing price once a quote has
+    # returned one; it never overwrites unit_cost/line_total themselves, which stay our frozen
+    # catalog pricing (used as a fallback only for distributors that don't quote per-item
+    # pricing). unit_price is normally stable across every split for the same item_id;
+    # line_total is per-split (unit_price * this split's quantity), not the item's overall total.
     distributor_unit_price: typing.Optional[decimal.Decimal] = None
     distributor_line_total: typing.Optional[decimal.Decimal] = None
 

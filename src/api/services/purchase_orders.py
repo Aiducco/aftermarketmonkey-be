@@ -80,6 +80,14 @@ def _serialize_line_item(li: src_models.PurchaseOrderLineItem) -> typing.Dict:
         "shipments": li.shipments,
         "is_split_shipment": len(li.shipments or []) > 1,
         "promotions": li.promotions,
+        # Distributor's own quoted price for this item (gross, and net of the promotions
+        # above) — the authoritative billing price once a quote has returned one; see
+        # PurchaseOrderLineItem.distributor_net_line_total / _compute_totals. Null for
+        # distributors whose adapter doesn't return per-item pricing at quote time yet.
+        "distributor_unit_price": _decimal_to_float(li.distributor_unit_price),
+        "distributor_line_total": _decimal_to_float(li.distributor_line_total),
+        "distributor_net_line_total": _decimal_to_float(li.distributor_net_line_total),
+        "is_prop_65": li.is_prop_65,
         "distributor_order_id": li.distributor_order_id,
     }
 
@@ -126,6 +134,10 @@ def _serialize_purchase_order(po: src_models.PurchaseOrder, include_line_items: 
         "subtotal": _decimal_to_float(po.subtotal),
         "estimated_shipping": _decimal_to_float(po.estimated_shipping),
         "total": _decimal_to_float(po.total),
+        # Distributor's own quoted grand total and order-level fees (e.g. a dropship fee) from
+        # the last quote — informational; subtotal/total above stay authoritative for billing.
+        "distributor_quoted_total": _decimal_to_float(po.distributor_quoted_total),
+        "fees": po.fees,
         "error_message": po.error_message,
         "notes": po.notes,
         "quoted_at": po.quoted_at.isoformat() if po.quoted_at else None,

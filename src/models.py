@@ -2101,16 +2101,22 @@ class PurchaseOrderLineItem(django_db_models.Model):
     shipments = django_db_models.JSONField(null=True, blank=True, encoder=DjangoJSONEncoder)
 
     # Distributor-applied discounts on this line from the last quote (e.g. Turn14's per-item
-    # pricing promos): [{description, amount}]. Display-only — already netted into the
-    # distributor's own price in quote_raw_response, never fed back into unit_cost/line_total
-    # (those stay our frozen catalog price). Empty/null for distributors that don't have this
-    # concept.
+    # pricing promos): [{description, amount}]. Already netted into the distributor's own price
+    # in quote_raw_response; subtracted from distributor_line_total below to produce
+    # distributor_net_line_total, which IS what feeds po.subtotal (see
+    # purchase_order_jobs._compute_totals) — never fed back into unit_cost/line_total
+    # themselves, which stay our frozen catalog price regardless. Empty/null for distributors
+    # that don't have this concept.
     promotions = django_db_models.JSONField(null=True, blank=True, encoder=DjangoJSONEncoder)
 
     # Distributor's own quoted pricing for this item from the last quote (gross, before
-    # promotions) — display-only, never fed back into unit_cost/line_total (those stay our
-    # frozen catalog price). distributor_line_total is the sum of every shipment-split's line
-    # total for this item; distributor_net_line_total is that total minus the promotions above.
+    # promotions). distributor_line_total is the sum of every shipment-split's line total for
+    # this item; distributor_net_line_total is that total minus the promotions above — THIS is
+    # the authoritative price fed into po.subtotal once a quote has returned one (see
+    # purchase_order_jobs._compute_totals/_effective_line_total), since a quote is exactly the
+    # distributor telling us what they will actually charge. Falling back to unit_cost/line_total
+    # (our frozen catalog price, left untouched by these fields) only happens for distributors
+    # whose adapter doesn't return per-item pricing at quote time yet.
     distributor_unit_price = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
     distributor_line_total = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     distributor_net_line_total = django_db_models.DecimalField(
