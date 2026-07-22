@@ -234,14 +234,17 @@ class PurchaseOrderDetailView(views.View):
 class PurchaseOrderSubmitView(views.View):
     """POST /purchase-orders/<id>/submit/ — submits SYNCHRONOUSLY, placing a real order with
     the distributor in the request/response cycle (see run_submit_synchronously). Optional
-    body: {ship_method?, notes?}. A quote returns every available shipping method's live price,
-    so the user picks one AFTER seeing the quote, not before — pass their choice here (the
-    shipping_code from that PO's line items' ship_options) to apply it just before submitting.
-    ``notes``, when given, is set on the PO right before submit and passed through to the
-    distributor as order notes (e.g. Turn14's order_notes). Omit either to keep whatever was
-    set at review time / the distributor's default. Returns the updated PurchaseOrder directly
-    — check status/error_message, since a distributor-side failure doesn't raise here (same
-    contract as .../requote/)."""
+    body: {ship_method?, notes?, po_name?}. A quote returns every available shipping method's
+    live price, so the user picks one AFTER seeing the quote, not before — pass their choice
+    here (the shipping_code from that PO's line items' ship_options) to apply it just before
+    submitting. ``notes``, when given, is set on the PO right before submit and passed through
+    to the distributor as order notes (e.g. Turn14's order_notes). ``po_name``, when given, is
+    an optional customer-facing PO name/reference sent to the distributor as ITS po_number
+    field instead of our own po_number (currently only honored by Turn14 — see
+    Turn14OrderAdapter._turn14_po_number). Omit any of these to keep whatever was set at review
+    time / the distributor's default. Returns the updated PurchaseOrder directly — check
+    status/error_message, since a distributor-side failure doesn't raise here (same contract as
+    .../requote/)."""
 
     def post(self, request: http.HttpRequest, *args, **kwargs) -> http.HttpResponse:
         company_id, _user_id, err = _require_auth(request)
@@ -259,6 +262,7 @@ class PurchaseOrderSubmitView(views.View):
                 purchase_order_id=po_id,
                 ship_method=body.get("ship_method"),
                 notes=body.get("notes"),
+                po_name=body.get("po_name"),
             )
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e))

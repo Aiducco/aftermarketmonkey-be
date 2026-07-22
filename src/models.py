@@ -2047,6 +2047,14 @@ class PurchaseOrder(django_db_models.Model):
 
     error_message = django_db_models.TextField(null=True, blank=True)
     notes = django_db_models.TextField(null=True, blank=True)
+    # Customer-supplied PO name/reference, optionally set at submit time (POST .../submit/
+    # body: {po_name}) — sent to the distributor as ITS po_number field instead of our own
+    # po_number below, when set. po_number itself is never overridden: it's unique and is what
+    # every adapter uses as the lookup key for post-submit status-check/cancel (Premier and
+    # Keystone especially, which have no other order identifier) — swapping it out post-hoc
+    # would break those lookups. Currently only Turn14OrderAdapter reads this (see
+    # _turn14_po_number); Keystone/Meyer/Premier still always send po_number as-is.
+    po_name = django_db_models.TextField(null=True, blank=True)
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)

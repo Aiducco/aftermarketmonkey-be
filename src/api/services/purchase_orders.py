@@ -162,6 +162,10 @@ def _serialize_purchase_order(po: src_models.PurchaseOrder, include_line_items: 
         "shipments": po.shipments,
         "error_message": po.error_message,
         "notes": po.notes,
+        # Customer-facing PO name/reference, set optionally at submit time (see
+        # submit_purchase_order's po_name param) — sent to the distributor as ITS po_number
+        # field instead of our own po_number above, currently only honored by Turn14.
+        "po_name": po.po_name,
         "quoted_at": po.quoted_at.isoformat() if po.quoted_at else None,
         "quote_is_stale": (
             _quote_is_stale(po) if po.status == src_enums.PurchaseOrderStatus.QUOTED.value else None
@@ -613,6 +617,7 @@ def submit_purchase_order(
     purchase_order_id: int,
     ship_method: typing.Optional[str] = None,
     notes: typing.Optional[str] = None,
+    po_name: typing.Optional[str] = None,
 ) -> typing.Dict:
     """
     Places a REAL order with the distributor, synchronously — the caller (a POST to
@@ -630,6 +635,11 @@ def submit_purchase_order(
     reaches the distributor as ``order_notes`` (see Turn14OrderAdapter.submit_order). Leave
     unset to keep whatever note was already on the PO.
 
+    ``po_name``, when given, overwrites ``po.po_name`` — an optional customer-facing PO
+    name/reference sent to the distributor AS ITS po_number field (see
+    Turn14OrderAdapter._turn14_po_number), instead of our own ``po.po_number``. Leave unset (the
+    default) to keep sending our own po_number, same as before this param existed.
+
     Never raises for a distributor-side failure — same contract as run_quote_synchronously —
     so submit_purchase_order_group can keep submitting the rest of a multi-distributor group
     instead of aborting the whole request. Returns the serialized PurchaseOrder either way;
@@ -644,6 +654,9 @@ def submit_purchase_order(
     if notes is not None:
         po.notes = notes
         po.save(update_fields=["notes", "updated_at"])
+    if po_name is not None:
+        po.po_name = po_name
+        po.save(update_fields=["po_name", "updated_at"])
     if po.status != src_enums.PurchaseOrderStatus.QUOTED.value:
         raise PurchaseOrderServiceError(
             "Purchase order must be quoted before it can be submitted (current status: {}).".format(

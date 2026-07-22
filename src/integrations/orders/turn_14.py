@@ -286,6 +286,7 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
         acknowledge_prop_65 = purchase_order.line_items.filter(is_prop_65=True).exists()
         order_notes = purchase_order.notes or ""
         phone_number = ship_to.phone or ""
+        po_number = self._turn14_po_number(purchase_order)
 
         try:
             if quote_id:
@@ -294,7 +295,7 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
                     {
                         "environment": self._client.environment,
                         "quote_id": quote_id,
-                        "po_number": purchase_order.po_number,
+                        "po_number": po_number,
                         "acknowledge_prop_65": acknowledge_prop_65,
                         "acknowledge_epa": False,
                         "acknowledge_carb": False,
@@ -308,7 +309,7 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
                 response = self._client.create_order(
                     {
                         "environment": self._client.environment,
-                        "po_number": purchase_order.po_number,
+                        "po_number": po_number,
                         "locations": self._build_locations(line_items, shipping_code=shipping_code),
                         "acknowledge_prop_65": acknowledge_prop_65,
                         "acknowledge_epa": False,
@@ -322,6 +323,18 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
             self._handle_error(e)
 
         return self._parse_order_response(response, line_items)
+
+    @staticmethod
+    def _turn14_po_number(purchase_order: src_models.PurchaseOrder) -> str:
+        """
+        The po_number value sent to/looked up against Turn14 — purchase_order.po_name when the
+        customer supplied one at submit time (POST .../submit/ body: {po_name}), else our own
+        purchase_order.po_number unchanged (today's behavior). Used both when submitting AND in
+        get_order_status, since whichever value Turn14 actually recorded the order under is the
+        only one get_orders_by_po_number can find it by — purchase_order.po_number itself is
+        never overridden (see PurchaseOrder.po_name docstring for why).
+        """
+        return purchase_order.po_name or purchase_order.po_number
 
     @staticmethod
     def _build_shipping_selection(purchase_order: src_models.PurchaseOrder) -> typing.List[typing.Dict]:
@@ -392,7 +405,7 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
 
     def get_order_status(self, purchase_order: src_models.PurchaseOrder) -> base.OrderStatusResult:
         try:
-            response = self._client.get_orders_by_po_number(purchase_order.po_number)
+            response = self._client.get_orders_by_po_number(self._turn14_po_number(purchase_order))
         except turn14_client_exceptions.Turn14APIBadResponseCodeError as e:
             self._handle_error(e)
 
