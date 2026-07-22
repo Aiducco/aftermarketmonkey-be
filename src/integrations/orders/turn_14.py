@@ -173,6 +173,27 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
                     )
                 )
 
+            # California Prop 65 warning applicability is also a top-level array keyed by
+            # item_id (only present when shipping to a California address, per Turn14's docs) —
+            # folded into each matching line's flags below rather than tracked separately.
+            prop_65_item_ids = {str(row.get("item_id", "")) for row in attrs.get("prop_65", [])}
+
+            # Order-level fees (e.g. a dropship fee) aren't tied to any specific item.
+            fees = [
+                base.LineFee(
+                    fee_type=fee.get("fee_type") or "",
+                    description=fee.get("fee_description") or "",
+                    amount=(
+                        decimal.Decimal(str(fee["fee_amount"])) if fee.get("fee_amount") is not None else None
+                    ),
+                )
+                for fee in attrs.get("fees", [])
+            ]
+
+            distributor_total = (
+                decimal.Decimal(str(attrs["total"])) if attrs.get("total") is not None else None
+            )
+
             warehouse_names = _load_warehouse_names()
 
             lines: typing.List[base.ShippingQuoteLine] = []
@@ -184,8 +205,16 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
                 ship_options = [
                     base.ShipOption(
                         service_level_code=str(opt.get("shipping_code", "")),
-                        service_level_name=opt.get("verbose_eta") or "",
+                        # Turn14's quote response doesn't name most options at all (see
+                        # verbose_eta below) — left blank here and backfilled from the
+                        # distributor's method-name catalog downstream (purchase_order_jobs.py),
+                        # same as every other adapter.
+                        service_level_name="",
                         cost=(decimal.Decimal(str(opt["cost"])) if opt.get("cost") is not None else None),
+                        days_in_transit=opt.get("days_in_transit"),
+                        # Only present on some options (e.g. the flat-rate "Preferred Access"
+                        # one) — a marketing/eligibility blurb, not a clean method name.
+                        verbose_eta=opt.get("verbose_eta") or None,
                     )
                     for opt in (shipment.get("shipping") or [])
                 ]
@@ -195,6 +224,9 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
                     li = by_external_id.get(external_id)
                     quantity = item.get("quantity", 0)
                     warehouse_code = _normalize_warehouse_code(shipment.get("location"))
+                    flags = ["backorder"] if is_out_of_stock else []
+                    if external_id in prop_65_item_ids:
+                        flags.append("prop_65")
                     lines.append(
                         base.ShippingQuoteLine(
                             line_item_id=li.line_item_id if li else 0,
@@ -204,8 +236,18 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
                             warehouse_code=warehouse_code,
                             warehouse_name=warehouse_names.get(warehouse_code) if warehouse_code else None,
                             ship_options=ship_options,
-                            flags=(["backorder"] if is_out_of_stock else []),
+                            flags=flags,
                             promotions=promotions_by_item_id.get(external_id, []),
+                            distributor_unit_price=(
+                                decimal.Decimal(str(item["unit_price"]))
+                                if item.get("unit_price") is not None
+                                else None
+                            ),
+                            distributor_line_total=(
+                                decimal.Decimal(str(item["line_total"]))
+                                if item.get("line_total") is not None
+                                else None
+                            ),
                         )
                     )
         except (AttributeError, TypeError, KeyError, IndexError) as e:
@@ -219,7 +261,9 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
                 )
             )
 
-        return base.ShippingQuoteResult(lines=lines, raw_response=response)
+        return base.ShippingQuoteResult(
+            lines=lines, raw_response=response, distributor_total=distributor_total, fees=fees
+        )
 
     def submit_order(
         self,

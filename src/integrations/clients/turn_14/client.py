@@ -228,6 +228,30 @@ class Turn14ApiClient(object):
 
         return data, next_page
 
+    def get_inventory_item(self, item_id: str) -> typing.Optional[typing.Dict]:
+        """
+        GET /v1/inventory/item/{item_id} - live inventory for a single item, for on-demand
+        refresh (distinct from get_inventory_items_for_brand's paginated bulk pull used by the
+        scheduled catalog sync). Returns the raw JSON:API "data" object, or None if Turn14 has
+        no inventory record for this item id (404).
+        """
+        try:
+            response = simplejson.loads(
+                self._request(
+                    endpoint="inventory/item/{}".format(item_id),
+                    method=common_enums.HttpMethod.GET,
+                ).content
+            )
+        except exceptions.Turn14APIBadResponseCodeError as e:
+            if e.code == 404:
+                return None
+            raise
+
+        data = response.get("data")
+        if isinstance(data, list):
+            return data[0] if data else None
+        return data if isinstance(data, dict) else None
+
     def get_inventory_items_updates(
             self, page: int = 1, minutes: int = 60
     ) -> typing.Tuple[typing.List[typing.Dict], typing.Optional[int]]:

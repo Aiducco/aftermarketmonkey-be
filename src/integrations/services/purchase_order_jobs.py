@@ -284,6 +284,9 @@ def _run_quote(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrde
                         "estimated_delivery_date": (
                             opt.estimated_delivery_date.isoformat() if opt.estimated_delivery_date else None
                         ),
+                        "days_in_transit": opt.days_in_transit,
+                        # Marketing/eligibility blurb, not a name — see base.ShipOption.
+                        "verbose_eta": opt.verbose_eta,
                     }
                     for opt in ql.ship_options
                 ],
@@ -296,6 +299,26 @@ def _run_quote(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrde
             {"description": promo.description, "amount": float(promo.amount) if promo.amount is not None else None}
             for promo in quote_lines[0].promotions
         ] or None
+
+        # Distributor's own gross pricing, aggregated the same way as quantity above: unit price
+        # is stable across splits (take the first non-null), line total is summed across every
+        # shipment-split for this item. Net-of-promotion is our own subtraction, since the
+        # distributor's response never states it directly (promo amounts apply to the item as a
+        # whole — see turn_14.py — not proportionally per split).
+        unit_prices = [ql.distributor_unit_price for ql in quote_lines if ql.distributor_unit_price is not None]
+        li.distributor_unit_price = unit_prices[0] if unit_prices else None
+        line_totals = [ql.distributor_line_total for ql in quote_lines if ql.distributor_line_total is not None]
+        li.distributor_line_total = sum(line_totals, decimal.Decimal("0")) if line_totals else None
+        if li.distributor_line_total is not None:
+            promo_total = sum(
+                (decimal.Decimal(str(p["amount"])) for p in (li.promotions or []) if p.get("amount") is not None),
+                decimal.Decimal("0"),
+            )
+            li.distributor_net_line_total = li.distributor_line_total - promo_total
+        else:
+            li.distributor_net_line_total = None
+        li.is_prop_65 = any("prop_65" in ql.flags for ql in quote_lines)
+
         li.save(
             update_fields=[
                 "quantity_confirmed",
@@ -304,6 +327,10 @@ def _run_quote(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrde
                 "warehouse_code",
                 "shipments",
                 "promotions",
+                "distributor_unit_price",
+                "distributor_line_total",
+                "distributor_net_line_total",
+                "is_prop_65",
                 "updated_at",
             ]
         )
@@ -313,6 +340,15 @@ def _run_quote(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrde
     po.status = src_enums.PurchaseOrderStatus.QUOTED.value
     po.status_name = src_enums.PurchaseOrderStatus.QUOTED.name
     po.error_message = None
+    po.distributor_quoted_total = result.distributor_total
+    po.fees = [
+        {
+            "fee_type": fee.fee_type,
+            "description": fee.description,
+            "amount": float(fee.amount) if fee.amount is not None else None,
+        }
+        for fee in result.fees
+    ] or None
     _compute_totals(po)
     po.save(
         update_fields=[
@@ -321,6 +357,8 @@ def _run_quote(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrde
             "status",
             "status_name",
             "error_message",
+            "distributor_quoted_total",
+            "fees",
             "subtotal",
             "estimated_shipping",
             "total",

@@ -297,3 +297,57 @@ class PartDetailView(views.View):
             content=simplejson.dumps({"data": data}),
             status=200,
         )
+
+
+class PartProviderRefreshInventoryView(views.View):
+    """
+    POST /parts/<id>/providers/<provider_id>/refresh-inventory/ - on-demand live inventory
+    pull from the distributor for one part/provider pair. Returns the same per-provider row
+    shape as GET /parts/<id>/ (the matching entry from its "providers" list) so the frontend
+    can replace just that distributor row.
+    """
+
+    def post(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
+        err, company_id = _auth_check(request)
+        if err:
+            return err
+        if not company_id:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "No company found in token"}),
+                status=400,
+            )
+
+        part_id = kwargs.get("id")
+        provider_id = kwargs.get("provider_id")
+
+        try:
+            data = parts_services.refresh_provider_live_inventory(
+                master_part_id=part_id, provider_id=provider_id, company_id=company_id
+            )
+        except parts_services.PartsServiceError as e:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": e.message}),
+                status=e.status,
+            )
+        except Exception as e:
+            logger.exception("{} Live inventory refresh error: {}".format(_LOG_PREFIX, str(e)))
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Error refreshing inventory"}),
+                status=500,
+            )
+
+        if data is None:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Part or provider not found"}),
+                status=404,
+            )
+
+        return http.HttpResponse(
+            headers={"Content-Type": "application/json"},
+            content=simplejson.dumps({"data": data}),
+            status=200,
+        )

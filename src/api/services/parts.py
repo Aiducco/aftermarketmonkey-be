@@ -11,10 +11,21 @@ from django.db.models import Prefetch
 from src import constants as src_constants
 from src import enums as src_enums
 from src import models as src_models
+from src.integrations.live_inventory import exceptions as live_inventory_exceptions
+from src.integrations.live_inventory import registry as live_inventory_registry
 from src.integrations.orders import registry as order_registry
 from src.search import meilisearch_client as meilisearch_client
 
 logger = logging.getLogger(__name__)
+
+
+class PartsServiceError(Exception):
+    """Raised for any client-correctable error (not connected, not supported, not found)."""
+
+    def __init__(self, message: str, status: int = 400) -> None:
+        Exception.__init__(self, message)
+        self.message = message
+        self.status = status
 
 # Turn14 warehouse keys may be "01", "02" or "wh 01", "wh 02" - normalize to external_id
 _TURN14_WH_KEY_RE = re.compile(r"^(?:wh\s+)?(\d+)$", re.IGNORECASE)
@@ -491,6 +502,67 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
     base["provider_image_urls"] = _get_all_provider_image_urls()
     base["providers"] = providers_data
     return base
+
+
+def refresh_provider_live_inventory(
+    master_part_id: int, provider_id: int, company_id: int
+) -> typing.Optional[typing.Dict]:
+    """
+    Pulls this item's current inventory directly from the distributor (see
+    src.integrations.live_inventory), writes it to that distributor's raw feed table plus
+    ProviderPartInventory, then returns the same per-provider row shape get_part_detail
+    returns for this provider_id - so the frontend can replace just that one distributor row
+    instead of re-fetching the whole part.
+
+    Raises PartsServiceError for any client-correctable failure (not connected, distributor
+    doesn't support live refresh yet, distributor has no inventory record for this item,
+    distributor API error).
+    """
+    try:
+        provider_part = src_models.ProviderPart.objects.select_related("provider").get(
+            master_part_id=master_part_id, provider_id=provider_id
+        )
+    except src_models.ProviderPart.DoesNotExist:
+        return None
+
+    company_provider = (
+        src_models.CompanyProviders.objects.filter(
+            company_id=company_id,
+            provider_id=provider_id,
+            provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
+        )
+        .select_related("provider")
+        .first()
+    )
+    if company_provider is None:
+        raise PartsServiceError("Not connected to this distributor.", status=400)
+
+    provider = live_inventory_registry.get_provider(company_provider)
+    if provider is None:
+        kind_name = provider_part.provider.kind_name if provider_part.provider else "This distributor"
+        raise PartsServiceError(
+            "Live inventory refresh isn't available for {} yet.".format(kind_name), status=400
+        )
+
+    try:
+        provider.refresh(provider_part)
+    except live_inventory_exceptions.LiveInventoryNotFoundError as e:
+        raise PartsServiceError(str(e), status=404)
+    except live_inventory_exceptions.LiveInventoryTransportError as e:
+        logger.error(
+            "{} Live inventory refresh failed for provider_part_id={}: {}".format(
+                _LOG_PREFIX, provider_part.id, str(e)
+            )
+        )
+        raise PartsServiceError("Error contacting the distributor. Try again shortly.", status=502)
+
+    part_detail = get_part_detail(master_part_id=master_part_id, company_id=company_id)
+    if part_detail is None:
+        return None
+    for row in part_detail["providers"]:
+        if row["provider_id"] == provider_id:
+            return row
+    return None
 
 
 def list_part_detail_audit_history(

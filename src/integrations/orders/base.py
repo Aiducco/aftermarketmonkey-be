@@ -47,6 +47,14 @@ class ShipOption:
     service_level_name: str
     estimated_delivery_date: typing.Optional[datetime.date] = None
     cost: typing.Optional[decimal.Decimal] = None
+    # Number of business days in transit (distinct from estimated_delivery_date — some
+    # distributors, Turn14 included, give only one or the other per option).
+    days_in_transit: typing.Optional[int] = None
+    # Distributor's own marketing/eligibility blurb for this specific option (e.g. Turn14's
+    # "Preferred Access $9.75 Flat Rate ... For Powersports" text) — display-only, and NOT a
+    # substitute for service_level_name: most options don't carry one at all, and where present
+    # it describes eligibility/terms, not a clean carrier/method name.
+    verbose_eta: typing.Optional[str] = None
 
 
 @dataclasses.dataclass
@@ -55,6 +63,16 @@ class LinePromotion:
     promos) — informational for the buyer, already netted into the distributor's own
     unit_price/line_total in the raw response, so this is display-only and never feeds back
     into our own subtotal math (that's still our frozen catalog pricing)."""
+    description: str
+    amount: typing.Optional[decimal.Decimal] = None
+
+
+@dataclasses.dataclass
+class LineFee:
+    """A distributor-applied fee that isn't tied to any specific line item (e.g. Turn14's
+    per-shipment dropship fee) — display-only, surfaced separately from per-line pricing and
+    never fed into our own subtotal/total math (see ShippingQuoteResult.fees)."""
+    fee_type: str
     description: str
     amount: typing.Optional[decimal.Decimal] = None
 
@@ -77,6 +95,12 @@ class ShippingQuoteLine:
     # Per-item promos active on this quote (see LinePromotion) — same list on every shipment
     # line for a given item_id, since the promo applies to the item as a whole, not per-shipment.
     promotions: typing.List[LinePromotion] = dataclasses.field(default_factory=list)
+    # Distributor's own quoted price for THIS shipment-split (gross, before promotions) —
+    # display-only, never feeds into unit_cost/line_total (our own frozen catalog pricing).
+    # unit_price is normally stable across every split for the same item_id; line_total is
+    # per-split (unit_price * this split's quantity), not the item's overall total.
+    distributor_unit_price: typing.Optional[decimal.Decimal] = None
+    distributor_line_total: typing.Optional[decimal.Decimal] = None
 
 
 @dataclasses.dataclass
@@ -86,6 +110,13 @@ class ShippingQuoteResult:
     # (e.g. Turn14's quote_id + per-location shipping_quote_id). Stored verbatim on
     # PurchaseOrder.quote_raw_response and handed back to submit_order() unchanged.
     raw_response: typing.Dict
+    # Distributor's own quoted grand total across every line (gross, before any shipping
+    # method is selected) — display-only, never fed into PurchaseOrder.total (our own frozen
+    # catalog pricing stays authoritative for billing).
+    distributor_total: typing.Optional[decimal.Decimal] = None
+    # Fees that apply to the order as a whole rather than any specific line (e.g. a dropship
+    # fee) — see LineFee. Display-only, same reasoning as distributor_total.
+    fees: typing.List[LineFee] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass

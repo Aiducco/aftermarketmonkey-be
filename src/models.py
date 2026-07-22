@@ -2020,6 +2020,15 @@ class PurchaseOrder(django_db_models.Model):
     estimated_shipping = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     total = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
 
+    # Distributor's own quoted grand total (gross, before any shipping method is selected) —
+    # display-only, informational comparison against our own `total` above, which stays
+    # authoritative for billing (see base.ShippingQuoteResult.distributor_total).
+    distributor_quoted_total = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    # Order-level fees from the last quote that aren't tied to any specific line item (e.g.
+    # Turn14's dropship fee): [{fee_type, description, amount}]. Display-only, same reasoning
+    # as distributor_quoted_total — not folded into subtotal/estimated_shipping/total.
+    fees = django_db_models.JSONField(null=True, blank=True, encoder=DjangoJSONEncoder)
+
     error_message = django_db_models.TextField(null=True, blank=True)
     notes = django_db_models.TextField(null=True, blank=True)
 
@@ -2097,6 +2106,20 @@ class PurchaseOrderLineItem(django_db_models.Model):
     # (those stay our frozen catalog price). Empty/null for distributors that don't have this
     # concept.
     promotions = django_db_models.JSONField(null=True, blank=True, encoder=DjangoJSONEncoder)
+
+    # Distributor's own quoted pricing for this item from the last quote (gross, before
+    # promotions) — display-only, never fed back into unit_cost/line_total (those stay our
+    # frozen catalog price). distributor_line_total is the sum of every shipment-split's line
+    # total for this item; distributor_net_line_total is that total minus the promotions above.
+    distributor_unit_price = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    distributor_line_total = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    distributor_net_line_total = django_db_models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True
+    )
+
+    # Whether the distributor flagged this item as subject to a California Prop 65 warning on
+    # the last quote (e.g. Turn14's top-level "prop_65" array) — display-only.
+    is_prop_65 = django_db_models.BooleanField(default=False)
 
     # Which distributor-side order slice this line ended up on. Nullable because a PO can
     # fan out across several distributor orders (Meyer's Orders array, Keystone/Turn14
