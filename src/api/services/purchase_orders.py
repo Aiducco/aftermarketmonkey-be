@@ -782,12 +782,27 @@ def submit_purchase_order_group(
 ) -> typing.Dict:
     """``ship_methods``: optional {purchase_order_id (as string): shipping_method_code} —
     same per-PO keying as review_cart, since each distributor has its own method-code
-    namespace."""
+    namespace.
+
+    Submits each distributor's PO SEQUENTIALLY, in ``id`` order (oldest-added-to-the-group
+    first) — one real distributor call at a time, never in parallel. One PO failing does NOT
+    stop the others: submit_purchase_order never raises for a distributor-side failure (see
+    its own docstring), so every quoted PO in the group is always attempted regardless of
+    whether an earlier one succeeded or failed. There is deliberately no rollback of an
+    already-successful PO if a later one fails — neither Turn14 nor Keystone expose a cancel
+    endpoint, so there is no API call that could undo it anyway; each distributor's result
+    must be checked independently in the response (never treat this as one pass/fail unit).
+    A PO that fails here drops to FAILED, not QUOTED, so it's excluded from any retry of this
+    same group call — see requote_purchase_order for how to bring a failed PO back to QUOTED
+    before resubmitting it individually.
+    """
     group = src_models.PurchaseOrderGroup.objects.filter(id=group_id, company_id=company_id).first()
     if not group:
         raise PurchaseOrderServiceError("Purchase order group not found.")
     quoted_ids = list(
-        group.purchase_orders.filter(status=src_enums.PurchaseOrderStatus.QUOTED.value).values_list("id", flat=True)
+        group.purchase_orders.filter(status=src_enums.PurchaseOrderStatus.QUOTED.value)
+        .order_by("id")
+        .values_list("id", flat=True)
     )
     if not quoted_ids:
         raise PurchaseOrderServiceError("No quoted purchase orders in this group to submit.")
