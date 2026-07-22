@@ -18,6 +18,8 @@ import decimal
 import logging
 import typing
 
+from django.core.cache import cache
+
 from src import enums as src_enums
 from src import models as src_models
 from src.integrations import credentials as credentials_helper
@@ -65,6 +67,15 @@ _WAREHOUSE_NAMES = {
 # Keystone's sentinel for "no estimate available" (seen on LTL quotes) — .NET's DateTime.MinValue
 # serialized as a date, not a real delivery date.
 _UNKNOWN_DATE_YEAR = 1
+
+# CheckPriceBulk is rate-limited far more strictly than every other Keystone method (their docs:
+# "should be used no more than once per hour" and warn of account suspension for overuse) — cache
+# each VCPN's price for exactly that long, keyed per connection since price can vary by account.
+# See KeystoneOrderAdapter._get_prices, the only caller of check_price_bulk.
+_PRICE_CACHE_KEY = "keystone_price:{}:{}"  # (company_provider_id, vcpn)
+_PRICE_CACHE_TTL_SECONDS = 3600
+# Keystone's own documented cap on how many VCPNs one CheckPriceBulk call accepts.
+_PRICE_BULK_CHUNK_SIZE = 12
 
 
 def _days_in_transit(order_date: typing.Optional[str], thru_delivery: typing.Optional[str]) -> typing.Optional[int]:
@@ -190,6 +201,70 @@ class KeystoneOrderAdapter(base.DistributorOrderAdapter):
         code = getattr(e, "code", None)
         raise order_exceptions.OrderValidationError(message=str(e), code=str(code) if code else None)
 
+    def _get_prices(self, vcpns: typing.List[str]) -> typing.Dict[str, decimal.Decimal]:
+        """
+        {vcpn: CustomerPrice} via CheckPriceBulk, so quoted line items carry Keystone's own
+        up-to-date price rather than only our (potentially stale) catalog-sync price — same
+        role Turn14's inline quote pricing already plays for that adapter.
+
+        Cached per (company_provider, vcpn) for _PRICE_CACHE_TTL_SECONDS (1 hour) — required,
+        not just an optimization: CheckPriceBulk is the one Keystone method whose docs warn of
+        account suspension for calling it more than once an hour. A quote is commonly re-run
+        many times in that window (cart edits, review, requote), so only VCPNs actually missing
+        from cache ever trigger a real call. Best-effort throughout: any failure here (cache or
+        the call itself) degrades to no pricing for the affected VCPN(s) rather than failing the
+        shipping quote — pricing is an enrichment, availability/shipping is the core result.
+        """
+        prices: typing.Dict[str, decimal.Decimal] = {}
+        missing: typing.List[str] = []
+        for vcpn in vcpns:
+            cache_key = _PRICE_CACHE_KEY.format(self.company_provider.id, vcpn)
+            try:
+                cached = cache.get(cache_key)
+            except Exception:
+                logger.warning(
+                    "{} Cache unavailable reading price for vcpn={}; will re-fetch live.".format(
+                        _LOG_PREFIX, vcpn
+                    )
+                )
+                cached = None
+            if cached is not None:
+                prices[vcpn] = cached
+            else:
+                missing.append(vcpn)
+
+        for i in range(0, len(missing), _PRICE_BULK_CHUNK_SIZE):
+            chunk = missing[i : i + _PRICE_BULK_CHUNK_SIZE]
+            try:
+                tables = self._client.check_price_bulk(",".join(chunk))
+            except keystone_client_exceptions.KeystoneException:
+                logger.exception(
+                    "{} CheckPriceBulk failed for vcpns={}; those line(s) will have no "
+                    "distributor-quoted price this round.".format(_LOG_PREFIX, chunk)
+                )
+                continue
+
+            rows = next(iter(tables.values()), []) if tables else []
+            for row in rows:
+                vendor = (row.get("Vendor") or "").strip()
+                part_number = (row.get("PartNumber") or "").strip()
+                vcpn = "{}{}".format(vendor, part_number)
+                price = _parse_decimal(row.get("CustomerPrice"))
+                if not vcpn or price is None:
+                    continue
+                prices[vcpn] = price
+                try:
+                    cache.set(
+                        _PRICE_CACHE_KEY.format(self.company_provider.id, vcpn), price, _PRICE_CACHE_TTL_SECONDS
+                    )
+                except Exception:
+                    logger.warning(
+                        "{} Cache unavailable writing price for vcpn={}; will re-fetch live "
+                        "next time instead of using the cache.".format(_LOG_PREFIX, vcpn)
+                    )
+
+        return prices
+
     # -- DistributorOrderAdapter ------------------------------------------------------------
 
     def get_shipping_quote(
@@ -207,6 +282,8 @@ class KeystoneOrderAdapter(base.DistributorOrderAdapter):
             self._handle_error(e)
 
         logger.info("{} Quote tables: {}".format(_LOG_PREFIX, repr(list(tables.keys()))[:2000]))
+
+        prices = self._get_prices([li.provider_part.provider_external_id for li in line_items])
 
         try:
             by_vcpn = {li.provider_part.provider_external_id: li for li in line_items}
@@ -243,16 +320,27 @@ class KeystoneOrderAdapter(base.DistributorOrderAdapter):
                 ship_flag = row.get("ShipFlag", "")
                 warehouse_number = row.get("Warehouse", "")
                 flags = {"B": ["backorder"], "X": ["not_orderable"], "T": ["transfer"]}.get(ship_flag, [])
+                quantity_available = _parse_int(row.get("QTO")) if ship_flag in ("O", "T") else 0
+                quantity_backordered = _parse_int(row.get("Backordered"))
+                unit_price = prices.get(vcpn)
                 lines.append(
                     base.ShippingQuoteLine(
                         line_item_id=li.line_item_id if li else 0,
                         provider_external_id=vcpn,
-                        quantity_available=_parse_int(row.get("QTO")) if ship_flag in ("O", "T") else 0,
-                        quantity_backordered=_parse_int(row.get("Backordered")),
+                        quantity_available=quantity_available,
+                        quantity_backordered=quantity_backordered,
                         warehouse_code=warehouse_number,
                         warehouse_name=_WAREHOUSE_NAMES.get(warehouse_number),
                         ship_options=warehouse_options.get(warehouse_number, []),
                         flags=flags,
+                        # From CheckPriceBulk (see _get_prices) — Keystone's shipping-quote
+                        # endpoint itself never returns pricing, unlike Turn14's.
+                        distributor_unit_price=unit_price,
+                        distributor_line_total=(
+                            unit_price * (quantity_available or quantity_backordered)
+                            if unit_price is not None
+                            else None
+                        ),
                     )
                 )
 

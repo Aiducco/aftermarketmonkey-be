@@ -195,6 +195,22 @@ class KeystoneOrderApiClient(object):
             [("PartNumbersQty", part_numbers_qty), ("ToZip", to_zip or "")],
         )
 
+    # -- Pricing ----------------------------------------------------------------------------
+
+    def check_price_bulk(self, full_part_no: str) -> typing.Dict[str, typing.List[typing.Dict[str, str]]]:
+        """CheckPriceBulk (confirmed against Keystone's own WSDL service description — their
+        SDK PDF's SOAP sample mislabels this operation "CheckPrice" and the VB.NET stub calls
+        it "GetCheckPrice"; the real wire operation name is "CheckPriceBulk"). ``full_part_no``
+        is a comma-separated list of VCPNs — Keystone's docs cap this at 12 per call; caller is
+        responsible for chunking (see KeystoneOrderAdapter._get_prices).
+
+        RATE LIMIT: Keystone's docs say this "should be used no more than once per hour" and
+        warn that overuse of it specifically "may [get your] account suspended" — much
+        stricter than every other method here. Never call this directly from a per-quote code
+        path without the caching layer in KeystoneOrderAdapter._get_prices sitting in front of
+        it."""
+        return self._call_dataset("CheckPriceBulk", [("FullPartNo", full_part_no)])
+
     # -- Order (SUBMIT when order_process_method=1 — real order placement, see module docstring) --
 
     def ship_order_dropship_multiple_parts(
