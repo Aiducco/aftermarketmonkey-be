@@ -158,8 +158,13 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
             seen: typing.Set[str] = set()
 
             for group in groups:
-                warehouse = group.get("warehouse", "")
-                skus = [s.strip() for s in (group.get("skus") or "").split(",") if s.strip()]
+                # Meyer's mass-quote response uses PascalCase group keys ("Warehouse", "Skus",
+                # "Quotes") — confirmed against a live response. Reading them lowercase (as this
+                # code previously did) silently returned "" / [] for every group, so no SKU ever
+                # matched and every line fell through to the "not_returned_in_quote" fallback
+                # below instead of getting real availability/shipping data.
+                warehouse = group.get("Warehouse", "")
+                skus = [s.strip() for s in (group.get("Skus") or "").split(",") if s.strip()]
                 ship_options = _filter_options(
                     [
                         base.ShipOption(
@@ -171,7 +176,7 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
                             # ShipMethod code shown here directly.
                             quote_option_id=(q.get("ShipMethod") or "").strip(),
                         )
-                        for q in group.get("quotes", [])
+                        for q in group.get("Quotes", [])
                     ],
                     ship_method,
                 )
