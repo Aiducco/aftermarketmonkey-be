@@ -208,14 +208,13 @@ TURN14_BASE_URL = 'https://api.turn14.com/v1'
 # "production" environments; the "environment" value must also be set to match in every
 # request body (per Turn 14's docs: requests to apitest.turn14.com must carry "testing",
 # requests to api.turn14.com must carry "production" — the two must always agree). Flipped
-# back to testing now that submit is called synchronously, directly from POST .../submit/
-# (run_submit_synchronously) instead of behind a job a human runs by hand — testing gives a
-# safety margin while that new path gets exercised, since Turn 14's docs confirm even their
-# testing environment creates a real (test) order, not a dry-run. Revisit once the
-# synchronous submit flow has been validated end-to-end against apitest.turn14.com.
+# to production: the synchronous submit path (run_submit_synchronously, called directly from
+# an authenticated POST .../submit/ request) has been validated end-to-end against
+# apitest.turn14.com, so quote/order/submit calls now go to Turn 14's real environment —
+# submit_order() places genuine live orders from here on, not Turn 14 test orders.
 TURN14_ORDER_TEST_BASE_URL = 'https://apitest.turn14.com/v1'
 TURN14_ORDER_PRODUCTION_BASE_URL = 'https://api.turn14.com/v1'
-TURN14_ORDER_ENVIRONMENT = os.environ.get("TURN14_ORDER_ENVIRONMENT", "testing")
+TURN14_ORDER_ENVIRONMENT = os.environ.get("TURN14_ORDER_ENVIRONMENT", "production")
 
 # How long a PurchaseOrder's quote stays valid before submit is blocked and a re-quote is
 # required. Distributor pricing/availability can shift between quote and submit; this stops
