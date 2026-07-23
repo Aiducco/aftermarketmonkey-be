@@ -297,30 +297,40 @@ def _run_quote(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrde
                 # in with "available".
                 "status": status,
                 "items": [],
-                "ship_options": [
-                    {
-                        # The id submit_order sends back to select THIS exact priced option —
-                        # see base.ShipOption.quote_option_id.
-                        "id": opt.quote_option_id,
-                        "code": opt.service_level_code,
-                        # Falls back to the distributor's method-name catalog when the quote
-                        # itself didn't name this option (e.g. Turn14 often omits verbose_eta)
-                        # — the FE should never need to show a bare code.
-                        "name": opt.service_level_name or method_names.get(opt.service_level_code, ""),
-                        # Stored as float, not Decimal: this JSON blob is for display/selection,
-                        # not financial calculation (those still go through unit_cost/line_total
-                        # DecimalFields) — a plain number round-trips through JSON cleanly,
-                        # whereas DjangoJSONEncoder would otherwise write Decimal out as a string.
-                        "cost": float(opt.cost) if opt.cost is not None else None,
-                        "estimated_delivery_date": (
-                            opt.estimated_delivery_date.isoformat() if opt.estimated_delivery_date else None
-                        ),
-                        "days_in_transit": opt.days_in_transit,
-                        # Marketing/eligibility blurb, not a name — see base.ShipOption.
-                        "verbose_eta": opt.verbose_eta,
-                    }
-                    for opt in ql.ship_options
-                ],
+                # A "not orderable" warehouse can't ship this at all — its ship_options would
+                # otherwise still show that warehouse's general shipping-rate table (Keystone
+                # quotes rates per warehouse regardless of whether a given SKU is orderable
+                # there), which looks like a real pick-a-carrier choice for something that can
+                # never actually ship. Force empty for not_orderable, real options otherwise.
+                "ship_options": (
+                    []
+                    if status == "not_orderable"
+                    else [
+                        {
+                            # The id submit_order sends back to select THIS exact priced option
+                            # — see base.ShipOption.quote_option_id.
+                            "id": opt.quote_option_id,
+                            "code": opt.service_level_code,
+                            # Falls back to the distributor's method-name catalog when the quote
+                            # itself didn't name this option (e.g. Turn14 often omits
+                            # verbose_eta) — the FE should never need to show a bare code.
+                            "name": opt.service_level_name or method_names.get(opt.service_level_code, ""),
+                            # Stored as float, not Decimal: this JSON blob is for display/
+                            # selection, not financial calculation (those still go through
+                            # unit_cost/line_total DecimalFields) — a plain number round-trips
+                            # through JSON cleanly, whereas DjangoJSONEncoder would otherwise
+                            # write Decimal out as a string.
+                            "cost": float(opt.cost) if opt.cost is not None else None,
+                            "estimated_delivery_date": (
+                                opt.estimated_delivery_date.isoformat() if opt.estimated_delivery_date else None
+                            ),
+                            "days_in_transit": opt.days_in_transit,
+                            # Marketing/eligibility blurb, not a name — see base.ShipOption.
+                            "verbose_eta": opt.verbose_eta,
+                        }
+                        for opt in ql.ship_options
+                    ]
+                ),
             }
             shipments_by_key[key] = shipment
         shipment["items"].append(
