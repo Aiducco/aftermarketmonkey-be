@@ -125,6 +125,19 @@ def _parse_keystone_delivery_date(value: typing.Optional[str]) -> typing.Optiona
     return None if parsed and parsed.year == _UNKNOWN_DATE_YEAR else parsed
 
 
+def _is_real_ship_option(row: typing.Dict[str, typing.Any]) -> bool:
+    """
+    Keystone's warehouse rate tables occasionally include a placeholder row alongside the real
+    options — e.g. ``{"ShipVia": "3", "Description": "", "ServiceLevel": "U01",
+    "TotalFreightCharge": "0"}`` with no ``ThruDelivery``/``FromDelivery``/``OrderDate`` at all
+    (confirmed against a live quote). Distinguish this from a legitimate LTL quote, which also
+    has no *usable* delivery estimate but represents that with the "unknown date" sentinel
+    (``0001-01-01``, handled by ``_parse_keystone_delivery_date``) while still including a real
+    ``ThruDelivery`` key — the placeholder is missing the key entirely, not just its value.
+    """
+    return "ThruDelivery" in row
+
+
 def _filter_options(
     options: typing.List[base.ShipOption], ship_method: typing.Optional[str]
 ) -> typing.List[base.ShipOption]:
@@ -310,6 +323,7 @@ class KeystoneOrderAdapter(base.DistributorOrderAdapter):
                         quote_option_id=row.get("ServiceLevel", ""),
                     )
                     for row in rows
+                    if _is_real_ship_option(row)
                 ]
                 warehouse_options[wh_number] = _filter_options(options, ship_method)
 
