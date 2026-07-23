@@ -12,6 +12,26 @@ class IntegrationDestinationStatus(enum.Enum):
     ACTIVE = 1
     INACTIVE = 2
 
+
+class ShopManagementProviderKind(enum.Enum):
+    """Specific shop-management vendor. Separate from BrandProviderKind on purpose — a shop
+    management system isn't a parts source and shouldn't share the distributor kind namespace."""
+    SHOPMONKEY = 1
+
+
+class ShopManagementProviderStatus(enum.Enum):
+    ACTIVE = 1
+    INACTIVE = 2
+
+
+class ShopManagementConnectionStatus(enum.Enum):
+    """Connectivity status for a CompanyShopManagementProviders connection, set synchronously
+    from test_connection() at connect/update time. Simpler than CompanyProviderConnectionStatus
+    (no INGESTING/WAITING) since there's no background feed to sync — just an API key check."""
+    CONNECTED = 1
+    FAILING = 2
+
+
 class BrandProvider(enum.Enum):
     CATALOG = 1
     DISTRIBUTOR = 2

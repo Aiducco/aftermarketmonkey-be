@@ -168,6 +168,56 @@ class CompanyProviders(django_db_models.Model):
         unique_together = ["company", "provider"]
 
 
+class ShopManagementProviders(django_db_models.Model):
+    """Global catalog of connectable shop-management systems (ShopMonkey, ...). Deliberately
+    separate from Providers/BrandProviderKind — a shop-management system isn't a parts source
+    and shouldn't share that model's distributor-oriented flows or kind namespace."""
+    name = django_db_models.CharField(max_length=255)
+    status = django_db_models.PositiveSmallIntegerField()
+    status_name = django_db_models.CharField(max_length=255)
+
+    kind = django_db_models.PositiveSmallIntegerField()
+    kind_name = django_db_models.CharField(max_length=255)
+
+    coming_soon = django_db_models.BooleanField(default=False)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "shop_management_providers"
+        unique_together = ["kind"]
+
+
+class CompanyShopManagementProviders(django_db_models.Model):
+    """Per-tenant connection to a shop-management system. One credentials namespace only
+    (e.g. {"api_key": "..."}) — unlike CompanyProviders there's no separate feed/order split,
+    since there's a single credential set and (for now) a single capability."""
+    company = django_db_models.ForeignKey(
+        Company, on_delete=django_db_models.CASCADE, related_name="shop_management_providers"
+    )
+    provider = django_db_models.ForeignKey(
+        ShopManagementProviders, on_delete=django_db_models.CASCADE, related_name="company_connections"
+    )
+
+    credentials = django_db_models.JSONField()
+
+    active = django_db_models.BooleanField(default=True)
+
+    # See src.enums.ShopManagementConnectionStatus. Null until first checked.
+    status = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+    status_name = django_db_models.CharField(max_length=32, null=True, blank=True)
+    status_reason = django_db_models.TextField(null=True, blank=True)
+    status_checked_at = django_db_models.DateTimeField(null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "company_shop_management_providers"
+        unique_together = ["company", "provider"]
+
+
 class IntegrationRequest(django_db_models.Model):
     company = django_db_models.ForeignKey(Company, on_delete=django_db_models.CASCADE, related_name="integration_requests")
     provider = django_db_models.ForeignKey(Providers, on_delete=django_db_models.CASCADE, related_name="requests")
@@ -317,6 +367,24 @@ class MeyerLocation(django_db_models.Model):
 
     class Meta:
         db_table = "meyer_locations"
+        unique_together = ["external_id"]
+
+
+class WheelProsWarehouse(django_db_models.Model):
+    """Wheel Pros warehouses from the Orders API's GET /warehouses/v1 — decodes a tracking/order
+    response's bare warehouseCode into a human-readable ship-from location, the same role
+    Turn14Location/MeyerLocation play for their distributors."""
+    external_id = django_db_models.CharField(max_length=32)  # Wheel Pros' "id"
+    name = django_db_models.CharField(max_length=255, blank=True)
+    city = django_db_models.CharField(max_length=255, blank=True)
+    state = django_db_models.CharField(max_length=64, blank=True)
+    country = django_db_models.CharField(max_length=64, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "wheelpros_warehouses"
         unique_together = ["external_id"]
 
 
@@ -2229,6 +2297,12 @@ class PurchaseOrderDistributorOrder(django_db_models.Model):
     tracking_numbers = django_db_models.JSONField(default=list, blank=True, encoder=DjangoJSONEncoder)
     carrier = django_db_models.CharField(max_length=64, null=True, blank=True)
 
+    # Populated only where the distributor's status/tracking response actually says so (see
+    # base.DistributorOrderStatus) — null for distributors/status-checks that don't carry this.
+    ship_date = django_db_models.DateField(null=True, blank=True)
+    estimated_delivery_date = django_db_models.DateField(null=True, blank=True)
+    delivery_status = django_db_models.CharField(max_length=32, null=True, blank=True)
+
     raw_response = django_db_models.JSONField(null=True, blank=True, encoder=DjangoJSONEncoder)
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
@@ -2270,6 +2344,10 @@ class PurchaseOrderInvoice(django_db_models.Model):
     # [{ship_method, tracking_number}] — one entry per package; an invoice commonly ships as
     # more than one package/tracking number.
     tracking = django_db_models.JSONField(default=list, blank=True, encoder=DjangoJSONEncoder)
+    # [{part_number, description, quantity, unit_price, total_price, warehouse_code}] — see
+    # base.InvoiceLineItem. Empty for adapters whose invoice data is header-only (Keystone's
+    # synthesized invoice) rather than itemized.
+    line_items = django_db_models.JSONField(default=list, blank=True, encoder=DjangoJSONEncoder)
     comments = django_db_models.TextField(null=True, blank=True)
 
     raw_response = django_db_models.JSONField(null=True, blank=True, encoder=DjangoJSONEncoder)

@@ -26,6 +26,14 @@ from src.api.views.company_settings import (
     DeleteAccountView,
     DeleteCompanyDataView,
 )
+from src.api.views.shop_management import (
+    ShopManagementCatalogView,
+    ShopManagementProviderConnectView,
+    ShopManagementConnectionView,
+    ShopManagementConnectionDetailView,
+    CompanyShopManagementProvidersView,
+    CompanyShopManagementProviderDetailView,
+)
 from src.api.views.support import SupportTicketsView
 from src.api.views.billing import (
     CreatePortalSessionView,
@@ -150,6 +158,36 @@ urlpatterns = [
         "company-providers/<int:id>/",
         CompanyProviderDetailView.as_view(),
         name="company_provider_detail",
+    ),
+    path(
+        "shop-management/catalog/",
+        ShopManagementCatalogView.as_view(),
+        name="shop_management_catalog",
+    ),
+    path(
+        "shop-management/catalog/<int:id>/connect/",
+        ShopManagementProviderConnectView.as_view(),
+        name="shop_management_provider_connect",
+    ),
+    path(
+        "shop-management/connections/<int:company_provider_id>/detail/",
+        ShopManagementConnectionDetailView.as_view(),
+        name="shop_management_connection_detail",
+    ),
+    path(
+        "shop-management/connections/<int:company_provider_id>/",
+        ShopManagementConnectionView.as_view(),
+        name="shop_management_connection",
+    ),
+    path(
+        "company-shop-management-providers/",
+        CompanyShopManagementProvidersView.as_view(),
+        name="company_shop_management_providers",
+    ),
+    path(
+        "company-shop-management-providers/<int:id>/",
+        CompanyShopManagementProviderDetailView.as_view(),
+        name="company_shop_management_provider_detail",
     ),
     path(
         "brands/",

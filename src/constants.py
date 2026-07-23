@@ -856,6 +856,32 @@ COMING_SOON_PROVIDERS = [
     {"kind": enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING,"name": "Motor State Distributing",   "category": "Distributors", "icon_url": f"{_UPLOADS}/motor_state_logo.png"},
 ]
 
+"""
+Shop-management provider catalog: list of connectable shop-management systems for the
+shop-management integrations catalog. Used by seed_shop_management_providers and the shop
+management catalog endpoint. Separate from PROVIDER_CATALOG (distributors) on purpose — see
+ShopManagementProviders/CompanyShopManagementProviders in src/models.py.
+"""
+SHOP_MANAGEMENT_PROVIDER_CATALOG = [
+    {
+        "kind": enums.ShopManagementProviderKind.SHOPMONKEY,
+        "name": "ShopMonkey",
+        "description": "Connect your ShopMonkey shop management account.",
+        "icon_url": f"{_UPLOADS}/shopmonkey_logo.png",
+        "category": "Shop Management",
+        "connection_required_fields": ["api_key"],
+        "installation_instructions_html": (
+            "<p><strong>ShopMonkey</strong> connections use an API key issued from your ShopMonkey account.</p>"
+            "<ol>"
+            "<li>Sign in to ShopMonkey and open your account's API settings.</li>"
+            "<li>Generate (or copy your existing) <strong>API key</strong>.</li>"
+            "<li>Paste it into the field below and save. AfterMarketScout uses it only to call "
+            "ShopMonkey on your behalf.</li>"
+            "</ol>"
+        ),
+    },
+]
+
 # Field priority configuration for merging CATALOG and DISTRIBUTOR parts
 # Each field maps to its primary source (CATALOG or DISTRIBUTOR)
 # If field is null/empty in primary source, fallback to the other source
