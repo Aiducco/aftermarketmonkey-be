@@ -27,6 +27,7 @@ via the API). Callers must never invoke either except through an explicit, user-
 submission — see the Purchase Orders job-queue path this is meant to run behind.
 """
 import decimal
+import logging
 import typing
 
 import requests
@@ -36,6 +37,9 @@ from django.conf import settings
 from common import enums as common_enums
 from common import utils as common_utils
 from src.integrations.clients.meyer import exceptions
+
+logger = logging.getLogger(__name__)
+_LOG_PREFIX = "[MEYER-ORDER-CLIENT]"
 
 REQUEST_TIMEOUT_SECONDS = 30
 
@@ -92,6 +96,11 @@ class MeyerOrderApiClient(object):
             "Content-Type": "application/json",
             "Authorization": "Espresso {}:1".format(self.api_key),
         }
+        logger.info(
+            "{} -> {} {} (proxy={}, params={}, json_body={})".format(
+                _LOG_PREFIX, method.value, url, self.proxy_url, params, json_body
+            )
+        )
         try:
             response = requests.request(
                 url=url,
@@ -103,13 +112,21 @@ class MeyerOrderApiClient(object):
                 proxies={"http": self.proxy_url, "https": self.proxy_url} if self.proxy_url else None,
             )
         except requests.exceptions.ConnectTimeout as e:
+            logger.error("{} Connect timeout calling {} {}.".format(_LOG_PREFIX, method.value, url))
             raise exceptions.MeyerOrderAPIException(
                 "Connect timeout. Error: {}".format(common_utils.get_exception_message(exception=e))
             )
         except requests.RequestException as e:
+            logger.error("{} Request exception calling {} {}: {}.".format(_LOG_PREFIX, method.value, url, e))
             raise exceptions.MeyerOrderAPIException(
                 "Request exception. Error: {}".format(common_utils.get_exception_message(exception=e))
             )
+
+        logger.info(
+            "{} <- {} {} status={} body={}".format(
+                _LOG_PREFIX, method.value, url, response.status_code, response.content[:2000]
+            )
+        )
 
         # A static key isn't ours to refresh (see module docstring) — a 401 here means the
         # stored key itself is invalid/revoked, not a transient/expired-token condition to
