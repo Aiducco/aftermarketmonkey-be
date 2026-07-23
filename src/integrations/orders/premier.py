@@ -99,9 +99,10 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
         base.DistributorOrderAdapter.__init__(self, company_provider)
         # Was previously omitted entirely, so every call silently defaulted to
         # PremierOrderApiClient's own hardcoded "testing" regardless of
-        # settings.PREMIER_ORDER_ENVIRONMENT (already "production") — same
-        # getattr(settings, ..., "testing") pattern turn_14.py/meyer.py already use.
-        environment = getattr(settings, "PREMIER_ORDER_ENVIRONMENT", "testing")
+        # settings.PREMIER_ORDER_ENVIRONMENT (already "production" in settings_base.py).
+        # Fallback here is also "production" (unlike Turn14/Meyer's "testing" fallback) since
+        # Premier's own setting has always defaulted to production, not testing.
+        environment = getattr(settings, "PREMIER_ORDER_ENVIRONMENT", "production")
         self._client = PremierOrderApiClient(
             credentials=credentials_helper.get_order_credentials(company_provider),
             environment=environment,
@@ -345,6 +346,90 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
                 )
             )
         return base.OrderStatusResult(orders=orders)
+
+    def supports_invoices(self) -> bool:
+        return True
+
+    def get_invoices(self, purchase_order: src_models.PurchaseOrder) -> typing.List[base.DistributorInvoice]:
+        """
+        Premier's Invoice API (GET invoices) can only be filtered by invoiceNumber/
+        salesOrderNumber/itemNumber/date-range — never by customerPurchaseOrderNumber (see
+        module docstring's order-number gap, which applies here too). So invoice numbers must be
+        discovered first, from whichever tracking entries (already fetched by get_order_status,
+        re-fetched here since adapters are called independently) carry one — Premier's bulk
+        tracking/date endpoint is confirmed to return an invoiceNumber per sales order, but the
+        purchaseOrderNumber-filtered form used here isn't confirmed to carry the same field on
+        each entry; read defensively (.get) so this degrades to "no invoices yet" rather than
+        breaking if it's genuinely absent. Revisit once confirmed against Premier's test
+        environment, same caveat get_order_status already carries for this same endpoint.
+        """
+        try:
+            tracking_entries = self._client.get_tracking_by_purchase_order_number(purchase_order.po_number)
+        except premier_client_exceptions.PremierOrderValidationError:
+            return []
+        except premier_client_exceptions.PremierException as e:
+            self._handle_error(e)
+
+        invoice_numbers = sorted(
+            {entry.get("invoiceNumber") for entry in tracking_entries if entry.get("invoiceNumber")}
+        )
+        if not invoice_numbers:
+            return []
+
+        invoices: typing.List[base.DistributorInvoice] = []
+        for invoice_number in invoice_numbers:
+            try:
+                rows = self._client.get_invoices(invoice_number=invoice_number)
+            except premier_client_exceptions.PremierException:
+                logger.warning(
+                    "{} get_invoices failed for invoice_number={}; skipped this round.".format(
+                        _LOG_PREFIX, invoice_number
+                    )
+                )
+                continue
+            invoices.extend(self._parse_invoice(row) for row in rows)
+        return invoices
+
+    @staticmethod
+    def _parse_invoice(row: typing.Dict) -> base.DistributorInvoice:
+        try:
+            header = row.get("header") or {}
+            line_items = [
+                base.InvoiceLineItem(
+                    part_number=(line.get("item") or {}).get("itemNumber"),
+                    description=next(
+                        (
+                            d.get("shortDescription") or d.get("longDescription")
+                            for d in ((line.get("item") or {}).get("descriptions") or [])
+                        ),
+                        None,
+                    ),
+                    quantity=line.get("quantityShipped"),
+                    unit_price=_to_decimal(line.get("unitPrice")),
+                    total_price=_to_decimal(line.get("total")),
+                    warehouse_code=line.get("warehouseCode"),
+                )
+                for line in (row.get("lines") or [])
+            ]
+            return base.DistributorInvoice(
+                invoice_number=str(header.get("invoiceNumber", "")),
+                invoice_date=_parse_premier_date(header.get("transactionDate")),
+                total_price=_to_decimal(header.get("transactionAmount")),
+                freight=_to_decimal(header.get("shipAmount")),
+                discount_amount=_to_decimal(header.get("discountAmount")),
+                # Premier's invoice header has "balance" (amount still owed), no separate
+                # paid_amount field — payments[] (also on this response, in raw_response) has
+                # the itemized payment history if that's ever needed beyond the running balance.
+                amount_due=_to_decimal(header.get("balance")),
+                line_items=line_items,
+                raw_response=row,
+            )
+        except (AttributeError, TypeError, KeyError, IndexError) as e:
+            raise order_exceptions.OrderValidationError(
+                "Unexpected invoice response shape from Premier ({}: {}). Raw response: {}".format(
+                    type(e).__name__, e, repr(row)[:2000]
+                )
+            )
 
     def cancel_order(self, purchase_order: src_models.PurchaseOrder) -> bool:
         raise order_exceptions.OrderNotSupportedError(

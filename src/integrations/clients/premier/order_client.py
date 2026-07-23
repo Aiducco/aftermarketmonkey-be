@@ -73,9 +73,12 @@ def _decode_jwt_exp(token: str) -> typing.Optional[float]:
 
 
 class PremierOrderApiClient(object):
-    """One instance per (credentials, environment) pair."""
+    """One instance per (credentials, environment) pair. Defaults to "production" (unlike
+    Turn14/Meyer's "testing" class default) since PremierOrderAdapter always passes
+    settings.PREMIER_ORDER_ENVIRONMENT explicitly anyway, and that setting has always
+    defaulted to "production" for Premier."""
 
-    def __init__(self, credentials: typing.Dict, environment: str = "testing") -> None:
+    def __init__(self, credentials: typing.Dict, environment: str = "production") -> None:
         self.api_key = credentials.get("api_key", "")
         if not self.api_key:
             raise ValueError("Invalid credentials parameter.")
