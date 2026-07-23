@@ -93,21 +93,24 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
         code = getattr(e, "code", None)
         raise order_exceptions.OrderValidationError(message=str(e), code=str(code) if code else None)
 
-    def _get_prices(self, item_numbers: typing.List[str]) -> typing.Dict[str, decimal.Decimal]:
+    def _get_item_info(self, item_numbers: typing.List[str]) -> typing.Dict[str, typing.Dict[str, typing.Any]]:
         """
-        {item_number: CustomerPrice} via ItemInformation, so quoted line items carry Meyer's own
-        up-to-date price rather than only our (potentially stale) catalog-sync price — same role
-        Turn14's inline quote pricing already plays for that adapter, and the same gap
-        Keystone's CheckPriceBulk fills for that one.
+        {item_number: {"price": Decimal|None, "prop_65": bool}} via ItemInformation, so quoted
+        line items carry Meyer's own up-to-date price rather than only our (potentially stale)
+        catalog-sync price — same role Turn14's inline quote pricing already plays for that
+        adapter, and the same gap Keystone's CheckPriceBulk fills for that one. The same response
+        also carries Meyer's own Prop 65 flag per item ("Prop 65": "Yes", only present when
+        applicable) — folded into ShippingQuoteLine.flags by get_shipping_quote the same way
+        Turn14 does from its own quote response (see turn_14.py), no separate API call needed.
 
         No caching layer here, unlike Keystone: Meyer's docs cap ItemInformation at 100 items
         per call but don't warn of any rate limit or account-suspension risk for calling it
-        often, so there's nothing to protect against — every quote can safely fetch live prices.
-        Best-effort: any failure degrades to no pricing for the affected item(s) rather than
-        failing the shipping quote — pricing is an enrichment, availability/shipping is the
-        core result.
+        often, so there's nothing to protect against — every quote can safely fetch live data.
+        Best-effort: any failure degrades to no pricing/prop_65 info for the affected item(s)
+        rather than failing the shipping quote — this is an enrichment, availability/shipping is
+        the core result.
         """
-        prices: typing.Dict[str, decimal.Decimal] = {}
+        info: typing.Dict[str, typing.Dict[str, typing.Any]] = {}
         for i in range(0, len(item_numbers), _ITEM_INFORMATION_CHUNK_SIZE):
             chunk = item_numbers[i : i + _ITEM_INFORMATION_CHUNK_SIZE]
             try:
@@ -115,15 +118,18 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
             except meyer_client_exceptions.MeyerException:
                 logger.exception(
                     "{} ItemInformation failed for item_numbers={}; those line(s) will have no "
-                    "distributor-quoted price this round.".format(_LOG_PREFIX, chunk)
+                    "distributor-quoted price/Prop 65 info this round.".format(_LOG_PREFIX, chunk)
                 )
                 continue
             for item in items:
                 item_number = (item.get("ItemNumber") or "").strip()
-                price = _parse_decimal(item.get("CustomerPrice"))
-                if item_number and price is not None:
-                    prices[item_number] = price
-        return prices
+                if not item_number:
+                    continue
+                info[item_number] = {
+                    "price": _parse_decimal(item.get("CustomerPrice")),
+                    "prop_65": (item.get("Prop 65") or "").strip().lower() == "yes",
+                }
+        return info
 
     # -- DistributorOrderAdapter ------------------------------------------------------------
 
@@ -144,7 +150,7 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
 
         logger.info("{} Quote response: {}".format(_LOG_PREFIX, repr(groups)[:4000]))
 
-        prices = self._get_prices([li.provider_part.provider_external_id for li in line_items])
+        item_info = self._get_item_info([li.provider_part.provider_external_id for li in line_items])
 
         try:
             by_external_id = {li.provider_part.provider_external_id: li for li in line_items}
@@ -173,7 +179,8 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
                     li = by_external_id.get(sku)
                     seen.add(sku)
                     quantity_available = li.quantity if li else 0
-                    unit_price = prices.get(sku)
+                    info = item_info.get(sku, {})
+                    unit_price = info.get("price")
                     lines.append(
                         base.ShippingQuoteLine(
                             line_item_id=li.line_item_id if li else 0,
@@ -186,7 +193,8 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
                             quantity_available=quantity_available,
                             warehouse_code=warehouse,
                             ship_options=ship_options,
-                            # From ItemInformation (see _get_prices) — Meyer's shipping-quote
+                            flags=["prop_65"] if info.get("prop_65") else [],
+                            # From ItemInformation (see _get_item_info) — Meyer's shipping-quote
                             # endpoint itself never returns pricing, unlike Turn14's.
                             distributor_unit_price=unit_price,
                             distributor_line_total=(
@@ -199,12 +207,15 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
             for external_id, li in by_external_id.items():
                 if external_id in seen:
                     continue
+                flags = ["not_returned_in_quote"]
+                if item_info.get(external_id, {}).get("prop_65"):
+                    flags.append("prop_65")
                 lines.append(
                     base.ShippingQuoteLine(
                         line_item_id=li.line_item_id,
                         provider_external_id=external_id,
                         quantity_available=0,
-                        flags=["not_returned_in_quote"],
+                        flags=flags,
                     )
                 )
 

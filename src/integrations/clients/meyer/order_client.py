@@ -214,6 +214,6 @@ class MeyerOrderApiClient(object):
 
     def test_connection(self) -> None:
         """Cheap connectivity/auth probe — ShipMethods takes no parameters and doesn't need
-        customer_number, so a successful call proves the username/password (and therefore the
-        apikey exchange) work, without touching any order/customer data."""
+        customer_number, so a successful call proves the api_key alone is valid, without
+        touching any order/customer data."""
         self.get_ship_methods()
