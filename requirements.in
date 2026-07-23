@@ -18,6 +18,7 @@ oauthlib
 packaging
 protobuf
 psycopg2-binary
+PySocks
 pyasn1
 pyasn1-modules
 pyparsing

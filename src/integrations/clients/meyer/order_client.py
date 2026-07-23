@@ -14,6 +14,11 @@ logic here: a static key isn't ours to refresh — if Meyer ever invalidates one
 to come from the Meyer rep and be re-entered, the same as any other distributor credential
 update.
 
+Transport: every request is routed through a SOCKS5 proxy (``settings.MEYER_ORDER_PROXY_URL``)
+whose IP is allowlisted with Meyer — direct connections to either Meyer host fail the TLS
+handshake entirely from non-allowlisted IPs (TCP connects, ``ClientHello`` sent, no
+``ServerHello`` ever comes back). Requires ``PySocks`` for the ``socks5h://`` scheme.
+
 SAFETY: ``create_order`` places a REAL order against Meyer (even against the "testing"
 environment — Meyer's docs warn the test API "can contain outdated information" but do not
 describe it as a sandbox that skips real order creation). ``cancel_order`` also has real,
@@ -56,6 +61,7 @@ class MeyerOrderApiClient(object):
             raise ValueError("Invalid environment: {}. Must be 'testing' or 'production'.".format(environment))
         self.environment = environment
         self.api_base_url = _ENVIRONMENT_BASE_URLS[environment]
+        self.proxy_url = settings.MEYER_ORDER_PROXY_URL or None
 
     # -- Request/response plumbing ---------------------------------------------------------
 
@@ -94,6 +100,7 @@ class MeyerOrderApiClient(object):
                 json=json_body,
                 headers=headers,
                 timeout=REQUEST_TIMEOUT_SECONDS,
+                proxies={"http": self.proxy_url, "https": self.proxy_url} if self.proxy_url else None,
             )
         except requests.exceptions.ConnectTimeout as e:
             raise exceptions.MeyerOrderAPIException(

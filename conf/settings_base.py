@@ -329,6 +329,13 @@ MEYER_ORDER_PRODUCTION_BASE_URL = os.environ.get(
 )
 MEYER_ORDER_ENVIRONMENT = os.environ.get("MEYER_ORDER_ENVIRONMENT", "testing")
 
+# Meyer's API hosts don't complete a TLS handshake from arbitrary IPs (confirmed: TCP connects,
+# ClientHello sent, no ServerHello ever comes back) — almost certainly IP allowlisting on their
+# end. This SOCKS5 proxy's IP is the one Meyer has on file, so every Meyer order-API request is
+# routed through it. Set MEYER_ORDER_PROXY_URL="" to disable (e.g. once Meyer allowlists origin
+# IPs directly and the proxy is no longer needed).
+MEYER_ORDER_PROXY_URL = os.environ.get("MEYER_ORDER_PROXY_URL", "socks5h://54.236.214.147:1080")
+
 # A-Tech relay SFTP: same pattern as Meyer — per-company sftp_user/sftp_password in CompanyProviders.
 try:
     _atech_port = int(os.environ.get("ATECH_SFTP_PORT") or "22")
@@ -443,3 +450,8 @@ PREMIER_ORDER_PRODUCTION_BASE_URL = os.environ.get(
     "PREMIER_ORDER_PRODUCTION_BASE_URL", "https://api.premierwd.com/api/v5"
 )
 PREMIER_ORDER_ENVIRONMENT = os.environ.get("PREMIER_ORDER_ENVIRONMENT", "production")
+
+# ShopMonkey API (REST, single api_key -> Bearer header, no token exchange). Base URL is a
+# best-effort default pending confirmation against ShopMonkey's current API docs — override via
+# env if it turns out to differ.
+SHOPMONKEY_API_BASE_URL = os.environ.get("SHOPMONKEY_API_BASE_URL", "https://api.shopmonkey.cloud/v3")

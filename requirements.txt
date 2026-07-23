@@ -129,6 +129,8 @@ protobuf==4.22.1
     #   googleapis-common-protos
 psycopg2-binary==2.9.6
     # via -r requirements.in
+pysocks==1.7.1
+    # via -r requirements.in
 pyasn1==0.4.8
     # via
     #   -r requirements.in
