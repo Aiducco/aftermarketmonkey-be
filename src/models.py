@@ -2110,23 +2110,36 @@ class PurchaseOrderLineItem(django_db_models.Model):
     # Distributor-side per-line detail, filled in after quote/submit. A single line item can be
     # fulfilled from more than one distributor shipment/warehouse at quote time (e.g. Turn14
     # splitting a qty=4 request into 1@warehouse-59 + 2@warehouse-02 + 1 backordered@warehouse-01)
-    # — these four fields are the AGGREGATE across every shipment (summed confirmed/backordered,
-    # earliest ESD, warehouse_code only when there's exactly one shipment). The per-shipment
-    # breakdown itself lives in ``shipments`` below; these aggregates exist so callers that don't
-    # care about the split (e.g. a simple "x of y available" badge) don't have to compute it.
+    # — these fields are the AGGREGATE across every shipment (summed confirmed/backordered/
+    # not_orderable, earliest ESD, warehouse_code only when there's exactly one shipment). The
+    # per-shipment breakdown itself lives in ``shipments`` below; these aggregates exist so
+    # callers that don't care about the split (e.g. a simple "x of y available" badge) don't
+    # have to compute it.
     distributor_line_status_code = django_db_models.CharField(max_length=64, null=True, blank=True)
     distributor_line_status_message = django_db_models.TextField(null=True, blank=True)
     quantity_confirmed = django_db_models.PositiveIntegerField(null=True, blank=True)
+    # Genuinely backordered — will still ship (and be billed) once the distributor restocks;
+    # distinct from quantity_not_orderable below. Only ever set from shipment-splits whose
+    # purchase_order_jobs._shipment_status() is "backordered" (Keystone ShipFlag B, Turn14
+    # out_of_stock) — "not_orderable"/"transfer" splits are excluded and counted separately, so
+    # this field can't silently mix "will ship later" with "will never ship" the way it used to.
     quantity_backordered = django_db_models.PositiveIntegerField(null=True, blank=True)
+    # Cancelled outright — Keystone ShipFlag X ("not orderable"), never ships and is never
+    # billed (see keystone.py/_billable_quantity). Previously lumped into quantity_backordered,
+    # which made a fully-cancelled quantity look like it would eventually arrive.
+    quantity_not_orderable = django_db_models.PositiveIntegerField(null=True, blank=True)
     manufacturer_esd = django_db_models.DateField(null=True, blank=True)
     warehouse_code = django_db_models.CharField(max_length=64, null=True, blank=True)
 
     # Lightweight references into PurchaseOrder.shipments (the full, deduplicated shipment
     # records — items + priced ship_options — now live there once, not copied per line item):
-    # [{shipment_id, quantity_confirmed, quantity_backordered, manufacturer_esd}]. Almost always
-    # a single-entry list; more than one entry means the distributor is fulfilling this line
-    # from multiple shipments — see the aggregate fields above for the common case, use this to
-    # look up which PurchaseOrder.shipments entries this line participates in.
+    # [{shipment_id, status, quantity_confirmed, quantity_backordered, manufacturer_esd}].
+    # ``status`` is copied in from that same PurchaseOrder.shipments entry (rather than making
+    # the FE cross-reference by shipment_id) so a given split's quantity_backordered can be read
+    # correctly on its own — it means "cancelled, will never ship" when status is
+    # "not_orderable", vs. "will ship once restocked" when status is "backordered". Almost
+    # always a single-entry list; more than one entry means the distributor is fulfilling this
+    # line from multiple shipments — see the aggregate fields above for the common case.
     shipments = django_db_models.JSONField(null=True, blank=True, encoder=DjangoJSONEncoder)
 
     # Distributor-applied discounts on this line from the last quote (e.g. Turn14's per-item

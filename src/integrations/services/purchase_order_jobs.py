@@ -375,8 +375,24 @@ def _run_quote(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrde
         if not li:
             continue
 
-        li.quantity_confirmed = sum(ql.quantity_available for ql in quote_lines)
-        li.quantity_backordered = sum(ql.quantity_backordered for ql in quote_lines)
+        # quantity_backordered vs. quantity_not_orderable: ql.quantity_backordered alone can't
+        # tell them apart (Keystone's "not orderable" splits store their cancelled quantity in
+        # that same field — see keystone.py — since there's no separate field at the
+        # ShippingQuoteLine level). Split by each split's own status instead of blanket-summing,
+        # so a fully-cancelled quantity no longer gets counted as if it would eventually ship
+        # (confirmed against a live PO: a not_orderable split's 2 units were showing up in
+        # quantity_backordered, indistinguishable from a genuine backorder that will still ship).
+        li.quantity_confirmed = 0
+        li.quantity_backordered = 0
+        li.quantity_not_orderable = 0
+        for ql in quote_lines:
+            split_status = _shipment_status(ql.flags)
+            if split_status in ("in_stock", "transfer"):
+                li.quantity_confirmed += ql.quantity_available
+            elif split_status == "not_orderable":
+                li.quantity_not_orderable += ql.quantity_backordered
+            else:  # "backordered"
+                li.quantity_backordered += ql.quantity_backordered
         # Earliest ESD among shipments that have one — the soonest a backordered unit could
         # arrive is the most useful single date to surface when there's more than one shipment.
         esds = [ql.manufacturer_esd for ql in quote_lines if ql.manufacturer_esd]
@@ -385,10 +401,13 @@ def _run_quote(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrde
         # one, see li.shipments for the per-warehouse breakdown.
         li.warehouse_code = quote_lines[0].warehouse_code if len(quote_lines) == 1 else None
         # Lightweight references into po.shipments (built above) — the full item list/priced
-        # ship_options live there once, not copied per line item.
+        # ship_options live there once, not copied per line item. "status" is copied in so a
+        # split's quantity_backordered can be read correctly on its own (see the model's
+        # docstring on PurchaseOrderLineItem.shipments).
         li.shipments = [
             {
                 "shipment_id": quote_line_shipment_ids.get(id(ql)),
+                "status": _shipment_status(ql.flags),
                 "quantity_confirmed": ql.quantity_available,
                 "quantity_backordered": ql.quantity_backordered,
                 "manufacturer_esd": ql.manufacturer_esd.isoformat() if ql.manufacturer_esd else None,
@@ -425,6 +444,7 @@ def _run_quote(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrde
             update_fields=[
                 "quantity_confirmed",
                 "quantity_backordered",
+                "quantity_not_orderable",
                 "manufacturer_esd",
                 "warehouse_code",
                 "shipments",

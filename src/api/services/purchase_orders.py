@@ -80,7 +80,12 @@ def _serialize_line_item(
         "distributor_line_status_code": li.distributor_line_status_code,
         "distributor_line_status_message": li.distributor_line_status_message,
         "quantity_confirmed": li.quantity_confirmed,
+        # Genuinely backordered — will still ship once restocked. Distinct from
+        # quantity_not_orderable (cancelled outright, never ships/bills) — see the model's
+        # docstring on PurchaseOrderLineItem.quantity_not_orderable for why these used to be
+        # conflated.
         "quantity_backordered": li.quantity_backordered,
+        "quantity_not_orderable": li.quantity_not_orderable,
         "manufacturer_esd": li.manufacturer_esd.isoformat() if li.manufacturer_esd else None,
         "warehouse_code": li.warehouse_code,
         # Human-readable label for warehouse_code (e.g. "Hatfield, PA" — same convention
@@ -306,6 +311,7 @@ def _revert_to_draft(po: src_models.PurchaseOrder) -> None:
         warehouse_code=None,
         quantity_confirmed=None,
         quantity_backordered=None,
+        quantity_not_orderable=None,
         manufacturer_esd=None,
     )
 
