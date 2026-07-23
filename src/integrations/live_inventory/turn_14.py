@@ -1,13 +1,10 @@
 """
-Turn14LiveInventoryProvider - on-demand single-item inventory refresh, distinct from the
-brand-wide paginated pull used by the scheduled catalog sync
-(src.integrations.services.turn_14.fetch_and_save_all_turn_14_brand_inventory).
-
-Turn14's inventory-by-item lookup does not key on the same numeric item id used everywhere
-else (ProviderPart.provider_external_id / Turn14Items.external_id, taken from the item
-resource's top-level "id") - it keys on that item's own "external_id" attribute instead, which
-has to be resolved first via a GET /items/item/{id} call. So a refresh is two Turn14 API calls:
-resolve the item, then look up its inventory by that resolved external_id.
+Turn14LiveInventoryProvider - on-demand single-item inventory refresh via Turn14's
+GET /v1/inventory/{item_id}, distinct from the brand-wide paginated pull used by the
+scheduled catalog sync (src.integrations.services.turn_14.fetch_and_save_all_turn_14_brand_inventory).
+Takes the same numeric item id used everywhere else in this codebase
+(ProviderPart.provider_external_id / Turn14Items.external_id) directly - no separate
+resolution call needed.
 
 Writes the raw Turn14BrandInventory row first (so the table stays consistent for whatever the
 next scheduled bulk sync does), then reuses the same parsing/mapping helpers the bulk sync
@@ -43,48 +40,21 @@ class Turn14LiveInventoryProvider(base.LiveInventoryProvider):
         item_id = provider_part.provider_external_id
 
         try:
-            item = self._client.get_item(item_id)
+            raw_item = self._client.get_inventory_item(item_id)
         except turn14_client_exceptions.Turn14APIException as e:
             logger.error(
-                "{} Turn14 API error resolving item_id={} (provider_part_id={}): {}".format(
-                    _LOG_PREFIX, item_id, provider_part.id, str(e)
-                )
-            )
-            raise live_inventory_exceptions.LiveInventoryTransportError(str(e)) from e
-
-        if item is None:
-            raise live_inventory_exceptions.LiveInventoryNotFoundError(
-                "Turn14 has no item record for id {}.".format(item_id)
-            )
-
-        item_external_id = (item.get("attributes") or {}).get("external_id") or item.get("external_id")
-        if not item_external_id:
-            raise live_inventory_exceptions.LiveInventoryNotFoundError(
-                "Turn14 item {} has no external_id to look up live inventory by.".format(item_id)
-            )
-
-        try:
-            raw_item = self._client.get_inventory_item(item_external_id)
-        except turn14_client_exceptions.Turn14APIException as e:
-            logger.error(
-                "{} Turn14 API error refreshing inventory for provider_part_id={} item_id={} "
-                "external_id={}: {}".format(
-                    _LOG_PREFIX, provider_part.id, item_id, item_external_id, str(e)
+                "{} Turn14 API error refreshing inventory for provider_part_id={} item_id={}: {}".format(
+                    _LOG_PREFIX, provider_part.id, item_id, str(e)
                 )
             )
             raise live_inventory_exceptions.LiveInventoryTransportError(str(e)) from e
 
         if raw_item is None:
             raise live_inventory_exceptions.LiveInventoryNotFoundError(
-                "Turn14 has no inventory record for item {} (external_id={}).".format(
-                    item_id, item_external_id
-                )
+                "Turn14 has no inventory record for item {}.".format(item_id)
             )
 
         now = timezone.now()
-        # Keyed by item_id (not item_external_id) to stay consistent with the bulk sync's
-        # Turn14BrandInventory rows and with ProviderPart.provider_external_id, which is what
-        # every other lookup in this codebase joins on.
         raw_row = self._save_raw_inventory(item_id, raw_item, now)
         return self._sync_provider_part_inventory(provider_part, raw_row, now)
 
