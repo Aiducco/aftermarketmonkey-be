@@ -14,9 +14,11 @@ that fulfillment mode.
 import datetime
 import decimal
 import logging
+import re
 import typing
 
 from django.conf import settings
+from django.utils import timezone
 
 from src import enums as src_enums
 from src import models as src_models
@@ -36,6 +38,11 @@ _CANCEL_NOT_CANCELLABLE_CODES = {"60501", "60502"}
 # Meyer's own documented cap on how many item numbers ItemInformation accepts per call.
 _ITEM_INFORMATION_CHUNK_SIZE = 100
 
+# Meyer's own docs: DeliveryDate on a quote line is either a literal date ("9/28/2017") or a
+# business-day estimate string ("3-5 Business Days" / "5 Business Days") — same field, two
+# shapes, confirmed on both ShippingRateQuote and ShippingRateMassQuote.
+_MEYER_BUSINESS_DAYS_PATTERN = re.compile(r"^(?:(\d+)\s*-\s*)?(\d+)\s*Business\s*Days?$", re.IGNORECASE)
+
 
 def _parse_decimal(value: typing.Optional[typing.Any]) -> typing.Optional[decimal.Decimal]:
     if value in (None, ""):
@@ -46,13 +53,44 @@ def _parse_decimal(value: typing.Optional[typing.Any]) -> typing.Optional[decima
         return None
 
 
-def _parse_meyer_date(value: typing.Optional[str]) -> typing.Optional[datetime.date]:
+def _add_business_days(start: datetime.date, business_days: int) -> datetime.date:
+    d = start
+    remaining = business_days
+    while remaining > 0:
+        d += datetime.timedelta(days=1)
+        if d.weekday() < 5:  # Mon-Fri
+            remaining -= 1
+    return d
+
+
+def _parse_meyer_delivery(
+    value: typing.Optional[str],
+) -> typing.Tuple[typing.Optional[datetime.date], typing.Optional[int]]:
+    """(estimated_delivery_date, days_in_transit) from Meyer's DeliveryDate field — mirrors
+    keystone.py's _days_in_transit (diffs two Keystone-supplied dates into a day count), except
+    Meyer only ever gives us one of two shapes instead of a matching pair of dates:
+      - a literal date ("9/28/2017"): diff it against today for days_in_transit, with today
+        standing in for the order-placement date (the role Keystone's own OrderDate plays).
+      - a business-day estimate ("3-5 Business Days"): Meyer already gives us the day count
+        directly (use the upper bound of a range), so derive a concrete date by adding that
+        many business days to today, so the FE still has a real date to show.
+    """
     if not value:
-        return None
+        return None, None
+    value = value.strip()
+    today = timezone.now().date()
+
+    m = _MEYER_BUSINESS_DAYS_PATTERN.match(value)
+    if m:
+        upper = int(m.group(2))
+        return _add_business_days(today, upper), upper
+
     try:
-        return datetime.datetime.strptime(value.strip(), "%m/%d/%Y").date()
+        estimated_delivery_date = datetime.datetime.strptime(value, "%m/%d/%Y").date()
     except ValueError:
-        return None
+        return None, None
+    delta = (estimated_delivery_date - today).days
+    return estimated_delivery_date, (delta if delta >= 0 else None)
 
 
 def _filter_options(
@@ -182,21 +220,22 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
                 # below instead of getting real availability/shipping data.
                 warehouse = group.get("Warehouse", "")
                 skus = [s.strip() for s in (group.get("Skus") or "").split(",") if s.strip()]
-                ship_options = _filter_options(
-                    [
+                raw_options = []
+                for q in group.get("Quotes", []):
+                    estimated_delivery_date, days_in_transit = _parse_meyer_delivery(q.get("DeliveryDate"))
+                    raw_options.append(
                         base.ShipOption(
                             service_level_code=(q.get("ShipMethod") or "").strip(),
                             service_level_name=q.get("ServiceType", ""),
-                            estimated_delivery_date=_parse_meyer_date(q.get("DeliveryDate")),
+                            estimated_delivery_date=estimated_delivery_date,
+                            days_in_transit=days_in_transit,
                             cost=_parse_decimal(q.get("Cost")),
                             # No separate quote-scoped id for Meyer — CreateOrder takes the same
                             # ShipMethod code shown here directly.
                             quote_option_id=(q.get("ShipMethod") or "").strip(),
                         )
-                        for q in group.get("Quotes", [])
-                    ],
-                    ship_method,
-                )
+                    )
+                ship_options = _filter_options(raw_options, ship_method)
                 for sku in skus:
                     li = by_external_id.get(sku)
                     seen.add(sku)

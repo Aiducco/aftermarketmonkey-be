@@ -210,21 +210,41 @@ def _primary_meyer_company_provider() -> typing.Optional[src_models.CompanyProvi
     return base.first()
 
 
+def _meyer_company_provider_with_order_credentials() -> typing.Optional[src_models.CompanyProviders]:
+    """An active Meyer CompanyProviders row whose credentials.order carries a usable api_key +
+    customer_number pair. _primary_meyer_company_provider() can't be reused here — it's
+    feed/SFTP-oriented and, lacking any row with primary=True for Meyer in practice, falls back
+    to the lowest-id active row regardless of whether it has order credentials at all (most
+    Meyer connections only ever set up feed/SFTP credentials; a few have a stale
+    username/password/customer_number shape from before order credentials were standardized on
+    api_key). GET /Warehouses is account-agnostic — every valid Meyer order credential sees the
+    same warehouse list — so any one row with real order credentials works."""
+    for cp in _active_meyer_company_providers_queryset().order_by("-primary", "id"):
+        order_credentials = credentials_helper.get_order_credentials(cp)
+        if order_credentials.get("api_key") and order_credentials.get("customer_number"):
+            return cp
+    return None
+
+
 def fetch_and_save_meyer_locations() -> None:
     """Fetch Meyer warehouses from the Order API's GET /Warehouses and upsert into MeyerLocation
     — decodes a shipping quote's bare warehouse code (e.g. "053") into a human-readable place,
-    the same role fetch_and_save_turn_14_locations plays for Turn14Location. Uses the primary
-    company's Meyer **order** credentials (order.py's MeyerOrderAdapter uses the same pair), not
-    the feed/SFTP credentials the rest of this module uses."""
+    the same role fetch_and_save_turn_14_locations plays for Turn14Location."""
     logger.info("{} Started fetching and saving Meyer locations.".format(_LOG_PREFIX))
 
-    primary_provider = _primary_meyer_company_provider()
+    primary_provider = _meyer_company_provider_with_order_credentials()
     if not primary_provider:
-        logger.info("{} No active Meyer CompanyProviders row found.".format(_LOG_PREFIX))
+        logger.info("{} No active Meyer CompanyProviders row with order credentials found.".format(_LOG_PREFIX))
         return
 
     order_credentials = credentials_helper.get_order_credentials(primary_provider)
-    environment = getattr(settings, "MEYER_ORDER_ENVIRONMENT", "testing")
+    # Always hit production here, regardless of settings.MEYER_ORDER_ENVIRONMENT (which the
+    # live MeyerOrderAdapter uses and currently defaults to "testing") — the api_key stored on
+    # every CompanyProviders row we've seen so far is a real production key, rejected outright
+    # by the testing host ("Auth Token not found"), and Meyer's warehouse list is an
+    # account-agnostic reference table anyway, so production is the right source of truth here
+    # independent of whichever environment order submission is currently configured for.
+    environment = "production"
     try:
         api_client = MeyerOrderApiClient(credentials=order_credentials, environment=environment)
     except ValueError as e:
