@@ -335,7 +335,12 @@ class KeystoneOrderAdapter(base.DistributorOrderAdapter):
                 warehouse_number = row.get("Warehouse", "")
                 flags = {"B": ["backorder"], "X": ["not_orderable"], "T": ["transfer"]}.get(ship_flag, [])
                 quantity_available = _parse_int(row.get("QTO")) if ship_flag in ("O", "T") else 0
-                quantity_backordered = _parse_int(row.get("Backordered"))
+                # "Not orderable" rows carry their unavailable quantity in "Cancelled", not
+                # "Backordered" (confirmed against a live quote: an X row has no "Backordered"
+                # key at all) — read the right field per ShipFlag so the FE's "N backordered"
+                # badge (driven by quantity_backordered, same as Turn14's out-of-stock shipments)
+                # shows the real quantity instead of a silent 0 that looks like nothing happened.
+                quantity_backordered = _parse_int(row.get("Cancelled" if ship_flag == "X" else "Backordered"))
                 unit_price = prices.get(vcpn)
                 lines.append(
                     base.ShippingQuoteLine(

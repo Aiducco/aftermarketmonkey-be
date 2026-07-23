@@ -218,6 +218,30 @@ def _get_shipping_method_names(
     return names
 
 
+def _shipment_status(flags: typing.List[str]) -> str:
+    """
+    Distributor-agnostic per-shipment fulfillment status, derived from
+    ``ShippingQuoteLine.flags`` — the single source of truth for grouping/labeling shipments in
+    po.shipments (see _run_quote below), replacing a boolean ``is_backordered`` that only had
+    room for two states. Keystone alone can report four distinct ShipFlag values per warehouse
+    (O/orderable, X/not orderable, B/backordered, T/transfer — see
+    src/integrations/orders/keystone.py); Turn14 only ever reports "ordered" or "backordered".
+    Every adapter's flags funnel through the same four buckets here so the FE renders one
+    consistent status per shipment regardless of which distributor it came from:
+      "backordered"   — will ship, just not yet (Keystone ShipFlag B, Turn14 out_of_stock).
+      "not_orderable" — cannot ship from this warehouse at all (Keystone ShipFlag X).
+      "transfer"      — will ship via an inter-warehouse transfer (Keystone ShipFlag T).
+      "ordered"       — normal, in-stock fulfillment (the default/fallback).
+    """
+    if "backorder" in flags:
+        return "backordered"
+    if "not_orderable" in flags:
+        return "not_orderable"
+    if "transfer" in flags:
+        return "transfer"
+    return "ordered"
+
+
 def _run_quote(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrderAdapter) -> None:
     _ensure_po_number(po)
     ship_to = _ship_to_from_purchase_order(po)
@@ -253,12 +277,12 @@ def _run_quote(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrde
     shipments_by_key: typing.Dict[typing.Tuple, typing.Dict] = {}
     quote_line_shipment_ids: typing.Dict[int, str] = {}  # id(quote_line) -> shipment id
     for idx, ql in enumerate(result.lines):
-        is_backordered = "backorder" in ql.flags
-        key = (ql.warehouse_code, is_backordered) if ql.warehouse_code else ("__no_warehouse__", idx)
+        status = _shipment_status(ql.flags)
+        key = (ql.warehouse_code, status) if ql.warehouse_code else ("__no_warehouse__", idx)
         shipment = shipments_by_key.get(key)
         if shipment is None:
             shipment_id = (
-                "{}-{}".format(ql.warehouse_code, "backordered" if is_backordered else "available")
+                "{}-{}".format(ql.warehouse_code, status)
                 if ql.warehouse_code
                 else "shipment-{}".format(idx)
             )
@@ -266,7 +290,11 @@ def _run_quote(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrde
                 "id": shipment_id,
                 "warehouse_code": ql.warehouse_code,
                 "warehouse_name": ql.warehouse_name,
-                "is_backordered": is_backordered,
+                # One of "ordered"/"backordered"/"not_orderable"/"transfer" — see
+                # _shipment_status. Replaces the old boolean is_backordered, which had no room
+                # for Keystone's "not orderable"/"transfer" warehouses and silently lumped them
+                # in with "available".
+                "status": status,
                 "items": [],
                 "ship_options": [
                     {
@@ -298,7 +326,13 @@ def _run_quote(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrde
             {
                 "line_item_id": ql.line_item_id,
                 "provider_external_id": ql.provider_external_id,
-                "quantity": ql.quantity_backordered if is_backordered else ql.quantity_available,
+                # "ordered"/"transfer" both mean this quantity will actually ship — only
+                # "backordered"/"not_orderable" fall back to the unavailable-quantity bucket
+                # (see keystone.py's ShipFlag handling for why "not_orderable" also populates
+                # quantity_backordered, not a separate field).
+                "quantity": (
+                    ql.quantity_available if status in ("ordered", "transfer") else ql.quantity_backordered
+                ),
                 "unit_price": float(ql.distributor_unit_price) if ql.distributor_unit_price is not None else None,
                 "line_total": float(ql.distributor_line_total) if ql.distributor_line_total is not None else None,
             }

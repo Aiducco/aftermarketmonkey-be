@@ -2017,14 +2017,18 @@ class PurchaseOrder(django_db_models.Model):
     quoted_at = django_db_models.DateTimeField(null=True, blank=True)
 
     # Normalized (distributor-agnostic), PO-level breakdown of the last quote's shipments —
-    # one entry per distinct (warehouse, in-stock-vs-backordered) group, built once here rather
-    # than duplicated inside every line item's own shipments (see PurchaseOrderLineItem.shipments,
-    # which now only holds a lightweight {shipment_id, quantity_confirmed, quantity_backordered}
+    # one entry per distinct (warehouse, status) group, built once here rather than duplicated
+    # inside every line item's own shipments (see PurchaseOrderLineItem.shipments, which now
+    # only holds a lightweight {shipment_id, quantity_confirmed, quantity_backordered}
     # reference into this list):
-    # [{id, warehouse_code, warehouse_name, is_backordered,
+    # [{id, warehouse_code, warehouse_name, status,
     #   items: [{line_item_id, provider_external_id, quantity, unit_price, line_total}],
     #   ship_options: [{id, code, name, verbose_eta, days_in_transit, cost, estimated_delivery_date}],
     #   selected_ship_option_id}].
+    # `status` is one of "ordered"/"backordered"/"not_orderable"/"transfer" — see
+    # purchase_order_jobs._shipment_status. Distinguishes Keystone's four ShipFlag outcomes
+    # (only two of which — ordered/backordered — Turn14 can ever report) instead of collapsing
+    # "not orderable" and "transfer" into a bare in-stock-or-not boolean.
     # `ship_options[].id` is the distributor's own per-option identifier (base.ShipOption.
     # quote_option_id) — what submit_order actually sends to select that option, not
     # service_level_code (which can recur across shipments/quotes). `selected_ship_option_id`
