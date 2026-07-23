@@ -138,6 +138,20 @@ def _is_real_ship_option(row: typing.Dict[str, typing.Any]) -> bool:
     return "ThruDelivery" in row
 
 
+def _billable_quantity(ship_flag: str, quantity_available: int, quantity_backordered: int) -> int:
+    """
+    The quantity this warehouse-split should actually be priced/charged for. "Not orderable"
+    (ShipFlag X) is a hard cancellation — Keystone will never ship or bill for that quantity —
+    unlike a genuine backorder (ShipFlag B), which the distributor still charges for once it
+    ships. Without this distinction, ``quantity_available or quantity_backordered`` (the naive
+    "whichever is nonzero" pick) would price a cancelled quantity exactly like a backordered
+    one, silently inflating po.subtotal/total for units that will never actually be billed.
+    """
+    if ship_flag == "X":
+        return 0
+    return quantity_available or quantity_backordered
+
+
 def _filter_options(
     options: typing.List[base.ShipOption], ship_method: typing.Optional[str]
 ) -> typing.List[base.ShipOption]:
@@ -356,7 +370,7 @@ class KeystoneOrderAdapter(base.DistributorOrderAdapter):
                         # endpoint itself never returns pricing, unlike Turn14's.
                         distributor_unit_price=unit_price,
                         distributor_line_total=(
-                            unit_price * (quantity_available or quantity_backordered)
+                            unit_price * _billable_quantity(ship_flag, quantity_available, quantity_backordered)
                             if unit_price is not None
                             else None
                         ),
