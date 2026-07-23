@@ -12,12 +12,16 @@ when to refresh, not trusting the claim for authorization) to know when to re-au
 falling back to a conservative cache window if that claim is missing or the token can't be
 decoded.
 
-KNOWN DOCUMENTATION GAPS (see https://developer.premierwd.com/ — confirmed thin, no OpenAPI
-spec or working GitHub source found): no documented error-response body shape, no documented
-success HTTP status code for POST /sales-orders/, and — most importantly — the order-creation
-response does NOT include Premier's own order number. Every choice below that depends on one of
-these gaps is called out at the point it's made; treat this client as best-effort until
-confirmed against Premier's test environment.
+Re-confirmed against a full read of https://developer.premierwd.com/ (0.5.0, current as of this
+pass) — the docs are actually complete for every endpoint this client uses (inventory, pricing,
+tracking, sales-orders); the "thin docs" note from an earlier pass was wrong. Two real gaps
+remain, both because they're genuinely undocumented rather than missed: no documented
+error-response body shape, and no documented success HTTP status code for POST /sales-orders/
+(handled as "any 2xx", see _request). Most importantly, the documented POST /sales-orders/
+response example does NOT include Premier's own salesOrderNumber — confirmed directly from the
+docs' own example response, not inferred. Every choice below that depends on one of these gaps
+is called out at the point it's made; treat this client as best-effort until confirmed against
+Premier's test environment.
 
 SAFETY: ``create_sales_order`` places a REAL order against Premier — their docs state orders
 are committed immediately on POST, with no dry-run/preview mode. Must only ever be invoked from
@@ -208,6 +212,24 @@ class PremierOrderApiClient(object):
             batch = item_numbers[i : i + MAX_ITEMS_PER_BULK_REQUEST]
             data = self._request(
                 endpoint="inventory",
+                method=common_enums.HttpMethod.GET,
+                params={"itemNumbers": ",".join(batch)},
+            )
+            results.extend(data if isinstance(data, list) else [data])
+        return results
+
+    # -- Pricing --------------------------------------------------------------------------
+
+    def get_pricing(self, item_numbers: typing.List[str]) -> typing.List[typing.Dict]:
+        """GET /pricing. Up to 50 item numbers per call — batches internally if given more.
+        Returns cost/jobber/map/retail per item, once per currency (USD and, where the item has
+        Canadian pricing, CAD) — see PremierOrderAdapter._get_prices for how the right currency
+        row is picked per order."""
+        results: typing.List[typing.Dict] = []
+        for i in range(0, len(item_numbers), MAX_ITEMS_PER_BULK_REQUEST):
+            batch = item_numbers[i : i + MAX_ITEMS_PER_BULK_REQUEST]
+            data = self._request(
+                endpoint="pricing",
                 method=common_enums.HttpMethod.GET,
                 params={"itemNumbers": ",".join(batch)},
             )

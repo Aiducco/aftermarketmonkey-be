@@ -2,29 +2,32 @@
 PremierOrderAdapter — DistributorOrderAdapter implementation for Premier (APG Wholesale)'s v5
 REST Order API. Wraps ``src.integrations.clients.premier.order_client.PremierOrderApiClient``.
 
-Premier's public documentation (https://developer.premierwd.com/) is noticeably thinner than
-Turn14/Keystone/Meyer's — confirmed via multiple targeted lookups, not just a scraping gap (the
-docs page's own "View on GitHub" source link 404s, and there is no OpenAPI spec). Two real,
-confirmed limitations shape this adapter:
+Re-confirmed against a full read of https://developer.premierwd.com/ (v0.5.0) — contrary to an
+earlier pass's note, the docs are actually complete for every endpoint used here. Two real
+limitations remain, both confirmed directly from the docs rather than inferred:
 
 1. There is NO shipping/freight-quote endpoint at all. Premier's docs state orders are
    committed immediately on POST with no dry-run/preview mode, so get_shipping_quote() can only
-   report availability (via GET /inventory) — every ShippingQuoteLine's ship_options is empty,
-   never priced. This is a hard API limitation, not something this adapter is missing.
+   report availability (via GET /inventory) and pricing (via GET /pricing) — every
+   ShippingQuoteLine's ship_options is empty, never priced/scheduled. This is a hard API
+   limitation, not something this adapter is missing.
 2. The order-creation response does NOT include Premier's own order number — it only echoes
-   back what was submitted. Since GET /sales-orders/{salesOrderNumber} needs exactly that
-   number, it's unusable right after submission. This adapter uses ``purchase_order.po_number``
-   (Premier's ``customerPurchaseOrderNumber``) as the distributor_order_number throughout, and
-   polls status via GET /tracking?purchaseOrderNumber=... instead — the only documented lookup
-   keyed by something we actually have. This is inferred, not documented; verify against
-   Premier's test environment before relying on it in production.
+   back what was submitted (confirmed directly from the docs' own POST /sales-orders/ example
+   response). Since GET /sales-orders/{salesOrderNumber} needs exactly that number, it's
+   unusable right after submission. This adapter uses ``purchase_order.po_number`` (Premier's
+   ``customerPurchaseOrderNumber``) as the distributor_order_number throughout, and polls status
+   via GET /tracking?purchaseOrderNumber=... instead — the only documented lookup keyed by
+   something we actually have.
 
 SAFETY: submit_order() places a REAL order against Premier — their docs describe no dry-run
 mode at all, even for a "testing" environment. Must only ever be invoked from an explicit,
 user-approved submission. There is no cancel endpoint — see cancel_order() below.
 """
+import decimal
 import logging
 import typing
+
+from django.conf import settings
 
 from src import enums as src_enums
 from src import models as src_models
@@ -36,6 +39,22 @@ from src.integrations.orders import exceptions as order_exceptions
 
 logger = logging.getLogger(__name__)
 _LOG_PREFIX = "[PREMIER-ORDER-ADAPTER]"
+
+# Premier's own "Warehouse Code List" (https://developer.premierwd.com/#sales-orders) — unlike
+# Turn14/Meyer, this is a small, static, fully-documented table, so no location-sync job/table
+# is needed here; "City, ST"-style label to match the convention Turn14/Keystone already use.
+# *Idaho was renamed Utah per Premier's docs — the API still accepts the old code and converts
+# it, so it's mapped here too for display purposes.
+_WAREHOUSE_NAMES = {
+    "UT-1-US": "Utah Warehouse",
+    "ID-1-US": "Utah Warehouse",
+    "KY-1-US": "Kentucky Warehouse",
+    "CA-1-US": "California Warehouse",
+    "TX-1-US": "Texas Warehouse",
+    "WA-1-US": "Washington Warehouse",
+    "CO-1-US": "Colorado Warehouse",
+    "AB-1-CA": "Alberta Warehouse",
+}
 
 # Verbatim from Premier's docs (https://developer.premierwd.com/#sales-orders) — a mix of named
 # and numeric carrier service codes, no carrier/name breakdown given for the numeric ones.
@@ -55,18 +74,73 @@ _SHIP_METHOD_CODES = [
 ]
 
 
+def _best_candidate_warehouse(inventory_rows: typing.List[typing.Dict], country: typing.Optional[str]) -> typing.Optional[str]:
+    """Best-effort fulfillment-warehouse guess for display at quote time: the matching-country
+    warehouse (codes end "-US"/"-CA") with the most available stock. Premier's own "Warehouse
+    Auto-selection" (docs: closest domestic warehouse with inventory) depends on geocoding we
+    don't have, so this can't be authoritative — the real warehouse actually used is only known
+    once the order is placed (see LineItemPlacement.warehouse_code, taken straight from
+    Premier's POST /sales-orders/ response)."""
+    suffix = "-CA" if (country or "").upper() in ("CA", "CAN", "CANADA") else "-US"
+    candidates = [
+        (w.get("warehouseCode"), w.get("quantityAvailable") or 0)
+        for w in inventory_rows
+        if (w.get("warehouseCode") or "").upper().endswith(suffix) and (w.get("quantityAvailable") or 0) > 0
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda c: c[1])[0]
+
+
 class PremierOrderAdapter(base.DistributorOrderAdapter):
     provider_kind = src_enums.BrandProviderKind.PREMIER_PERFORMANCE.value
 
     def __init__(self, company_provider: src_models.CompanyProviders) -> None:
         base.DistributorOrderAdapter.__init__(self, company_provider)
+        # Was previously omitted entirely, so every call silently defaulted to
+        # PremierOrderApiClient's own hardcoded "testing" regardless of
+        # settings.PREMIER_ORDER_ENVIRONMENT (already "production") — same
+        # getattr(settings, ..., "testing") pattern turn_14.py/meyer.py already use.
+        environment = getattr(settings, "PREMIER_ORDER_ENVIRONMENT", "testing")
         self._client = PremierOrderApiClient(
-            credentials=credentials_helper.get_order_credentials(company_provider)
+            credentials=credentials_helper.get_order_credentials(company_provider),
+            environment=environment,
         )
 
     def _handle_error(self, e: Exception) -> None:
         code = getattr(e, "code", None)
         raise order_exceptions.OrderValidationError(message=str(e), code=str(code) if code else None)
+
+    def _get_prices(self, item_numbers: typing.List[str], currency: str) -> typing.Dict[str, decimal.Decimal]:
+        """{item_number: cost} in the given currency ("USD"/"CAD") via GET /pricing — Premier's
+        own quoted dealer cost (what we pay Premier, not jobber/map/retail — same role Meyer's
+        ItemInformation/Turn14's inline quote pricing play for those adapters). Best-effort: a
+        failure here degrades to no distributor pricing for this quote rather than failing it
+        outright, matching MeyerOrderAdapter._get_item_info."""
+        try:
+            rows = self._client.get_pricing(item_numbers)
+        except premier_client_exceptions.PremierException:
+            logger.exception(
+                "{} get_pricing failed; quote will have no distributor pricing this round.".format(_LOG_PREFIX)
+            )
+            return {}
+
+        prices: typing.Dict[str, decimal.Decimal] = {}
+        for row in rows:
+            item_number = row.get("itemNumber", "")
+            if not item_number:
+                continue
+            for p in row.get("pricing") or []:
+                if (p.get("currency") or "").upper() != currency:
+                    continue
+                cost = p.get("cost")
+                if cost is not None:
+                    try:
+                        prices[item_number] = decimal.Decimal(str(cost))
+                    except decimal.InvalidOperation:
+                        pass
+                break
+        return prices
 
     # -- DistributorOrderAdapter ------------------------------------------------------------
 
@@ -84,6 +158,9 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
 
         logger.info("{} Inventory response: {}".format(_LOG_PREFIX, repr(inventory)[:4000]))
 
+        currency = "CAD" if (ship_to.country or "").upper() in ("CA", "CAN", "CANADA") else "USD"
+        prices = self._get_prices(item_numbers, currency)
+
         try:
             by_external_id = {li.provider_part.provider_external_id: li for li in line_items}
             lines: typing.List[base.ShippingQuoteLine] = []
@@ -93,10 +170,12 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
                 external_id = entry.get("itemNumber", "")
                 li = by_external_id.get(external_id)
                 seen.add(external_id)
-                total_available = sum(
-                    w.get("quantityAvailable", 0) or 0 for w in (entry.get("inventory") or [])
-                )
+                inventory_rows = entry.get("inventory") or []
+                total_available = sum(w.get("quantityAvailable", 0) or 0 for w in inventory_rows)
                 requested = li.quantity if li else 0
+                quantity_available = min(total_available, requested)
+                warehouse_code = _best_candidate_warehouse(inventory_rows, ship_to.country)
+                unit_price = prices.get(external_id)
                 # No freight-quote endpoint exists — ship_options is always empty (see module
                 # docstring). quantity_available is capped at what was actually requested;
                 # any shortfall is reported as backordered.
@@ -104,9 +183,15 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
                     base.ShippingQuoteLine(
                         line_item_id=li.line_item_id if li else 0,
                         provider_external_id=external_id,
-                        quantity_available=min(total_available, requested),
+                        quantity_available=quantity_available,
                         quantity_backordered=max(requested - total_available, 0),
+                        warehouse_code=warehouse_code,
+                        warehouse_name=_WAREHOUSE_NAMES.get(warehouse_code) if warehouse_code else None,
                         flags=[] if total_available >= requested else ["backorder"],
+                        distributor_unit_price=unit_price,
+                        distributor_line_total=(
+                            unit_price * quantity_available if unit_price is not None else None
+                        ),
                     )
                 )
 
