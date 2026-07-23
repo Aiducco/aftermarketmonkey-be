@@ -9,8 +9,9 @@ limitations remain, both confirmed directly from the docs rather than inferred:
 1. There is NO shipping/freight-quote endpoint at all. Premier's docs state orders are
    committed immediately on POST with no dry-run/preview mode, so get_shipping_quote() can only
    report availability (via GET /inventory) and pricing (via GET /pricing) — every
-   ShippingQuoteLine's ship_options is empty, never priced/scheduled. This is a hard API
-   limitation, not something this adapter is missing.
+   ShippingQuoteLine's ship_options comes from the static, documented Ship Method List instead
+   (see _static_ship_options) and is never priced/scheduled like Turn14/Keystone/Meyer's. This
+   is a hard API limitation, not something this adapter is missing.
 2. The order-creation response does NOT include Premier's own order number — it only echoes
    back what was submitted (confirmed directly from the docs' own POST /sales-orders/ example
    response). Since GET /sales-orders/{salesOrderNumber} needs exactly that number, it's
@@ -45,6 +46,10 @@ _LOG_PREFIX = "[PREMIER-ORDER-ADAPTER]"
 # is needed here; "City, ST"-style label to match the convention Turn14/Keystone already use.
 # *Idaho was renamed Utah per Premier's docs — the API still accepts the old code and converts
 # it, so it's mapped here too for display purposes.
+# CONFIRMED INCOMPLETE: a live quote returned "NV-1-US" (Nevada), which isn't in Premier's own
+# documented table at all — added here from the same "<State> Warehouse" naming pattern as the
+# rest, but treat this list as best-effort; any other undocumented code just falls back to None
+# (see get_shipping_quote) rather than guessing further.
 _WAREHOUSE_NAMES = {
     "UT-1-US": "Utah Warehouse",
     "ID-1-US": "Utah Warehouse",
@@ -54,6 +59,7 @@ _WAREHOUSE_NAMES = {
     "WA-1-US": "Washington Warehouse",
     "CO-1-US": "Colorado Warehouse",
     "AB-1-CA": "Alberta Warehouse",
+    "NV-1-US": "Nevada Warehouse",
 }
 
 # Verbatim from Premier's docs (https://developer.premierwd.com/#sales-orders) — a mix of named
@@ -90,6 +96,26 @@ def _premier_item_number(provider_part: src_models.ProviderPart) -> str:
     ext_id = provider_part.provider_external_id or ""
     _, _, remainder = ext_id.partition("_")
     return (remainder or ext_id).strip()
+
+
+def _static_ship_options(ship_method: typing.Optional[str]) -> typing.List[base.ShipOption]:
+    """Premier's GET /inventory carries no per-method cost/date at all — there is no
+    shipping/freight-quote endpoint (see module docstring) — so, unlike Turn14/Keystone/Meyer,
+    these options can never be priced or scheduled. But POST /sales-orders/'s shipMethod field
+    does accept any of the documented Ship Method List codes (_SHIP_METHOD_CODES, the same
+    catalog list_shipping_methods() already exposes), so ship_options is populated from that
+    static list rather than left empty — otherwise the FE has nothing to let a user pick from
+    at all, despite supports_shipping_method_selection() being True. Once ship_method is set
+    (a previous selection, or a re-quote), narrow to just that one code, matching every other
+    adapter's _filter_options."""
+    options = [
+        base.ShipOption(service_level_code=code, service_level_name=code, quote_option_id=code)
+        for code in _SHIP_METHOD_CODES
+    ]
+    if not ship_method:
+        return options
+    filtered = [o for o in options if o.service_level_code == ship_method]
+    return filtered or options
 
 
 def _best_candidate_warehouse(inventory_rows: typing.List[typing.Dict], country: typing.Optional[str]) -> typing.Optional[str]:
@@ -179,6 +205,7 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
 
         currency = "CAD" if (ship_to.country or "").upper() in ("CA", "CAN", "CANADA") else "USD"
         prices = self._get_prices(item_numbers, currency)
+        ship_options = _static_ship_options(ship_method)
 
         try:
             by_external_id = {_premier_item_number(li.provider_part): li for li in line_items}
@@ -195,9 +222,10 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
                 quantity_available = min(total_available, requested)
                 warehouse_code = _best_candidate_warehouse(inventory_rows, ship_to.country)
                 unit_price = prices.get(external_id)
-                # No freight-quote endpoint exists — ship_options is always empty (see module
-                # docstring). quantity_available is capped at what was actually requested;
-                # any shortfall is reported as backordered.
+                # quantity_available is capped at what was actually requested; any shortfall is
+                # reported as backordered. ship_options is the static method catalog (see
+                # _static_ship_options) — never priced/scheduled, since no freight-quote
+                # endpoint exists, but still selectable.
                 lines.append(
                     base.ShippingQuoteLine(
                         line_item_id=li.line_item_id if li else 0,
@@ -206,6 +234,7 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
                         quantity_backordered=max(requested - total_available, 0),
                         warehouse_code=warehouse_code,
                         warehouse_name=_WAREHOUSE_NAMES.get(warehouse_code) if warehouse_code else None,
+                        ship_options=ship_options,
                         flags=[] if total_available >= requested else ["backorder"],
                         distributor_unit_price=unit_price,
                         distributor_line_total=(
