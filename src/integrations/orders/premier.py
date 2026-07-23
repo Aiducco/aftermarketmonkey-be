@@ -74,6 +74,24 @@ _SHIP_METHOD_CODES = [
 ]
 
 
+def _premier_item_number(provider_part: src_models.ProviderPart) -> str:
+    """Premier's real itemNumber — NOT ProviderPart.provider_external_id, which for Premier is a
+    composite ``"{premier_brand_id}_{premier_part_number}"`` key (see
+    master_parts._premier_provider_external_id), needed only for our own DB uniqueness since the
+    same premier_part_number can recur across different Premier brands. Sending that composite
+    key straight to Premier's API would never match a real item — every quote/submit call would
+    silently fail to find anything. product_details' "sku" entry (see
+    master_parts._premier_product_details) carries the raw number directly; fall back to
+    splitting provider_external_id on its first "_" (the brand id prefix is always purely
+    numeric, so this is safe) if product_details is ever missing/stale."""
+    for entry in provider_part.product_details or []:
+        if entry.get("key") == "sku" and entry.get("value"):
+            return str(entry["value"]).strip()
+    ext_id = provider_part.provider_external_id or ""
+    _, _, remainder = ext_id.partition("_")
+    return (remainder or ext_id).strip()
+
+
 def _best_candidate_warehouse(inventory_rows: typing.List[typing.Dict], country: typing.Optional[str]) -> typing.Optional[str]:
     """Best-effort fulfillment-warehouse guess for display at quote time: the matching-country
     warehouse (codes end "-US"/"-CA") with the most available stock. Premier's own "Warehouse
@@ -151,7 +169,7 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
         ship_to: base.ShipToAddress,
         ship_method: typing.Optional[str] = None,
     ) -> base.ShippingQuoteResult:
-        item_numbers = [li.provider_part.provider_external_id for li in line_items]
+        item_numbers = [_premier_item_number(li.provider_part) for li in line_items]
         try:
             inventory = self._client.get_inventory(item_numbers)
         except premier_client_exceptions.PremierException as e:
@@ -163,7 +181,7 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
         prices = self._get_prices(item_numbers, currency)
 
         try:
-            by_external_id = {li.provider_part.provider_external_id: li for li in line_items}
+            by_external_id = {_premier_item_number(li.provider_part): li for li in line_items}
             lines: typing.List[base.ShippingQuoteLine] = []
             seen: typing.Set[str] = set()
 
@@ -245,7 +263,7 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
                 "phone": phone_digits,
             },
             "salesOrderLines": [
-                {"itemNumber": li.provider_part.provider_external_id, "quantity": li.quantity}
+                {"itemNumber": _premier_item_number(li.provider_part), "quantity": li.quantity}
                 for li in line_items
             ],
         }
@@ -266,13 +284,13 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
         line_items: typing.List[base.OrderLineItemRequest],
     ) -> base.DistributorOrderResult:
         try:
-            by_external_id = {li.provider_part.provider_external_id: li for li in line_items}
+            by_external_id = {_premier_item_number(li.provider_part): li for li in line_items}
             placements: typing.List[base.LineItemPlacement] = []
             # Premier's response only echoes back what was submitted (no confirmed-vs-requested
             # signal, no per-line pricing) — see module docstring. Fall back to our own request
             # data if the response is missing/malformed rather than failing a placed order.
             response_lines = response.get("salesOrderLines") or [
-                {"itemNumber": li.provider_part.provider_external_id, "quantity": li.quantity}
+                {"itemNumber": _premier_item_number(li.provider_part), "quantity": li.quantity}
                 for li in line_items
             ]
             for line in response_lines:
