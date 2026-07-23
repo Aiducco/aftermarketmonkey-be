@@ -64,6 +64,22 @@ def _filter_options(
     return filtered or options
 
 
+def _load_meyer_warehouse_names() -> typing.Dict[str, str]:
+    """{external_id: "City, ST"} from MeyerLocation (populated by fetch_meyer_locations from
+    GET /Warehouses), so quote responses can show a real place instead of a bare code like
+    "053" — same role turn_14.py's _load_warehouse_names plays for Turn14, except Meyer has no
+    separate "name" field, just city/state/country."""
+    names = {}
+    for row in src_models.MeyerLocation.objects.all().values("external_id", "city", "state"):
+        external_id = (row.get("external_id") or "").strip()
+        if not external_id:
+            continue
+        label = ", ".join(part for part in (row.get("city"), row.get("state")) if part)
+        if label:
+            names[external_id] = label
+    return names
+
+
 class MeyerOrderAdapter(base.DistributorOrderAdapter):
     provider_kind = src_enums.BrandProviderKind.MEYER.value
 
@@ -151,6 +167,7 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
         logger.info("{} Quote response: {}".format(_LOG_PREFIX, repr(groups)[:4000]))
 
         item_info = self._get_item_info([li.provider_part.provider_external_id for li in line_items])
+        warehouse_names = _load_meyer_warehouse_names()
 
         try:
             by_external_id = {li.provider_part.provider_external_id: li for li in line_items}
@@ -197,6 +214,7 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
                             # for the quantity we requested.
                             quantity_available=quantity_available,
                             warehouse_code=warehouse,
+                            warehouse_name=warehouse_names.get(warehouse) if warehouse else None,
                             ship_options=ship_options,
                             flags=["prop_65"] if info.get("prop_65") else [],
                             # From ItemInformation (see _get_item_info) — Meyer's shipping-quote

@@ -212,6 +212,13 @@ class MeyerOrderApiClient(object):
         result = self._request(endpoint="ShipMethods", method=common_enums.HttpMethod.GET)
         return result if isinstance(result, list) else [result]
 
+    def get_warehouses(self) -> typing.List[typing.Dict]:
+        """GET /Warehouses. All active Meyer warehouses — {LocationCode, City, State, Country}
+        — used to decode a shipping quote's bare warehouse code into a human-readable location
+        (see fetch_and_save_meyer_locations / MeyerLocation)."""
+        result = self._request(endpoint="Warehouses", method=common_enums.HttpMethod.GET)
+        return result if isinstance(result, list) else [result]
+
     def test_connection(self) -> None:
         """Cheap connectivity/auth probe — ShipMethods takes no parameters and doesn't need
         customer_number, so a successful call proves the api_key alone is valid, without

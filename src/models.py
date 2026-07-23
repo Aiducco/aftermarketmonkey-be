@@ -301,6 +301,25 @@ class Turn14Location(django_db_models.Model):
         unique_together = ["external_id"]
 
 
+class MeyerLocation(django_db_models.Model):
+    """Meyer warehouse locations from the Order API's GET /Warehouses (see
+    fetch_and_save_meyer_locations) — decodes a shipping quote's bare warehouse code
+    (e.g. "053") into a human-readable place, the same role Turn14Location plays for Turn14.
+    Meyer's Warehouses response is narrower than Turn14's locations (no name/street/zip), just
+    LocationCode/City/State/Country."""
+    external_id = django_db_models.CharField(max_length=32)  # Meyer's "LocationCode"
+    city = django_db_models.CharField(max_length=255, blank=True)
+    state = django_db_models.CharField(max_length=64, blank=True)
+    country = django_db_models.CharField(max_length=64, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "meyer_locations"
+        unique_together = ["external_id"]
+
+
 class CompanyBrands(django_db_models.Model):
     company = django_db_models.ForeignKey(Company, on_delete=django_db_models.CASCADE, related_name="brands")
     brand = django_db_models.ForeignKey(Brands, on_delete=django_db_models.CASCADE, related_name="brands")

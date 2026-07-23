@@ -20,6 +20,7 @@ from src import models as src_models
 from src.integrations import credentials as credentials_helper
 from src.integrations.clients.meyer import client as meyer_client
 from src.integrations.clients.meyer import exceptions as meyer_exceptions
+from src.integrations.clients.meyer.order_client import MeyerOrderApiClient
 from src.integrations.utils.brand_matching import (
     best_fuzzy_brand_match,
     brands_by_compact_key,
@@ -207,6 +208,70 @@ def _primary_meyer_company_provider() -> typing.Optional[src_models.CompanyProvi
     if cp:
         return cp
     return base.first()
+
+
+def fetch_and_save_meyer_locations() -> None:
+    """Fetch Meyer warehouses from the Order API's GET /Warehouses and upsert into MeyerLocation
+    — decodes a shipping quote's bare warehouse code (e.g. "053") into a human-readable place,
+    the same role fetch_and_save_turn_14_locations plays for Turn14Location. Uses the primary
+    company's Meyer **order** credentials (order.py's MeyerOrderAdapter uses the same pair), not
+    the feed/SFTP credentials the rest of this module uses."""
+    logger.info("{} Started fetching and saving Meyer locations.".format(_LOG_PREFIX))
+
+    primary_provider = _primary_meyer_company_provider()
+    if not primary_provider:
+        logger.info("{} No active Meyer CompanyProviders row found.".format(_LOG_PREFIX))
+        return
+
+    order_credentials = credentials_helper.get_order_credentials(primary_provider)
+    environment = getattr(settings, "MEYER_ORDER_ENVIRONMENT", "testing")
+    try:
+        api_client = MeyerOrderApiClient(credentials=order_credentials, environment=environment)
+    except ValueError as e:
+        logger.error("{} Invalid order credentials: {}".format(_LOG_PREFIX, str(e)))
+        raise
+
+    try:
+        warehouses = api_client.get_warehouses()
+    except meyer_exceptions.MeyerException as e:
+        logger.error("{} Meyer API error: {}".format(_LOG_PREFIX, str(e)))
+        raise
+
+    if not warehouses:
+        logger.warning("{} No warehouses returned from Meyer API.".format(_LOG_PREFIX))
+        return
+
+    now = timezone.now()
+    instances = []
+    for item in warehouses:
+        external_id = str(item.get("LocationCode", "")).strip()
+        if not external_id:
+            continue
+        instances.append(
+            src_models.MeyerLocation(
+                external_id=external_id,
+                city=str(item.get("City", "")).strip(),
+                state=str(item.get("State", "")).strip(),
+                country=str(item.get("Country", "")).strip(),
+                updated_at=now,
+            )
+        )
+    if not instances:
+        logger.warning("{} No valid location instances after transformation.".format(_LOG_PREFIX))
+        return
+
+    try:
+        pgbulk.upsert(
+            src_models.MeyerLocation,
+            instances,
+            unique_fields=["external_id"],
+            update_fields=["city", "state", "country", "updated_at"],
+        )
+    except Exception as e:
+        logger.error("{} Error during locations upsert: {}".format(_LOG_PREFIX, str(e)))
+        raise
+
+    logger.info("{} Successfully upserted {} Meyer locations.".format(_LOG_PREFIX, len(instances)))
 
 
 def fetch_and_save_meyer_brands() -> None:
