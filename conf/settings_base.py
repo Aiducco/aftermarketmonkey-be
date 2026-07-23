@@ -318,15 +318,17 @@ MEYER_INVENTORY_LOCAL_PATH = os.environ.get("MEYER_INVENTORY_LOCAL_PATH", "/tmp/
 
 # Meyer Order API (REST, static Espresso apikey issued directly by a Meyer rep) — separate
 # hosts for their "testing" and "production" environments, same pattern as Turn14's order API
-# split. Defaults to "testing" for now — flip to "production" (or set MEYER_ORDER_ENVIRONMENT)
-# once Meyer order placement has been verified end-to-end against the test API.
+# split. Flipped to production (same move as Turn14's TURN14_ORDER_ENVIRONMENT) — the stored
+# CompanyProviders order api_keys are production keys, rejected outright by the test host, so
+# "testing" was never actually reachable with real credentials. Can still be overridden with
+# MEYER_ORDER_ENVIRONMENT.
 MEYER_ORDER_TEST_BASE_URL = os.environ.get(
     "MEYER_ORDER_TEST_BASE_URL", "https://meyerapitest.meyerdistributing.com/http/default/TestAPI/v2"
 )
 MEYER_ORDER_PRODUCTION_BASE_URL = os.environ.get(
     "MEYER_ORDER_PRODUCTION_BASE_URL", "https://meyerapi.meyerdistributing.com/http/default/ProdAPI/v2"
 )
-MEYER_ORDER_ENVIRONMENT = os.environ.get("MEYER_ORDER_ENVIRONMENT", "testing")
+MEYER_ORDER_ENVIRONMENT = os.environ.get("MEYER_ORDER_ENVIRONMENT", "production")
 
 # Meyer's API hosts don't complete a TLS handshake from arbitrary IPs (confirmed: TCP connects,
 # ClientHello sent, no ServerHello ever comes back) — almost certainly IP allowlisting on their
