@@ -66,9 +66,12 @@ class ShipOption:
 
 @dataclasses.dataclass
 class LinePromotion:
-    """A distributor-applied discount on a quoted line (e.g. Turn14's per-item pricing
-    promos) — already netted into the distributor's own unit_price/line_total in the raw
-    response. Subtracted from ShippingQuoteLine.distributor_line_total to produce
+    """A distributor-applied discount on a quoted line (e.g. Turn14's per-item pricing promos)
+    — NOT already netted into the distributor's own unit_price/line_total in the raw response;
+    adapters must compute and attach it separately (see turn_14.py: Turn14 reports a per-unit
+    promo_amount plus a promo_qty, and ``amount`` here must be the two multiplied together — the
+    real total to deduct — not the bare per-unit rate). Subtracted from
+    ShippingQuoteLine.distributor_line_total to produce
     PurchaseOrderLineItem.distributor_net_line_total, which IS what feeds po.subtotal (see
     compute_totals) — this never touches unit_cost/line_total themselves, which stay our
     frozen catalog pricing regardless."""

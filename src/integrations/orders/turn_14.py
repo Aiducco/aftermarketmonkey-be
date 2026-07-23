@@ -163,14 +163,26 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
             promotions_by_item_id: typing.Dict[str, typing.List[base.LinePromotion]] = {}
             for promo in attrs.get("promos", []):
                 item_id = str(promo.get("item_id", ""))
+                # promo_amount is PER-UNIT; promo_total (= promo_amount * promo_qty) is the real
+                # total to deduct from this item's gross line total. Using promo_amount alone (as
+                # if it were the whole line's discount) undercounts the deduction by a factor of
+                # promo_qty — confirmed against a live quote: a 9-unit line with a $22.61/unit,
+                # 7% promo has promo_total=$203.49, not $22.61; using promo_amount alone left
+                # po.subtotal $180.88 higher than Turn14's own distributor_quoted_total.
+                if promo.get("promo_total") is not None:
+                    promo_amount = decimal.Decimal(str(promo["promo_total"]))
+                elif promo.get("promo_amount") is not None and promo.get("promo_qty") is not None:
+                    promo_amount = decimal.Decimal(str(promo["promo_amount"])) * decimal.Decimal(
+                        str(promo["promo_qty"])
+                    )
+                elif promo.get("promo_amount") is not None:
+                    promo_amount = decimal.Decimal(str(promo["promo_amount"]))
+                else:
+                    promo_amount = None
                 promotions_by_item_id.setdefault(item_id, []).append(
                     base.LinePromotion(
                         description=promo.get("promo_description") or "",
-                        amount=(
-                            decimal.Decimal(str(promo["promo_amount"]))
-                            if promo.get("promo_amount") is not None
-                            else None
-                        ),
+                        amount=promo_amount,
                     )
                 )
 
