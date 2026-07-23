@@ -225,13 +225,13 @@ def _shipment_status(flags: typing.List[str]) -> str:
     po.shipments (see _run_quote below), replacing a boolean ``is_backordered`` that only had
     room for two states. Keystone alone can report four distinct ShipFlag values per warehouse
     (O/orderable, X/not orderable, B/backordered, T/transfer — see
-    src/integrations/orders/keystone.py); Turn14 only ever reports "ordered" or "backordered".
+    src/integrations/orders/keystone.py); Turn14 only ever reports "in_stock" or "backordered".
     Every adapter's flags funnel through the same four buckets here so the FE renders one
     consistent status per shipment regardless of which distributor it came from:
       "backordered"   — will ship, just not yet (Keystone ShipFlag B, Turn14 out_of_stock).
       "not_orderable" — cannot ship from this warehouse at all (Keystone ShipFlag X).
       "transfer"      — will ship via an inter-warehouse transfer (Keystone ShipFlag T).
-      "ordered"       — normal, in-stock fulfillment (the default/fallback).
+      "in_stock"      — normal, in-stock fulfillment (the default/fallback).
     """
     if "backorder" in flags:
         return "backordered"
@@ -239,7 +239,7 @@ def _shipment_status(flags: typing.List[str]) -> str:
         return "not_orderable"
     if "transfer" in flags:
         return "transfer"
-    return "ordered"
+    return "in_stock"
 
 
 def _run_quote(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrderAdapter) -> None:
@@ -290,7 +290,7 @@ def _run_quote(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrde
                 "id": shipment_id,
                 "warehouse_code": ql.warehouse_code,
                 "warehouse_name": ql.warehouse_name,
-                # One of "ordered"/"backordered"/"not_orderable"/"transfer" — see
+                # One of "in_stock"/"backordered"/"not_orderable"/"transfer" — see
                 # _shipment_status. Replaces the old boolean is_backordered, which had no room
                 # for Keystone's "not orderable"/"transfer" warehouses and silently lumped them
                 # in with "available".
@@ -326,12 +326,12 @@ def _run_quote(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrde
             {
                 "line_item_id": ql.line_item_id,
                 "provider_external_id": ql.provider_external_id,
-                # "ordered"/"transfer" both mean this quantity will actually ship — only
+                # "in_stock"/"transfer" both mean this quantity will actually ship — only
                 # "backordered"/"not_orderable" fall back to the unavailable-quantity bucket
                 # (see keystone.py's ShipFlag handling for why "not_orderable" also populates
                 # quantity_backordered, not a separate field).
                 "quantity": (
-                    ql.quantity_available if status in ("ordered", "transfer") else ql.quantity_backordered
+                    ql.quantity_available if status in ("in_stock", "transfer") else ql.quantity_backordered
                 ),
                 "unit_price": float(ql.distributor_unit_price) if ql.distributor_unit_price is not None else None,
                 "line_total": float(ql.distributor_line_total) if ql.distributor_line_total is not None else None,

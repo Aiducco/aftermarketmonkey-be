@@ -2025,9 +2025,9 @@ class PurchaseOrder(django_db_models.Model):
     #   items: [{line_item_id, provider_external_id, quantity, unit_price, line_total}],
     #   ship_options: [{id, code, name, verbose_eta, days_in_transit, cost, estimated_delivery_date}],
     #   selected_ship_option_id}].
-    # `status` is one of "ordered"/"backordered"/"not_orderable"/"transfer" — see
+    # `status` is one of "in_stock"/"backordered"/"not_orderable"/"transfer" — see
     # purchase_order_jobs._shipment_status. Distinguishes Keystone's four ShipFlag outcomes
-    # (only two of which — ordered/backordered — Turn14 can ever report) instead of collapsing
+    # (only two of which — in_stock/backordered — Turn14 can ever report) instead of collapsing
     # "not orderable" and "transfer" into a bare in-stock-or-not boolean.
     # `ship_options[].id` is the distributor's own per-option identifier (base.ShipOption.
     # quote_option_id) — what submit_order actually sends to select that option, not
