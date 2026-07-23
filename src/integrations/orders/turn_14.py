@@ -89,10 +89,10 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
             "country": ship_to.country,
             "zip": ship_to.postal_code,
             "phone_number": ship_to.phone or "",
-            # We don't yet distinguish "shipping to the shop's own address" from "drop-shipping
-            # to an end customer" at the internal PO level, so default to the drop-ship (False)
-            # semantics — this is informational to Turn 14, not fulfillment-blocking.
-            "is_shop_address": False,
+            # Set from the FE's review-cart request (ship_to.ship_to_my_shop) — see
+            # base.ShipToAddress.is_shop_address. Informational to Turn 14, not
+            # fulfillment-blocking; defaults False (drop-ship) when the FE doesn't send it.
+            "is_shop_address": ship_to.is_shop_address,
         }
         if ship_to.address2:
             recipient["address_2"] = ship_to.address2

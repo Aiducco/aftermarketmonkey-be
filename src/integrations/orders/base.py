@@ -30,6 +30,11 @@ class ShipToAddress:
     attention: typing.Optional[str] = None
     phone: typing.Optional[str] = None
     email: typing.Optional[str] = None
+    # Ship to the shop's own address (True) vs. drop-ship to an end customer (False) — set from
+    # the FE's review-cart request and passed through to whichever adapter has an equivalent
+    # concept (currently only Turn14's recipient.is_shop_address; see turn_14.py). Defaults False
+    # to match the hardcoded value every adapter used before this field existed.
+    is_shop_address: bool = False
 
 
 @dataclasses.dataclass

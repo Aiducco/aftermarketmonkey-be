@@ -127,6 +127,7 @@ def _ship_to_from_purchase_order(po: src_models.PurchaseOrder) -> order_base.Shi
         country=po.ship_to_country,
         attention=po.ship_to_attention,
         phone=po.ship_to_phone,
+        is_shop_address=po.ship_to_is_shop_address,
     )
 
 

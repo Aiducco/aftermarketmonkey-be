@@ -161,6 +161,7 @@ def _serialize_purchase_order(po: src_models.PurchaseOrder, include_line_items: 
             "postal_code": po.ship_to_postal_code,
             "country": po.ship_to_country,
             "phone": po.ship_to_phone,
+            "ship_to_my_shop": po.ship_to_is_shop_address,
         }
         if po.ship_to_address1
         else None,
@@ -525,6 +526,10 @@ def review_cart(
         po.ship_to_postal_code = ship_to["postal_code"]
         po.ship_to_country = ship_to["country"]
         po.ship_to_phone = ship_to.get("phone")
+        # Passed straight through to Turn14 as recipient.is_shop_address (see
+        # _ship_to_from_purchase_order / turn_14.py) — distinguishes "ship to the shop's own
+        # address" from "drop-ship to an end customer". Defaults False when the FE omits it.
+        po.ship_to_is_shop_address = bool(ship_to.get("ship_to_my_shop"))
         po.ship_method = ship_methods.get(str(po.id))
         po.save(
             update_fields=[
@@ -538,6 +543,7 @@ def review_cart(
                 "ship_to_postal_code",
                 "ship_to_country",
                 "ship_to_phone",
+                "ship_to_is_shop_address",
                 "ship_method",
                 "updated_at",
             ]

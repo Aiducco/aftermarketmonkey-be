@@ -2010,6 +2010,12 @@ class PurchaseOrder(django_db_models.Model):
     ship_to_postal_code = django_db_models.CharField(max_length=32, null=True, blank=True)
     ship_to_country = django_db_models.CharField(max_length=64, null=True, blank=True)
     ship_to_phone = django_db_models.CharField(max_length=32, null=True, blank=True)
+    # Set from the FE's review-cart request ({"ship_to": {..., "ship_to_my_shop": true}}).
+    # Distinguishes "ship to the shop's own address" from "drop-ship to an end customer" —
+    # passed straight through to Turn14 as recipient.is_shop_address (see turn_14.py's
+    # _build_recipient). Defaults False (drop-ship) to match the field's prior hardcoded value
+    # before this flag existed, so an FE that doesn't send it yet sees no behavior change.
+    ship_to_is_shop_address = django_db_models.BooleanField(default=False)
     ship_method = django_db_models.CharField(max_length=64, null=True, blank=True)
 
     # Quote snapshot from the distributor adapter's get_shipping_quote(), before submit.
