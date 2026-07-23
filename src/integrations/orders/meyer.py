@@ -35,6 +35,12 @@ _LOG_PREFIX = "[MEYER-ORDER-ADAPTER]"
 # Meyer's docs — cancel_order() must return False for these (per base.py's contract), not raise.
 _CANCEL_NOT_CANCELLABLE_CODES = {"60501", "60502"}
 
+# GET /Invoice error codes meaning "nothing has invoiced yet" (40400: no OrderNumber matched,
+# 70202: "No invoice found for [OrderNumber]") — get_invoices() must return an empty list for
+# these, not raise, since it's a routine/expected state for most of a PO's lifetime before
+# anything ships.
+_NO_INVOICE_YET_CODES = {"40400", "70202"}
+
 # Meyer's own documented cap on how many item numbers ItemInformation accepts per call.
 _ITEM_INFORMATION_CHUNK_SIZE = 100
 
@@ -91,6 +97,34 @@ def _parse_meyer_delivery(
         return None, None
     delta = (estimated_delivery_date - today).days
     return estimated_delivery_date, (delta if delta >= 0 else None)
+
+
+def _parse_meyer_date(value: typing.Optional[str]) -> typing.Optional[datetime.date]:
+    """Plain M/D/YYYY date parsing for header fields like Invoice.InvoiceDate/OrderDate — unlike
+    _parse_meyer_delivery, these are never a business-days estimate string."""
+    if not value or not value.strip():
+        return None
+    try:
+        return datetime.datetime.strptime(value.strip(), "%m/%d/%Y").date()
+    except ValueError:
+        return None
+
+
+def _summarize_meyer_tracking(
+    rows: typing.List[typing.Dict],
+) -> typing.Tuple[typing.Optional[datetime.date], typing.Optional[str]]:
+    """Collapses GET /SalesTracking's per-tracking-number rows (one order can have several) into
+    one (estimated_delivery_date, delivery_status) pair for DistributorOrderStatus. Meyer only
+    ever populates DeliveryDate for a delivered Meyer Truck shipment (per its docs) — treated as
+    the strongest signal available; otherwise fall back to the earliest parsed DeliveryETA across
+    rows (reusing _parse_meyer_delivery, the same ETA-string parsing quote-time already uses) as
+    an in-transit estimate. Meyer never gives an actual ship date, only these two."""
+    if not rows:
+        return None, None
+    if any((r.get("DeliveryDate") or "").strip() for r in rows):
+        return None, "delivered"
+    etas = [d for d, _ in (_parse_meyer_delivery(r.get("DeliveryETA")) for r in rows) if d]
+    return (min(etas) if etas else None), ("in_transit" if etas else None)
 
 
 def _filter_options(
@@ -393,12 +427,38 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
             for order in orders:
                 order_number = order.get("OrderNumber", "")
                 invoiced = order.get("Invoiced", "")
-                tracking_numbers = list(order.get("Tracking") or [])
+                tracking_numbers = set(order.get("Tracking") or [])
+
+                # Best-effort: SalesOrderDetail's embedded Tracking[] has no ETA/delivered-date
+                # info at all — GET /SalesTracking is Meyer's only source for that (see
+                # _summarize_meyer_tracking). A failure here degrades to no date/delivery_status
+                # for this order rather than failing the whole status check, same reasoning as
+                # _sync_invoices in purchase_order_jobs.py: status/tracking-number data above
+                # already succeeded and is the primary result.
+                estimated_delivery_date, delivery_status = None, None
+                if order_number:
+                    try:
+                        tracking_rows = self._client.get_sales_tracking(
+                            customer_number=self._client.customer_number, order_number=order_number
+                        )
+                    except meyer_client_exceptions.MeyerException:
+                        logger.warning(
+                            "{} SalesTracking failed for order_number={}; delivery date/status "
+                            "unavailable this round.".format(_LOG_PREFIX, order_number)
+                        )
+                    else:
+                        tracking_numbers.update(
+                            t for t in (r.get("TrackingNumber") for r in tracking_rows) if t
+                        )
+                        estimated_delivery_date, delivery_status = _summarize_meyer_tracking(tracking_rows)
+
                 results.append(
                     base.DistributorOrderStatus(
                         distributor_order_number=order_number,
                         status_code="INVOICED" if invoiced == "Yes" else "OPEN",
-                        tracking_numbers=tracking_numbers,
+                        tracking_numbers=sorted(tracking_numbers),
+                        estimated_delivery_date=estimated_delivery_date,
+                        delivery_status=delivery_status,
                         raw_response=order,
                     )
                 )
@@ -409,6 +469,61 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
                 )
             )
         return base.OrderStatusResult(orders=results)
+
+    def supports_invoices(self) -> bool:
+        return True
+
+    def get_invoices(self, purchase_order: src_models.PurchaseOrder) -> typing.List[base.DistributorInvoice]:
+        try:
+            raw_invoices = self._client.get_invoice(
+                order_number=purchase_order.po_number, customer_number=self._client.customer_number
+            )
+        except meyer_client_exceptions.MeyerOrderValidationError as e:
+            if e.code in _NO_INVOICE_YET_CODES:
+                return []
+            self._handle_error(e)
+        except meyer_client_exceptions.MeyerException as e:
+            self._handle_error(e)
+
+        try:
+            invoices: typing.List[base.DistributorInvoice] = []
+            for inv in raw_invoices:
+                invoice_number = str(inv.get("InvoiceNumber", "")).strip()
+                if not invoice_number:
+                    continue
+                line_items = [
+                    base.InvoiceLineItem(
+                        part_number=item.get("ItemNumber"),
+                        quantity=item.get("Quantity"),
+                        unit_price=_parse_decimal(item.get("UnitPrice")),
+                        total_price=_parse_decimal(item.get("ExtendedPrice")),
+                    )
+                    for item in (inv.get("Items") or [])
+                ]
+                invoices.append(
+                    base.DistributorInvoice(
+                        invoice_number=invoice_number,
+                        invoice_date=_parse_meyer_date(inv.get("InvoiceDate")),
+                        distributor_order_number=inv.get("OrderNumber") or None,
+                        # Meyer's Invoice response has no separate "website order number"
+                        # concept, no paid_amount/amount_due, and no per-invoice tracking array
+                        # (that's SalesTracking/SalesOrderDetail's job) — left None/[] rather
+                        # than guessed. total_price already includes Tax/MiscCharge, which have
+                        # no dedicated field here; see raw_response for the full breakdown.
+                        total_price=_parse_decimal(inv.get("Total")),
+                        freight=_parse_decimal(inv.get("Freight")),
+                        discount_amount=_parse_decimal(inv.get("TradeDiscount")),
+                        line_items=line_items,
+                        raw_response=inv,
+                    )
+                )
+        except (AttributeError, TypeError, KeyError, IndexError) as e:
+            raise order_exceptions.OrderValidationError(
+                "Unexpected invoice response shape from Meyer ({}: {}). Raw response: {}".format(
+                    type(e).__name__, e, repr(raw_invoices)[:2000]
+                )
+            )
+        return invoices
 
     def cancel_order(self, purchase_order: src_models.PurchaseOrder) -> bool:
         distributor_orders = list(purchase_order.distributor_orders.all())

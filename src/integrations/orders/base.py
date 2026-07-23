@@ -172,6 +172,14 @@ class DistributorOrderStatus:
     tracking_numbers: typing.List[str] = dataclasses.field(default_factory=list)
     carrier: typing.Optional[str] = None
     raw_response: typing.Optional[typing.Dict] = None
+    # Populated only where a distributor's status/tracking response actually says so (Meyer's
+    # SalesTracking DeliveryETA/DeliveryDate, WheelPros' realtime tracking events, Turn14's
+    # tracking/package_details ship_date) — left None everywhere else rather than guessed.
+    ship_date: typing.Optional[datetime.date] = None
+    estimated_delivery_date: typing.Optional[datetime.date] = None
+    # Normalized to "in_transit" / "delivered" / "cancelled", or None when the distributor gives
+    # no signal beyond status_code itself.
+    delivery_status: typing.Optional[str] = None
 
 
 @dataclasses.dataclass
@@ -186,6 +194,19 @@ class InvoiceTrackingEntry:
     dashboard lists each separately)."""
     ship_method: typing.Optional[str] = None
     tracking_number: typing.Optional[str] = None
+
+
+@dataclasses.dataclass
+class InvoiceLineItem:
+    """One billed line on a DistributorInvoice — only populated by adapters whose invoice
+    response actually itemizes lines (Turn14, Premier); left as an empty list by adapters that
+    only have header-level invoice data (Keystone's synthesized invoice) or none at all."""
+    part_number: typing.Optional[str] = None
+    description: typing.Optional[str] = None
+    quantity: typing.Optional[int] = None
+    unit_price: typing.Optional[decimal.Decimal] = None
+    total_price: typing.Optional[decimal.Decimal] = None
+    warehouse_code: typing.Optional[str] = None
 
 
 @dataclasses.dataclass
@@ -212,6 +233,7 @@ class DistributorInvoice:
     paid_amount: typing.Optional[decimal.Decimal] = None
     amount_due: typing.Optional[decimal.Decimal] = None
     tracking: typing.List[InvoiceTrackingEntry] = dataclasses.field(default_factory=list)
+    line_items: typing.List[InvoiceLineItem] = dataclasses.field(default_factory=list)
     comments: typing.Optional[str] = None
     raw_response: typing.Optional[typing.Dict] = None
 

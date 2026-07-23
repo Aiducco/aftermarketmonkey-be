@@ -48,6 +48,21 @@ _COMMON_SHIPPING_METHODS = [
 # GetOrderHistory rows whose EKORD# holds one of these means "no matching order", not a real PO.
 _ORDER_HISTORY_ERROR_VALUES = {"NoData", "BadDate", "BadInDt"}
 
+# EKSTAT's documented progression (RCV ORD -> ORDER -> PICK -> PACKAGE/XDOCK -> OUT4DLV ->
+# INVOICE -> CANCEL) mapped to DistributorOrderStatus.delivery_status's normalized vocabulary.
+# Left unmapped (None) for the earlier stages (RCV ORD/ORDER/PICK) — Keystone's own status_code
+# already carries the raw stage for those; INVOICE means billed, not confirmed delivered, so it
+# stays unmapped too rather than guessed as "delivered".
+_EKSTAT_DELIVERY_STATUS = {
+    "PACKAGE": "in_transit",
+    "XDOCK": "in_transit",
+    "OUT4DLV": "in_transit",
+    "CANCEL": "cancelled",
+}
+# EKSTAT values from which EKDATE (that row's transaction date) is a reasonable ship_date proxy
+# — Keystone gives no dedicated ship-date field, only the date of each status transition.
+_EKSTAT_SHIPPED_STAGES = {"PACKAGE", "XDOCK", "OUT4DLV", "INVOICE"}
+
 # Keystone's own "List of Active Warehouses" reference table — the same warehouse-number
 # strings GetShippingOptionsMultiplePartsPerWarehouse's "Warehouse" column and its dynamically
 # named "Warehouse_<name>_<number>" rate tables use (see get_shipping_quote below). "City, ST"
@@ -516,11 +531,20 @@ class KeystoneOrderAdapter(base.DistributorOrderAdapter):
                 po_rows.sort(key=lambda r: (r.get("EKDATE", ""), r.get("EKTIME", "")))
                 latest = po_rows[-1]
                 tracking_numbers = sorted({r.get("EKTRCK", "") for r in po_rows if r.get("EKTRCK")})
+                latest_stat = latest.get("EKSTAT", "")
                 orders.append(
                     base.DistributorOrderStatus(
                         distributor_order_number=po,
-                        status_code=latest.get("EKSTAT", ""),
+                        status_code=latest_stat,
                         tracking_numbers=tracking_numbers,
+                        delivery_status=_EKSTAT_DELIVERY_STATUS.get(latest_stat),
+                        # EKDATE on the latest transaction row as a ship_date proxy — Keystone
+                        # gives no dedicated ship-date field (see _EKSTAT_SHIPPED_STAGES).
+                        ship_date=(
+                            _parse_keystone_date(latest.get("EKDATE"))
+                            if latest_stat in _EKSTAT_SHIPPED_STAGES
+                            else None
+                        ),
                         raw_response={"rows": po_rows},
                     )
                 )
@@ -544,6 +568,75 @@ class KeystoneOrderAdapter(base.DistributorOrderAdapter):
         if len(tables) == 1:
             return next(iter(tables.values()))
         return []
+
+    def supports_invoices(self) -> bool:
+        return True
+
+    def get_invoices(self, purchase_order: src_models.PurchaseOrder) -> typing.List[base.DistributorInvoice]:
+        """
+        Keystone has no dedicated invoice endpoint — GetOrderHistory's own transaction rows
+        carry an EKINV# once a line has actually invoiced, so an invoice here is synthesized by
+        grouping rows by that field, not fetched as a real invoice document. This means
+        invoice_date/paid_amount/amount_due (things GetOrderHistory doesn't report at all) stay
+        None — see the comments field on the returned DistributorInvoice for that caveat.
+        """
+        try:
+            tables = self._client.get_order_history(po_number=purchase_order.po_number)
+        except keystone_client_exceptions.KeystoneException as e:
+            self._handle_error(e)
+
+        try:
+            rows = self._find_order_history_rows(tables)
+            usable_rows = [r for r in rows if r.get("EKORD#") not in _ORDER_HISTORY_ERROR_VALUES]
+
+            by_invoice: typing.Dict[str, typing.List[typing.Dict[str, str]]] = {}
+            for row in usable_rows:
+                invoice_number = row.get("EKINV#", "")
+                if invoice_number:
+                    by_invoice.setdefault(invoice_number, []).append(row)
+
+            invoices: typing.List[base.DistributorInvoice] = []
+            for invoice_number, inv_rows in by_invoice.items():
+                line_items = [
+                    base.InvoiceLineItem(
+                        part_number="{}{}".format(
+                            (r.get("EKVEND") or "").strip(), (r.get("EKPART") or "").strip()
+                        ),
+                        quantity=_parse_int(r.get("EKXQTY")),
+                        unit_price=_parse_decimal(r.get("EKPRIC")),
+                        total_price=_parse_decimal(r.get("EKEXTD")),
+                        warehouse_code=r.get("EKSWHS") or None,
+                    )
+                    for r in inv_rows
+                ]
+                line_totals = [li.total_price for li in line_items if li.total_price is not None]
+                freight_values = [_parse_decimal(r.get("EKFRTD")) for r in inv_rows]
+                invoices.append(
+                    base.DistributorInvoice(
+                        invoice_number=invoice_number,
+                        distributor_order_number=inv_rows[0].get("EKORD#") or None,
+                        total_price=(sum(line_totals, decimal.Decimal("0")) if line_totals else None),
+                        freight=next((f for f in freight_values if f is not None), None),
+                        tracking=[
+                            base.InvoiceTrackingEntry(tracking_number=t)
+                            for t in sorted({r.get("EKTRCK", "") for r in inv_rows if r.get("EKTRCK")})
+                        ],
+                        line_items=line_items,
+                        comments=(
+                            "Synthesized from Keystone GetOrderHistory transaction rows, not a "
+                            "real invoice document — invoice_date/paid_amount/amount_due aren't "
+                            "available in this feed."
+                        ),
+                        raw_response={"rows": inv_rows},
+                    )
+                )
+        except (AttributeError, TypeError, KeyError, IndexError) as e:
+            raise order_exceptions.OrderValidationError(
+                "Unexpected order-history response shape from Keystone ({}: {}). Raw tables: {}".format(
+                    type(e).__name__, e, repr(tables)[:2000]
+                )
+            )
+        return invoices
 
     def cancel_order(self, purchase_order: src_models.PurchaseOrder) -> bool:
         raise order_exceptions.OrderNotSupportedError(

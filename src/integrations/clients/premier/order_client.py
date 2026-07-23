@@ -261,6 +261,33 @@ class PremierOrderApiClient(object):
         )
         return data if isinstance(data, list) else [data]
 
+    def get_invoices(
+        self,
+        invoice_number: typing.Optional[str] = None,
+        sales_order_number: typing.Optional[str] = None,
+        item_number: typing.Optional[str] = None,
+        created_begin_date: typing.Optional[str] = None,
+        created_end_date: typing.Optional[str] = None,
+    ) -> typing.List[typing.Dict]:
+        """GET invoices. Full invoice objects (header + lines + payments per invoice) —
+        filterable by any combination of these params. NOT filterable by customer PO number —
+        Premier's docs don't offer that filter at all, unlike the tracking endpoints; see
+        PremierOrderAdapter.get_invoices for the two-step tracking-then-invoice-number lookup
+        this forces."""
+        params = {
+            k: v
+            for k, v in {
+                "invoiceNumber": invoice_number,
+                "salesOrderNumber": sales_order_number,
+                "itemNumber": item_number,
+                "createdBeginDate": created_begin_date,
+                "createdEndDate": created_end_date,
+            }.items()
+            if v
+        }
+        data = self._request(endpoint="invoices", method=common_enums.HttpMethod.GET, params=params)
+        return data if isinstance(data, list) else [data]
+
     def test_connection(self) -> None:
         """Cheap connectivity/auth probe — Premier has no dedicated ping endpoint, but forcing
         an authenticate call (bypassing any cache) proves the api_key works without touching

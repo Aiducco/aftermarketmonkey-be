@@ -211,6 +211,80 @@ class PurchaseOrdersView(views.View):
         return _json_response(result)
 
 
+class PurchaseOrderInvoicesView(views.View):
+    """GET /purchase-orders/invoices/ — flat, cross-distributor invoice list. Optional
+    ?company_provider_id=&start_date=&end_date= (dates: YYYY-MM-DD, filtered on invoice_date)."""
+
+    def get(self, request: http.HttpRequest, *args, **kwargs) -> http.HttpResponse:
+        company_id, _user_id, err = _require_auth(request)
+        if err:
+            return err
+
+        cp_param = request.GET.get("company_provider_id")
+        try:
+            result = purchase_orders_services.list_purchase_order_invoices(
+                company_id=company_id,
+                company_provider_id=int(cp_param) if cp_param else None,
+                start_date=request.GET.get("start_date"),
+                end_date=request.GET.get("end_date"),
+            )
+        except purchase_orders_services.PurchaseOrderServiceError as e:
+            return _error_response(str(e))
+        except Exception:
+            logger.exception("{} Error listing invoices for company_id={}".format(_LOG_PREFIX, company_id))
+            return _error_response("Error listing invoices", status=500)
+
+        return _json_response(result)
+
+
+class PurchaseOrderInvoiceDetailView(views.View):
+    """GET /purchase-orders/invoices/<id>/"""
+
+    def get(self, request: http.HttpRequest, *args, **kwargs) -> http.HttpResponse:
+        company_id, _user_id, err = _require_auth(request)
+        if err:
+            return err
+
+        invoice_id = kwargs.get("id")
+        try:
+            result = purchase_orders_services.get_purchase_order_invoice_detail(
+                company_id=company_id, invoice_id=invoice_id
+            )
+        except purchase_orders_services.PurchaseOrderServiceError as e:
+            return _error_response(str(e), status=404)
+        except Exception:
+            logger.exception("{} Error fetching invoice id={}".format(_LOG_PREFIX, invoice_id))
+            return _error_response("Error fetching invoice", status=500)
+
+        return _json_response(result)
+
+
+class PurchaseOrderTrackingView(views.View):
+    """GET /purchase-orders/tracking/ — flat, cross-distributor tracking list (one row per
+    tracking number). Optional ?company_provider_id=&delivery_status=
+    (delivery_status: in_transit|delivered|cancelled)."""
+
+    def get(self, request: http.HttpRequest, *args, **kwargs) -> http.HttpResponse:
+        company_id, _user_id, err = _require_auth(request)
+        if err:
+            return err
+
+        cp_param = request.GET.get("company_provider_id")
+        try:
+            result = purchase_orders_services.list_purchase_order_tracking(
+                company_id=company_id,
+                company_provider_id=int(cp_param) if cp_param else None,
+                delivery_status=request.GET.get("delivery_status"),
+            )
+        except purchase_orders_services.PurchaseOrderServiceError as e:
+            return _error_response(str(e))
+        except Exception:
+            logger.exception("{} Error listing tracking for company_id={}".format(_LOG_PREFIX, company_id))
+            return _error_response("Error listing tracking", status=500)
+
+        return _json_response(result)
+
+
 class PurchaseOrderDetailView(views.View):
     """GET /purchase-orders/<id>/"""
 

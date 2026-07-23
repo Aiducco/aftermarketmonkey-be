@@ -646,6 +646,9 @@ def _run_status_check(po: src_models.PurchaseOrder, adapter: order_base.Distribu
         ).update(
             tracking_numbers=order_status.tracking_numbers,
             carrier=order_status.carrier,
+            ship_date=order_status.ship_date,
+            estimated_delivery_date=order_status.estimated_delivery_date,
+            delivery_status=order_status.delivery_status,
             raw_response=order_status.raw_response,
             updated_at=timezone.now(),
         )
@@ -688,6 +691,17 @@ def _sync_invoices(po: src_models.PurchaseOrder, adapter: order_base.Distributor
                 "tracking": [
                     {"ship_method": t.ship_method, "tracking_number": t.tracking_number}
                     for t in invoice.tracking
+                ],
+                "line_items": [
+                    {
+                        "part_number": li.part_number,
+                        "description": li.description,
+                        "quantity": li.quantity,
+                        "unit_price": li.unit_price,
+                        "total_price": li.total_price,
+                        "warehouse_code": li.warehouse_code,
+                    }
+                    for li in invoice.line_items
                 ],
                 "comments": invoice.comments,
                 "raw_response": invoice.raw_response,

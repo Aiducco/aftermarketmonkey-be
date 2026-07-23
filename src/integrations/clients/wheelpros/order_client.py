@@ -230,6 +230,17 @@ class WheelProsOrderApiClient(object):
             data["requestId"] = request_id
         return self._request("inventory/v1/search", common_enums.HttpMethod.POST, json_body=data)
 
+    # -- Warehouse master data -------------------------------------------------------------
+
+    def get_warehouses(self) -> typing.List[typing.Dict]:
+        """GET /warehouses/v1. Full ship-from address per warehouse ({id, name, nameDetail,
+        address, city, state, zip, countryCode, phone, active, wheels, tires, accessories}) —
+        used to decode a tracking/order response's bare warehouseCode into a real location (see
+        fetch_and_save_wheelpros_warehouses / WheelProsWarehouse). Account-agnostic reference
+        data, same role Turn14's GET /v1/locations and Meyer's GET /Warehouses play."""
+        data = self._request("warehouses/v1", common_enums.HttpMethod.GET)
+        return data if isinstance(data, list) else [data]
+
     # -- Connection test ------------------------------------------------------------------
 
     def test_connection(self) -> None:

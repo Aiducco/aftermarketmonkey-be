@@ -28,11 +28,15 @@ Confirmed, real API limitations that shape this adapter (from Wheel Pros' own Op
 5. There is no pre-shipment cancel endpoint — only a post-fulfillment return/RMA flow
    (POST /orders/v1/return), which is a distinct capability this adapter doesn't implement (see
    cancel_order()).
+6. There is no invoice API anywhere in Wheel Pros' docs (confirmed against both the Core API
+   and as much of the Legacy Postman collection as was reachable) — supports_invoices() stays
+   at its inherited False default, deliberately, not by omission.
 
 SAFETY: submit_order() places a REAL order against Wheel Pros. It must only ever be invoked from
 an explicit, user-approved submission — never from exploratory/dev code, automated tests, or
 ad-hoc scripts. See ``src/integrations/orders/turn_14.py`` for the reference adapter this mirrors.
 """
+import datetime
 import logging
 import typing
 
@@ -59,6 +63,62 @@ _SHIPPING_METHODS = [
     base.ShippingMethod(code="FR", name="FedEx Ground Residential", carrier_name="FedEx"),
     base.ShippingMethod(code="PU", name="Purolator (Canada)", carrier_name="Purolator"),
 ]
+
+# GET /orders/v1/track's trackingInfo[].statusCode vocabulary, confirmed directly from Wheel
+# Pros' OpenAPI spec (unlike the rest of the tracking response shape — see module docstring,
+# point 4) — mapped to DistributorOrderStatus.delivery_status's normalized vocabulary. Left
+# unmapped (None) for the earlier pre-shipment stages (ZN/ZP/ZR/ZU); any other code passes
+# through directly from the carrier per the spec and isn't one of these constants.
+_STATUS_CODE_DELIVERY_STATUS = {
+    "ZC": "in_transit",  # tracking # exists, fully invoiced, no carrier info (local carriers)
+    "DL": "delivered",  # tracking # exists, fully invoiced, delivery finalized
+    "ZX": "cancelled",  # order cancelled
+}
+
+
+def _parse_wheelpros_event_date(value: typing.Optional[str]) -> typing.Optional[datetime.date]:
+    """trackingInfo[].statusDate's exact format isn't shown in Wheel Pros' spec (only the field
+    name/type) — try ISO 8601 first (the spec's own convention elsewhere), then MM/DD/YYYY,
+    else give up rather than guess further; same defensive pattern as Premier's date parsing."""
+    if not value or not value.strip():
+        return None
+    value = value.strip()
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y"):
+        try:
+            return datetime.datetime.strptime(value[:10], fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _summarize_wheelpros_tracking_events(
+    tracking_info: typing.List[typing.Dict],
+) -> typing.Tuple[typing.Optional[str], typing.Optional[datetime.date]]:
+    """Collapses one tracking number's trackingInfo[] events (only populated when
+    realtimeShipmentStatus=True was requested) into (delivery_status, latest_event_date) — the
+    most recent event by statusDate/statusTime wins."""
+    if not tracking_info:
+        return None, None
+    latest = max(tracking_info, key=lambda e: (e.get("statusDate") or "", e.get("statusTime") or ""))
+    return _STATUS_CODE_DELIVERY_STATUS.get(latest.get("statusCode")), _parse_wheelpros_event_date(
+        latest.get("statusDate")
+    )
+
+
+def _load_wheelpros_warehouse_names() -> typing.Dict[str, str]:
+    """{external_id: "City, ST"} from WheelProsWarehouse (populated by
+    fetch_and_save_wheelpros_warehouses from GET /warehouses/v1), so quote responses can show a
+    real place instead of a bare warehouseId — same role turn_14.py's _load_warehouse_names /
+    meyer.py's _load_meyer_warehouse_names play for their distributors."""
+    names = {}
+    for row in src_models.WheelProsWarehouse.objects.all().values("external_id", "city", "state"):
+        external_id = (row.get("external_id") or "").strip()
+        if not external_id:
+            continue
+        label = ", ".join(part for part in (row.get("city"), row.get("state")) if part)
+        if label:
+            names[external_id] = label
+    return names
 
 
 class WheelProsOrderAdapter(base.DistributorOrderAdapter):
@@ -119,6 +179,8 @@ class WheelProsOrderAdapter(base.DistributorOrderAdapter):
 
         logger.info("{} Inventory response: {}".format(_LOG_PREFIX, repr(response)[:4000]))
 
+        warehouse_names = _load_wheelpros_warehouse_names()
+
         try:
             by_external_id = {li.provider_part.provider_external_id: li for li in line_items}
             lines: typing.List[base.ShippingQuoteLine] = []
@@ -142,6 +204,7 @@ class WheelProsOrderAdapter(base.DistributorOrderAdapter):
                 for warehouse in warehouses:
                     atp = warehouse.get("atp", 0) or 0
                     requested = li.quantity if li else 0
+                    warehouse_code = warehouse.get("warehouseId")
                     # No shipping-rate endpoint exists — ship_options is always empty (see
                     # module docstring, point 1).
                     lines.append(
@@ -150,7 +213,10 @@ class WheelProsOrderAdapter(base.DistributorOrderAdapter):
                             provider_external_id=external_id,
                             quantity_available=min(atp, requested) if li else atp,
                             quantity_backordered=warehouse.get("backOrderQty", 0) or 0,
-                            warehouse_code=warehouse.get("warehouseId"),
+                            warehouse_code=warehouse_code,
+                            warehouse_name=(
+                                warehouse_names.get(str(warehouse_code)) if warehouse_code is not None else None
+                            ),
                             flags=[] if atp > 0 else ["backorder"],
                         )
                     )
@@ -285,9 +351,13 @@ class WheelProsOrderAdapter(base.DistributorOrderAdapter):
 
         try:
             if sales_order_number:
-                response = self._client.get_order_tracking(salesOrderNumber=sales_order_number)
+                response = self._client.get_order_tracking(
+                    salesOrderNumber=sales_order_number, realtimeShipmentStatus=True
+                )
             else:
-                response = self._client.get_order_tracking(poNumber=purchase_order.po_number)
+                response = self._client.get_order_tracking(
+                    poNumber=purchase_order.po_number, realtimeShipmentStatus=True
+                )
         except wheelpros_client_exceptions.WheelProsException as e:
             self._handle_error(e)
 
@@ -311,6 +381,10 @@ class WheelProsOrderAdapter(base.DistributorOrderAdapter):
                     ]
                 )
 
+            # {trackingNumber: entry} for the realtimeShipmentStatus=True "trackings" array —
+            # trackingNumber is the one field its schema confirms (see module docstring, point 4).
+            trackings_by_number = {t.get("trackingNumber"): t for t in trackings if t.get("trackingNumber")}
+
             orders: typing.List[base.DistributorOrderStatus] = []
             for so in sales_orders:
                 so_number = str(so.get("salesOrderNumber") or so.get("orderNumber") or fallback_order_number)
@@ -319,12 +393,40 @@ class WheelProsOrderAdapter(base.DistributorOrderAdapter):
                     for t in trackings
                     if not t.get("salesOrderNumber") or str(t.get("salesOrderNumber")) == so_number
                 ]
+                tracking_numbers = {t.get("trackingNumber") for t in related if t.get("trackingNumber")}
+                # salesOrders[].trackingNumber is confirmed directly in Wheel Pros' OpenAPI spec
+                # (unlike the "trackings" array's own shape) — include it even if the "trackings"
+                # cross-reference above missed it.
+                if so.get("trackingNumber"):
+                    tracking_numbers.add(so["trackingNumber"])
+
+                # Latest carrier-level event across every tracking # tied to this order — only
+                # populated when realtimeShipmentStatus=True was requested above.
+                delivery_status, ship_date = None, None
+                for tracking_number in tracking_numbers:
+                    entry = trackings_by_number.get(tracking_number)
+                    if not entry:
+                        continue
+                    ds, ev_date = _summarize_wheelpros_tracking_events(entry.get("trackingInfo") or [])
+                    if ds:
+                        delivery_status, ship_date = ds, ev_date
+                        if ds == "cancelled":
+                            break
+
                 orders.append(
                     base.DistributorOrderStatus(
                         distributor_order_number=so_number,
                         status_code=str(so.get("status") or so.get("orderStatus") or "OPEN"),
-                        tracking_numbers=[t.get("trackingNumber") for t in related if t.get("trackingNumber")],
-                        carrier=next((t.get("carrier") for t in related if t.get("carrier")), None),
+                        tracking_numbers=sorted(t for t in tracking_numbers if t),
+                        # carrier/carrierName are confirmed salesOrders[] fields; fall back to the
+                        # "trackings" cross-reference (unconfirmed shape) only if both are absent.
+                        carrier=(
+                            so.get("carrierName")
+                            or so.get("carrier")
+                            or next((t.get("carrier") for t in related if t.get("carrier")), None)
+                        ),
+                        delivery_status=delivery_status,
+                        ship_date=ship_date,
                         raw_response=so,
                     )
                 )

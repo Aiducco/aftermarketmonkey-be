@@ -75,6 +75,9 @@ from src.api.views.purchase_orders import (
     PurchaseOrderGroupDetailView,
     PurchaseOrderGroupSubmitView,
     PurchaseOrderCapabilitiesView,
+    PurchaseOrderInvoicesView,
+    PurchaseOrderInvoiceDetailView,
+    PurchaseOrderTrackingView,
     ShippingMethodsView,
 )
 
@@ -288,6 +291,21 @@ urlpatterns = [
         "purchase-orders/shipping-methods/",
         ShippingMethodsView.as_view(),
         name="purchase_orders_shipping_methods",
+    ),
+    path(
+        "purchase-orders/invoices/",
+        PurchaseOrderInvoicesView.as_view(),
+        name="purchase_orders_invoices",
+    ),
+    path(
+        "purchase-orders/invoices/<int:id>/",
+        PurchaseOrderInvoiceDetailView.as_view(),
+        name="purchase_order_invoice_detail",
+    ),
+    path(
+        "purchase-orders/tracking/",
+        PurchaseOrderTrackingView.as_view(),
+        name="purchase_orders_tracking",
     ),
     path(
         "purchase-orders/groups/<int:id>/",

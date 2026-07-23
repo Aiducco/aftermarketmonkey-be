@@ -139,6 +139,7 @@ def _serialize_invoice(inv: src_models.PurchaseOrderInvoice) -> typing.Dict:
         # [{ship_method, tracking_number}] — one entry per package; an invoice commonly ships
         # as more than one.
         "tracking": inv.tracking,
+        "line_items": inv.line_items,
         "comments": inv.comments,
     }
 
@@ -617,6 +618,17 @@ def _parse_status_filter(value: typing.Optional[typing.Union[int, str]]) -> typi
         )
 
 
+
+# "Placed but not yet fully closed out" — the FE's "Open" tab alias (see list_purchase_orders'
+# status param). Deliberately excludes FULFILLED/CANCELLED/FAILED, same as it excludes
+# DRAFT/QUOTED by virtue of _cart_queryset already filtering those out beforehand.
+_OPEN_STATUSES = [
+    src_enums.PurchaseOrderStatus.SUBMITTED.value,
+    src_enums.PurchaseOrderStatus.CONFIRMED.value,
+    src_enums.PurchaseOrderStatus.PARTIALLY_FULFILLED.value,
+]
+
+
 def list_purchase_orders(
     company_id: int,
     status: typing.Optional[typing.Union[int, str]] = None,
@@ -625,7 +637,6 @@ def list_purchase_orders(
     """Order history: everything that isn't still cart territory (see _cart_queryset) — a
     quote, even a stale or failed one, is never "an order" here on its own; only a submit
     attempt (successful or failed) is."""
-    status_value = _parse_status_filter(status)
     qs = (
         src_models.PurchaseOrder.objects.filter(company_id=company_id)
         .exclude(id__in=_cart_queryset(company_id).values("id"))
@@ -633,11 +644,112 @@ def list_purchase_orders(
         .prefetch_related("distributor_orders")
         .order_by("-created_at")
     )
-    if status_value is not None:
-        qs = qs.filter(status=status_value)
+    if isinstance(status, str) and status.strip().lower() == "open":
+        qs = qs.filter(status__in=_OPEN_STATUSES)
+    else:
+        status_value = _parse_status_filter(status)
+        if status_value is not None:
+            qs = qs.filter(status=status_value)
     if company_provider_id is not None:
         qs = qs.filter(company_provider_id=company_provider_id)
     return [_serialize_purchase_order(po, include_line_items=False) for po in qs[:200]]
+
+
+def list_purchase_order_invoices(
+    company_id: int,
+    company_provider_id: typing.Optional[int] = None,
+    start_date: typing.Optional[str] = None,
+    end_date: typing.Optional[str] = None,
+) -> typing.List[typing.Dict]:
+    """Flat, cross-distributor invoice list — the same PurchaseOrderInvoice rows already
+    nested under each PO's detail response (see _serialize_purchase_order), but queryable and
+    sortable independent of which PO they belong to, for an "Invoices" tab."""
+    qs = (
+        src_models.PurchaseOrderInvoice.objects.filter(purchase_order__company_id=company_id)
+        .select_related("purchase_order__company_provider__provider")
+        .order_by("-invoice_date", "-created_at")
+    )
+    if company_provider_id is not None:
+        qs = qs.filter(purchase_order__company_provider_id=company_provider_id)
+    if start_date:
+        qs = qs.filter(invoice_date__gte=start_date)
+    if end_date:
+        qs = qs.filter(invoice_date__lte=end_date)
+    return [_serialize_invoice_flat(inv) for inv in qs[:200]]
+
+
+def get_purchase_order_invoice_detail(company_id: int, invoice_id: int) -> typing.Dict:
+    inv = (
+        src_models.PurchaseOrderInvoice.objects.filter(id=invoice_id, purchase_order__company_id=company_id)
+        .select_related("purchase_order__company_provider__provider")
+        .first()
+    )
+    if not inv:
+        raise PurchaseOrderServiceError("Invoice not found.")
+    return _serialize_invoice_flat(inv)
+
+
+def _serialize_invoice_flat(inv: src_models.PurchaseOrderInvoice) -> typing.Dict:
+    po = inv.purchase_order
+    provider = po.company_provider.provider
+    result = _serialize_invoice(inv)
+    result.update(
+        {
+            "purchase_order_id": po.id,
+            "po_number": po.po_number,
+            "company_provider_id": po.company_provider_id,
+            "provider_name": provider.name,
+            "provider_kind_name": provider.kind_name,
+        }
+    )
+    return result
+
+
+def list_purchase_order_tracking(
+    company_id: int,
+    company_provider_id: typing.Optional[int] = None,
+    delivery_status: typing.Optional[str] = None,
+) -> typing.List[typing.Dict]:
+    """Flat, cross-distributor tracking list — one row per tracking number (a distributor order
+    can carry several, e.g. a split shipment), for a "Tracking" tab. Distinct from
+    PurchaseOrderDistributorOrder's nested appearance under each PO's detail response, which
+    stays grouped by distributor order instead."""
+    qs = (
+        src_models.PurchaseOrderDistributorOrder.objects.filter(purchase_order__company_id=company_id)
+        .select_related("purchase_order__company_provider__provider")
+        .order_by("-updated_at")
+    )
+    if company_provider_id is not None:
+        qs = qs.filter(purchase_order__company_provider_id=company_provider_id)
+    if delivery_status:
+        qs = qs.filter(delivery_status=delivery_status)
+
+    rows: typing.List[typing.Dict] = []
+    for pdo in qs[:500]:
+        po = pdo.purchase_order
+        provider = po.company_provider.provider
+        row = {
+            "distributor_order_id": pdo.id,
+            "purchase_order_id": po.id,
+            "po_number": po.po_number,
+            "company_provider_id": po.company_provider_id,
+            "provider_name": provider.name,
+            "provider_kind_name": provider.kind_name,
+            "distributor_order_number": pdo.distributor_order_number,
+            "warehouse_code": pdo.warehouse_code,
+            "carrier": pdo.carrier,
+            "ship_date": pdo.ship_date.isoformat() if pdo.ship_date else None,
+            "estimated_delivery_date": (
+                pdo.estimated_delivery_date.isoformat() if pdo.estimated_delivery_date else None
+            ),
+            "delivery_status": pdo.delivery_status,
+            "status": pdo.status,
+            "status_name": pdo.status_name,
+            "updated_at": pdo.updated_at.isoformat(),
+        }
+        for tracking_number in pdo.tracking_numbers or [None]:
+            rows.append({**row, "tracking_number": tracking_number})
+    return rows
 
 
 def get_purchase_order_group_detail(company_id: int, group_id: int) -> typing.Dict:
@@ -898,6 +1010,10 @@ def get_order_capabilities(company_id: int) -> typing.List[typing.Dict]:
                     adapter and adapter.supports_shipping_method_selection()
                 ),
                 "supports_cancel": bool(adapter and adapter.supports_cancel()),
+                # Lets the FE hide/grey out the Invoices tab for a connection whose distributor
+                # has no invoice API at all (e.g. WheelPros) instead of just always rendering an
+                # empty list with no explanation.
+                "supports_invoices": bool(adapter and adapter.supports_invoices()),
             }
         )
     return results

@@ -24,6 +24,7 @@ SAFETY: submit_order() places a REAL order against Premier — their docs descri
 mode at all, even for a "testing" environment. Must only ever be invoked from an explicit,
 user-approved submission. There is no cancel endpoint — see cancel_order() below.
 """
+import datetime
 import decimal
 import logging
 import typing
@@ -78,6 +79,31 @@ _SHIP_METHOD_CODES = [
     "FEDEX 2 DAY AM", "20207", "20208", "20209", "20210", "FEDEX INT ECON", "FEDEX INT FIRST",
     "20211", "20212", "ONTRAC SUNRISE", "ONTRAC GOLD",
 ]
+
+
+def _to_decimal(value: typing.Optional[typing.Any]) -> typing.Optional[decimal.Decimal]:
+    if value in (None, ""):
+        return None
+    try:
+        return decimal.Decimal(str(value))
+    except decimal.InvalidOperation:
+        return None
+
+
+def _parse_premier_date(value: typing.Optional[str]) -> typing.Optional[datetime.date]:
+    """Premier's invoice-filter query params use MM/DD/YYYY (per the docs' own examples), but
+    the response body's own date fields (e.g. header.transactionDate) aren't shown in an example
+    anywhere — try ISO 8601 first (the more common API-response convention), then MM/DD/YYYY,
+    else give up rather than guess further."""
+    if not value or not value.strip():
+        return None
+    value = value.strip()
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y"):
+        try:
+            return datetime.datetime.strptime(value[:10], fmt).date()
+        except ValueError:
+            continue
+    return None
 
 
 def _premier_item_number(provider_part: src_models.ProviderPart) -> str:

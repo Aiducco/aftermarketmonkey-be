@@ -430,12 +430,24 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
             orders = []
             for order in raw_orders:
                 attrs = order.get("attributes", {}) or {}
+                # Turn14's Order.attributes carries tracking as a list of {ship_method,
+                # tracking_number} objects, not a flat "tracking_numbers" array or a top-level
+                # "carrier" field (neither key exists anywhere in Turn14's documented Order
+                # shape) — reading those non-existent keys meant tracking was silently never
+                # captured. Turn14 doesn't give a real carrier code at the order level either;
+                # ship_method (e.g. "UPS Ground") is the closest available label, used here as a
+                # best-effort stand-in rather than left blank.
+                tracking_entries = attrs.get("tracking") or []
+                tracking_numbers = [
+                    t.get("tracking_number") for t in tracking_entries if t.get("tracking_number")
+                ]
+                ship_methods = sorted({t.get("ship_method") for t in tracking_entries if t.get("ship_method")})
                 orders.append(
                     base.DistributorOrderStatus(
                         distributor_order_number=str(order.get("id", "")),
                         status_code=str(attrs.get("status", "")),
-                        tracking_numbers=attrs.get("tracking_numbers", []) or [],
-                        carrier=attrs.get("carrier"),
+                        tracking_numbers=tracking_numbers,
+                        carrier=", ".join(ship_methods) if ship_methods else None,
                         raw_response=order,
                     )
                 )

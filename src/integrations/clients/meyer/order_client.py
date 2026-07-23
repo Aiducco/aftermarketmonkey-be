@@ -207,6 +207,38 @@ class MeyerOrderApiClient(object):
         )
         return result if isinstance(result, list) else [result]
 
+    def get_invoice(self, order_number: str, customer_number: str) -> typing.List[typing.Dict]:
+        """GET /Invoice. Same dual-mode lookup as get_sales_order_detail: a real Meyer
+        OrderNumber returns a single object, a CustPO returns an array — always normalized to a
+        list here. Errors 40400 (no OrderNumber given) / 70202 ("No invoice found for
+        [OrderNumber]") surface as MeyerException via _raise_for_business_error; the latter
+        just means nothing has invoiced yet, not a real failure — callers should treat an empty
+        result the same as that error (see MeyerOrderAdapter.get_invoices)."""
+        result = self._request(
+            endpoint="Invoice",
+            method=common_enums.HttpMethod.GET,
+            params={"OrderNumber": order_number, "CustomerNumber": customer_number},
+        )
+        return result if isinstance(result, list) else [result]
+
+    def get_sales_tracking(
+        self,
+        customer_number: str,
+        order_number: typing.Optional[str] = None,
+        tracking_number: typing.Optional[str] = None,
+    ) -> typing.List[typing.Dict]:
+        """GET /SalesTracking. Richer per-shipment ETA/delivered-date than the Tracking[] array
+        embedded in SalesOrderDetail — {OrderNumber, TrackingNumber, ShipMethod, DeliveryETA,
+        DeliveryDate}. Either order_number or tracking_number should be given (tracking_number is
+        the alternate lookup key for Meyer Truck shipments)."""
+        params: typing.Dict[str, str] = {"CustomerNumber": customer_number}
+        if order_number:
+            params["OrderNumber"] = order_number
+        if tracking_number:
+            params["TrackingNumber"] = tracking_number
+        result = self._request(endpoint="SalesTracking", method=common_enums.HttpMethod.GET, params=params)
+        return result if isinstance(result, list) else [result]
+
     def get_ship_methods(self) -> typing.List[typing.Dict]:
         """GET /ShipMethods. All ship methods valid for CreateOrder's ShipMethod field."""
         result = self._request(endpoint="ShipMethods", method=common_enums.HttpMethod.GET)

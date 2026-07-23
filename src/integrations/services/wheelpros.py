@@ -22,6 +22,7 @@ from src import models as src_models
 from src.integrations import credentials as credentials_helper
 from src.integrations.clients.wheelpros import client as wheelpros_client
 from src.integrations.clients.wheelpros import exceptions as wheelpros_exceptions
+from src.integrations.clients.wheelpros.order_client import WheelProsOrderApiClient
 from src.integrations.utils.brand_matching import (
     best_fuzzy_brand_match,
     brands_by_compact_key,
@@ -948,3 +949,82 @@ def sync_wheelpros_company_pricing_for_company_provider(
             _LOG_PREFIX, total_all, company_provider_id,
         )
     )
+
+
+def _wheelpros_company_provider_with_order_credentials() -> typing.Optional[src_models.CompanyProviders]:
+    """An active WheelPros CompanyProviders row whose credentials.order carries a usable
+    username + password pair — same reasoning as Meyer's
+    _meyer_company_provider_with_order_credentials: GET /warehouses/v1 is account-agnostic, so
+    any one row with real order credentials works, and most WheelPros connections only ever set
+    up feed/SFTP credentials, not order ones."""
+    for cp in _active_wheelpros_company_providers_queryset().order_by("-primary", "id"):
+        order_credentials = credentials_helper.get_order_credentials(cp)
+        if order_credentials.get("username") and order_credentials.get("password"):
+            return cp
+    return None
+
+
+def fetch_and_save_wheelpros_warehouses() -> None:
+    """Fetch Wheel Pros warehouses from GET /warehouses/v1 and upsert into WheelProsWarehouse —
+    decodes a tracking/order response's bare warehouseCode into a human-readable ship-from
+    location, the same role fetch_and_save_turn_14_locations/fetch_and_save_meyer_locations play
+    for their distributors."""
+    logger.info("{} Started fetching and saving Wheel Pros warehouses.".format(_LOG_PREFIX))
+
+    company_provider = _wheelpros_company_provider_with_order_credentials()
+    if not company_provider:
+        logger.info(
+            "{} No active WheelPros CompanyProviders row with order credentials found.".format(_LOG_PREFIX)
+        )
+        return
+
+    order_credentials = credentials_helper.get_order_credentials(company_provider)
+    environment = getattr(settings, "WHEELPROS_ORDER_ENVIRONMENT", "production")
+    try:
+        api_client = WheelProsOrderApiClient(credentials=order_credentials, environment=environment)
+    except ValueError as e:
+        logger.error("{} Invalid order credentials: {}".format(_LOG_PREFIX, str(e)))
+        raise
+
+    try:
+        warehouses = api_client.get_warehouses()
+    except wheelpros_exceptions.WheelProsException as e:
+        logger.error("{} Wheel Pros API error: {}".format(_LOG_PREFIX, str(e)))
+        raise
+
+    if not warehouses:
+        logger.warning("{} No warehouses returned from Wheel Pros API.".format(_LOG_PREFIX))
+        return
+
+    now = timezone.now()
+    instances = []
+    for item in warehouses:
+        external_id = str(item.get("id", "")).strip()
+        if not external_id:
+            continue
+        instances.append(
+            src_models.WheelProsWarehouse(
+                external_id=external_id,
+                name=str(item.get("name", "") or item.get("nameDetail", "")).strip(),
+                city=str(item.get("city", "")).strip(),
+                state=str(item.get("state", "")).strip(),
+                country=str(item.get("countryCode", "")).strip(),
+                updated_at=now,
+            )
+        )
+    if not instances:
+        logger.warning("{} No valid warehouse instances after transformation.".format(_LOG_PREFIX))
+        return
+
+    try:
+        pgbulk.upsert(
+            src_models.WheelProsWarehouse,
+            instances,
+            unique_fields=["external_id"],
+            update_fields=["name", "city", "state", "country", "updated_at"],
+        )
+    except Exception as e:
+        logger.error("{} Error during warehouse upsert: {}".format(_LOG_PREFIX, str(e)))
+        raise
+
+    logger.info("{} Successfully upserted {} Wheel Pros warehouses.".format(_LOG_PREFIX, len(instances)))
