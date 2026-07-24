@@ -11,6 +11,7 @@ exploratory/dev code, automated tests, or ad-hoc scripts.
 import datetime
 import decimal
 import logging
+import re
 import typing
 
 from django.conf import settings
@@ -41,6 +42,27 @@ def _normalize_warehouse_code(location: typing.Any) -> typing.Optional[str]:
     number for others (59, confirmed against a live quote) — normalize to str so warehouse_code
     is consistently typed everywhere it's compared/keyed on (our own JSON responses, the FE)."""
     return str(location) if location is not None else None
+
+
+def _sanitize_order_notes(raw: typing.Optional[str]) -> typing.Optional[str]:
+    """
+    Turn14 has 400'd a whole submit over order_notes alone: {"errors":[{"status":"400",
+    "title":"Invalid string","source":{"pointer":"/data/order_notes/"},"detail":"The characters
+    provided were not valid for a string."}]}. purchase_order.notes is free text a dealer typed
+    or pasted (often from a phone/Word doc, so smart quotes/em dashes/emoji are common) — non-
+    ASCII characters are a plausible trigger for that error, so they're stripped rather than
+    rejected client-side, so a note with one bad character doesn't block the whole order.
+
+    Returns None (no notes at all, or notes that were entirely non-ASCII) when there's nothing
+    left to send — callers should omit order_notes from the request body entirely rather than
+    send "" or null, since either is itself a plausible trigger for the same error, and
+    Turn14's own field-mapping docs list "Don't Map" as valid for this field, implying it's
+    genuinely optional.
+    """
+    if not raw:
+        return None
+    collapsed = re.sub(r"\s+", " ", raw)
+    return collapsed.encode("ascii", "ignore").decode("ascii").strip() or None
 
 
 def _load_warehouse_names() -> typing.Dict[str, str]:
@@ -302,7 +324,7 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
         # Turn14's quote response carries a parallel array for either, and CARB would need a
         # separate Turn14Items catalog lookup; flagged as a follow-up, not silently guessed at.
         acknowledge_prop_65 = purchase_order.line_items.filter(is_prop_65=True).exists()
-        order_notes = purchase_order.notes or ""
+        order_notes = _sanitize_order_notes(purchase_order.notes)
         phone_number = ship_to.phone or ""
         po_number = base.resolve_po_number(purchase_order)
 
@@ -317,10 +339,11 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
                     "acknowledge_prop_65": acknowledge_prop_65,
                     "acknowledge_epa": False,
                     "acknowledge_carb": False,
-                    "order_notes": order_notes,
                     "phone_number": phone_number,
                     "shipping": shipping_ids,
                 }
+                if order_notes is not None:
+                    data["order_notes"] = order_notes
                 response = self._client.promote_quote_to_order(data)
             else:
                 shipping_code = purchase_order.ship_method or _DEFAULT_SHIPPING_GROUP_CODE
@@ -331,10 +354,11 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
                     "acknowledge_prop_65": acknowledge_prop_65,
                     "acknowledge_epa": False,
                     "acknowledge_carb": False,
-                    "order_notes": order_notes,
                     "phone_number": phone_number,
                     "recipient": self._build_recipient(ship_to),
                 }
+                if order_notes is not None:
+                    data["order_notes"] = order_notes
                 response = self._client.create_order(data)
         except turn14_client_exceptions.Turn14APIBadResponseCodeError as e:
             self._handle_error(e, request_payload=data)
