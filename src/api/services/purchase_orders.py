@@ -919,6 +919,16 @@ def submit_purchase_order_group(
     A PO that fails here drops to FAILED, not QUOTED, so it's excluded from any retry of this
     same group call — see requote_purchase_order for how to bring a failed PO back to QUOTED
     before resubmitting it individually.
+
+    submit_purchase_order itself never raises for a *distributor-side* failure (see its own
+    docstring) — but it can still raise PurchaseOrderServiceError directly, before ever calling
+    the distributor, if this PO's quote went stale mid-loop (submission is sequential and each
+    real distributor call takes real time, so a later PO in a multi-distributor group can easily
+    outlive the quote TTL while an earlier one is still being submitted). Each PO's call is
+    wrapped individually so that failure mode degrades to a per-PO result too, exactly like a
+    distributor rejection does — without this, one stale quote would raise straight out of this
+    function, discarding the results of every PO that already succeeded earlier in this same
+    call and turning a partial success into a total error response.
     """
     group = src_models.PurchaseOrderGroup.objects.filter(id=group_id, company_id=company_id).first()
     if not group:
@@ -931,10 +941,15 @@ def submit_purchase_order_group(
     if not quoted_ids:
         raise PurchaseOrderServiceError("No quoted purchase orders in this group to submit.")
     ship_methods = ship_methods or {}
-    results = [
-        submit_purchase_order(company_id, po_id, ship_method=ship_methods.get(str(po_id)))
-        for po_id in quoted_ids
-    ]
+    results = []
+    for po_id in quoted_ids:
+        try:
+            results.append(submit_purchase_order(company_id, po_id, ship_method=ship_methods.get(str(po_id))))
+        except PurchaseOrderServiceError as e:
+            po = src_models.PurchaseOrder.objects.filter(id=po_id, company_id=company_id).first()
+            result = _serialize_purchase_order(po) if po else {"id": po_id}
+            result["error_message"] = str(e)
+            results.append(result)
     return {"group_id": group_id, "purchase_orders": results}
 
 
