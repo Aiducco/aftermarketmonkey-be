@@ -366,6 +366,16 @@ def _run_quote(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrde
     # Default selection per shipment — same fallback this project always used (match
     # po.ship_method's code when offered there, else cheapest) — until the FE overrides it via
     # POST .../shipments/select/ before submitting.
+    #
+    # Also writes the chosen default's code onto po.ship_method itself, not just
+    # shipment["selected_ship_option_id"] — Keystone/Meyer/Premier/WheelPros's submit_order()
+    # all read po.ship_method directly as their one order-level service level (only Turn14
+    # reads the per-shipment structure), so a PO submitted straight off this auto-picked
+    # default — without the FE ever calling POST .../shipments/select/ — used to send an empty
+    # ship method to those four distributors regardless of what was shown as "selected" in the
+    # quote. Confirmed live: a Keystone submit request showed "service_level": "" despite the
+    # quote UI displaying a pre-selected default option, and Keystone rejected the order
+    # ("Code 210 - Shipping Error. Item ordered cannot be shipped via selected service level.").
     for shipment in shipments_by_key.values():
         priced_options = [o for o in shipment["ship_options"] if o.get("cost") is not None]
         chosen = None
@@ -374,6 +384,8 @@ def _run_quote(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrde
         if chosen is None and priced_options:
             chosen = min(priced_options, key=lambda o: o["cost"])
         shipment["selected_ship_option_id"] = chosen["id"] if chosen else None
+        if chosen and chosen.get("code") and not po.ship_method:
+            po.ship_method = chosen["code"]
 
     po.shipments = list(shipments_by_key.values())
 
@@ -495,6 +507,7 @@ def _run_quote(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrde
             "distributor_quoted_total",
             "fees",
             "shipments",
+            "ship_method",
             "subtotal",
             "estimated_shipping",
             "total",

@@ -43,6 +43,24 @@ def _decimal_to_float(value: typing.Optional[decimal.Decimal]) -> typing.Optiona
     return float(value) if value is not None else None
 
 
+def _build_recipient_line(po: src_models.PurchaseOrder) -> typing.Optional[str]:
+    """Single joined display string for the ship-to address, built from the same
+    ship_to_* snapshot fields as the structured ``ship_to`` object below — for PO-history
+    list/table views that want one column instead of a nested object. None while still a
+    cart draft (no ship_to captured yet), same condition as ``ship_to`` itself."""
+    if not po.ship_to_address1:
+        return None
+    city_state_zip = " ".join(part for part in (po.ship_to_state, po.ship_to_postal_code) if part)
+    parts = [
+        po.ship_to_name,
+        po.ship_to_address1,
+        po.ship_to_address2,
+        ", ".join(part for part in (po.ship_to_city, city_state_zip) if part) or None,
+        po.ship_to_country,
+    ]
+    return ", ".join(part for part in parts if part)
+
+
 def _single_shipment_warehouse_name(
     li: src_models.PurchaseOrderLineItem, shipments_by_id: typing.Dict[str, typing.Dict]
 ) -> typing.Optional[str]:
@@ -156,6 +174,14 @@ def _serialize_purchase_order(po: src_models.PurchaseOrder, include_line_items: 
         "provider_kind_name": provider.kind_name,
         "provider_name": provider.name,
         "group_id": po.group_id,
+        # Human-readable label for the cross-distributor checkout this PO belongs to (see
+        # PurchaseOrderGroup.reference) — None for a PO submitted on its own (group_id is also
+        # None then) or for a group created without one.
+        "group_reference": po.group.reference if po.group_id else None,
+        # Single joined display string built from the same ship_to_* fields as the structured
+        # object below — for PO-history list/table views that want one column, not a nested
+        # object.
+        "recipient": _build_recipient_line(po),
         "ship_to": {
             "name": po.ship_to_name,
             "attention": po.ship_to_attention,
@@ -435,7 +461,7 @@ def remove_cart_item(company_id: int, line_item_id: int) -> typing.Dict:
 def get_cart(company_id: int) -> typing.Dict:
     drafts = (
         _cart_queryset(company_id)
-        .select_related("company_provider__provider")
+        .select_related("company_provider__provider", "group")
         .prefetch_related("line_items__provider_part__master_part__brand", "distributor_orders")
         .order_by("company_provider__provider__name")
     )
@@ -562,7 +588,7 @@ def review_cart(
 def get_purchase_order_detail(company_id: int, purchase_order_id: int) -> typing.Dict:
     po = (
         src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id)
-        .select_related("company_provider__provider")
+        .select_related("company_provider__provider", "group")
         .prefetch_related("line_items__provider_part__master_part__brand", "distributor_orders")
         .first()
     )
@@ -621,7 +647,7 @@ def list_purchase_orders(
         src_models.PurchaseOrder.objects.filter(company_id=company_id)
         .exclude(id__in=_cart_queryset(company_id).values("id"))
         .exclude(status=src_enums.PurchaseOrderStatus.DISCARDED.value)
-        .select_related("company_provider__provider")
+        .select_related("company_provider__provider", "group")
         .prefetch_related("distributor_orders")
         .order_by("-created_at")
     )
@@ -738,7 +764,7 @@ def get_purchase_order_group_detail(company_id: int, group_id: int) -> typing.Di
     if not group:
         raise PurchaseOrderServiceError("Purchase order group not found.")
     pos = (
-        group.purchase_orders.select_related("company_provider__provider")
+        group.purchase_orders.select_related("company_provider__provider", "group")
         .prefetch_related("line_items__provider_part__master_part__brand", "distributor_orders")
         .all()
     )
@@ -835,6 +861,21 @@ def select_shipping_options(
     (ids are opaque; only used to look each other up here). Every id must already exist there —
     a quote must have run first. Recomputes estimated_shipping/total from the new selection(s)
     before returning, so the UI can reflect the price change immediately without a re-quote.
+
+    Also writes the chosen option's code onto po.ship_method, not just po.shipments[].
+    selected_ship_option_id — Keystone/Meyer/Premier/WheelPros's submit_order() all read
+    po.ship_method directly as their one order-level service level (confirmed: Keystone's
+    "service_level", Meyer's "ShipMethod", Premier's "shipMethod", Wheel Pros' "method" all come
+    straight from purchase_order.ship_method); only Turn14 reads the per-shipment structure this
+    function used to update exclusively. Without this, calling this endpoint had no effect at
+    all on what those four distributors actually got at submit time — confirmed live: a
+    Keystone submit request showed "service_level": "" despite a shipping option having been
+    selected in the UI, and Keystone rejected it ("Code 210 - Shipping Error. Item ordered
+    cannot be shipped via selected service level."). If more than one shipment's selection
+    changes in the same call, the last one processed wins — these four distributors only ever
+    accept one flat method for the whole order anyway (Keystone's own order-placement call
+    takes a single "service_level" argument, not one per warehouse), so there's no meaningful
+    finer-grained choice to preserve for them.
     """
     po = src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id).first()
     if not po:
@@ -843,20 +884,29 @@ def select_shipping_options(
         raise PurchaseOrderServiceError("This purchase order has no quoted shipments yet — quote it first.")
 
     shipments_by_id = {s["id"]: s for s in po.shipments}
+    new_ship_method = None
     for shipment_id, ship_option_id in selections.items():
         shipment = shipments_by_id.get(shipment_id)
         if shipment is None:
             raise PurchaseOrderServiceError("Unknown shipment_id: {}".format(shipment_id))
-        valid_option_ids = {o.get("id") for o in (shipment.get("ship_options") or [])}
-        if ship_option_id not in valid_option_ids:
+        matched_option = next(
+            (o for o in (shipment.get("ship_options") or []) if o.get("id") == ship_option_id), None
+        )
+        if matched_option is None:
             raise PurchaseOrderServiceError(
                 "Unknown ship_option_id '{}' for shipment '{}'.".format(ship_option_id, shipment_id)
             )
         shipment["selected_ship_option_id"] = ship_option_id
+        if matched_option.get("code"):
+            new_ship_method = matched_option["code"]
 
     po.shipments = list(shipments_by_id.values())
+    update_fields = ["shipments", "subtotal", "estimated_shipping", "total", "updated_at"]
+    if new_ship_method is not None:
+        po.ship_method = new_ship_method
+        update_fields.append("ship_method")
     purchase_order_jobs.compute_totals(po)
-    po.save(update_fields=["shipments", "subtotal", "estimated_shipping", "total", "updated_at"])
+    po.save(update_fields=update_fields)
     return _serialize_purchase_order(po)
 
 
