@@ -350,7 +350,7 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
             {
                 "ShipMethod": purchase_order.ship_method,
                 "ShipToPhone": ship_to.phone or "",
-                "CustPO": purchase_order.po_number,
+                "CustPO": base.resolve_po_number(purchase_order),
                 # We're a marketplace/dropship intermediary with no visibility into whether
                 # sales tax was independently collected from the end customer — "No" is the
                 # conservative default (Meyer can still add tax on their end rather than risk
@@ -426,7 +426,7 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
     def get_order_status(self, purchase_order: src_models.PurchaseOrder) -> base.OrderStatusResult:
         try:
             orders = self._client.get_sales_order_detail(
-                order_number=purchase_order.po_number, customer_number=self._client.customer_number
+                order_number=base.resolve_po_number(purchase_order), customer_number=self._client.customer_number
             )
         except meyer_client_exceptions.MeyerException as e:
             self._handle_error(e)
@@ -485,7 +485,7 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
     def get_invoices(self, purchase_order: src_models.PurchaseOrder) -> typing.List[base.DistributorInvoice]:
         try:
             raw_invoices = self._client.get_invoice(
-                order_number=purchase_order.po_number, customer_number=self._client.customer_number
+                order_number=base.resolve_po_number(purchase_order), customer_number=self._client.customer_number
             )
         except meyer_client_exceptions.MeyerOrderValidationError as e:
             if e.code in _NO_INVOICE_YET_CODES:

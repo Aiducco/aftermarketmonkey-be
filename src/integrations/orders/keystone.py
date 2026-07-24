@@ -445,11 +445,12 @@ class KeystoneOrderAdapter(base.DistributorOrderAdapter):
         part_number_quantity = self._build_part_number_quantity(line_items)
         drop_ship = self._build_drop_ship(ship_to)
         service_level = purchase_order.ship_method or ""
+        po_number = base.resolve_po_number(purchase_order)
         data = {
             "order_process_method": 1,
             "part_number_quantity": part_number_quantity,
             "drop_ship": drop_ship,
-            "po_number": purchase_order.po_number,
+            "po_number": po_number,
             "service_level": service_level,
         }
 
@@ -458,7 +459,7 @@ class KeystoneOrderAdapter(base.DistributorOrderAdapter):
                 order_process_method=1,
                 part_number_quantity=part_number_quantity,
                 drop_ship=drop_ship,
-                po_number=purchase_order.po_number,
+                po_number=po_number,
                 service_level=service_level,
             )
         except keystone_client_exceptions.KeystoneException as e:
@@ -485,6 +486,7 @@ class KeystoneOrderAdapter(base.DistributorOrderAdapter):
                     request_payload=request_payload,
                 )
 
+            po_number = base.resolve_po_number(purchase_order)
             by_vcpn = {li.provider_part.provider_external_id: li for li in line_items}
             placements: typing.List[base.LineItemPlacement] = []
             for row in tables.get("PartResults", []):
@@ -496,7 +498,7 @@ class KeystoneOrderAdapter(base.DistributorOrderAdapter):
                 placements.append(
                     base.LineItemPlacement(
                         line_item_id=li.line_item_id if li else 0,
-                        distributor_order_number=purchase_order.po_number,
+                        distributor_order_number=po_number,
                         # A non-empty per-line Status means that line was rejected/removed —
                         # see the "New" errata rows in Keystone's docs (overall order can be OK
                         # while individual lines were dropped for stock/shipping reasons).
@@ -518,7 +520,7 @@ class KeystoneOrderAdapter(base.DistributorOrderAdapter):
         # Keystone doesn't hand back a distinct distributor order number at submit time — order
         # lookups (GetOrderHistory) are keyed off the same po_number we submitted.
         return base.DistributorOrderResult(
-            distributor_order_numbers=[purchase_order.po_number],
+            distributor_order_numbers=[po_number],
             line_item_placements=placements,
             raw_response=tables,
             request_payload=request_payload,
@@ -526,7 +528,7 @@ class KeystoneOrderAdapter(base.DistributorOrderAdapter):
 
     def get_order_status(self, purchase_order: src_models.PurchaseOrder) -> base.OrderStatusResult:
         try:
-            tables = self._client.get_order_history(po_number=purchase_order.po_number)
+            tables = self._client.get_order_history(po_number=base.resolve_po_number(purchase_order))
         except keystone_client_exceptions.KeystoneException as e:
             self._handle_error(e)
 
@@ -597,7 +599,7 @@ class KeystoneOrderAdapter(base.DistributorOrderAdapter):
         None — see the comments field on the returned DistributorInvoice for that caveat.
         """
         try:
-            tables = self._client.get_order_history(po_number=purchase_order.po_number)
+            tables = self._client.get_order_history(po_number=base.resolve_po_number(purchase_order))
         except keystone_client_exceptions.KeystoneException as e:
             self._handle_error(e)
 

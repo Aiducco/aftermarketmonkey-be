@@ -287,7 +287,7 @@ class WheelProsOrderAdapter(base.DistributorOrderAdapter):
             )
 
         data = {
-            "purchaseOrderNumber": purchase_order.po_number,
+            "purchaseOrderNumber": base.resolve_po_number(purchase_order),
             "purchaseOrderMethod": "EDI",
             "allowPartialDelivery": True,
             "items": items_payload,
@@ -367,7 +367,7 @@ class WheelProsOrderAdapter(base.DistributorOrderAdapter):
                 )
             else:
                 response = self._client.get_order_tracking(
-                    poNumber=purchase_order.po_number, realtimeShipmentStatus=True
+                    poNumber=base.resolve_po_number(purchase_order), realtimeShipmentStatus=True
                 )
         except wheelpros_client_exceptions.WheelProsException as e:
             self._handle_error(e)
@@ -377,7 +377,7 @@ class WheelProsOrderAdapter(base.DistributorOrderAdapter):
         # single "OPEN, no tracking yet" entry rather than raising, since that's the far more
         # common case for a routine status-poll on a fresh order (same defensive default
         # Premier's adapter uses for its own unconfirmed tracking schema).
-        fallback_order_number = sales_order_number or purchase_order.po_number
+        fallback_order_number = sales_order_number or base.resolve_po_number(purchase_order)
         try:
             sales_orders = response.get("salesOrders") or []
             trackings = response.get("trackings") or []

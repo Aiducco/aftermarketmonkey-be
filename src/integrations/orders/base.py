@@ -258,6 +258,18 @@ class ShippingMethod:
     carrier_name: typing.Optional[str] = None
 
 
+def resolve_po_number(purchase_order: src_models.PurchaseOrder) -> str:
+    """
+    The PO/reference number every adapter must send to the distributor and look status up
+    by — the customer-supplied ``po_name`` when one was given at submit time (POST .../submit/
+    body: ``{po_name}``), else our own ``po_number`` unchanged. Every adapter's submit_order()
+    AND get_order_status() must use this, not ``purchase_order.po_number`` directly, since
+    whichever value the distributor actually recorded the order under is the only one a later
+    status lookup can find it by.
+    """
+    return purchase_order.po_name or purchase_order.po_number
+
+
 class DistributorOrderAdapter(abc.ABC):
     """
     One instance per CompanyProviders connection (holds that connection's credentials).

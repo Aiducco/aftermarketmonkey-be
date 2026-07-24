@@ -311,7 +311,7 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
     ) -> base.DistributorOrderResult:
         phone_digits = "".join(ch for ch in (ship_to.phone or "") if ch.isdigit())
         data = {
-            "customerPurchaseOrderNumber": purchase_order.po_number,
+            "customerPurchaseOrderNumber": base.resolve_po_number(purchase_order),
             "shipToAddress": {
                 "name": ship_to.name,
                 "addressLine1": ship_to.address1,
@@ -345,6 +345,7 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
         request_payload: typing.Optional[typing.Dict] = None,
     ) -> base.DistributorOrderResult:
         try:
+            po_number = base.resolve_po_number(purchase_order)
             by_external_id = {_premier_item_number(li.provider_part): li for li in line_items}
             placements: typing.List[base.LineItemPlacement] = []
             # Premier's response only echoes back what was submitted (no confirmed-vs-requested
@@ -360,7 +361,7 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
                 placements.append(
                     base.LineItemPlacement(
                         line_item_id=li.line_item_id if li else 0,
-                        distributor_order_number=purchase_order.po_number,
+                        distributor_order_number=po_number,
                         quantity_confirmed=line.get("quantity", li.quantity if li else 0),
                         warehouse_code=line.get("warehouseCode"),
                     )
@@ -375,15 +376,16 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
 
         # No distributor order number is ever returned — see module docstring.
         return base.DistributorOrderResult(
-            distributor_order_numbers=[purchase_order.po_number],
+            distributor_order_numbers=[po_number],
             line_item_placements=placements,
             raw_response=response,
             request_payload=request_payload,
         )
 
     def get_order_status(self, purchase_order: src_models.PurchaseOrder) -> base.OrderStatusResult:
+        po_number = base.resolve_po_number(purchase_order)
         try:
-            tracking_entries = self._client.get_tracking_by_purchase_order_number(purchase_order.po_number)
+            tracking_entries = self._client.get_tracking_by_purchase_order_number(po_number)
         except premier_client_exceptions.PremierOrderValidationError:
             # Undocumented whether "no tracking yet" (order placed but not shipped) returns an
             # empty result or an error — treated as "still open" rather than a hard failure,
@@ -392,7 +394,7 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
             return base.OrderStatusResult(
                 orders=[
                     base.DistributorOrderStatus(
-                        distributor_order_number=purchase_order.po_number,
+                        distributor_order_number=po_number,
                         status_code="OPEN",
                         tracking_numbers=[],
                     )
@@ -407,7 +409,7 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
                 tracking_number = entry.get("trackingNumber")
                 orders.append(
                     base.DistributorOrderStatus(
-                        distributor_order_number=purchase_order.po_number,
+                        distributor_order_number=po_number,
                         status_code="SHIPPED" if tracking_number else "OPEN",
                         tracking_numbers=[tracking_number] if tracking_number else [],
                         carrier=entry.get("carrier"),
@@ -417,7 +419,7 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
             if not orders:
                 orders = [
                     base.DistributorOrderStatus(
-                        distributor_order_number=purchase_order.po_number, status_code="OPEN", tracking_numbers=[]
+                        distributor_order_number=po_number, status_code="OPEN", tracking_numbers=[]
                     )
                 ]
         except (AttributeError, TypeError, KeyError, IndexError) as e:
@@ -445,7 +447,9 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
         environment, same caveat get_order_status already carries for this same endpoint.
         """
         try:
-            tracking_entries = self._client.get_tracking_by_purchase_order_number(purchase_order.po_number)
+            tracking_entries = self._client.get_tracking_by_purchase_order_number(
+                base.resolve_po_number(purchase_order)
+            )
         except premier_client_exceptions.PremierOrderValidationError:
             return []
         except premier_client_exceptions.PremierException as e:
