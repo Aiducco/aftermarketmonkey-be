@@ -134,9 +134,11 @@ class WheelProsOrderAdapter(base.DistributorOrderAdapter):
 
     # -- Request building -----------------------------------------------------------------
 
-    def _handle_error(self, e: Exception) -> None:
+    def _handle_error(self, e: Exception, request_payload: typing.Optional[typing.Dict] = None) -> None:
         code = getattr(e, "code", None)
-        raise order_exceptions.OrderValidationError(message=str(e), code=str(code) if code else None)
+        raise order_exceptions.OrderValidationError(
+            message=str(e), code=str(code) if code else None, request_payload=request_payload
+        )
 
     def _load_warehouse_codes(
         self,
@@ -164,6 +166,7 @@ class WheelProsOrderAdapter(base.DistributorOrderAdapter):
         ship_method: typing.Optional[str] = None,
     ) -> base.ShippingQuoteResult:
         skus = [li.provider_part.provider_external_id for li in line_items]
+        data = {"skus": skus, "country_codes": [(ship_to.country or "US").upper()]}
         try:
             response = self._client.search_inventory(
                 skus=skus, country_codes=[(ship_to.country or "US").upper()]
@@ -172,10 +175,11 @@ class WheelProsOrderAdapter(base.DistributorOrderAdapter):
             raise order_exceptions.OrderValidationError(
                 "Wheel Pros denied access to the Inventory API needed for a shipping quote — "
                 "this account may not be approved for it yet. Contact Wheel Pros support to "
-                "request Inventory API access. ({})".format(e)
+                "request Inventory API access. ({})".format(e),
+                request_payload=data,
             )
         except wheelpros_client_exceptions.WheelProsException as e:
-            self._handle_error(e)
+            self._handle_error(e, request_payload=data)
 
         logger.info("{} Inventory response: {}".format(_LOG_PREFIX, repr(response)[:4000]))
 
@@ -237,7 +241,8 @@ class WheelProsOrderAdapter(base.DistributorOrderAdapter):
                 raise order_exceptions.OrderValidationError(
                     "Unexpected/empty inventory response shape from Wheel Pros. Raw response: {}".format(
                         repr(response)[:2000]
-                    )
+                    ),
+                    request_payload=data,
                 )
         except order_exceptions.OrderValidationError:
             raise
@@ -245,10 +250,11 @@ class WheelProsOrderAdapter(base.DistributorOrderAdapter):
             raise order_exceptions.OrderValidationError(
                 "Unexpected inventory response shape from Wheel Pros ({}: {}). Raw response: {}".format(
                     type(e).__name__, e, repr(response)[:2000]
-                )
+                ),
+                request_payload=data,
             )
 
-        return base.ShippingQuoteResult(lines=lines, raw_response=response)
+        return base.ShippingQuoteResult(lines=lines, raw_response=response, request_payload=data)
 
     def submit_order(
         self,
@@ -302,13 +308,15 @@ class WheelProsOrderAdapter(base.DistributorOrderAdapter):
         try:
             response = self._client.create_sales_order_edi(data)
         except wheelpros_client_exceptions.WheelProsException as e:
-            self._handle_error(e)
+            self._handle_error(e, request_payload=data)
 
-        return self._parse_submit_response(response, line_items)
+        return self._parse_submit_response(response, line_items, request_payload=data)
 
     @staticmethod
     def _parse_submit_response(
-        response: typing.Dict, line_items: typing.List[base.OrderLineItemRequest]
+        response: typing.Dict,
+        line_items: typing.List[base.OrderLineItemRequest],
+        request_payload: typing.Optional[typing.Dict] = None,
     ) -> base.DistributorOrderResult:
         try:
             order_number = response.get("supplierOrderNumber", "")
@@ -316,7 +324,8 @@ class WheelProsOrderAdapter(base.DistributorOrderAdapter):
                 raise order_exceptions.OrderValidationError(
                     "Unexpected/empty order response shape from Wheel Pros. Raw response: {}".format(
                         repr(response)[:2000]
-                    )
+                    ),
+                    request_payload=request_payload,
                 )
             # Wheel Pros' create response only confirms overall success — no per-line
             # confirmation detail is returned (see module docstring, point 3). Every submitted
@@ -336,13 +345,15 @@ class WheelProsOrderAdapter(base.DistributorOrderAdapter):
             raise order_exceptions.OrderValidationError(
                 "Unexpected order response shape from Wheel Pros ({}: {}). Raw response: {}".format(
                     type(e).__name__, e, repr(response)[:2000]
-                )
+                ),
+                request_payload=request_payload,
             )
 
         return base.DistributorOrderResult(
             distributor_order_numbers=[order_number],
             line_item_placements=placements,
             raw_response=response,
+            request_payload=request_payload,
         )
 
     def get_order_status(self, purchase_order: src_models.PurchaseOrder) -> base.OrderStatusResult:

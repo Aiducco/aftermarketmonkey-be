@@ -177,9 +177,11 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
             "ShipToCountry": ship_to.country,
         }
 
-    def _handle_error(self, e: Exception) -> None:
+    def _handle_error(self, e: Exception, request_payload: typing.Optional[typing.Dict] = None) -> None:
         code = getattr(e, "code", None)
-        raise order_exceptions.OrderValidationError(message=str(e), code=str(code) if code else None)
+        raise order_exceptions.OrderValidationError(
+            message=str(e), code=str(code) if code else None, request_payload=request_payload
+        )
 
     def _get_item_info(self, item_numbers: typing.List[str]) -> typing.Dict[str, typing.Dict[str, typing.Any]]:
         """
@@ -234,7 +236,7 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
         try:
             groups = self._client.get_shipping_rate_mass_quote(data)
         except meyer_client_exceptions.MeyerException as e:
-            self._handle_error(e)
+            self._handle_error(e, request_payload=data)
 
         logger.info("{} Quote response: {}".format(_LOG_PREFIX, repr(groups)[:4000]))
 
@@ -317,7 +319,8 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
 
             if not lines:
                 raise order_exceptions.OrderValidationError(
-                    "Unexpected/empty quote response shape from Meyer. Raw response: {}".format(repr(groups)[:2000])
+                    "Unexpected/empty quote response shape from Meyer. Raw response: {}".format(repr(groups)[:2000]),
+                    request_payload=data,
                 )
         except order_exceptions.OrderValidationError:
             raise
@@ -325,10 +328,11 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
             raise order_exceptions.OrderValidationError(
                 "Unexpected quote response shape from Meyer ({}: {}). Raw response: {}".format(
                     type(e).__name__, e, repr(groups)[:2000]
-                )
+                ),
+                request_payload=data,
             )
 
-        return base.ShippingQuoteResult(lines=lines, raw_response={"groups": groups})
+        return base.ShippingQuoteResult(lines=lines, raw_response={"groups": groups}, request_payload=data)
 
     def submit_order(
         self,
@@ -362,13 +366,15 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
         try:
             response = self._client.create_order(customer_number=self._client.customer_number, data=data)
         except meyer_client_exceptions.MeyerException as e:
-            self._handle_error(e)
+            self._handle_error(e, request_payload=data)
 
-        return self._parse_submit_response(response, line_items)
+        return self._parse_submit_response(response, line_items, request_payload=data)
 
     @staticmethod
     def _parse_submit_response(
-        response: typing.Dict, line_items: typing.List[base.OrderLineItemRequest]
+        response: typing.Dict,
+        line_items: typing.List[base.OrderLineItemRequest],
+        request_payload: typing.Optional[typing.Dict] = None,
     ) -> base.DistributorOrderResult:
         try:
             by_external_id = {li.provider_part.provider_external_id: li for li in line_items}
@@ -397,7 +403,8 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
                 raise order_exceptions.OrderValidationError(
                     "Unexpected/empty order response shape from Meyer. Raw response: {}".format(
                         repr(response)[:2000]
-                    )
+                    ),
+                    request_payload=request_payload,
                 )
         except order_exceptions.OrderValidationError:
             raise
@@ -405,13 +412,15 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
             raise order_exceptions.OrderValidationError(
                 "Unexpected order response shape from Meyer ({}: {}). Raw response: {}".format(
                     type(e).__name__, e, repr(response)[:2000]
-                )
+                ),
+                request_payload=request_payload,
             )
 
         return base.DistributorOrderResult(
             distributor_order_numbers=order_numbers,
             line_item_placements=placements,
             raw_response=response,
+            request_payload=request_payload,
         )
 
     def get_order_status(self, purchase_order: src_models.PurchaseOrder) -> base.OrderStatusResult:

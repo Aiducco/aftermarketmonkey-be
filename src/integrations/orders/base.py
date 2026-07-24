@@ -138,6 +138,12 @@ class ShippingQuoteResult:
     # Fees that apply to the order as a whole rather than any specific line (e.g. a dropship
     # fee) — see LineFee. Display-only, same reasoning as distributor_total.
     fees: typing.List[LineFee] = dataclasses.field(default_factory=list)
+    # The logical request body/params this adapter actually sent for the quote call (never
+    # includes credentials — those are header/transport-level on every adapter, not part of
+    # the body built here). Recorded verbatim on PurchaseOrderSubmissionAttempt.request_payload
+    # so a bad/rejected quote can be diagnosed without reproducing it by hand. None only when an
+    # adapter hasn't been updated to populate it yet.
+    request_payload: typing.Optional[typing.Dict] = None
 
 
 @dataclasses.dataclass
@@ -163,6 +169,8 @@ class DistributorOrderResult:
     distributor_order_numbers: typing.List[str]
     line_item_placements: typing.List[LineItemPlacement]
     raw_response: typing.Dict
+    # Same role as ShippingQuoteResult.request_payload, for the submit call.
+    request_payload: typing.Optional[typing.Dict] = None
 
 
 @dataclasses.dataclass

@@ -151,6 +151,7 @@ def _record_attempt(
     po: src_models.PurchaseOrder,
     operation: src_enums.PurchaseOrderOperation,
     success: bool,
+    request_payload: typing.Optional[typing.Dict] = None,
     response_payload: typing.Optional[typing.Dict] = None,
     error_message: typing.Optional[str] = None,
     duration_ms: typing.Optional[int] = None,
@@ -160,6 +161,7 @@ def _record_attempt(
         operation=operation.value,
         operation_name=operation.name,
         success=success,
+        request_payload=request_payload,
         response_payload=response_payload,
         error_message=error_message[:4000] if error_message else None,
         duration_ms=duration_ms,
@@ -252,11 +254,22 @@ def _run_quote(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrde
     try:
         result = adapter.get_shipping_quote(line_items, ship_to, ship_method=po.ship_method)
     except order_exceptions.OrderAdapterError as e:
-        _record_attempt(po, src_enums.PurchaseOrderOperation.QUOTE, False, error_message=str(e))
+        _record_attempt(
+            po,
+            src_enums.PurchaseOrderOperation.QUOTE,
+            False,
+            request_payload=getattr(e, "request_payload", None),
+            error_message=str(e),
+        )
         raise
     duration_ms = int((time.monotonic() - started) * 1000)
     _record_attempt(
-        po, src_enums.PurchaseOrderOperation.QUOTE, True, response_payload=result.raw_response, duration_ms=duration_ms
+        po,
+        src_enums.PurchaseOrderOperation.QUOTE,
+        True,
+        request_payload=result.request_payload,
+        response_payload=result.raw_response,
+        duration_ms=duration_ms
     )
 
     method_names = _get_shipping_method_names(adapter, po.company_provider_id)
@@ -558,7 +571,13 @@ def _run_submit(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrd
         line_items = _line_item_requests(po)
         result = adapter.submit_order(po, line_items, ship_to)
     except order_exceptions.OrderAdapterError as e:
-        _record_attempt(po, src_enums.PurchaseOrderOperation.SUBMIT, False, error_message=str(e))
+        _record_attempt(
+            po,
+            src_enums.PurchaseOrderOperation.SUBMIT,
+            False,
+            request_payload=getattr(e, "request_payload", None),
+            error_message=str(e),
+        )
         po.status = src_enums.PurchaseOrderStatus.FAILED.value
         po.status_name = src_enums.PurchaseOrderStatus.FAILED.name
         po.error_message = str(e)[:4000]
@@ -566,7 +585,12 @@ def _run_submit(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrd
         raise
     duration_ms = int((time.monotonic() - started) * 1000)
     _record_attempt(
-        po, src_enums.PurchaseOrderOperation.SUBMIT, True, response_payload=result.raw_response, duration_ms=duration_ms
+        po,
+        src_enums.PurchaseOrderOperation.SUBMIT,
+        True,
+        request_payload=result.request_payload,
+        response_payload=result.raw_response,
+        duration_ms=duration_ms,
     )
 
     distributor_orders_by_number = {}

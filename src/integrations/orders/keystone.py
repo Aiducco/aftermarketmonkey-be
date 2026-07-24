@@ -239,9 +239,11 @@ class KeystoneOrderAdapter(base.DistributorOrderAdapter):
             "email": ship_to.email or "",
         }
 
-    def _handle_error(self, e: Exception) -> None:
+    def _handle_error(self, e: Exception, request_payload: typing.Optional[typing.Dict] = None) -> None:
         code = getattr(e, "code", None)
-        raise order_exceptions.OrderValidationError(message=str(e), code=str(code) if code else None)
+        raise order_exceptions.OrderValidationError(
+            message=str(e), code=str(code) if code else None, request_payload=request_payload
+        )
 
     def _get_prices(self, vcpns: typing.List[str]) -> typing.Dict[str, decimal.Decimal]:
         """
@@ -316,12 +318,13 @@ class KeystoneOrderAdapter(base.DistributorOrderAdapter):
         ship_method: typing.Optional[str] = None,
     ) -> base.ShippingQuoteResult:
         part_numbers_qty = self._build_part_numbers_qty(line_items)
+        data = {"part_numbers_qty": part_numbers_qty, "to_zip": ship_to.postal_code}
         try:
             tables = self._client.get_shipping_options_multiple_parts_per_warehouse(
                 part_numbers_qty, to_zip=ship_to.postal_code
             )
         except keystone_client_exceptions.KeystoneException as e:
-            self._handle_error(e)
+            self._handle_error(e, request_payload=data)
 
         logger.info("{} Quote tables: {}".format(_LOG_PREFIX, repr(list(tables.keys()))[:2000]))
 
@@ -420,16 +423,18 @@ class KeystoneOrderAdapter(base.DistributorOrderAdapter):
                 raise order_exceptions.OrderValidationError(
                     "Unexpected/empty quote response shape from Keystone. Raw tables: {}".format(
                         repr(tables)[:2000]
-                    )
+                    ),
+                    request_payload=data,
                 )
         except (AttributeError, TypeError, KeyError, IndexError) as e:
             raise order_exceptions.OrderValidationError(
                 "Unexpected quote response shape from Keystone ({}: {}). Raw tables: {}".format(
                     type(e).__name__, e, repr(tables)[:2000]
-                )
+                ),
+                request_payload=data,
             )
 
-        return base.ShippingQuoteResult(lines=lines, raw_response=tables)
+        return base.ShippingQuoteResult(lines=lines, raw_response=tables, request_payload=data)
 
     def submit_order(
         self,
@@ -440,6 +445,13 @@ class KeystoneOrderAdapter(base.DistributorOrderAdapter):
         part_number_quantity = self._build_part_number_quantity(line_items)
         drop_ship = self._build_drop_ship(ship_to)
         service_level = purchase_order.ship_method or ""
+        data = {
+            "order_process_method": 1,
+            "part_number_quantity": part_number_quantity,
+            "drop_ship": drop_ship,
+            "po_number": purchase_order.po_number,
+            "service_level": service_level,
+        }
 
         try:
             tables = self._client.ship_order_dropship_multiple_parts(
@@ -450,15 +462,16 @@ class KeystoneOrderAdapter(base.DistributorOrderAdapter):
                 service_level=service_level,
             )
         except keystone_client_exceptions.KeystoneException as e:
-            self._handle_error(e)
+            self._handle_error(e, request_payload=data)
 
-        return self._parse_submit_response(tables, purchase_order, line_items)
+        return self._parse_submit_response(tables, purchase_order, line_items, request_payload=data)
 
     @staticmethod
     def _parse_submit_response(
         tables: typing.Dict[str, typing.List[typing.Dict[str, str]]],
         purchase_order: src_models.PurchaseOrder,
         line_items: typing.List[base.OrderLineItemRequest],
+        request_payload: typing.Optional[typing.Dict] = None,
     ) -> base.DistributorOrderResult:
         try:
             status_rows = tables.get("Status", [])
@@ -468,7 +481,8 @@ class KeystoneOrderAdapter(base.DistributorOrderAdapter):
 
             if overall_message != "OK":
                 raise order_exceptions.OrderValidationError(
-                    message=overall_status or overall_message or "Order rejected by Keystone."
+                    message=overall_status or overall_message or "Order rejected by Keystone.",
+                    request_payload=request_payload,
                 )
 
             by_vcpn = {li.provider_part.provider_external_id: li for li in line_items}
@@ -497,7 +511,8 @@ class KeystoneOrderAdapter(base.DistributorOrderAdapter):
             raise order_exceptions.OrderValidationError(
                 "Unexpected order response shape from Keystone ({}: {}). Raw tables: {}".format(
                     type(e).__name__, e, repr(tables)[:2000]
-                )
+                ),
+                request_payload=request_payload,
             )
 
         # Keystone doesn't hand back a distinct distributor order number at submit time — order
@@ -506,6 +521,7 @@ class KeystoneOrderAdapter(base.DistributorOrderAdapter):
             distributor_order_numbers=[purchase_order.po_number],
             line_item_placements=placements,
             raw_response=tables,
+            request_payload=request_payload,
         )
 
     def get_order_status(self, purchase_order: src_models.PurchaseOrder) -> base.OrderStatusResult:

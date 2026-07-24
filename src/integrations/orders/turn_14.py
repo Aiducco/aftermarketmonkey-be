@@ -126,8 +126,12 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
             }
         return [location]
 
-    def _handle_error(self, e: turn14_client_exceptions.Turn14APIBadResponseCodeError) -> None:
-        raise order_exceptions.OrderValidationError(message=e.message, code=str(e.code))
+    def _handle_error(
+        self,
+        e: turn14_client_exceptions.Turn14APIBadResponseCodeError,
+        request_payload: typing.Optional[typing.Dict] = None,
+    ) -> None:
+        raise order_exceptions.OrderValidationError(message=e.message, code=str(e.code), request_payload=request_payload)
 
     # -- DistributorOrderAdapter ------------------------------------------------------------
 
@@ -149,7 +153,7 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
         try:
             response = self._client.create_quote(data)
         except turn14_client_exceptions.Turn14APIBadResponseCodeError as e:
-            self._handle_error(e)
+            self._handle_error(e, request_payload=data)
 
         logger.info("{} Quote response: {}".format(_LOG_PREFIX, repr(response)[:4000]))
 
@@ -276,11 +280,12 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
             raise order_exceptions.OrderValidationError(
                 "Unexpected quote response shape from Turn14 ({}: {}). Raw response: {}".format(
                     type(e).__name__, e, repr(response)[:2000]
-                )
+                ),
+                request_payload=data,
             )
 
         return base.ShippingQuoteResult(
-            lines=lines, raw_response=response, distributor_total=distributor_total, fees=fees
+            lines=lines, raw_response=response, distributor_total=distributor_total, fees=fees, request_payload=data
         )
 
     def submit_order(
@@ -301,41 +306,40 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
         phone_number = ship_to.phone or ""
         po_number = self._turn14_po_number(purchase_order)
 
+        data: typing.Dict = {}
         try:
             if quote_id:
                 shipping_ids = self._build_shipping_selection(purchase_order)
-                response = self._client.promote_quote_to_order(
-                    {
-                        "environment": self._client.environment,
-                        "quote_id": quote_id,
-                        "po_number": po_number,
-                        "acknowledge_prop_65": acknowledge_prop_65,
-                        "acknowledge_epa": False,
-                        "acknowledge_carb": False,
-                        "order_notes": order_notes,
-                        "phone_number": phone_number,
-                        "shipping": shipping_ids,
-                    }
-                )
+                data = {
+                    "environment": self._client.environment,
+                    "quote_id": quote_id,
+                    "po_number": po_number,
+                    "acknowledge_prop_65": acknowledge_prop_65,
+                    "acknowledge_epa": False,
+                    "acknowledge_carb": False,
+                    "order_notes": order_notes,
+                    "phone_number": phone_number,
+                    "shipping": shipping_ids,
+                }
+                response = self._client.promote_quote_to_order(data)
             else:
                 shipping_code = purchase_order.ship_method or _DEFAULT_SHIPPING_GROUP_CODE
-                response = self._client.create_order(
-                    {
-                        "environment": self._client.environment,
-                        "po_number": po_number,
-                        "locations": self._build_locations(line_items, shipping_code=shipping_code),
-                        "acknowledge_prop_65": acknowledge_prop_65,
-                        "acknowledge_epa": False,
-                        "acknowledge_carb": False,
-                        "order_notes": order_notes,
-                        "phone_number": phone_number,
-                        "recipient": self._build_recipient(ship_to),
-                    }
-                )
+                data = {
+                    "environment": self._client.environment,
+                    "po_number": po_number,
+                    "locations": self._build_locations(line_items, shipping_code=shipping_code),
+                    "acknowledge_prop_65": acknowledge_prop_65,
+                    "acknowledge_epa": False,
+                    "acknowledge_carb": False,
+                    "order_notes": order_notes,
+                    "phone_number": phone_number,
+                    "recipient": self._build_recipient(ship_to),
+                }
+                response = self._client.create_order(data)
         except turn14_client_exceptions.Turn14APIBadResponseCodeError as e:
-            self._handle_error(e)
+            self._handle_error(e, request_payload=data)
 
-        return self._parse_order_response(response, line_items)
+        return self._parse_order_response(response, line_items, request_payload=data)
 
     @staticmethod
     def _turn14_po_number(purchase_order: src_models.PurchaseOrder) -> str:
@@ -381,7 +385,9 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
 
     @staticmethod
     def _parse_order_response(
-        response: typing.Dict, line_items: typing.List[base.OrderLineItemRequest]
+        response: typing.Dict,
+        line_items: typing.List[base.OrderLineItemRequest],
+        request_payload: typing.Optional[typing.Dict] = None,
     ) -> base.DistributorOrderResult:
         try:
             by_external_id = {li.provider_part.provider_external_id: li for li in line_items}
@@ -407,13 +413,15 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
             raise order_exceptions.OrderValidationError(
                 "Unexpected order response shape from Turn14 ({}: {}). Raw response: {}".format(
                     type(e).__name__, e, repr(response)[:2000]
-                )
+                ),
+                request_payload=request_payload,
             )
 
         return base.DistributorOrderResult(
             distributor_order_numbers=[order_id] if order_id else [],
             line_item_placements=placements,
             raw_response=response,
+            request_payload=request_payload,
         )
 
     def get_order_status(self, purchase_order: src_models.PurchaseOrder) -> base.OrderStatusResult:

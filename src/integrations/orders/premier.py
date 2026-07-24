@@ -178,9 +178,11 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
             environment=environment,
         )
 
-    def _handle_error(self, e: Exception) -> None:
+    def _handle_error(self, e: Exception, request_payload: typing.Optional[typing.Dict] = None) -> None:
         code = getattr(e, "code", None)
-        raise order_exceptions.OrderValidationError(message=str(e), code=str(code) if code else None)
+        raise order_exceptions.OrderValidationError(
+            message=str(e), code=str(code) if code else None, request_payload=request_payload
+        )
 
     def _get_prices(self, item_numbers: typing.List[str], currency: str) -> typing.Dict[str, decimal.Decimal]:
         """{item_number: cost} in the given currency ("USD"/"CAD") via GET /pricing — Premier's
@@ -222,10 +224,11 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
         ship_method: typing.Optional[str] = None,
     ) -> base.ShippingQuoteResult:
         item_numbers = [_premier_item_number(li.provider_part) for li in line_items]
+        data = {"itemNumbers": item_numbers}
         try:
             inventory = self._client.get_inventory(item_numbers)
         except premier_client_exceptions.PremierException as e:
-            self._handle_error(e)
+            self._handle_error(e, request_payload=data)
 
         logger.info("{} Inventory response: {}".format(_LOG_PREFIX, repr(inventory)[:4000]))
 
@@ -285,7 +288,8 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
                 raise order_exceptions.OrderValidationError(
                     "Unexpected/empty inventory response shape from Premier. Raw response: {}".format(
                         repr(inventory)[:2000]
-                    )
+                    ),
+                    request_payload=data,
                 )
         except order_exceptions.OrderValidationError:
             raise
@@ -293,10 +297,11 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
             raise order_exceptions.OrderValidationError(
                 "Unexpected inventory response shape from Premier ({}: {}). Raw response: {}".format(
                     type(e).__name__, e, repr(inventory)[:2000]
-                )
+                ),
+                request_payload=data,
             )
 
-        return base.ShippingQuoteResult(lines=lines, raw_response={"inventory": inventory})
+        return base.ShippingQuoteResult(lines=lines, raw_response={"inventory": inventory}, request_payload=data)
 
     def submit_order(
         self,
@@ -328,15 +333,16 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
         try:
             response = self._client.create_sales_order(data)
         except premier_client_exceptions.PremierException as e:
-            self._handle_error(e)
+            self._handle_error(e, request_payload=data)
 
-        return self._parse_submit_response(response, purchase_order, line_items)
+        return self._parse_submit_response(response, purchase_order, line_items, request_payload=data)
 
     @staticmethod
     def _parse_submit_response(
         response: typing.Dict,
         purchase_order: src_models.PurchaseOrder,
         line_items: typing.List[base.OrderLineItemRequest],
+        request_payload: typing.Optional[typing.Dict] = None,
     ) -> base.DistributorOrderResult:
         try:
             by_external_id = {_premier_item_number(li.provider_part): li for li in line_items}
@@ -363,7 +369,8 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
             raise order_exceptions.OrderValidationError(
                 "Unexpected order response shape from Premier ({}: {}). Raw response: {}".format(
                     type(e).__name__, e, repr(response)[:2000]
-                )
+                ),
+                request_payload=request_payload,
             )
 
         # No distributor order number is ever returned — see module docstring.
@@ -371,6 +378,7 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
             distributor_order_numbers=[purchase_order.po_number],
             line_item_placements=placements,
             raw_response=response,
+            request_payload=request_payload,
         )
 
     def get_order_status(self, purchase_order: src_models.PurchaseOrder) -> base.OrderStatusResult:
