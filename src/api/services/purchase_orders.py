@@ -18,7 +18,6 @@ import typing
 
 from django.conf import settings
 from django.db import IntegrityError, transaction
-from django.db.models import Exists, OuterRef, Q
 from django.utils import timezone as django_timezone
 
 from src import enums as src_enums
@@ -250,30 +249,24 @@ def _get_company_provider(company_id: int, provider_id: int) -> src_models.Compa
 def _cart_queryset(company_id: int):
     """
     POs that still belong to the "cart" world, as opposed to order history: never-submitted
-    DRAFT/QUOTED carts, plus a quote attempt that failed before ever reaching submit (still
-    editable/retryable from the cart, not a real order attempt). A FAILED PO that *did* reach
-    submit (a real, failed order attempt) is deliberately excluded — that belongs in order
-    history, not the cart. "Ever reached submit" is determined by whether a SUBMIT
-    PurchaseOrderSubmissionAttempt was ever recorded for it (see _run_submit's ``_record_attempt``
-    calls, which fire on both success and failure), not by status alone, since both failure
-    modes land on the same FAILED status. This used to check for an enqueued SUBMIT
-    PurchaseOrderJob instead, back when submit was job-queued — now that submit_purchase_order
-    calls the distributor directly (see run_submit_synchronously), the submission-attempt audit
-    row is the only record that a real submit was ever tried.
+    DRAFT/QUOTED carts, AND any FAILED PO regardless of whether the failure ever actually
+    reached the distributor. A failed submission is never treated as "an order" here, even when
+    the distributor genuinely rejected it — from the user's perspective nothing real happened,
+    so it stays actionable (requote-and-resubmit, or discard_purchase_order) in the same place
+    a never-submitted cart item is, rather than cluttering order history with something that
+    didn't go through. Adding a new item for that distributor reuses/reverts this same FAILED
+    row back to DRAFT exactly like it already does for a stale QUOTED cart (see
+    _get_or_create_draft / _revert_to_draft) — a fresh cart edit implicitly means "never mind,
+    starting over." DISCARDED is deliberately excluded — once a user discards a PO it's a dead
+    end, never resurrected as a draft.
     """
-    ever_submitted = src_models.PurchaseOrderSubmissionAttempt.objects.filter(
-        purchase_order_id=OuterRef("pk"), operation=src_enums.PurchaseOrderOperation.SUBMIT.value
-    )
-    return src_models.PurchaseOrder.objects.filter(company_id=company_id).annotate(
-        _ever_submitted=Exists(ever_submitted)
-    ).filter(
-        Q(
-            status__in=[
-                src_enums.PurchaseOrderStatus.DRAFT.value,
-                src_enums.PurchaseOrderStatus.QUOTED.value,
-            ]
-        )
-        | Q(status=src_enums.PurchaseOrderStatus.FAILED.value, _ever_submitted=False)
+    return src_models.PurchaseOrder.objects.filter(
+        company_id=company_id,
+        status__in=[
+            src_enums.PurchaseOrderStatus.DRAFT.value,
+            src_enums.PurchaseOrderStatus.QUOTED.value,
+            src_enums.PurchaseOrderStatus.FAILED.value,
+        ],
     )
 
 
@@ -635,11 +628,16 @@ def list_purchase_orders(
     company_provider_id: typing.Optional[int] = None,
 ) -> typing.List[typing.Dict]:
     """Order history: everything that isn't still cart territory (see _cart_queryset) — a
-    quote, even a stale or failed one, is never "an order" here on its own; only a submit
-    attempt (successful or failed) is."""
+    quote, even a stale one, is never "an order" here on its own, and neither is a failed
+    submit attempt (it stays in the cart, actionable via requote-and-resubmit or
+    discard_purchase_order, until it either succeeds for real or is explicitly discarded).
+    DISCARDED is excluded separately, since a user who gave up on a PO doesn't want it
+    resurfacing as "an order" either — it's not in _cart_queryset (that would let it be
+    silently reused as a fresh draft, undoing the discard), but it still isn't real history."""
     qs = (
         src_models.PurchaseOrder.objects.filter(company_id=company_id)
         .exclude(id__in=_cart_queryset(company_id).values("id"))
+        .exclude(status=src_enums.PurchaseOrderStatus.DISCARDED.value)
         .select_related("company_provider__provider")
         .prefetch_related("distributor_orders")
         .order_by("-created_at")
@@ -982,11 +980,49 @@ def cancel_purchase_order(company_id: int, purchase_order_id: int) -> typing.Dic
         src_enums.PurchaseOrderStatus.CANCELLED.value,
         src_enums.PurchaseOrderStatus.FAILED.value,
         src_enums.PurchaseOrderStatus.FULFILLED.value,
+        src_enums.PurchaseOrderStatus.DISCARDED.value,
     }
     if po.status in terminal:
         raise PurchaseOrderServiceError("Purchase order is already {}.".format(po.status_name.lower()))
     job = purchase_order_jobs.enqueue_cancel_job(po.id)
     return {"purchase_order_id": po.id, "job_id": job.id}
+
+
+def discard_purchase_order(company_id: int, purchase_order_id: int) -> typing.Dict:
+    """
+    Abandons a PO that never became — and now never will become — a real distributor order:
+    a never-submitted DRAFT/QUOTED cart the user doesn't want anymore, or a FAILED submission
+    attempt they've decided not to retry. Unlike cancel_purchase_order, this NEVER calls the
+    distributor — there is nothing real to undo (a FAILED PO either never reached them, or was
+    already rejected outright), so this is a pure local status flip, always synchronous, no
+    job queue involved.
+
+    The row itself (line items, submission-attempt audit trail) is never deleted — only hidden
+    from the cart and from order history (see _cart_queryset / list_purchase_orders) — so a
+    rejected attempt stays diagnosable on the backend without ever showing up to the user as
+    "an order" again.
+
+    Rejects anything that already reflects (or once reflected) a real distributor-side state —
+    once a PO has actually gone anywhere with the distributor, cancel_purchase_order (or, for
+    a distributor that doesn't support cancellation, nothing) is the only path forward, not this.
+    """
+    po = src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id).first()
+    if not po:
+        raise PurchaseOrderServiceError("Purchase order not found.")
+    discardable = {
+        src_enums.PurchaseOrderStatus.DRAFT.value,
+        src_enums.PurchaseOrderStatus.QUOTED.value,
+        src_enums.PurchaseOrderStatus.FAILED.value,
+    }
+    if po.status not in discardable:
+        raise PurchaseOrderServiceError(
+            "Purchase order cannot be discarded (current status: {}). Only a never-submitted "
+            "or failed purchase order can be discarded.".format(po.status_name)
+        )
+    po.status = src_enums.PurchaseOrderStatus.DISCARDED.value
+    po.status_name = src_enums.PurchaseOrderStatus.DISCARDED.name
+    po.save(update_fields=["status", "status_name", "updated_at"])
+    return _serialize_purchase_order(po)
 
 
 def refresh_purchase_order_status(company_id: int, purchase_order_id: int) -> typing.Dict:

@@ -400,6 +400,27 @@ class PurchaseOrderCancelView(views.View):
         return _json_response(result, status=202)
 
 
+class PurchaseOrderDiscardView(views.View):
+    """POST /purchase-orders/<id>/discard/ — abandons a never-submitted or failed purchase
+    order (never calls the distributor); see purchase_orders_services.discard_purchase_order."""
+
+    def post(self, request: http.HttpRequest, *args, **kwargs) -> http.HttpResponse:
+        company_id, _user_id, err = _require_auth(request)
+        if err:
+            return err
+
+        po_id = kwargs.get("id")
+        try:
+            result = purchase_orders_services.discard_purchase_order(company_id=company_id, purchase_order_id=po_id)
+        except purchase_orders_services.PurchaseOrderServiceError as e:
+            return _error_response(str(e))
+        except Exception:
+            logger.exception("{} Error discarding purchase order id={}".format(_LOG_PREFIX, po_id))
+            return _error_response("Error discarding purchase order", status=500)
+
+        return _json_response(result, status=200)
+
+
 class PurchaseOrderRefreshStatusView(views.View):
     """POST /purchase-orders/<id>/refresh-status/"""
 

@@ -155,6 +155,13 @@ class PurchaseOrderStatus(enum.Enum):
     FULFILLED = 7
     CANCELLED = 8
     FAILED = 9
+    # A PO that never became a real distributor order (DRAFT/QUOTED/FAILED, regardless of
+    # whether FAILED reached the distributor and was rejected there) that the user explicitly
+    # gave up on — see purchase_orders.discard_purchase_order. Distinct from CANCELLED, which
+    # means a real distributor order existed and was successfully reversed; DISCARDED never
+    # involves a distributor call at all. Hidden from both the cart and order-history views,
+    # but the row (and its submission-attempt audit trail) is never deleted.
+    DISCARDED = 10
 
 
 class PurchaseOrderLineItemStatus(enum.Enum):
