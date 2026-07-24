@@ -5,6 +5,11 @@ showing the last feed-synced ProviderPartInventory values only.
 
 Providers are added one at a time as each distributor's live-inventory lookup is confirmed
 against their API - this file starts with just Turn14 on purpose.
+
+Note: which credential namespace a provider needs (feed vs. order - see
+src.integrations.credentials) is that provider's own choice, made in its __init__. Turn14 uses
+feed credentials (its catalog OAuth client works for both feed and order); Keystone uses order
+credentials (CheckInventory is part of its order-placement SOAP service, not its FTP feed).
 """
 import logging
 import typing
@@ -32,8 +37,8 @@ def get_provider(
 ) -> typing.Optional[base.LiveInventoryProvider]:
     """
     Returns None both when no provider is registered for this kind AND when one is registered
-    but this connection's feed credentials are missing/invalid - constructors raise ValueError
-    in the latter case (matching Turn14ApiClient / orders.registry.get_adapter's convention).
+    but this connection's credentials are missing/invalid - constructors raise ValueError in
+    the latter case (matching Turn14ApiClient / orders.registry.get_adapter's convention).
     """
     provider_cls = _PROVIDERS.get(company_provider.provider.kind)
     if provider_cls is None:
@@ -43,7 +48,7 @@ def get_provider(
     except ValueError:
         logger.info(
             "Live inventory provider for provider kind=%s company_provider_id=%s could not be "
-            "constructed (feed credentials likely missing/invalid for this connection).",
+            "constructed (credentials likely missing/invalid for this connection).",
             company_provider.provider.kind,
             company_provider.id,
         )
@@ -53,6 +58,8 @@ def get_provider(
 # Self-register each implemented provider. Imported here (rather than an AppConfig.ready()
 # hook, which this project doesn't use) so registration happens as soon as anything imports
 # this module.
+from src.integrations.live_inventory import keystone as _keystone  # noqa: E402
 from src.integrations.live_inventory import turn_14 as _turn_14  # noqa: E402
 
 register(src_enums.BrandProviderKind.TURN_14.value, _turn_14.Turn14LiveInventoryProvider)
+register(src_enums.BrandProviderKind.KEYSTONE.value, _keystone.KeystoneLiveInventoryProvider)

@@ -182,6 +182,39 @@ class KeystoneOrderApiClient(object):
             )
         return _parse_dataset_tables(result)
 
+    def _call_string(self, operation: str, extra_params: typing.List[typing.Tuple[str, str]]) -> str:
+        """Like _call_dataset, but for operations whose SOAP return type is a plain string
+        (e.g. CheckInventory) rather than a DataSet/diffgram."""
+        params = [("Key", self.security_key), ("FullAccountNo", self.account_number)] + extra_params
+        response_text = self._request(operation, params)
+        try:
+            root = ET.fromstring(response_text)
+        except ET.ParseError as e:
+            raise exceptions.KeystoneOrderAPIException(
+                "Could not parse Keystone {} response as XML ({}). Raw response: {}".format(
+                    operation, e, response_text[:2000]
+                )
+            )
+        result = _find_by_local_name(root, "{}Result".format(operation))
+        if result is None:
+            raise exceptions.KeystoneOrderAPIException(
+                "Keystone {} response missing {}Result element. Raw response: {}".format(
+                    operation, operation, response_text[:2000]
+                )
+            )
+        return (result.text or "").strip()
+
+    # -- Inventory --------------------------------------------------------------------------
+
+    def check_inventory(self, full_part_no: str) -> str:
+        """CheckInventory - one VCPN, live inventory across every warehouse this account can
+        see. Returns the raw result string: either "WAREHOUSE,QTY,WAREHOUSE,QTY,..." (e.g.
+        "EAST,0,MIDWEST,3,...") or one of Keystone's plain-text business errors ("Invalid part
+        number.", "Part is blocked.") - parsing/error detection is the caller's job (see
+        src.integrations.live_inventory.keystone), since this is a bare string, not a
+        DataSet with its own ErrorMessage column like CheckInventoryBulk has."""
+        return self._call_string("CheckInventory", [("FullPartNo", full_part_no)])
+
     # -- Shipping quote -----------------------------------------------------------------
 
     def get_shipping_options_multiple_parts_per_warehouse(
