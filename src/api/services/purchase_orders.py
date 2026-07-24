@@ -492,12 +492,14 @@ def review_cart(
     if shipping_method_id and not ship_methods and purchase_order_ids and len(purchase_order_ids) == 1:
         ship_methods[str(purchase_order_ids[0])] = shipping_method_id
 
-    # DRAFT (never quoted) or FAILED (a previous quote attempt failed) — both are still cart
-    # territory. An already-QUOTED PO isn't picked up here: it either already has a usable
-    # quote (nothing to do) or is stale/needs retrying, which is requote_purchase_order's job.
-    qs = _cart_queryset(company_id).filter(
-        status__in=[src_enums.PurchaseOrderStatus.DRAFT.value, src_enums.PurchaseOrderStatus.FAILED.value]
-    ).filter(line_items__isnull=False)
+    # DRAFT (never quoted), FAILED (a previous quote attempt failed), or QUOTED (already
+    # reviewed once) are all picked up and freshly re-quoted from scratch with whatever
+    # ship_to/ship_method was just submitted. Review must be safe to call again on something
+    # already reviewed — e.g. the user edited the ship-to address, or just wants current
+    # pricing — rather than silently treating "already quoted" as "nothing to do" (which used
+    # to raise "No cart items to review" on a cart that's entirely already-quoted, even though
+    # a perfectly valid line item existed).
+    qs = _cart_queryset(company_id).filter(line_items__isnull=False)
     if purchase_order_ids:
         qs = qs.filter(id__in=purchase_order_ids)
     purchase_orders = list(qs.distinct())
@@ -550,25 +552,6 @@ def review_cart(
         )
         quoted_po = purchase_order_jobs.run_quote_synchronously(po.id)
         results.append(_serialize_purchase_order(quoted_po))
-
-    # Any OTHER distributor's PO that's already QUOTED from an earlier review_cart call (e.g.
-    # the caller just added an item for a second distributor and is re-reviewing the cart) is
-    # still part of the same checkout session — re-point it at this new group too, without
-    # re-quoting it (its existing quote is still valid; requote_purchase_order is the path for
-    # a stale one). Without this, it would stay attached to its old, now-orphaned group, and
-    # submit_purchase_order_group(group_id=<this new one>) would silently miss it.
-    other_quoted = (
-        src_models.PurchaseOrder.objects.filter(
-            company_id=company_id, status=src_enums.PurchaseOrderStatus.QUOTED.value
-        )
-        .exclude(id__in=[po.id for po in purchase_orders])
-        .filter(line_items__isnull=False)
-        .distinct()
-    )
-    for po in other_quoted:
-        po.group = group
-        po.save(update_fields=["group", "updated_at"])
-        results.append(_serialize_purchase_order(po))
 
     return {"group_id": group.id, "purchase_orders": results}
 
