@@ -646,7 +646,7 @@ def _serialize_confirmed_shipped_to(po: src_models.PurchaseOrder) -> typing.Opti
 def _serialize_confirmed_distributor_order(
     pdo: src_models.PurchaseOrderDistributorOrder, provider_kind: int
 ) -> typing.Dict:
-    parsed = raw_response_parsers.parse(provider_kind, pdo.raw_response)
+    parsed = raw_response_parsers.parse(provider_kind, pdo)
     return {
         "distributor_order_number": pdo.distributor_order_number,
         "distributor_status": parsed["distributor_status"],

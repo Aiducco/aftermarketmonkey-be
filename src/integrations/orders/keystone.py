@@ -340,6 +340,131 @@ def decode_and_merge_order_history(
     return [_merge_line_item_rows(group) for group in by_vcpn.values()]
 
 
+def _to_float(value: typing.Any) -> typing.Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _ekstat_code(decoded_status: typing.Optional[str]) -> typing.Optional[str]:
+    """processed_order's "status" is already the human-readable "{code} - {description}" string
+    built by _decode_status -- this pulls the raw EKSTAT code back out of it so it can be run
+    back through translate_order_status/_EKSTAT_* lookups."""
+    if not decoded_status:
+        return None
+    return decoded_status.split(" - ", 1)[0].strip()
+
+
+# EKSTAT's stage progression collapsed onto the same "in_stock"/"backordered"/"shipped"/
+# "confirmed" line-item vocabulary Turn14's parser uses (see turn_14.parse_order_raw_response)
+# -- Keystone's GetOrderHistory has no distinct "backordered" stage of its own (that's a
+# quote-time ShipFlag concept, not part of this progression), so every pre-shipment stage
+# collapses to "confirmed" here rather than being guessed at.
+_LINE_ITEM_STATUS_BY_EKSTAT = {
+    "RCV ORD": "confirmed",
+    "ORDER": "confirmed",
+    "PICK": "confirmed",
+    "PACKAGE": "shipped",
+    "XDOCK": "shipped",
+    "OUT4DLV": "shipped",
+    "INVOICE": "shipped",
+    "CANCEL": "cancelled",
+}
+
+
+def parse_processed_order(processed_order: typing.Optional[typing.List[typing.Dict]]) -> typing.Dict:
+    """
+    Maps PurchaseOrderDistributorOrder.processed_order (see decode_and_merge_order_history --
+    Keystone's own per-line-item order history, already decoded/merged) into the purchase-order
+    detail API's standardized distributor-order fields. Unlike Turn14, Keystone has no single
+    order-level status/total/tracking record -- every field here is derived by joining across
+    this order's line items instead (see turn_14.parse_order_raw_response for the Turn14
+    equivalent read straight off raw_response).
+    """
+    empty = {
+        "distributor_status": None,
+        "distributor_invoice_ids": [],
+        "tracking": [],
+        "total": None,
+        "freight": None,
+        "discount": None,
+        "subtotal": None,
+        "line_items": [],
+    }
+    if not processed_order:
+        return empty
+
+    line_items = []
+    invoice_ids: typing.List[str] = []
+    tracking: typing.List[typing.Dict] = []
+    freight = None
+    raw_statuses = []
+    for row in processed_order:
+        code = _ekstat_code(row.get("status"))
+        raw_statuses.append(code)
+        line_items.append(
+            {
+                "part_number": row.get("vcpn"),
+                "quantity": row.get("quantity"),
+                "unit_price": _to_float(row.get("unit_price")),
+                "line_total": _to_float(row.get("extended_price")),
+                "warehouse_code": row.get("warehouse"),
+                "status": _LINE_ITEM_STATUS_BY_EKSTAT.get(code) if code else None,
+            }
+        )
+
+        invoice_number = row.get("invoice_number")
+        if invoice_number and invoice_number not in invoice_ids:
+            invoice_ids.append(invoice_number)
+
+        tracking_number = row.get("tracking_number")
+        if tracking_number:
+            ship_method = row.get("ship_method") or ""
+            method = ship_method.split(" - ", 1)[-1].strip() if " - " in ship_method else (ship_method or None)
+            entry = {"tracking_number": tracking_number, "method": method}
+            if entry not in tracking:
+                tracking.append(entry)
+
+        # freight_charge is an order-level charge repeated identically on every line row
+        # (confirmed against a live 2-line order) -- take the first value seen, not a sum
+        # across lines, to avoid multiplying it by the number of line items.
+        if freight is None:
+            row_freight = _to_float(row.get("freight_charge"))
+            if row_freight is not None:
+                freight = row_freight
+
+    line_totals = [li["line_total"] for li in line_items if li["line_total"] is not None]
+    subtotal = round(sum(line_totals), 2) if line_totals else None
+    total = round(subtotal + freight, 2) if subtotal is not None and freight is not None else subtotal
+
+    # Order-level status: CLOSED only once every line item has reached a terminal EKSTAT stage
+    # (INVOICE/CANCEL) -- if any line item is still earlier in the pipeline, the order as a
+    # whole is still OPEN. Same OPEN/CLOSED vocabulary translate_order_status already uses.
+    translated = [translate_order_status(code) for code in raw_statuses if code]
+    if translated and all(t == src_enums.DistributorOrderRawStatus.CLOSED for t in translated):
+        distributor_status = src_enums.DistributorOrderRawStatus.CLOSED.name
+    elif translated:
+        distributor_status = src_enums.DistributorOrderRawStatus.OPEN.name
+    else:
+        distributor_status = None
+
+    return {
+        "distributor_status": distributor_status,
+        "distributor_invoice_ids": invoice_ids,
+        "tracking": tracking,
+        "total": total,
+        "freight": freight,
+        # Keystone's order history carries no discount figure of its own (unlike Turn14's
+        # attributes.discount) -- left None rather than guessed.
+        "discount": None,
+        "subtotal": subtotal,
+        "line_items": line_items,
+    }
+
+
 class KeystoneOrderAdapter(base.DistributorOrderAdapter):
     provider_kind = src_enums.BrandProviderKind.KEYSTONE.value
 

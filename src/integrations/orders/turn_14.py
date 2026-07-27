@@ -232,7 +232,7 @@ def parse_order_raw_response(raw_response: typing.Optional[typing.Dict]) -> typi
 
     line_items = _parse_order_lines(attrs) if "lines" in attrs else _parse_order_shipment_items(attrs)
     line_totals = [li["line_total"] for li in line_items if li["line_total"] is not None]
-    subtotal = sum(line_totals) if line_totals else None
+    subtotal = round(sum(line_totals), 2) if line_totals else None
 
     return {
         "distributor_status": attrs.get("status"),
