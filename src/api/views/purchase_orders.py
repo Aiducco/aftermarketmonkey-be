@@ -305,6 +305,31 @@ class PurchaseOrderDetailView(views.View):
         return _json_response(result)
 
 
+class PurchaseOrderConfirmedDetailView(views.View):
+    """GET /purchase-orders/<id>/confirmed-details/ -- standardized, distributor-agnostic view
+    of a placed order (distributor status/tracking/invoice ids/line items read straight off
+    PurchaseOrderDistributorOrder.raw_response). Separate from PurchaseOrderDetailView, which
+    every cart/quote/submit flow still depends on for its full shape."""
+
+    def get(self, request: http.HttpRequest, *args, **kwargs) -> http.HttpResponse:
+        company_id, _user_id, err = _require_auth(request)
+        if err:
+            return err
+
+        po_id = kwargs.get("id")
+        try:
+            result = purchase_orders_services.get_confirmed_purchase_order_detail(
+                company_id=company_id, purchase_order_id=po_id
+            )
+        except purchase_orders_services.PurchaseOrderServiceError as e:
+            return _error_response(str(e), status=404)
+        except Exception:
+            logger.exception("{} Error fetching confirmed purchase order id={}".format(_LOG_PREFIX, po_id))
+            return _error_response("Error fetching purchase order", status=500)
+
+        return _json_response(result)
+
+
 class PurchaseOrderSubmitView(views.View):
     """POST /purchase-orders/<id>/submit/ — submits SYNCHRONOUSLY, placing a real order with
     the distributor in the request/response cycle (see run_submit_synchronously). Optional

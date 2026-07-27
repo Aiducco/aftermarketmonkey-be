@@ -66,6 +66,7 @@ from src.api.views.purchase_orders import (
     CartReviewView,
     PurchaseOrdersView,
     PurchaseOrderDetailView,
+    PurchaseOrderConfirmedDetailView,
     PurchaseOrderSubmitView,
     PurchaseOrderShippingSelectionView,
     PurchaseOrderCancelView,
@@ -352,6 +353,11 @@ urlpatterns = [
         "purchase-orders/<int:id>/requote/",
         PurchaseOrderRequoteView.as_view(),
         name="purchase_order_requote",
+    ),
+    path(
+        "purchase-orders/<int:id>/confirmed-details/",
+        PurchaseOrderConfirmedDetailView.as_view(),
+        name="purchase_order_confirmed_detail",
     ),
     path(
         "purchase-orders/<int:id>/",

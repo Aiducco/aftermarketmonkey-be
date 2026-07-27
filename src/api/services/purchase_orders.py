@@ -612,7 +612,22 @@ def review_cart(
 # -- PO / group reads -----------------------------------------------------------------------
 
 
-def _serialize_shipped_to(po: src_models.PurchaseOrder) -> typing.Optional[typing.Dict]:
+def get_purchase_order_detail(company_id: int, purchase_order_id: int) -> typing.Dict:
+    po = (
+        src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id)
+        .select_related("company_provider__provider", "group")
+        .prefetch_related("line_items__provider_part__master_part__brand", "distributor_orders")
+        .first()
+    )
+    if not po:
+        raise PurchaseOrderServiceError("Purchase order not found.")
+    return _serialize_purchase_order(po)
+
+
+# -- Confirmed-order standardized detail (distributor_orders read straight off raw_response) ----
+
+
+def _serialize_confirmed_shipped_to(po: src_models.PurchaseOrder) -> typing.Optional[typing.Dict]:
     if not po.ship_to_address1:
         return None
     return {
@@ -628,7 +643,7 @@ def _serialize_shipped_to(po: src_models.PurchaseOrder) -> typing.Optional[typin
     }
 
 
-def _serialize_distributor_order_detail(
+def _serialize_confirmed_distributor_order(
     pdo: src_models.PurchaseOrderDistributorOrder, provider_kind: int
 ) -> typing.Dict:
     parsed = raw_response_parsers.parse(provider_kind, pdo.raw_response)
@@ -645,7 +660,14 @@ def _serialize_distributor_order_detail(
     }
 
 
-def get_purchase_order_detail(company_id: int, purchase_order_id: int) -> typing.Dict:
+def get_confirmed_purchase_order_detail(company_id: int, purchase_order_id: int) -> typing.Dict:
+    """
+    Standardized, distributor-agnostic view of a placed order: reads distributor_status/
+    tracking/invoice ids/line items straight off PurchaseOrderDistributorOrder.raw_response via
+    a per-provider parser (see raw_response_parsers), instead of the full cart/quote-oriented
+    shape get_purchase_order_detail returns (which every cart/quote/submit flow still depends
+    on and must keep returning unchanged).
+    """
     po = (
         src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id)
         .select_related("company_provider__provider")
@@ -661,11 +683,11 @@ def get_purchase_order_detail(company_id: int, purchase_order_id: int) -> typing
         "po_internal_number": po.po_number,
         "po_number": order_base.resolve_po_number(po),
         "status": po.status_name,
-        "shipped_to": _serialize_shipped_to(po),
+        "shipped_to": _serialize_confirmed_shipped_to(po),
         "created_at": po.created_at.isoformat(),
         "submitted_at": po.submitted_at.isoformat() if po.submitted_at else None,
         "distributor_orders": [
-            _serialize_distributor_order_detail(pdo, provider_kind) for pdo in po.distributor_orders.all()
+            _serialize_confirmed_distributor_order(pdo, provider_kind) for pdo in po.distributor_orders.all()
         ],
     }
 
