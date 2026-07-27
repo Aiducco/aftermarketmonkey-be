@@ -452,7 +452,9 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
                         )
                     )
                 if meyer_truck_option is not None:
-                    raw_options.append(meyer_truck_option)
+                    # Listed first, not appended -- it's Meyer's own preferred/free route, not
+                    # just another carrier option buried among everything else.
+                    raw_options.insert(0, meyer_truck_option)
                 ship_options = _filter_options(raw_options, ship_method)
                 for sku in skus:
                     li = by_external_id.get(sku)
