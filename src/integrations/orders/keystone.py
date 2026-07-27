@@ -86,6 +86,45 @@ _WAREHOUSE_NAMES = {
     "70": "Ocoee, FL",
 }
 
+# Same "List of Active Warehouses" table's "Name" column -- the region label GetOrderHistory's
+# EKSWHS doesn't itself carry, used only by decode_and_merge_order_history's human-readable
+# "warehouse" field (e.g. "70 - Florida (Ocoee, FL)"), not by anything that keys off warehouse
+# codes elsewhere in this file (those all use _WAREHOUSE_NAMES's plain "City, ST" directly).
+_WAREHOUSE_REGION_NAMES = {
+    "1": "East",
+    "14": "Midwest",
+    "25": "California",
+    "30": "Southeast",
+    "45": "Pacific Northwest",
+    "50": "Texas",
+    "55": "TexasDFW",
+    "60": "Great Lakes",
+    "70": "Florida",
+}
+
+# EKSVIA's documented examples (GetOrderHistory's own field description) -- not exhaustive per
+# the docs, but the only ship-method codes Keystone actually documents.
+_SHIP_VIA_NAMES = {
+    "2": "Fedex",
+    "3": "UPS",
+    "6": "Keystone Truck Run",
+}
+
+# EKSTAT's full documented vocabulary (both KAO Drop Ship and KAO Jobber customer types --
+# distinct stage names never collide across the two, so one combined mapping is safe) --
+# see _EKSTAT_OPEN_STAGES/_EKSTAT_TERMINAL_STAGES above for the same vocabulary's OPEN/CLOSED
+# classification.
+_EKSTAT_DESCRIPTIONS = {
+    "RCV ORD": "Order received by the order processor",
+    "ORDER": "Processing has begun",
+    "PICK": "Item/quantity picked at the warehouse; pick sheet printed",
+    "PACKAGE": "Label for 3rd party carrier printed and placed on the box containing all items",
+    "XDOCK": "Product has arrived at the cross dock",
+    "OUT4DLV": "Product has been physically placed in a KAO cube van, en route for delivery",
+    "INVOICE": "Invoice has been generated",
+    "CANCEL": "Order has been cancelled",
+}
+
 # Keystone's sentinel for "no estimate available" (seen on LTL quotes) — .NET's DateTime.MinValue
 # serialized as a date, not a real delivery date.
 _UNKNOWN_DATE_YEAR = 1
@@ -200,6 +239,105 @@ def translate_order_status(ekstat: typing.Optional[str]) -> typing.Optional["src
     if normalized in _EKSTAT_OPEN_STAGES:
         return src_enums.DistributorOrderRawStatus.OPEN
     return None
+
+
+def _none_if_zero(value: typing.Optional[str]) -> typing.Optional[str]:
+    """EKKEY#/EKINV# come back as "0" until Keystone actually assigns a real internal order/
+    invoice number -- "0" isn't a real id, so it's presented as absent rather than the literal
+    string "0"."""
+    return None if value in (None, "", "0") else value
+
+
+def _decode_warehouse(code: typing.Optional[str]) -> typing.Optional[str]:
+    if not code:
+        return None
+    region = _WAREHOUSE_REGION_NAMES.get(code)
+    city_state = _WAREHOUSE_NAMES.get(code)
+    if region and city_state:
+        return "{} - {} ({})".format(code, region, city_state)
+    return "{} - {}".format(code, city_state) if city_state else code
+
+
+def _decode_ship_method(code: typing.Optional[str]) -> typing.Optional[str]:
+    if not code:
+        return None
+    name = _SHIP_VIA_NAMES.get(code)
+    return "{} - {}".format(code, name) if name else code
+
+
+def _decode_status(code: typing.Optional[str]) -> typing.Optional[str]:
+    if not code:
+        return None
+    description = _EKSTAT_DESCRIPTIONS.get(code)
+    return "{} - {}".format(code, description) if description else code
+
+
+def _decode_order_history_timestamp(date: typing.Optional[str], time_: typing.Optional[str]) -> typing.Optional[str]:
+    """EKDATE (YYYYMMDD) + EKTIME (HHMMSS, no leading zero before 10 AM per the docs) -> a
+    zero-padded "YYYY-MM-DD HH:MM:SS" string -- zero-padding EKTIME first means these strings
+    also sort correctly as plain strings, which _merge_order_history_rows relies on."""
+    if not date or len(date) != 8:
+        return None
+    padded_time = (time_ or "").zfill(6)
+    return "{}-{}-{} {}:{}:{}".format(
+        date[0:4], date[4:6], date[6:8], padded_time[0:2], padded_time[2:4], padded_time[4:6]
+    )
+
+
+def _decode_order_history_row(row: typing.Dict[str, str]) -> typing.Dict[str, typing.Any]:
+    """One raw GetOrderHistory row -> the human-readable shape used throughout the PO detail
+    API and processed_order (see decode_and_merge_order_history)."""
+    vend = row.get("EKVEND", "")
+    part = row.get("EKPART", "")
+    return {
+        "customer_number": row.get("EKCCUS") or None,
+        "po_number": row.get("EKORD#") or None,
+        "timestamp": _decode_order_history_timestamp(row.get("EKDATE"), row.get("EKTIME")),
+        "vcpn": "{}-{}".format(vend, part) if vend or part else None,
+        "quantity": _parse_int(row.get("EKXQTY")),
+        "extended_price": _parse_decimal(row.get("EKEXTD")),
+        "freight_charge": _parse_decimal(row.get("EKFRTD")),
+        "warehouse": _decode_warehouse(row.get("EKSWHS")),
+        "ship_method": _decode_ship_method(row.get("EKSVIA")),
+        "tracking_number": row.get("EKTRCK") or None,
+        "status": _decode_status(row.get("EKSTAT")),
+        "unit_price": _parse_decimal(row.get("EKPRIC")),
+        "internal_order_number": _none_if_zero(row.get("EKKEY#")),
+        "invoice_number": _none_if_zero(row.get("EKINV#")),
+    }
+
+
+def _merge_line_item_rows(decoded_rows: typing.List[typing.Dict[str, typing.Any]]) -> typing.Dict[str, typing.Any]:
+    """Collapses one line item's full stage-by-stage row history down to a single entry: the
+    most recent row as a base (its status/timestamp/etc are what's "current"), with any field
+    that row left null backfilled from the most recent earlier row that had a value -- e.g.
+    tracking_number is only ever populated on the PACKAGE-stage row, so without this it would
+    disappear again once the line item reaches INVOICE."""
+    ordered = sorted(decoded_rows, key=lambda r: r.get("timestamp") or "")
+    merged = dict(ordered[-1])
+    for field, value in merged.items():
+        if value is not None:
+            continue
+        for earlier in reversed(ordered[:-1]):
+            if earlier.get(field) is not None:
+                merged[field] = earlier[field]
+                break
+    return merged
+
+
+def decode_and_merge_order_history(
+    rows: typing.List[typing.Dict[str, str]]
+) -> typing.List[typing.Dict[str, typing.Any]]:
+    """GetOrderHistory returns one raw row per (line item, status transition) pair -- a 2-line
+    PO that's reached INVOICE has 10 raw rows. This decodes every row into human-readable form
+    (see _decode_order_history_row) and merges each line item's (grouped by vcpn) rows down to
+    one entry via _merge_line_item_rows -- the shape stored in
+    PurchaseOrderDistributorOrder.processed_order."""
+    by_vcpn: typing.Dict[typing.Optional[str], typing.List[typing.Dict[str, typing.Any]]] = {}
+    for row in rows:
+        decoded = _decode_order_history_row(row)
+        by_vcpn.setdefault(decoded.get("vcpn"), []).append(decoded)
+    return [_merge_line_item_rows(group) for group in by_vcpn.values()]
 
 
 class KeystoneOrderAdapter(base.DistributorOrderAdapter):

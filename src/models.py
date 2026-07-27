@@ -2327,6 +2327,17 @@ class PurchaseOrderDistributorOrder(django_db_models.Model):
 
     raw_response = django_db_models.JSONField(null=True, blank=True, encoder=DjangoJSONEncoder)
 
+    # A human-readable, one-row-per-line-item distillation of raw_response's full transaction
+    # history (see keystone.decode_and_merge_order_history) -- e.g. Keystone's GetOrderHistory
+    # returns one row per (line item, status transition) pair, so a 2-line PO that's reached
+    # INVOICE has 10 raw rows; this collapses each line item's rows down to a single merged
+    # entry carrying its current status/timestamp plus every other field's most recent non-null
+    # value across all of that line item's stages (e.g. tracking_number, only ever populated on
+    # the PACKAGE-stage row, still shows up here even though the final/INVOICE-stage row is what
+    # supplies status/invoice_number). Only populated once a refresh has looked this order up;
+    # currently only Keystone is decoded this way.
+    processed_order = django_db_models.JSONField(null=True, blank=True, encoder=DjangoJSONEncoder)
+
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
 

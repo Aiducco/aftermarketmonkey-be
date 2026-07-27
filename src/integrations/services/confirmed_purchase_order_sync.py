@@ -43,7 +43,10 @@ query the wrong PO and find nothing -- the same "don't re-derive the reference f
 PurchaseOrder state" lesson as Turn14's extraction above, just triggered a different way).
 Pulls the matching entry's EKKEY# (Keystone's own internal order number) into
 distributor_internal_order_number, translating its EKSTAT via keystone.translate_order_status
-into distributor_order_status/distributor_order_status_name.
+into distributor_order_status/distributor_order_status_name. Also runs the PO's full raw row
+set (every line item x every status transition) through keystone.decode_and_merge_order_history
+into PurchaseOrderDistributorOrder.processed_order -- one human-readable, merged entry per line
+item (by VCPN) instead of GetOrderHistory's one-row-per-status-transition shape.
 """
 import datetime
 import logging
@@ -172,8 +175,9 @@ def _refresh_keystone_distributor_order(
     # the most recent transaction for this PO.
     latest = rows[-1] if rows else {}
 
-    update_fields = ["raw_response", "updated_at"]
+    update_fields = ["raw_response", "processed_order", "updated_at"]
     pdo.raw_response = matched.raw_response
+    pdo.processed_order = keystone_adapter.decode_and_merge_order_history(rows)
     if not pdo.po_number:
         # Keystone has no separate order id -- distributor_order_number already IS the po_number.
         pdo.po_number = pdo.distributor_order_number
