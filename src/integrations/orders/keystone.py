@@ -322,6 +322,18 @@ def _merge_line_item_rows(decoded_rows: typing.List[typing.Dict[str, typing.Any]
             if earlier.get(field) is not None:
                 merged[field] = earlier[field]
                 break
+
+    # freight_charge specifically flickers to a "0.00" placeholder on every intermediate stage
+    # (only RCV ORD's initial estimate and INVOICE's final figure ever carry a real amount --
+    # confirmed live: 4.00 -> 0.00 -> 0.00 -> 0.00 -> 3.99 for an invoiced PO), so unlike every
+    # other field, 0.00 has to be treated the same as null here: a PO cancelled before ever
+    # reaching INVOICE would otherwise report CANCEL's 0.00 instead of its real RCV ORD estimate.
+    if merged.get("freight_charge") == decimal.Decimal("0"):
+        for row in reversed(ordered):
+            fee = row.get("freight_charge")
+            if fee is not None and fee != decimal.Decimal("0"):
+                merged["freight_charge"] = fee
+                break
     return merged
 
 
