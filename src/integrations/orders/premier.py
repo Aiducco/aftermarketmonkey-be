@@ -12,13 +12,15 @@ limitations remain, both confirmed directly from the docs rather than inferred:
    ShippingQuoteLine's ship_options comes from the static, documented Ship Method List instead
    (see _static_ship_options) and is never priced/scheduled like Turn14/Keystone/Meyer's. This
    is a hard API limitation, not something this adapter is missing.
-2. The order-creation response does NOT include Premier's own order number — it only echoes
-   back what was submitted (confirmed directly from the docs' own POST /sales-orders/ example
-   response). Since GET /sales-orders/{salesOrderNumber} needs exactly that number, it's
-   unusable right after submission. This adapter uses ``purchase_order.po_number`` (Premier's
-   ``customerPurchaseOrderNumber``) as the distributor_order_number throughout, and polls status
-   via GET /tracking?purchaseOrderNumber=... instead — the only documented lookup keyed by
-   something we actually have.
+2. CORRECTED (was previously believed absent, based on the docs' example response only): a
+   real POST /sales-orders/ response DOES include Premier's own order number, as
+   ``salesOrderNumber`` (confirmed directly against a live order) — the docs' own example
+   response just happens not to show it. This is what's stored as distributor_order_number
+   (see _parse_submit_response), while ``customerPurchaseOrderNumber`` (our own po_name/
+   po_number, echoed back verbatim) is stored separately as PurchaseOrderDistributorOrder.
+   po_number — the same two-numbering shape Turn14/Meyer already have. Status/tracking still
+   polls via GET /tracking?purchaseOrderNumber=... (see get_order_status), since that endpoint
+   is keyed by the customer PO reference, not salesOrderNumber.
 
 SAFETY: submit_order() places a REAL order against Premier — their docs describe no dry-run
 mode at all, even for a "testing" environment. Must only ever be invoked from an explicit,
@@ -142,6 +144,15 @@ def _static_ship_options(ship_method: typing.Optional[str]) -> typing.List[base.
         return options
     filtered = [o for o in options if o.service_level_code == ship_method]
     return filtered or options
+
+
+def extract_po_reference(raw_response: typing.Optional[typing.Dict]) -> typing.Optional[str]:
+    """The customer PO reference we actually submitted, read back from a POST /sales-orders/
+    response's top-level customerPurchaseOrderNumber -- distinct from salesOrderNumber
+    (Premier's own order id, used as distributor_order_number; see _parse_submit_response)."""
+    if not isinstance(raw_response, dict):
+        return None
+    return raw_response.get("customerPurchaseOrderNumber") or None
 
 
 def _best_candidate_warehouse(inventory_rows: typing.List[typing.Dict], country: typing.Optional[str]) -> typing.Optional[str]:
@@ -345,7 +356,11 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
         request_payload: typing.Optional[typing.Dict] = None,
     ) -> base.DistributorOrderResult:
         try:
-            po_number = base.resolve_po_number(purchase_order)
+            # salesOrderNumber is Premier's own real order id (confirmed live -- see module
+            # docstring) -- this is what's stored as distributor_order_number. Falls back to our
+            # own po_number only if the response is ever missing it (defensive: an already-placed
+            # order must still get a row, not fail, even if the response shape is off).
+            sales_order_number = response.get("salesOrderNumber") or base.resolve_po_number(purchase_order)
             by_external_id = {_premier_item_number(li.provider_part): li for li in line_items}
             placements: typing.List[base.LineItemPlacement] = []
             # Premier's response only echoes back what was submitted (no confirmed-vs-requested
@@ -361,7 +376,7 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
                 placements.append(
                     base.LineItemPlacement(
                         line_item_id=li.line_item_id if li else 0,
-                        distributor_order_number=po_number,
+                        distributor_order_number=sales_order_number,
                         quantity_confirmed=line.get("quantity", li.quantity if li else 0),
                         warehouse_code=line.get("warehouseCode"),
                     )
@@ -374,9 +389,8 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
                 request_payload=request_payload,
             )
 
-        # No distributor order number is ever returned — see module docstring.
         return base.DistributorOrderResult(
-            distributor_order_numbers=[po_number],
+            distributor_order_numbers=[sales_order_number],
             line_item_placements=placements,
             raw_response=response,
             request_payload=request_payload,
@@ -433,11 +447,30 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
     def supports_invoices(self) -> bool:
         return True
 
+    def get_invoices_by_sales_order_number(
+        self, sales_order_number: str
+    ) -> typing.List[base.DistributorInvoice]:
+        """
+        Fetches invoices directly by Premier's real salesOrderNumber (confirmed a valid GET
+        /invoices filter against https://developer.premierwd.com/#invoice) -- one call, no
+        discovery step needed. Used by confirmed_purchase_order_sync's Premier refresh, which
+        already has this exact value as PurchaseOrderDistributorOrder.distributor_order_number
+        (see module docstring). Prefer this over get_invoices(purchase_order) below whenever
+        the real order id is already on hand.
+        """
+        try:
+            rows = self._client.get_invoices(sales_order_number=sales_order_number)
+        except premier_client_exceptions.PremierException as e:
+            self._handle_error(e)
+        return [self._parse_invoice(row) for row in rows]
+
     def get_invoices(self, purchase_order: src_models.PurchaseOrder) -> typing.List[base.DistributorInvoice]:
         """
-        Premier's Invoice API (GET invoices) can only be filtered by invoiceNumber/
-        salesOrderNumber/itemNumber/date-range — never by customerPurchaseOrderNumber (see
-        module docstring's order-number gap, which applies here too). So invoice numbers must be
+        Legacy path for callers that only have a PurchaseOrder, not its real Premier
+        salesOrderNumber (e.g. the older, currently-paused general STATUS_CHECK job) --
+        prefer get_invoices_by_sales_order_number when that's already on hand. Premier's
+        Invoice API (GET invoices) can only be filtered by invoiceNumber/salesOrderNumber/
+        itemNumber/date-range — never by customerPurchaseOrderNumber. So invoice numbers must be
         discovered first, from whichever tracking entries (already fetched by get_order_status,
         re-fetched here since adapters are called independently) carry one — Premier's bulk
         tracking/date endpoint is confirmed to return an invoiceNumber per sales order, but the

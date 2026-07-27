@@ -9,7 +9,7 @@ Policy: a fresh order needs checking often at first, then rarely --
   - After that: check at most once per calendar day, tracked via
     PurchaseOrder.distributor_status_checked_at.
 
-Turn14, Keystone, and Meyer are implemented so far (per-provider dispatch in
+Turn14, Keystone, Meyer, and Premier are implemented so far (per-provider dispatch in
 _refresh_purchase_order, via _REFRESH_HANDLERS) -- any other provider kind is logged and
 skipped, not crashed on, so this command is safe to run against a mixed-distributor CONFIRMED
 queue today and grows adapter-by-adapter later.
@@ -57,6 +57,27 @@ as Keystone's own fix. The response's CustomerPO field (what we actually submitt
 po_number if not already set, and its "Invoiced" Yes/No (already normalized by
 get_order_status_by_reference into status_code "INVOICED"/"OPEN") is translated via
 meyer.translate_order_status into distributor_order_status/distributor_order_status_name.
+
+For Premier: distributor_order_number IS Premier's real salesOrderNumber, confirmed live to
+actually be present in a POST /sales-orders/ response despite the adapter's own module
+docstring previously believing it never was (see PremierOrderAdapter.submit_order/
+_parse_submit_response). Order status/tracking still has to go through
+adapter.get_order_status(purchase_order) using base.resolve_po_number, since Premier's
+/tracking endpoint has no salesOrderNumber filter at all (confirmed against
+developer.premierwd.com) -- unlike Turn14/Keystone/Meyer, there's no drift-safe alternative
+reference available for that specific lookup, and Premier never fans one PO out into multiple
+distributor orders, so there's no searching/matching several entries by number either; every
+tracking entry returned belongs to this PO's single PurchaseOrderDistributorOrder row. Invoices,
+however, ARE filterable by salesOrderNumber (confirmed against developer.premierwd.com/
+#invoice), so those are fetched directly via
+get_invoices_by_sales_order_number(pdo.distributor_order_number) -- no discovery step needed,
+unlike get_invoices(purchase_order)'s tracking-then-invoice-number two-step lookup for the older
+general status-check path. Fetched invoices are persisted the same way _sync_invoices does (see
+purchase_order_jobs.py) via _persist_invoices, and their presence is used to derive
+distributor_order_status/distributor_order_status_name (src.enums.DistributorOrderRawStatus) --
+Premier gives no OPEN/CLOSED field of its own, so an order with at least one invoice is
+considered CLOSED, matching the same "invoiced == closed" rule Keystone/Meyer/Turn14 apply to
+their own literal status fields.
 """
 import datetime
 import logging
@@ -66,8 +87,10 @@ from django.utils import timezone
 
 from src import enums as src_enums
 from src import models as src_models
+from src.integrations.orders import exceptions as order_exceptions
 from src.integrations.orders import keystone as keystone_adapter
 from src.integrations.orders import meyer as meyer_adapter
+from src.integrations.orders import premier as premier_adapter
 from src.integrations.orders import registry as order_registry
 from src.integrations.orders import turn_14 as turn_14_adapter
 
@@ -271,12 +294,112 @@ def _refresh_meyer_distributor_order(
     )
 
 
+def _persist_invoices(po: src_models.PurchaseOrder, invoices: typing.List) -> None:
+    """Same persistence shape as purchase_order_jobs._sync_invoices (the older general
+    status-check path) -- duplicated rather than shared to avoid a cross-module dependency for
+    what's a handful of straightforward field assignments."""
+    for invoice in invoices:
+        src_models.PurchaseOrderInvoice.objects.update_or_create(
+            purchase_order=po,
+            invoice_number=invoice.invoice_number,
+            defaults={
+                "invoice_date": invoice.invoice_date,
+                "distributor_order_number": invoice.distributor_order_number,
+                "website_order_number": invoice.website_order_number,
+                "total_price": invoice.total_price,
+                "freight": invoice.freight,
+                "discount_amount": invoice.discount_amount,
+                "paid_amount": invoice.paid_amount,
+                "amount_due": invoice.amount_due,
+                "tracking": [
+                    {"ship_method": t.ship_method, "tracking_number": t.tracking_number}
+                    for t in invoice.tracking
+                ],
+                "line_items": [
+                    {
+                        "part_number": li.part_number,
+                        "description": li.description,
+                        "quantity": li.quantity,
+                        "unit_price": li.unit_price,
+                        "total_price": li.total_price,
+                        "warehouse_code": li.warehouse_code,
+                    }
+                    for li in invoice.line_items
+                ],
+                "comments": invoice.comments,
+                "raw_response": invoice.raw_response,
+            },
+        )
+
+
+def _refresh_premier_distributor_order(
+    adapter: premier_adapter.PremierOrderAdapter,
+    po: src_models.PurchaseOrder,
+    pdo: src_models.PurchaseOrderDistributorOrder,
+) -> None:
+    """
+    Premier never fans one PurchaseOrder out into multiple distributor orders (see
+    PremierOrderAdapter.submit_order), so unlike Turn14/Keystone/Meyer there's no
+    searching/matching a specific entry among several sharing one PO reference -- every
+    tracking entry get_order_status returns for this PO belongs to this one row. That lookup is
+    still keyed by base.resolve_po_number (Premier's /tracking endpoint has no salesOrderNumber
+    filter at all), unlike invoices below, which ARE filterable by salesOrderNumber and so are
+    fetched directly via pdo.distributor_order_number -- no discovery step needed.
+    """
+    try:
+        result = adapter.get_order_status(po)
+    except order_exceptions.OrderAdapterError:
+        logger.exception(
+            "{} get_order_status failed for PurchaseOrderDistributorOrder id={}.".format(_LOG_PREFIX, pdo.id)
+        )
+        return
+
+    tracking_numbers = sorted({t for o in result.orders for t in o.tracking_numbers if t})
+    carriers = sorted({o.carrier for o in result.orders if o.carrier})
+
+    update_fields = ["raw_response", "tracking_numbers", "updated_at"]
+    pdo.raw_response = {"tracking": [o.raw_response for o in result.orders if o.raw_response]}
+    pdo.tracking_numbers = tracking_numbers
+    if carriers:
+        pdo.carrier = ", ".join(carriers)
+        update_fields.append("carrier")
+
+    try:
+        invoices = adapter.get_invoices_by_sales_order_number(pdo.distributor_order_number)
+    except order_exceptions.OrderAdapterError:
+        logger.warning(
+            "{} Invoice fetch failed for PurchaseOrderDistributorOrder id={}; distributor_order_status "
+            "left unset this round.".format(_LOG_PREFIX, pdo.id)
+        )
+        invoices = None
+
+    if invoices is not None:
+        _persist_invoices(po, invoices)
+        # Premier gives no OPEN/CLOSED field of its own (unlike Keystone/Meyer/Turn14's literal
+        # status) -- having at least one invoice is the only signal available that the order is
+        # actually done, same "invoiced == closed" rule the other three apply to their own field.
+        raw_status = (
+            src_enums.DistributorOrderRawStatus.CLOSED if invoices else src_enums.DistributorOrderRawStatus.OPEN
+        )
+        pdo.distributor_order_status = raw_status.value
+        pdo.distributor_order_status_name = raw_status.name
+        update_fields += ["distributor_order_status", "distributor_order_status_name"]
+
+    pdo.save(update_fields=update_fields)
+    logger.info(
+        "{} Updated raw_response for PurchaseOrderDistributorOrder id={} (distributor_order_number={}).".format(
+            _LOG_PREFIX, pdo.id, pdo.distributor_order_number
+        )
+    )
+
+
 # Per-adapter-type refresh handler, all sharing the (adapter, po, pdo) signature -- add an entry
 # here (and its own _refresh_<x>_distributor_order function) as each new distributor is wired up.
 _REFRESH_HANDLERS = {
     turn_14_adapter.Turn14OrderAdapter: _refresh_turn14_distributor_order,
     keystone_adapter.KeystoneOrderAdapter: _refresh_keystone_distributor_order,
     meyer_adapter.MeyerOrderAdapter: _refresh_meyer_distributor_order,
+    premier_adapter.PremierOrderAdapter: _refresh_premier_distributor_order,
 }
 
 

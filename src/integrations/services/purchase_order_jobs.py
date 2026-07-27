@@ -31,6 +31,7 @@ from src import enums as src_enums
 from src import models as src_models
 from src.integrations.orders import base as order_base
 from src.integrations.orders import exceptions as order_exceptions
+from src.integrations.orders import premier as premier_adapter
 from src.integrations.orders import registry as order_registry
 from src.integrations.orders import turn_14 as turn_14_adapter
 
@@ -607,14 +608,17 @@ def _run_submit(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrd
         duration_ms=duration_ms,
     )
 
-    # Only Turn14's raw response is known to carry a po_number/purchase_order_number attribute
-    # today (see turn_14.extract_po_reference) -- other distributors leave this null until their
-    # adapters are taught the same extraction.
-    po_number = (
-        turn_14_adapter.extract_po_reference(result.raw_response)
-        if isinstance(adapter, turn_14_adapter.Turn14OrderAdapter)
-        else None
-    )
+    # Turn14 and Premier both have a real distributor-side order id distinct from our own
+    # po_number (Turn14: order_number/website_order_number vs. attributes.po_number; Premier:
+    # salesOrderNumber vs. customerPurchaseOrderNumber) -- extracted here from each's raw
+    # response so it's captured immediately rather than left to a later refresh. Other
+    # distributors leave this null until their adapters are taught the same extraction.
+    if isinstance(adapter, turn_14_adapter.Turn14OrderAdapter):
+        po_number = turn_14_adapter.extract_po_reference(result.raw_response)
+    elif isinstance(adapter, premier_adapter.PremierOrderAdapter):
+        po_number = premier_adapter.extract_po_reference(result.raw_response)
+    else:
+        po_number = None
 
     distributor_orders_by_number = {}
     for order_number in result.distributor_order_numbers:
