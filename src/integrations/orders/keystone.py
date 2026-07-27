@@ -397,6 +397,7 @@ def parse_processed_order(processed_order: typing.Optional[typing.List[typing.Di
     equivalent read straight off raw_response).
     """
     empty = {
+        "distributor_order_number": None,
         "distributor_status": None,
         "distributor_invoice_ids": [],
         "tracking": [],
@@ -414,9 +415,12 @@ def parse_processed_order(processed_order: typing.Optional[typing.List[typing.Di
     tracking: typing.List[typing.Dict] = []
     freight = None
     raw_statuses = []
+    internal_order_number = None
     for row in processed_order:
         code = _ekstat_code(row.get("status"))
         raw_statuses.append(code)
+        if internal_order_number is None and row.get("internal_order_number"):
+            internal_order_number = row["internal_order_number"]
         line_items.append(
             {
                 "part_number": row.get("vcpn"),
@@ -464,6 +468,12 @@ def parse_processed_order(processed_order: typing.Optional[typing.List[typing.Di
         distributor_status = None
 
     return {
+        # Keystone's submit response has no distinct order id of its own -- pdo.
+        # distributor_order_number falls back to our own po_number for that reason (see
+        # KeystoneOrderAdapter.submit_order). GetOrderHistory's EKKEY# (internal_order_number)
+        # is Keystone's real, distributor-native order id, conventionally shown with a "KAO"
+        # prefix -- preferred here over that fallback whenever a refresh has populated it.
+        "distributor_order_number": "KAO{}".format(internal_order_number) if internal_order_number else None,
         "distributor_status": distributor_status,
         "distributor_invoice_ids": invoice_ids,
         "tracking": tracking,

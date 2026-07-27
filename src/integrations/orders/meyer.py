@@ -156,6 +156,87 @@ def translate_order_status(status_code: typing.Optional[str]) -> typing.Optional
     return None
 
 
+def _to_float(value: typing.Any) -> typing.Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+_EMPTY_PARSED_ORDER = {
+    "distributor_order_number": None,
+    "distributor_status": None,
+    "distributor_invoice_ids": [],
+    "tracking": [],
+    "total": None,
+    "freight": None,
+    "discount": None,
+    "subtotal": None,
+    "line_items": [],
+}
+
+
+def parse_order_raw_response(raw_response: typing.Optional[typing.Dict]) -> typing.Dict:
+    """
+    Maps a single SalesOrderDetail entry (whatever PurchaseOrderDistributorOrder.raw_response
+    holds for a Meyer order -- see get_order_status_by_reference, which already stores exactly
+    this shape) into the purchase-order detail API's standardized distributor-order fields.
+    Mirrors turn_14.parse_order_raw_response; unlike Turn14, Meyer states no per-line status or
+    order total directly -- both are derived here (see below) rather than read off a field that
+    doesn't exist in this response.
+    """
+    if not isinstance(raw_response, dict):
+        return dict(_EMPTY_PARSED_ORDER)
+
+    invoiced = raw_response.get("Invoiced")
+    translated = translate_order_status("INVOICED" if invoiced == "Yes" else "OPEN")
+    distributor_status = translated.name if translated else None
+    # Meyer has no distinct per-line status of its own (SalesOrderDetail's Items[] carry no
+    # status field at all) -- every line shares the order's own Invoiced/not-yet-invoiced state,
+    # same reasoning as distributor_status above.
+    line_item_status = "shipped" if invoiced == "Yes" else "confirmed"
+
+    ship_method = raw_response.get("ShipMethod")
+    tracking = [
+        {"tracking_number": t, "method": ship_method}
+        for t in (raw_response.get("Tracking") or [])
+        if t
+    ]
+
+    line_items = [
+        {
+            "part_number": item.get("ItemNumber"),
+            "quantity": item.get("Quantity"),
+            "unit_price": _to_float(item.get("UnitPrice")),
+            "line_total": _to_float(item.get("TotalPrice")),
+            "warehouse_code": None,
+            "status": line_item_status,
+        }
+        for item in raw_response.get("Items", []) or []
+    ]
+
+    line_totals = [li["line_total"] for li in line_items if li["line_total"] is not None]
+    subtotal = round(sum(line_totals), 2) if line_totals else None
+    freight = _to_float(raw_response.get("Freight"))
+    total = round(subtotal + freight, 2) if subtotal is not None and freight is not None else subtotal
+
+    return {
+        "distributor_status": distributor_status,
+        # SalesOrderDetail carries no invoice id of its own -- that only comes from Meyer's
+        # separate GET /Invoice response (see get_invoices), not this order-status shape.
+        "distributor_invoice_ids": [],
+        "tracking": tracking,
+        "total": total,
+        "freight": freight,
+        # Meyer's order response carries no discount figure of its own.
+        "discount": None,
+        "subtotal": subtotal,
+        "line_items": line_items,
+    }
+
+
 def _load_meyer_warehouse_names() -> typing.Dict[str, str]:
     """{external_id: "City, ST"} from MeyerLocation (populated by fetch_meyer_locations from
     GET /Warehouses), so quote responses can show a real place instead of a bare code like

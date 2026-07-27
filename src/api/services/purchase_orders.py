@@ -649,7 +649,10 @@ def _serialize_confirmed_distributor_order(
 ) -> typing.Dict:
     parsed = raw_response_parsers.parse(provider_kind, pdo)
     return {
-        "distributor_order_number": pdo.distributor_order_number,
+        # Keystone's parser overrides this with its real distributor-native order id (KAO +
+        # internal_order_number) when available -- pdo.distributor_order_number is otherwise the
+        # website/order-number match key every provider's submit response actually assigns.
+        "distributor_order_number": parsed.get("distributor_order_number") or pdo.distributor_order_number,
         "distributor_status": parsed["distributor_status"],
         "distributor_invoice_ids": parsed["distributor_invoice_ids"],
         "tracking": parsed["tracking"],

@@ -186,6 +186,7 @@ def _parse_order_shipment_items(attrs: typing.Dict) -> typing.List[typing.Dict]:
 
 
 _EMPTY_PARSED_ORDER = {
+    "distributor_order_number": None,
     "distributor_status": None,
     "distributor_invoice_ids": [],
     "tracking": [],
