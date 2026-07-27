@@ -40,8 +40,23 @@ VCPN_REGEX = re.compile(r"^[A-Z][A-Z0-9]{3,12}$")
 _ELECTRONIC_ORDER_URL = settings.KEYSTONE_ORDER_ELECTRONIC_ORDER_URL
 
 
+# ADO.NET's DataSet XML serialization runs every element name through XmlConvert.EncodeName,
+# which escapes any character not valid in an XML NCName as "_x" + its 4-hex-digit codepoint +
+# "_". Column names like EKORD#/EKKEY#/EKINV# (see GetOrderHistory's documented output columns)
+# come back on the wire as EKORD_x0023_/EKKEY_x0023_/EKINV_x0023_ ("#" is codepoint 0x23) --
+# confirmed against a real GetOrderHistory response. Without reversing this, every dict lookup
+# for the literal column name silently returns nothing instead of raising, so this was masked
+# rather than crashing outright.
+_XML_ENCODED_NAME_RE = re.compile(r"_x([0-9A-Fa-f]{4})_")
+
+
+def _decode_xml_name(name: str) -> str:
+    return _XML_ENCODED_NAME_RE.sub(lambda m: chr(int(m.group(1), 16)), name)
+
+
 def _local_name(tag: str) -> str:
-    return tag.split("}", 1)[-1] if "}" in tag else tag
+    local = tag.split("}", 1)[-1] if "}" in tag else tag
+    return _decode_xml_name(local)
 
 
 def _find_by_local_name(root: ET.Element, local_name: str) -> typing.Optional[ET.Element]:
