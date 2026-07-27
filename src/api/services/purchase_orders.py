@@ -61,6 +61,22 @@ def _build_recipient_line(po: src_models.PurchaseOrder) -> typing.Optional[str]:
     return ", ".join(part for part in parts if part)
 
 
+def _resolve_ship_method_label(po: src_models.PurchaseOrder) -> typing.Optional[str]:
+    """Human-readable name for po.ship_method (a bare distributor code like "28"/"U11"/"UPS
+    GRND RES" — meaningless to a user without the FE maintaining its own per-distributor
+    code->name table). Looked up against this same PO's own last-quoted ship_options, same
+    convention as warehouse_code/warehouse_name decoding elsewhere. Falls back to the raw code
+    if no quote has run yet or the code no longer appears in the current shipments (e.g. a
+    stale quote) — never silently drops it to None when a code exists."""
+    if not po.ship_method:
+        return None
+    for shipment in po.shipments or []:
+        for option in shipment.get("ship_options") or []:
+            if option.get("code") == po.ship_method:
+                return option.get("name") or po.ship_method
+    return po.ship_method
+
+
 def _single_shipment_warehouse_name(
     li: src_models.PurchaseOrderLineItem, shipments_by_id: typing.Dict[str, typing.Dict]
 ) -> typing.Optional[str]:
@@ -196,7 +212,7 @@ def _serialize_purchase_order(po: src_models.PurchaseOrder, include_line_items: 
         }
         if po.ship_to_address1
         else None,
-        "ship_method": po.ship_method,
+        "ship_method": _resolve_ship_method_label(po),
         "subtotal": _decimal_to_float(po.subtotal),
         "estimated_shipping": _decimal_to_float(po.estimated_shipping),
         "total": _decimal_to_float(po.total),
