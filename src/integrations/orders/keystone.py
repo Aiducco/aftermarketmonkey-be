@@ -63,6 +63,13 @@ _EKSTAT_DELIVERY_STATUS = {
 # — Keystone gives no dedicated ship-date field, only the date of each status transition.
 _EKSTAT_SHIPPED_STAGES = {"PACKAGE", "XDOCK", "OUT4DLV", "INVOICE"}
 
+# EKSTAT's full documented vocabulary, split into open (still progressing through fulfillment)
+# vs. terminal (INVOICE/CANCEL are the only two stages that end an order for either customer
+# type) — used by translate_order_status to normalize onto src.enums.DistributorOrderRawStatus,
+# the same OPEN/CLOSED vocabulary Turn14's own literal status string is normalized onto.
+_EKSTAT_OPEN_STAGES = {"RCV ORD", "ORDER", "PICK", "PACKAGE", "XDOCK", "OUT4DLV"}
+_EKSTAT_TERMINAL_STAGES = {"INVOICE", "CANCEL"}
+
 # Keystone's own "List of Active Warehouses" reference table — the same warehouse-number
 # strings GetShippingOptionsMultiplePartsPerWarehouse's "Warehouse" column and its dynamically
 # named "Warehouse_<name>_<number>" rate tables use (see get_shipping_quote below). "City, ST"
@@ -174,6 +181,25 @@ def _filter_options(
         return options
     filtered = [o for o in options if o.service_level_code == ship_method]
     return filtered or options
+
+
+def translate_order_status(ekstat: typing.Optional[str]) -> typing.Optional["src_enums.DistributorOrderRawStatus"]:
+    """
+    Keystone has no single OPEN/CLOSED field of its own — GetOrderHistory's EKSTAT is a
+    multi-stage progression instead (see _EKSTAT_OPEN_STAGES/_EKSTAT_TERMINAL_STAGES). This
+    collapses that progression onto the same OPEN/CLOSED vocabulary Turn14's own literal status
+    string is normalized onto (src.enums.DistributorOrderRawStatus): INVOICE/CANCEL (the only
+    two terminal stages, for either KAO Drop Ship or KAO Jobber customers) map to CLOSED, every
+    earlier stage maps to OPEN. Unknown/empty values return None rather than guessing.
+    """
+    if not ekstat:
+        return None
+    normalized = ekstat.strip().upper()
+    if normalized in _EKSTAT_TERMINAL_STAGES:
+        return src_enums.DistributorOrderRawStatus.CLOSED
+    if normalized in _EKSTAT_OPEN_STAGES:
+        return src_enums.DistributorOrderRawStatus.OPEN
+    return None
 
 
 class KeystoneOrderAdapter(base.DistributorOrderAdapter):

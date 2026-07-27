@@ -9,9 +9,10 @@ Policy: a fresh order needs checking often at first, then rarely --
   - After that: check at most once per calendar day, tracked via
     PurchaseOrder.distributor_status_checked_at.
 
-Only Turn14 is implemented so far (per-provider dispatch in _refresh_purchase_order) -- any
-other provider kind is logged and skipped, not crashed on, so this command is safe to run
-against a mixed-distributor CONFIRMED queue today and grows adapter-by-adapter later.
+Turn14 and Keystone are implemented so far (per-provider dispatch in _refresh_purchase_order,
+via _REFRESH_HANDLERS) -- any other provider kind is logged and skipped, not crashed on, so
+this command is safe to run against a mixed-distributor CONFIRMED queue today and grows
+adapter-by-adapter later.
 
 For Turn14 specifically: rather than re-deriving the customer PO reference from the
 PurchaseOrder (see base.resolve_po_number, used by the general status-check path), this reads
@@ -30,6 +31,14 @@ same matched entry's attributes.order_number (Turn14's own internal order id) is
 distributor_internal_order_number, and attributes.status is translated via
 turn_14.translate_order_status into distributor_order_status/distributor_order_status_name
 (src.enums.DistributorOrderRawStatus) -- currently a direct OPEN/CLOSED passthrough.
+
+For Keystone: distributor_order_number IS the po_number we submitted (Keystone hands back no
+separate order id at submit time -- see KeystoneOrderAdapter.submit_order), so there's no
+reference-extraction step. This calls the adapter's own get_order_status(), which already wraps
+GetOrderHistory correctly (unlike Turn14's general status-check path, Keystone's has no known
+field-mismatch bug), and pulls the matching entry's EKKEY# (Keystone's own internal order
+number) into distributor_internal_order_number, translating its EKSTAT via
+keystone.translate_order_status into distributor_order_status/distributor_order_status_name.
 """
 import datetime
 import logging
@@ -39,6 +48,7 @@ from django.utils import timezone
 
 from src import enums as src_enums
 from src import models as src_models
+from src.integrations.orders import keystone as keystone_adapter
 from src.integrations.orders import registry as order_registry
 from src.integrations.orders import turn_14 as turn_14_adapter
 
@@ -60,8 +70,12 @@ def _should_check(po: src_models.PurchaseOrder, now: datetime.datetime) -> bool:
 
 
 def _refresh_turn14_distributor_order(
-    adapter: turn_14_adapter.Turn14OrderAdapter, pdo: src_models.PurchaseOrderDistributorOrder
+    adapter: turn_14_adapter.Turn14OrderAdapter,
+    po: src_models.PurchaseOrder,
+    pdo: src_models.PurchaseOrderDistributorOrder,
 ) -> None:
+    # po is unused here (Turn14's reference comes from pdo.raw_response, not the PurchaseOrder
+    # itself) -- accepted anyway so every _REFRESH_HANDLERS entry shares one call signature.
     # pdo.po_number is captured up front at submit time (see purchase_order_jobs._run_submit)
     # so this normally doesn't need to touch raw_response at all; the extraction fallback only
     # matters for rows created before that field existed.
@@ -129,6 +143,66 @@ def _refresh_turn14_distributor_order(
     )
 
 
+def _refresh_keystone_distributor_order(
+    adapter: keystone_adapter.KeystoneOrderAdapter,
+    po: src_models.PurchaseOrder,
+    pdo: src_models.PurchaseOrderDistributorOrder,
+) -> None:
+    result = adapter.get_order_status(po)
+    matched = next(
+        (o for o in result.orders if o.distributor_order_number == pdo.distributor_order_number), None
+    )
+    if matched is None:
+        logger.info(
+            "{} No GetOrderHistory entry matched distributor_order_number={} for "
+            "PurchaseOrderDistributorOrder id={}.".format(_LOG_PREFIX, pdo.distributor_order_number, pdo.id)
+        )
+        return
+
+    rows = (matched.raw_response or {}).get("rows") or []
+    # get_order_status already sorts rows chronologically before returning, so the last row is
+    # the most recent transaction for this PO.
+    latest = rows[-1] if rows else {}
+
+    update_fields = ["raw_response", "updated_at"]
+    pdo.raw_response = matched.raw_response
+    if not pdo.po_number:
+        # Keystone has no separate order id -- distributor_order_number already IS the po_number.
+        pdo.po_number = pdo.distributor_order_number
+        update_fields.append("po_number")
+
+    internal_order_number = latest.get("EKKEY#")
+    if internal_order_number:
+        pdo.distributor_internal_order_number = internal_order_number
+        update_fields.append("distributor_internal_order_number")
+
+    raw_status = keystone_adapter.translate_order_status(matched.status_code)
+    if raw_status is not None:
+        pdo.distributor_order_status = raw_status.value
+        pdo.distributor_order_status_name = raw_status.name
+        update_fields += ["distributor_order_status", "distributor_order_status_name"]
+    else:
+        logger.warning(
+            "{} Unrecognized Keystone EKSTAT {!r} for PurchaseOrderDistributorOrder id={}; "
+            "leaving distributor_order_status unset.".format(_LOG_PREFIX, matched.status_code, pdo.id)
+        )
+
+    pdo.save(update_fields=update_fields)
+    logger.info(
+        "{} Updated raw_response for PurchaseOrderDistributorOrder id={} (distributor_order_number={}).".format(
+            _LOG_PREFIX, pdo.id, pdo.distributor_order_number
+        )
+    )
+
+
+# Per-adapter-type refresh handler, all sharing the (adapter, po, pdo) signature -- add an entry
+# here (and its own _refresh_<x>_distributor_order function) as each new distributor is wired up.
+_REFRESH_HANDLERS = {
+    turn_14_adapter.Turn14OrderAdapter: _refresh_turn14_distributor_order,
+    keystone_adapter.KeystoneOrderAdapter: _refresh_keystone_distributor_order,
+}
+
+
 def _refresh_purchase_order(po: src_models.PurchaseOrder) -> None:
     adapter = order_registry.get_adapter(po.company_provider)
     if adapter is None:
@@ -138,7 +212,8 @@ def _refresh_purchase_order(po: src_models.PurchaseOrder) -> None:
         )
         return
 
-    if not isinstance(adapter, turn_14_adapter.Turn14OrderAdapter):
+    handler = _REFRESH_HANDLERS.get(type(adapter))
+    if handler is None:
         logger.info(
             "{} {} not implemented yet for purchase_order_id={}; skipping.".format(
                 _LOG_PREFIX, po.company_provider.provider.kind_name, po.id
@@ -148,7 +223,7 @@ def _refresh_purchase_order(po: src_models.PurchaseOrder) -> None:
 
     for pdo in po.distributor_orders.all():
         try:
-            _refresh_turn14_distributor_order(adapter, pdo)
+            handler(adapter, po, pdo)
         except Exception:
             logger.exception(
                 "{} Failed refreshing PurchaseOrderDistributorOrder id={} for "
