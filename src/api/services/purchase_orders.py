@@ -269,6 +269,35 @@ def _serialize_purchase_order(po: src_models.PurchaseOrder, include_line_items: 
     return result
 
 
+def _serialize_purchase_order_list_item(po: src_models.PurchaseOrder) -> typing.Dict:
+    """
+    Lean row shape for GET /purchase-orders/ (the order-history table) -- exactly the columns
+    that view renders (internal ref #, PO, distributor, status, recipient, ship method, total,
+    placed) plus a few free identifiers (id, company_provider_id/provider_kind_name) needed for
+    row navigation and the distributor filter dropdown. Deliberately doesn't reuse
+    _serialize_purchase_order: that pulls in line_items, the full shipments/fees blobs,
+    distributor_orders (whose raw_response/processed_order columns can now be large -- Keystone's
+    full GetOrderHistory dump, Premier's full order + tracking, Turn14's orders/po lookup -- see
+    confirmed_purchase_order_sync), and a per-PO invoices query, none of which this table shows.
+    """
+    provider = po.company_provider.provider
+    return {
+        "id": po.id,
+        "po_number": po.po_number,
+        "po_name": po.po_name,
+        "status": po.status,
+        "status_name": po.status_name,
+        "company_provider_id": po.company_provider_id,
+        "provider_kind_name": provider.kind_name,
+        "provider_name": provider.name,
+        "recipient": _build_recipient_line(po),
+        "ship_method": _resolve_ship_method_label(po),
+        "total": _decimal_to_float(po.total),
+        "submitted_at": po.submitted_at.isoformat() if po.submitted_at else None,
+        "created_at": po.created_at.isoformat(),
+    }
+
+
 # -- Cart -----------------------------------------------------------------------------------
 
 
@@ -743,13 +772,20 @@ def list_purchase_orders(
     discard_purchase_order, until it either succeeds for real or is explicitly discarded).
     DISCARDED is excluded separately, since a user who gave up on a PO doesn't want it
     resurfacing as "an order" either — it's not in _cart_queryset (that would let it be
-    silently reused as a fresh draft, undoing the discard), but it still isn't real history."""
+    silently reused as a fresh draft, undoing the discard), but it still isn't real history.
+
+    Lean by design: only select_related("company_provider__provider") — the one join the row
+    shape actually needs (distributor name) — and no prefetch_related at all. distributor_orders
+    used to be prefetched here for a shape (_serialize_purchase_order) this list no longer uses;
+    that prefetch pulled every PurchaseOrderDistributorOrder column, including raw_response/
+    processed_order, which can now be large (Keystone's full GetOrderHistory dump, Premier's
+    full order + tracking, Turn14's orders/po lookup) for every PO in the list. See
+    _serialize_purchase_order_list_item for exactly what this response shape carries."""
     qs = (
         src_models.PurchaseOrder.objects.filter(company_id=company_id)
         .exclude(id__in=_cart_queryset(company_id).values("id"))
         .exclude(status=src_enums.PurchaseOrderStatus.DISCARDED.value)
-        .select_related("company_provider__provider", "group")
-        .prefetch_related("distributor_orders")
+        .select_related("company_provider__provider")
         .order_by("-created_at")
     )
     if isinstance(status, str) and status.strip().lower() == "open":
@@ -760,7 +796,7 @@ def list_purchase_orders(
             qs = qs.filter(status=status_value)
     if company_provider_id is not None:
         qs = qs.filter(company_provider_id=company_provider_id)
-    return [_serialize_purchase_order(po, include_line_items=False) for po in qs[:200]]
+    return [_serialize_purchase_order_list_item(po) for po in qs[:200]]
 
 
 def list_purchase_order_invoices(
