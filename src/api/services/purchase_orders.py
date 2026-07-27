@@ -33,6 +33,10 @@ _LOG_PREFIX = "[PURCHASE-ORDERS-API]"
 
 _REQUIRED_SHIP_TO_FIELDS = ("name", "address1", "city", "state", "postal_code", "country")
 
+# How long after submission get_confirmed_purchase_order_detail's "recent_order" flag stays
+# true -- see that function.
+_RECENT_ORDER_WINDOW = datetime.timedelta(minutes=20)
+
 
 class PurchaseOrderServiceError(Exception):
     """Raised for any client-correctable error (bad input, not found, wrong state)."""
@@ -721,6 +725,12 @@ def get_confirmed_purchase_order_detail(company_id: int, purchase_order_id: int)
         "shipped_to": _serialize_confirmed_shipped_to(po),
         "created_at": po.created_at.isoformat(),
         "submitted_at": po.submitted_at.isoformat() if po.submitted_at else None,
+        # True for the first _RECENT_ORDER_WINDOW after submission -- lets the FE flag a PO as
+        # "just placed" (e.g. to explain why distributor status/tracking might still be sparse)
+        # without it having to do its own submitted_at math against the current time.
+        "recent_order": bool(
+            po.submitted_at and (django_timezone.now() - po.submitted_at) <= _RECENT_ORDER_WINDOW
+        ),
         "distributor_orders": [
             _serialize_confirmed_distributor_order(pdo, provider_kind) for pdo in po.distributor_orders.all()
         ],
