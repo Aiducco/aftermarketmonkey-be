@@ -479,6 +479,18 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
             )
         return base.OrderStatusResult(orders=orders)
 
+    def get_orders_by_reference(self, po_reference: str) -> typing.Dict:
+        """GET /v1/orders/po/{po_reference} for an arbitrary reference value, not necessarily
+        derived from a PurchaseOrder via base.resolve_po_number — used by
+        confirmed_purchase_order_sync.refresh_confirmed_purchase_orders, which already has the
+        reference to query stored on PurchaseOrderDistributorOrder.raw_response (the value
+        Turn14 actually recorded the order under at submit time) rather than needing to
+        re-derive it from the PurchaseOrder itself."""
+        try:
+            return self._client.get_orders_by_po_number(po_reference)
+        except turn14_client_exceptions.Turn14APIBadResponseCodeError as e:
+            self._handle_error(e)
+
     def supports_invoices(self) -> bool:
         return True
 

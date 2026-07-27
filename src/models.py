@@ -2149,13 +2149,17 @@ class PurchaseOrder(django_db_models.Model):
     # po_number below, when set. po_number itself is never overridden: it's unique and is what
     # every adapter uses as the lookup key for post-submit status-check/cancel (Premier and
     # Keystone especially, which have no other order identifier) — swapping it out post-hoc
-    # would break those lookups. Currently only Turn14OrderAdapter reads this (see
-    # _turn14_po_number); Keystone/Meyer/Premier still always send po_number as-is.
+    # would break those lookups. See base.resolve_po_number — every adapter reads this.
     po_name = django_db_models.TextField(null=True, blank=True)
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
     submitted_at = django_db_models.DateTimeField(null=True, blank=True)
+    # Last time refresh_confirmed_purchase_orders (a distinct, lighter-weight cadence than the
+    # general STATUS_CHECK job) actually polled the distributor for this PO's raw order data.
+    # Drives that command's "check often right after submission, then once a day" rule — see
+    # its own module docstring for the exact policy.
+    distributor_status_checked_at = django_db_models.DateTimeField(null=True, blank=True)
 
     class Meta:
         db_table = "purchase_orders"
