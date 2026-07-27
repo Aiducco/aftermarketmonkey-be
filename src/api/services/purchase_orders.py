@@ -231,7 +231,7 @@ def _serialize_purchase_order(po: src_models.PurchaseOrder, include_line_items: 
         "notes": po.notes,
         # Customer-facing PO name/reference, set optionally at submit time (see
         # submit_purchase_order's po_name param) — sent to the distributor as ITS po_number
-        # field instead of our own po_number above, currently only honored by Turn14.
+        # field instead of our own po_number above (see base.resolve_po_number).
         "po_name": po.po_name,
         "quoted_at": po.quoted_at.isoformat() if po.quoted_at else None,
         "quote_is_stale": (
@@ -240,6 +240,15 @@ def _serialize_purchase_order(po: src_models.PurchaseOrder, include_line_items: 
         "submitted_at": po.submitted_at.isoformat() if po.submitted_at else None,
         "created_at": po.created_at.isoformat(),
         "updated_at": po.updated_at.isoformat(),
+        # Flat, quick-reference version of distributor_orders[].distributor_order_number below
+        # — for a list/table view that wants one column instead of reaching into the nested
+        # array. None until a submit has actually created at least one PurchaseOrderDistributorOrder
+        # row (see purchase_order_jobs._run_submit). Comma-joined on the rare case a single PO
+        # split into more than one genuinely separate distributor order number (Meyer only —
+        # Turn14/Keystone's own multi-warehouse orders still carry a single order number).
+        "distributor_order_number": ", ".join(
+            pdo.distributor_order_number for pdo in po.distributor_orders.all() if pdo.distributor_order_number
+        ) or None,
         "distributor_orders": [_serialize_distributor_order(pdo) for pdo in po.distributor_orders.all()],
         # Distributor-issued invoices (see PurchaseOrderInvoice) — only populated for
         # distributors whose adapter supports it (currently Turn14) and only once items
