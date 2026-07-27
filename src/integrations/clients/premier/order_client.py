@@ -14,14 +14,17 @@ decoded.
 
 Re-confirmed against a full read of https://developer.premierwd.com/ (0.5.0, current as of this
 pass) — the docs are actually complete for every endpoint this client uses (inventory, pricing,
-tracking, sales-orders); the "thin docs" note from an earlier pass was wrong. Two real gaps
-remain, both because they're genuinely undocumented rather than missed: no documented
-error-response body shape, and no documented success HTTP status code for POST /sales-orders/
-(handled as "any 2xx", see _request). Most importantly, the documented POST /sales-orders/
-response example does NOT include Premier's own salesOrderNumber — confirmed directly from the
-docs' own example response, not inferred. Every choice below that depends on one of these gaps
-is called out at the point it's made; treat this client as best-effort until confirmed against
-Premier's test environment.
+tracking, sales-orders). Two real gaps remain, both because they're genuinely undocumented
+rather than missed: no documented error-response body shape, and no documented success HTTP
+status code for POST /sales-orders/ (handled as "any 2xx", see _request). CORRECTED (was
+previously believed absent, based on the docs' example response only): a real POST
+/sales-orders/ response DOES include Premier's own salesOrderNumber — confirmed live against an
+actual order. That number makes GET /sales-orders/{salesOrderNumber} (get_sales_order below)
+usable right after submission, returning the full order (customer, ship-to, priced/warehoused
+line items) that GET /tracking never does (tracking-only fields — see
+get_tracking_by_purchase_order_number). Every choice below that depends on one of the remaining
+gaps is called out at the point it's made; treat this client as best-effort until confirmed
+against Premier's test environment.
 
 SAFETY: ``create_sales_order`` places a REAL order against Premier — their docs state orders
 are committed immediately on POST, with no dry-run/preview mode. Must only ever be invoked from
@@ -249,11 +252,21 @@ class PremierOrderApiClient(object):
 
     # -- Status / tracking ----------------------------------------------------------------
 
+    def get_sales_order(self, sales_order_number: str) -> typing.Dict:
+        """GET /sales-orders/{salesOrderNumber}. The full order -- customer number, ship-to
+        address, and priced/warehoused salesOrderLines -- confirmed against
+        https://developer.premierwd.com/#sales-orders. Unlike GET /tracking (tracking-specific
+        fields only, see get_tracking_by_purchase_order_number), this is only usable now that
+        submit_order actually captures salesOrderNumber (see module docstring)."""
+        result = self._request(
+            endpoint="sales-orders/{}".format(sales_order_number), method=common_enums.HttpMethod.GET
+        )
+        return result if isinstance(result, dict) else {}
+
     def get_tracking_by_purchase_order_number(self, purchase_order_number: str) -> typing.List[typing.Dict]:
-        """GET /tracking?purchaseOrderNumber=... . Used in place of
-        GET /sales-orders/{salesOrderNumber} for status polling, since Premier's order-creation
-        response never hands back its own salesOrderNumber (see module docstring) — this is the
-        only documented lookup keyed by something we actually have (our own PO number)."""
+        """GET /tracking?purchaseOrderNumber=... . Tracking-specific fields only (trackingNumber,
+        carrier, isDropShip, packageItems) -- never full order details, confirmed against
+        https://developer.premierwd.com/#tracking. See get_sales_order for the full order."""
         data = self._request(
             endpoint="tracking",
             method=common_enums.HttpMethod.GET,

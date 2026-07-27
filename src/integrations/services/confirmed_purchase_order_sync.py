@@ -67,9 +67,15 @@ adapter.get_order_status(purchase_order) using base.resolve_po_number, since Pre
 developer.premierwd.com) -- unlike Turn14/Keystone/Meyer, there's no drift-safe alternative
 reference available for that specific lookup, and Premier never fans one PO out into multiple
 distributor orders, so there's no searching/matching several entries by number either; every
-tracking entry returned belongs to this PO's single PurchaseOrderDistributorOrder row. Invoices,
-however, ARE filterable by salesOrderNumber (confirmed against developer.premierwd.com/
-#invoice), so those are fetched directly via
+tracking entry returned belongs to this PO's single PurchaseOrderDistributorOrder row -- but
+GET /tracking only ever carries shipping-specific fields (trackingNumber/carrier/isDropShip/
+packageItems, confirmed against developer.premierwd.com/#tracking), never full order details,
+so GET /sales-orders/{salesOrderNumber} (get_full_order(pdo.distributor_order_number), usable
+now that the real number is captured) is also fetched and merged into raw_response alongside
+tracking, instead of raw_response ending up with only the narrow tracking shape. That full
+order's customerPurchaseOrderNumber backfills po_number too, same as Keystone/Meyer's own
+backfill-on-refresh. Invoices, however, ARE filterable by salesOrderNumber (confirmed against
+developer.premierwd.com/#invoice), so those are fetched directly via
 get_invoices_by_sales_order_number(pdo.distributor_order_number) -- no discovery step needed,
 unlike get_invoices(purchase_order)'s tracking-then-invoice-number two-step lookup for the older
 general status-check path. Fetched invoices are persisted the same way _sync_invoices does (see
@@ -343,8 +349,14 @@ def _refresh_premier_distributor_order(
     searching/matching a specific entry among several sharing one PO reference -- every
     tracking entry get_order_status returns for this PO belongs to this one row. That lookup is
     still keyed by base.resolve_po_number (Premier's /tracking endpoint has no salesOrderNumber
-    filter at all), unlike invoices below, which ARE filterable by salesOrderNumber and so are
-    fetched directly via pdo.distributor_order_number -- no discovery step needed.
+    filter at all and never returns full order details -- only shipping-specific fields, per
+    developer.premierwd.com/#tracking), unlike invoices below, which ARE filterable by
+    salesOrderNumber and so are fetched directly via pdo.distributor_order_number -- no
+    discovery step needed. GET /sales-orders/{salesOrderNumber} (get_full_order) is what
+    actually carries the full order (customer, ship-to, priced/warehoused line items) -- fetched
+    here and merged into raw_response alongside tracking, instead of raw_response ending up with
+    only GET /tracking's narrow shipping fields (its previous behavior, which silently discarded
+    the full order data every refresh replaced it with).
     """
     try:
         result = adapter.get_order_status(po)
@@ -356,13 +368,22 @@ def _refresh_premier_distributor_order(
 
     tracking_numbers = sorted({t for o in result.orders for t in o.tracking_numbers if t})
     carriers = sorted({o.carrier for o in result.orders if o.carrier})
+    full_order = adapter.get_full_order(pdo.distributor_order_number)
 
     update_fields = ["raw_response", "tracking_numbers", "updated_at"]
-    pdo.raw_response = {"tracking": [o.raw_response for o in result.orders if o.raw_response]}
+    pdo.raw_response = {
+        "order": full_order,
+        "tracking": [o.raw_response for o in result.orders if o.raw_response],
+    }
     pdo.tracking_numbers = tracking_numbers
     if carriers:
         pdo.carrier = ", ".join(carriers)
         update_fields.append("carrier")
+    if not pdo.po_number:
+        customer_po = full_order.get("customerPurchaseOrderNumber")
+        if customer_po:
+            pdo.po_number = customer_po
+            update_fields.append("po_number")
 
     try:
         invoices = adapter.get_invoices_by_sales_order_number(pdo.distributor_order_number)

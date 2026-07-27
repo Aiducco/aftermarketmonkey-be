@@ -396,6 +396,26 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
             request_payload=request_payload,
         )
 
+    def get_full_order(self, sales_order_number: str) -> typing.Dict:
+        """
+        GET /sales-orders/{salesOrderNumber} -- the full order (customer number, ship-to
+        address, priced/warehoused line items), confirmed against
+        https://developer.premierwd.com/#sales-orders. Only usable now that submit_order
+        actually captures a real salesOrderNumber (see module docstring) -- previously this
+        endpoint was unusable right after submission since we had no number to call it with.
+        Best-effort: a failure here degrades to no full-order enrichment this round rather than
+        failing the whole refresh, since GET /tracking's own status/tracking data (see
+        get_order_status) is the primary, already-succeeded result by the time this is called.
+        """
+        try:
+            return self._client.get_sales_order(sales_order_number)
+        except premier_client_exceptions.PremierException:
+            logger.warning(
+                "{} get_sales_order failed for sales_order_number={}; raw_response will only "
+                "carry tracking data this round.".format(_LOG_PREFIX, sales_order_number)
+            )
+            return {}
+
     def get_order_status(self, purchase_order: src_models.PurchaseOrder) -> base.OrderStatusResult:
         po_number = base.resolve_po_number(purchase_order)
         try:
