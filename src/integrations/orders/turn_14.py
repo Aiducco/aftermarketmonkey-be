@@ -225,11 +225,14 @@ def parse_order_raw_response(raw_response: typing.Optional[typing.Dict]) -> typi
 
     # relationships.invoice is only present once an invoice has actually been generated against
     # this order (post-refresh shape) -- absent entirely on a freshly-submitted order.
-    invoice_ids = [
-        str(rel["invoice_id"])
-        for rel in (entry.get("relationships", {}) or {}).get("invoice", []) or []
-        if rel.get("invoice_id") is not None
-    ]
+    # relationships.invoice lists one entry per line item billed against this invoice, not one
+    # per invoice (confirmed against a live 2-line order sharing a single invoice) -- deduped so
+    # a multi-line order doesn't repeat the same invoice id once per line.
+    invoice_ids = []
+    for rel in (entry.get("relationships", {}) or {}).get("invoice", []) or []:
+        invoice_id = rel.get("invoice_id")
+        if invoice_id is not None and str(invoice_id) not in invoice_ids:
+            invoice_ids.append(str(invoice_id))
 
     line_items = _parse_order_lines(attrs) if "lines" in attrs else _parse_order_shipment_items(attrs)
     line_totals = [li["line_total"] for li in line_items if li["line_total"] is not None]
