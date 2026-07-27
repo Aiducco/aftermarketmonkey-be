@@ -2295,6 +2295,12 @@ class PurchaseOrderDistributorOrder(django_db_models.Model):
     distributor_order_number = django_db_models.CharField(max_length=128)
     warehouse_code = django_db_models.CharField(max_length=64, null=True, blank=True)
 
+    # Captured up front at submit time from the distributor's raw response (see
+    # turn_14.extract_po_reference) so later refreshes (confirmed_purchase_order_sync) don't
+    # need to re-derive it from a raw_response shape that can change between distributor
+    # endpoints.
+    po_number = django_db_models.CharField(max_length=128, null=True, blank=True)
+
     status = django_db_models.PositiveSmallIntegerField()
     status_name = django_db_models.CharField(max_length=32)
 

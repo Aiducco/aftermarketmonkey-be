@@ -55,33 +55,17 @@ def _should_check(po: src_models.PurchaseOrder, now: datetime.datetime) -> bool:
     return po.distributor_status_checked_at.date() < now.date()
 
 
-def _extract_turn14_reference(raw_response: typing.Optional[typing.Dict]) -> typing.Optional[str]:
-    """The customer PO reference to query GET /v1/orders/po/{ref} with, read from whatever
-    shape PurchaseOrderDistributorOrder.raw_response currently holds — see module docstring
-    for why two different attribute names both have to be checked."""
-    if not isinstance(raw_response, dict):
-        return None
-    data = raw_response.get("data")
-    if isinstance(data, dict):
-        attrs = data.get("attributes") or {}
-    elif isinstance(data, list) and data:
-        attrs = data[0].get("attributes") or {}
-    else:
-        # Already-unwrapped shape: what this same command stores back after a previous run
-        # (see _refresh_turn14_distributor_order) — a bare orders/po/{ref} list entry, not
-        # wrapped in a "data" key at all.
-        attrs = raw_response.get("attributes") or {}
-    return attrs.get("po_number") or attrs.get("purchase_order_number") or None
-
-
 def _refresh_turn14_distributor_order(
     adapter: turn_14_adapter.Turn14OrderAdapter, pdo: src_models.PurchaseOrderDistributorOrder
 ) -> None:
-    reference = _extract_turn14_reference(pdo.raw_response)
+    # pdo.po_number is captured up front at submit time (see purchase_order_jobs._run_submit)
+    # so this normally doesn't need to touch raw_response at all; the extraction fallback only
+    # matters for rows created before that field existed.
+    reference = pdo.po_number or turn_14_adapter.extract_po_reference(pdo.raw_response)
     if not reference:
         logger.warning(
-            "{} No po_number/purchase_order_number found in raw_response for "
-            "PurchaseOrderDistributorOrder id={}; skipping.".format(_LOG_PREFIX, pdo.id)
+            "{} No po_number/purchase_order_number found for PurchaseOrderDistributorOrder "
+            "id={}; skipping.".format(_LOG_PREFIX, pdo.id)
         )
         return
 
@@ -107,8 +91,13 @@ def _refresh_turn14_distributor_order(
         )
         return
 
+    update_fields = ["raw_response", "updated_at"]
     pdo.raw_response = matched
-    pdo.save(update_fields=["raw_response", "updated_at"])
+    if not pdo.po_number:
+        # Backfills rows created before po_number was captured at submit time.
+        pdo.po_number = reference
+        update_fields.append("po_number")
+    pdo.save(update_fields=update_fields)
     logger.info(
         "{} Updated raw_response for PurchaseOrderDistributorOrder id={} (distributor_order_number={}).".format(
             _LOG_PREFIX, pdo.id, pdo.distributor_order_number

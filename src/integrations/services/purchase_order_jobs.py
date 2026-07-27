@@ -32,6 +32,7 @@ from src import models as src_models
 from src.integrations.orders import base as order_base
 from src.integrations.orders import exceptions as order_exceptions
 from src.integrations.orders import registry as order_registry
+from src.integrations.orders import turn_14 as turn_14_adapter
 
 # The shipping-method catalog (code -> name/carrier) is near-static reference data, not
 # something that changes between quotes — cache it instead of calling the distributor's
@@ -606,6 +607,15 @@ def _run_submit(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrd
         duration_ms=duration_ms,
     )
 
+    # Only Turn14's raw response is known to carry a po_number/purchase_order_number attribute
+    # today (see turn_14.extract_po_reference) -- other distributors leave this null until their
+    # adapters are taught the same extraction.
+    po_number = (
+        turn_14_adapter.extract_po_reference(result.raw_response)
+        if isinstance(adapter, turn_14_adapter.Turn14OrderAdapter)
+        else None
+    )
+
     distributor_orders_by_number = {}
     for order_number in result.distributor_order_numbers:
         pdo, _ = src_models.PurchaseOrderDistributorOrder.objects.get_or_create(
@@ -615,6 +625,7 @@ def _run_submit(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrd
                 "status": src_enums.PurchaseOrderDistributorOrderStatus.SUBMITTED.value,
                 "status_name": src_enums.PurchaseOrderDistributorOrderStatus.SUBMITTED.name,
                 "raw_response": result.raw_response,
+                "po_number": po_number,
             },
         )
         distributor_orders_by_number[order_number] = pdo

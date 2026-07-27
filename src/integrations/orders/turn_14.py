@@ -87,6 +87,29 @@ def _load_warehouse_names() -> typing.Dict[str, str]:
     return names
 
 
+def extract_po_reference(raw_response: typing.Optional[typing.Dict]) -> typing.Optional[str]:
+    """
+    The customer PO reference Turn14 recorded an order under, read from whatever shape a
+    PurchaseOrderDistributorOrder.raw_response currently holds. Two different attribute names
+    carry the same value depending on which Turn14 endpoint produced the response: the
+    order-creation/submit response uses ``attributes.po_number``, while a later
+    GET /v1/orders/po/{ref} lookup's entries use ``attributes.purchase_order_number`` instead
+    (confirmed directly from live examples of each).
+    """
+    if not isinstance(raw_response, dict):
+        return None
+    data = raw_response.get("data")
+    if isinstance(data, dict):
+        attrs = data.get("attributes") or {}
+    elif isinstance(data, list) and data:
+        attrs = data[0].get("attributes") or {}
+    else:
+        # Already-unwrapped shape: a bare orders/po/{ref} list entry, as stored back by
+        # confirmed_purchase_order_sync after a refresh — not wrapped in a "data" key at all.
+        attrs = raw_response.get("attributes") or {}
+    return attrs.get("po_number") or attrs.get("purchase_order_number") or None
+
+
 class Turn14OrderAdapter(base.DistributorOrderAdapter):
     provider_kind = src_enums.BrandProviderKind.TURN_14.value
 
