@@ -251,6 +251,21 @@ class MeyerOrderApiClient(object):
         result = self._request(endpoint="Warehouses", method=common_enums.HttpMethod.GET)
         return result if isinstance(result, list) else [result]
 
+    def get_account_addresses(self, customer_number: str) -> typing.List[typing.Dict]:
+        """GET /AccountAddresses. The customer's own registered business addresses (store/
+        warehouse/office locations, not end-customer ship-to addresses -- those only live
+        within historical sales orders, per Meyer's docs). Each carries an AddressCode
+        (usable as CreateOrder's AddressCode field) and a "Meyer Route"/"Contract Route"
+        Yes/No flag -- ShipMethod "Meyer Truck" is only ever valid for an address where
+        "Meyer Route" is "Yes", and is never itself returned by ShippingRateQuote/
+        ShippingRateMassQuote (see MeyerOrderAdapter's module docstring)."""
+        result = self._request(
+            endpoint="AccountAddresses",
+            method=common_enums.HttpMethod.GET,
+            params={"CustomerNumber": customer_number},
+        )
+        return result if isinstance(result, list) else [result]
+
     def test_connection(self) -> None:
         """Cheap connectivity/auth probe — ShipMethods takes no parameters and doesn't need
         customer_number, so a successful call proves the api_key alone is valid, without
