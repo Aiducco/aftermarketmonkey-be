@@ -136,6 +136,26 @@ def _filter_options(
     return filtered or options
 
 
+def translate_order_status(status_code: typing.Optional[str]) -> typing.Optional["src_enums.DistributorOrderRawStatus"]:
+    """
+    Meyer's SalesOrderDetail carries no OPEN/CLOSED field of its own -- get_order_status already
+    normalizes its "Invoiced" Yes/No field into status_code "INVOICED"/"OPEN" (see
+    get_order_status_by_reference). This maps that normalized vocabulary onto the same OPEN/
+    CLOSED enum Turn14/Keystone's own status is normalized onto (src.enums.
+    DistributorOrderRawStatus): INVOICED -> CLOSED (an invoiced Meyer order is fully billed, the
+    same terminal meaning Keystone's INVOICE/Turn14's CLOSED carry), OPEN -> OPEN. Unknown/empty
+    values return None rather than guessing.
+    """
+    if not status_code:
+        return None
+    normalized = status_code.strip().upper()
+    if normalized == "INVOICED":
+        return src_enums.DistributorOrderRawStatus.CLOSED
+    if normalized == "OPEN":
+        return src_enums.DistributorOrderRawStatus.OPEN
+    return None
+
+
 def _load_meyer_warehouse_names() -> typing.Dict[str, str]:
     """{external_id: "City, ST"} from MeyerLocation (populated by fetch_meyer_locations from
     GET /Warehouses), so quote responses can show a real place instead of a bare code like
@@ -424,9 +444,19 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
         )
 
     def get_order_status(self, purchase_order: src_models.PurchaseOrder) -> base.OrderStatusResult:
+        return self.get_order_status_by_reference(base.resolve_po_number(purchase_order))
+
+    def get_order_status_by_reference(self, order_number: str) -> base.OrderStatusResult:
+        """
+        Same as get_order_status, but takes the OrderNumber/CustomerPO to query directly instead
+        of re-deriving one from a PurchaseOrder's current po_name/po_number. Needed for the same
+        reason as Keystone's own get_order_status_by_reference: a PurchaseOrderDistributorOrder's
+        real Meyer OrderNumber (distributor_order_number, assigned at submit time) must never
+        drift just because po_name is set/changed on the PurchaseOrder afterward.
+        """
         try:
             orders = self._client.get_sales_order_detail(
-                order_number=base.resolve_po_number(purchase_order), customer_number=self._client.customer_number
+                order_number=order_number, customer_number=self._client.customer_number
             )
         except meyer_client_exceptions.MeyerException as e:
             self._handle_error(e)

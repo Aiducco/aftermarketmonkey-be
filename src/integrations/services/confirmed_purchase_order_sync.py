@@ -9,10 +9,10 @@ Policy: a fresh order needs checking often at first, then rarely --
   - After that: check at most once per calendar day, tracked via
     PurchaseOrder.distributor_status_checked_at.
 
-Turn14 and Keystone are implemented so far (per-provider dispatch in _refresh_purchase_order,
-via _REFRESH_HANDLERS) -- any other provider kind is logged and skipped, not crashed on, so
-this command is safe to run against a mixed-distributor CONFIRMED queue today and grows
-adapter-by-adapter later.
+Turn14, Keystone, and Meyer are implemented so far (per-provider dispatch in
+_refresh_purchase_order, via _REFRESH_HANDLERS) -- any other provider kind is logged and
+skipped, not crashed on, so this command is safe to run against a mixed-distributor CONFIRMED
+queue today and grows adapter-by-adapter later.
 
 For Turn14 specifically: rather than re-deriving the customer PO reference from the
 PurchaseOrder (see base.resolve_po_number, used by the general status-check path), this reads
@@ -47,6 +47,16 @@ into distributor_order_status/distributor_order_status_name. Also runs the PO's 
 set (every line item x every status transition) through keystone.decode_and_merge_order_history
 into PurchaseOrderDistributorOrder.processed_order -- one human-readable, merged entry per line
 item (by VCPN) instead of GetOrderHistory's one-row-per-status-transition shape.
+
+For Meyer: distributor_order_number IS Meyer's own real OrderNumber, assigned at submit time
+(see MeyerOrderAdapter.submit_order) -- querying SalesOrderDetail by that exact value always
+returns exactly one order (its single-object response mode), so there's no searching/matching
+among several entries like Turn14/Keystone need. Calls
+get_order_status_by_reference(pdo.distributor_order_number) for the same reference-drift reason
+as Keystone's own fix. The response's CustomerPO field (what we actually submitted) is saved to
+po_number if not already set, and its "Invoiced" Yes/No (already normalized by
+get_order_status_by_reference into status_code "INVOICED"/"OPEN") is translated via
+meyer.translate_order_status into distributor_order_status/distributor_order_status_name.
 """
 import datetime
 import logging
@@ -57,6 +67,7 @@ from django.utils import timezone
 from src import enums as src_enums
 from src import models as src_models
 from src.integrations.orders import keystone as keystone_adapter
+from src.integrations.orders import meyer as meyer_adapter
 from src.integrations.orders import registry as order_registry
 from src.integrations.orders import turn_14 as turn_14_adapter
 
@@ -207,11 +218,65 @@ def _refresh_keystone_distributor_order(
     )
 
 
+def _refresh_meyer_distributor_order(
+    adapter: meyer_adapter.MeyerOrderAdapter,
+    po: src_models.PurchaseOrder,
+    pdo: src_models.PurchaseOrderDistributorOrder,
+) -> None:
+    """
+    Meyer's distributor_order_number IS its own real OrderNumber, assigned at submit time (see
+    MeyerOrderAdapter.submit_order/_parse_submit_response) -- querying SalesOrderDetail by that
+    exact value always returns exactly one order (its single-object response mode), unlike
+    Turn14/Keystone, which both have to search/match among several entries sharing one PO
+    reference.
+    """
+    result = adapter.get_order_status_by_reference(pdo.distributor_order_number)
+    matched = next(
+        (o for o in result.orders if o.distributor_order_number == pdo.distributor_order_number), None
+    )
+    if matched is None:
+        logger.info(
+            "{} No SalesOrderDetail entry matched distributor_order_number={} for "
+            "PurchaseOrderDistributorOrder id={}.".format(_LOG_PREFIX, pdo.distributor_order_number, pdo.id)
+        )
+        return
+
+    update_fields = ["raw_response", "updated_at"]
+    pdo.raw_response = matched.raw_response
+    if not pdo.po_number:
+        # CustomerPO is what we actually submitted (base.resolve_po_number at submit time),
+        # distinct from Meyer's own OrderNumber (distributor_order_number) -- same two-numbering
+        # shape as Turn14's po_number/website_order_number, unlike Keystone's single numbering.
+        customer_po = (matched.raw_response or {}).get("CustomerPO")
+        if customer_po:
+            pdo.po_number = customer_po
+            update_fields.append("po_number")
+
+    raw_status = meyer_adapter.translate_order_status(matched.status_code)
+    if raw_status is not None:
+        pdo.distributor_order_status = raw_status.value
+        pdo.distributor_order_status_name = raw_status.name
+        update_fields += ["distributor_order_status", "distributor_order_status_name"]
+    else:
+        logger.warning(
+            "{} Unrecognized Meyer status_code {!r} for PurchaseOrderDistributorOrder id={}; "
+            "leaving distributor_order_status unset.".format(_LOG_PREFIX, matched.status_code, pdo.id)
+        )
+
+    pdo.save(update_fields=update_fields)
+    logger.info(
+        "{} Updated raw_response for PurchaseOrderDistributorOrder id={} (distributor_order_number={}).".format(
+            _LOG_PREFIX, pdo.id, pdo.distributor_order_number
+        )
+    )
+
+
 # Per-adapter-type refresh handler, all sharing the (adapter, po, pdo) signature -- add an entry
 # here (and its own _refresh_<x>_distributor_order function) as each new distributor is wired up.
 _REFRESH_HANDLERS = {
     turn_14_adapter.Turn14OrderAdapter: _refresh_turn14_distributor_order,
     keystone_adapter.KeystoneOrderAdapter: _refresh_keystone_distributor_order,
+    meyer_adapter.MeyerOrderAdapter: _refresh_meyer_distributor_order,
 }
 
 

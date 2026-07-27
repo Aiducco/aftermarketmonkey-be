@@ -7,8 +7,9 @@ class Command(BaseCommand):
     help = (
         "Refresh distributor order data for CONFIRMED purchase orders: checked on every run "
         "within the first hour after submission, then at most once a day after that. See "
-        "confirmed_purchase_order_sync's module docstring for the exact policy. Turn14 and "
-        "Keystone are implemented so far; other distributors are skipped with a log line."
+        "confirmed_purchase_order_sync's module docstring for the exact policy. Turn14, "
+        "Keystone, and Meyer are implemented so far; other distributors are skipped with a "
+        "log line."
     )
 
     def handle(self, *args, **options):
