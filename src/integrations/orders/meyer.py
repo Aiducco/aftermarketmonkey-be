@@ -7,9 +7,19 @@ irreversible) effect. Both must only ever be invoked from an explicit, user-appr
 submission/cancellation — never from exploratory/dev code, automated tests, or ad-hoc scripts.
 See ``src/integrations/orders/turn_14.py`` for the reference adapter this mirrors.
 
-Not yet handled: Meyer's "route"/Meyer Truck orders (AddressCode + "Meyer Truck" ship method,
-a distinct order-creation path per Meyer's docs) — out of scope until a company actually needs
-that fulfillment mode.
+Meyer Truck ("route") orders: confirmed live that GET /ShipMethods' canonical code is
+"MEYER TRUCK" (Carrier "Meyer Truck", ServiceType "Meyer Normal Route Delivery") — NOT the
+"Meyer Truck" (Title Case) casing shown in the docs' own CreateOrder example, which CreateOrder
+apparently accepts leniently but ShipMethods' own reference list doesn't use. Meyer Truck is
+never returned by ShippingRateQuote/ShippingRateMassQuote at all (confirmed against the docs'
+response schema and a live quote) -- it's a customer-address-bound route, not a rate-quotable
+carrier service, only discoverable via GET /AccountAddresses (see _get_meyer_truck_route). It's
+only offered here when the ship-to is the shop's own address (ship_to.is_shop_address) -- that
+call only ever returns the company's own registered addresses, never a drop-ship destination --
+and only once the order's subtotal clears that address's own "Route Minimum Order Amount".
+CreateOrder additionally requires AddressCode whenever ShipMethod is Meyer Truck (see
+submit_order); omitting it either falls back to default order logic or gets rejected, per the
+docs.
 """
 import datetime
 import decimal
@@ -43,6 +53,10 @@ _NO_INVOICE_YET_CODES = {"40400", "70202"}
 
 # Meyer's own documented cap on how many item numbers ItemInformation accepts per call.
 _ITEM_INFORMATION_CHUNK_SIZE = 100
+
+# GET /ShipMethods' canonical code for a Meyer Truck route order -- confirmed live, distinct
+# from the "Meyer Truck" (Title Case) shown in CreateOrder's own docs example.
+_MEYER_TRUCK_SHIP_METHOD_CODE = "MEYER TRUCK"
 
 # Meyer's own docs: DeliveryDate on a quote line is either a literal date ("9/28/2017") or a
 # business-day estimate string ("3-5 Business Days" / "5 Business Days") — same field, two
@@ -322,6 +336,38 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
                 }
         return info
 
+    def _get_meyer_truck_route(self) -> typing.Optional[typing.Dict[str, typing.Any]]:
+        """
+        {"address_code": str, "minimum_order_amount": Decimal} for the company's own
+        Meyer-route-eligible registered address, or None if it has none (or the lookup fails).
+        GET /AccountAddresses only ever returns the company's own registered addresses, never a
+        drop-ship destination -- see module docstring for why this is only offered when shipping
+        to the shop's own address. If more than one registered address has "Meyer Route": "Yes",
+        the first one is used; this codebase has no way to let a user pick among several yet.
+        Best-effort: a failure here just means Meyer Truck isn't offered this round, same
+        reasoning as _get_item_info's own pricing enrichment -- availability/shipping from the
+        mass quote is the core result, this is an addition to it.
+        """
+        try:
+            addresses = self._client.get_account_addresses(self._client.customer_number)
+        except meyer_client_exceptions.MeyerException:
+            logger.warning(
+                "{} AccountAddresses failed; Meyer Truck won't be offered this round.".format(_LOG_PREFIX)
+            )
+            return None
+
+        for address in addresses:
+            if (address.get("Meyer Route") or "").strip().lower() != "yes":
+                continue
+            address_code = (address.get("AddressCode") or "").strip()
+            if not address_code:
+                continue
+            return {
+                "address_code": address_code,
+                "minimum_order_amount": _parse_decimal(address.get("Route Minimum Order Amount")) or decimal.Decimal(0),
+            }
+        return None
+
     # -- DistributorOrderAdapter ------------------------------------------------------------
 
     def get_shipping_quote(
@@ -343,6 +389,39 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
 
         item_info = self._get_item_info([li.provider_part.provider_external_id for li in line_items])
         warehouse_names = _load_meyer_warehouse_names()
+
+        # Meyer Truck is never part of the mass-quote response itself (see module docstring) --
+        # only offered here when shipping to the shop's own address, and only once this order's
+        # estimated subtotal (from the same live pricing just fetched above) clears that
+        # address's own minimum. Built once and appended to every group below rather than
+        # queried per group: it's a whole-order route, not a per-warehouse carrier rate.
+        meyer_truck_option = None
+        if ship_to.is_shop_address:
+            route = self._get_meyer_truck_route()
+            if route is not None:
+                estimated_subtotal = sum(
+                    (item_info.get(li.provider_part.provider_external_id, {}).get("price") or decimal.Decimal(0))
+                    * li.quantity
+                    for li in line_items
+                )
+                if estimated_subtotal >= route["minimum_order_amount"]:
+                    meyer_truck_option = base.ShipOption(
+                        service_level_code=_MEYER_TRUCK_SHIP_METHOD_CODE,
+                        service_level_name="Meyer Normal Route Delivery",
+                        # Never rate-quoted by Meyer's own API -- no per-shipment cost exists to
+                        # report, unlike every other option here.
+                        cost=decimal.Decimal(0),
+                        quote_option_id=_MEYER_TRUCK_SHIP_METHOD_CODE,
+                        verbose_eta="Ships via Meyer's own route truck to {} (min. order "
+                        "${:.2f})".format(route["address_code"], route["minimum_order_amount"]),
+                    )
+                else:
+                    logger.info(
+                        "{} Meyer Truck route available but subtotal ${} is below its ${} "
+                        "minimum; not offered this round.".format(
+                            _LOG_PREFIX, estimated_subtotal, route["minimum_order_amount"]
+                        )
+                    )
 
         try:
             by_external_id = {li.provider_part.provider_external_id: li for li in line_items}
@@ -372,6 +451,8 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
                             quote_option_id=(q.get("ShipMethod") or "").strip(),
                         )
                     )
+                if meyer_truck_option is not None:
+                    raw_options.append(meyer_truck_option)
                 ship_options = _filter_options(raw_options, ship_method)
                 for sku in skus:
                     li = by_external_id.get(sku)
@@ -463,6 +544,26 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
                 ],
             }
         )
+
+        if purchase_order.ship_method.strip().upper() == _MEYER_TRUCK_SHIP_METHOD_CODE:
+            # CreateOrder requires AddressCode whenever ShipMethod is Meyer Truck -- omitting it
+            # either falls back to default order logic or gets rejected, per the docs. Re-checked
+            # live here (not just trusted from quote time) since the route/minimum could have
+            # changed since; failing loudly beats silently placing an order Meyer will mishandle.
+            route = self._get_meyer_truck_route()
+            if route is None:
+                raise order_exceptions.OrderValidationError(
+                    "Meyer Truck was selected but this account has no Meyer-route-eligible "
+                    "address on file (GET /AccountAddresses)."
+                )
+            if purchase_order.subtotal is not None and purchase_order.subtotal < route["minimum_order_amount"]:
+                raise order_exceptions.OrderValidationError(
+                    "Meyer Truck requires a minimum order of ${} for address {} (this order's "
+                    "subtotal is ${}).".format(
+                        route["minimum_order_amount"], route["address_code"], purchase_order.subtotal
+                    )
+                )
+            data["AddressCode"] = route["address_code"]
 
         try:
             response = self._client.create_order(customer_number=self._client.customer_number, data=data)
