@@ -25,6 +25,7 @@ from src import models as src_models
 from src.integrations.orders import base as order_base
 from src.integrations.orders import raw_response_parsers
 from src.integrations.orders import registry as order_registry
+from src.integrations.services import confirmed_purchase_order_sync
 from src.integrations.services import purchase_order_jobs
 
 logger = logging.getLogger(__name__)
@@ -1156,11 +1157,25 @@ def discard_purchase_order(company_id: int, purchase_order_id: int) -> typing.Di
 
 
 def refresh_purchase_order_status(company_id: int, purchase_order_id: int) -> typing.Dict:
-    po = src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id).first()
+    """
+    Refreshes this PO's distributor order(s) synchronously using the same per-distributor logic
+    as the refresh_confirmed_purchase_orders command (see confirmed_purchase_order_sync.
+    refresh_purchase_order_now) -- NOT the older, job-queued STATUS_CHECK path (see
+    purchase_order_jobs._run_status_check, whose Turn14 handling has a known field-mismatch bug
+    -- see confirmed_purchase_order_sync's module docstring). Returns the same standardized
+    shape get_confirmed_purchase_order_detail's own endpoint returns, so a caller doesn't need a
+    separate response shape or a follow-up GET just to see the refreshed data.
+    """
+    po = (
+        src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id)
+        .select_related("company_provider__provider")
+        .prefetch_related("distributor_orders")
+        .first()
+    )
     if not po:
         raise PurchaseOrderServiceError("Purchase order not found.")
-    job = purchase_order_jobs.enqueue_status_check_job(po.id)
-    return {"purchase_order_id": po.id, "job_id": job.id}
+    confirmed_purchase_order_sync.refresh_purchase_order_now(po)
+    return get_confirmed_purchase_order_detail(company_id=company_id, purchase_order_id=purchase_order_id)
 
 
 # -- Capabilities ---------------------------------------------------------------------------

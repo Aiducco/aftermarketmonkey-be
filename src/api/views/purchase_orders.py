@@ -447,7 +447,10 @@ class PurchaseOrderDiscardView(views.View):
 
 
 class PurchaseOrderRefreshStatusView(views.View):
-    """POST /purchase-orders/<id>/refresh-status/"""
+    """POST /purchase-orders/<id>/refresh-status/ -- refreshes synchronously (same
+    per-distributor logic as the refresh_confirmed_purchase_orders command; see
+    purchase_orders_services.refresh_purchase_order_status) and returns the refreshed PO in the
+    same standardized shape as GET .../confirmed-details/, not a job id to poll."""
 
     def post(self, request: http.HttpRequest, *args, **kwargs) -> http.HttpResponse:
         company_id, _user_id, err = _require_auth(request)
@@ -465,7 +468,7 @@ class PurchaseOrderRefreshStatusView(views.View):
             logger.exception("{} Error refreshing status for purchase order id={}".format(_LOG_PREFIX, po_id))
             return _error_response("Error refreshing purchase order status", status=500)
 
-        return _json_response(result, status=202)
+        return _json_response(result, status=200)
 
 
 class PurchaseOrderRequoteView(views.View):

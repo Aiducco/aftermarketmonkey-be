@@ -243,6 +243,21 @@ def _refresh_purchase_order(po: src_models.PurchaseOrder) -> None:
             )
 
 
+def refresh_purchase_order_now(po: src_models.PurchaseOrder) -> None:
+    """
+    Public single-PO entry point for on-demand refreshes -- see the
+    .../purchase-orders/<id>/refresh-status/ API endpoint (purchase_orders_services.
+    refresh_purchase_order_status). Runs the exact same per-distributor refresh logic
+    refresh_confirmed_purchase_orders' batch sweep uses, but bypasses _should_check's
+    frequent-then-daily cadence gate entirely, since this is an explicit, user-initiated
+    request rather than a scheduled poll -- a user clicking "refresh" should always get a real
+    refresh, not "not due yet".
+    """
+    _refresh_purchase_order(po)
+    po.distributor_status_checked_at = timezone.now()
+    po.save(update_fields=["distributor_status_checked_at", "updated_at"])
+
+
 def refresh_confirmed_purchase_orders() -> typing.Dict[str, int]:
     now = timezone.now()
     checked = 0
