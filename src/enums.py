@@ -206,3 +206,12 @@ class PurchaseOrderDistributorOrderStatus(enum.Enum):
     PARTIALLY_SHIPPED = 3
     SHIPPED = 4
     CANCELLED = 5
+
+
+class DistributorOrderRawStatus(enum.Enum):
+    """The distributor's own raw order status, as reported verbatim by their API -- distinct
+    from PurchaseOrderDistributorOrderStatus, which is our internal fulfillment lifecycle.
+    Currently only populated for Turn14, whose orders/po lookup reports exactly these two
+    strings (see turn_14.translate_order_status)."""
+    OPEN = 1
+    CLOSED = 2

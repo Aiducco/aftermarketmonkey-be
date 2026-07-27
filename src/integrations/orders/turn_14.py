@@ -110,6 +110,21 @@ def extract_po_reference(raw_response: typing.Optional[typing.Dict]) -> typing.O
     return attrs.get("po_number") or attrs.get("purchase_order_number") or None
 
 
+def translate_order_status(raw_status: typing.Optional[str]) -> typing.Optional["src_enums.DistributorOrderRawStatus"]:
+    """
+    Turn14's orders/po/{ref} lookup reports attributes.status as one of exactly these two
+    strings today -- a direct 1:1 mapping, not a heuristic. Unknown/future values return None
+    rather than guessing, so callers can log and leave the field unset instead of recording a
+    wrong status.
+    """
+    if not raw_status:
+        return None
+    try:
+        return src_enums.DistributorOrderRawStatus[raw_status.strip().upper()]
+    except KeyError:
+        return None
+
+
 class Turn14OrderAdapter(base.DistributorOrderAdapter):
     provider_kind = src_enums.BrandProviderKind.TURN_14.value
 

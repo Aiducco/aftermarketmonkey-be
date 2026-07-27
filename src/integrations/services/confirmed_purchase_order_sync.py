@@ -25,7 +25,11 @@ distributor_order_number was assigned to (matched against each entry's attribute
 website_order_number -- confirmed live: a submit response's data.id, e.g. "20927114", equals
 website_order_number in the later orders/po lookup, NOT that lookup's own outer "id" field,
 which is a different, unrelated numbering the general status-check path incorrectly compares
-against instead) is found and its raw JSON entirely replaces this row's raw_response.
+against instead) is found and its raw JSON entirely replaces this row's raw_response. That
+same matched entry's attributes.order_number (Turn14's own internal order id) is saved to
+distributor_internal_order_number, and attributes.status is translated via
+turn_14.translate_order_status into distributor_order_status/distributor_order_status_name
+(src.enums.DistributorOrderRawStatus) -- currently a direct OPEN/CLOSED passthrough.
 """
 import datetime
 import logging
@@ -97,6 +101,26 @@ def _refresh_turn14_distributor_order(
         # Backfills rows created before po_number was captured at submit time.
         pdo.po_number = reference
         update_fields.append("po_number")
+
+    # attrs here is still the matched entry's attributes (loop breaks right after assigning
+    # `matched`) -- order_number is Turn14's own internal order id, distinct from both
+    # distributor_order_number (website_order_number) and po_number.
+    pdo.distributor_internal_order_number = attrs.get("order_number")
+    update_fields.append("distributor_internal_order_number")
+
+    raw_status = turn_14_adapter.translate_order_status(attrs.get("status"))
+    if raw_status is not None:
+        pdo.distributor_order_status = raw_status.value
+        pdo.distributor_order_status_name = raw_status.name
+        update_fields += ["distributor_order_status", "distributor_order_status_name"]
+    else:
+        logger.warning(
+            "{} Unrecognized Turn14 order status {!r} for PurchaseOrderDistributorOrder "
+            "id={}; leaving distributor_order_status unset.".format(
+                _LOG_PREFIX, attrs.get("status"), pdo.id
+            )
+        )
+
     pdo.save(update_fields=update_fields)
     logger.info(
         "{} Updated raw_response for PurchaseOrderDistributorOrder id={} (distributor_order_number={}).".format(

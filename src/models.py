@@ -2301,8 +2301,20 @@ class PurchaseOrderDistributorOrder(django_db_models.Model):
     # endpoints.
     po_number = django_db_models.CharField(max_length=128, null=True, blank=True)
 
+    # The distributor's own Turn14-internal order id (attributes.order_number from the
+    # orders/po/{ref} lookup, e.g. "16958747") -- a different, unrelated numbering from both
+    # distributor_order_number (our website_order_number match key) and po_number. Only
+    # populated once a refresh (confirmed_purchase_order_sync) has actually looked this order up.
+    distributor_internal_order_number = django_db_models.CharField(max_length=128, null=True, blank=True)
+
     status = django_db_models.PositiveSmallIntegerField()
     status_name = django_db_models.CharField(max_length=32)
+
+    # The distributor's own raw order status (see src.enums.DistributorOrderRawStatus) --
+    # distinct from status/status_name above, which is our internal fulfillment lifecycle. Only
+    # populated once a refresh has looked this order up; currently only Turn14 is translated.
+    distributor_order_status = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+    distributor_order_status_name = django_db_models.CharField(max_length=16, null=True, blank=True)
 
     tracking_numbers = django_db_models.JSONField(default=list, blank=True, encoder=DjangoJSONEncoder)
     carrier = django_db_models.CharField(max_length=64, null=True, blank=True)
