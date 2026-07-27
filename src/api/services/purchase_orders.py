@@ -22,6 +22,8 @@ from django.utils import timezone as django_timezone
 
 from src import enums as src_enums
 from src import models as src_models
+from src.integrations.orders import base as order_base
+from src.integrations.orders import raw_response_parsers
 from src.integrations.orders import registry as order_registry
 from src.integrations.services import purchase_order_jobs
 
@@ -610,16 +612,62 @@ def review_cart(
 # -- PO / group reads -----------------------------------------------------------------------
 
 
+def _serialize_shipped_to(po: src_models.PurchaseOrder) -> typing.Optional[typing.Dict]:
+    if not po.ship_to_address1:
+        return None
+    return {
+        "name": po.ship_to_name,
+        "address1": po.ship_to_address1,
+        "address2": po.ship_to_address2,
+        "city": po.ship_to_city,
+        "state": po.ship_to_state,
+        "postal_code": po.ship_to_postal_code,
+        "country": po.ship_to_country,
+        "phone": po.ship_to_phone,
+        "is_shop_address": po.ship_to_is_shop_address,
+    }
+
+
+def _serialize_distributor_order_detail(
+    pdo: src_models.PurchaseOrderDistributorOrder, provider_kind: int
+) -> typing.Dict:
+    parsed = raw_response_parsers.parse(provider_kind, pdo.raw_response)
+    return {
+        "distributor_order_number": pdo.distributor_order_number,
+        "distributor_status": parsed["distributor_status"],
+        "distributor_invoice_ids": parsed["distributor_invoice_ids"],
+        "tracking": parsed["tracking"],
+        "total": parsed["total"],
+        "freight": parsed["freight"],
+        "discount": parsed["discount"],
+        "subtotal": parsed["subtotal"],
+        "line_items": parsed["line_items"],
+    }
+
+
 def get_purchase_order_detail(company_id: int, purchase_order_id: int) -> typing.Dict:
     po = (
         src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id)
-        .select_related("company_provider__provider", "group")
-        .prefetch_related("line_items__provider_part__master_part__brand", "distributor_orders")
+        .select_related("company_provider__provider")
+        .prefetch_related("distributor_orders")
         .first()
     )
     if not po:
         raise PurchaseOrderServiceError("Purchase order not found.")
-    return _serialize_purchase_order(po)
+
+    provider_kind = po.company_provider.provider.kind
+    return {
+        "id": po.id,
+        "po_internal_number": po.po_number,
+        "po_number": order_base.resolve_po_number(po),
+        "status": po.status_name,
+        "shipped_to": _serialize_shipped_to(po),
+        "created_at": po.created_at.isoformat(),
+        "submitted_at": po.submitted_at.isoformat() if po.submitted_at else None,
+        "distributor_orders": [
+            _serialize_distributor_order_detail(pdo, provider_kind) for pdo in po.distributor_orders.all()
+        ],
+    }
 
 
 def _parse_status_filter(value: typing.Optional[typing.Union[int, str]]) -> typing.Optional[int]:

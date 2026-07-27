@@ -125,6 +125,132 @@ def translate_order_status(raw_status: typing.Optional[str]) -> typing.Optional[
         return None
 
 
+def _to_float(value: typing.Any) -> typing.Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_order_lines(attrs: typing.Dict) -> typing.List[typing.Dict]:
+    """
+    The orders/po/{ref} lookup (what confirmed_purchase_order_sync stores long-term into
+    PurchaseOrderDistributorOrder.raw_response) reports items as a flat ``lines`` array, not
+    nested under ``shipment`` the way a fresh create/promote response does (see
+    _parse_order_shipment_items for that shape) -- confirmed against a live refreshed order.
+    """
+    line_items = []
+    for line in attrs.get("lines", []) or []:
+        open_quantity = line.get("open_quantity") or 0
+        delivered_quantity = line.get("delivered_quantity") or line.get("total_fulfilled_quantity") or 0
+        if open_quantity:
+            status = "backordered"
+        elif delivered_quantity:
+            status = "shipped"
+        else:
+            status = "confirmed"
+        line_items.append(
+            {
+                "part_number": line.get("part_number"),
+                "quantity": line.get("quantity"),
+                "unit_price": _to_float(line.get("price")),
+                "line_total": _to_float(line.get("total")),
+                "warehouse_code": _normalize_warehouse_code(line.get("location_id")),
+                "status": status,
+            }
+        )
+    return line_items
+
+
+def _parse_order_shipment_items(attrs: typing.Dict) -> typing.List[typing.Dict]:
+    """The create_order/promote_quote_to_order response's shape -- items nested under
+    ``shipment``, before any refresh has replaced it with the flatter ``lines`` shape above."""
+    line_items = []
+    for shipment in attrs.get("shipment", []) or []:
+        is_backordered = shipment.get("type") == "out_of_stock"
+        warehouse_code = _normalize_warehouse_code(shipment.get("location"))
+        for item in shipment.get("items", []) or []:
+            line_items.append(
+                {
+                    "part_number": item.get("part_number"),
+                    "quantity": item.get("quantity"),
+                    "unit_price": _to_float(item.get("unit_price")),
+                    "line_total": _to_float(item.get("line_total")),
+                    "warehouse_code": warehouse_code,
+                    "status": "backordered" if is_backordered else "in_stock",
+                }
+            )
+    return line_items
+
+
+_EMPTY_PARSED_ORDER = {
+    "distributor_status": None,
+    "distributor_invoice_ids": [],
+    "tracking": [],
+    "total": None,
+    "freight": None,
+    "discount": None,
+    "subtotal": None,
+    "line_items": [],
+}
+
+
+def parse_order_raw_response(raw_response: typing.Optional[typing.Dict]) -> typing.Dict:
+    """
+    Maps whatever shape PurchaseOrderDistributorOrder.raw_response currently holds for a Turn14
+    order (same create/promote vs. orders/po/{ref} shape tolerance as extract_po_reference)
+    into the purchase-order detail API's standardized distributor-order fields. Reads the raw
+    JSON fresh on every call instead of a separately-synced DB copy, so a status/tracking change
+    on Turn14's side shows up here without needing a background job to have already caught up.
+    """
+    if not isinstance(raw_response, dict):
+        return dict(_EMPTY_PARSED_ORDER)
+    data = raw_response.get("data")
+    if isinstance(data, dict):
+        entry = data
+    elif isinstance(data, list) and data:
+        entry = data[0]
+    else:
+        entry = raw_response
+    attrs = entry.get("attributes") or {}
+
+    tracking = [
+        {"tracking_number": t.get("tracking_number"), "method": t.get("ship_method")}
+        for t in (attrs.get("tracking") or [])
+        if t.get("tracking_number")
+    ]
+
+    # relationships.invoice is only present once an invoice has actually been generated against
+    # this order (post-refresh shape) -- absent entirely on a freshly-submitted order.
+    invoice_ids = [
+        str(rel["invoice_id"])
+        for rel in (entry.get("relationships", {}) or {}).get("invoice", []) or []
+        if rel.get("invoice_id") is not None
+    ]
+
+    line_items = _parse_order_lines(attrs) if "lines" in attrs else _parse_order_shipment_items(attrs)
+    line_totals = [li["line_total"] for li in line_items if li["line_total"] is not None]
+    subtotal = sum(line_totals) if line_totals else None
+
+    return {
+        "distributor_status": attrs.get("status"),
+        "distributor_invoice_ids": invoice_ids,
+        "tracking": tracking,
+        # freight/discount only appear on the orders/po/{ref} (post-refresh) shape -- absent on
+        # a freshly-submitted, not-yet-refreshed order's shipment[]-shaped response.
+        "total": _to_float(attrs.get("total")),
+        "freight": _to_float(attrs.get("freight")),
+        "discount": _to_float(attrs.get("discount")),
+        # Our own sum of line_total across every parsed line -- not read off the distributor's
+        # response (Turn14 doesn't state a subtotal directly; "total" above is gross, after
+        # freight/discount).
+        "subtotal": subtotal,
+        "line_items": line_items,
+    }
+
+
 class Turn14OrderAdapter(base.DistributorOrderAdapter):
     provider_kind = src_enums.BrandProviderKind.TURN_14.value
 
