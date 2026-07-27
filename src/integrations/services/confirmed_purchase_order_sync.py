@@ -33,12 +33,17 @@ turn_14.translate_order_status into distributor_order_status/distributor_order_s
 (src.enums.DistributorOrderRawStatus) -- currently a direct OPEN/CLOSED passthrough.
 
 For Keystone: distributor_order_number IS the po_number we submitted (Keystone hands back no
-separate order id at submit time -- see KeystoneOrderAdapter.submit_order), so there's no
-reference-extraction step. This calls the adapter's own get_order_status(), which already wraps
-GetOrderHistory correctly (unlike Turn14's general status-check path, Keystone's has no known
-field-mismatch bug), and pulls the matching entry's EKKEY# (Keystone's own internal order
-number) into distributor_internal_order_number, translating its EKSTAT via
-keystone.translate_order_status into distributor_order_status/distributor_order_status_name.
+separate order id at submit time -- see KeystoneOrderAdapter.submit_order). This calls
+get_order_status_by_reference(pdo.distributor_order_number) -- NOT the adapter's own
+get_order_status(purchase_order) -- because that re-derives the query PONumber from the
+PurchaseOrder's *current* po_name/po_number (base.resolve_po_number), which can drift from what
+was actually submitted if po_name is set/changed afterward (confirmed live: a PO submitted under
+PONumber "AMS-000036" whose po_name was later set to "30747" made get_order_status silently
+query the wrong PO and find nothing -- the same "don't re-derive the reference from mutable
+PurchaseOrder state" lesson as Turn14's extraction above, just triggered a different way).
+Pulls the matching entry's EKKEY# (Keystone's own internal order number) into
+distributor_internal_order_number, translating its EKSTAT via keystone.translate_order_status
+into distributor_order_status/distributor_order_status_name.
 """
 import datetime
 import logging
@@ -148,7 +153,10 @@ def _refresh_keystone_distributor_order(
     po: src_models.PurchaseOrder,
     pdo: src_models.PurchaseOrderDistributorOrder,
 ) -> None:
-    result = adapter.get_order_status(po)
+    # Queries by pdo.distributor_order_number itself (the PONumber actually submitted), not by
+    # re-deriving one from the PurchaseOrder's current po_name/po_number (get_order_status would)
+    # -- po_name can be set/changed after submission, which would silently query the wrong PO.
+    result = adapter.get_order_status_by_reference(pdo.distributor_order_number)
     matched = next(
         (o for o in result.orders if o.distributor_order_number == pdo.distributor_order_number), None
     )

@@ -553,8 +553,22 @@ class KeystoneOrderAdapter(base.DistributorOrderAdapter):
         )
 
     def get_order_status(self, purchase_order: src_models.PurchaseOrder) -> base.OrderStatusResult:
+        return self.get_order_status_by_reference(base.resolve_po_number(purchase_order))
+
+    def get_order_status_by_reference(self, po_number: str) -> base.OrderStatusResult:
+        """
+        Same as get_order_status, but takes the PONumber to query directly instead of
+        re-deriving it from a PurchaseOrder's current po_name/po_number. Needed because Keystone
+        has no separate order id -- distributor_order_number IS whatever PONumber was actually
+        submitted (see submit_order) -- and that can drift from base.resolve_po_number(po) later
+        if po_name is set/changed after submission (confirmed live: a PO submitted under
+        PONumber "AMS-000036" whose po_name was later set to "30747" made resolve_po_number
+        return "30747", silently querying the wrong PO and finding no match). Callers refreshing
+        an already-submitted PurchaseOrderDistributorOrder should always pass its own
+        distributor_order_number here, not go through get_order_status(purchase_order).
+        """
         try:
-            tables = self._client.get_order_history(po_number=base.resolve_po_number(purchase_order))
+            tables = self._client.get_order_history(po_number=po_number)
         except keystone_client_exceptions.KeystoneException as e:
             self._handle_error(e)
 
