@@ -677,12 +677,14 @@ def get_confirmed_purchase_order_detail(company_id: int, purchase_order_id: int)
     if not po:
         raise PurchaseOrderServiceError("Purchase order not found.")
 
-    provider_kind = po.company_provider.provider.kind
+    provider = po.company_provider.provider
+    provider_kind = provider.kind
     return {
         "id": po.id,
         "po_internal_number": po.po_number,
         "po_number": order_base.resolve_po_number(po),
         "status": po.status_name,
+        "distributor": {"name": provider.name, "kind": provider.kind_name},
         "shipped_to": _serialize_confirmed_shipped_to(po),
         "created_at": po.created_at.isoformat(),
         "submitted_at": po.submitted_at.isoformat() if po.submitted_at else None,
