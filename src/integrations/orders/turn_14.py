@@ -134,7 +134,7 @@ def _to_float(value: typing.Any) -> typing.Optional[float]:
         return None
 
 
-def _parse_order_lines(attrs: typing.Dict) -> typing.List[typing.Dict]:
+def _parse_order_lines(attrs: typing.Dict, warehouse_names: typing.Dict[str, str]) -> typing.List[typing.Dict]:
     """
     The orders/po/{ref} lookup (what confirmed_purchase_order_sync stores long-term into
     PurchaseOrderDistributorOrder.raw_response) reports items as a flat ``lines`` array, not
@@ -151,20 +151,22 @@ def _parse_order_lines(attrs: typing.Dict) -> typing.List[typing.Dict]:
             status = "shipped"
         else:
             status = "confirmed"
+        warehouse_code = _normalize_warehouse_code(line.get("location_id"))
         line_items.append(
             {
                 "part_number": line.get("part_number"),
                 "quantity": line.get("quantity"),
                 "unit_price": _to_float(line.get("price")),
                 "line_total": _to_float(line.get("total")),
-                "warehouse_code": _normalize_warehouse_code(line.get("location_id")),
+                "warehouse_code": warehouse_code,
+                "warehouse_name": warehouse_names.get(warehouse_code) if warehouse_code else None,
                 "status": status,
             }
         )
     return line_items
 
 
-def _parse_order_shipment_items(attrs: typing.Dict) -> typing.List[typing.Dict]:
+def _parse_order_shipment_items(attrs: typing.Dict, warehouse_names: typing.Dict[str, str]) -> typing.List[typing.Dict]:
     """The create_order/promote_quote_to_order response's shape -- items nested under
     ``shipment``, before any refresh has replaced it with the flatter ``lines`` shape above."""
     line_items = []
@@ -179,6 +181,7 @@ def _parse_order_shipment_items(attrs: typing.Dict) -> typing.List[typing.Dict]:
                     "unit_price": _to_float(item.get("unit_price")),
                     "line_total": _to_float(item.get("line_total")),
                     "warehouse_code": warehouse_code,
+                    "warehouse_name": warehouse_names.get(warehouse_code) if warehouse_code else None,
                     "status": "backordered" if is_backordered else "in_stock",
                 }
             )
@@ -224,17 +227,22 @@ def parse_order_raw_response(raw_response: typing.Optional[typing.Dict]) -> typi
     ]
 
     # relationships.invoice is only present once an invoice has actually been generated against
-    # this order (post-refresh shape) -- absent entirely on a freshly-submitted order.
-    # relationships.invoice lists one entry per line item billed against this invoice, not one
-    # per invoice (confirmed against a live 2-line order sharing a single invoice) -- deduped so
-    # a multi-line order doesn't repeat the same invoice id once per line.
+    # this order (post-refresh shape) -- absent entirely on a freshly-submitted order. It lists
+    # one entry per line item billed against the invoice, not one per invoice (confirmed against
+    # a live 2-line order sharing a single invoice) -- deduped so a multi-line order doesn't
+    # repeat the same invoice id once per line.
     invoice_ids = []
     for rel in (entry.get("relationships", {}) or {}).get("invoice", []) or []:
         invoice_id = rel.get("invoice_id")
         if invoice_id is not None and str(invoice_id) not in invoice_ids:
             invoice_ids.append(str(invoice_id))
 
-    line_items = _parse_order_lines(attrs) if "lines" in attrs else _parse_order_shipment_items(attrs)
+    warehouse_names = _load_warehouse_names()
+    line_items = (
+        _parse_order_lines(attrs, warehouse_names)
+        if "lines" in attrs
+        else _parse_order_shipment_items(attrs, warehouse_names)
+    )
     line_totals = [li["line_total"] for li in line_items if li["line_total"] is not None]
     subtotal = round(sum(line_totals), 2) if line_totals else None
 
