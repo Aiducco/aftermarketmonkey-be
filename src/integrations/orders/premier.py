@@ -173,6 +173,116 @@ def _best_candidate_warehouse(inventory_rows: typing.List[typing.Dict], country:
     return max(candidates, key=lambda c: c[1])[0]
 
 
+def _to_float(value: typing.Any) -> typing.Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_quantity(value: typing.Any) -> typing.Optional[typing.Union[int, float]]:
+    """Premier's own quantity fields come back as decimal strings ("1.00000000") -- collapsed to
+    a plain int for the whole-unit case every other adapter's quantity field already uses,
+    rather than carrying pointless trailing zeros through to the API response."""
+    parsed = _to_float(value)
+    if parsed is None:
+        return None
+    return int(parsed) if parsed == int(parsed) else parsed
+
+
+_EMPTY_PARSED_ORDER = {
+    "distributor_order_number": None,
+    "distributor_status": None,
+    "distributor_invoice_ids": [],
+    "tracking": [],
+    "total": None,
+    "freight": None,
+    "discount": None,
+    "subtotal": None,
+    "line_items": [],
+}
+
+
+def parse_order_raw_response(raw_response: typing.Optional[typing.Dict]) -> typing.Dict:
+    """
+    Maps PurchaseOrderDistributorOrder.raw_response for a Premier order -- get_sales_order's
+    order body plus get_order_status's tracking entries, combined into one {"order":...,
+    "tracking":...} record -- into the purchase-order detail API's standardized distributor-
+    order fields. Unlike Turn14, Premier states no order-level status or per-line total
+    directly, so both are derived here: distributor_status from whether any tracking has been
+    recorded yet, and each line's total from quantity * unitPrice (Premier's own line data
+    carries no lineTotal/extendedPrice field of its own).
+    """
+    if not isinstance(raw_response, dict):
+        return dict(_EMPTY_PARSED_ORDER)
+
+    order = raw_response.get("order") or {}
+    tracking_entries = raw_response.get("tracking") or []
+
+    tracking = [
+        {"tracking_number": t.get("trackingNumber"), "method": t.get("carrier")}
+        for t in tracking_entries
+        if t.get("trackingNumber")
+    ]
+    shipped_item_numbers = {
+        item.get("itemNumber")
+        for t in tracking_entries
+        for item in (t.get("packageItems") or [])
+        if item.get("itemNumber")
+    }
+
+    line_items = []
+    for line in order.get("salesOrderLines", []) or []:
+        item_number = line.get("itemNumber")
+        quantity = _parse_quantity(line.get("quantity"))
+        unit_price = _to_float(line.get("unitPrice"))
+        line_total = round(quantity * unit_price, 2) if quantity is not None and unit_price is not None else None
+        line_items.append(
+            {
+                "part_number": item_number,
+                "quantity": quantity,
+                "unit_price": unit_price,
+                "line_total": line_total,
+                "warehouse_code": line.get("warehouseCode"),
+                "status": "shipped" if item_number in shipped_item_numbers else "confirmed",
+            }
+        )
+
+    line_totals = [li["line_total"] for li in line_items if li["line_total"] is not None]
+    subtotal = round(sum(line_totals), 2) if line_totals else None
+    freight = _to_float(order.get("freightAmt"))
+    discount = _to_float(order.get("tradeDiscountAmount"))
+    total = subtotal
+    if total is not None and freight is not None:
+        total += freight
+    if total is not None and discount is not None:
+        total -= discount
+    total = round(total, 2) if total is not None else None
+
+    # Premier's order body carries no status field of its own (unlike Turn14's attributes.
+    # status) -- get_order_status already treats "has at least one tracking entry" as shipped,
+    # else open (see that method's own OPEN/SHIPPED fallback); same signal, same OPEN/CLOSED
+    # vocabulary Turn14/Keystone/Meyer's own distributor_status uses.
+    distributor_status = (
+        src_enums.DistributorOrderRawStatus.CLOSED.name if tracking else src_enums.DistributorOrderRawStatus.OPEN.name
+    )
+
+    return {
+        "distributor_status": distributor_status,
+        # Premier's order/tracking response carries no invoice reference of its own -- invoices
+        # only come from the separate GET /invoices endpoint (see get_invoices), not this shape.
+        "distributor_invoice_ids": [],
+        "tracking": tracking,
+        "total": total,
+        "freight": freight,
+        "discount": discount,
+        "subtotal": subtotal,
+        "line_items": line_items,
+    }
+
+
 class PremierOrderAdapter(base.DistributorOrderAdapter):
     provider_kind = src_enums.BrandProviderKind.PREMIER_PERFORMANCE.value
 

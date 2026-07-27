@@ -16,6 +16,7 @@ from src import enums as src_enums
 from src import models as src_models
 from src.integrations.orders import keystone
 from src.integrations.orders import meyer
+from src.integrations.orders import premier
 from src.integrations.orders import turn_14
 
 _EMPTY_PARSED_ORDER = {
@@ -34,6 +35,9 @@ _PARSERS = {
     src_enums.BrandProviderKind.TURN_14.value: lambda pdo: turn_14.parse_order_raw_response(pdo.raw_response),
     src_enums.BrandProviderKind.KEYSTONE.value: lambda pdo: keystone.parse_processed_order(pdo.processed_order),
     src_enums.BrandProviderKind.MEYER.value: lambda pdo: meyer.parse_order_raw_response(pdo.raw_response),
+    src_enums.BrandProviderKind.PREMIER_PERFORMANCE.value: lambda pdo: premier.parse_order_raw_response(
+        pdo.raw_response
+    ),
 }
 
 
