@@ -72,6 +72,7 @@ class BrandProviderKind(enum.Enum):
     WESTERN_POWER_SPORTS = 32
     XDP = 33
     ASAP_NETWORK = 34
+    VOSSEN = 35
 
 class BrandProviderStatus(enum.Enum):
     ACTIVE = 1

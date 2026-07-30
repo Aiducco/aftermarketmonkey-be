@@ -1547,6 +1547,97 @@ class BrandRoughCountryBrandMapping(django_db_models.Model):
         unique_together = ["brand", "rough_country_brand"]
 
 
+class VossenBrand(django_db_models.Model):
+    """Single brand from the Vossen feed — always one row, "VOSSEN" (Vossen is brand=distributor)."""
+    external_id = django_db_models.CharField(max_length=255)
+    name = django_db_models.CharField(max_length=255)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "vossen_brands"
+        unique_together = [["external_id"]]
+
+
+class VossenPart(django_db_models.Model):
+    """
+    Part from Vossen's AfterMarket.aspx CSV feed (catalog + manufacturer-wide stock; not
+    per-company — see VossenCompanyPricing for per-company price). Wheel-spec columns
+    (diameter/width/offset/bolt_pattern/center_bore) are stored as CharField like
+    WheelProsPart's equivalents since raw feed formats vary and non-wheel rows (caps, lug nuts)
+    carry "0"/blank placeholders rather than real dimensions.
+    """
+    brand = django_db_models.ForeignKey(
+        VossenBrand,
+        on_delete=django_db_models.CASCADE,
+        related_name="parts",
+    )
+    sku = django_db_models.CharField(max_length=255)
+    description = django_db_models.TextField(null=True, blank=True)
+    available = django_db_models.IntegerField(null=True, blank=True)
+    diameter = django_db_models.CharField(max_length=64, null=True, blank=True)
+    width = django_db_models.CharField(max_length=64, null=True, blank=True)
+    offset = django_db_models.CharField(max_length=64, null=True, blank=True)
+    bolt_pattern = django_db_models.CharField(max_length=64, null=True, blank=True)
+    center_bore = django_db_models.CharField(max_length=64, null=True, blank=True)
+    raw_data = django_db_models.JSONField(null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "vossen_parts"
+        unique_together = [["brand", "sku"]]
+
+
+class VossenCompanyPricing(django_db_models.Model):
+    """
+    Per-company Vossen pricing for a catalog row (VossenPart), read from that company's own
+    feed_url — mirrors RoughCountryCompanyPricing's split (catalog/stock on the Part, price
+    per company) so ProviderPartCompanyPricing sync keys off (part, company) like other providers.
+    """
+    part = django_db_models.ForeignKey(
+        VossenPart,
+        on_delete=django_db_models.CASCADE,
+        related_name="company_pricing",
+    )
+    company = django_db_models.ForeignKey(
+        Company,
+        on_delete=django_db_models.CASCADE,
+        related_name="vossen_company_pricing",
+    )
+    price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "vossen_company_pricing"
+        unique_together = [["part", "company"]]
+
+
+class BrandVossenBrandMapping(django_db_models.Model):
+    """Maps our Brands to VossenBrand (for master parts sync). Always a single row in practice."""
+    brand = django_db_models.ForeignKey(
+        Brands,
+        on_delete=django_db_models.CASCADE,
+        related_name="vossen_brand_mappings",
+    )
+    vossen_brand = django_db_models.ForeignKey(
+        VossenBrand,
+        on_delete=django_db_models.CASCADE,
+        related_name="brand_mappings",
+    )
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "brand_vossen_brand_mapping"
+        unique_together = ["brand", "vossen_brand"]
+
+
 class MasterPart(django_db_models.Model):
     brand = django_db_models.ForeignKey(Brands, on_delete=django_db_models.CASCADE, related_name="master_parts")
     part_number = django_db_models.CharField(max_length=255)

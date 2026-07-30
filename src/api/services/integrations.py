@@ -26,6 +26,8 @@ from src.integrations.clients.rough_country import exceptions as rough_country_e
 from src.integrations.clients.turn_14 import client as turn14_client
 from src.integrations.clients.turn_14 import exceptions as turn14_exceptions
 from src.integrations.clients.turn_14 import order_client as turn14_order_client
+from src.integrations.clients.vossen import client as vossen_client
+from src.integrations.clients.vossen import exceptions as vossen_exceptions
 from src.integrations.clients.wheelpros import client as wheelpros_client
 from src.integrations.clients.wheelpros import exceptions as wheelpros_exceptions
 from src.integrations.clients.wheelpros import order_client as wheelpros_order_client
@@ -485,6 +487,19 @@ def _validate_rough_country_connection(credentials: typing.Dict[str, typing.Any]
     return None, None
 
 
+def _validate_vossen_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
+    url = credentials.get(src_constants.VOSSEN_CREDENTIALS_FEED_URL)
+    try:
+        client = vossen_client.VossenFeedClient(file_url=url)
+    except ValueError as e:
+        return str(e), CONNECTION_ERROR_INVALID_INPUT
+    try:
+        client.test_connection()
+    except (vossen_exceptions.VossenException, ValueError) as e:
+        return str(e), CONNECTION_ERROR_CONNECTION_FAILED
+    return None, None
+
+
 # Connection validators run synchronously at connect/update time, before credentials are saved,
 # so bad credentials fail the request instead of silently failing the first background sync.
 # Kinds without an entry here are not validated (relay-provisioned kinds, where credentials are
@@ -496,6 +511,7 @@ _CONNECTION_VALIDATORS: typing.Dict[int, typing.Callable[[typing.Dict[str, typin
     src_enums.BrandProviderKind.PREMIER_PERFORMANCE.value: _validate_premier_connection,
     src_enums.BrandProviderKind.WHEELPROS.value: _validate_wheelpros_connection,
     src_enums.BrandProviderKind.ROUGH_COUNTRY.value: _validate_rough_country_connection,
+    src_enums.BrandProviderKind.VOSSEN.value: _validate_vossen_connection,
 }
 
 

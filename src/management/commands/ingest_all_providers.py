@@ -54,6 +54,7 @@ from src.integrations.services import (
     premier,
     rough_country,
     turn_14,
+    vossen,
     wheelpros,
 )
 from src.search.meilisearch_client import is_configured, reindex_all_master_parts_zero_downtime
@@ -135,6 +136,7 @@ class Command(BaseCommand):
             "ingest_all_providers_dlg",
             "ingest_all_providers_wheelpros",
             "ingest_all_providers_premier",
+            "ingest_all_providers_vossen",
             "ingest_all_providers_sync_all_master_parts",
             "ingest_all_providers_enqueue_pricing_jobs",
             "ingest_all_providers_meilisearch_reindex",
@@ -161,6 +163,7 @@ class Command(BaseCommand):
                 ("dlg",           self._run_dlg),
                 ("wheelpros",     self._run_wheelpros),
                 ("premier",       self._run_premier),
+                ("vossen",        self._run_vossen),
             ]
             for name, run_fn in phase1_providers:
                 self._ingest_log("phase 1 | starting {} fetch".format(name))
@@ -351,3 +354,17 @@ class Command(BaseCommand):
             premier.fetch_and_save_premier_brands()
             premier.sync_unmapped_premier_brands_to_brands()
             premier.fetch_and_save_all_premier_brand_parts()
+
+    def _run_vossen(self) -> None:
+        with self._audited_step(
+            "ingest_all_providers_vossen",
+            "Vossen source fetch + brand mapping complete (derived in sync_all).",
+            continue_on_error=True,
+        ):
+            self._ingest_log("Vossen: feed + brand mapping")
+            vossen.fetch_and_save_vossen(
+                file_url=None,
+                local_file_path=None,
+                download=True,
+            )
+            vossen.ensure_vossen_brand_and_mapping()

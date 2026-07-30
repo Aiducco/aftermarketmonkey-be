@@ -343,4 +343,13 @@ def get_distributor_credentials_info() -> dict:
             "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("DLG", "DLG"),
             "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("DLG") or None,
         },
+        "vossen": {
+            "required": [src_constants.VOSSEN_CREDENTIALS_FEED_URL],
+            "description": (
+                "Vossen AfterMarket.aspx CSV feed URL (feed_url) per company. Catalog uses the "
+                "primary connection; per-company pricing loads each company's own feed_url."
+            ),
+            "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("VOSSEN", "Vossen"),
+            "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("VOSSEN") or None,
+        },
     }

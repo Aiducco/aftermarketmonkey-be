@@ -29,6 +29,7 @@ from src.integrations.services import notifications as notifications_services
 from src.integrations.services import premier as premier_services
 from src.integrations.services import rough_country as rough_country_services
 from src.integrations.services import turn_14 as turn_14_services
+from src.integrations.services import vossen as vossen_services
 from src.integrations.services import wheelpros as wheelpros_services
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,7 @@ _PRICING_SYNC_KINDS = frozenset(
         src_enums.BrandProviderKind.ATECH.value,
         src_enums.BrandProviderKind.DLG.value,
         src_enums.BrandProviderKind.PREMIER_PERFORMANCE.value,
+        src_enums.BrandProviderKind.VOSSEN.value,
     }
 )
 
@@ -171,6 +173,9 @@ def _fetch_raw_pricing(cp: src_models.CompanyProviders, use_delta_fetch: bool = 
         # (same call as Phase 1 ingest; only needed for on-demand/new-company runs).
         premier_services.fetch_and_save_all_premier_brand_parts()
 
+    elif kind == src_enums.BrandProviderKind.VOSSEN.value:
+        vossen_services.sync_vossen_company_pricing_for_company_provider(cp.id)
+
     else:
         raise ValueError("Unsupported provider kind for raw pricing fetch: {}".format(kind))
 
@@ -206,6 +211,9 @@ def _sync_master_pricing(cp: src_models.CompanyProviders) -> None:
 
     elif kind == src_enums.BrandProviderKind.PREMIER_PERFORMANCE.value:
         master_parts.sync_provider_pricing_from_premier_for_company(company_id)
+
+    elif kind == src_enums.BrandProviderKind.VOSSEN.value:
+        master_parts.sync_provider_pricing_from_vossen_for_company(company_id)
 
     else:
         raise ValueError("Unsupported provider kind for master pricing sync: {}".format(kind))

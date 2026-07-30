@@ -1,6 +1,7 @@
 """
 Sync MasterPart, ProviderPart, ProviderPartInventory, and ProviderPartCompanyPricing
-from Turn14, Keystone, Meyer, A-Tech, Rough Country, WheelPros, DLG, and Premier (APG Wholesale) provider data.
+from Turn14, Keystone, Meyer, A-Tech, Rough Country, WheelPros, DLG, Premier (APG Wholesale),
+and Vossen provider data.
 """
 import ctypes
 import gc
@@ -117,6 +118,15 @@ def _get_brand_for_wheelpros_brand(
 ) -> typing.Optional[src_models.Brands]:
     mapping = src_models.BrandWheelProsBrandMapping.objects.filter(
         wheelpros_brand=wp_brand,
+    ).first()
+    return mapping.brand if mapping else None
+
+
+def _get_brand_for_vossen_brand(
+    vossen_brand: src_models.VossenBrand,
+) -> typing.Optional[src_models.Brands]:
+    mapping = src_models.BrandVossenBrandMapping.objects.filter(
+        vossen_brand=vossen_brand,
     ).first()
     return mapping.brand if mapping else None
 
@@ -3107,6 +3117,430 @@ def sync_provider_pricing_from_rough_country() -> None:
     logger.info("{} Synced {} Rough Country pricing records total.".format(_LOG_PREFIX, total_upserted))
 
 
+def _vossen_provider_external_id(vossen_brand_id: int, sku: str) -> str:
+    """Unique per Vossen provider: vossen_brand_id + sku (Vossen only ever has one brand, but
+    kept the same compound shape as every other provider's external id for consistency)."""
+    return "{}_{}".format(vossen_brand_id, sku)
+
+
+def _vossen_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
+    """Wheel-spec attributes for a VossenPart row, shown as ProviderPart.product_details."""
+    diameter = row.get("diameter")
+    width = row.get("width")
+    offset = row.get("offset")
+    bolt_pattern = row.get("bolt_pattern")
+    center_bore = row.get("center_bore")
+    return [
+        {"key": "sku", "label": "SKU", "value": row.get("sku") or None},
+        {"key": "diameter", "label": "Diameter", "value": diameter if diameter and diameter != "0" else None},
+        {"key": "width", "label": "Width", "value": width if width and width != "0.00" else None},
+        {"key": "offset", "label": "Offset", "value": offset if offset and offset != "0" else None},
+        {"key": "bolt_pattern", "label": "Bolt Pattern", "value": bolt_pattern or None},
+        {"key": "center_bore", "label": "Centerbore", "value": center_bore if center_bore and center_bore != "0.00" else None},
+    ]
+
+
+def _ingest_vossen_parts_for_mapped_brands(
+    mapped_catalog_brand_ids: typing.Set[int],
+    vossen_provider: src_models.Providers,
+    vossen_brand_to_brand: typing.Dict[int, src_models.Brands],
+    category_by_source: typing.Dict[str, typing.Tuple[typing.Optional[str], typing.Optional[str]]],
+) -> typing.Tuple[int, int]:
+    """Batch-ingest VossenPart rows for one disjoint set of Vossen catalog brand PKs."""
+    if not mapped_catalog_brand_ids:
+        return 0, 0
+
+    total_master = 0
+    total_provider = 0
+    batch_num = 0
+    last_id = 0
+
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.VossenPart.objects.filter(
+                brand_id__in=mapped_catalog_brand_ids,
+                id__gt=last_id,
+            )
+            .order_by("id")
+            .values("id", "brand_id", "sku", "description", "updated_at")[:BATCH_SIZE_MASTER_PARTS]
+        )
+        if not batch:
+            break
+
+        last_id = batch[-1]["id"]
+        seen = set()
+        master_parts = []
+        vossen_external_id_to_brand_part = {}
+
+        for row in batch:
+            brand = vossen_brand_to_brand.get(row["brand_id"])
+            if not brand:
+                continue
+
+            part_number = (row.get("sku") or "").strip()
+            if not part_number:
+                continue
+
+            key = (brand.id, part_number)
+            if key not in seen:
+                seen.add(key)
+                master_parts.append(
+                    src_models.MasterPart(
+                        brand=brand,
+                        part_number=part_number,
+                        sku=part_number,
+                        description=row.get("description"),
+                    )
+                )
+            vossen_external_id_to_brand_part[
+                _vossen_provider_external_id(row["brand_id"], row["sku"])
+            ] = (brand.id, part_number)
+
+        if not master_parts:
+            connection.close()
+            if len(batch) == BATCH_SIZE_MASTER_PARTS:
+                time.sleep(BATCH_DELAY_SECONDS)
+            continue
+
+        pairs = list(seen)
+        existing_by_key = {}
+        if pairs:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(pairs),),
+                )
+                for row in cur.fetchall():
+                    mp_id, b_id, p_num = row
+                    existing_by_key[(b_id, p_num)] = mp_id
+
+        new_parts = [mp for mp in master_parts if (mp.brand_id, mp.part_number) not in existing_by_key]
+
+        if new_parts:
+            new_parts = _dedupe_master_parts_for_upsert(
+                new_parts, context="Vossen new_parts batch={}".format(batch_num)
+            )
+            pgbulk.upsert(
+                src_models.MasterPart,
+                new_parts,
+                unique_fields=["brand", "part_number"],
+                update_fields=[],
+            )
+            total_master += len(new_parts)
+
+        brand_part_to_master = {}
+        if pairs:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(pairs),),
+                )
+                for row in cur.fetchall():
+                    mp_id, b_id, p_num = row
+                    mp = src_models.MasterPart()
+                    mp.id = mp_id
+                    mp.brand_id = b_id
+                    mp.part_number = p_num
+                    brand_part_to_master[(b_id, p_num)] = mp
+
+        provider_parts_by_key = {}
+        for row in batch:
+            ext_id = _vossen_provider_external_id(row["brand_id"], row["sku"])
+            key = vossen_external_id_to_brand_part.get(ext_id)
+            if not key:
+                continue
+            master_part = brand_part_to_master.get(key)
+            if not master_part:
+                continue
+            pp_key = (master_part.id, vossen_provider.id)
+            provider_parts_by_key[pp_key] = src_models.ProviderPart(
+                master_part=master_part,
+                provider=vossen_provider,
+                provider_external_id=ext_id,
+                distributor_refreshed_at=row.get("updated_at"),
+            )
+
+        provider_parts = list(provider_parts_by_key.values())
+        if provider_parts:
+            pgbulk.upsert(
+                src_models.ProviderPart,
+                provider_parts,
+                unique_fields=["master_part", "provider"],
+                update_fields=_PROVIDER_PART_SYNC_UPDATE_FIELDS,
+            )
+            total_provider += len(provider_parts)
+
+        logger.info("{} Batch {}: {} items -> {} master, {} provider (last_id={})".format(
+            _LOG_PREFIX, batch_num, len(batch), len(master_parts), len(provider_parts), last_id
+        ))
+        connection.close()
+        if len(batch) == BATCH_SIZE_MASTER_PARTS:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    return total_master, total_provider
+
+
+def sync_master_parts_from_vossen() -> None:
+    """
+    Create/update MasterPart and ProviderPart from VossenPart.
+    Only processes parts whose VossenBrand has a BrandVossenBrandMapping (in practice always
+    the single "VOSSEN" brand). Same cursor-based, two-phase upsert pattern as every other
+    provider.
+    """
+    logger.info("{} Syncing master parts from Vossen (batched, cursor-based).".format(_LOG_PREFIX))
+
+    vossen_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.VOSSEN.value,
+    ).first()
+    if not vossen_provider:
+        logger.info("{} No Vossen provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandVossenBrandMapping.objects.select_related("brand", "vossen_brand")
+    )
+    vossen_brand_to_brand = {m.vossen_brand_id: m.brand for m in mappings}
+    if not vossen_brand_to_brand:
+        logger.info("{} No BrandVossenBrandMapping found. Nothing to sync.".format(_LOG_PREFIX))
+        return
+
+    category_by_source = _load_category_mapping_by_source()
+    chunks = _partition_mapped_brands_for_parallel_ingest(mappings, MASTER_PARTS_SYNC_MAX_WORKERS)
+    total_master, total_provider = _run_parallel_master_parts_ingest(
+        chunks,
+        mappings,
+        "vossen_brand",
+        lambda cids: _ingest_vossen_parts_for_mapped_brands(
+            cids,
+            vossen_provider,
+            vossen_brand_to_brand,
+            category_by_source,
+        ),
+    )
+    logger.info("{} Synced {} master parts and {} provider parts from Vossen total.".format(
+        _LOG_PREFIX, total_master, total_provider
+    ))
+
+
+def sync_provider_inventory_from_vossen() -> None:
+    """
+    Sync ProviderPartInventory from VossenPart.available (manufacturer-wide stock, not
+    per-warehouse -- so warehouse_availability stays null, only warehouse_total_qty is set).
+    Also refreshes ProviderPart.product_details with wheel-spec attributes.
+    """
+    logger.info("{} Syncing provider inventory from Vossen.".format(_LOG_PREFIX))
+
+    vossen_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.VOSSEN.value,
+    ).first()
+    if not vossen_provider:
+        logger.info("{} No Vossen provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandVossenBrandMapping.objects.select_related("brand", "vossen_brand")
+    )
+    if not mappings:
+        logger.info("{} No BrandVossenBrandMapping found.".format(_LOG_PREFIX))
+        return
+
+    provider_parts = {
+        row["provider_external_id"]: src_models.ProviderPart(id=row["id"])
+        for row in src_models.ProviderPart.objects.filter(provider=vossen_provider).values(
+            "id", "provider_external_id"
+        )
+    }
+
+    now = timezone.now()
+
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            batch = list(
+                src_models.VossenPart.objects.filter(id__gt=last_id, brand_id__in=catalog_ids)
+                .order_by("id")
+                .values(
+                    "id", "brand_id", "sku", "available",
+                    "diameter", "width", "offset", "bolt_pattern", "center_bore",
+                )[:BATCH_SIZE_INVENTORY]
+            )
+            if not batch:
+                break
+
+            last_id = batch[-1]["id"]
+            to_upsert = []
+            for row in batch:
+                ext_id = _vossen_provider_external_id(row["brand_id"], row["sku"])
+                provider_part = provider_parts.get(ext_id)
+                if not provider_part:
+                    continue
+                to_upsert.append(
+                    src_models.ProviderPartInventory(
+                        provider_part=provider_part,
+                        warehouse_total_qty=row.get("available") or 0,
+                        manufacturer_inventory=None,
+                        manufacturer_esd=None,
+                        warehouse_availability=None,
+                        last_synced_at=now,
+                        updated_at=now,
+                    )
+                )
+
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_inventory_for_upsert(
+                    to_upsert, context="Vossen inventory batch={}".format(batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartInventory,
+                    to_upsert,
+                    unique_fields=["provider_part"],
+                    update_fields=[
+                        "warehouse_total_qty",
+                        "manufacturer_inventory",
+                        "manufacturer_esd",
+                        "warehouse_availability",
+                        "last_synced_at",
+                        "updated_at",
+                    ],
+                )
+                total_upserted += len(to_upsert)
+
+            pp_details_to_update = []
+            for row in batch:
+                ext_id = _vossen_provider_external_id(row["brand_id"], row["sku"])
+                pp = provider_parts.get(ext_id)
+                if pp:
+                    pp.product_details = _vossen_product_details(row)
+                    pp_details_to_update.append(pp)
+            if pp_details_to_update:
+                src_models.ProviderPart.objects.bulk_update(
+                    pp_details_to_update, ["product_details"], batch_size=500
+                )
+
+            logger.info("{} Vossen inventory batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_INVENTORY:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "vossen_brand", _worker)
+    logger.info("{} Synced {} Vossen inventory records total.".format(_LOG_PREFIX, total_upserted))
+
+
+def sync_provider_pricing_from_vossen() -> None:
+    """Sync ProviderPartCompanyPricing from VossenCompanyPricing (per-company rows)."""
+    logger.info("{} Syncing provider pricing from Vossen.".format(_LOG_PREFIX))
+
+    vossen_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.VOSSEN.value,
+    ).first()
+    if not vossen_provider:
+        logger.info("{} No Vossen provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandVossenBrandMapping.objects.select_related("brand", "vossen_brand")
+    )
+    vossen_brand_to_brand = {m.vossen_brand_id: m.brand for m in mappings}
+    if not vossen_brand_to_brand:
+        logger.info("{} No BrandVossenBrandMapping found. Nothing to price.".format(_LOG_PREFIX))
+        return
+
+    now = timezone.now()
+
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            batch = list(
+                src_models.VossenCompanyPricing.objects.filter(
+                    id__gt=last_id, part__brand_id__in=catalog_ids
+                )
+                .order_by("id")
+                .values("id", "company_id", "price", "part__brand_id", "part__sku")[:BATCH_SIZE_PRICING]
+            )
+            if not batch:
+                break
+
+            last_id = batch[-1]["id"]
+            batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
+            companies_by_id = {
+                c.id: c for c in src_models.Company.objects.filter(id__in=batch_company_ids)
+            }
+            master_keys = []
+            for row in batch:
+                brand = vossen_brand_to_brand.get(row.get("part__brand_id"))
+                if not brand:
+                    continue
+                sku = (row.get("part__sku") or "").strip()
+                if not sku:
+                    continue
+                master_keys.append((brand.id, sku))
+            pp_by_key = _provider_parts_by_master_brand_and_part_number(vossen_provider, master_keys)
+
+            to_upsert = []
+            for row in batch:
+                brand = vossen_brand_to_brand.get(row.get("part__brand_id"))
+                if not brand:
+                    continue
+                sku = (row.get("part__sku") or "").strip()
+                if not sku:
+                    continue
+                provider_part = pp_by_key.get((brand.id, sku))
+                if not provider_part:
+                    continue
+                company = companies_by_id.get(row.get("company_id"))
+                if not company:
+                    continue
+                to_upsert.append(
+                    src_models.ProviderPartCompanyPricing(
+                        provider_part=provider_part,
+                        company=company,
+                        cost=row.get("price"),
+                        jobber_price=None,
+                        map_price=None,
+                        msrp=None,
+                        retail_price=None,
+                        last_synced_at=now,
+                    )
+                )
+
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                    to_upsert, context="Vossen pricing batch={}".format(batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartCompanyPricing,
+                    to_upsert,
+                    unique_fields=["provider_part", "company"],
+                    update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
+                )
+                total_upserted += len(to_upsert)
+
+            logger.info("{} Vossen pricing batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_PRICING:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "vossen_brand", _worker)
+    logger.info("{} Synced {} Vossen pricing records total.".format(_LOG_PREFIX, total_upserted))
+
+
 def _wheelpros_provider_external_id(wp_brand_id: int, part_number: str) -> str:
     """Unique per WheelPros provider: wp_brand_id + part_number."""
     return "{}_{}".format(wp_brand_id, part_number)
@@ -4722,6 +5156,115 @@ def sync_provider_pricing_from_rough_country_for_company(company_id: int) -> Non
     ))
 
 
+def sync_provider_pricing_from_vossen_for_company(company_id: int) -> None:
+    logger.info("{} Syncing Vossen provider pricing for company_id={}.".format(_LOG_PREFIX, company_id))
+
+    vossen_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.VOSSEN.value,
+    ).first()
+    if not vossen_provider:
+        logger.info("{} No Vossen provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandVossenBrandMapping.objects.select_related("brand", "vossen_brand")
+    )
+    vossen_brand_to_brand = {m.vossen_brand_id: m.brand for m in mappings}
+    if not vossen_brand_to_brand:
+        logger.info("{} No BrandVossenBrandMapping found. Nothing to price.".format(_LOG_PREFIX))
+        return
+
+    now = timezone.now()
+
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            batch = list(
+                src_models.VossenCompanyPricing.objects.filter(
+                    id__gt=last_id,
+                    company_id=company_id,
+                    part__brand_id__in=catalog_ids,
+                )
+                .order_by("id")
+                .values("id", "company_id", "price", "part__brand_id", "part__sku")[:BATCH_SIZE_PRICING]
+            )
+            if not batch:
+                break
+
+            last_id = batch[-1]["id"]
+            batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
+            companies_by_id = {
+                c.id: c for c in src_models.Company.objects.filter(id__in=batch_company_ids)
+            }
+            master_keys = []
+            for row in batch:
+                brand = vossen_brand_to_brand.get(row.get("part__brand_id"))
+                if not brand:
+                    continue
+                sku = (row.get("part__sku") or "").strip()
+                if not sku:
+                    continue
+                master_keys.append((brand.id, sku))
+            pp_by_key = _provider_parts_by_master_brand_and_part_number(vossen_provider, master_keys)
+
+            to_upsert = []
+            for row in batch:
+                brand = vossen_brand_to_brand.get(row.get("part__brand_id"))
+                if not brand:
+                    continue
+                sku = (row.get("part__sku") or "").strip()
+                if not sku:
+                    continue
+                provider_part = pp_by_key.get((brand.id, sku))
+                if not provider_part:
+                    continue
+                company = companies_by_id.get(row.get("company_id"))
+                if not company:
+                    continue
+                to_upsert.append(
+                    src_models.ProviderPartCompanyPricing(
+                        provider_part=provider_part,
+                        company=company,
+                        cost=row.get("price"),
+                        jobber_price=None,
+                        map_price=None,
+                        msrp=None,
+                        retail_price=None,
+                        last_synced_at=now,
+                    )
+                )
+
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                    to_upsert, context="Vossen pricing company={} batch={}".format(company_id, batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartCompanyPricing,
+                    to_upsert,
+                    unique_fields=["provider_part", "company"],
+                    update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
+                )
+                total_upserted += len(to_upsert)
+
+            logger.info("{} Vossen pricing company={} batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, company_id, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_PRICING:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "vossen_brand", _worker)
+    logger.info("{} Synced {} Vossen pricing records for company_id={}.".format(
+        _LOG_PREFIX, total_upserted, company_id,
+    ))
+
+
 def sync_provider_pricing_from_wheelpros_for_company(company_id: int) -> None:
     logger.info("{} Syncing WheelPros provider pricing for company_id={}.".format(_LOG_PREFIX, company_id))
 
@@ -6120,6 +6663,42 @@ def sync_derived_from_rough_country(*, reindex_meilisearch: bool = False, skip_m
     logger.info("{} Completed Rough Country-only derived sync.".format(_LOG_PREFIX))
 
 
+def sync_derived_from_vossen(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False, skip_pricing: bool = False) -> None:
+    """
+    Propagate Vossen source data into MasterPart, ProviderPart, ProviderPartInventory, and
+    ProviderPartCompanyPricing. Call after Vossen feed ingest. No fitment sync -- the Vossen
+    feed carries wheel-spec attributes (diameter/width/offset/bolt_pattern/center_bore), not
+    vehicle fitment.
+
+    Pass ``skip_master_parts=True`` to run only inventory + pricing (fast incremental path).
+    Pass ``skip_pricing=True`` to run only master parts + inventory (global catalog sync path).
+    """
+    logger.info("{} Starting Vossen-only derived sync ({}).".format(
+        _LOG_PREFIX,
+        "inventory + pricing only" if skip_master_parts else "parts, inventory" + ("" if skip_pricing else ", pricing"),
+    ))
+    if not skip_master_parts:
+        sync_master_parts_from_vossen()
+        connection.close()
+
+    def _cont() -> None:
+        sync_provider_inventory_from_vossen()
+        connection.close()
+        if not skip_pricing:
+            sync_provider_pricing_from_vossen()
+            connection.close()
+
+    if skip_master_parts:
+        _cont()
+    else:
+        _maybe_reindex_meilisearch_after_master_parts(
+            reindex_meilisearch=reindex_meilisearch,
+            provider_label="Vossen",
+            continuation=_cont,
+        )
+    logger.info("{} Completed Vossen-only derived sync.".format(_LOG_PREFIX))
+
+
 def sync_derived_from_wheelpros(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False, skip_pricing: bool = False) -> None:
     """
     Propagate WheelPros source data into MasterPart, ProviderPart, ProviderPartInventory,
@@ -7207,6 +7786,8 @@ def sync_all_master_parts() -> None:
     sync_derived_from_wheelpros(reindex_meilisearch=False, skip_pricing=True)
     _reclaim_memory()
     sync_derived_from_premier(reindex_meilisearch=False, skip_pricing=True)
+    _reclaim_memory()
+    sync_derived_from_vossen(reindex_meilisearch=False, skip_pricing=True)
 
     logger.info("{} Completed full master parts sync.".format(_LOG_PREFIX))
 
@@ -7244,6 +7825,8 @@ def sync_all_master_parts_global() -> None:
     sync_derived_from_wheelpros(skip_pricing=True)
     _reclaim_memory()
     sync_derived_from_premier(skip_pricing=True)
+    _reclaim_memory()
+    sync_derived_from_vossen(skip_pricing=True)
 
     logger.info("{} Completed global master parts sync (catalog + inventory, no pricing).".format(_LOG_PREFIX))
 
@@ -7271,5 +7854,6 @@ def sync_all_master_parts_incremental() -> None:
     sync_derived_from_dlg(skip_master_parts=True)
     sync_derived_from_wheelpros(skip_master_parts=True)
     sync_derived_from_premier(skip_master_parts=True)
+    sync_derived_from_vossen(skip_master_parts=True)
 
     logger.info("{} Completed incremental master parts sync.".format(_LOG_PREFIX))

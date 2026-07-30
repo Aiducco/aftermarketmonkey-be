@@ -32,6 +32,7 @@ PROVIDER_DISPLAY_NAMES = {
     "WESTERN_POWER_SPORTS": "Western Power Sports",
     "XDP": "XDP",
     "ATD": "ATD",
+    "VOSSEN": "Vossen",
 }
 
 # Provider kind_name -> image URL (used by parts API)
@@ -66,6 +67,7 @@ PROVIDER_IMAGE_URLS = {
     "WESTERN_POWER_SPORTS": "https://api.aftermarketscout.com/uploads/western_power_sports_logo.png",
     "XDP": "https://api.aftermarketscout.com/uploads/xdp_logo.png",
     "ATD": "https://api.aftermarketscout.com/uploads/atd_logo.png",
+    "VOSSEN": "https://api.aftermarketscout.com/uploads/vossen_logo.png",
 }
 
 # Public "open in distributor" links (parts API ``provider_go_to_link``); ``urllib.parse.quote`` at call sites.
@@ -110,6 +112,10 @@ def dlg_b2b_search_keywords(dlg_brand_name: typing.Optional[str], part_number: s
 
 # CompanyProviders.credentials JSON key for Rough Country: jobber Excel URL (required per connection).
 ROUGH_COUNTRY_CREDENTIALS_FEED_URL = "feed_url"
+
+# CompanyProviders.credentials JSON key for Vossen: AfterMarket.aspx CSV feed URL (required per connection).
+VOSSEN_CREDENTIALS_FEED_URL = "feed_url"
+VOSSEN_FEED_URL_HOST_PREFIX = "http://inventory.vossenwheels.com/"
 
 # WheelPros SFTP feed paths (relative; leading / added by client when downloading)
 WHEELPROS_FEED_PATHS = {
@@ -845,6 +851,24 @@ PROVIDER_CATALOG = [
             "<p>For access or assistance, contact your ATD representative at "
             "<a href=\"mailto:bmoyer@atd-us.com\">bmoyer@atd-us.com</a>.</p>"
         ),
+    },
+    {
+        "kind": enums.BrandProviderKind.VOSSEN,
+        "name": "Vossen",
+        "description": "Access Vossen wheel inventory and pricing via their AfterMarket CSV feed.",
+        "icon_url": "https://api.aftermarketscout.com/uploads/vossen_logo.png",
+        "category": "Distributors",
+        "connection_required_fields": [VOSSEN_CREDENTIALS_FEED_URL],
+        "integration_time": "Data available within 1-2 hours",
+        "installation_instructions_html": (
+            "<p><strong>Vossen</strong> provides a downloadable CSV inventory feed "
+            "(<code>AfterMarket.aspx</code>) per dealer account.</p>"
+            "<ol>"
+            "<li>Contact your Vossen rep for your dealer <strong>feed URL</strong> — it starts with "
+            "<code>{}</code>.</li>"
+            "<li>Paste the full URL into <strong>feed_url</strong> below and save the connection.</li>"
+            "</ol>"
+        ).format(VOSSEN_FEED_URL_HOST_PREFIX),
     },
 ]
 
