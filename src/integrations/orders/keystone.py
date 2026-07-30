@@ -8,10 +8,18 @@ an explicit, user-approved submission — never from exploratory/dev code, autom
 ad-hoc scripts. See ``src/integrations/orders/turn_14.py`` for the reference adapter this
 mirrors.
 
-Not yet handled: Keystone kits (``GetKitComponents``) — a kit VCPN submitted through
-ShipOrderDropShipMultipleParts is silently exploded server-side into its component line items,
-which this adapter does not attempt to reconcile against our own line items. Out of scope until
-kit SKUs are actually sold through this path.
+Not yet handled: Keystone kits (``GetKitComponents``) — two separate, confirmed-live gaps, not
+one:
+  1. Quote time: GetShippingOptionsMultiplePartsPerWarehouse rejects a kit VCPN outright --
+     PartsData returns PartMessage "'[vcpn]' is a kit.  Kits are not supported by this method"
+     and no PartsQuantityPerWarehouse/Warehouse_* rows at all for it. Already handled correctly
+     by get_shipping_quote's generic PartsData-error path below (no special-casing needed): it
+     synthesizes a quantity_available=0 line carrying that raw message as a flag, same as any
+     other per-part error (blocked/insufficient qty/case-qty).
+  2. Submit time: a kit VCPN submitted through ShipOrderDropShipMultipleParts is silently
+     exploded server-side into its component line items, which this adapter does not attempt to
+     reconcile against our own line items.
+Out of scope until kit SKUs are actually sold through this path.
 """
 import datetime
 import decimal
@@ -707,7 +715,8 @@ class KeystoneOrderAdapter(base.DistributorOrderAdapter):
                 )
 
             # PartsData carries per-part errors (blocked / insufficient qty / case-qty multiple /
-            # not found) — attach as a flag on any matching line(s), or synthesize a
+            # not found / kit -- see module docstring's kit-handling note for that last one,
+            # confirmed live) — attach as a flag on any matching line(s), or synthesize a
             # zero-availability line so the error isn't silently dropped if no warehouse rows
             # exist for that part at all.
             for row in tables.get("PartsData", []):
