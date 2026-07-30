@@ -3,7 +3,7 @@ import typing
 
 from django.conf import settings
 from django.core.paginator import Paginator
-from django.db import IntegrityError
+from django.db import IntegrityError, transaction
 from django.db.models import ProtectedError
 from django.utils import timezone
 
@@ -1355,6 +1355,34 @@ def _promote_next_default_order_account(company_provider: src_models.CompanyProv
         next_account.save(update_fields=["is_default", "updated_at"])
 
 
+def _refresh_default_order_status(company_provider: src_models.CompanyProviders) -> None:
+    """
+    Recomputes CompanyProviders.order_status/order_status_name/order_status_reason/
+    order_status_checked_at from whichever account is currently this connection's default.
+    Called after create_order_account/update_order_account/delete_order_account change the
+    default account's identity, credentials, or active state, so the catalog listing's Ordering
+    badge (which reads these same four fields) never goes stale regardless of whether a caller
+    used these endpoints or the legacy connect_provider/update_connection "order" namespace path
+    to manage ordering. Non-default accounts don't affect this — order_status has always
+    represented the connection's one primary ordering capability, not a per-account concept.
+
+    No live re-validation here: create_order_account/update_order_account only ever persist
+    credentials that already passed _validate_order_connection at write time, so recomputing the
+    status badge from that already-known-good fact doesn't need to hit the distributor's API
+    again.
+    """
+    default_account = credentials_helper.get_default_order_account(company_provider)
+    feed_status_enum = _status_enum_from_stored(company_provider.status)
+    if default_account is None:
+        status_enum, reason = None, None
+    else:
+        status_enum, reason = _resolve_order_status(True, None, feed_status_enum)
+    status_fields = _order_connection_status_fields(status_enum, reason)
+    for field, value in status_fields.items():
+        setattr(company_provider, field, value)
+    company_provider.save(update_fields=list(status_fields.keys()) + ["updated_at"])
+
+
 def _serialize_order_account(
     catalog_entry: typing.Dict[str, typing.Any], account: src_models.CompanyProviderOrderAccount
 ) -> typing.Dict[str, typing.Any]:
@@ -1401,24 +1429,23 @@ def create_order_account(
     company_provider_id: int,
     label: str,
     credentials: typing.Dict[str, typing.Any],
+    is_default: typing.Optional[bool] = None,
 ) -> typing.Tuple[typing.Optional[typing.Dict], typing.Optional[str], typing.Optional[str]]:
     """
-    Adds an ADDITIONAL named order account to a connection. ``credentials`` is a flat dict of
-    this provider's order-connection fields (same fields as the "order" namespace in
-    connect_provider/update_connection, NOT nested under "order" again since it's already
-    scoped by this endpoint) — validated live the same way, before being saved. Returns
-    (data, error_message, error_code); error_code is one of the ``CONNECTION_ERROR_*``
+    Adds an order account to a connection — this is the ONE path for creating an order account,
+    whether it's the very first one (which always becomes the default, same as
+    CompanyLocation's "first location defaults to primary") or an additional one alongside an
+    existing default (which becomes the default too, but only if ``is_default=True`` is passed
+    explicitly; otherwise it's added as a non-default alternative). ``credentials`` is a flat
+    dict of this provider's order-connection fields (same fields as the "order" namespace in
+    the legacy connect_provider/update_connection path, NOT nested under "order" again since
+    it's already scoped by this endpoint) — validated live the same way, before being saved.
+    Returns (data, error_message, error_code); error_code is one of the ``CONNECTION_ERROR_*``
     constants, for the frontend to branch on.
     """
     label = (label or "").strip()
     if not label:
         return None, "label is required.", CONNECTION_ERROR_INVALID_INPUT
-    if label.lower() == "default":
-        return (
-            None,
-            'The name "Default" is reserved for the connection\'s own Ordering credentials.',
-            CONNECTION_ERROR_INVALID_INPUT,
-        )
 
     cp = (
         src_models.CompanyProviders.objects.filter(id=company_provider_id, company_id=company_id)
@@ -1437,7 +1464,7 @@ def create_order_account(
     if not order_required and not order_optional:
         return (
             None,
-            "{} doesn't support additional order accounts yet.".format(cp.provider.name),
+            "{} doesn't support order accounts yet.".format(cp.provider.name),
             CONNECTION_ERROR_INVALID_INPUT,
         )
 
@@ -1453,16 +1480,24 @@ def create_order_account(
     if val_error:
         return None, val_error, val_error_code
 
+    make_default = is_default is True or not cp.order_accounts.exists()
+
     try:
-        account = src_models.CompanyProviderOrderAccount.objects.create(
-            company_provider=cp, label=label, credentials=creds
-        )
+        with transaction.atomic():
+            if make_default:
+                cp.order_accounts.filter(is_default=True).update(is_default=False)
+            account = src_models.CompanyProviderOrderAccount.objects.create(
+                company_provider=cp, label=label, credentials=creds, is_default=make_default
+            )
     except IntegrityError:
         return (
             None,
             'An order account named "{}" already exists for this connection.'.format(label),
             CONNECTION_ERROR_INVALID_INPUT,
         )
+
+    if make_default:
+        _refresh_default_order_status(cp)
 
     result = _serialize_order_account(catalog_entry, account)
     result["connection_validated"] = validated
@@ -1475,11 +1510,19 @@ def update_order_account(
     label: typing.Optional[str] = None,
     credentials: typing.Optional[typing.Dict[str, typing.Any]] = None,
     active: typing.Optional[bool] = None,
+    is_default: typing.Optional[bool] = None,
 ) -> typing.Tuple[typing.Optional[typing.Dict], typing.Optional[str], typing.Optional[str]]:
-    """Partial update of an additional order account — any of label/credentials/active may be
-    omitted to leave it unchanged. ``credentials`` is merged onto the stored dict the same way
-    update_connection merges "order" (non-empty values overwrite, empty/null for a sensitive
-    field leaves it unchanged), then re-validated live if anything actually changed."""
+    """
+    Partial update of ANY order account, including the default one — label/credentials/active/
+    is_default may each be omitted to leave them unchanged. ``credentials`` is merged onto the
+    stored dict the same way the legacy connect_provider/update_connection path merges "order"
+    (non-empty values overwrite, empty/null for a sensitive field leaves it unchanged), then
+    re-validated live if anything actually changed. ``is_default=True`` promotes this account to
+    be the connection's default (demoting whichever one currently is); ``is_default=False`` on
+    the current default demotes it and promotes the next-oldest active account, same as
+    deactivating it (see below) — there always at most one default, never zero once at least one
+    active account exists.
+    """
     account = (
         src_models.CompanyProviderOrderAccount.objects.filter(
             id=order_account_id, company_provider__company_id=company_id
@@ -1515,12 +1558,6 @@ def update_order_account(
         label = label.strip()
         if not label:
             return None, "label is required.", CONNECTION_ERROR_INVALID_INPUT
-        if label.lower() == "default":
-            return (
-                None,
-                'The name "Default" is reserved for the connection\'s own Ordering credentials.',
-                CONNECTION_ERROR_INVALID_INPUT,
-            )
         account.label = label
 
     was_default = account.is_default
@@ -1536,13 +1573,25 @@ def update_order_account(
             CONNECTION_ERROR_INVALID_INPUT,
         )
 
-    # Deactivating the current default leaves ordering silently unusable if this connection has
-    # other configured accounts that could serve instead — demote and promote the next one, same
-    # as disconnect_provider does when the default is removed outright.
-    if was_default and active is False:
+    if is_default is True and not account.is_default:
+        cp.order_accounts.filter(is_default=True).exclude(id=account.id).update(is_default=False)
+        account.is_default = True
+        account.save(update_fields=["is_default", "updated_at"])
+    elif (
+        (is_default is False or (is_default is None and active is False))
+        and was_default
+        and account.is_default
+    ):
+        # Deactivating the current default (or explicitly un-defaulting it) leaves ordering
+        # silently unusable if this connection has other configured accounts that could serve
+        # instead — demote and promote the next one, same as disconnect_provider does when the
+        # default is removed outright.
         account.is_default = False
         account.save(update_fields=["is_default", "updated_at"])
         _promote_next_default_order_account(cp)
+
+    if credentials or was_default or account.is_default:
+        _refresh_default_order_status(cp)
 
     result = _serialize_order_account(catalog_entry, account)
     if validated is not None:
@@ -1552,27 +1601,30 @@ def update_order_account(
 
 def delete_order_account(company_id: int, order_account_id: int) -> typing.Tuple[bool, typing.Optional[str]]:
     """
-    Deletes an additional order account. Blocked (rather than silently orphaning history) while
-    any PurchaseOrder still references it — PurchaseOrder.order_account is on_delete=PROTECT for
-    exactly this reason; a company that no longer wants an account with order history should
-    deactivate it via update_order_account(active=False) instead of deleting it.
-
-    The default account can't be removed here at all — it's managed through the connection's
-    normal Ordering section (see disconnect_provider(namespace="order")), which also handles
-    promoting another account to be the new default; this endpoint only ever holds additional,
-    always-non-default accounts.
+    Deletes ANY order account, including the default (promoting the oldest remaining active
+    account to be the new default, if any — see _promote_next_default_order_account). Blocked
+    (rather than silently orphaning history) while any PurchaseOrder still references it —
+    PurchaseOrder.order_account is on_delete=PROTECT for exactly this reason; deactivate it via
+    update_order_account(active=False) instead if it has order history.
     """
-    account = src_models.CompanyProviderOrderAccount.objects.filter(
-        id=order_account_id, company_provider__company_id=company_id
-    ).first()
+    account = (
+        src_models.CompanyProviderOrderAccount.objects.filter(
+            id=order_account_id, company_provider__company_id=company_id
+        )
+        .select_related("company_provider")
+        .first()
+    )
     if not account:
         return False, "Order account not found"
-    if account.is_default:
-        return False, "The default account can't be deleted here — disconnect Ordering on the connection instead."
+    cp = account.company_provider
+    was_default = account.is_default
     try:
         account.delete()
     except ProtectedError:
         return False, "This account has order history and can't be deleted — deactivate it instead."
+    if was_default:
+        _promote_next_default_order_account(cp)
+    _refresh_default_order_status(cp)
     return True, None
 
 
