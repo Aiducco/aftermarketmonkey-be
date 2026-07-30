@@ -383,26 +383,17 @@ def _resolve_order_account(
 def _serialize_order_accounts(cp: src_models.CompanyProviders) -> typing.List[typing.Dict]:
     """
     Every account this connection can order through, for the "choose which account" picker at
-    add-to-cart time (see add_cart_item's ``order_account_id``): the implicit default (``id:
-    None``, whatever was entered through the connection's normal "Ordering" section) when
-    configured, followed by any additional named accounts. ``is_default`` marks whichever one
-    get_order_credentials would actually pick when no account is specified — see that function's
-    resolution order — purely informational, not needed to place an order via the default.
+    add-to-cart time (see add_cart_item's ``order_account_id``): the default account (whatever
+    was entered through the connection's normal "Ordering" section) first, then any additional
+    named accounts. ``is_default`` marks whichever one get_order_credentials would actually pick
+    when no account is specified — purely informational, not needed to place an order via the
+    default (leave ``order_account_id`` unset for that).
     """
-    has_implicit_default = bool((cp.credentials or {}).get("order"))
-    accounts = []
-    if has_implicit_default:
-        accounts.append({"id": None, "label": "Default", "is_default": True})
-    extra_accounts = list(cp.order_accounts.filter(active=True).order_by("created_at"))
-    for i, account in enumerate(extra_accounts):
-        accounts.append(
-            {
-                "id": account.id,
-                "label": account.label,
-                "is_default": not has_implicit_default and i == 0,
-            }
-        )
-    return accounts
+    accounts = cp.order_accounts.filter(active=True).order_by("-is_default", "created_at")
+    return [
+        {"id": account.id, "label": account.label, "is_default": account.is_default}
+        for account in accounts
+    ]
 
 
 def _cart_queryset(company_id: int):
