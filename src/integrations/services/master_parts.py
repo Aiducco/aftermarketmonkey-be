@@ -6645,11 +6645,19 @@ def sync_premier_kit_components() -> None:
         part_number_to_ext_ids.setdefault(part_number, []).append(ext_id)
 
     kit_provider_part_ids: typing.Set[int] = set()
-    components: typing.List[src_models.ProviderPartKitComponent] = []
+    # Keyed on (kit_part_id, component_part_id) rather than a plain list -- confirmed live that
+    # Premier's own kit_component_list string can repeat the exact same component block 2-3x
+    # within one kit row (e.g. "WCF100418-BRZ" lists component "WCF100129" three times over),
+    # which pgbulk.upsert's single ON CONFLICT DO UPDATE statement cannot apply twice to the same
+    # target row (psycopg2.errors.CardinalityViolation). Collapsing duplicates here, keeping the
+    # max quantity seen for a pair, avoids both the crash and inflating quantity by summing what
+    # is almost certainly a redundant feed listing rather than a genuine multi-line quantity.
+    components_by_pair: typing.Dict[typing.Tuple[int, int], src_models.ProviderPartKitComponent] = {}
     kits_seen = 0
     kits_missing_own_part = 0
     components_unresolved = 0
     components_ambiguous = 0
+    components_deduped = 0
 
     kit_rows = (
         src_models.PremierParts.objects.filter(is_kit=True)
@@ -6680,12 +6688,18 @@ def sync_premier_kit_components() -> None:
                 else:
                     components_unresolved += 1
                     continue
-            components.append(
-                src_models.ProviderPartKitComponent(
-                    kit_part_id=kit_part_id, component_part_id=component_part_id, quantity=quantity
-                )
+            pair_key = (kit_part_id, component_part_id)
+            existing = components_by_pair.get(pair_key)
+            if existing is not None:
+                components_deduped += 1
+                if quantity > existing.quantity:
+                    existing.quantity = quantity
+                continue
+            components_by_pair[pair_key] = src_models.ProviderPartKitComponent(
+                kit_part_id=kit_part_id, component_part_id=component_part_id, quantity=quantity
             )
 
+    components = list(components_by_pair.values())
     if components:
         pgbulk.upsert(
             src_models.ProviderPartKitComponent,
@@ -6697,9 +6711,10 @@ def sync_premier_kit_components() -> None:
         src_models.ProviderPart.objects.filter(id__in=kit_provider_part_ids).update(is_kit=True)
 
     logger.info(
-        "{} Kit components: {} kit rows seen, {} linked components, {} kits with no matching "
-        "ProviderPart, {} component part numbers unresolved, {} ambiguous across brands.".format(
-            _LOG_PREFIX, kits_seen, len(components), kits_missing_own_part,
+        "{} Kit components: {} kit rows seen, {} linked components ({} duplicate pairs "
+        "collapsed), {} kits with no matching ProviderPart, {} component part numbers "
+        "unresolved, {} ambiguous across brands.".format(
+            _LOG_PREFIX, kits_seen, len(components), components_deduped, kits_missing_own_part,
             components_unresolved, components_ambiguous,
         )
     )
