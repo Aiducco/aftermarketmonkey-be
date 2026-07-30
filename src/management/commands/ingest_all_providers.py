@@ -53,6 +53,7 @@ from src.integrations.services import (
     meyer,
     premier,
     rough_country,
+    tirerack,
     turn_14,
     vossen,
     wheelpros,
@@ -137,6 +138,7 @@ class Command(BaseCommand):
             "ingest_all_providers_wheelpros",
             "ingest_all_providers_premier",
             "ingest_all_providers_vossen",
+            "ingest_all_providers_tirerack",
             "ingest_all_providers_sync_all_master_parts",
             "ingest_all_providers_enqueue_pricing_jobs",
             "ingest_all_providers_meilisearch_reindex",
@@ -164,6 +166,7 @@ class Command(BaseCommand):
                 ("wheelpros",     self._run_wheelpros),
                 ("premier",       self._run_premier),
                 ("vossen",        self._run_vossen),
+                ("tirerack",      self._run_tirerack),
             ]
             for name, run_fn in phase1_providers:
                 self._ingest_log("phase 1 | starting {} fetch".format(name))
@@ -368,3 +371,13 @@ class Command(BaseCommand):
                 download=True,
             )
             vossen.ensure_vossen_brand_and_mapping()
+
+    def _run_tirerack(self) -> None:
+        with self._audited_step(
+            "ingest_all_providers_tirerack",
+            "TireRack source fetch + brand mapping complete (derived in sync_all).",
+            continue_on_error=True,
+        ):
+            self._ingest_log("TireRack: feed + brand mapping")
+            tirerack.fetch_and_save_tirerack_catalog()
+            tirerack.sync_unmapped_tirerack_brands_to_brands()

@@ -47,6 +47,7 @@ _PRICING_SYNC_KINDS = frozenset(
         src_enums.BrandProviderKind.DLG.value,
         src_enums.BrandProviderKind.PREMIER_PERFORMANCE.value,
         src_enums.BrandProviderKind.VOSSEN.value,
+        src_enums.BrandProviderKind.TIRERACK.value,
     }
 )
 
@@ -176,6 +177,14 @@ def _fetch_raw_pricing(cp: src_models.CompanyProviders, use_delta_fetch: bool = 
     elif kind == src_enums.BrandProviderKind.VOSSEN.value:
         vossen_services.sync_vossen_company_pricing_for_company_provider(cp.id)
 
+    elif kind == src_enums.BrandProviderKind.TIRERACK.value:
+        # No-op: TireRack has no per-company raw feed to fetch -- one shared platform-wide price
+        # list, already refreshed daily via the primary connection's own
+        # fetch_and_save_tirerack_catalog call (Phase 1 of the nightly pipeline). Nothing to
+        # re-download here; _sync_master_pricing below reads straight off the already-ingested
+        # TireRackParts table for this company.
+        pass
+
     else:
         raise ValueError("Unsupported provider kind for raw pricing fetch: {}".format(kind))
 
@@ -214,6 +223,9 @@ def _sync_master_pricing(cp: src_models.CompanyProviders) -> None:
 
     elif kind == src_enums.BrandProviderKind.VOSSEN.value:
         master_parts.sync_provider_pricing_from_vossen_for_company(company_id)
+
+    elif kind == src_enums.BrandProviderKind.TIRERACK.value:
+        master_parts.sync_provider_pricing_from_tirerack_for_company(company_id)
 
     else:
         raise ValueError("Unsupported provider kind for master pricing sync: {}".format(kind))

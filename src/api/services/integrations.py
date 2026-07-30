@@ -24,6 +24,8 @@ from src.integrations.clients.premier import exceptions as premier_exceptions
 from src.integrations.clients.premier import order_client as premier_order_client
 from src.integrations.clients.rough_country import client as rough_country_client
 from src.integrations.clients.rough_country import exceptions as rough_country_exceptions
+from src.integrations.clients.tirerack import client as tirerack_client
+from src.integrations.clients.tirerack import exceptions as tirerack_exceptions
 from src.integrations.clients.turn_14 import client as turn14_client
 from src.integrations.clients.turn_14 import exceptions as turn14_exceptions
 from src.integrations.clients.turn_14 import order_client as turn14_order_client
@@ -501,6 +503,19 @@ def _validate_vossen_connection(credentials: typing.Dict[str, typing.Any]) -> _V
     return None, None
 
 
+def _validate_tirerack_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
+    try:
+        client = tirerack_client.TireRackSFTPClient(credentials=credentials)
+        client.test_connection()
+    except ValueError as e:
+        return str(e), CONNECTION_ERROR_INVALID_INPUT
+    except tirerack_exceptions.TireRackSFTPConnectionError as e:
+        return str(e), CONNECTION_ERROR_INVALID_CREDENTIALS
+    except tirerack_exceptions.TireRackException as e:
+        return str(e), CONNECTION_ERROR_CONNECTION_FAILED
+    return None, None
+
+
 # Connection validators run synchronously at connect/update time, before credentials are saved,
 # so bad credentials fail the request instead of silently failing the first background sync.
 # Kinds without an entry here are not validated (relay-provisioned kinds, where credentials are
@@ -513,6 +528,7 @@ _CONNECTION_VALIDATORS: typing.Dict[int, typing.Callable[[typing.Dict[str, typin
     src_enums.BrandProviderKind.WHEELPROS.value: _validate_wheelpros_connection,
     src_enums.BrandProviderKind.ROUGH_COUNTRY.value: _validate_rough_country_connection,
     src_enums.BrandProviderKind.VOSSEN.value: _validate_vossen_connection,
+    src_enums.BrandProviderKind.TIRERACK.value: _validate_tirerack_connection,
 }
 
 

@@ -6699,6 +6699,526 @@ def sync_derived_from_vossen(*, reindex_meilisearch: bool = False, skip_master_p
     logger.info("{} Completed Vossen-only derived sync.".format(_LOG_PREFIX))
 
 
+# ============================================================
+# TIRERACK
+# ============================================================
+
+def _tirerack_provider_external_id(tirerack_brand_id: int, part_number: str) -> str:
+    """Stable TireRack ProviderPart key: tirerack brand row id + part number (same PN can exist under multiple feed brands)."""
+    pn = (part_number or "").strip()
+    return "{}_{}".format(int(tirerack_brand_id), pn)
+
+
+def _ingest_tirerack_parts_for_mapped_brands(
+    mapped_catalog_brand_ids: typing.Set[int],
+    tirerack_provider: src_models.Providers,
+    tirerack_brand_to_brand: typing.Dict[int, src_models.Brands],
+    tirerack_brand_to_aaia: typing.Dict[int, typing.Optional[str]],
+) -> typing.Tuple[int, int]:
+    """Batch-ingest TireRackParts for one disjoint set of TireRack catalog brand PKs. Mirrors _ingest_dlg_parts_for_mapped_brands."""
+    if not mapped_catalog_brand_ids:
+        return 0, 0
+
+    total_master = 0
+    total_provider = 0
+    batch_num = 0
+    last_id = 0
+
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.TireRackParts.objects.filter(
+                brand_id__in=mapped_catalog_brand_ids,
+                id__gt=last_id,
+            )
+            .order_by("id")
+            .values(
+                "id",
+                "brand_id",
+                "part_number",
+                "description",
+                "updated_at",
+            )[:BATCH_SIZE_MASTER_PARTS]
+        )
+        if not batch:
+            break
+
+        last_id = batch[-1]["id"]
+        seen = set()
+        master_parts = []
+        tirerack_external_to_brand_part = {}
+
+        for row in batch:
+            brand = tirerack_brand_to_brand.get(row["brand_id"])
+            if not brand:
+                continue
+
+            part_number = row.get("part_number") or ""
+            if isinstance(part_number, str):
+                part_number = part_number.strip()
+            else:
+                part_number = str(part_number or "").strip()
+            if not part_number:
+                continue
+
+            key = (brand.id, part_number)
+            if key not in seen:
+                seen.add(key)
+                aaia = tirerack_brand_to_aaia.get(row["brand_id"])
+                master_parts.append(
+                    src_models.MasterPart(
+                        brand=brand,
+                        part_number=part_number,
+                        sku=part_number,
+                        description=row.get("description"),
+                        aaia_code=aaia,
+                        image_url=None,
+                    )
+                )
+            tirerack_external_to_brand_part[
+                _tirerack_provider_external_id(row["brand_id"], part_number)
+            ] = (brand.id, part_number)
+
+        if not master_parts:
+            connection.close()
+            if len(batch) == BATCH_SIZE_MASTER_PARTS:
+                time.sleep(BATCH_DELAY_SECONDS)
+            continue
+
+        pairs = list(seen)
+        existing_by_key = {}
+        if pairs:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(pairs),),
+                )
+                for row in cur.fetchall():
+                    mp_id, b_id, p_num = row
+                    existing_by_key[(b_id, p_num)] = mp_id
+
+        new_parts = [mp for mp in master_parts if (mp.brand_id, mp.part_number) not in existing_by_key]
+        existing_keys = [k for k in pairs if k in existing_by_key]
+
+        if new_parts:
+            new_parts = _dedupe_master_parts_for_upsert(
+                new_parts, context="TireRack new_parts batch={}".format(batch_num)
+            )
+            pgbulk.upsert(
+                src_models.MasterPart,
+                new_parts,
+                unique_fields=["brand", "part_number"],
+                update_fields=[],
+            )
+            total_master += len(new_parts)
+
+        if existing_keys:
+            key_to_mp = {(mp.brand_id, mp.part_number): mp for mp in master_parts}
+            values = [
+                (existing_by_key[k], key_to_mp[k].aaia_code)
+                for k in existing_keys
+            ]
+            placeholders = ", ".join(["(%s::bigint, %s)"] * len(values))
+            params = [x for row_vals in values for x in row_vals]
+            with connection.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE master_parts mp SET aaia_code = v.aaia_code
+                    FROM (VALUES {}) AS v(id, aaia_code)
+                    WHERE mp.id = v.id
+                    """.format(placeholders),
+                    params,
+                )
+
+        brand_part_to_master = {}
+        if pairs:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(pairs),),
+                )
+                for row in cur.fetchall():
+                    mp_id, b_id, p_num = row
+                    mp = src_models.MasterPart()
+                    mp.id = mp_id
+                    mp.brand_id = b_id
+                    mp.part_number = p_num
+                    brand_part_to_master[(b_id, p_num)] = mp
+
+        provider_parts_by_key = {}
+        for row in batch:
+            pn = row.get("part_number") or ""
+            if isinstance(pn, str):
+                pn = pn.strip()
+            else:
+                pn = str(pn or "").strip()
+            if not pn:
+                continue
+            ext_id = _tirerack_provider_external_id(row["brand_id"], pn)
+            key_bp = tirerack_external_to_brand_part.get(ext_id)
+            if not key_bp:
+                continue
+            master_part = brand_part_to_master.get(key_bp)
+            if not master_part:
+                continue
+            pp_key = (master_part.id, tirerack_provider.id)
+            provider_parts_by_key[pp_key] = src_models.ProviderPart(
+                master_part=master_part,
+                provider=tirerack_provider,
+                provider_external_id=ext_id,
+                distributor_refreshed_at=row.get("updated_at"),
+            )
+
+        provider_parts = list(provider_parts_by_key.values())
+        if provider_parts:
+            pgbulk.upsert(
+                src_models.ProviderPart,
+                provider_parts,
+                unique_fields=["master_part", "provider"],
+                update_fields=_PROVIDER_PART_SYNC_UPDATE_FIELDS,
+            )
+            total_provider += len(provider_parts)
+
+        logger.info("{} TireRack batch {}: {} items -> {} master, {} provider (last_id={})".format(
+            _LOG_PREFIX, batch_num, len(batch), len(master_parts), len(provider_parts), last_id
+        ))
+        connection.close()
+        if len(batch) == BATCH_SIZE_MASTER_PARTS:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    return total_master, total_provider
+
+
+def sync_master_parts_from_tirerack() -> None:
+    """
+    Create/update MasterPart and ProviderPart from TireRackParts.
+    Only rows whose TireRackBrand has a BrandTireRackBrandMapping are included.
+
+    Resolution uses (catalog brand_id, part_number) only, same as DLG.
+    ``MasterPart.sku`` is set to ``part_number`` for consistency with other single-key feeds.
+    ``ProviderPart.provider_external_id`` is ``f"{tirerack_brand_id}_{part_number}"`` so inventory joins stay unique.
+    """
+    logger.info("{} Syncing master parts from TireRack (batched, part_number only).".format(_LOG_PREFIX))
+
+    tirerack_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.TIRERACK.value,
+    ).first()
+    if not tirerack_provider:
+        logger.info("{} No TireRack provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandTireRackBrandMapping.objects.select_related("brand", "tirerack_brand")
+    )
+    tirerack_brand_to_brand = {m.tirerack_brand_id: m.brand for m in mappings}
+    tirerack_brand_to_aaia = {
+        m.tirerack_brand_id: (m.brand.aaia_code if m.brand else None)
+        for m in mappings
+    }
+    if not tirerack_brand_to_brand:
+        logger.info("{} No BrandTireRackBrandMapping found. Nothing to sync.".format(_LOG_PREFIX))
+        return
+
+    chunks = _partition_mapped_brands_for_parallel_ingest(mappings, MASTER_PARTS_SYNC_MAX_WORKERS)
+    total_master, total_provider = _run_parallel_master_parts_ingest(
+        chunks,
+        mappings,
+        "tirerack_brand",
+        lambda cids: _ingest_tirerack_parts_for_mapped_brands(
+            cids,
+            tirerack_provider,
+            tirerack_brand_to_brand,
+            tirerack_brand_to_aaia,
+        ),
+    )
+    logger.info("{} Synced {} master parts and {} provider parts from TireRack total.".format(
+        _LOG_PREFIX, total_master, total_provider
+    ))
+
+
+def _tirerack_product_details(row: typing.Dict, brand_name: typing.Optional[str] = None) -> typing.List[typing.Dict]:
+    return [
+        {"key": "sku",                  "label": "SKU",                  "value": row.get("part_number") or None},
+        {"key": "brand",                "label": "Brand",                "value": brand_name},
+        {"key": "description",          "label": "Description",          "value": row.get("description") or None},
+        {"key": "country_of_origin",    "label": "Country of Origin",    "value": row.get("country_of_origin") or None},
+        {"key": "fet",                  "label": "FET",                  "value": str(row["fet"]) if row.get("fet") is not None else None},
+        {"key": "base_price",           "label": "Base Price (excl. FET)", "value": str(row["base_price"]) if row.get("base_price") is not None else None},
+        {"key": "road_hazard_warranty", "label": "Road Hazard Warranty", "value": row.get("road_hazard_warranty") or None},
+        {"key": "treadlife_warranty_1", "label": "Treadlife Warranty 1", "value": row.get("treadlife_warranty_1") or None},
+        {"key": "treadlife_warranty_2", "label": "Treadlife Warranty 2", "value": row.get("treadlife_warranty_2") or None},
+        {"key": "treadlife_warranty_3", "label": "Treadlife Warranty 3", "value": row.get("treadlife_warranty_3") or None},
+    ]
+
+
+def sync_provider_inventory_from_tirerack() -> None:
+    """Sync ProviderPartInventory from TireRackParts (mapped brands): totals + product_details (warranty/FET/country of origin)."""
+    logger.info("{} Syncing provider inventory from TireRack.".format(_LOG_PREFIX))
+
+    tirerack_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.TIRERACK.value,
+    ).first()
+    if not tirerack_provider:
+        logger.info("{} No TireRack provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandTireRackBrandMapping.objects.select_related("brand", "tirerack_brand")
+    )
+    if not mappings:
+        logger.info("{} No BrandTireRackBrandMapping found.".format(_LOG_PREFIX))
+        return
+
+    tirerack_brand_id_to_name = {m.tirerack_brand_id: m.tirerack_brand.name for m in mappings}
+
+    provider_parts = {
+        row["provider_external_id"]: src_models.ProviderPart(id=row["id"])
+        for row in src_models.ProviderPart.objects.filter(provider=tirerack_provider).values("id", "provider_external_id")
+    }
+
+    now = timezone.now()
+
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            batch = list(
+                src_models.TireRackParts.objects.filter(id__gt=last_id, brand_id__in=catalog_ids)
+                .order_by("id")
+                .values(
+                    "id", "brand_id", "part_number", "quantity", "description",
+                    "country_of_origin", "fet", "base_price",
+                    "road_hazard_warranty", "treadlife_warranty_1", "treadlife_warranty_2", "treadlife_warranty_3",
+                )[:BATCH_SIZE_INVENTORY]
+            )
+            if not batch:
+                break
+
+            last_id = batch[-1]["id"]
+            to_upsert = []
+            for row in batch:
+                pn = row.get("part_number") or ""
+                pn = pn.strip() if isinstance(pn, str) else str(pn or "").strip()
+                if not pn:
+                    continue
+                ext_id = _tirerack_provider_external_id(row["brand_id"], pn)
+                provider_part = provider_parts.get(ext_id)
+                if not provider_part:
+                    continue
+                qty = row.get("quantity")
+                try:
+                    total_qty = int(qty) if qty is not None else 0
+                    wh_avail = {"available_on_hand": total_qty if qty is not None else None}
+                except (TypeError, ValueError):
+                    total_qty = 0
+                    wh_avail = {"available_on_hand": None}
+                to_upsert.append(
+                    src_models.ProviderPartInventory(
+                        provider_part=provider_part,
+                        warehouse_total_qty=total_qty,
+                        manufacturer_inventory=None,
+                        manufacturer_esd=None,
+                        warehouse_availability=wh_avail,
+                        last_synced_at=now,
+                        updated_at=now,
+                    )
+                )
+
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_inventory_for_upsert(
+                    to_upsert, context="TireRack inventory batch={}".format(batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartInventory,
+                    to_upsert,
+                    unique_fields=["provider_part"],
+                    update_fields=[
+                        "warehouse_total_qty",
+                        "manufacturer_inventory",
+                        "manufacturer_esd",
+                        "warehouse_availability",
+                        "last_synced_at",
+                        "updated_at",
+                    ],
+                )
+                total_upserted += len(to_upsert)
+
+            # Update product_details on ProviderPart (product metadata, not inventory)
+            pp_details_to_update = []
+            for row in batch:
+                pn = row.get("part_number") or ""
+                pn = pn.strip() if isinstance(pn, str) else str(pn or "").strip()
+                if not pn:
+                    continue
+                ext_id = _tirerack_provider_external_id(row["brand_id"], pn)
+                pp = provider_parts.get(ext_id)
+                if pp:
+                    pp.product_details = _tirerack_product_details(
+                        row, brand_name=tirerack_brand_id_to_name.get(row.get("brand_id"))
+                    )
+                    pp_details_to_update.append(pp)
+            if pp_details_to_update:
+                src_models.ProviderPart.objects.bulk_update(
+                    pp_details_to_update, ["product_details"], batch_size=500
+                )
+
+            logger.info("{} TireRack inventory batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_INVENTORY:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "tirerack_brand", _worker)
+    logger.info("{} Synced {} TireRack inventory records total.".format(_LOG_PREFIX, total_upserted))
+
+
+def sync_provider_pricing_from_tirerack_for_company(company_id: int) -> None:
+    """
+    Write ProviderPartCompanyPricing for one company straight from the shared TireRackParts
+    price list (cost = Total Price; all other pricing fields left null -- GTIN/MAP/Retail/
+    Jobber/Core aren't in TireRack's feed). Unlike DLG's per-company SFTP pulls, TireRack has no
+    per-company pricing variation -- every connected company gets the same cost here, sourced
+    from the one platform-wide feed (see fetch_and_save_tirerack_catalog / TireRackParts docstring).
+    """
+    logger.info("{} Syncing TireRack provider pricing for company_id={}.".format(_LOG_PREFIX, company_id))
+
+    tirerack_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.TIRERACK.value,
+    ).first()
+    if not tirerack_provider:
+        logger.info("{} No TireRack provider found.".format(_LOG_PREFIX))
+        return
+
+    company = src_models.Company.objects.filter(id=company_id).first()
+    if not company:
+        logger.warning("{} Company id={} not found.".format(_LOG_PREFIX, company_id))
+        return
+
+    ext_id_to_pp_id: typing.Dict[str, int] = dict(
+        src_models.ProviderPart.objects.filter(provider=tirerack_provider).values_list(
+            "provider_external_id", "id"
+        )
+    )
+    if not ext_id_to_pp_id:
+        logger.info("{} No TireRack ProviderPart rows yet. Run master parts sync first.".format(_LOG_PREFIX))
+        return
+
+    now = timezone.now()
+    total_upserted = 0
+    batch_num = 0
+    last_id = 0
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.TireRackParts.objects.filter(id__gt=last_id)
+            .order_by("id")
+            .values("id", "brand_id", "part_number", "total_price")[:BATCH_SIZE_PRICING]
+        )
+        if not batch:
+            break
+        last_id = batch[-1]["id"]
+
+        pricing_by_pp: typing.Dict[int, src_models.ProviderPartCompanyPricing] = {}
+        for row in batch:
+            pn = (row.get("part_number") or "").strip()
+            if not pn:
+                continue
+            ext_id = _tirerack_provider_external_id(row["brand_id"], pn)
+            pp_id = ext_id_to_pp_id.get(ext_id)
+            if not pp_id:
+                continue
+            pricing_by_pp[pp_id] = src_models.ProviderPartCompanyPricing(
+                provider_part_id=pp_id,
+                company=company,
+                cost=row.get("total_price"),
+                jobber_price=None,
+                map_price=None,
+                msrp=None,
+                retail_price=None,
+                last_synced_at=now,
+            )
+
+        to_upsert = list(pricing_by_pp.values())
+        if to_upsert:
+            pgbulk.upsert(
+                src_models.ProviderPartCompanyPricing,
+                to_upsert,
+                unique_fields=["provider_part", "company"],
+                update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
+            )
+            total_upserted += len(to_upsert)
+
+        logger.info("{} TireRack pricing company={} batch {}: {} records (last_id={})".format(
+            _LOG_PREFIX, company_id, batch_num, len(to_upsert), last_id,
+        ))
+        connection.close()
+        if len(batch) == BATCH_SIZE_PRICING:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    logger.info("{} Synced {} TireRack pricing records for company_id={}.".format(
+        _LOG_PREFIX, total_upserted, company_id,
+    ))
+
+
+def sync_provider_pricing_from_tirerack() -> None:
+    """Sync ProviderPartCompanyPricing from the shared TireRackParts price list for every company connected to TireRack."""
+    logger.info("{} Syncing provider pricing from TireRack (all companies).".format(_LOG_PREFIX))
+
+    company_ids = list(
+        src_models.CompanyProviders.objects.filter(
+            provider__kind=src_enums.BrandProviderKind.TIRERACK.value,
+            provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
+        ).values_list("company_id", flat=True).distinct()
+    )
+    if not company_ids:
+        logger.info("{} No active TireRack CompanyProviders. Nothing to price.".format(_LOG_PREFIX))
+        return
+
+    for company_id in company_ids:
+        sync_provider_pricing_from_tirerack_for_company(company_id)
+        connection.close()
+
+
+def sync_derived_from_tirerack(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False, skip_pricing: bool = False) -> None:
+    """
+    Propagate TireRack source data into MasterPart, ProviderPart, ProviderPartInventory, and
+    ProviderPartCompanyPricing. Call after fetch_and_save_tirerack_catalog.
+
+    Pass ``skip_master_parts=True`` to run only inventory + pricing (fast incremental path).
+    Pass ``skip_pricing=True`` to run only master parts + inventory (global catalog sync path).
+    """
+    logger.info("{} Starting TireRack-only derived sync ({}).".format(
+        _LOG_PREFIX,
+        "inventory + pricing only" if skip_master_parts else "parts, inventory" + ("" if skip_pricing else ", pricing"),
+    ))
+    if not skip_master_parts:
+        sync_master_parts_from_tirerack()
+        connection.close()
+
+    def _cont() -> None:
+        sync_provider_inventory_from_tirerack()
+        connection.close()
+        if not skip_pricing:
+            sync_provider_pricing_from_tirerack()
+            connection.close()
+
+    if skip_master_parts:
+        _cont()
+    else:
+        _maybe_reindex_meilisearch_after_master_parts(
+            reindex_meilisearch=reindex_meilisearch,
+            provider_label="TireRack",
+            continuation=_cont,
+        )
+    logger.info("{} Completed TireRack-only derived sync.".format(_LOG_PREFIX))
+
+
 def sync_derived_from_wheelpros(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False, skip_pricing: bool = False) -> None:
     """
     Propagate WheelPros source data into MasterPart, ProviderPart, ProviderPartInventory,
@@ -7827,6 +8347,8 @@ def sync_all_master_parts_global() -> None:
     sync_derived_from_premier(skip_pricing=True)
     _reclaim_memory()
     sync_derived_from_vossen(skip_pricing=True)
+    _reclaim_memory()
+    sync_derived_from_tirerack(skip_pricing=True)
 
     logger.info("{} Completed global master parts sync (catalog + inventory, no pricing).".format(_LOG_PREFIX))
 
@@ -7855,5 +8377,6 @@ def sync_all_master_parts_incremental() -> None:
     sync_derived_from_wheelpros(skip_master_parts=True)
     sync_derived_from_premier(skip_master_parts=True)
     sync_derived_from_vossen(skip_master_parts=True)
+    sync_derived_from_tirerack(skip_master_parts=True)
 
     logger.info("{} Completed incremental master parts sync.".format(_LOG_PREFIX))

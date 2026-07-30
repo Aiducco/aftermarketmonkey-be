@@ -73,6 +73,7 @@ class BrandProviderKind(enum.Enum):
     XDP = 33
     ASAP_NETWORK = 34
     VOSSEN = 35
+    TIRERACK = 36
 
 class BrandProviderStatus(enum.Enum):
     ACTIVE = 1

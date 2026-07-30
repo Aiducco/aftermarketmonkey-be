@@ -33,6 +33,7 @@ PROVIDER_DISPLAY_NAMES = {
     "XDP": "XDP",
     "ATD": "ATD",
     "VOSSEN": "Vossen",
+    "TIRERACK": "TireRack",
 }
 
 # Provider kind_name -> image URL (used by parts API)
@@ -68,6 +69,7 @@ PROVIDER_IMAGE_URLS = {
     "XDP": "https://api.aftermarketscout.com/uploads/xdp_logo.png",
     "ATD": "https://api.aftermarketscout.com/uploads/atd_logo.png",
     "VOSSEN": "https://api.aftermarketscout.com/uploads/vossen_logo.png",
+    "TIRERACK": "https://api.aftermarketscout.com/uploads/tirerack_logo.png",
 }
 
 # Public "open in distributor" links (parts API ``provider_go_to_link``); ``urllib.parse.quote`` at call sites.
@@ -116,6 +118,14 @@ ROUGH_COUNTRY_CREDENTIALS_FEED_URL = "feed_url"
 # CompanyProviders.credentials JSON key for Vossen: AfterMarket.aspx CSV feed URL (required per connection).
 VOSSEN_CREDENTIALS_FEED_URL = "feed_url"
 VOSSEN_FEED_URL_HOST_PREFIX = "http://inventory.vossenwheels.com/"
+
+# CompanyProviders.credentials JSON keys for TireRack's SFTP feed (password-only auth --
+# confirmed live that public-key auth fails for this account while password auth succeeds, see
+# src.integrations.clients.tirerack.client.TireRackSFTPClient).
+TIRERACK_CREDENTIALS_SFTP_HOST = "sftp_host"
+TIRERACK_CREDENTIALS_SFTP_PORT = "sftp_port"
+TIRERACK_CREDENTIALS_SFTP_USER = "sftp_user"
+TIRERACK_CREDENTIALS_SFTP_PASSWORD = "sftp_password"
 
 # WheelPros SFTP feed paths (relative; leading / added by client when downloading)
 WHEELPROS_FEED_PATHS = {
@@ -869,6 +879,29 @@ PROVIDER_CATALOG = [
             "<li>Paste the full URL into <strong>feed_url</strong> below and save the connection.</li>"
             "</ol>"
         ).format(VOSSEN_FEED_URL_HOST_PREFIX),
+    },
+    {
+        "kind": enums.BrandProviderKind.TIRERACK,
+        "name": "TireRack",
+        "description": "Access TireRack tire pricing and inventory via their daily SFTP CSV feed.",
+        "icon_url": "https://api.aftermarketscout.com/uploads/tirerack_logo.png",
+        "category": "Distributors",
+        "connection_required_fields": [
+            TIRERACK_CREDENTIALS_SFTP_HOST,
+            TIRERACK_CREDENTIALS_SFTP_PORT,
+            TIRERACK_CREDENTIALS_SFTP_USER,
+            TIRERACK_CREDENTIALS_SFTP_PASSWORD,
+        ],
+        "integration_time": "Data available within 1-2 hours",
+        "installation_instructions_html": (
+            "<p><strong>TireRack</strong> drops a new pricing/inventory CSV onto your dealer "
+            "SFTP account every morning.</p>"
+            "<ol>"
+            "<li>Contact your TireRack rep for your dealer SFTP <strong>host</strong>, "
+            "<strong>port</strong>, <strong>username</strong>, and <strong>password</strong>.</li>"
+            "<li>Enter them below and save the connection.</li>"
+            "</ol>"
+        ),
     },
 ]
 

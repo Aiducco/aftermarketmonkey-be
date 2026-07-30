@@ -352,4 +352,19 @@ def get_distributor_credentials_info() -> dict:
             "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("VOSSEN", "Vossen"),
             "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("VOSSEN") or None,
         },
+        "tirerack": {
+            "required": [
+                src_constants.TIRERACK_CREDENTIALS_SFTP_HOST,
+                src_constants.TIRERACK_CREDENTIALS_SFTP_PORT,
+                src_constants.TIRERACK_CREDENTIALS_SFTP_USER,
+                src_constants.TIRERACK_CREDENTIALS_SFTP_PASSWORD,
+            ],
+            "description": (
+                "TireRack dealer SFTP host, port, username, and password. TireRack is a single "
+                "platform-wide catalog (one shared price list) -- the primary connection's "
+                "credentials drive the daily catalog pull for every company that enables TireRack."
+            ),
+            "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("TIRERACK", "TireRack"),
+            "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("TIRERACK") or None,
+        },
     }
