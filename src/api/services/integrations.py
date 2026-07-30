@@ -10,6 +10,7 @@ from django.utils import timezone
 from src import constants as src_constants
 from src import enums as src_enums
 from src import models as src_models
+from src.integrations import credentials as credentials_helper
 from src.integrations.clients.atech import client as atech_client
 from src.integrations.clients.atech import exceptions as atech_exceptions
 from src.integrations.clients.keystone import client as keystone_client
@@ -844,7 +845,12 @@ def connect_provider(
         company_id=company_id,
         provider_id=provider_id,
     ).first()
-    existing_creds = existing.credentials if existing else None
+    # existing.credentials never carries "order" (see CompanyProviderOrderAccount) — seed the
+    # merge/relay baseline below from this connection's actual default account instead, so a
+    # feed-only request still correctly carries forward whatever order credentials already exist.
+    existing_creds = dict(existing.credentials or {}) if existing else None
+    if existing:
+        existing_creds["order"] = credentials_helper.get_order_credentials(existing)
 
     if catalog_entry.get("relay_provisioned"):
         company = src_models.Company.objects.filter(id=company_id).first()
@@ -977,6 +983,12 @@ def connect_provider(
     if order_fields_touched:
         status_fields.update(_order_connection_status_fields(order_status_enum, order_status_reason))
 
+    # "order" is never persisted onto CompanyProviders.credentials — only "feed" lives there;
+    # order credentials go to this connection's default CompanyProviderOrderAccount row instead
+    # (see _sync_default_order_account), which needs cp to already have an id, hence the call
+    # placement after save/create below rather than folding it into `creds` first.
+    order_creds_to_sync = creds.pop("order", None)
+
     if existing:
         existing.credentials = creds
         for field, value in status_fields.items():
@@ -991,6 +1003,8 @@ def connect_provider(
             primary=False,
             **status_fields,
         )
+    if order_fields_touched:
+        _sync_default_order_account(cp, order_creds_to_sync or {})
 
     # Only (re-)enqueue a pricing sync when feed was actually part of this request (or the
     # initial sync hasn't completed yet) — an order-only save has nothing to do with the feed
@@ -1018,7 +1032,11 @@ def connect_provider(
         "created_at": cp.created_at.isoformat() if cp.created_at else None,
         "updated_at": cp.updated_at.isoformat() if cp.updated_at else None,
     }
-    result.update(_redacted_credentials_for_catalog_entry(catalog_entry, cp.credentials))
+    result.update(
+        _redacted_credentials_for_catalog_entry(
+            catalog_entry, cp.credentials, credentials_helper.get_order_credentials(cp)
+        )
+    )
     return result, None, None
 
 
@@ -1045,9 +1063,14 @@ def update_connection(
     if not catalog_entry:
         return None, "Provider not found in catalog", CONNECTION_ERROR_NOT_FOUND
 
+    # cp.credentials never carries "order" (see CompanyProviderOrderAccount) — seed the merge
+    # baseline from this connection's actual default account instead, so a feed-only PATCH still
+    # correctly carries forward whatever order credentials already exist.
+    merge_baseline = dict(cp.credentials or {})
+    merge_baseline["order"] = credentials_helper.get_order_credentials(cp)
     creds, err, err_code = _merge_update_credentials(
         catalog_entry,
-        cp.credentials,
+        merge_baseline,
         credentials,
     )
     if err:
@@ -1130,6 +1153,8 @@ def update_connection(
         else:
             order_validated, order_status_enum, order_status_reason = None, None, None
 
+    # "order" is never persisted onto CompanyProviders.credentials — see connect_provider.
+    order_creds_to_sync = creds.pop("order", None)
     cp.credentials = creds
     # Only include a namespace's status fields in what actually gets written when this call
     # touched that namespace — otherwise leave the existing row's stored values alone entirely.
@@ -1141,6 +1166,8 @@ def update_connection(
     for field, value in status_fields.items():
         setattr(cp, field, value)
     cp.save()
+    if order_fields_touched:
+        _sync_default_order_account(cp, order_creds_to_sync or {})
 
     # Only (re-)enqueue a pricing sync when feed was actually part of this request (or the
     # initial sync hasn't completed yet) — an order-only PATCH has nothing to do with the feed
@@ -1168,7 +1195,11 @@ def update_connection(
         "created_at": cp.created_at.isoformat() if cp.created_at else None,
         "updated_at": cp.updated_at.isoformat() if cp.updated_at else None,
     }
-    result.update(_redacted_credentials_for_catalog_entry(catalog_entry, cp.credentials))
+    result.update(
+        _redacted_credentials_for_catalog_entry(
+            catalog_entry, cp.credentials, credentials_helper.get_order_credentials(cp)
+        )
+    )
     return result, None, None
 
 
@@ -1204,11 +1235,10 @@ def disconnect_provider(
     if namespace not in ("feed", "order"):
         return False, 'namespace must be "feed" or "order"'
 
-    creds = dict(cp.credentials or {})
-    creds[namespace] = {}
-    other_namespace = "order" if namespace == "feed" else "feed"
-
     if namespace == "feed":
+        creds = dict(cp.credentials or {})
+        creds["feed"] = {}
+        cp.credentials = creds
         cp.status = None
         cp.status_name = None
         cp.status_reason = None
@@ -1221,40 +1251,92 @@ def disconnect_provider(
             cp.order_status_reason = _ORDER_WAITING_ON_FEED_REASON
             cp.order_status_checked_at = timezone.now()
     else:
+        # Order credentials live on the default CompanyProviderOrderAccount row, not
+        # cp.credentials — delete it outright when nothing protects it (no order history yet),
+        # else deactivate/clear it in place so PurchaseOrder.order_account (PROTECT) never
+        # breaks. Either way, promote the next remaining account (if any) to be the new default
+        # so a company with other configured accounts isn't left unable to order at all.
+        default_account = cp.order_accounts.filter(is_default=True).first()
+        if default_account:
+            try:
+                default_account.delete()
+            except ProtectedError:
+                default_account.credentials = {}
+                default_account.active = False
+                default_account.is_default = False
+                default_account.save(update_fields=["credentials", "active", "is_default", "updated_at"])
+            _promote_next_default_order_account(cp)
         cp.order_status = None
         cp.order_status_name = None
         cp.order_status_reason = None
         cp.order_status_checked_at = None
 
-    if not creds.get(other_namespace):
+    feed_empty = not (cp.credentials or {}).get("feed")
+    order_empty = not credentials_helper.get_order_credentials(cp)
+    if feed_empty and order_empty:
         cp.delete()
         return True, None
 
-    cp.credentials = creds
     cp.save()
     return True, None
 
 
-# -- Additional order accounts (src.models.CompanyProviderOrderAccount) ---------------------
+# -- Order accounts (src.models.CompanyProviderOrderAccount) --------------------------------
 #
-# A connection's normal "Ordering" section (credentials["order"], managed by connect_provider/
-# update_connection/disconnect_provider above) is always the IMPLICIT DEFAULT order account —
-# these functions only ever manage ADDITIONAL, explicitly-named accounts beyond that one (e.g. a
-# company that places its own shop's orders through one Keystone account and drop-ships through
-# a second). See CompanyProviderOrderAccount's docstring for why credentials are never migrated
-# out of the implicit default into a row here.
+# A connection's normal "Ordering" section is what connect_provider/update_connection/
+# disconnect_provider manage below — it always writes to this connection's is_default=True
+# CompanyProviderOrderAccount row (via _sync_default_order_account), never to
+# CompanyProviders.credentials directly. create_order_account/update_order_account/
+# delete_order_account further down manage ADDITIONAL, explicitly-named, always-non-default
+# accounts beyond that one (e.g. a company that places its own shop's orders through one
+# Keystone account and drop-ships through a second).
 
 
-def _is_default_order_account(
-    cp: src_models.CompanyProviders, account: src_models.CompanyProviderOrderAccount
-) -> bool:
-    """True if ``account`` is the one get_order_credentials would pick when no account is
-    explicitly requested — i.e. there's no implicit default AND this is the earliest-created
-    active additional account. Purely informational (see list_order_accounts)."""
-    if (cp.credentials or {}).get("order"):
-        return False
-    earliest = cp.order_accounts.filter(active=True).order_by("created_at").first()
-    return bool(earliest and earliest.id == account.id)
+def _sync_default_order_account(
+    company_provider: src_models.CompanyProviders, order_credentials: typing.Dict[str, typing.Any]
+) -> None:
+    """
+    Keeps this connection's is_default=True account in sync with the "order" credentials
+    connect_provider/update_connection just merged/validated — creating it on first use,
+    updating it thereafter. ``order_credentials`` being empty (order never configured, or just
+    disconnected) deactivates rather than deletes an existing default row, so
+    PurchaseOrder.order_account (PROTECT) never breaks over a routine credentials change; use
+    disconnect_provider for an explicit, intentional removal.
+    """
+    # Looked up regardless of `active` (unlike credentials_helper.get_default_order_account,
+    # which callers use to find a USABLE default for placing orders) — a previously-deactivated
+    # default must be found and reactivated here, not shadowed by a second is_default=True row.
+    account = company_provider.order_accounts.filter(is_default=True).first()
+    if not order_credentials:
+        if account:
+            account.credentials = {}
+            account.active = False
+            account.is_default = False
+            account.save(update_fields=["credentials", "active", "is_default", "updated_at"])
+            _promote_next_default_order_account(company_provider)
+        return
+    if account:
+        account.credentials = order_credentials
+        account.active = True
+        account.save(update_fields=["credentials", "active", "updated_at"])
+    else:
+        src_models.CompanyProviderOrderAccount.objects.create(
+            company_provider=company_provider,
+            label="Default",
+            credentials=order_credentials,
+            is_default=True,
+        )
+
+
+def _promote_next_default_order_account(company_provider: src_models.CompanyProviders) -> None:
+    """After the is_default account is deleted outright (see disconnect_provider), promotes the
+    oldest remaining active additional account to is_default so ordering isn't silently left
+    unusable when other configured accounts could serve as the default — same "promote the next
+    one" idiom as company_locations.delete_company_location for is_primary."""
+    next_account = company_provider.order_accounts.filter(active=True).order_by("created_at").first()
+    if next_account:
+        next_account.is_default = True
+        next_account.save(update_fields=["is_default", "updated_at"])
 
 
 def _serialize_order_account(
@@ -1270,6 +1352,7 @@ def _serialize_order_account(
         "company_provider_id": account.company_provider_id,
         "label": account.label,
         "active": account.active,
+        "is_default": account.is_default,
         "credentials": credentials,
         "secrets_configured": secrets_configured,
         "created_at": account.created_at.isoformat() if account.created_at else None,
@@ -1280,9 +1363,10 @@ def _serialize_order_account(
 def list_order_accounts(company_id: int, company_provider_id: int) -> typing.Optional[typing.List[typing.Dict]]:
     """
     Every order account for this connection, for the Settings > Integrations "Ordering
-    accounts" management list: the implicit default (``id: None``, whatever was entered through
-    the connection's normal "Ordering" section) when configured, followed by any additional
-    named accounts, oldest first. Returns None if the connection doesn't exist for this company.
+    accounts" management list — the default account (whatever was entered through the
+    connection's normal "Ordering" section) first, then any additional named accounts, oldest
+    first. Returns None if the connection doesn't exist for this company, or an empty list if
+    order credentials have never been configured at all.
     """
     cp = (
         src_models.CompanyProviders.objects.filter(id=company_provider_id, company_id=company_id)
@@ -1292,33 +1376,8 @@ def list_order_accounts(company_id: int, company_provider_id: int) -> typing.Opt
     if not cp or not cp.provider:
         return None
     catalog_entry = _get_catalog_entry_for_provider(cp.provider_id) or {}
-
-    has_implicit_default = bool((cp.credentials or {}).get("order"))
-    accounts: typing.List[typing.Dict[str, typing.Any]] = []
-    if has_implicit_default:
-        default_credentials, default_secrets = _redacted_credentials(
-            catalog_entry.get("order_connection_required_fields") or [],
-            catalog_entry.get("order_connection_optional_fields") or [],
-            (cp.credentials or {}).get("order"),
-        )
-        accounts.append(
-            {
-                "id": None,
-                "company_provider_id": cp.id,
-                "label": "Default",
-                "active": True,
-                "is_default": True,
-                "credentials": default_credentials,
-                "secrets_configured": default_secrets,
-                "created_at": cp.created_at.isoformat() if cp.created_at else None,
-                "updated_at": cp.updated_at.isoformat() if cp.updated_at else None,
-            }
-        )
-    for i, account in enumerate(cp.order_accounts.order_by("created_at")):
-        row = _serialize_order_account(catalog_entry, account)
-        row["is_default"] = account.active and not has_implicit_default and i == 0
-        accounts.append(row)
-    return accounts
+    accounts = cp.order_accounts.order_by("-is_default", "created_at")
+    return [_serialize_order_account(catalog_entry, account) for account in accounts]
 
 
 def create_order_account(
@@ -1390,7 +1449,6 @@ def create_order_account(
         )
 
     result = _serialize_order_account(catalog_entry, account)
-    result["is_default"] = _is_default_order_account(cp, account)
     result["connection_validated"] = validated
     return result, None, None
 
@@ -1449,6 +1507,7 @@ def update_order_account(
             )
         account.label = label
 
+    was_default = account.is_default
     if active is not None:
         account.active = bool(active)
 
@@ -1461,8 +1520,15 @@ def update_order_account(
             CONNECTION_ERROR_INVALID_INPUT,
         )
 
+    # Deactivating the current default leaves ordering silently unusable if this connection has
+    # other configured accounts that could serve instead — demote and promote the next one, same
+    # as disconnect_provider does when the default is removed outright.
+    if was_default and active is False:
+        account.is_default = False
+        account.save(update_fields=["is_default", "updated_at"])
+        _promote_next_default_order_account(cp)
+
     result = _serialize_order_account(catalog_entry, account)
-    result["is_default"] = _is_default_order_account(cp, account)
     if validated is not None:
         result["connection_validated"] = validated
     return result, None, None
@@ -1474,12 +1540,19 @@ def delete_order_account(company_id: int, order_account_id: int) -> typing.Tuple
     any PurchaseOrder still references it — PurchaseOrder.order_account is on_delete=PROTECT for
     exactly this reason; a company that no longer wants an account with order history should
     deactivate it via update_order_account(active=False) instead of deleting it.
+
+    The default account can't be removed here at all — it's managed through the connection's
+    normal Ordering section (see disconnect_provider(namespace="order")), which also handles
+    promoting another account to be the new default; this endpoint only ever holds additional,
+    always-non-default accounts.
     """
     account = src_models.CompanyProviderOrderAccount.objects.filter(
         id=order_account_id, company_provider__company_id=company_id
     ).first()
     if not account:
         return False, "Order account not found"
+    if account.is_default:
+        return False, "The default account can't be deleted here — disconnect Ordering on the connection instead."
     try:
         account.delete()
     except ProtectedError:
@@ -1530,7 +1603,11 @@ def get_company_providers(company_id: int) -> typing.List[typing.Dict]:
                 if entry["kind"].value == provider.kind:
                     catalog_entry = entry
                     break
-        row.update(_redacted_credentials_for_catalog_entry(catalog_entry, cp.credentials))
+        row.update(
+            _redacted_credentials_for_catalog_entry(
+                catalog_entry, cp.credentials, credentials_helper.get_order_credentials(cp)
+            )
+        )
         if provider:
             row.update(_provider_ui_metadata(provider))
         data.append(row)
@@ -1600,10 +1677,14 @@ def get_company_provider_by_id(company_id: int, provider_id: int) -> typing.Opti
             "created_at": company_provider.created_at.isoformat() if company_provider.created_at else None,
             "updated_at": company_provider.updated_at.isoformat() if company_provider.updated_at else None,
         }
-        data.update(_redacted_credentials_for_catalog_entry(catalog_entry, company_provider.credentials))
+        data.update(
+            _redacted_credentials_for_catalog_entry(
+                catalog_entry, company_provider.credentials, credentials_helper.get_order_credentials(company_provider)
+            )
+        )
         if provider:
             data.update(_provider_ui_metadata(provider))
-        
+
         logger.info('{} Found company provider with id: {} for company_id: {}.'.format(
             _LOG_PREFIX, provider_id, company_id
         ))
@@ -1659,6 +1740,7 @@ def _redacted_credentials(
 def _redacted_credentials_for_catalog_entry(
     catalog_entry: typing.Dict[str, typing.Any],
     stored: typing.Optional[typing.Dict[str, typing.Any]],
+    order_credentials: typing.Optional[typing.Dict[str, typing.Any]] = None,
 ) -> typing.Dict[str, typing.Any]:
     """
     feed_credentials/secrets_configured/order_credentials/order_secrets_configured for one
@@ -1670,12 +1752,17 @@ def _redacted_credentials_for_catalog_entry(
     secret from the company itself). ORDER is always redacted normally against the catalog's
     order field lists, relay-provisioned or not — Meyer's order credentials (relay-provisioned
     feed, but real user-entered order API creds) are genuine secrets like any other provider's.
+
+    ``stored`` is a connection's ``credentials`` JSON — "feed" only; it never carries "order"
+    (see CompanyProviderOrderAccount). ``order_credentials`` is passed in explicitly by the
+    caller (via ``credentials_helper.get_order_credentials``) since it now lives in a separate
+    table this function has no model access point for.
     """
     stored = stored or {}
     order_redacted, order_secrets = _redacted_credentials(
         catalog_entry.get("order_connection_required_fields") or [],
         catalog_entry.get("order_connection_optional_fields") or [],
-        stored.get("order"),
+        order_credentials,
     )
     if catalog_entry.get("relay_provisioned"):
         feed_stored = stored.get("feed") or {}
@@ -1780,7 +1867,12 @@ def get_company_provider_connection_detail(
         out["installation_instructions_html"] = _render_relay_instructions_html(catalog_entry, company)
     else:
         out["installation_instructions_html"] = catalog_entry.get("installation_instructions_html") or None
-    out.update(_redacted_credentials_for_catalog_entry(catalog_entry, company_provider.credentials))
+    out.update(
+        _redacted_credentials_for_catalog_entry(
+            catalog_entry, company_provider.credentials, credentials_helper.get_order_credentials(company_provider)
+        )
+    )
+    out["order_accounts"] = list_order_accounts(company_id=company_id, company_provider_id=company_provider_id)
     return out
 
 

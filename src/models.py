@@ -170,21 +170,20 @@ class CompanyProviders(django_db_models.Model):
 
 class CompanyProviderOrderAccount(django_db_models.Model):
     """
-    An ADDITIONAL named order-placement credential set for a CompanyProviders connection —
-    e.g. a company that has one Keystone account for its own shop's orders and a second,
-    separate Keystone account it uses for drop-shipping. This table only ever holds accounts
-    beyond the first: the credentials entered through the normal "Ordering" section of a
-    connection (CompanyProviders.credentials["order"], via connect_provider/update_connection)
-    remain the implicit default account and are never migrated/duplicated into a row here — see
-    src.integrations.credentials.get_order_credentials for the resolution order. This keeps
-    every existing single-account connection (the overwhelming majority) completely unaffected:
-    no backfill, no data migration, `order_account=None` everywhere continues to mean exactly
-    what it always meant.
+    A named order-placement credential set for a CompanyProviders connection — e.g. a company
+    that has one Keystone account for its own shop's orders and a second, separate Keystone
+    account it uses for drop-shipping. Every connection with order credentials configured has
+    exactly one row here with ``is_default=True`` (the account get_order_credentials resolves to
+    when no account is explicitly requested — see src.integrations.credentials); this is the
+    single source of truth for order credentials, including for connections that only ever have
+    one account, which is still represented by its own is_default row rather than living
+    directly on CompanyProviders.credentials. Credentials entered through a connection's normal
+    "Ordering" section (connect_provider/update_connection) are written here, to the is_default
+    row — CompanyProviders.credentials never carries an "order" key.
 
-    There is deliberately no ``is_default``/``primary`` flag here — the implicit default above
-    is always THE default; an account row is only ever a non-default, explicitly-selected
-    alternative. Promoting one of these rows to replace the implicit default isn't supported
-    yet (would require moving credentials out of CompanyProviders.credentials entirely).
+    ``is_default`` is enforced at the application layer the same way CompanyLocation.is_primary
+    is: at most one True per company_provider, and clearing/deleting the default promotes the
+    next-oldest active account (see integrations_services._promote_next_default_order_account).
     """
     company_provider = django_db_models.ForeignKey(
         CompanyProviders, on_delete=django_db_models.CASCADE, related_name="order_accounts"
@@ -193,6 +192,7 @@ class CompanyProviderOrderAccount(django_db_models.Model):
     label = django_db_models.CharField(max_length=100)
     credentials = django_db_models.JSONField()
 
+    is_default = django_db_models.BooleanField(default=False)
     active = django_db_models.BooleanField(default=True)
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
@@ -1638,6 +1638,77 @@ class BrandVossenBrandMapping(django_db_models.Model):
         unique_together = ["brand", "vossen_brand"]
 
 
+class TireRackBrand(django_db_models.Model):
+    """
+    Manufacturer label from TireRack's feed (``Manufacturer Name`` column, e.g. "Bridgestone") --
+    unlike VossenBrand (always one row, since Vossen itself is the brand), TireRack's single feed
+    covers many tire manufacturers, one row per distinct name. The feed has no numeric/external
+    id for a brand, so ``name`` is the natural key.
+    """
+    name = django_db_models.CharField(max_length=255)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "tirerack_brands"
+        unique_together = [["name"]]
+
+
+class BrandTireRackBrandMapping(django_db_models.Model):
+    """Maps our Brands to TireRackBrand (for master parts sync)."""
+    brand = django_db_models.ForeignKey(
+        Brands,
+        on_delete=django_db_models.CASCADE,
+        related_name="tirerack_brand_mappings",
+    )
+    tirerack_brand = django_db_models.ForeignKey(
+        TireRackBrand,
+        on_delete=django_db_models.CASCADE,
+        related_name="brand_mappings",
+    )
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "brand_tirerack_brand_mapping"
+        unique_together = [["brand", "tirerack_brand"]]
+
+
+class TireRackParts(django_db_models.Model):
+    """
+    Row from TireRack's single shared SFTP CSV feed (one platform-wide price list -- not
+    per-company, unlike DlgParts/DlgCompanyPricing -- so there's no separate CompanyPricing
+    table here; sync_provider_pricing_from_tirerack_for_company reads straight off this table
+    for every connected company).
+    """
+    brand = django_db_models.ForeignKey(
+        TireRackBrand,
+        on_delete=django_db_models.CASCADE,
+        related_name="parts",
+    )
+    part_number = django_db_models.CharField(max_length=255)
+    description = django_db_models.TextField(null=True, blank=True)
+    quantity = django_db_models.IntegerField(null=True, blank=True)
+    country_of_origin = django_db_models.CharField(max_length=255, null=True, blank=True)
+    fet = django_db_models.DecimalField(max_digits=14, decimal_places=5, null=True, blank=True)
+    base_price = django_db_models.DecimalField(max_digits=14, decimal_places=5, null=True, blank=True)
+    total_price = django_db_models.DecimalField(max_digits=14, decimal_places=5, null=True, blank=True)
+    road_hazard_warranty = django_db_models.CharField(max_length=255, null=True, blank=True)
+    treadlife_warranty_1 = django_db_models.CharField(max_length=255, null=True, blank=True)
+    treadlife_warranty_2 = django_db_models.CharField(max_length=255, null=True, blank=True)
+    treadlife_warranty_3 = django_db_models.CharField(max_length=255, null=True, blank=True)
+    raw_data = django_db_models.JSONField(null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "tirerack_parts"
+        unique_together = [["part_number", "brand"]]
+
+
 class MasterPart(django_db_models.Model):
     brand = django_db_models.ForeignKey(Brands, on_delete=django_db_models.CASCADE, related_name="master_parts")
     part_number = django_db_models.CharField(max_length=255)
@@ -2239,13 +2310,14 @@ class PurchaseOrder(django_db_models.Model):
         CompanyProviders, on_delete=django_db_models.PROTECT, related_name="purchase_orders"
     )
     # Which of company_provider's order accounts this PO is placed through — see
-    # CompanyProviderOrderAccount's docstring. Null means "the implicit default account" (the
-    # credentials in company_provider.credentials["order"]), which is what every PO meant before
-    # this field existed and is still what the overwhelming majority of POs mean today; only set
-    # when a company has configured more than one named account and explicitly chose a
-    # non-default one at add-to-cart time (see purchase_orders_services.add_cart_item). Decided
-    # once, at cart-creation time, and never re-resolved implicitly afterward — requote/submit
-    # must keep using whatever account the cart was actually built against.
+    # CompanyProviderOrderAccount's docstring. Null resolves to that connection's is_default
+    # account at order/quote time (see src.integrations.credentials.get_order_credentials),
+    # which is what every PO means today for the overwhelming majority of connections (a single
+    # account, always the default); only set explicitly when a company has configured more than
+    # one named account and chose a non-default one at add-to-cart time (see
+    # purchase_orders_services.add_cart_item). Decided once, at cart-creation time, and never
+    # re-resolved implicitly afterward — requote/submit must keep using whatever account the
+    # cart was actually built against.
     order_account = django_db_models.ForeignKey(
         CompanyProviderOrderAccount,
         on_delete=django_db_models.PROTECT,
