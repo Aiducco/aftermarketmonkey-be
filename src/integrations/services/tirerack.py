@@ -362,14 +362,13 @@ _TIRERACK_PARTS_UPDATE_FIELDS = [
 
 def fetch_and_save_tirerack_catalog() -> None:
     """
-    Download TireRack's latest daily CSV (one new ``CustomTruck_<date>.csv`` dropped each
-    morning -- see TireRackSFTPClient) and upsert TireRackBrand / TireRackParts. This is a single
-    platform-wide price list, not per-company like DLG's feed, so pricing (Base Price/Total
-    Price/FET) lives directly on TireRackParts -- there's no separate TireRackCompanyPricing
-    table; sync_provider_pricing_from_tirerack_for_company reads straight off this table for
-    every connected company. Credentials come from the primary TireRack CompanyProviders row
-    (see _primary_tirerack_company_provider), the same "one authoritative connection" pattern
-    DLG's relay feed already uses.
+    Download the latest daily CSV (one new ``CustomTruck_<date>.csv`` dropped each morning --
+    see TireRackSFTPClient) from the PRIMARY TireRack connection and upsert the shared
+    TireRackBrand / TireRackParts catalog. Each company has its own separate TireRack SFTP
+    account/feed (same pattern as DLG) -- this shared catalog step only uses the primary
+    connection (see _primary_tirerack_company_provider), matching DLG's own split: catalog is
+    shared, but per-company pricing (Total Price) is pulled separately per company via
+    sync_tirerack_company_pricing_for_company_provider into TireRackCompanyPricing.
     """
     logger.info("{} Starting TireRack catalog ingest.".format(_LOG_PREFIX))
 
@@ -475,3 +474,135 @@ def fetch_and_save_tirerack_catalog() -> None:
             time.sleep(_TIRERACK_PARTS_UPSERT_DELAY)
 
     logger.info("{} Finished TireRack catalog ingest ({} parts).".format(_LOG_PREFIX, len(parts)))
+
+
+_TIRERACK_PRICING_UPSERT_BATCH = 2000
+_TIRERACK_PART_ID_LOOKUP_CHUNK = 3000
+
+
+def _upsert_tirerack_company_pricing_for_company(
+    company: src_models.Company,
+    records: typing.List[typing.Dict],
+) -> int:
+    """Map this company's own feed rows to the shared TireRackParts catalog and upsert TireRackCompanyPricing (Total Price column)."""
+    brand_by_upper_name: typing.Dict[str, src_models.TireRackBrand] = {
+        b.name.upper(): b for b in src_models.TireRackBrand.objects.all()
+    }
+    if not brand_by_upper_name:
+        return 0
+
+    pairs: typing.List[typing.Tuple[int, str]] = []
+    seen_pairs: typing.Set[typing.Tuple[int, str]] = set()
+    for row in records:
+        bkey = _tirerack_brand_key(row.get("Manufacturer Name"))
+        pn = _clean(row.get("Manufacturer Part#"))
+        if not bkey or not pn:
+            continue
+        brand = brand_by_upper_name.get(bkey)
+        if not brand:
+            continue
+        t = (brand.id, pn)
+        if t not in seen_pairs:
+            seen_pairs.add(t)
+            pairs.append(t)
+    if not pairs:
+        return 0
+
+    part_id_by_pair: typing.Dict[typing.Tuple[int, str], int] = {}
+    for i in range(0, len(pairs), _TIRERACK_PART_ID_LOOKUP_CHUNK):
+        chunk = pairs[i : i + _TIRERACK_PART_ID_LOOKUP_CHUNK]
+        with connection.cursor() as cur:
+            cur.execute(
+                "SELECT id, brand_id, part_number FROM tirerack_parts WHERE (brand_id, part_number) IN %s",
+                (tuple(chunk),),
+            )
+            for pid, bid, pn in cur.fetchall():
+                pn_s = (pn or "").strip() if isinstance(pn, str) else str(pn or "").strip()
+                part_id_by_pair[(int(bid), pn_s)] = int(pid)
+    if not part_id_by_pair:
+        return 0
+
+    by_conflict: typing.Dict[typing.Tuple[int, int], src_models.TireRackCompanyPricing] = {}
+    for row in records:
+        bkey = _tirerack_brand_key(row.get("Manufacturer Name"))
+        pn = _clean(row.get("Manufacturer Part#"))
+        if not bkey or not pn:
+            continue
+        brand = brand_by_upper_name.get(bkey)
+        if not brand:
+            continue
+        pid = part_id_by_pair.get((brand.id, pn))
+        if not pid:
+            continue
+        by_conflict[(pid, company.id)] = src_models.TireRackCompanyPricing(
+            part_id=pid,
+            company=company,
+            total_price=_safe_decimal(row.get("Total Price")),
+        )
+
+    pricing_rows = list(by_conflict.values())
+    total = 0
+    for j in range(0, len(pricing_rows), _TIRERACK_PRICING_UPSERT_BATCH):
+        batch = pricing_rows[j : j + _TIRERACK_PRICING_UPSERT_BATCH]
+        pgbulk.upsert(
+            src_models.TireRackCompanyPricing,
+            batch,
+            unique_fields=["part", "company"],
+            update_fields=["total_price", "updated_at"],
+            returning=False,
+        )
+        total += len(batch)
+        connection.close()
+    return total
+
+
+def sync_tirerack_company_pricing_for_company_provider(company_provider_id: int) -> None:
+    """
+    Download this company's own TireRack SFTP feed and upsert TireRackCompanyPricing. Each
+    company has its own TireRack dealer account/credentials (same pattern as DLG's
+    sync_dlg_company_pricing_for_company_provider) -- separate from the shared catalog ingest
+    (fetch_and_save_tirerack_catalog), which uses only the primary connection. Requires matching
+    TireRackParts/TireRackBrand (run the primary's catalog + brand sync first).
+    """
+    cp = (
+        src_models.CompanyProviders.objects.filter(
+            id=company_provider_id,
+            provider__kind=src_enums.BrandProviderKind.TIRERACK.value,
+            provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
+        )
+        .select_related("company", "provider")
+        .first()
+    )
+    if not cp:
+        logger.warning(
+            "{} No active TireRack CompanyProviders id={}. Skipping pricing.".format(
+                _LOG_PREFIX, company_provider_id,
+            )
+        )
+        return
+
+    try:
+        sftp = tirerack_client.TireRackSFTPClient(credentials=credentials_helper.get_feed_credentials(cp))
+    except ValueError as e:
+        logger.error("{} company_id={}: {}.".format(_LOG_PREFIX, cp.company_id, str(e)))
+        raise
+
+    try:
+        filename, content = sftp.download_latest_catalog()
+    except tirerack_exceptions.TireRackException as e:
+        logger.error(
+            "{} TireRack pricing download error company_id={}: {}.".format(_LOG_PREFIX, cp.company_id, str(e))
+        )
+        raise
+
+    local_path = _write_temp_catalog_file("company_{}_{}".format(cp.company_id, filename), content)
+    records = _records_from_csv(local_path)
+    if not records:
+        logger.warning("{} TireRack pricing file empty: {}.".format(_LOG_PREFIX, local_path))
+        return
+    n = _upsert_tirerack_company_pricing_for_company(cp.company, records)
+    logger.info(
+        "{} TireRackCompanyPricing upserted {} rows for company_id={} (company_provider id={}).".format(
+            _LOG_PREFIX, n, cp.company_id, company_provider_id,
+        )
+    )

@@ -7078,13 +7078,37 @@ def sync_provider_inventory_from_tirerack() -> None:
     logger.info("{} Synced {} TireRack inventory records total.".format(_LOG_PREFIX, total_upserted))
 
 
+def _tirerack_company_pricing_batch_row_id_to_provider_part(
+    batch: typing.List[typing.Dict],
+    tirerack_provider: src_models.Providers,
+) -> typing.Dict[int, src_models.ProviderPart]:
+    ext_ids = {
+        _tirerack_provider_external_id(row["part__brand_id"], row["part__part_number"])
+        for row in batch
+    }
+    pp_by_ext_id = {
+        row["provider_external_id"]: src_models.ProviderPart(id=row["id"])
+        for row in src_models.ProviderPart.objects.filter(
+            provider=tirerack_provider, provider_external_id__in=ext_ids
+        ).values("id", "provider_external_id")
+    }
+    out: typing.Dict[int, src_models.ProviderPart] = {}
+    for row in batch:
+        ext_id = _tirerack_provider_external_id(row["part__brand_id"], row["part__part_number"])
+        pp = pp_by_ext_id.get(ext_id)
+        if pp:
+            out[row["id"]] = pp
+    return out
+
+
 def sync_provider_pricing_from_tirerack_for_company(company_id: int) -> None:
     """
-    Write ProviderPartCompanyPricing for one company straight from the shared TireRackParts
-    price list (cost = Total Price; all other pricing fields left null -- GTIN/MAP/Retail/
-    Jobber/Core aren't in TireRack's feed). Unlike DLG's per-company SFTP pulls, TireRack has no
-    per-company pricing variation -- every connected company gets the same cost here, sourced
-    from the one platform-wide feed (see fetch_and_save_tirerack_catalog / TireRackParts docstring).
+    Write ProviderPartCompanyPricing for one company from that company's own
+    TireRackCompanyPricing rows (cost = Total Price; all other pricing fields left null --
+    GTIN/MAP/Retail/Jobber/Core aren't in TireRack's feed). Each company has its own TireRack
+    dealer account/feed (same pattern as DLG) -- see
+    tirerack.sync_tirerack_company_pricing_for_company_provider, which populates
+    TireRackCompanyPricing from that company's own SFTP pull.
     """
     logger.info("{} Syncing TireRack provider pricing for company_id={}.".format(_LOG_PREFIX, company_id))
 
@@ -7095,20 +7119,6 @@ def sync_provider_pricing_from_tirerack_for_company(company_id: int) -> None:
         logger.info("{} No TireRack provider found.".format(_LOG_PREFIX))
         return
 
-    company = src_models.Company.objects.filter(id=company_id).first()
-    if not company:
-        logger.warning("{} Company id={} not found.".format(_LOG_PREFIX, company_id))
-        return
-
-    ext_id_to_pp_id: typing.Dict[str, int] = dict(
-        src_models.ProviderPart.objects.filter(provider=tirerack_provider).values_list(
-            "provider_external_id", "id"
-        )
-    )
-    if not ext_id_to_pp_id:
-        logger.info("{} No TireRack ProviderPart rows yet. Run master parts sync first.".format(_LOG_PREFIX))
-        return
-
     now = timezone.now()
     total_upserted = 0
     batch_num = 0
@@ -7116,26 +7126,23 @@ def sync_provider_pricing_from_tirerack_for_company(company_id: int) -> None:
     while True:
         batch_num += 1
         batch = list(
-            src_models.TireRackParts.objects.filter(id__gt=last_id)
+            src_models.TireRackCompanyPricing.objects.filter(id__gt=last_id, company_id=company_id)
             .order_by("id")
-            .values("id", "brand_id", "part_number", "total_price")[:BATCH_SIZE_PRICING]
+            .values("id", "total_price", "part__brand_id", "part__part_number")[:BATCH_SIZE_PRICING]
         )
         if not batch:
             break
         last_id = batch[-1]["id"]
 
+        row_id_to_pp = _tirerack_company_pricing_batch_row_id_to_provider_part(batch, tirerack_provider)
         pricing_by_pp: typing.Dict[int, src_models.ProviderPartCompanyPricing] = {}
         for row in batch:
-            pn = (row.get("part_number") or "").strip()
-            if not pn:
+            pp = row_id_to_pp.get(row["id"])
+            if not pp:
                 continue
-            ext_id = _tirerack_provider_external_id(row["brand_id"], pn)
-            pp_id = ext_id_to_pp_id.get(ext_id)
-            if not pp_id:
-                continue
-            pricing_by_pp[pp_id] = src_models.ProviderPartCompanyPricing(
-                provider_part_id=pp_id,
-                company=company,
+            pricing_by_pp[pp.id] = src_models.ProviderPartCompanyPricing(
+                provider_part=pp,
+                company_id=company_id,
                 cost=row.get("total_price"),
                 jobber_price=None,
                 map_price=None,
@@ -7167,22 +7174,66 @@ def sync_provider_pricing_from_tirerack_for_company(company_id: int) -> None:
 
 
 def sync_provider_pricing_from_tirerack() -> None:
-    """Sync ProviderPartCompanyPricing from the shared TireRackParts price list for every company connected to TireRack."""
+    """Sync ProviderPartCompanyPricing from TireRackCompanyPricing (each company's own SFTP pull) for every connected company."""
     logger.info("{} Syncing provider pricing from TireRack (all companies).".format(_LOG_PREFIX))
 
-    company_ids = list(
-        src_models.CompanyProviders.objects.filter(
-            provider__kind=src_enums.BrandProviderKind.TIRERACK.value,
-            provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
-        ).values_list("company_id", flat=True).distinct()
-    )
-    if not company_ids:
-        logger.info("{} No active TireRack CompanyProviders. Nothing to price.".format(_LOG_PREFIX))
+    tirerack_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.TIRERACK.value,
+    ).first()
+    if not tirerack_provider:
+        logger.info("{} No TireRack provider found.".format(_LOG_PREFIX))
         return
 
-    for company_id in company_ids:
-        sync_provider_pricing_from_tirerack_for_company(company_id)
+    now = timezone.now()
+    total_upserted = 0
+    batch_num = 0
+    last_id = 0
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.TireRackCompanyPricing.objects.filter(id__gt=last_id)
+            .order_by("id")
+            .values("id", "company_id", "total_price", "part__brand_id", "part__part_number")[:BATCH_SIZE_PRICING]
+        )
+        if not batch:
+            break
+        last_id = batch[-1]["id"]
+
+        row_id_to_pp = _tirerack_company_pricing_batch_row_id_to_provider_part(batch, tirerack_provider)
+        pricing_by_pp_company: typing.Dict[typing.Tuple[int, int], src_models.ProviderPartCompanyPricing] = {}
+        for row in batch:
+            pp = row_id_to_pp.get(row["id"])
+            if not pp:
+                continue
+            pricing_by_pp_company[(pp.id, row["company_id"])] = src_models.ProviderPartCompanyPricing(
+                provider_part=pp,
+                company_id=row["company_id"],
+                cost=row.get("total_price"),
+                jobber_price=None,
+                map_price=None,
+                msrp=None,
+                retail_price=None,
+                last_synced_at=now,
+            )
+
+        to_upsert = list(pricing_by_pp_company.values())
+        if to_upsert:
+            pgbulk.upsert(
+                src_models.ProviderPartCompanyPricing,
+                to_upsert,
+                unique_fields=["provider_part", "company"],
+                update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
+            )
+            total_upserted += len(to_upsert)
+
+        logger.info("{} TireRack pricing batch {}: {} records (last_id={})".format(
+            _LOG_PREFIX, batch_num, len(to_upsert), last_id,
+        ))
         connection.close()
+        if len(batch) == BATCH_SIZE_PRICING:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    logger.info("{} Synced {} TireRack pricing records total.".format(_LOG_PREFIX, total_upserted))
 
 
 def sync_derived_from_tirerack(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False, skip_pricing: bool = False) -> None:

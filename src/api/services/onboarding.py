@@ -360,9 +360,9 @@ def get_distributor_credentials_info() -> dict:
                 src_constants.TIRERACK_CREDENTIALS_SFTP_PASSWORD,
             ],
             "description": (
-                "TireRack dealer SFTP host, port, username, and password. TireRack is a single "
-                "platform-wide catalog (one shared price list) -- the primary connection's "
-                "credentials drive the daily catalog pull for every company that enables TireRack."
+                "TireRack dealer SFTP host, port, username, and password, per company (like DLG). "
+                "The shared catalog is refreshed from the primary connection; each company's own "
+                "feed drives its own pricing."
             ),
             "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("TIRERACK", "TireRack"),
             "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("TIRERACK") or None,

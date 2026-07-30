@@ -1678,10 +1678,11 @@ class BrandTireRackBrandMapping(django_db_models.Model):
 
 class TireRackParts(django_db_models.Model):
     """
-    Row from TireRack's single shared SFTP CSV feed (one platform-wide price list -- not
-    per-company, unlike DlgParts/DlgCompanyPricing -- so there's no separate CompanyPricing
-    table here; sync_provider_pricing_from_tirerack_for_company reads straight off this table
-    for every connected company).
+    Row from TireRack's SFTP CSV feed. Each company has its own TireRack dealer account/feed
+    (same pattern as DlgParts/DlgCompanyPricing) -- catalog/inventory fields here come from the
+    PRIMARY connection's own feed only (shared catalog, mirrors DLG); company-specific cost
+    lives on TireRackCompanyPricing, sourced from each company's own SFTP pull (see
+    tirerack.sync_tirerack_company_pricing_for_company_provider).
     """
     brand = django_db_models.ForeignKey(
         TireRackBrand,
@@ -1707,6 +1708,33 @@ class TireRackParts(django_db_models.Model):
     class Meta:
         db_table = "tirerack_parts"
         unique_together = [["part_number", "brand"]]
+
+
+class TireRackCompanyPricing(django_db_models.Model):
+    """
+    Per-company TireRack pricing for a TireRackParts row (from that company's own SFTP feed --
+    each company has its own TireRack dealer account/credentials, same as DlgCompanyPricing).
+    Catalog/inventory fields stay on TireRackParts (shared, from the primary connection);
+    total_price here is the company-specific amount.
+    """
+    part = django_db_models.ForeignKey(
+        TireRackParts,
+        on_delete=django_db_models.CASCADE,
+        related_name="company_pricing",
+    )
+    company = django_db_models.ForeignKey(
+        Company,
+        on_delete=django_db_models.CASCADE,
+        related_name="tirerack_company_pricing",
+    )
+    total_price = django_db_models.DecimalField(max_digits=14, decimal_places=5, null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "tirerack_company_pricing"
+        unique_together = [["part", "company"]]
 
 
 class MasterPart(django_db_models.Model):

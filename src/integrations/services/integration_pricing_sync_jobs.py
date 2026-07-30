@@ -28,6 +28,7 @@ from src.integrations.services import meyer as meyer_services
 from src.integrations.services import notifications as notifications_services
 from src.integrations.services import premier as premier_services
 from src.integrations.services import rough_country as rough_country_services
+from src.integrations.services import tirerack as tirerack_services
 from src.integrations.services import turn_14 as turn_14_services
 from src.integrations.services import vossen as vossen_services
 from src.integrations.services import wheelpros as wheelpros_services
@@ -178,12 +179,7 @@ def _fetch_raw_pricing(cp: src_models.CompanyProviders, use_delta_fetch: bool = 
         vossen_services.sync_vossen_company_pricing_for_company_provider(cp.id)
 
     elif kind == src_enums.BrandProviderKind.TIRERACK.value:
-        # No-op: TireRack has no per-company raw feed to fetch -- one shared platform-wide price
-        # list, already refreshed daily via the primary connection's own
-        # fetch_and_save_tirerack_catalog call (Phase 1 of the nightly pipeline). Nothing to
-        # re-download here; _sync_master_pricing below reads straight off the already-ingested
-        # TireRackParts table for this company.
-        pass
+        tirerack_services.sync_tirerack_company_pricing_for_company_provider(cp.id)
 
     else:
         raise ValueError("Unsupported provider kind for raw pricing fetch: {}".format(kind))
