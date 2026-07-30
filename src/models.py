@@ -1548,6 +1548,12 @@ class ProviderPart(django_db_models.Model):
     subcategory = django_db_models.CharField(max_length=255, null=True, blank=True)
     product_details = django_db_models.JSONField(null=True)
     is_discontinued = django_db_models.BooleanField(default=False)
+    # True when the distributor's own feed flags this as a kit (e.g. Keystone's IsKit) --
+    # denormalized here so cart/quote code can check kit-ness without joining
+    # kit_components. See ProviderPartKitComponent for the actual component breakdown; this
+    # flag can be True with zero linked components if the feed's component VCPNs haven't
+    # resolved to a ProviderPart yet (not yet synced, or a raw-data quality issue).
+    is_kit = django_db_models.BooleanField(default=False)
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
@@ -1559,6 +1565,41 @@ class ProviderPart(django_db_models.Model):
             django_db_models.Index(fields=["category"], name="pp_category_idx"),
             django_db_models.Index(fields=["overview_category"], name="pp_overview_category_idx"),
         ]
+
+
+class ProviderPartKitComponent(django_db_models.Model):
+    """
+    One component line of a kit ProviderPart (kit_part.is_kit=True) -- decoded from the
+    distributor's own kit-components feed field (e.g. Keystone's KitComponents string,
+    "B94GNRC823-1|B94GNRM1123-1|") into real FKs against the same provider's normal catalog
+    rows, not just raw VCPN strings. Lives on ProviderPart generically (not a Keystone-only
+    table) since Premier's PremierParts has the identical is_kit/kit_component_list shape and
+    is expected to populate this same table later.
+
+    The whole point of resolving real ProviderPart rows here (not just storing VCPN text) is
+    that "add a kit to cart" can add its components directly -- see
+    purchase_orders_services.add_cart_item -- instead of ever sending the kit's own VCPN to a
+    distributor's order API. Keystone's own API cannot place a kit order at all: confirmed live
+    that GetShippingOptionsMultiplePartsPerWarehouse rejects a kit VCPN outright at quote time,
+    and ShipOrderDropShipMultipleParts silently explodes one into components server-side at
+    submit time with no way to reconcile that back to our own line items (see
+    src.integrations.orders.keystone's module docstring). Expanding into components ourselves,
+    before either call happens, sidesteps both.
+    """
+    kit_part = django_db_models.ForeignKey(
+        ProviderPart, on_delete=django_db_models.CASCADE, related_name="kit_components"
+    )
+    component_part = django_db_models.ForeignKey(
+        ProviderPart, on_delete=django_db_models.PROTECT, related_name="kit_of"
+    )
+    quantity = django_db_models.PositiveIntegerField()
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "provider_part_kit_components"
+        unique_together = [["kit_part", "component_part"]]
 
 
 class ProviderPartInventory(django_db_models.Model):
@@ -2187,6 +2228,17 @@ class PurchaseOrderLineItem(django_db_models.Model):
     )
     provider_part = django_db_models.ForeignKey(
         ProviderPart, on_delete=django_db_models.PROTECT, related_name="po_line_items"
+    )
+    # Set only when this line was created by expanding a kit ProviderPart into its components
+    # (see purchase_orders_services.add_cart_item / ProviderPartKitComponent) -- the kit itself
+    # is never added as its own line item, so this is purely traceability: lets the cart UI
+    # group/label "these N lines came from kit X" instead of showing unrelated-looking parts.
+    kit_source_provider_part = django_db_models.ForeignKey(
+        ProviderPart,
+        on_delete=django_db_models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="expanded_kit_line_items",
     )
 
     quantity = django_db_models.PositiveIntegerField()

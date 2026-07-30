@@ -149,6 +149,26 @@ def _serialize_line_item(
         "distributor_net_line_total": _decimal_to_float(li.distributor_net_line_total),
         "is_prop_65": li.is_prop_65,
         "distributor_order_id": li.distributor_order_id,
+        # Set only when this line was added by expanding a kit into its components (see
+        # purchase_orders_services.add_cart_item) -- lets the FE group/label "these lines came
+        # from kit X" instead of showing unrelated-looking parts. None for a normal add.
+        "kit_source": (
+            {
+                "provider_part_id": li.kit_source_provider_part_id,
+                "part_number": (
+                    li.kit_source_provider_part.master_part.part_number
+                    if li.kit_source_provider_part and li.kit_source_provider_part.master_part
+                    else None
+                ),
+                "description": (
+                    li.kit_source_provider_part.master_part.description
+                    if li.kit_source_provider_part and li.kit_source_provider_part.master_part
+                    else None
+                ),
+            }
+            if li.kit_source_provider_part_id
+            else None
+        ),
     }
 
 
@@ -267,7 +287,9 @@ def _serialize_purchase_order(po: src_models.PurchaseOrder, include_line_items: 
         shipments_by_id = {s["id"]: s for s in (po.shipments or [])}
         result["line_items"] = [
             _serialize_line_item(li, shipments_by_id)
-            for li in po.line_items.select_related("provider_part__master_part__brand").all()
+            for li in po.line_items.select_related(
+                "provider_part__master_part__brand", "kit_source_provider_part__master_part"
+            ).all()
         ]
         result["item_count"] = sum(li["quantity"] for li in result["line_items"])
     return result
@@ -427,6 +449,52 @@ def _get_or_create_draft(
     return po
 
 
+def _add_or_increment_line_item(
+    po: src_models.PurchaseOrder,
+    company_id: int,
+    provider_part: src_models.ProviderPart,
+    quantity: int,
+    kit_source_provider_part: typing.Optional[src_models.ProviderPart] = None,
+) -> None:
+    """
+    One (purchase_order, provider_part) line item: increments quantity if already in the cart,
+    creates it otherwise. Must be called inside a transaction.atomic() block by the caller (see
+    add_cart_item) -- shared between adding a single part directly and adding each component of
+    an expanded kit, so both go through the identical select_for_update/create-or-increment path.
+    """
+    pricing = src_models.ProviderPartCompanyPricing.objects.filter(
+        provider_part=provider_part, company_id=company_id
+    ).first()
+    unit_cost = pricing.cost if pricing else None
+
+    li = (
+        src_models.PurchaseOrderLineItem.objects.select_for_update()
+        .filter(purchase_order=po, provider_part=provider_part)
+        .first()
+    )
+    if li:
+        li.quantity += quantity
+        if unit_cost is not None:
+            li.unit_cost = unit_cost
+            li.line_total = unit_cost * li.quantity
+        # A line item already in the cart keeps whatever kit_source it was first created with --
+        # e.g. if a component was already added standalone, then later pulled in by a kit, it
+        # stays a standalone line (not silently relabeled as kit-sourced) since its identity as
+        # "a real request for this part" predates the kit add.
+        li.save(update_fields=["quantity", "unit_cost", "line_total", "updated_at"])
+    else:
+        src_models.PurchaseOrderLineItem.objects.create(
+            purchase_order=po,
+            provider_part=provider_part,
+            kit_source_provider_part=kit_source_provider_part,
+            quantity=quantity,
+            unit_cost=unit_cost,
+            line_total=(unit_cost * quantity) if unit_cost is not None else None,
+            status=src_enums.PurchaseOrderLineItemStatus.PENDING.value,
+            status_name=src_enums.PurchaseOrderLineItemStatus.PENDING.name,
+        )
+
+
 def add_cart_item(
     company_id: int,
     user_id: typing.Optional[int],
@@ -438,6 +506,13 @@ def add_cart_item(
     ``provider_id`` and ``master_part_id`` are exactly what GET /parts/<id>/ already exposes
     per provider row (providers[].provider_id and the part's own id) — the FE never needs to
     know about internal CompanyProviders/ProviderPart row ids to add something to a cart.
+
+    A kit ProviderPart (provider_part.is_kit) is never added to the cart as its own line item --
+    its components (ProviderPartKitComponent) are added instead, each at
+    requested_quantity * that component's own kit quantity, tagged with kit_source_provider_part
+    for traceability. See ProviderPartKitComponent's docstring for why: neither Keystone's quote
+    nor its order-submit call can handle a kit VCPN cleanly, confirmed live, so the kit's own
+    VCPN must never reach that far in the first place.
     """
     if not provider_id:
         raise PurchaseOrderServiceError("provider_id is required.")
@@ -456,33 +531,25 @@ def add_cart_item(
 
     po = _get_or_create_draft(company_id, user_id, cp)
 
-    pricing = src_models.ProviderPartCompanyPricing.objects.filter(
-        provider_part=provider_part, company_id=company_id
-    ).first()
-    unit_cost = pricing.cost if pricing else None
-
     with transaction.atomic():
-        li = (
-            src_models.PurchaseOrderLineItem.objects.select_for_update()
-            .filter(purchase_order=po, provider_part=provider_part)
-            .first()
-        )
-        if li:
-            li.quantity += quantity
-            if unit_cost is not None:
-                li.unit_cost = unit_cost
-                li.line_total = unit_cost * li.quantity
-            li.save(update_fields=["quantity", "unit_cost", "line_total", "updated_at"])
-        else:
-            src_models.PurchaseOrderLineItem.objects.create(
-                purchase_order=po,
-                provider_part=provider_part,
-                quantity=quantity,
-                unit_cost=unit_cost,
-                line_total=(unit_cost * quantity) if unit_cost is not None else None,
-                status=src_enums.PurchaseOrderLineItemStatus.PENDING.value,
-                status_name=src_enums.PurchaseOrderLineItemStatus.PENDING.name,
+        if provider_part.is_kit:
+            kit_components = list(
+                provider_part.kit_components.select_related("component_part").all()
             )
+            if not kit_components:
+                raise PurchaseOrderServiceError(
+                    "This kit's components aren't available to order individually yet."
+                )
+            for component in kit_components:
+                _add_or_increment_line_item(
+                    po,
+                    company_id,
+                    component.component_part,
+                    quantity * component.quantity,
+                    kit_source_provider_part=provider_part,
+                )
+        else:
+            _add_or_increment_line_item(po, company_id, provider_part, quantity)
 
     return get_cart(company_id)
 

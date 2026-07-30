@@ -980,6 +980,118 @@ def sync_master_parts_from_keystone() -> None:
     ))
 
 
+def _parse_keystone_kit_components(kit_components_raw: typing.Optional[str]) -> typing.List[typing.Tuple[str, int]]:
+    """
+    Decodes Keystone's pipe-delimited KitComponents field (e.g.
+    "B94GNRC823-1|B94GNRM1123-1|") into [(component_vcpn, quantity), ...]. Splitting on the
+    LAST "-" in each token is safe and unambiguous: Keystone's own VCPN format is validated
+    server-side against the regex "^[A-Z][A-Z0-9]{3,12}$" (confirmed in the SDK docs' error
+    section for full part numbers), which never allows a hyphen, so the only hyphen in
+    "VCPN-QTY" is the one separating them.
+    """
+    if not kit_components_raw:
+        return []
+    pairs: typing.List[typing.Tuple[str, int]] = []
+    for token in kit_components_raw.split("|"):
+        token = token.strip()
+        if not token:
+            continue
+        vcpn, sep, qty_str = token.rpartition("-")
+        if not sep or not vcpn:
+            continue
+        try:
+            quantity = int(qty_str)
+        except ValueError:
+            continue
+        if quantity <= 0:
+            continue
+        pairs.append((vcpn, quantity))
+    return pairs
+
+
+def sync_keystone_kit_components() -> None:
+    """
+    Decodes KeystoneParts.kit_components (see _parse_keystone_kit_components) into real
+    ProviderPartKitComponent rows against the same provider's own catalog, and sets
+    ProviderPart.is_kit for each kit's own row. Run after sync_master_parts_from_keystone --
+    needs every Keystone ProviderPart (kit rows AND component rows) to already exist. Can't be
+    scoped to one brand's ingestion batch: a kit's components aren't guaranteed to belong to the
+    same KAO vendor code/brand as the kit itself (confirmed live: kit "B94GNRK1123" and its
+    components "B94GNRC823"/"B94GNRM1123" happen to share vendor code B94 here, but nothing in
+    the feed guarantees that in general).
+
+    See ProviderPartKitComponent's own docstring for why this exists: expanding a kit into its
+    components ourselves, at add-to-cart time (see purchase_orders_services.add_cart_item), is
+    what lets purchase order quote/submit avoid ever sending a kit's own VCPN to Keystone's
+    order API -- confirmed live that neither call handles one cleanly (see
+    src.integrations.orders.keystone's module docstring).
+    """
+    logger.info("{} Syncing Keystone kit components.".format(_LOG_PREFIX))
+
+    keystone_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.KEYSTONE.value,
+    ).first()
+    if not keystone_provider:
+        logger.info("{} No Keystone provider found.".format(_LOG_PREFIX))
+        return
+
+    vcpn_to_provider_part_id = dict(
+        src_models.ProviderPart.objects.filter(provider=keystone_provider).values_list(
+            "provider_external_id", "id"
+        )
+    )
+
+    kit_provider_part_ids: typing.Set[int] = set()
+    components: typing.List[src_models.ProviderPartKitComponent] = []
+    kits_seen = 0
+    kits_missing_own_part = 0
+    components_unresolved = 0
+
+    kit_rows = (
+        src_models.KeystoneParts.objects.filter(is_kit=True)
+        .exclude(kit_components__isnull=True)
+        .exclude(kit_components="")
+        .values("vcpn", "kit_components")
+        .iterator(chunk_size=2000)
+    )
+    for row in kit_rows:
+        kits_seen += 1
+        kit_part_id = vcpn_to_provider_part_id.get(row["vcpn"])
+        if kit_part_id is None:
+            kits_missing_own_part += 1
+            continue
+        kit_provider_part_ids.add(kit_part_id)
+        for component_vcpn, quantity in _parse_keystone_kit_components(row["kit_components"]):
+            component_part_id = vcpn_to_provider_part_id.get(component_vcpn)
+            if component_part_id is None:
+                components_unresolved += 1
+                continue
+            components.append(
+                src_models.ProviderPartKitComponent(
+                    kit_part_id=kit_part_id, component_part_id=component_part_id, quantity=quantity
+                )
+            )
+
+    if components:
+        pgbulk.upsert(
+            src_models.ProviderPartKitComponent,
+            components,
+            unique_fields=["kit_part", "component_part"],
+            update_fields=["quantity"],
+        )
+    if kit_provider_part_ids:
+        # Marked True regardless of whether any component resolved (see ProviderPartKitComponent's
+        # docstring) -- a kit whose components haven't synced yet is still a kit.
+        src_models.ProviderPart.objects.filter(id__in=kit_provider_part_ids).update(is_kit=True)
+
+    logger.info(
+        "{} Kit components: {} kit rows seen, {} linked components, {} kits with no matching "
+        "ProviderPart, {} component VCPNs unresolved.".format(
+            _LOG_PREFIX, kits_seen, len(components), kits_missing_own_part, components_unresolved
+        )
+    )
+
+
 def _ingest_meyer_parts_for_mapped_brands(
     mapped_catalog_brand_ids: typing.Set[int],
     meyer_provider: src_models.Providers,
@@ -5947,6 +6059,11 @@ def sync_derived_from_keystone(*, reindex_meilisearch: bool = False, skip_master
     ))
     if not skip_master_parts:
         sync_master_parts_from_keystone()
+        connection.close()
+        # Needs every Keystone ProviderPart to exist first (see sync_keystone_kit_components'
+        # own docstring for why it can't run per-brand) -- only worth re-running when master
+        # parts themselves were just resynced, not on the fast inventory/pricing-only path.
+        sync_keystone_kit_components()
         connection.close()
 
     def _cont() -> None:
