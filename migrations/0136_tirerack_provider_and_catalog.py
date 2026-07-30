@@ -25,7 +25,7 @@ def remove_tirerack_provider(apps, schema_editor):
 class Migration(migrations.Migration):
 
     dependencies = [
-        ("src", "0135_vossen_provider_and_catalog"),
+        ("src", "0137_order_account_is_default_and_backfill"),
     ]
 
     operations = [
