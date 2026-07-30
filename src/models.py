@@ -1570,21 +1570,35 @@ class ProviderPart(django_db_models.Model):
 class ProviderPartKitComponent(django_db_models.Model):
     """
     One component line of a kit ProviderPart (kit_part.is_kit=True) -- decoded from the
-    distributor's own kit-components feed field (e.g. Keystone's KitComponents string,
-    "B94GNRC823-1|B94GNRM1123-1|") into real FKs against the same provider's normal catalog
-    rows, not just raw VCPN strings. Lives on ProviderPart generically (not a Keystone-only
-    table) since Premier's PremierParts has the identical is_kit/kit_component_list shape and
-    is expected to populate this same table later.
+    distributor's own kit-components feed field into real FKs against the same provider's
+    normal catalog rows, not just raw part-number strings. Lives on ProviderPart generically
+    (not a Keystone-only table): Premier's PremierParts has the same is_kit/kit_component_list
+    *concept*, populated into this same table by sync_premier_kit_components -- but NOT the
+    identical raw format an earlier version of this docstring assumed. Confirmed live against
+    real rows of each:
+      - Keystone's KitComponents: hyphen-joined pairs, pipe-separated ("B94GNRC823-1|
+        B94GNRM1123-1|") -- safe to split on each token's trailing hyphen since Keystone's own
+        VCPN format never contains one (see master_parts._parse_keystone_kit_components).
+      - Premier's Kit Component List: alternating pipe-delimited tokens, not hyphen-joined
+        ("SYN8863-10|1|SYN8855-02|1|...") -- Premier part numbers routinely contain hyphens
+        themselves (e.g. "SYN8863-10"), which is exactly why Keystone's hyphen-split approach
+        would be ambiguous here (see master_parts._parse_premier_kit_components).
+    Each distributor's own sync function owns decoding its own raw format into this shared
+    table; don't assume a new distributor's kit-components field matches either shape without
+    checking real rows first.
 
-    The whole point of resolving real ProviderPart rows here (not just storing VCPN text) is
-    that "add a kit to cart" can add its components directly -- see
-    purchase_orders_services.add_cart_item -- instead of ever sending the kit's own VCPN to a
+    The whole point of resolving real ProviderPart rows here (not just storing part-number
+    text) is that "add a kit to cart" can add its components directly -- see
+    purchase_orders_services.add_cart_item, which is already provider-agnostic and needs no
+    per-distributor changes -- instead of ever sending the kit's own item number to a
     distributor's order API. Keystone's own API cannot place a kit order at all: confirmed live
     that GetShippingOptionsMultiplePartsPerWarehouse rejects a kit VCPN outright at quote time,
     and ShipOrderDropShipMultipleParts silently explodes one into components server-side at
     submit time with no way to reconcile that back to our own line items (see
-    src.integrations.orders.keystone's module docstring). Expanding into components ourselves,
-    before either call happens, sidesteps both.
+    src.integrations.orders.keystone's module docstring). Premier's own order API's kit
+    behavior is untested/undocumented (no confirmed failure, unlike Keystone) -- treated as
+    unverified and risky by default rather than assumed safe. Expanding into components
+    ourselves, before either distributor's order API is ever called, sidesteps both cases.
     """
     kit_part = django_db_models.ForeignKey(
         ProviderPart, on_delete=django_db_models.CASCADE, related_name="kit_components"

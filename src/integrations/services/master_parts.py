@@ -6564,6 +6564,147 @@ def sync_master_parts_from_premier() -> None:
     ))
 
 
+def _parse_premier_kit_components(kit_component_list_raw: typing.Optional[str]) -> typing.List[typing.Tuple[str, int]]:
+    """
+    Decodes Premier's "Kit Component List" feed field into [(component_part_number, quantity),
+    ...]. Confirmed live against real PremierParts rows: alternating pipe-delimited tokens --
+    "PARTNUM|QTY|PARTNUM|QTY|..." -- NOT hyphen-joined pairs like Keystone's KitComponents.
+    Premier part numbers routinely contain hyphens themselves (e.g. "SYN8863-10"), which is
+    exactly why a hyphen-split (Keystone's approach) would be ambiguous here; alternating
+    pipe-delimited tokens sidesteps that entirely. Malformed rows (odd token count, non-integer
+    quantity) return as many valid leading pairs as parsed and drop the rest, rather than
+    raising -- confirmed against the live catalog that ~0.15% of kit rows are malformed this
+    way, and a partial link is better than losing the whole kit's decode over one bad token.
+    """
+    if not kit_component_list_raw:
+        return []
+    tokens = kit_component_list_raw.split("|")
+    pairs: typing.List[typing.Tuple[str, int]] = []
+    for i in range(0, len(tokens) - 1, 2):
+        part_number = tokens[i].strip()
+        qty_str = tokens[i + 1].strip()
+        if not part_number:
+            continue
+        try:
+            quantity = int(qty_str)
+        except ValueError:
+            continue
+        if quantity <= 0:
+            continue
+        pairs.append((part_number, quantity))
+    return pairs
+
+
+def sync_premier_kit_components() -> None:
+    """
+    Decodes PremierParts.kit_component_list (see _parse_premier_kit_components) into real
+    ProviderPartKitComponent rows against the same provider's own catalog, and sets
+    ProviderPart.is_kit for each kit's own row. Run after sync_master_parts_from_premier --
+    needs every Premier ProviderPart (kit AND component rows) to already exist.
+
+    Component resolution prefers the SAME PremierBrand as the kit itself first -- confirmed
+    live against real examples (e.g. kit "SYN8820-2000" under brand_id=547, whose components
+    "SYN8863-10"/"SYN8855-02"/etc. all resolve under that same brand_id) -- since
+    ProviderPart.provider_external_id for Premier is a composite
+    "{premier_brand_id}_{premier_part_number}" key (see _premier_provider_external_id), not the
+    bare part number Keystone's VCPN is. Falls back to a global (any-brand) lookup only when
+    that part number is unambiguous across the whole Premier catalog (exactly one match);
+    otherwise it's left unresolved rather than guessing which brand's part was meant --
+    PremierParts.unique_together = ["premier_part_number", "brand"] means the same part number
+    CAN legitimately recur under different brands elsewhere in the catalog even though the
+    confirmed examples above didn't show that.
+
+    See ProviderPartKitComponent's own docstring for why this exists at all: expanding a kit
+    into its components ourselves, at add-to-cart time (see
+    purchase_orders_services.add_cart_item, which is already provider-agnostic and needs no
+    Premier-specific changes), avoids ever sending a kit's own item number to a distributor's
+    order API. Unlike Keystone (confirmed-live rejection), Premier's own order API's kit
+    behavior is untested/undocumented -- treated as unverified and risky by default, matching
+    submit_order's existing no-dry-run caution, rather than assumed safe just because no
+    failure has been observed yet.
+    """
+    logger.info("{} Syncing Premier kit components.".format(_LOG_PREFIX))
+
+    premier_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.PREMIER_PERFORMANCE.value,
+    ).first()
+    if not premier_provider:
+        logger.info("{} No Premier provider found.".format(_LOG_PREFIX))
+        return
+
+    ext_id_to_pp_id: typing.Dict[str, int] = dict(
+        src_models.ProviderPart.objects.filter(provider=premier_provider).values_list(
+            "provider_external_id", "id"
+        )
+    )
+    # Reverse index for the any-brand fallback -- part_number -> every ext_id it appears under,
+    # so ambiguity (recurs under >1 brand) is detectable instead of silently picking one.
+    part_number_to_ext_ids: typing.Dict[str, typing.List[str]] = {}
+    for ext_id in ext_id_to_pp_id:
+        _, _, part_number = ext_id.partition("_")
+        part_number_to_ext_ids.setdefault(part_number, []).append(ext_id)
+
+    kit_provider_part_ids: typing.Set[int] = set()
+    components: typing.List[src_models.ProviderPartKitComponent] = []
+    kits_seen = 0
+    kits_missing_own_part = 0
+    components_unresolved = 0
+    components_ambiguous = 0
+
+    kit_rows = (
+        src_models.PremierParts.objects.filter(is_kit=True)
+        .exclude(kit_component_list__isnull=True)
+        .exclude(kit_component_list="")
+        .values("premier_part_number", "brand_id", "kit_component_list")
+        .iterator(chunk_size=2000)
+    )
+    for row in kit_rows:
+        kits_seen += 1
+        kit_ext_id = _premier_provider_external_id(row["brand_id"], row["premier_part_number"])
+        kit_part_id = ext_id_to_pp_id.get(kit_ext_id)
+        if kit_part_id is None:
+            kits_missing_own_part += 1
+            continue
+        kit_provider_part_ids.add(kit_part_id)
+
+        for component_part_number, quantity in _parse_premier_kit_components(row["kit_component_list"]):
+            same_brand_ext_id = _premier_provider_external_id(row["brand_id"], component_part_number)
+            component_part_id = ext_id_to_pp_id.get(same_brand_ext_id)
+            if component_part_id is None:
+                candidates = part_number_to_ext_ids.get(component_part_number) or []
+                if len(candidates) == 1:
+                    component_part_id = ext_id_to_pp_id[candidates[0]]
+                elif len(candidates) > 1:
+                    components_ambiguous += 1
+                    continue
+                else:
+                    components_unresolved += 1
+                    continue
+            components.append(
+                src_models.ProviderPartKitComponent(
+                    kit_part_id=kit_part_id, component_part_id=component_part_id, quantity=quantity
+                )
+            )
+
+    if components:
+        pgbulk.upsert(
+            src_models.ProviderPartKitComponent,
+            components,
+            unique_fields=["kit_part", "component_part"],
+            update_fields=["quantity"],
+        )
+    if kit_provider_part_ids:
+        src_models.ProviderPart.objects.filter(id__in=kit_provider_part_ids).update(is_kit=True)
+
+    logger.info(
+        "{} Kit components: {} kit rows seen, {} linked components, {} kits with no matching "
+        "ProviderPart, {} component part numbers unresolved, {} ambiguous across brands.".format(
+            _LOG_PREFIX, kits_seen, len(components), kits_missing_own_part,
+            components_unresolved, components_ambiguous,
+        )
+    )
+
+
 def sync_provider_inventory_from_premier() -> None:
     """
     Sync ProviderPartInventory and ProviderPart.product_details from PremierParts.
@@ -6979,6 +7120,11 @@ def sync_derived_from_premier(*, reindex_meilisearch: bool = False, skip_master_
     ))
     if not skip_master_parts:
         sync_master_parts_from_premier()
+        connection.close()
+        # Needs every Premier ProviderPart to exist first (see sync_premier_kit_components' own
+        # docstring) -- only worth re-running when master parts themselves were just resynced,
+        # not on the fast inventory/pricing-only path. Same rule as Keystone's own kit sync.
+        sync_premier_kit_components()
         connection.close()
 
     def _cont() -> None:
