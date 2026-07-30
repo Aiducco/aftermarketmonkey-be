@@ -12,6 +12,12 @@ access are separate permission grants on Turn14's side) or are entirely disjoint
 for the feed, a SOAP security key + account number for ordering) — callers should never read
 ``company_provider.credentials`` directly; always go through one of these two functions so the
 right namespace is used regardless of which shape a given vendor happens to have.
+
+A connection can also have one or more ADDITIONAL named order accounts beyond the implicit
+default above (``src.models.CompanyProviderOrderAccount`` — e.g. a company that places its own
+shop's orders through one Keystone account and drop-ships through a second). See
+``get_order_credentials`` for the resolution order between the implicit default and these extra
+accounts.
 """
 import typing
 
@@ -22,5 +28,21 @@ def get_feed_credentials(company_provider: src_models.CompanyProviders) -> typin
     return (company_provider.credentials or {}).get("feed", {})
 
 
-def get_order_credentials(company_provider: src_models.CompanyProviders) -> typing.Dict:
-    return (company_provider.credentials or {}).get("order", {})
+def get_order_credentials(
+    company_provider: src_models.CompanyProviders,
+    order_account: typing.Optional[src_models.CompanyProviderOrderAccount] = None,
+) -> typing.Dict:
+    """
+    ``order_account``, when given, must belong to this connection (callers are responsible for
+    that — see purchase_orders_services._resolve_order_account) and its credentials are used
+    directly. Otherwise resolves to the implicit default: ``company_provider.credentials["order"]``
+    if configured, else the earliest-created additional CompanyProviderOrderAccount, else {} (no
+    order credentials configured at all).
+    """
+    if order_account is not None:
+        return order_account.credentials or {}
+    embedded = (company_provider.credentials or {}).get("order")
+    if embedded:
+        return embedded
+    default_account = company_provider.order_accounts.filter(active=True).order_by("created_at").first()
+    return default_account.credentials if default_account else {}

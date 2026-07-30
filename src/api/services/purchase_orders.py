@@ -216,6 +216,13 @@ def _serialize_purchase_order(po: src_models.PurchaseOrder, include_line_items: 
         "company_provider_id": po.company_provider_id,
         "provider_kind_name": provider.kind_name,
         "provider_name": provider.name,
+        # Which of this connection's order accounts the PO is placed through (see
+        # PurchaseOrder.order_account's docstring) — null/"Default" for the connection's
+        # implicit default account, which is what the overwhelming majority of POs use. Lets a
+        # cart view spanning more than one account for the same distributor label its groups
+        # (e.g. "Keystone — Dropship · 2 items") instead of only showing the distributor name.
+        "order_account_id": po.order_account_id,
+        "order_account_label": po.order_account.label if po.order_account_id else "Default",
         "group_id": po.group_id,
         # Human-readable label for the cross-distributor checkout this PO belongs to (see
         # PurchaseOrderGroup.reference) — None for a PO submitted on its own (group_id is also
@@ -355,6 +362,49 @@ def _get_company_provider(company_id: int, provider_id: int) -> src_models.Compa
     return cp
 
 
+def _resolve_order_account(
+    cp: src_models.CompanyProviders, order_account_id: typing.Optional[int]
+) -> typing.Optional[src_models.CompanyProviderOrderAccount]:
+    """
+    None means "use this connection's implicit default account" (see
+    src.integrations.credentials.get_order_credentials) — what every caller meant before
+    multi-account support existed, and still correct for the overwhelming majority of
+    connections, which only ever have one account. A non-null ``order_account_id`` must name an
+    active CompanyProviderOrderAccount belonging to this exact connection.
+    """
+    if not order_account_id:
+        return None
+    account = cp.order_accounts.filter(id=order_account_id, active=True).first()
+    if not account:
+        raise PurchaseOrderServiceError("Order account not found for this distributor connection.")
+    return account
+
+
+def _serialize_order_accounts(cp: src_models.CompanyProviders) -> typing.List[typing.Dict]:
+    """
+    Every account this connection can order through, for the "choose which account" picker at
+    add-to-cart time (see add_cart_item's ``order_account_id``): the implicit default (``id:
+    None``, whatever was entered through the connection's normal "Ordering" section) when
+    configured, followed by any additional named accounts. ``is_default`` marks whichever one
+    get_order_credentials would actually pick when no account is specified — see that function's
+    resolution order — purely informational, not needed to place an order via the default.
+    """
+    has_implicit_default = bool((cp.credentials or {}).get("order"))
+    accounts = []
+    if has_implicit_default:
+        accounts.append({"id": None, "label": "Default", "is_default": True})
+    extra_accounts = list(cp.order_accounts.filter(active=True).order_by("created_at"))
+    for i, account in enumerate(extra_accounts):
+        accounts.append(
+            {
+                "id": account.id,
+                "label": account.label,
+                "is_default": not has_implicit_default and i == 0,
+            }
+        )
+    return accounts
+
+
 def _cart_queryset(company_id: int):
     """
     POs that still belong to the "cart" world, as opposed to order history: never-submitted
@@ -420,9 +470,22 @@ def _revert_to_draft(po: src_models.PurchaseOrder) -> None:
 
 
 def _get_or_create_draft(
-    company_id: int, user_id: typing.Optional[int], cp: src_models.CompanyProviders
+    company_id: int,
+    user_id: typing.Optional[int],
+    cp: src_models.CompanyProviders,
+    order_account: typing.Optional[src_models.CompanyProviderOrderAccount] = None,
 ) -> src_models.PurchaseOrder:
-    existing = _cart_queryset(company_id).filter(company_provider=cp).order_by("-created_at").first()
+    """
+    Each (company_provider, order_account) pair has its own independent open draft — items
+    added under two different accounts of the same distributor never land in the same cart (see
+    PurchaseOrder.order_account's docstring and its two open-draft uniqueness constraints).
+    """
+    existing = (
+        _cart_queryset(company_id)
+        .filter(company_provider=cp, order_account=order_account)
+        .order_by("-created_at")
+        .first()
+    )
     if existing:
         if existing.status != src_enums.PurchaseOrderStatus.DRAFT.value:
             _revert_to_draft(existing)
@@ -434,6 +497,7 @@ def _get_or_create_draft(
             po, _created = src_models.PurchaseOrder.objects.get_or_create(
                 company_id=company_id,
                 company_provider=cp,
+                order_account=order_account,
                 status=src_enums.PurchaseOrderStatus.DRAFT.value,
                 defaults={
                     "status_name": src_enums.PurchaseOrderStatus.DRAFT.name,
@@ -444,7 +508,10 @@ def _get_or_create_draft(
             )
     except IntegrityError:
         po = src_models.PurchaseOrder.objects.get(
-            company_id=company_id, company_provider=cp, status=src_enums.PurchaseOrderStatus.DRAFT.value
+            company_id=company_id,
+            company_provider=cp,
+            order_account=order_account,
+            status=src_enums.PurchaseOrderStatus.DRAFT.value,
         )
     return po
 
@@ -501,11 +568,21 @@ def add_cart_item(
     provider_id: int,
     master_part_id: int,
     quantity: int,
+    order_account_id: typing.Optional[int] = None,
 ) -> typing.Dict:
     """
     ``provider_id`` and ``master_part_id`` are exactly what GET /parts/<id>/ already exposes
     per provider row (providers[].provider_id and the part's own id) — the FE never needs to
     know about internal CompanyProviders/ProviderPart row ids to add something to a cart.
+
+    ``order_account_id``, when given, must be one of this connection's additional named order
+    accounts (see GET .../purchase-orders/capabilities/'s ``order_accounts`` list) — leave unset
+    to use the connection's implicit default account, which is what the overwhelming majority of
+    connections (a single account) mean anyway. The account is decided once, here, at
+    add-to-cart time: each (company_provider, order_account) pair gets its own independent open
+    draft (see _get_or_create_draft), so items added under two different accounts never mix into
+    the same cart/quote/order. Use set_cart_order_account to move an already-created draft to a
+    different account instead of removing and re-adding every item.
 
     A kit ProviderPart (provider_part.is_kit) is never added to the cart as its own line item --
     its components (ProviderPartKitComponent) are added instead, each at
@@ -522,6 +599,7 @@ def add_cart_item(
         raise PurchaseOrderServiceError("Quantity must be a positive integer.")
 
     cp = _get_company_provider(company_id, provider_id)
+    order_account = _resolve_order_account(cp, order_account_id)
 
     provider_part = src_models.ProviderPart.objects.filter(
         master_part_id=master_part_id, provider_id=provider_id
@@ -529,7 +607,7 @@ def add_cart_item(
     if not provider_part:
         raise PurchaseOrderServiceError("Part not found for this distributor.")
 
-    po = _get_or_create_draft(company_id, user_id, cp)
+    po = _get_or_create_draft(company_id, user_id, cp, order_account)
 
     with transaction.atomic():
         if provider_part.is_kit:
@@ -586,10 +664,55 @@ def remove_cart_item(company_id: int, line_item_id: int) -> typing.Dict:
     return get_cart(company_id)
 
 
+def set_cart_order_account(
+    company_id: int, purchase_order_id: int, order_account_id: typing.Optional[int]
+) -> typing.Dict:
+    """
+    Moves an existing cart-side PO to a different order account of the SAME connection — lets a
+    user fix "added to the wrong account" without removing and re-adding every line item. Pass
+    ``order_account_id=None`` to move it back to the connection's implicit default account.
+
+    Only valid while the PO is still cart-side (see _cart_queryset) — once submitted, the
+    account it was placed through is fixed for good. Reverts a QUOTED/FAILED cart back to DRAFT
+    (same as update_cart_item/remove_cart_item) since a quote priced against the OLD account
+    means nothing once the account backing it changes; a fresh review/quote is required.
+    """
+    po = (
+        _cart_queryset(company_id)
+        .filter(id=purchase_order_id)
+        .select_related("company_provider")
+        .first()
+    )
+    if not po:
+        raise PurchaseOrderServiceError("Cart not found.")
+
+    order_account = _resolve_order_account(po.company_provider, order_account_id)
+    if order_account == po.order_account:
+        return get_cart(company_id)
+
+    conflict = (
+        _cart_queryset(company_id)
+        .filter(company_provider=po.company_provider, order_account=order_account)
+        .exclude(id=po.id)
+        .exists()
+    )
+    if conflict:
+        label = order_account.label if order_account else "the default account"
+        raise PurchaseOrderServiceError(
+            "You already have an open cart for {} — remove its items first.".format(label)
+        )
+
+    po.order_account = order_account
+    po.save(update_fields=["order_account", "updated_at"])
+    if po.status != src_enums.PurchaseOrderStatus.DRAFT.value:
+        _revert_to_draft(po)
+    return get_cart(company_id)
+
+
 def get_cart(company_id: int) -> typing.Dict:
     drafts = (
         _cart_queryset(company_id)
-        .select_related("company_provider__provider", "group")
+        .select_related("company_provider__provider", "group", "order_account")
         .prefetch_related("line_items__provider_part__master_part__brand", "distributor_orders")
         .order_by("company_provider__provider__name")
     )
@@ -716,7 +839,7 @@ def review_cart(
 def get_purchase_order_detail(company_id: int, purchase_order_id: int) -> typing.Dict:
     po = (
         src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id)
-        .select_related("company_provider__provider", "group")
+        .select_related("company_provider__provider", "group", "order_account")
         .prefetch_related("line_items__provider_part__master_part__brand", "distributor_orders")
         .first()
     )
@@ -978,7 +1101,7 @@ def get_purchase_order_group_detail(company_id: int, group_id: int) -> typing.Di
     if not group:
         raise PurchaseOrderServiceError("Purchase order group not found.")
     pos = (
-        group.purchase_orders.select_related("company_provider__provider", "group")
+        group.purchase_orders.select_related("company_provider__provider", "group", "order_account")
         .prefetch_related("line_items__provider_part__master_part__brand", "distributor_orders")
         .all()
     )
@@ -1311,6 +1434,7 @@ def get_order_capabilities(company_id: int) -> typing.List[typing.Dict]:
         # abstract) would tell the FE ordering is available for connections that would
         # actually fail the moment a quote/order was attempted.
         adapter = order_registry.get_adapter(cp)
+        order_accounts = _serialize_order_accounts(cp)
         results.append(
             {
                 "company_provider_id": cp.id,
@@ -1326,6 +1450,12 @@ def get_order_capabilities(company_id: int) -> typing.List[typing.Dict]:
                 # has no invoice API at all (e.g. WheelPros) instead of just always rendering an
                 # empty list with no explanation.
                 "supports_invoices": bool(adapter and adapter.supports_invoices()),
+                # Every account this connection can order through (see
+                # _serialize_order_accounts) — the FE shows an account picker on "Add to PO"
+                # only when this has more than one entry; a single-entry list (the common case)
+                # means nothing about the existing single-account UX needs to change.
+                "order_accounts": order_accounts,
+                "has_multiple_order_accounts": len(order_accounts) > 1,
             }
         )
     return results

@@ -124,11 +124,15 @@ def _load_wheelpros_warehouse_names() -> typing.Dict[str, str]:
 class WheelProsOrderAdapter(base.DistributorOrderAdapter):
     provider_kind = src_enums.BrandProviderKind.WHEELPROS.value
 
-    def __init__(self, company_provider: src_models.CompanyProviders) -> None:
-        base.DistributorOrderAdapter.__init__(self, company_provider)
+    def __init__(
+        self,
+        company_provider: src_models.CompanyProviders,
+        order_account: typing.Optional[src_models.CompanyProviderOrderAccount] = None,
+    ) -> None:
+        base.DistributorOrderAdapter.__init__(self, company_provider, order_account)
         environment = getattr(settings, "WHEELPROS_ORDER_ENVIRONMENT", "production")
         self._client = WheelProsOrderApiClient(
-            credentials=credentials_helper.get_order_credentials(company_provider),
+            credentials=credentials_helper.get_order_credentials(company_provider, order_account),
             environment=environment,
         )
 

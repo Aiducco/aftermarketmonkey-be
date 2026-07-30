@@ -272,14 +272,24 @@ def resolve_po_number(purchase_order: src_models.PurchaseOrder) -> str:
 
 class DistributorOrderAdapter(abc.ABC):
     """
-    One instance per CompanyProviders connection (holds that connection's credentials).
-    Only implemented for distributors whose order API is registered in ``registry.py``.
+    One instance per CompanyProviders connection AND order account (holds that account's
+    credentials — see src.integrations.credentials.get_order_credentials). ``order_account``
+    is None for the connection's implicit default account (the overwhelming majority of
+    connections, which only ever have one account); only set when a company has configured more
+    than one named account (src.models.CompanyProviderOrderAccount) and a specific one was
+    explicitly selected. Only implemented for distributors whose order API is registered in
+    ``registry.py``.
     """
 
     provider_kind: int  # src.enums.BrandProviderKind value, set by each subclass
 
-    def __init__(self, company_provider: src_models.CompanyProviders) -> None:
+    def __init__(
+        self,
+        company_provider: src_models.CompanyProviders,
+        order_account: typing.Optional[src_models.CompanyProviderOrderAccount] = None,
+    ) -> None:
         self.company_provider = company_provider
+        self.order_account = order_account
 
     @abc.abstractmethod
     def get_shipping_quote(

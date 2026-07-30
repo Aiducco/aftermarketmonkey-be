@@ -266,11 +266,15 @@ def parse_order_raw_response(raw_response: typing.Optional[typing.Dict]) -> typi
 class Turn14OrderAdapter(base.DistributorOrderAdapter):
     provider_kind = src_enums.BrandProviderKind.TURN_14.value
 
-    def __init__(self, company_provider: src_models.CompanyProviders) -> None:
-        base.DistributorOrderAdapter.__init__(self, company_provider)
+    def __init__(
+        self,
+        company_provider: src_models.CompanyProviders,
+        order_account: typing.Optional[src_models.CompanyProviderOrderAccount] = None,
+    ) -> None:
+        base.DistributorOrderAdapter.__init__(self, company_provider, order_account)
         environment = getattr(settings, "TURN14_ORDER_ENVIRONMENT", "testing")
         self._client = Turn14OrderApiClient(
-            credentials=credentials_helper.get_order_credentials(company_provider),
+            credentials=credentials_helper.get_order_credentials(company_provider, order_account),
             environment=environment,
         )
 

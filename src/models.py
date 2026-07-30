@@ -168,6 +168,41 @@ class CompanyProviders(django_db_models.Model):
         unique_together = ["company", "provider"]
 
 
+class CompanyProviderOrderAccount(django_db_models.Model):
+    """
+    An ADDITIONAL named order-placement credential set for a CompanyProviders connection —
+    e.g. a company that has one Keystone account for its own shop's orders and a second,
+    separate Keystone account it uses for drop-shipping. This table only ever holds accounts
+    beyond the first: the credentials entered through the normal "Ordering" section of a
+    connection (CompanyProviders.credentials["order"], via connect_provider/update_connection)
+    remain the implicit default account and are never migrated/duplicated into a row here — see
+    src.integrations.credentials.get_order_credentials for the resolution order. This keeps
+    every existing single-account connection (the overwhelming majority) completely unaffected:
+    no backfill, no data migration, `order_account=None` everywhere continues to mean exactly
+    what it always meant.
+
+    There is deliberately no ``is_default``/``primary`` flag here — the implicit default above
+    is always THE default; an account row is only ever a non-default, explicitly-selected
+    alternative. Promoting one of these rows to replace the implicit default isn't supported
+    yet (would require moving credentials out of CompanyProviders.credentials entirely).
+    """
+    company_provider = django_db_models.ForeignKey(
+        CompanyProviders, on_delete=django_db_models.CASCADE, related_name="order_accounts"
+    )
+
+    label = django_db_models.CharField(max_length=100)
+    credentials = django_db_models.JSONField()
+
+    active = django_db_models.BooleanField(default=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "company_provider_order_accounts"
+        unique_together = ["company_provider", "label"]
+
+
 class ShopManagementProviders(django_db_models.Model):
     """Global catalog of connectable shop-management systems (ShopMonkey, ...). Deliberately
     separate from Providers/BrandProviderKind — a shop-management system isn't a parts source
@@ -2112,6 +2147,21 @@ class PurchaseOrder(django_db_models.Model):
     company_provider = django_db_models.ForeignKey(
         CompanyProviders, on_delete=django_db_models.PROTECT, related_name="purchase_orders"
     )
+    # Which of company_provider's order accounts this PO is placed through — see
+    # CompanyProviderOrderAccount's docstring. Null means "the implicit default account" (the
+    # credentials in company_provider.credentials["order"]), which is what every PO meant before
+    # this field existed and is still what the overwhelming majority of POs mean today; only set
+    # when a company has configured more than one named account and explicitly chose a
+    # non-default one at add-to-cart time (see purchase_orders_services.add_cart_item). Decided
+    # once, at cart-creation time, and never re-resolved implicitly afterward — requote/submit
+    # must keep using whatever account the cart was actually built against.
+    order_account = django_db_models.ForeignKey(
+        CompanyProviderOrderAccount,
+        on_delete=django_db_models.PROTECT,
+        related_name="purchase_orders",
+        null=True,
+        blank=True,
+    )
     group = django_db_models.ForeignKey(
         PurchaseOrderGroup,
         on_delete=django_db_models.SET_NULL,
@@ -2224,14 +2274,27 @@ class PurchaseOrder(django_db_models.Model):
         ]
         constraints = [
             # At most one open cart (DRAFT=1 or QUOTED=2, see src.enums.PurchaseOrderStatus)
-            # per distributor connection at a time — "Add to PO" always finds-or-creates this
-            # row. A quote-failed cart (status=FAILED) isn't covered here since that requires
-            # a subquery a partial index can't express; the application layer
+            # per distributor connection *and order account* at a time — "Add to PO" always
+            # finds-or-creates this row. A quote-failed cart (status=FAILED) isn't covered here
+            # since that requires a subquery a partial index can't express; the application layer
             # (_get_or_create_draft) is responsible for finding and reusing that row too.
+            #
+            # Split into two constraints (rather than one over
+            # ["company", "company_provider", "order_account"]) because Postgres treats every
+            # NULL as distinct from every other NULL in a unique index — a single constraint
+            # including the nullable order_account column would let two open drafts for the
+            # *default* account (order_account=None, still the overwhelming majority of
+            # connections) coexist silently, which is exactly the bug this constraint exists to
+            # prevent. The two conditions partition every PO into exactly one of them.
             django_db_models.UniqueConstraint(
                 fields=["company", "company_provider"],
-                condition=django_db_models.Q(status__in=[1, 2]),
+                condition=django_db_models.Q(status__in=[1, 2], order_account__isnull=True),
                 name="po_one_open_draft_per_company_provider",
+            ),
+            django_db_models.UniqueConstraint(
+                fields=["company", "company_provider", "order_account"],
+                condition=django_db_models.Q(status__in=[1, 2], order_account__isnull=False),
+                name="po_one_open_draft_per_company_provider_order_account",
             ),
         ]
 

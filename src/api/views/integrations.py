@@ -294,6 +294,215 @@ class ProviderConnectionDetailView(views.View):
         )
 
 
+class OrderAccountsView(views.View):
+    """
+    GET  /integrations/connections/<company_provider_id>/order-accounts/ — list every order
+         account for this connection (implicit default + any additional named accounts).
+    POST /integrations/connections/<company_provider_id>/order-accounts/ — add an additional
+         named order account. Body: {"label": "Dropship", "credentials": {...}} — credentials
+         is a flat dict of this provider's order-connection fields (not nested under "order").
+    """
+
+    def get(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
+        if not request.user or not request.user.is_authenticated:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "User not authenticated"}),
+                status=401,
+            )
+
+        company_id = getattr(request, "company_id", None)
+        if not company_id:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "No company found in token"}),
+                status=400,
+            )
+
+        company_provider_id = kwargs.get("company_provider_id")
+        try:
+            cpi = int(company_provider_id)
+        except (TypeError, ValueError):
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Invalid connection ID"}),
+                status=400,
+            )
+
+        data = integrations_services.list_order_accounts(company_id=company_id, company_provider_id=cpi)
+        if data is None:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Connection not found"}),
+                status=404,
+            )
+
+        return http.HttpResponse(
+            headers={"Content-Type": "application/json"},
+            content=simplejson.dumps({"data": data}),
+            status=200,
+        )
+
+    def post(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
+        if not request.user or not request.user.is_authenticated:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "User not authenticated"}),
+                status=401,
+            )
+
+        company_id = getattr(request, "company_id", None)
+        if not company_id:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "No company found in token"}),
+                status=400,
+            )
+
+        company_provider_id = kwargs.get("company_provider_id")
+        try:
+            cpi = int(company_provider_id)
+        except (TypeError, ValueError):
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Invalid connection ID"}),
+                status=400,
+            )
+
+        try:
+            body = json.loads(request.body) if request.body else {}
+        except json.JSONDecodeError:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Invalid JSON body"}),
+                status=400,
+            )
+        if not isinstance(body, dict):
+            body = {}
+
+        data, err, error_code = integrations_services.create_order_account(
+            company_id=company_id,
+            company_provider_id=cpi,
+            label=body.get("label"),
+            credentials=body.get("credentials") or {},
+        )
+        if err:
+            status = 404 if error_code == integrations_services.CONNECTION_ERROR_NOT_FOUND else 400
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": err, "error_code": error_code}),
+                status=status,
+            )
+
+        return http.HttpResponse(
+            headers={"Content-Type": "application/json"},
+            content=simplejson.dumps({"data": data}),
+            status=201,
+        )
+
+
+class OrderAccountDetailView(views.View):
+    """
+    PATCH  /integrations/order-accounts/<order_account_id>/ — {label?, credentials?, active?}
+    DELETE /integrations/order-accounts/<order_account_id>/
+    """
+
+    def patch(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
+        if not request.user or not request.user.is_authenticated:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "User not authenticated"}),
+                status=401,
+            )
+
+        company_id = getattr(request, "company_id", None)
+        if not company_id:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "No company found in token"}),
+                status=400,
+            )
+
+        order_account_id = kwargs.get("order_account_id")
+        try:
+            oai = int(order_account_id)
+        except (TypeError, ValueError):
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Invalid order account ID"}),
+                status=400,
+            )
+
+        try:
+            body = json.loads(request.body) if request.body else {}
+        except json.JSONDecodeError:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Invalid JSON body"}),
+                status=400,
+            )
+        if not isinstance(body, dict):
+            body = {}
+
+        data, err, error_code = integrations_services.update_order_account(
+            company_id=company_id,
+            order_account_id=oai,
+            label=body.get("label"),
+            credentials=body.get("credentials"),
+            active=body.get("active"),
+        )
+        if err:
+            status = 404 if error_code == integrations_services.CONNECTION_ERROR_NOT_FOUND else 400
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": err, "error_code": error_code}),
+                status=status,
+            )
+
+        return http.HttpResponse(
+            headers={"Content-Type": "application/json"},
+            content=simplejson.dumps({"data": data}),
+            status=200,
+        )
+
+    def delete(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
+        if not request.user or not request.user.is_authenticated:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "User not authenticated"}),
+                status=401,
+            )
+
+        company_id = getattr(request, "company_id", None)
+        if not company_id:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "No company found in token"}),
+                status=400,
+            )
+
+        order_account_id = kwargs.get("order_account_id")
+        try:
+            oai = int(order_account_id)
+        except (TypeError, ValueError):
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Invalid order account ID"}),
+                status=400,
+            )
+
+        success, err = integrations_services.delete_order_account(company_id=company_id, order_account_id=oai)
+        if not success:
+            status = 404 if err == "Order account not found" else 400
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": err}),
+                status=status,
+            )
+
+        return http.HttpResponse(status=204)
+
+
 class CompanyProvidersView(views.View):
     def get(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
 

@@ -8,6 +8,8 @@ from src.api.views.integrations import (
     ProviderConnectView,
     ProviderConnectionView,
     ProviderConnectionDetailView,
+    OrderAccountsView,
+    OrderAccountDetailView,
     CompanyProvidersView,
     CompanyProviderDetailView,
     BrandsWithProvidersView,
@@ -64,6 +66,7 @@ from src.api.views.purchase_orders import (
     CartItemsView,
     CartItemDetailView,
     CartReviewView,
+    PurchaseOrderOrderAccountView,
     PurchaseOrdersView,
     PurchaseOrderDetailView,
     PurchaseOrderConfirmedDetailView,
@@ -153,6 +156,16 @@ urlpatterns = [
         "integrations/connections/<int:company_provider_id>/",
         ProviderConnectionView.as_view(),
         name="provider_connection",
+    ),
+    path(
+        "integrations/connections/<int:company_provider_id>/order-accounts/",
+        OrderAccountsView.as_view(),
+        name="order_accounts",
+    ),
+    path(
+        "integrations/order-accounts/<int:order_account_id>/",
+        OrderAccountDetailView.as_view(),
+        name="order_account_detail",
     ),
     path(
         "company-providers/",
@@ -348,6 +361,11 @@ urlpatterns = [
         "purchase-orders/<int:id>/refresh-status/",
         PurchaseOrderRefreshStatusView.as_view(),
         name="purchase_order_refresh_status",
+    ),
+    path(
+        "purchase-orders/<int:id>/order-account/",
+        PurchaseOrderOrderAccountView.as_view(),
+        name="purchase_order_order_account",
     ),
     path(
         "purchase-orders/<int:id>/requote/",

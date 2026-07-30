@@ -270,11 +270,15 @@ def _load_meyer_warehouse_names() -> typing.Dict[str, str]:
 class MeyerOrderAdapter(base.DistributorOrderAdapter):
     provider_kind = src_enums.BrandProviderKind.MEYER.value
 
-    def __init__(self, company_provider: src_models.CompanyProviders) -> None:
-        base.DistributorOrderAdapter.__init__(self, company_provider)
+    def __init__(
+        self,
+        company_provider: src_models.CompanyProviders,
+        order_account: typing.Optional[src_models.CompanyProviderOrderAccount] = None,
+    ) -> None:
+        base.DistributorOrderAdapter.__init__(self, company_provider, order_account)
         environment = getattr(settings, "MEYER_ORDER_ENVIRONMENT", "testing")
         self._client = MeyerOrderApiClient(
-            credentials=credentials_helper.get_order_credentials(company_provider),
+            credentials=credentials_helper.get_order_credentials(company_provider, order_account),
             environment=environment,
         )
 

@@ -498,10 +498,14 @@ def parse_processed_order(processed_order: typing.Optional[typing.List[typing.Di
 class KeystoneOrderAdapter(base.DistributorOrderAdapter):
     provider_kind = src_enums.BrandProviderKind.KEYSTONE.value
 
-    def __init__(self, company_provider: src_models.CompanyProviders) -> None:
-        base.DistributorOrderAdapter.__init__(self, company_provider)
+    def __init__(
+        self,
+        company_provider: src_models.CompanyProviders,
+        order_account: typing.Optional[src_models.CompanyProviderOrderAccount] = None,
+    ) -> None:
+        base.DistributorOrderAdapter.__init__(self, company_provider, order_account)
         self._client = KeystoneOrderApiClient(
-            credentials=credentials_helper.get_order_credentials(company_provider)
+            credentials=credentials_helper.get_order_credentials(company_provider, order_account)
         )
 
     # -- Request building -----------------------------------------------------------------

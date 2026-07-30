@@ -286,8 +286,12 @@ def parse_order_raw_response(raw_response: typing.Optional[typing.Dict]) -> typi
 class PremierOrderAdapter(base.DistributorOrderAdapter):
     provider_kind = src_enums.BrandProviderKind.PREMIER_PERFORMANCE.value
 
-    def __init__(self, company_provider: src_models.CompanyProviders) -> None:
-        base.DistributorOrderAdapter.__init__(self, company_provider)
+    def __init__(
+        self,
+        company_provider: src_models.CompanyProviders,
+        order_account: typing.Optional[src_models.CompanyProviderOrderAccount] = None,
+    ) -> None:
+        base.DistributorOrderAdapter.__init__(self, company_provider, order_account)
         # Was previously omitted entirely, so every call silently defaulted to
         # PremierOrderApiClient's own hardcoded "testing" regardless of
         # settings.PREMIER_ORDER_ENVIRONMENT (already "production" in settings_base.py).
@@ -295,7 +299,7 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
         # Premier's own setting has always defaulted to production, not testing.
         environment = getattr(settings, "PREMIER_ORDER_ENVIRONMENT", "production")
         self._client = PremierOrderApiClient(
-            credentials=credentials_helper.get_order_credentials(company_provider),
+            credentials=credentials_helper.get_order_credentials(company_provider, order_account),
             environment=environment,
         )
 

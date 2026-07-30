@@ -3,6 +3,8 @@ import typing
 
 from django.conf import settings
 from django.core.paginator import Paginator
+from django.db import IntegrityError
+from django.db.models import ProtectedError
 from django.utils import timezone
 
 from src import constants as src_constants
@@ -1214,6 +1216,258 @@ def disconnect_provider(
 
     cp.credentials = creds
     cp.save()
+    return True, None
+
+
+# -- Additional order accounts (src.models.CompanyProviderOrderAccount) ---------------------
+#
+# A connection's normal "Ordering" section (credentials["order"], managed by connect_provider/
+# update_connection/disconnect_provider above) is always the IMPLICIT DEFAULT order account —
+# these functions only ever manage ADDITIONAL, explicitly-named accounts beyond that one (e.g. a
+# company that places its own shop's orders through one Keystone account and drop-ships through
+# a second). See CompanyProviderOrderAccount's docstring for why credentials are never migrated
+# out of the implicit default into a row here.
+
+
+def _is_default_order_account(
+    cp: src_models.CompanyProviders, account: src_models.CompanyProviderOrderAccount
+) -> bool:
+    """True if ``account`` is the one get_order_credentials would pick when no account is
+    explicitly requested — i.e. there's no implicit default AND this is the earliest-created
+    active additional account. Purely informational (see list_order_accounts)."""
+    if (cp.credentials or {}).get("order"):
+        return False
+    earliest = cp.order_accounts.filter(active=True).order_by("created_at").first()
+    return bool(earliest and earliest.id == account.id)
+
+
+def _serialize_order_account(
+    catalog_entry: typing.Dict[str, typing.Any], account: src_models.CompanyProviderOrderAccount
+) -> typing.Dict[str, typing.Any]:
+    credentials, secrets_configured = _redacted_credentials(
+        catalog_entry.get("order_connection_required_fields") or [],
+        catalog_entry.get("order_connection_optional_fields") or [],
+        account.credentials,
+    )
+    return {
+        "id": account.id,
+        "company_provider_id": account.company_provider_id,
+        "label": account.label,
+        "active": account.active,
+        "credentials": credentials,
+        "secrets_configured": secrets_configured,
+        "created_at": account.created_at.isoformat() if account.created_at else None,
+        "updated_at": account.updated_at.isoformat() if account.updated_at else None,
+    }
+
+
+def list_order_accounts(company_id: int, company_provider_id: int) -> typing.Optional[typing.List[typing.Dict]]:
+    """
+    Every order account for this connection, for the Settings > Integrations "Ordering
+    accounts" management list: the implicit default (``id: None``, whatever was entered through
+    the connection's normal "Ordering" section) when configured, followed by any additional
+    named accounts, oldest first. Returns None if the connection doesn't exist for this company.
+    """
+    cp = (
+        src_models.CompanyProviders.objects.filter(id=company_provider_id, company_id=company_id)
+        .select_related("provider")
+        .first()
+    )
+    if not cp or not cp.provider:
+        return None
+    catalog_entry = _get_catalog_entry_for_provider(cp.provider_id) or {}
+
+    has_implicit_default = bool((cp.credentials or {}).get("order"))
+    accounts: typing.List[typing.Dict[str, typing.Any]] = []
+    if has_implicit_default:
+        default_credentials, default_secrets = _redacted_credentials(
+            catalog_entry.get("order_connection_required_fields") or [],
+            catalog_entry.get("order_connection_optional_fields") or [],
+            (cp.credentials or {}).get("order"),
+        )
+        accounts.append(
+            {
+                "id": None,
+                "company_provider_id": cp.id,
+                "label": "Default",
+                "active": True,
+                "is_default": True,
+                "credentials": default_credentials,
+                "secrets_configured": default_secrets,
+                "created_at": cp.created_at.isoformat() if cp.created_at else None,
+                "updated_at": cp.updated_at.isoformat() if cp.updated_at else None,
+            }
+        )
+    for i, account in enumerate(cp.order_accounts.order_by("created_at")):
+        row = _serialize_order_account(catalog_entry, account)
+        row["is_default"] = account.active and not has_implicit_default and i == 0
+        accounts.append(row)
+    return accounts
+
+
+def create_order_account(
+    company_id: int,
+    company_provider_id: int,
+    label: str,
+    credentials: typing.Dict[str, typing.Any],
+) -> typing.Tuple[typing.Optional[typing.Dict], typing.Optional[str], typing.Optional[str]]:
+    """
+    Adds an ADDITIONAL named order account to a connection. ``credentials`` is a flat dict of
+    this provider's order-connection fields (same fields as the "order" namespace in
+    connect_provider/update_connection, NOT nested under "order" again since it's already
+    scoped by this endpoint) — validated live the same way, before being saved. Returns
+    (data, error_message, error_code); error_code is one of the ``CONNECTION_ERROR_*``
+    constants, for the frontend to branch on.
+    """
+    label = (label or "").strip()
+    if not label:
+        return None, "label is required.", CONNECTION_ERROR_INVALID_INPUT
+    if label.lower() == "default":
+        return (
+            None,
+            'The name "Default" is reserved for the connection\'s own Ordering credentials.',
+            CONNECTION_ERROR_INVALID_INPUT,
+        )
+
+    cp = (
+        src_models.CompanyProviders.objects.filter(id=company_provider_id, company_id=company_id)
+        .select_related("provider")
+        .first()
+    )
+    if not cp or not cp.provider:
+        return None, "Connection not found", CONNECTION_ERROR_NOT_FOUND
+
+    catalog_entry = _get_catalog_entry_for_provider(cp.provider_id)
+    if not catalog_entry:
+        return None, "Provider not found in catalog", CONNECTION_ERROR_NOT_FOUND
+
+    order_required = [str(f) for f in (catalog_entry.get("order_connection_required_fields") or [])]
+    order_optional = [str(f) for f in (catalog_entry.get("order_connection_optional_fields") or [])]
+    if not order_required and not order_optional:
+        return (
+            None,
+            "{} doesn't support additional order accounts yet.".format(cp.provider.name),
+            CONNECTION_ERROR_INVALID_INPUT,
+        )
+
+    creds: typing.Dict[str, typing.Any] = {}
+    err, err_code = _merge_namespace_credentials(creds, order_required, order_optional, credentials)
+    if err:
+        return None, err, err_code
+    missing = [f for f in order_required if not _normalize_credential_value(creds.get(f))]
+    if missing:
+        return None, "Missing required fields: {}".format(", ".join(missing)), CONNECTION_ERROR_MISSING_FIELDS
+
+    validated, val_error, val_error_code = _validate_order_connection(cp.provider.kind, creds)
+    if val_error:
+        return None, val_error, val_error_code
+
+    try:
+        account = src_models.CompanyProviderOrderAccount.objects.create(
+            company_provider=cp, label=label, credentials=creds
+        )
+    except IntegrityError:
+        return (
+            None,
+            'An order account named "{}" already exists for this connection.'.format(label),
+            CONNECTION_ERROR_INVALID_INPUT,
+        )
+
+    result = _serialize_order_account(catalog_entry, account)
+    result["is_default"] = _is_default_order_account(cp, account)
+    result["connection_validated"] = validated
+    return result, None, None
+
+
+def update_order_account(
+    company_id: int,
+    order_account_id: int,
+    label: typing.Optional[str] = None,
+    credentials: typing.Optional[typing.Dict[str, typing.Any]] = None,
+    active: typing.Optional[bool] = None,
+) -> typing.Tuple[typing.Optional[typing.Dict], typing.Optional[str], typing.Optional[str]]:
+    """Partial update of an additional order account — any of label/credentials/active may be
+    omitted to leave it unchanged. ``credentials`` is merged onto the stored dict the same way
+    update_connection merges "order" (non-empty values overwrite, empty/null for a sensitive
+    field leaves it unchanged), then re-validated live if anything actually changed."""
+    account = (
+        src_models.CompanyProviderOrderAccount.objects.filter(
+            id=order_account_id, company_provider__company_id=company_id
+        )
+        .select_related("company_provider__provider")
+        .first()
+    )
+    if not account:
+        return None, "Order account not found", CONNECTION_ERROR_NOT_FOUND
+
+    cp = account.company_provider
+    catalog_entry = _get_catalog_entry_for_provider(cp.provider_id)
+    if not catalog_entry:
+        return None, "Provider not found in catalog", CONNECTION_ERROR_NOT_FOUND
+
+    validated = None
+    if credentials:
+        order_required = [str(f) for f in (catalog_entry.get("order_connection_required_fields") or [])]
+        order_optional = [str(f) for f in (catalog_entry.get("order_connection_optional_fields") or [])]
+        creds = dict(account.credentials or {})
+        err, err_code = _merge_namespace_credentials(creds, order_required, order_optional, credentials)
+        if err:
+            return None, err, err_code
+        missing = [f for f in order_required if not _normalize_credential_value(creds.get(f))]
+        if missing:
+            return None, "Missing required fields: {}".format(", ".join(missing)), CONNECTION_ERROR_MISSING_FIELDS
+        validated, val_error, val_error_code = _validate_order_connection(cp.provider.kind, creds)
+        if val_error:
+            return None, val_error, val_error_code
+        account.credentials = creds
+
+    if label is not None:
+        label = label.strip()
+        if not label:
+            return None, "label is required.", CONNECTION_ERROR_INVALID_INPUT
+        if label.lower() == "default":
+            return (
+                None,
+                'The name "Default" is reserved for the connection\'s own Ordering credentials.',
+                CONNECTION_ERROR_INVALID_INPUT,
+            )
+        account.label = label
+
+    if active is not None:
+        account.active = bool(active)
+
+    try:
+        account.save()
+    except IntegrityError:
+        return (
+            None,
+            'An order account named "{}" already exists for this connection.'.format(account.label),
+            CONNECTION_ERROR_INVALID_INPUT,
+        )
+
+    result = _serialize_order_account(catalog_entry, account)
+    result["is_default"] = _is_default_order_account(cp, account)
+    if validated is not None:
+        result["connection_validated"] = validated
+    return result, None, None
+
+
+def delete_order_account(company_id: int, order_account_id: int) -> typing.Tuple[bool, typing.Optional[str]]:
+    """
+    Deletes an additional order account. Blocked (rather than silently orphaning history) while
+    any PurchaseOrder still references it — PurchaseOrder.order_account is on_delete=PROTECT for
+    exactly this reason; a company that no longer wants an account with order history should
+    deactivate it via update_order_account(active=False) instead of deleting it.
+    """
+    account = src_models.CompanyProviderOrderAccount.objects.filter(
+        id=order_account_id, company_provider__company_id=company_id
+    ).first()
+    if not account:
+        return False, "Order account not found"
+    try:
+        account.delete()
+    except ProtectedError:
+        return False, "This account has order history and can't be deleted — deactivate it instead."
     return True, None
 
 

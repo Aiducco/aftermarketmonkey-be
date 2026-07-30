@@ -74,9 +74,12 @@ class CartView(views.View):
 
 
 class CartItemsView(views.View):
-    """POST /purchase-orders/cart/items/ — {provider_id, master_part_id, quantity}.
-    Both ids are exactly what GET /parts/<id>/ already returns (providers[].provider_id and
-    the part's own id) — no separate lookup needed to add something to the cart."""
+    """POST /purchase-orders/cart/items/ — {provider_id, master_part_id, quantity,
+    order_account_id?}. Both ids are exactly what GET /parts/<id>/ already returns
+    (providers[].provider_id and the part's own id) — no separate lookup needed to add
+    something to the cart. ``order_account_id`` is only relevant when GET
+    .../purchase-orders/capabilities/ reports more than one entry in that connection's
+    order_accounts — omit it (or pass null) to use the implicit default account."""
 
     def post(self, request: http.HttpRequest, *args, **kwargs) -> http.HttpResponse:
         company_id, user_id, err = _require_auth(request)
@@ -93,6 +96,7 @@ class CartItemsView(views.View):
                 provider_id=body.get("provider_id"),
                 master_part_id=body.get("master_part_id"),
                 quantity=body.get("quantity"),
+                order_account_id=body.get("order_account_id"),
             )
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e))
@@ -184,6 +188,38 @@ class CartReviewView(views.View):
             return _error_response("Error reviewing cart", status=500)
 
         return _json_response(result, status=200)
+
+
+class PurchaseOrderOrderAccountView(views.View):
+    """PATCH /purchase-orders/<id>/order-account/ — {order_account_id}. Moves an existing
+    cart-side PO (DRAFT/QUOTED/FAILED) to a different order account of the same distributor
+    connection — pass null to move it back to the implicit default account. Only valid before
+    submission; see set_cart_order_account's docstring."""
+
+    def patch(self, request: http.HttpRequest, *args, **kwargs) -> http.HttpResponse:
+        company_id, _user_id, err = _require_auth(request)
+        if err:
+            return err
+        body, err = _parse_json_body(request)
+        if err:
+            return err
+
+        purchase_order_id = kwargs.get("id")
+        try:
+            result = purchase_orders_services.set_cart_order_account(
+                company_id=company_id,
+                purchase_order_id=purchase_order_id,
+                order_account_id=body.get("order_account_id"),
+            )
+        except purchase_orders_services.PurchaseOrderServiceError as e:
+            return _error_response(str(e))
+        except Exception:
+            logger.exception(
+                "{} Error reassigning order account for purchase_order_id={}".format(_LOG_PREFIX, purchase_order_id)
+            )
+            return _error_response("Error reassigning order account", status=500)
+
+        return _json_response(result)
 
 
 class PurchaseOrdersView(views.View):

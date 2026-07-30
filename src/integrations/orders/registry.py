@@ -39,10 +39,17 @@ def supports_ordering(provider_kind: int) -> bool:
 
 def get_adapter(
     company_provider: src_models.CompanyProviders,
+    order_account: typing.Optional[src_models.CompanyProviderOrderAccount] = None,
 ) -> typing.Optional[base.DistributorOrderAdapter]:
     """
+    ``order_account``, when given, selects which of this connection's order accounts the
+    returned adapter places orders through (see base.DistributorOrderAdapter) — leave None to
+    use the connection's implicit default account, which is what every caller meant before
+    multi-account support existed and is still correct for the overwhelming majority of
+    connections (single account).
+
     Returns None both when no adapter is registered for this provider kind AND when one is
-    registered but this connection's order credentials are missing/invalid — adapter
+    registered but the selected account's order credentials are missing/invalid — adapter
     constructors raise ValueError in the latter case (e.g. KeystoneOrderApiClient requires
     account_number/security_key), and letting that propagate here would crash every caller
     that expects "no adapter" to be a normal, handleable outcome (job processing, capability
@@ -54,7 +61,7 @@ def get_adapter(
     if adapter_cls is None:
         return None
     try:
-        return adapter_cls(company_provider)
+        return adapter_cls(company_provider, order_account)
     except ValueError:
         logger.info(
             "Order adapter for provider kind=%s company_provider_id=%s could not be "

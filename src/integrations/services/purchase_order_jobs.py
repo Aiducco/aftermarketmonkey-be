@@ -809,14 +809,14 @@ def _resolve_po_and_adapter(
     None/partial) when resolution failed — same lookup used by both the job runner and the
     synchronous quote path so they fail the same way."""
     po = (
-        src_models.PurchaseOrder.objects.select_related("company_provider__provider")
+        src_models.PurchaseOrder.objects.select_related("company_provider__provider", "order_account")
         .filter(id=purchase_order_id)
         .first()
     )
     if not po:
         return None, None, "PurchaseOrder no longer exists."
 
-    adapter = order_registry.get_adapter(po.company_provider)
+    adapter = order_registry.get_adapter(po.company_provider, po.order_account)
     if adapter is None:
         return po, None, order_registry.get_adapter_unavailable_reason(po.company_provider)
 
