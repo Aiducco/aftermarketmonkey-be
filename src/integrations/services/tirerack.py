@@ -49,7 +49,11 @@ def _clean(value: typing.Any) -> typing.Optional[str]:
     if value is None:
         return None
     s = str(value).strip()
-    return s or None
+    if not s or s.lower() == "none":
+        # The feed itself uses the literal text "None" as its placeholder for "no warranty"
+        # (confirmed on real rows, e.g. Road Hazard Warranty) -- treat it the same as blank.
+        return None
+    return s
 
 
 def _safe_decimal(value: typing.Any) -> typing.Optional[Decimal]:
