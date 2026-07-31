@@ -9,6 +9,7 @@ import pgbulk
 
 from django.conf import settings
 from django.db import connection
+from django.db.models import Count, ProtectedError
 from django.db.models.functions import Upper
 from django.utils import timezone
 
@@ -501,6 +502,111 @@ def resolve_wheelpros_bucket_brands(dry_run: bool = True) -> typing.Dict[str, in
             time.sleep(PREMIER_PGBULK_BATCH_DELAY_SECONDS)
 
     logger.info("{} Wrote brand_override for {} rows.".format(_LOG_PREFIX, len(resolved_by_row_id)))
+    return summary
+
+
+def cleanup_premier_brand_override_orphans() -> typing.Dict[str, int]:
+    """
+    Companion to resolve_wheelpros_bucket_brands(): once a corrected PremierParts row's
+    ProviderPart is re-synced onto the right MasterPart (see
+    master_parts._ingest_premier_parts_for_mapped_brands), the OLD ProviderPart it used to
+    resolve to before the correction is left behind -- pgbulk.upsert's conflict target there is
+    (master_part, provider), not provider_external_id alone, so a row whose resolved master_part
+    changes creates a NEW ProviderPart rather than updating the old (wrong-branded) one in place.
+    Confirmed live: 5,649 duplicate provider_external_id pairs after the first real run.
+
+    Deletes the stale (lower id / older) ProviderPart in each duplicate pair, then any
+    MasterPart left with zero remaining ProviderPart rows as a result (the "Wheel Pros"-branded
+    duplicate the stale row belonged to). Rows with real order history
+    (PurchaseOrderLineItem.provider_part is on_delete=PROTECT) are left in place and logged
+    rather than raising -- those need manual review, not an automatic delete.
+
+    Safe to re-run any time resolve_wheelpros_bucket_brands() + a master-parts re-sync resolves
+    more rows later.
+    """
+    logger.info("{} Cleaning up stale ProviderPart/MasterPart rows after brand_override.".format(_LOG_PREFIX))
+
+    premier_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.PREMIER_PERFORMANCE.value,
+    ).first()
+    if not premier_provider:
+        logger.info("{} Premier provider not found.".format(_LOG_PREFIX))
+        return {}
+
+    dupes = (
+        src_models.ProviderPart.objects.filter(provider=premier_provider)
+        .values("provider_external_id")
+        .annotate(cnt=Count("id"))
+        .filter(cnt__gt=1)
+        .values_list("provider_external_id", flat=True)
+    )
+    dupe_ext_ids = list(dupes)
+    if not dupe_ext_ids:
+        logger.info("{} No duplicate ProviderPart rows found.".format(_LOG_PREFIX))
+        return {"deleted_provider_parts": 0, "protected_provider_parts": 0, "deleted_master_parts": 0}
+
+    logger.info("{} Found {} duplicate provider_external_id groups.".format(_LOG_PREFIX, len(dupe_ext_ids)))
+
+    stale_provider_part_ids: typing.List[int] = []
+    candidate_master_part_ids: typing.Set[int] = set()
+    batch_size = 2000
+    for i in range(0, len(dupe_ext_ids), batch_size):
+        chunk = dupe_ext_ids[i : i + batch_size]
+        pps = list(
+            src_models.ProviderPart.objects.filter(
+                provider=premier_provider, provider_external_id__in=chunk,
+            ).values("id", "provider_external_id", "master_part_id").order_by("provider_external_id", "id")
+        )
+        by_ext_id: typing.Dict[str, typing.List[typing.Dict]] = {}
+        for pp in pps:
+            by_ext_id.setdefault(pp["provider_external_id"], []).append(pp)
+        for ext_id, group in by_ext_id.items():
+            if len(group) <= 1:
+                continue
+            # Keep the newest (highest id -- created by the most recent sync, reflecting the
+            # corrected brand); everything else in the group is stale.
+            for stale in group[:-1]:
+                stale_provider_part_ids.append(stale["id"])
+                candidate_master_part_ids.add(stale["master_part_id"])
+
+    deleted_provider_parts = 0
+    protected_provider_parts = 0
+    for pp_id in stale_provider_part_ids:
+        try:
+            src_models.ProviderPart.objects.filter(id=pp_id).delete()
+            deleted_provider_parts += 1
+        except ProtectedError:
+            protected_provider_parts += 1
+            logger.warning(
+                "{} ProviderPart id={} has protected order history -- left in place.".format(
+                    _LOG_PREFIX, pp_id,
+                )
+            )
+
+    deleted_master_parts = 0
+    if candidate_master_part_ids:
+        orphaned_master_part_ids = list(
+            src_models.MasterPart.objects.filter(
+                id__in=candidate_master_part_ids, provider_parts__isnull=True,
+            ).values_list("id", flat=True)
+        )
+        if orphaned_master_part_ids:
+            try:
+                src_models.MasterPart.objects.filter(id__in=orphaned_master_part_ids).delete()
+                deleted_master_parts = len(orphaned_master_part_ids)
+            except ProtectedError:
+                logger.warning(
+                    "{} Some orphaned MasterParts have protected references -- left in place.".format(
+                        _LOG_PREFIX,
+                    )
+                )
+
+    summary = {
+        "deleted_provider_parts": deleted_provider_parts,
+        "protected_provider_parts": protected_provider_parts,
+        "deleted_master_parts": deleted_master_parts,
+    }
+    logger.info("{} Cleanup summary: {}".format(_LOG_PREFIX, summary))
     return summary
 
 
