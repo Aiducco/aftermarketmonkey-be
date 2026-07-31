@@ -427,16 +427,24 @@ def resolve_wheelpros_bucket_brands(dry_run: bool = True) -> typing.Dict[str, in
             how = "compact"
         if not brand:
             parts = normalize_upper_words(phrase).split()
+            # Fuzzy word-prefix matching is safe for a distributor's own clean single feed-brand
+            # label (every other sync's use case) but risky for a free-text description phrase --
+            # confirmed live that a single-word phrase can coincidentally prefix-match an
+            # unrelated multi-word Brand (e.g. wheel style name "DAGGER" false-matched brand
+            # "DAGGER KAYAKS"). Requiring >=2 words keeps the fuzzy phase for genuine multi-word
+            # brand phrases (e.g. "MOTO METAL", "OHTSU FP") without that single-token collision
+            # risk; a real 1-word brand can still resolve via the exact/compact phases above.
             candidates: typing.List[src_models.Brands] = []
-            if parts:
-                candidates = list(brands_first_index.get(parts[0], ()))
-            if not candidates:
-                if all_brands_fallback is None:
-                    all_brands_fallback = list(
-                        src_models.Brands.objects.only("id", "name", "aaia_code").order_by("id")
-                    )
-                candidates = all_brands_fallback
-            brand = best_fuzzy_brand_match(phrase, candidates)
+            if len(parts) >= 2:
+                if parts:
+                    candidates = list(brands_first_index.get(parts[0], ()))
+                if not candidates:
+                    if all_brands_fallback is None:
+                        all_brands_fallback = list(
+                            src_models.Brands.objects.only("id", "name", "aaia_code").order_by("id")
+                        )
+                    candidates = all_brands_fallback
+            brand = best_fuzzy_brand_match(phrase, candidates) if candidates else None
             how = "fuzzy"
         if brand and brand.id == wheelpros_catalog_brand_id:
             # Matched right back to "Wheel Pros" itself -- not a correction, skip.
