@@ -344,10 +344,15 @@ def get_distributor_credentials_info() -> dict:
             "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("DLG") or None,
         },
         "vossen": {
-            "required": [src_constants.VOSSEN_CREDENTIALS_FEED_URL],
+            "required": [
+                src_constants.VOSSEN_CREDENTIALS_FEED_URL,
+                src_constants.VOSSEN_CREDENTIALS_DISCOUNT_PERCENT,
+            ],
             "description": (
                 "Vossen AfterMarket.aspx CSV feed URL (feed_url) per company. Catalog uses the "
-                "primary connection; per-company pricing loads each company's own feed_url."
+                "primary connection; per-company pricing loads each company's own feed_url. "
+                "discount_percent: percent off the feed's list price (0-100) that is your dealer "
+                "cost; cost = price * (1 - discount_percent / 100)."
             ),
             "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("VOSSEN", "Vossen"),
             "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("VOSSEN") or None,

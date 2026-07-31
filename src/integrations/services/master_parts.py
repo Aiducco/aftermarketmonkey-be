@@ -21,6 +21,7 @@ from src import constants as src_constants
 from src import enums as src_enums
 from src import models as src_models
 from src.integrations import credentials as credentials_helper
+from src.integrations.services.vossen import dealer_cost_from_price as vossen_dealer_cost_from_price
 from src.integrations.services.wheelpros import dealer_cost_from_msrp
 
 logger = logging.getLogger(__name__)
@@ -3436,7 +3437,12 @@ def sync_provider_inventory_from_vossen() -> None:
 
 
 def sync_provider_pricing_from_vossen() -> None:
-    """Sync ProviderPartCompanyPricing from VossenCompanyPricing (per-company rows)."""
+    """
+    Sync ProviderPartCompanyPricing from VossenCompanyPricing (per-company raw feed price).
+    Sets ``cost`` from that price and company ``discount_percent`` (see
+    :func:`src.integrations.services.vossen.dealer_cost_from_price`); ``msrp``/``retail_price``
+    are the raw feed price as-is (no separate MSRP/MAP columns in Vossen's feed).
+    """
     logger.info("{} Syncing provider pricing from Vossen.".format(_LOG_PREFIX))
 
     vossen_provider = src_models.Providers.objects.filter(
@@ -3479,6 +3485,13 @@ def sync_provider_pricing_from_vossen() -> None:
             companies_by_id = {
                 c.id: c for c in src_models.Company.objects.filter(id__in=batch_company_ids)
             }
+            creds_by_company: typing.Dict[int, typing.Dict] = {}
+            if batch_company_ids:
+                for cpr in src_models.CompanyProviders.objects.filter(
+                    company_id__in=batch_company_ids,
+                    provider_id=vossen_provider.id,
+                ):
+                    creds_by_company[cpr.company_id] = credentials_helper.get_feed_credentials(cpr)
             master_keys = []
             for row in batch:
                 brand = vossen_brand_to_brand.get(row.get("part__brand_id"))
@@ -3501,18 +3514,22 @@ def sync_provider_pricing_from_vossen() -> None:
                 provider_part = pp_by_key.get((brand.id, sku))
                 if not provider_part:
                     continue
-                company = companies_by_id.get(row.get("company_id"))
+                cid = row.get("company_id")
+                company = companies_by_id.get(cid)
                 if not company:
                     continue
+                price = row.get("price")
+                creds = creds_by_company.get(cid) if cid is not None else {}
+                cost = vossen_dealer_cost_from_price(price, creds)
                 to_upsert.append(
                     src_models.ProviderPartCompanyPricing(
                         provider_part=provider_part,
                         company=company,
-                        cost=row.get("price"),
+                        cost=cost,
                         jobber_price=None,
                         map_price=None,
-                        msrp=None,
-                        retail_price=None,
+                        msrp=price,
+                        retail_price=price,
                         last_synced_at=now,
                     )
                 )
@@ -5174,6 +5191,11 @@ def sync_provider_pricing_from_vossen_for_company(company_id: int) -> None:
         logger.info("{} No BrandVossenBrandMapping found. Nothing to price.".format(_LOG_PREFIX))
         return
 
+    company_provider = src_models.CompanyProviders.objects.filter(
+        company_id=company_id, provider_id=vossen_provider.id
+    ).first()
+    creds = credentials_helper.get_feed_credentials(company_provider) if company_provider else {}
+
     now = timezone.now()
 
     def _worker(catalog_ids: typing.Set[int]) -> int:
@@ -5226,15 +5248,17 @@ def sync_provider_pricing_from_vossen_for_company(company_id: int) -> None:
                 company = companies_by_id.get(row.get("company_id"))
                 if not company:
                     continue
+                price = row.get("price")
+                cost = vossen_dealer_cost_from_price(price, creds)
                 to_upsert.append(
                     src_models.ProviderPartCompanyPricing(
                         provider_part=provider_part,
                         company=company,
-                        cost=row.get("price"),
+                        cost=cost,
                         jobber_price=None,
                         map_price=None,
-                        msrp=None,
-                        retail_price=None,
+                        msrp=price,
+                        retail_price=price,
                         last_synced_at=now,
                     )
                 )

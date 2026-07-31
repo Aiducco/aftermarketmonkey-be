@@ -490,7 +490,23 @@ def _validate_rough_country_connection(credentials: typing.Dict[str, typing.Any]
     return None, None
 
 
+def _validate_vossen_discount_percent(credentials: typing.Dict[str, typing.Any]) -> typing.Optional[str]:
+    """discount_percent must be a numeric percentage in [0, 100] — see vossen.dealer_cost_from_price."""
+    key = src_constants.VOSSEN_CREDENTIALS_DISCOUNT_PERCENT
+    raw = credentials.get(key)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return "{} must be a number between 0 and 100.".format(key)
+    if not (0 <= value <= 100):
+        return "{} must be between 0 and 100 (got {}).".format(key, raw)
+    return None
+
+
 def _validate_vossen_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
+    discount_error = _validate_vossen_discount_percent(credentials)
+    if discount_error:
+        return discount_error, CONNECTION_ERROR_INVALID_INPUT
     url = credentials.get(src_constants.VOSSEN_CREDENTIALS_FEED_URL)
     try:
         client = vossen_client.VossenFeedClient(file_url=url)

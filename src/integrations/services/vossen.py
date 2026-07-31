@@ -9,11 +9,12 @@ Catalog + stock (VossenPart) sync from the primary/catalog CompanyProvider; per-
 """
 import logging
 import typing
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 import pgbulk
 from django.utils import timezone
 
+from src import constants as src_constants
 from src import enums as src_enums
 from src import models as src_models
 from src.integrations import credentials as credentials_helper
@@ -26,6 +27,11 @@ _LOG_PREFIX = "[VOSSEN-SERVICES]"
 
 # VossenBrand.external_id / name -- always this single value (Vossen is brand == distributor).
 VOSSEN_BRAND_EXTERNAL_ID = "VOSSEN"
+
+# When discount_percent is missing/invalid, treat as 0% off (cost = full feed price) -- unlike
+# WheelPros' 20% default, there's no established business assumption for Vossen's typical dealer
+# discount, so the safe default is "no discount applied" rather than guessing one.
+VOSSEN_DEFAULT_DISCOUNT_PERCENT = Decimal(0)
 
 
 def _safe_int(value: typing.Any) -> typing.Optional[int]:
@@ -51,6 +57,57 @@ def _safe_decimal(value: typing.Any) -> typing.Optional[Decimal]:
 def _safe_str(value: typing.Any) -> typing.Optional[str]:
     s = str(value or "").strip()
     return s or None
+
+
+def _parse_discount_percent(raw: typing.Any) -> typing.Optional[Decimal]:
+    if raw is None or raw == "":
+        return None
+    try:
+        d = Decimal(str(raw).strip())
+    except Exception:
+        return None
+    if d < 0:
+        d = Decimal(0)
+    if d > 100:
+        d = Decimal(100)
+    return d
+
+
+def discount_percent_from_credentials(credentials: typing.Optional[typing.Dict]) -> Decimal:
+    """
+    Discount percent *off* the feed's Price column (0-100), from CompanyProviders.credentials
+    (see src.constants.VOSSEN_CREDENTIALS_DISCOUNT_PERCENT). Missing or unparseable value ->
+    VOSSEN_DEFAULT_DISCOUNT_PERCENT (0%, i.e. no discount) -- connect/update validates this field
+    as required (see _validate_vossen_discount_percent in src.api.services.integrations), so this
+    fallback is only a defensive default for callers that bypass that validation.
+    """
+    creds = credentials or {}
+    pct = _parse_discount_percent(creds.get(src_constants.VOSSEN_CREDENTIALS_DISCOUNT_PERCENT))
+    if pct is None:
+        return VOSSEN_DEFAULT_DISCOUNT_PERCENT
+    return pct
+
+
+def dealer_cost_from_price(
+    price: typing.Any,
+    credentials: typing.Optional[typing.Dict],
+) -> typing.Optional[Decimal]:
+    """
+    ``cost = price * (1 - discount_percent / 100)`` using this company's discount_percent
+    credential. Returns None if ``price`` is missing or invalid. Mirrors
+    src.integrations.services.wheelpros.dealer_cost_from_msrp's shape.
+    """
+    if price is None:
+        return None
+    try:
+        p = price if isinstance(price, Decimal) else Decimal(str(price).strip())
+    except Exception:
+        return None
+    if p < 0:
+        p = Decimal(0)
+    pct = discount_percent_from_credentials(credentials)
+    q = p * (Decimal(1) - pct / Decimal(100))
+    return q.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
 def _vossen_feed_client_for_credentials(

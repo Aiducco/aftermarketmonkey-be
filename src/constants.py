@@ -118,6 +118,11 @@ ROUGH_COUNTRY_CREDENTIALS_FEED_URL = "feed_url"
 # CompanyProviders.credentials JSON key for Vossen: AfterMarket.aspx CSV feed URL (required per connection).
 VOSSEN_CREDENTIALS_FEED_URL = "feed_url"
 VOSSEN_FEED_URL_HOST_PREFIX = "http://inventory.vossenwheels.com/"
+# Percent *off* the feed's Price column (0-100) this company's dealer cost is computed from --
+# cost = Price * (1 - discount_percent / 100). Same shape as WheelPros' wheel_markup/etc (see
+# src.integrations.services.wheelpros.dealer_cost_from_msrp) but a single field since Vossen has
+# only one feed/price column, not a per-category one.
+VOSSEN_CREDENTIALS_DISCOUNT_PERCENT = "discount_percent"
 
 # CompanyProviders.credentials JSON keys for TireRack's SFTP feed (password-only auth --
 # confirmed live that public-key auth fails for this account while password auth succeeds, see
@@ -868,7 +873,7 @@ PROVIDER_CATALOG = [
         "description": "Access Vossen wheel inventory and pricing via their AfterMarket CSV feed.",
         "icon_url": "https://api.aftermarketscout.com/uploads/vossen_logo.png",
         "category": "Distributors",
-        "connection_required_fields": [VOSSEN_CREDENTIALS_FEED_URL],
+        "connection_required_fields": [VOSSEN_CREDENTIALS_FEED_URL, VOSSEN_CREDENTIALS_DISCOUNT_PERCENT],
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
             "<p><strong>Vossen</strong> provides a downloadable CSV inventory feed "
@@ -876,7 +881,11 @@ PROVIDER_CATALOG = [
             "<ol>"
             "<li>Contact your Vossen rep for your dealer <strong>feed URL</strong> — it starts with "
             "<code>{}</code>.</li>"
-            "<li>Paste the full URL into <strong>feed_url</strong> below and save the connection.</li>"
+            "<li>Paste the full URL into <strong>feed_url</strong> below.</li>"
+            "<li>Enter <strong>discount_percent</strong> — the percent <em>off</em> the feed's list "
+            "price (0–100) that is your dealer cost. We derive cost as: "
+            "cost = price &times; (1 &minus; discount_percent / 100).</li>"
+            "<li>Save the connection.</li>"
             "</ol>"
         ).format(VOSSEN_FEED_URL_HOST_PREFIX),
     },
