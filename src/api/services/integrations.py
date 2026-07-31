@@ -744,6 +744,26 @@ def _status_enum_from_stored(
     return src_enums.CompanyProviderConnectionStatus(raw_status)
 
 
+def _order_gating_feed_status_enum(
+    company_provider: src_models.CompanyProviders,
+) -> typing.Optional["src_enums.CompanyProviderConnectionStatus"]:
+    """
+    The feed status order's CONNECTED-vs-WAITING gating should use — CONNECTED whenever
+    ``initial_sync_completed`` is True, regardless of what the narrower ``status`` enum
+    currently holds. ``initial_sync_completed`` is the durable "this feed has synced
+    successfully at least once" fact (see integration_pricing_sync_jobs, which sets it True the
+    moment the first sync completes, at the same time it sets status=CONNECTED); ``status``
+    itself can go back to None afterward for reasons unrelated to the feed actually being
+    broken — e.g. disconnect_provider(namespace="feed") clears status without resetting
+    initial_sync_completed, since the historical fact that a sync once completed doesn't
+    change. Falling back to _status_enum_from_stored(status) alone would then incorrectly gate
+    order status to WAITING for a feed that is, in every functional sense, still connected.
+    """
+    if company_provider.initial_sync_completed:
+        return src_enums.CompanyProviderConnectionStatus.CONNECTED
+    return _status_enum_from_stored(company_provider.status)
+
+
 def _connection_status_fields(
     status: typing.Optional["src_enums.CompanyProviderConnectionStatus"],
     reason: typing.Optional[str],
@@ -956,7 +976,7 @@ def connect_provider(
             validated, status_enum, status_reason = None, None, None
         effective_feed_status_enum = (
             status_enum if feed_fields_touched
-            else _status_enum_from_stored(existing.status if existing else None)
+            else (_order_gating_feed_status_enum(existing) if existing else None)
         )
 
         order_fields_touched = isinstance(credentials, dict) and "order" in credentials
@@ -1006,7 +1026,7 @@ def connect_provider(
             validated, status_enum, status_reason = None, None, None
         effective_feed_status_enum = (
             status_enum if feed_fields_touched
-            else _status_enum_from_stored(existing.status if existing else None)
+            else (_order_gating_feed_status_enum(existing) if existing else None)
         )
 
         # Order credentials are validated separately from feed credentials (different transport,
@@ -1146,7 +1166,7 @@ def update_connection(
         else:
             validated, status_enum, status_reason = None, None, None
         effective_feed_status_enum = (
-            status_enum if feed_fields_touched else _status_enum_from_stored(cp.status)
+            status_enum if feed_fields_touched else _order_gating_feed_status_enum(cp)
         )
 
         order_fields_touched = order_submitted
@@ -1187,7 +1207,7 @@ def update_connection(
         else:
             validated, status_enum, status_reason = None, None, None
         effective_feed_status_enum = (
-            status_enum if feed_fields_touched else _status_enum_from_stored(cp.status)
+            status_enum if feed_fields_touched else _order_gating_feed_status_enum(cp)
         )
 
         # Order credentials validate independently of feed credentials — a failure here rejects
@@ -1293,6 +1313,12 @@ def disconnect_provider(
         cp.status_name = None
         cp.status_reason = None
         cp.status_checked_at = None
+        # Also reset the durable "has synced at least once" fact, not just the narrower status
+        # enum — otherwise a later order-only call would see initial_sync_completed still True
+        # and incorrectly treat this now-disconnected feed as connected for order-gating purposes
+        # (see _order_gating_feed_status_enum). A genuine reconnect re-earns CONNECTED the normal
+        # way once its sync actually completes.
+        cp.initial_sync_completed = False
         # Order can never be CONNECTED once feed isn't — demote rather than clear, since the
         # order credentials themselves are still valid/unaffected by disconnecting feed. Demote
         # the default account's own row too (it's the source of truth for its status now), then
@@ -1572,7 +1598,7 @@ def create_order_account(
             CONNECTION_ERROR_INVALID_INPUT,
         )
 
-    status_enum, reason = _resolve_order_status(True, None, _status_enum_from_stored(cp.status))
+    status_enum, reason = _resolve_order_status(True, None, _order_gating_feed_status_enum(cp))
     _set_order_account_status(account, status_enum, reason)
     if make_default:
         _refresh_default_order_status(cp)
@@ -1631,7 +1657,7 @@ def update_order_account(
         if val_error:
             return None, val_error, val_error_code
         account.credentials = creds
-        status_enum, reason = _resolve_order_status(True, None, _status_enum_from_stored(cp.status))
+        status_enum, reason = _resolve_order_status(True, None, _order_gating_feed_status_enum(cp))
         status_fields = _order_connection_status_fields(status_enum, reason)
         for field, value in status_fields.items():
             setattr(account, field, value)
