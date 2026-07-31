@@ -346,9 +346,23 @@ def run_integration_pricing_sync_job(job: src_models.IntegrationPricingSyncJob) 
         )
         # Order credentials may have already validated fine and been sitting in WAITING because
         # the feed wasn't CONNECTED yet (see CompanyProviderOrderConnectionStatus) — now that it
-        # is, promote them to CONNECTED too. An ERROR order status is left alone; that's a real
-        # credential problem, unrelated to feed sync completing.
+        # is, promote them to CONNECTED too, on both the default CompanyProviderOrderAccount row
+        # (the source of truth for its own status) and this mirror. An ERROR order status is left
+        # alone; that's a real credential problem, unrelated to feed sync completing. Local
+        # imports: avoids a circular import, since src.api.services.integrations already imports
+        # this module (enqueue_company_provider_pricing_sync/should_enqueue_pricing_sync).
         if cp.order_status == src_enums.CompanyProviderOrderConnectionStatus.WAITING.value:
+            from src.api.services import integrations as integrations_services
+            from src.integrations import credentials as credentials_helper
+
+            default_account = credentials_helper.get_default_order_account(cp)
+            if (
+                default_account
+                and default_account.order_status == src_enums.CompanyProviderOrderConnectionStatus.WAITING.value
+            ):
+                integrations_services._set_order_account_status(
+                    default_account, src_enums.CompanyProviderOrderConnectionStatus.CONNECTED, None
+                )
             update_fields.update(
                 order_status=src_enums.CompanyProviderOrderConnectionStatus.CONNECTED.value,
                 order_status_name=src_enums.CompanyProviderOrderConnectionStatus.CONNECTED.name,

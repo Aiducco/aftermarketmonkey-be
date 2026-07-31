@@ -142,11 +142,7 @@ class Command(BaseCommand):
         source of truth (see CompanyProviderOrderAccount's docstring) — then mirrors whichever
         account is currently the connection's default onto CompanyProviders.order_status/..."""
         validator = integrations_services._ORDER_CONNECTION_VALIDATORS[kind]
-        feed_status_enum = (
-            src_enums.CompanyProviderConnectionStatus.CONNECTED
-            if cp.status == src_enums.CompanyProviderConnectionStatus.CONNECTED.value
-            else None
-        )
+        feed_status_enum = integrations_services._order_gating_feed_status_enum(cp)
         any_updated = False
         for account in accounts:
             message, _code = validator(account.credentials)
