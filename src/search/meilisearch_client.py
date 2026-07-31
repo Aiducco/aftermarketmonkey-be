@@ -61,6 +61,12 @@ VEHICLES_FILTERABLE_ATTRIBUTES = ["year", "make", "model", "submodel", "drive_ty
 # disappear from the FE's year dropdown even though the underlying data was always there.
 VEHICLES_MAX_VALUES_PER_FACET = 150
 
+# Same truncation risk as VEHICLES_MAX_VALUES_PER_FACET above, but for brand_name: ~3,400 distinct
+# brands have parts today, well past Meilisearch's default-100 cutoff -- setup_index() below never
+# raised this for the parts index (only setup_vehicles_index() did), so a brand_name facet query
+# would silently drop the vast majority of brands. Sized with headroom above the current count.
+PARTS_MAX_VALUES_PER_FACET = 4000
+
 
 def _get_client():
     """Lazy import to avoid import errors when meilisearch is not installed."""
@@ -94,9 +100,10 @@ def setup_index() -> bool:
 
         index.update_searchable_attributes(SEARCHABLE_ATTRIBUTES)
         index.update_filterable_attributes(FILTERABLE_ATTRIBUTES)
+        index.update_faceting_settings({"maxValuesPerFacet": PARTS_MAX_VALUES_PER_FACET})
 
-        logger.info("Meilisearch index '%s' configured: searchable=%s, filterable=%s",
-                    INDEX_NAME, SEARCHABLE_ATTRIBUTES, FILTERABLE_ATTRIBUTES)
+        logger.info("Meilisearch index '%s' configured: searchable=%s, filterable=%s, maxValuesPerFacet=%s",
+                    INDEX_NAME, SEARCHABLE_ATTRIBUTES, FILTERABLE_ATTRIBUTES, PARTS_MAX_VALUES_PER_FACET)
         return True
     except Exception as e:
         logger.exception("Meilisearch setup failed: %s", str(e))

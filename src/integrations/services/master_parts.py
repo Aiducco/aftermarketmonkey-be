@@ -8383,6 +8383,8 @@ def sync_all_master_parts() -> None:
     sync_derived_from_premier(reindex_meilisearch=False, skip_pricing=True)
     _reclaim_memory()
     sync_derived_from_vossen(reindex_meilisearch=False, skip_pricing=True)
+    _reclaim_memory()
+    sync_derived_from_tirerack(reindex_meilisearch=False, skip_pricing=True)
 
     logger.info("{} Completed full master parts sync.".format(_LOG_PREFIX))
 
