@@ -954,6 +954,19 @@ class PremierParts(django_db_models.Model):
     kit_component_list = django_db_models.TextField(null=True)
     raw_data = django_db_models.JSONField(null=True)
 
+    # Per-PART brand correction, distinct from the per-feed-brand BrandPremierBrandMapping --
+    # confirmed live that Premier's own feed lumps many real manufacturers (Nitto, Falken, Moto
+    # Metal, Niche, American Racing, Toyo, Performance Replicas, ...) under one vendor-name
+    # PremierBrand ("Wheel Pros", the wholesaler Premier resells through), rather than the true
+    # manufacturer. When set, this OVERRIDES the brand a BrandPremierBrandMapping would otherwise
+    # give this specific row (see premier.resolve_wheelpros_bucket_brands, which derives it from
+    # this row's own long_description, and master_parts._ingest_premier_parts_for_mapped_brands,
+    # which prefers it over the feed-brand-level mapping).
+    brand_override = django_db_models.ForeignKey(
+        Brands, on_delete=django_db_models.SET_NULL, null=True, blank=True,
+        related_name="premier_brand_overrides",
+    )
+
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
 

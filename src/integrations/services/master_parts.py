@@ -7524,6 +7524,7 @@ def _ingest_premier_parts_for_mapped_brands(
                 "id",
                 "premier_part_number",
                 "brand_id",
+                "brand_override_id",
                 "mfg_part_number",
                 "long_description",
                 "image_url",
@@ -7539,10 +7540,26 @@ def _ingest_premier_parts_for_mapped_brands(
         master_parts_list: typing.List[src_models.MasterPart] = []
         premier_ext_to_brand_part: typing.Dict[str, typing.Tuple[int, str]] = {}
 
+        # brand_override (see PremierParts docstring / premier.resolve_wheelpros_bucket_brands)
+        # takes precedence over the feed-brand-level BrandPremierBrandMapping for whichever rows
+        # have it set -- fetched once per batch, not per row.
+        override_ids = {row["brand_override_id"] for row in batch if row.get("brand_override_id")}
+        override_brands = (
+            {b.id: b for b in src_models.Brands.objects.filter(id__in=override_ids)}
+            if override_ids else {}
+        )
+
         for row in batch:
-            brand = pr_brand_to_brand.get(row["brand_id"])
-            if not brand:
-                continue
+            override_brand = override_brands.get(row.get("brand_override_id"))
+            if override_brand:
+                brand_id = override_brand.id
+                aaia = override_brand.aaia_code
+            else:
+                brand = pr_brand_to_brand.get(row["brand_id"])
+                if not brand:
+                    continue
+                brand_id = brand.id
+                aaia = pr_brand_to_aaia.get(row["brand_id"])
 
             part_number = row.get("mfg_part_number") or ""
             if isinstance(part_number, str):
@@ -7560,13 +7577,12 @@ def _ingest_premier_parts_for_mapped_brands(
             if not premier_pn:
                 continue
 
-            key = (brand.id, part_number)
+            key = (brand_id, part_number)
             if key not in seen:
                 seen.add(key)
-                aaia = pr_brand_to_aaia.get(row["brand_id"])
                 master_parts_list.append(
                     src_models.MasterPart(
-                        brand=brand,
+                        brand_id=brand_id,
                         part_number=part_number,
                         sku=premier_pn,
                         description=row.get("long_description"),
@@ -7577,7 +7593,7 @@ def _ingest_premier_parts_for_mapped_brands(
                 )
             premier_ext_to_brand_part[
                 _premier_provider_external_id(row["brand_id"], premier_pn)
-            ] = (brand.id, part_number)
+            ] = (brand_id, part_number)
 
         if not master_parts_list:
             connection.close()

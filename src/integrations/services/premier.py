@@ -1,4 +1,5 @@
 import logging
+import re
 import time
 import typing
 from decimal import Decimal
@@ -310,6 +311,178 @@ def sync_unmapped_premier_brands_to_brands() -> typing.List[src_models.PremierBr
         )
     )
     return unmapped
+
+
+_LEADING_BRAND_PHRASE_RE = re.compile(r"^([A-Za-z][A-Za-z.'&]*(?:\s+[A-Za-z][A-Za-z.'&]*)*)")
+
+
+def _leading_brand_phrase(description: typing.Optional[str]) -> typing.Optional[str]:
+    """
+    Extracts the leading run of pure-alphabetic word(s) from a Premier "Long Description" string,
+    stopping at the first token containing a digit or other non-letter character (sizes, part
+    numbers, style codes). E.g. "Nitto TRAIL GRAP LT285 70R16..." -> "Nitto TRAIL GRAP",
+    "MOTO METAL 975 MO975..." -> "MOTO METAL", "255/35ZR18 FK-452..." -> None (no leading words
+    at all). Deliberately includes trailing model-name words (e.g. "TRAIL GRAP") rather than
+    trying to isolate just the brand -- fuzzy_brand_name_matches/word_prefix_align already handle
+    a longer candidate phrase correctly as long as the true brand name is a strict word-prefix of
+    it, which holds for every real case checked live.
+    """
+    if not description:
+        return None
+    m = _LEADING_BRAND_PHRASE_RE.match(description.strip())
+    if not m:
+        return None
+    phrase = m.group(1).strip()
+    return phrase or None
+
+
+def resolve_wheelpros_bucket_brands(dry_run: bool = True) -> typing.Dict[str, int]:
+    """
+    Premier's own feed lumps many distinct real manufacturers (Nitto, Falken, Moto Metal, Niche,
+    American Racing, Toyo, Performance Replicas, Motegi, MSA, Ohtsu, DUB, Asanti, XD, TSW, ...)
+    under one vendor-name PremierBrand called "Wheel Pros" (the wholesale distributor Premier
+    resells through) instead of the true manufacturer -- confirmed live against real rows,
+    ~14,294 parts. Each row's own ``long_description`` reliably names the true manufacturer as
+    its leading word(s) (see :func:`_leading_brand_phrase`).
+
+    Resolves each PremierParts row under that bucket INDEPENDENTLY against the Brands catalog,
+    using the exact same exact-name -> compact-key -> fuzzy word-prefix cascade every other
+    provider's brand sync uses (see src.integrations.utils.brand_matching) -- but, unlike those,
+    never creates a new Brand for a row that doesn't resolve: a noisy free-text leading phrase is
+    a much less reliable signal than a distributor's own clean single feed-brand label, so an
+    unresolved row is left exactly as today (attributed to "Wheel Pros") rather than guessing.
+
+    Writes to PremierParts.brand_override, which
+    master_parts._ingest_premier_parts_for_mapped_brands prefers over the (wrong) feed-brand-level
+    mapping for just these rows. dry_run=True (default) performs no writes -- logs match-type
+    counts and a sample of resolved (part_number, phrase, matched brand) triples for review.
+    """
+    logger.info(
+        "{} Resolving per-part brands for the Wheel Pros bucket{}.".format(
+            _LOG_PREFIX, " (dry run)" if dry_run else "",
+        )
+    )
+
+    wheelpros_premier_brand = src_models.PremierBrand.objects.filter(name__iexact="Wheel Pros").first()
+    if not wheelpros_premier_brand:
+        logger.info("{} No \"Wheel Pros\" PremierBrand found.".format(_LOG_PREFIX))
+        return {}
+
+    rows = list(
+        src_models.PremierParts.objects.filter(
+            brand_id=wheelpros_premier_brand.id, brand_override__isnull=True,
+        )
+        .exclude(long_description__isnull=True)
+        .exclude(long_description="")
+        .values("id", "premier_part_number", "long_description")
+        .iterator(chunk_size=2000)
+    )
+
+    phrase_by_row_id: typing.Dict[int, str] = {}
+    for row in rows:
+        phrase = _leading_brand_phrase(row["long_description"])
+        if phrase:
+            phrase_by_row_id[row["id"]] = phrase
+
+    if not phrase_by_row_id:
+        logger.info("{} No Wheel Pros rows with a leading brand phrase to resolve.".format(_LOG_PREFIX))
+        return {}
+
+    phrase_upper_keys = {phrase.strip().upper() for phrase in phrase_by_row_id.values()}
+    brands_by_upper_name: typing.Dict[str, src_models.Brands] = {}
+    for b in (
+        src_models.Brands.objects.annotate(_name_u=Upper("name"))
+        .filter(_name_u__in=phrase_upper_keys)
+        .order_by("id")
+    ):
+        key = (b.name or "").strip().upper()
+        if key not in brands_by_upper_name:
+            brands_by_upper_name[key] = b
+
+    compact_index = brands_by_compact_key()
+    brands_first_index = brands_by_first_token_upper()
+    all_brands_fallback: typing.Optional[typing.List[src_models.Brands]] = None
+
+    resolved_by_row_id: typing.Dict[int, src_models.Brands] = {}
+    exact_matches = 0
+    compact_matches = 0
+    fuzzy_matches = 0
+    samples: typing.List[typing.Tuple[str, str, str, str]] = []
+
+    for row_id, phrase in phrase_by_row_id.items():
+        nm = phrase.strip().upper()
+        brand = brands_by_upper_name.get(nm)
+        how = "exact"
+        if not brand:
+            key = normalize_compact_key(phrase)
+            brand = compact_index.get(key) if key else None
+            how = "compact"
+        if not brand:
+            parts = normalize_upper_words(phrase).split()
+            candidates: typing.List[src_models.Brands] = []
+            if parts:
+                candidates = list(brands_first_index.get(parts[0], ()))
+            if not candidates:
+                if all_brands_fallback is None:
+                    all_brands_fallback = list(
+                        src_models.Brands.objects.only("id", "name", "aaia_code").order_by("id")
+                    )
+                candidates = all_brands_fallback
+            brand = best_fuzzy_brand_match(phrase, candidates)
+            how = "fuzzy"
+        if brand:
+            resolved_by_row_id[row_id] = brand
+            if how == "exact":
+                exact_matches += 1
+            elif how == "compact":
+                compact_matches += 1
+            else:
+                fuzzy_matches += 1
+            if len(samples) < 40:
+                samples.append((how, row_id, phrase, brand.name))
+
+    for how, row_id, phrase, brand_name in samples:
+        logger.info(
+            "{} [{}{}] row_id={} phrase={!r} -> Brand {!r}".format(
+                _LOG_PREFIX, how, " dry-run" if dry_run else "", row_id, phrase, brand_name,
+            )
+        )
+
+    unresolved = len(phrase_by_row_id) - len(resolved_by_row_id)
+    summary = {
+        "candidates": len(phrase_by_row_id),
+        "exact_matches": exact_matches,
+        "compact_matches": compact_matches,
+        "fuzzy_matches": fuzzy_matches,
+        "resolved": len(resolved_by_row_id),
+        "unresolved": unresolved,
+    }
+    logger.info("{} Summary: {}".format(_LOG_PREFIX, summary))
+
+    if dry_run or not resolved_by_row_id:
+        return summary
+
+    items = list(resolved_by_row_id.items())
+    for i in range(0, len(items), PREMIER_PGBULK_BATCH_SIZE):
+        batch = items[i : i + PREMIER_PGBULK_BATCH_SIZE]
+        values = [(row_id, brand.id) for row_id, brand in batch]
+        placeholders = ", ".join(["(%s::bigint, %s::bigint)"] * len(values))
+        params = [x for t in values for x in t]
+        with connection.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE premier_parts pp SET brand_override_id = v.brand_override_id
+                FROM (VALUES {}) AS v(id, brand_override_id)
+                WHERE pp.id = v.id::bigint
+                """.format(placeholders),
+                params,
+            )
+        connection.close()
+        if i + PREMIER_PGBULK_BATCH_SIZE < len(items):
+            time.sleep(PREMIER_PGBULK_BATCH_DELAY_SECONDS)
+
+    logger.info("{} Wrote brand_override for {} rows.".format(_LOG_PREFIX, len(resolved_by_row_id)))
+    return summary
 
 
 def _pgbulk_upsert_premier_parts_batches(
