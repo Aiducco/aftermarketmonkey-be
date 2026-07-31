@@ -805,6 +805,24 @@ def _resolve_order_status(
     return None, None
 
 
+def _set_order_account_status(
+    account: src_models.CompanyProviderOrderAccount,
+    status: typing.Optional["src_enums.CompanyProviderOrderConnectionStatus"],
+    reason: typing.Optional[str],
+) -> None:
+    """
+    Sets order_status/order_status_name/order_status_reason/order_status_checked_at on ONE
+    CompanyProviderOrderAccount row — this is the source of truth for order status per account
+    (including the default's own row; see the model docstring). Callers that also need
+    CompanyProviders.order_status* kept in sync for the default account should follow this with
+    :func:`_refresh_default_order_status`.
+    """
+    status_fields = _order_connection_status_fields(status, reason)
+    for field, value in status_fields.items():
+        setattr(account, field, value)
+    account.save(update_fields=list(status_fields.keys()) + ["updated_at"])
+
+
 def _validate_and_resolve_order_status(
     kind: int,
     order_creds: typing.Optional[typing.Dict[str, typing.Any]],
@@ -1036,7 +1054,7 @@ def connect_provider(
             **status_fields,
         )
     if order_fields_touched:
-        _sync_default_order_account(cp, order_creds_to_sync or {})
+        _sync_default_order_account(cp, order_creds_to_sync or {}, order_status_enum, order_status_reason)
 
     # Only (re-)enqueue a pricing sync when feed was actually part of this request (or the
     # initial sync hasn't completed yet) — an order-only save has nothing to do with the feed
@@ -1199,7 +1217,7 @@ def update_connection(
         setattr(cp, field, value)
     cp.save()
     if order_fields_touched:
-        _sync_default_order_account(cp, order_creds_to_sync or {})
+        _sync_default_order_account(cp, order_creds_to_sync or {}, order_status_enum, order_status_reason)
 
     # Only (re-)enqueue a pricing sync when feed was actually part of this request (or the
     # initial sync hasn't completed yet) — an order-only PATCH has nothing to do with the feed
@@ -1276,7 +1294,16 @@ def disconnect_provider(
         cp.status_reason = None
         cp.status_checked_at = None
         # Order can never be CONNECTED once feed isn't — demote rather than clear, since the
-        # order credentials themselves are still valid/unaffected by disconnecting feed.
+        # order credentials themselves are still valid/unaffected by disconnecting feed. Demote
+        # the default account's own row too (it's the source of truth for its status now), then
+        # mirror the same values onto cp.
+        default_account = credentials_helper.get_default_order_account(cp)
+        if default_account and default_account.order_status == src_enums.CompanyProviderOrderConnectionStatus.CONNECTED.value:
+            _set_order_account_status(
+                default_account,
+                src_enums.CompanyProviderOrderConnectionStatus.WAITING,
+                _ORDER_WAITING_ON_FEED_REASON,
+            )
         if cp.order_status == src_enums.CompanyProviderOrderConnectionStatus.CONNECTED.value:
             cp.order_status = src_enums.CompanyProviderOrderConnectionStatus.WAITING.value
             cp.order_status_name = src_enums.CompanyProviderOrderConnectionStatus.WAITING.name
@@ -1296,12 +1323,19 @@ def disconnect_provider(
                 default_account.credentials = {}
                 default_account.active = False
                 default_account.is_default = False
-                default_account.save(update_fields=["credentials", "active", "is_default", "updated_at"])
+                status_fields = _order_connection_status_fields(None, None)
+                for field, value in status_fields.items():
+                    setattr(default_account, field, value)
+                default_account.save(
+                    update_fields=["credentials", "active", "is_default"]
+                    + list(status_fields.keys())
+                    + ["updated_at"]
+                )
             _promote_next_default_order_account(cp)
-        cp.order_status = None
-        cp.order_status_name = None
-        cp.order_status_reason = None
-        cp.order_status_checked_at = None
+        # Mirrors whichever account is now the default (freshly promoted, with its own already-
+        # known status) or nulls out if none remain — rather than unconditionally nulling cp's
+        # fields, which would incorrectly wipe out a newly-promoted account's real status.
+        _refresh_default_order_status(cp)
 
     feed_empty = not (cp.credentials or {}).get("feed")
     order_empty = not credentials_helper.get_order_credentials(cp)
@@ -1325,7 +1359,10 @@ def disconnect_provider(
 
 
 def _sync_default_order_account(
-    company_provider: src_models.CompanyProviders, order_credentials: typing.Dict[str, typing.Any]
+    company_provider: src_models.CompanyProviders,
+    order_credentials: typing.Dict[str, typing.Any],
+    status: typing.Optional["src_enums.CompanyProviderOrderConnectionStatus"] = None,
+    reason: typing.Optional[str] = None,
 ) -> None:
     """
     Keeps this connection's is_default=True account in sync with the "order" credentials
@@ -1334,6 +1371,12 @@ def _sync_default_order_account(
     disconnected) deactivates rather than deletes an existing default row, so
     PurchaseOrder.order_account (PROTECT) never breaks over a routine credentials change; use
     disconnect_provider for an explicit, intentional removal.
+
+    ``status``/``reason`` are this call's already-computed order-status result (see
+    _validate_and_resolve_order_status) — stored directly on the account row itself, since
+    CompanyProviderOrderAccount is the source of truth for order status now, including the
+    default's. Callers still need to mirror onto CompanyProviders separately (they already do —
+    see connect_provider/update_connection, which set the same computed values there directly).
     """
     # Looked up regardless of `active` (unlike credentials_helper.get_default_order_account,
     # which callers use to find a USABLE default for placing orders) — a previously-deactivated
@@ -1344,19 +1387,28 @@ def _sync_default_order_account(
             account.credentials = {}
             account.active = False
             account.is_default = False
-            account.save(update_fields=["credentials", "active", "is_default", "updated_at"])
+            status_fields = _order_connection_status_fields(None, None)
+            for field, value in status_fields.items():
+                setattr(account, field, value)
+            account.save(
+                update_fields=["credentials", "active", "is_default"] + list(status_fields.keys()) + ["updated_at"]
+            )
             _promote_next_default_order_account(company_provider)
         return
+    status_fields = _order_connection_status_fields(status, reason)
     if account:
         account.credentials = order_credentials
         account.active = True
-        account.save(update_fields=["credentials", "active", "updated_at"])
+        for field, value in status_fields.items():
+            setattr(account, field, value)
+        account.save(update_fields=["credentials", "active"] + list(status_fields.keys()) + ["updated_at"])
     else:
         src_models.CompanyProviderOrderAccount.objects.create(
             company_provider=company_provider,
             label="Default",
             credentials=order_credentials,
             is_default=True,
+            **status_fields,
         )
 
 
@@ -1373,27 +1425,29 @@ def _promote_next_default_order_account(company_provider: src_models.CompanyProv
 
 def _refresh_default_order_status(company_provider: src_models.CompanyProviders) -> None:
     """
-    Recomputes CompanyProviders.order_status/order_status_name/order_status_reason/
-    order_status_checked_at from whichever account is currently this connection's default.
-    Called after create_order_account/update_order_account/delete_order_account change the
-    default account's identity, credentials, or active state, so the catalog listing's Ordering
-    badge (which reads these same four fields) never goes stale regardless of whether a caller
+    Mirrors CompanyProviders.order_status/order_status_name/order_status_reason/
+    order_status_checked_at from whichever CompanyProviderOrderAccount row is currently this
+    connection's default — that account is the source of truth for order status (including the
+    default's own), so this is a straight copy, not a recompute. Called after
+    create_order_account/update_order_account/delete_order_account change the default account's
+    identity, credentials, or active state, so the catalog listing's Ordering badge (which reads
+    these same four fields on CompanyProviders) never goes stale regardless of whether a caller
     used these endpoints or the legacy connect_provider/update_connection "order" namespace path
-    to manage ordering. Non-default accounts don't affect this — order_status has always
-    represented the connection's one primary ordering capability, not a per-account concept.
-
-    No live re-validation here: create_order_account/update_order_account only ever persist
-    credentials that already passed _validate_order_connection at write time, so recomputing the
-    status badge from that already-known-good fact doesn't need to hit the distributor's API
-    again.
+    (which sets the mirrored fields directly, from the same computation it already stores on the
+    account via _sync_default_order_account). Non-default accounts have their own status but
+    don't feed into this mirror — CompanyProviders.order_status has always represented the
+    connection's one primary ordering capability, not a per-account concept.
     """
     default_account = credentials_helper.get_default_order_account(company_provider)
-    feed_status_enum = _status_enum_from_stored(company_provider.status)
     if default_account is None:
-        status_enum, reason = None, None
+        status_fields = _order_connection_status_fields(None, None)
     else:
-        status_enum, reason = _resolve_order_status(True, None, feed_status_enum)
-    status_fields = _order_connection_status_fields(status_enum, reason)
+        status_fields = {
+            "order_status": default_account.order_status,
+            "order_status_name": default_account.order_status_name,
+            "order_status_reason": default_account.order_status_reason,
+            "order_status_checked_at": default_account.order_status_checked_at,
+        }
     for field, value in status_fields.items():
         setattr(company_provider, field, value)
     company_provider.save(update_fields=list(status_fields.keys()) + ["updated_at"])
@@ -1415,6 +1469,12 @@ def _serialize_order_account(
         "is_default": account.is_default,
         "credentials": credentials,
         "secrets_configured": secrets_configured,
+        "order_status": account.order_status,
+        "order_status_name": account.order_status_name,
+        "order_status_reason": account.order_status_reason,
+        "order_status_checked_at": (
+            account.order_status_checked_at.isoformat() if account.order_status_checked_at else None
+        ),
         "created_at": account.created_at.isoformat() if account.created_at else None,
         "updated_at": account.updated_at.isoformat() if account.updated_at else None,
     }
@@ -1512,6 +1572,8 @@ def create_order_account(
             CONNECTION_ERROR_INVALID_INPUT,
         )
 
+    status_enum, reason = _resolve_order_status(True, None, _status_enum_from_stored(cp.status))
+    _set_order_account_status(account, status_enum, reason)
     if make_default:
         _refresh_default_order_status(cp)
 
@@ -1569,6 +1631,10 @@ def update_order_account(
         if val_error:
             return None, val_error, val_error_code
         account.credentials = creds
+        status_enum, reason = _resolve_order_status(True, None, _status_enum_from_stored(cp.status))
+        status_fields = _order_connection_status_fields(status_enum, reason)
+        for field, value in status_fields.items():
+            setattr(account, field, value)
 
     if label is not None:
         label = label.strip()

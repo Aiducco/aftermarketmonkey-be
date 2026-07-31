@@ -19,14 +19,19 @@ Feed status — only rows whose initial pricing sync hasn't completed yet:
   are set to CONNECTED once, directly, in integration_pricing_sync_jobs when the first sync
   completes, and aren't re-checked here.
 
-Order status — every active row with order credentials configured and a registered order
-validator (see integrations_services._ORDER_CONNECTION_VALIDATORS), regardless of
-initial_sync_completed: order credentials can go stale on their own (a rotated API key, a
-revoked security key) independently of feed sync state, so they're re-checked continuously
-rather than only while the feed is still mid-sync.
+Order status — every active CompanyProviderOrderAccount (not just the connection's default —
+each account is its own source of truth for its own order_status/... fields, see that model's
+docstring) belonging to an active row whose provider kind has a registered order validator (see
+integrations_services._ORDER_CONNECTION_VALIDATORS), regardless of initial_sync_completed: order
+credentials can go stale on their own (a rotated API key, a revoked security key) independently
+of feed sync state, so they're re-checked continuously rather than only while the feed is still
+mid-sync.
   passes and feed status is CONNECTED -> CONNECTED
   passes but feed status isn't CONNECTED yet -> WAITING
   fails -> ERROR, reason = the validator's message
+CompanyProviders.order_status/... is refreshed afterward to mirror whichever account is
+currently the connection's default (see integrations_services._refresh_default_order_status) —
+that stays a read-only summary for consumers that only know the single-value legacy shape.
 """
 import logging
 import typing
@@ -80,11 +85,11 @@ class Command(BaseCommand):
                         )
 
                 if kind in integrations_services._ORDER_CONNECTION_VALIDATORS:
-                    order_creds = credentials_helper.get_order_credentials(cp)
-                    if order_creds:
+                    accounts = [a for a in cp.order_accounts.filter(active=True) if a.credentials]
+                    if accounts:
                         try:
-                            self._check_order_validated(cp, kind)
-                            order_checked += 1
+                            self._check_order_validated(cp, kind, accounts)
+                            order_checked += len(accounts)
                         except Exception as e:  # noqa: BLE001
                             logger.error(
                                 "{} Error checking order connection for company_provider_id={}: {}".format(
@@ -127,34 +132,31 @@ class Command(BaseCommand):
         if status is not None:
             self._save_status(cp, status, reason)
 
-    def _save_order_status(
+    def _check_order_validated(
         self,
         cp: src_models.CompanyProviders,
-        status: "src_enums.CompanyProviderOrderConnectionStatus",
-        reason: typing.Optional[str],
+        kind: int,
+        accounts: typing.List[src_models.CompanyProviderOrderAccount],
     ) -> None:
-        cp.order_status = status.value
-        cp.order_status_name = status.name
-        cp.order_status_reason = reason
-        cp.order_status_checked_at = timezone.now()
-        cp.save(
-            update_fields=[
-                "order_status", "order_status_name", "order_status_reason",
-                "order_status_checked_at", "updated_at",
-            ]
-        )
-
-    def _check_order_validated(self, cp: src_models.CompanyProviders, kind: int) -> None:
+        """Validates and stores status on EVERY given account individually — each one is its own
+        source of truth (see CompanyProviderOrderAccount's docstring) — then mirrors whichever
+        account is currently the connection's default onto CompanyProviders.order_status/..."""
         validator = integrations_services._ORDER_CONNECTION_VALIDATORS[kind]
-        message, _code = validator(credentials_helper.get_order_credentials(cp))
-        status, reason = integrations_services._resolve_order_status(
-            order_validated=(message is None),
-            order_val_error=message,
-            feed_status_enum=(
-                src_enums.CompanyProviderConnectionStatus.CONNECTED
-                if cp.status == src_enums.CompanyProviderConnectionStatus.CONNECTED.value
-                else None
-            ),
+        feed_status_enum = (
+            src_enums.CompanyProviderConnectionStatus.CONNECTED
+            if cp.status == src_enums.CompanyProviderConnectionStatus.CONNECTED.value
+            else None
         )
-        if status is not None:
-            self._save_order_status(cp, status, reason)
+        any_updated = False
+        for account in accounts:
+            message, _code = validator(account.credentials)
+            status, reason = integrations_services._resolve_order_status(
+                order_validated=(message is None),
+                order_val_error=message,
+                feed_status_enum=feed_status_enum,
+            )
+            if status is not None:
+                integrations_services._set_order_account_status(account, status, reason)
+                any_updated = True
+        if any_updated:
+            integrations_services._refresh_default_order_status(cp)

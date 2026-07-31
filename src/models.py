@@ -195,6 +195,15 @@ class CompanyProviderOrderAccount(django_db_models.Model):
     is_default = django_db_models.BooleanField(default=False)
     active = django_db_models.BooleanField(default=True)
 
+    # Order-placement connectivity status for THIS account (src.enums.CompanyProviderOrderConnectionStatus)
+    # -- the source of truth for order status, including the default account's; CompanyProviders.
+    # order_status/... mirrors whichever account is currently is_default, for consumers that only
+    # know that older single-value shape (see integrations_services._refresh_default_order_status).
+    order_status = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+    order_status_name = django_db_models.CharField(max_length=32, null=True, blank=True)
+    order_status_reason = django_db_models.TextField(null=True, blank=True)
+    order_status_checked_at = django_db_models.DateTimeField(null=True, blank=True)
+
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
 
