@@ -90,6 +90,9 @@ PREMIER_WAREHOUSE_QTY_FIELD_TO_LOCATION_LABEL = {
     "wa_qty": "Washington",
 }
 ROUGH_COUNTRY_INVENTORY_SEARCH_URL_TEMPLATE = "https://www.roughcountry.com/search/{sku}"
+# WheelPros' own part-number is the page slug directly (e.g. Nitto "N205-770" ->
+# https://dl.wheelpros.com/us_en/n205-770.html) -- confirmed against a real WheelProsPart row.
+WHEELPROS_INVENTORY_PART_URL_TEMPLATE = "https://dl.wheelpros.com/us_en/{part_slug}.html"
 
 # DLG: AfterMarketScout SFTP relay (single fixed endpoint; DlgSFTPClient always uses these).
 DLG_RELAY_SFTP_HOST = "5.161.121.143"

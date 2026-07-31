@@ -154,7 +154,14 @@ def _provider_go_to_link(
             return None
         return src_constants.ROUGH_COUNTRY_INVENTORY_SEARCH_URL_TEMPLATE.format(sku=quote(sku_clean, safe=""))
     if kind_name == "WHEELPROS":
-        return None
+        # ``provider_external_id`` is ``{wp_brand_id}_{part_number}``; the public PDP slug is the
+        # part number itself, lowercased (e.g. "N205-770" -> dl.wheelpros.com/us_en/n205-770.html
+        # -- confirmed against a real WheelProsPart row).
+        pn_src = ext.split("_", 1)[1] if "_" in ext else (master_part.part_number or "")
+        pn_clean = str(pn_src).strip().lower()
+        if not pn_clean:
+            return None
+        return src_constants.WHEELPROS_INVENTORY_PART_URL_TEMPLATE.format(part_slug=quote(pn_clean, safe=""))
     return None
 
 
