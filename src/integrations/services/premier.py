@@ -368,6 +368,14 @@ def resolve_wheelpros_bucket_brands(dry_run: bool = True) -> typing.Dict[str, in
         logger.info("{} No \"Wheel Pros\" PremierBrand found.".format(_LOG_PREFIX))
         return {}
 
+    # Today's feed-brand-level mapping target -- some Wheel Pros rows' own descriptions
+    # genuinely start with "Wheel Pros" (e.g. "Wheel Pros VN807..."), which would otherwise
+    # "resolve" right back to this same Brand: a no-op, not a correction, so excluded below.
+    wheelpros_catalog_mapping = src_models.BrandPremierBrandMapping.objects.filter(
+        premier_brand=wheelpros_premier_brand,
+    ).first()
+    wheelpros_catalog_brand_id = wheelpros_catalog_mapping.brand_id if wheelpros_catalog_mapping else None
+
     rows = list(
         src_models.PremierParts.objects.filter(
             brand_id=wheelpros_premier_brand.id, brand_override__isnull=True,
@@ -430,6 +438,9 @@ def resolve_wheelpros_bucket_brands(dry_run: bool = True) -> typing.Dict[str, in
                 candidates = all_brands_fallback
             brand = best_fuzzy_brand_match(phrase, candidates)
             how = "fuzzy"
+        if brand and brand.id == wheelpros_catalog_brand_id:
+            # Matched right back to "Wheel Pros" itself -- not a correction, skip.
+            continue
         if brand:
             resolved_by_row_id[row_id] = brand
             if how == "exact":
