@@ -378,8 +378,18 @@ def _get_company_provider(company_id: int, provider_id: int) -> src_models.Compa
     """
     Resolve this company's connection (CompanyProviders) to a distributor, from the
     distributor's public catalog id (Providers.id — what part-detail responses expose as
-    provider_id, and what the FE naturally has on hand). Raises if not connected, or if the
-    distributor doesn't support in-app ordering.
+    provider_id, and what the FE naturally has on hand). Raises if not connected.
+
+    Deliberately does NOT gate on ordering support here — order_registry.supports_ordering(kind)
+    only answers "is a real, distributor-specific API adapter registered for this kind at all,"
+    which is wrong for a connection ordering through the Email channel instead (a
+    CompanyProviderOrderAccount.order_method=EMAIL account is usable regardless of whether the
+    kind has any API adapter — confirmed live: an A-Tech connection with Email ordering
+    configured was rejected here with "A-Tech does not support in-app ordering yet." even though
+    it's fully order-ready). See add_cart_item, which checks order_registry.get_adapter(cp,
+    order_account) for the actually-resolved account instead, once _resolve_order_account has
+    run — that's the only check that knows whether THIS connection, through whichever account
+    ends up being used, can really place an order.
     """
     cp = (
         src_models.CompanyProviders.objects.filter(company_id=company_id, provider_id=provider_id)
@@ -388,10 +398,6 @@ def _get_company_provider(company_id: int, provider_id: int) -> src_models.Compa
     )
     if not cp:
         raise PurchaseOrderServiceError("This distributor isn't connected for your company.")
-    if not order_registry.supports_ordering(cp.provider.kind):
-        raise PurchaseOrderServiceError(
-            "{} does not support in-app ordering yet.".format(cp.provider.name)
-        )
     return cp
 
 
@@ -624,6 +630,10 @@ def add_cart_item(
 
     cp = _get_company_provider(company_id, provider_id)
     order_account = _resolve_order_account(cp, order_account_id)
+    if order_registry.get_adapter(cp, order_account) is None:
+        raise PurchaseOrderServiceError(
+            order_registry.get_adapter_unavailable_reason(cp, order_account)
+        )
 
     provider_part = src_models.ProviderPart.objects.filter(
         master_part_id=master_part_id, provider_id=provider_id

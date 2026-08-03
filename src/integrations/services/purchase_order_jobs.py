@@ -823,7 +823,7 @@ def _resolve_po_and_adapter(
 
     adapter = order_registry.get_adapter(po.company_provider, po.order_account)
     if adapter is None:
-        return po, None, order_registry.get_adapter_unavailable_reason(po.company_provider)
+        return po, None, order_registry.get_adapter_unavailable_reason(po.company_provider, po.order_account)
 
     return po, adapter, None
 

@@ -97,11 +97,18 @@ def get_adapter(
         return None
 
 
-def get_adapter_unavailable_reason(company_provider: src_models.CompanyProviders) -> str:
+def get_adapter_unavailable_reason(
+    company_provider: src_models.CompanyProviders,
+    order_account: typing.Optional[src_models.CompanyProviderOrderAccount] = None,
+) -> str:
     """Human-readable reason get_adapter() returned None for this connection — distinguishes
     "not supported at all" from "supported, but this connection isn't configured for it yet",
-    since those need different user-facing messages/next steps."""
-    account = order_credentials.get_default_order_account(company_provider)
+    since those need different user-facing messages/next steps. ``order_account``, when the
+    caller already resolved one, must match whatever was passed to the get_adapter() call this
+    is explaining — otherwise this falls back to the connection's default account and can give
+    a wrong reason for a non-default account (e.g. "does not support in-app ordering yet" for a
+    kind with no API adapter, when the actual account in use has Email configured just fine)."""
+    account = order_account or order_credentials.get_default_order_account(company_provider)
     if account is not None and account.order_method == src_enums.OrderMethod.EMAIL.value:
         return "Email ordering isn't fully configured for this connection yet — a rep email is required."
     if not supports_ordering(company_provider.provider.kind):
