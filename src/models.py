@@ -192,6 +192,15 @@ class CompanyProviderOrderAccount(django_db_models.Model):
     label = django_db_models.CharField(max_length=100)
     credentials = django_db_models.JSONField()
 
+    # Which channel this account currently places orders through — see src.enums.OrderMethod
+    # (API=1, EMAIL=2). Defaults to API so every account that existed before this field keeps
+    # its exact current behavior. Switching is non-destructive: `credentials` can hold both API
+    # and email keys (e.g. account_number/security_key alongside rep_email/cc_email) at once, so
+    # toggling back and forth never loses previously-entered values — see
+    # src.integrations.orders.registry.get_adapter().
+    order_method = django_db_models.PositiveSmallIntegerField(default=1)
+    order_method_name = django_db_models.CharField(max_length=16, default="API")
+
     is_default = django_db_models.BooleanField(default=False)
     active = django_db_models.BooleanField(default=True)
 

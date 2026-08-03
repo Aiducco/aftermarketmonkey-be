@@ -199,6 +199,11 @@ SUPPORT_EMAIL_RECIPIENT_LIST = ["hajdukbet@gmail.com"]
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 NOTIFICATIONS_FROM_EMAIL = os.environ.get("NOTIFICATIONS_FROM_EMAIL", "no-reply@aftermarketscout.com")
 
+# Always CC'd on every purchase-order email sent via EmailOrderAdapter, in addition to whichever
+# cc_email an order account itself configures (src/integrations/orders/email_order.py). Empty
+# string disables the platform-wide default and leaves CC entirely up to each order account.
+PURCHASE_ORDER_INTERNAL_CC_EMAIL = os.environ.get("PURCHASE_ORDER_INTERNAL_CC_EMAIL", "")
+
 # Frontend app base URL, used to build links in transactional emails.
 FRONTEND_BASE_URL = os.environ.get("FRONTEND_BASE_URL", "https://app.aftermarketscout.com")
 

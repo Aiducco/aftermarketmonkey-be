@@ -68,6 +68,7 @@ from src.api.views.purchase_orders import (
     PurchaseOrdersView,
     PurchaseOrderDetailView,
     PurchaseOrderConfirmedDetailView,
+    PurchaseOrderPdfView,
     PurchaseOrderSubmitView,
     PurchaseOrderShippingSelectionView,
     PurchaseOrderCancelView,
@@ -364,6 +365,11 @@ urlpatterns = [
         "purchase-orders/<int:id>/confirmed-details/",
         PurchaseOrderConfirmedDetailView.as_view(),
         name="purchase_order_confirmed_detail",
+    ),
+    path(
+        "purchase-orders/<int:id>/pdf/",
+        PurchaseOrderPdfView.as_view(),
+        name="purchase_order_pdf",
     ),
     path(
         "purchase-orders/<int:id>/",

@@ -267,18 +267,25 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
     def _provider_supports_ordering(kind: int) -> bool:
         """
         Whether this distributor supports in-app ordering at all — true whenever the catalog
-        declares an order adapter is registered OR declares its own order-specific credential
+        declares an order adapter is registered, OR declares its own order-specific credential
         fields (Meyer/Wheel Pros/Premier all report true here ahead of their order adapter
-        actually being built, same policy as the catalog endpoint's own supports_ordering).
-        Distinct from can_order_in_app below, which additionally requires THIS connection to
-        have working order credentials right now.
+        actually being built, same policy as the catalog endpoint's own supports_ordering), OR
+        declares email-order fields (every distributor with a real feed client can be ordered
+        by emailing a rep, regardless of whether it also has a real order API — see
+        src.enums.OrderMethod). Distinct from can_order_in_app below, which additionally
+        requires THIS connection to have a working, configured order method right now.
         """
         if order_registry.supports_ordering(kind):
             return True
         entry = _provider_catalog_by_kind.get(kind)
         if not entry:
             return False
-        return bool(entry.get("order_connection_required_fields") or entry.get("order_connection_optional_fields"))
+        return bool(
+            entry.get("order_connection_required_fields")
+            or entry.get("order_connection_optional_fields")
+            or entry.get("email_order_connection_required_fields")
+            or entry.get("email_order_connection_optional_fields")
+        )
 
     provider_parts = list(
         src_models.ProviderPart.objects.filter(master_part=part)
@@ -343,17 +350,18 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
                 turn14_vmm,
             ),
             # Whether "Add to PO" (in-app ordering) is available for this distributor row —
-            # see src.integrations.orders.registry. False for every distributor whose order
-            # adapter phase hasn't landed yet, AND false for a connection that supports
-            # ordering in the abstract but hasn't configured order credentials yet (e.g.
-            # Keystone's order credentials are a separate, optional namespace from its catalog
-            # feed) — get_adapter() returns None in both cases, so this is the actual "can
-            # this specific connection order right now" signal, not just "does this provider
-            # kind support ordering at all". Those rows keep provider_go_to_link only.
+            # see src.integrations.orders.registry. get_adapter() is the single source of
+            # truth: it resolves EITHER the connection's registered API adapter OR (when the
+            # default order account's order_method is EMAIL — see src.enums.OrderMethod) the
+            # generic EmailOrderAdapter, and returns None whenever neither is actually
+            # configured with working credentials for this connection right now. Deliberately
+            # NOT gated on order_registry.supports_ordering(kind) here anymore — that only
+            # covers the API-adapter case and would incorrectly hide "Add to PO" for a
+            # connection that's configured for email ordering on a kind with no API adapter.
+            # Those rows keep provider_go_to_link only until an order method is configured.
             "can_order_in_app": bool(
                 integrated
                 and pp.provider_id
-                and order_registry.supports_ordering(pp.provider.kind)
                 and order_registry.get_adapter(company_provider_objs[pp.provider_id])
             ),
             # Whether this DISTRIBUTOR supports in-app ordering at all, independent of any one

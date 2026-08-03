@@ -132,9 +132,25 @@ class CompanyProviderOrderConnectionStatus(enum.Enum):
     ERROR = 3      # order credentials invalid, or the order connectivity check failed
 
 
+class OrderMethod(enum.Enum):
+    """
+    Which channel a CompanyProviderOrderAccount currently places orders through. API is the
+    default/legacy behavior (unchanged for every account that existed before this field). EMAIL
+    routes submit_order()/get_shipping_quote()/cancel_order() through EmailOrderAdapter instead
+    of the distributor-specific adapter in orders.registry — see
+    src.integrations.orders.registry.get_adapter(). Switching between the two is non-destructive:
+    an account's credentials JSON can hold both API and email fields at once, so toggling never
+    loses previously-entered values, and subsystems that read order credentials directly rather
+    than through orders.registry (e.g. src.integrations.live_inventory) are unaffected either way.
+    """
+    API = 1
+    EMAIL = 2
+
+
 class NotificationEmailType(enum.Enum):
     """Kind of transactional notification email logged in NotificationEmailLog."""
     FIRST_SYNC_COMPLETED = 1
+    PURCHASE_ORDER_EMAILED = 2
 
 
 class NotificationEmailStatus(enum.Enum):

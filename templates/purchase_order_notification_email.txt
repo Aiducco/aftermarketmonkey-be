@@ -1,0 +1,17 @@
+Purchase order attached
+
+{{ company_name }} has placed a purchase order with you through
+AftermarketScout. The full order -- parts, quantities, and ship-to address
+-- is attached as a PDF.
+
+Purchase Order: {{ po_number }}
+From: {{ company_name }}
+To: {{ provider_name }}
+
+Please confirm pricing, availability, and shipping directly with
+{{ company_name }}. Questions about AftermarketScout? Reach us at
+support@aftermarketscout.com.
+
+--
+AftermarketScout
+Sent on behalf of {{ company_name }}.

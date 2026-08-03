@@ -391,6 +391,7 @@ class OrderAccountsView(views.View):
             label=body.get("label"),
             credentials=body.get("credentials") or {},
             is_default=body.get("is_default"),
+            order_method=body.get("order_method"),
         )
         if err:
             status = 404 if error_code == integrations_services.CONNECTION_ERROR_NOT_FOUND else 400
@@ -410,10 +411,13 @@ class OrderAccountsView(views.View):
 class OrderAccountDetailView(views.View):
     """
     PATCH  /integrations/order-accounts/<order_account_id>/ — {label?, credentials?, active?,
-           is_default?} — works on any account, including the current default. Setting
-           "is_default": true promotes this account (demoting whichever one currently is);
-           setting it false (or active: false) on the current default demotes it and promotes
-           the next-oldest active account instead.
+           is_default?, order_method?} — works on any account, including the current default.
+           Setting "is_default": true promotes this account (demoting whichever one currently
+           is); setting it false (or active: false) on the current default demotes it and
+           promotes the next-oldest active account instead. order_method ("api" | "email")
+           switches which channel this account places orders through — see
+           integrations_services.update_order_account for the non-destructive-credentials
+           behavior when switching.
     DELETE /integrations/order-accounts/<order_account_id>/ — works on any account, including
            the default (which then gets replaced the same way, if another active account
            exists).
@@ -463,6 +467,7 @@ class OrderAccountDetailView(views.View):
             credentials=body.get("credentials"),
             active=body.get("active"),
             is_default=body.get("is_default"),
+            order_method=body.get("order_method"),
         )
         if err:
             status = 404 if error_code == integrations_services.CONNECTION_ERROR_NOT_FOUND else 400

@@ -3,7 +3,9 @@ Transactional notification emails around distributor integrations, sent via Rese
 (https://resend.com). Separate from the legacy SMTP-based DEFAULT_FROM_EMAIL used for
 support tickets and API key emails.
 """
+import base64
 import logging
+import typing
 
 import requests
 from django.conf import settings
@@ -11,6 +13,7 @@ from django.template.loader import render_to_string
 
 from src import enums as src_enums
 from src import models as src_models
+from src.integrations.orders import exceptions as order_exceptions
 
 logger = logging.getLogger(__name__)
 
@@ -114,3 +117,92 @@ def send_first_sync_completed_email(company_provider: src_models.CompanyProvider
         status=src_enums.NotificationEmailStatus.SENT,
         provider_message_id=response.json().get("id"),
     )
+
+
+def send_purchase_order_email(
+    *,
+    company_provider: src_models.CompanyProviders,
+    purchase_order: src_models.PurchaseOrder,
+    to_email: str,
+    cc_email: typing.Optional[str],
+    pdf_bytes: bytes,
+    pdf_filename: str,
+) -> str:
+    """
+    Emails a generated purchase-order PDF to a distributor rep, called by
+    EmailOrderAdapter.submit_order() (src/integrations/orders/email_order.py). Returns Resend's
+    message id on success.
+
+    Unlike send_first_sync_completed_email above (fire-and-forget — a missed "you're live" email
+    isn't worth failing a sync job over), this one RAISES on failure as OrderValidationError. The
+    caller is inside submit_order(), and purchase_order_jobs._run_submit expects submit_order()
+    to raise OrderAdapterError on any failure so the PO is correctly marked FAILED with a real
+    error_message — silently swallowing a failed send here would leave the PO looking SUBMITTED
+    when no email actually went out.
+    """
+    company = company_provider.company
+    provider = company_provider.provider
+    from_email = settings.NOTIFICATIONS_FROM_EMAIL
+    po_reference = purchase_order.po_name or purchase_order.po_number
+    subject = "Purchase Order {} — {}".format(po_reference, company.name)
+    context = {
+        "provider_name": provider.name,
+        "company_name": company.name,
+        "po_number": po_reference,
+    }
+
+    cc_list = [addr for addr in (cc_email, settings.PURCHASE_ORDER_INTERNAL_CC_EMAIL) if addr]
+    payload: typing.Dict[str, typing.Any] = {
+        "from": from_email,
+        "to": [to_email],
+        "subject": subject,
+        "html": render_to_string("purchase_order_notification_email.html", context),
+        "text": render_to_string("purchase_order_notification_email.txt", context),
+        "attachments": [
+            {
+                "filename": pdf_filename,
+                "content": base64.b64encode(pdf_bytes).decode("ascii"),
+            }
+        ],
+    }
+    if cc_list:
+        payload["cc"] = cc_list
+
+    try:
+        response = requests.post(
+            RESEND_API_URL,
+            headers={"Authorization": "Bearer {}".format(settings.RESEND_API_KEY)},
+            json=payload,
+            timeout=15,
+        )
+        response.raise_for_status()
+    except Exception as e:
+        logger.exception(
+            "Failed to email purchase order id=%s to %s.", purchase_order.id, to_email
+        )
+        _log_email(
+            email_type=src_enums.NotificationEmailType.PURCHASE_ORDER_EMAILED,
+            to_email=to_email,
+            from_email=from_email,
+            subject=subject,
+            company=company,
+            company_provider=company_provider,
+            status=src_enums.NotificationEmailStatus.FAILED,
+            error_message=str(e)[:4000],
+        )
+        raise order_exceptions.OrderValidationError(
+            "Failed to email the purchase order to {}: {}".format(to_email, e)
+        )
+
+    message_id = response.json().get("id")
+    _log_email(
+        email_type=src_enums.NotificationEmailType.PURCHASE_ORDER_EMAILED,
+        to_email=to_email,
+        from_email=from_email,
+        subject=subject,
+        company=company,
+        company_provider=company_provider,
+        status=src_enums.NotificationEmailStatus.SENT,
+        provider_message_id=message_id,
+    )
+    return message_id

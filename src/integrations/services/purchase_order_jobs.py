@@ -663,13 +663,18 @@ def _run_submit(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrd
             ]
         )
 
+    # distributor_confirmed distinguishes a real distributor-side confirmation from a
+    # placeholder reference (e.g. EmailOrderAdapter's own po_number, set because emailing a rep
+    # doesn't confirm anything) — see base.DistributorOrderResult.distributor_confirmed. Default
+    # True preserves exact prior behavior for every adapter that existed before this field.
+    is_confirmed = bool(result.distributor_order_numbers and result.distributor_confirmed)
     po.status = (
         src_enums.PurchaseOrderStatus.CONFIRMED.value
-        if result.distributor_order_numbers
+        if is_confirmed
         else src_enums.PurchaseOrderStatus.SUBMITTED.value
     )
     po.status_name = src_enums.PurchaseOrderStatus.__members__[
-        "CONFIRMED" if result.distributor_order_numbers else "SUBMITTED"
+        "CONFIRMED" if is_confirmed else "SUBMITTED"
     ].name
     po.submitted_at = timezone.now()
     po.error_message = None

@@ -171,6 +171,14 @@ class DistributorOrderResult:
     raw_response: typing.Dict
     # Same role as ShippingQuoteResult.request_payload, for the submit call.
     request_payload: typing.Optional[typing.Dict] = None
+    # True (default — current behavior for every adapter that existed before this field) means
+    # distributor_order_numbers represents a real distributor-side confirmation, so the caller
+    # should mark the PurchaseOrder CONFIRMED. False means distributor_order_numbers is a
+    # placeholder reference (EmailOrderAdapter sets this to our own po_number/po_name, since
+    # emailing a rep doesn't confirm anything) — the PO should stay SUBMITTED even though a
+    # PurchaseOrderDistributorOrder row was created. See
+    # src.integrations.services.purchase_order_jobs._run_submit's status rollup.
+    distributor_confirmed: bool = True
 
 
 @dataclasses.dataclass
@@ -360,6 +368,15 @@ class DistributorOrderAdapter(abc.ABC):
     def supports_invoices(self) -> bool:
         """Override to return True for distributors whose adapter implements get_invoices()."""
         return False
+
+    def fulfillment_channel(self) -> str:
+        """
+        'api' (default) or 'email' — lets callers (get_order_capabilities(),
+        _serialize_purchase_order) surface how a PO was actually placed without hardcoding a
+        list of which distributor kinds are email-based. Overridden to 'email' by
+        EmailOrderAdapter only.
+        """
+        return "api"
 
     def get_invoices(self, purchase_order: src_models.PurchaseOrder) -> typing.List[DistributorInvoice]:
         """

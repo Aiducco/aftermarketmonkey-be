@@ -22,11 +22,13 @@ from django.utils import timezone as django_timezone
 
 from src import enums as src_enums
 from src import models as src_models
+from src.integrations import credentials as credentials_helper
 from src.integrations.orders import base as order_base
 from src.integrations.orders import raw_response_parsers
 from src.integrations.orders import registry as order_registry
 from src.integrations.services import confirmed_purchase_order_sync
 from src.integrations.services import purchase_order_jobs
+from src.integrations.services import purchase_order_pdf
 
 logger = logging.getLogger(__name__)
 _LOG_PREFIX = "[PURCHASE-ORDERS-API]"
@@ -204,6 +206,21 @@ def _serialize_invoice(inv: src_models.PurchaseOrderInvoice) -> typing.Dict:
     }
 
 
+def _po_fulfillment_channel(po: src_models.PurchaseOrder) -> str:
+    """
+    'api' | 'email' — which channel po.order_account currently places orders through (see
+    src.enums.OrderMethod), read straight off the account's own order_method_name rather than
+    constructing a real adapter via orders.registry.get_adapter() (which this PO's order_account
+    may not even resolve credentials for anymore, e.g. after a later credential change — the
+    stored order_method_name is what's authoritative for "how was/will this PO be placed",
+    independent of whether the adapter can be constructed right now). Falls back to resolving
+    the connection's implicit default account when po.order_account is null, same convention as
+    order_account_label above.
+    """
+    account = po.order_account if po.order_account_id else credentials_helper.get_default_order_account(po.company_provider)
+    return account.order_method_name.lower() if account else "api"
+
+
 def _serialize_purchase_order(po: src_models.PurchaseOrder, include_line_items: bool = True) -> typing.Dict:
     provider = po.company_provider.provider
     result = {
@@ -223,6 +240,11 @@ def _serialize_purchase_order(po: src_models.PurchaseOrder, include_line_items: 
         # (e.g. "Keystone — Dropship · 2 items") instead of only showing the distributor name.
         "order_account_id": po.order_account_id,
         "order_account_label": po.order_account.label if po.order_account_id else "Default",
+        # 'api' | 'email' — see _po_fulfillment_channel. Lets the FE show an "Emailed to
+        # distributor" tag distinct from a real API-confirmed order without hardcoding which
+        # distributor kinds are email-based (that's a per-order-account choice, not fixed per
+        # distributor).
+        "fulfillment_channel": _po_fulfillment_channel(po),
         "group_id": po.group_id,
         # Human-readable label for the cross-distributor checkout this PO belongs to (see
         # PurchaseOrderGroup.reference) — None for a PO submitted on its own (group_id is also
@@ -850,6 +872,32 @@ def get_purchase_order_detail(company_id: int, purchase_order_id: int) -> typing
     return _serialize_purchase_order(po)
 
 
+def get_purchase_order_pdf_bytes(company_id: int, purchase_order_id: int) -> bytes:
+    """
+    Regenerates the PDF that was emailed for an EmailOrderAdapter-submitted PO — see
+    src.integrations.orders.email_order.EmailOrderAdapter.submit_order(), which sets
+    DistributorOrderResult.request_payload to the exact PDF-rendering context.
+    PurchaseOrderSubmissionAttempt.request_payload persists that context durably at submit time
+    (see purchase_order_jobs._record_attempt), so no separate PDF file storage is needed — this
+    is byte-for-byte reproducible from that stored context alone.
+    """
+    po = src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id).first()
+    if not po:
+        raise PurchaseOrderServiceError("Purchase order not found.")
+
+    attempt = (
+        po.submission_attempts.filter(
+            operation=src_enums.PurchaseOrderOperation.SUBMIT.value, success=True
+        )
+        .order_by("-created_at")
+        .first()
+    )
+    if not attempt or not attempt.request_payload or "rep_email" not in attempt.request_payload:
+        raise PurchaseOrderServiceError("No emailed purchase order found to regenerate a PDF for.")
+
+    return purchase_order_pdf.render_purchase_order_pdf(attempt.request_payload)
+
+
 # -- Confirmed-order standardized detail (distributor_orders read straight off raw_response) ----
 
 
@@ -899,7 +947,7 @@ def get_confirmed_purchase_order_detail(company_id: int, purchase_order_id: int)
     """
     po = (
         src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id)
-        .select_related("company_provider__provider")
+        .select_related("company_provider__provider", "order_account")
         .prefetch_related("distributor_orders")
         .first()
     )
@@ -913,6 +961,11 @@ def get_confirmed_purchase_order_detail(company_id: int, purchase_order_id: int)
         "po_internal_number": po.po_number,
         "po_number": order_base.resolve_po_number(po),
         "status": po.status_name,
+        # 'api' | 'email' — see _po_fulfillment_channel. 'email' means this "confirmed" view is
+        # somewhat aspirational: there's no real distributor confirmation behind it, just the
+        # fact that a PDF was emailed — the FE should show a distinct "Emailed to distributor"
+        # tag rather than implying the same live-API confirmation the other 5 distributors get.
+        "fulfillment_channel": _po_fulfillment_channel(po),
         "distributor": {"name": provider.name, "kind": provider.kind_name},
         "shipped_to": _serialize_confirmed_shipped_to(po),
         "created_at": po.created_at.isoformat(),
@@ -1470,6 +1523,11 @@ def get_order_capabilities(company_id: int) -> typing.List[typing.Dict]:
                 "provider_kind_name": cp.provider.kind_name,
                 "provider_name": cp.provider.name,
                 "can_order_in_app": bool(adapter),
+                # 'api' | 'email' | None — see base.DistributorOrderAdapter.fulfillment_channel.
+                # Lets the FE show an "Emailed to distributor" style tag without hardcoding
+                # which provider kinds are email-based (that's a per-order-account choice now,
+                # not fixed per distributor — see src.enums.OrderMethod).
+                "fulfillment_channel": adapter.fulfillment_channel() if adapter else None,
                 "supports_shipping_method_selection": bool(
                     adapter and adapter.supports_shipping_method_selection()
                 ),

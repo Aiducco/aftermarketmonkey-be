@@ -2,6 +2,8 @@ import logging
 import typing
 
 from django.conf import settings
+from django.core import exceptions as django_core_exceptions
+from django.core import validators as django_validators
 from django.core.paginator import Paginator
 from django.db import IntegrityError, transaction
 from django.db.models import ProtectedError
@@ -370,12 +372,16 @@ def _catalog_supports_ordering_display(catalog_entry: typing.Dict[str, typing.An
     order_registry.get_adapter() actually constructing an adapter — see get_order_capabilities()
     and parts.py's can_order_in_app).
 
-    True when either:
+    True when any of:
       - an order adapter is actually registered (order_registry.supports_ordering()), or
-      - the catalog entry declares order-specific credential fields, meaning we know what this
-        distributor's ordering API needs even before its adapter is built (Meyer, Wheel Pros,
-        Premier as of this writing) — staging the credentials form ahead of the adapter lets
-        companies fill these in now instead of after the fact.
+      - the catalog entry declares order-specific (API) credential fields, meaning we know what
+        this distributor's ordering API needs even before its adapter is built (Meyer, Wheel
+        Pros, Premier as of this writing) — staging the credentials form ahead of the adapter
+        lets companies fill these in now instead of after the fact, or
+      - the catalog entry declares email-order credential fields (rep_email/cc_email) — every
+        distributor with a real feed client can be ordered by emailing a rep regardless of
+        whether it also has a real order API (see src.enums.OrderMethod), so this is true for
+        exactly the distributors PROVIDER_CATALOG declares email_order_connection_*_fields for.
     """
     kind_value = catalog_entry["kind"].value
     if order_registry.supports_ordering(kind_value):
@@ -383,6 +389,8 @@ def _catalog_supports_ordering_display(catalog_entry: typing.Dict[str, typing.An
     return bool(
         catalog_entry.get("order_connection_required_fields")
         or catalog_entry.get("order_connection_optional_fields")
+        or catalog_entry.get("email_order_connection_required_fields")
+        or catalog_entry.get("email_order_connection_optional_fields")
     )
 
 
@@ -677,6 +685,43 @@ def _validate_order_connection(
     if message:
         return False, message, code
     return True, None, None
+
+
+def _validate_email_order_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
+    """
+    Validator for the Email order channel (src.enums.OrderMethod.EMAIL) — checked whenever an
+    order account's order_method is EMAIL, regardless of provider kind. Unlike
+    _ORDER_CONNECTION_VALIDATORS above (one live-API-testing validator per distributor kind),
+    there's no live endpoint to test against here — just that rep_email/cc_email, when present,
+    are actually well-formed addresses. No network call, so this always runs synchronously and
+    cheaply, same as the format-only feed validators elsewhere in this module.
+    """
+    for field in ("rep_email", "cc_email"):
+        value = (credentials.get(field) or "").strip()
+        if not value:
+            continue
+        try:
+            django_validators.validate_email(value)
+        except django_core_exceptions.ValidationError:
+            return "{} must be a valid email address.".format(field), CONNECTION_ERROR_INVALID_INPUT
+    return None, None
+
+
+def _validate_order_connection_for_method(
+    kind: int, order_method: int, credentials: typing.Dict[str, typing.Any]
+) -> typing.Tuple[typing.Optional[bool], typing.Optional[str], typing.Optional[str]]:
+    """
+    Channel-first validation dispatch, mirroring orders.registry.get_adapter()'s channel-first
+    adapter resolution — EMAIL always validates against _validate_email_order_connection
+    regardless of provider kind; API falls through to the existing per-kind
+    _validate_order_connection lookup unchanged.
+    """
+    if order_method == src_enums.OrderMethod.EMAIL.value:
+        message, code = _validate_email_order_connection(credentials)
+        if message:
+            return False, message, code
+        return True, None, None
+    return _validate_order_connection(kind, credentials)
 
 
 # Relay-provisioned kinds we know an expected filename for — see _relay_feed_connection_status.
@@ -1479,20 +1524,39 @@ def _refresh_default_order_status(company_provider: src_models.CompanyProviders)
     company_provider.save(update_fields=list(status_fields.keys()) + ["updated_at"])
 
 
+def _order_credential_fields_for_method(
+    catalog_entry: typing.Dict[str, typing.Any], order_method: int
+) -> typing.Tuple[typing.List[str], typing.List[str]]:
+    """(required, optional) field lists for whichever channel order_method selects — API reads
+    the existing order_connection_*_fields catalog keys unchanged; EMAIL reads the parallel
+    email_order_connection_*_fields keys (see src/constants.py PROVIDER_CATALOG)."""
+    if order_method == src_enums.OrderMethod.EMAIL.value:
+        return (
+            list(catalog_entry.get("email_order_connection_required_fields") or []),
+            list(catalog_entry.get("email_order_connection_optional_fields") or []),
+        )
+    return (
+        list(catalog_entry.get("order_connection_required_fields") or []),
+        list(catalog_entry.get("order_connection_optional_fields") or []),
+    )
+
+
 def _serialize_order_account(
     catalog_entry: typing.Dict[str, typing.Any], account: src_models.CompanyProviderOrderAccount
 ) -> typing.Dict[str, typing.Any]:
-    credentials, secrets_configured = _redacted_credentials(
-        catalog_entry.get("order_connection_required_fields") or [],
-        catalog_entry.get("order_connection_optional_fields") or [],
-        account.credentials,
-    )
+    required, optional = _order_credential_fields_for_method(catalog_entry, account.order_method)
+    credentials, secrets_configured = _redacted_credentials(required, optional, account.credentials)
     return {
         "id": account.id,
         "company_provider_id": account.company_provider_id,
         "label": account.label,
         "active": account.active,
         "is_default": account.is_default,
+        # 'api' | 'email' — see src.enums.OrderMethod. Determines which credential fields above
+        # are the "current" ones; the other channel's values (if any — see the non-destructive
+        # merge in create_order_account/update_order_account) are still present in `credentials`
+        # under "any other keys in storage" but aren't part of `required`/`optional` for display.
+        "order_method": account.order_method_name.lower(),
         "credentials": credentials,
         "secrets_configured": secrets_configured,
         "order_status": account.order_status,
@@ -1532,6 +1596,7 @@ def create_order_account(
     label: str,
     credentials: typing.Dict[str, typing.Any],
     is_default: typing.Optional[bool] = None,
+    order_method: typing.Optional[str] = None,
 ) -> typing.Tuple[typing.Optional[typing.Dict], typing.Optional[str], typing.Optional[str]]:
     """
     Adds an order account to a connection — this is the ONE path for creating an order account,
@@ -1542,12 +1607,26 @@ def create_order_account(
     dict of this provider's order-connection fields (same fields as the "order" namespace in
     the legacy connect_provider/update_connection path, NOT nested under "order" again since
     it's already scoped by this endpoint) — validated live the same way, before being saved.
+
+    ``order_method`` ('api' | 'email', see src.enums.OrderMethod) selects which field set
+    ``credentials`` is validated against and which channel orders.registry.get_adapter() routes
+    this account through. Defaults to 'api' (the only channel that existed before this
+    parameter), matching CompanyProviderOrderAccount.order_method's own default. 'email' is
+    always available regardless of whether this provider kind has a real order adapter — see
+    _order_credential_fields_for_method.
+
     Returns (data, error_message, error_code); error_code is one of the ``CONNECTION_ERROR_*``
     constants, for the frontend to branch on.
     """
     label = (label or "").strip()
     if not label:
         return None, "label is required.", CONNECTION_ERROR_INVALID_INPUT
+
+    method_value = (
+        src_enums.OrderMethod.EMAIL.value
+        if (order_method or "").strip().lower() == "email"
+        else src_enums.OrderMethod.API.value
+    )
 
     cp = (
         src_models.CompanyProviders.objects.filter(id=company_provider_id, company_id=company_id)
@@ -1561,8 +1640,7 @@ def create_order_account(
     if not catalog_entry:
         return None, "Provider not found in catalog", CONNECTION_ERROR_NOT_FOUND
 
-    order_required = [str(f) for f in (catalog_entry.get("order_connection_required_fields") or [])]
-    order_optional = [str(f) for f in (catalog_entry.get("order_connection_optional_fields") or [])]
+    order_required, order_optional = _order_credential_fields_for_method(catalog_entry, method_value)
     if not order_required and not order_optional:
         return (
             None,
@@ -1578,7 +1656,7 @@ def create_order_account(
     if missing:
         return None, "Missing required fields: {}".format(", ".join(missing)), CONNECTION_ERROR_MISSING_FIELDS
 
-    validated, val_error, val_error_code = _validate_order_connection(cp.provider.kind, creds)
+    validated, val_error, val_error_code = _validate_order_connection_for_method(cp.provider.kind, method_value, creds)
     if val_error:
         return None, val_error, val_error_code
 
@@ -1589,7 +1667,12 @@ def create_order_account(
             if make_default:
                 cp.order_accounts.filter(is_default=True).update(is_default=False)
             account = src_models.CompanyProviderOrderAccount.objects.create(
-                company_provider=cp, label=label, credentials=creds, is_default=make_default
+                company_provider=cp,
+                label=label,
+                credentials=creds,
+                is_default=make_default,
+                order_method=method_value,
+                order_method_name=src_enums.OrderMethod(method_value).name,
             )
     except IntegrityError:
         return (
@@ -1615,17 +1698,29 @@ def update_order_account(
     credentials: typing.Optional[typing.Dict[str, typing.Any]] = None,
     active: typing.Optional[bool] = None,
     is_default: typing.Optional[bool] = None,
+    order_method: typing.Optional[str] = None,
 ) -> typing.Tuple[typing.Optional[typing.Dict], typing.Optional[str], typing.Optional[str]]:
     """
     Partial update of ANY order account, including the default one — label/credentials/active/
-    is_default may each be omitted to leave them unchanged. ``credentials`` is merged onto the
-    stored dict the same way the legacy connect_provider/update_connection path merges "order"
-    (non-empty values overwrite, empty/null for a sensitive field leaves it unchanged), then
-    re-validated live if anything actually changed. ``is_default=True`` promotes this account to
-    be the connection's default (demoting whichever one currently is); ``is_default=False`` on
-    the current default demotes it and promotes the next-oldest active account, same as
-    deactivating it (see below) — there always at most one default, never zero once at least one
-    active account exists.
+    is_default/order_method may each be omitted to leave them unchanged. ``credentials`` is
+    merged onto the stored dict the same way the legacy connect_provider/update_connection path
+    merges "order" (non-empty values overwrite, empty/null for a sensitive field leaves it
+    unchanged), then re-validated live if anything actually changed. ``is_default=True``
+    promotes this account to be the connection's default (demoting whichever one currently is);
+    ``is_default=False`` on the current default demotes it and promotes the next-oldest active
+    account, same as deactivating it (see below) — there always at most one default, never zero
+    once at least one active account exists.
+
+    ``order_method`` ('api' | 'email') switches which channel this account places orders
+    through — see orders.registry.get_adapter()'s channel-first dispatch. Switching is
+    non-destructive: credentials are validated/merged against whichever channel's field list is
+    now active, but _merge_namespace_credentials only ever touches keys in that list, so the
+    OTHER channel's previously-entered values (e.g. Keystone's account_number/security_key when
+    switching to Email, or rep_email/cc_email when switching back to API) stay in `credentials`
+    untouched — switching back later doesn't require re-entering them. When ``order_method`` is
+    given WITHOUT ``credentials`` (a bare channel switch), the account's already-stored values
+    for that channel are used as-is and re-validated only if that channel requires live
+    API-credential validation (email needs none — see _validate_email_order_connection).
     """
     account = (
         src_models.CompanyProviderOrderAccount.objects.filter(
@@ -1642,21 +1737,42 @@ def update_order_account(
     if not catalog_entry:
         return None, "Provider not found in catalog", CONNECTION_ERROR_NOT_FOUND
 
+    method_value = account.order_method
+    switching_method = False
+    if order_method is not None:
+        new_method_value = (
+            src_enums.OrderMethod.EMAIL.value
+            if order_method.strip().lower() == "email"
+            else src_enums.OrderMethod.API.value
+        )
+        switching_method = new_method_value != method_value
+        method_value = new_method_value
+
     validated = None
-    if credentials:
-        order_required = [str(f) for f in (catalog_entry.get("order_connection_required_fields") or [])]
-        order_optional = [str(f) for f in (catalog_entry.get("order_connection_optional_fields") or [])]
+    if credentials or switching_method:
+        order_required, order_optional = _order_credential_fields_for_method(catalog_entry, method_value)
+        if not order_required and not order_optional:
+            return (
+                None,
+                "{} doesn't support {} ordering.".format(
+                    cp.provider.name, "email" if method_value == src_enums.OrderMethod.EMAIL.value else "API"
+                ),
+                CONNECTION_ERROR_INVALID_INPUT,
+            )
         creds = dict(account.credentials or {})
-        err, err_code = _merge_namespace_credentials(creds, order_required, order_optional, credentials)
-        if err:
-            return None, err, err_code
+        if credentials:
+            err, err_code = _merge_namespace_credentials(creds, order_required, order_optional, credentials)
+            if err:
+                return None, err, err_code
         missing = [f for f in order_required if not _normalize_credential_value(creds.get(f))]
         if missing:
             return None, "Missing required fields: {}".format(", ".join(missing)), CONNECTION_ERROR_MISSING_FIELDS
-        validated, val_error, val_error_code = _validate_order_connection(cp.provider.kind, creds)
+        validated, val_error, val_error_code = _validate_order_connection_for_method(cp.provider.kind, method_value, creds)
         if val_error:
             return None, val_error, val_error_code
         account.credentials = creds
+        account.order_method = method_value
+        account.order_method_name = src_enums.OrderMethod(method_value).name
         status_enum, reason = _resolve_order_status(True, None, _order_gating_feed_status_enum(cp))
         status_fields = _order_connection_status_fields(status_enum, reason)
         for field, value in status_fields.items():
@@ -1698,7 +1814,7 @@ def update_order_account(
         account.save(update_fields=["is_default", "updated_at"])
         _promote_next_default_order_account(cp)
 
-    if credentials or was_default or account.is_default:
+    if credentials or switching_method or was_default or account.is_default:
         _refresh_default_order_status(cp)
 
     result = _serialize_order_account(catalog_entry, account)

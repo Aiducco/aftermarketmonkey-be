@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8" />
+<style>
+  @page { size: letter; margin: 36pt; }
+  body { font-family: Helvetica, Arial, sans-serif; font-size: 9.5pt; color: #1A1E27; }
+  .brand { font-size: 16pt; font-weight: bold; color: #1A1E27; }
+  .brand span { color: #E07830; }
+  .doc-title { font-size: 13pt; font-weight: bold; margin-top: 4pt; }
+  .meta-table { width: 100%; margin-top: 14pt; }
+  .meta-table td { vertical-align: top; padding-right: 20pt; }
+  .meta-label { font-size: 8pt; color: #8A8F99; text-transform: uppercase; }
+  .meta-value { font-size: 10pt; padding-top: 2pt; }
+  .section-heading { font-size: 9pt; font-weight: bold; color: #8A8F99; text-transform: uppercase; margin-top: 16pt; margin-bottom: 4pt; }
+  .ship-to-box { border: 1px solid #EFE6DB; background-color: #FAF6F1; padding: 8pt 10pt; }
+  table.items { width: 100%; border-collapse: collapse; margin-top: 6pt; }
+  table.items th { text-align: left; font-size: 8pt; text-transform: uppercase; color: #8A8F99; border-bottom: 1px solid #1A1E27; padding: 5pt 4pt; }
+  table.items td { font-size: 9.5pt; border-bottom: 1px solid #F0EDE8; padding: 6pt 4pt; }
+  .num { text-align: right; }
+  table.totals { width: 100%; margin-top: 8pt; }
+  table.totals td { padding: 3pt 4pt; }
+  .totals .label { text-align: right; color: #4A4F5A; }
+  .totals .value { text-align: right; width: 90pt; }
+  .totals .grand td { font-weight: bold; border-top: 1px solid #1A1E27; padding-top: 6pt; }
+  .footer { margin-top: 22pt; font-size: 8pt; color: #8A8F99; border-top: 1px solid #F0EDE8; padding-top: 8pt; }
+  .notes { margin-top: 12pt; font-size: 9pt; color: #4A4F5A; }
+</style>
+</head>
+<body>
+
+  <div class="brand">Aftermarket<span>Scout</span></div>
+  <div class="doc-title">Purchase Order {{ po_reference }}</div>
+
+  <table class="meta-table">
+    <tr>
+      <td>
+        <div class="meta-label">Ordered by</div>
+        <div class="meta-value">{{ company_name }}</div>
+      </td>
+      <td>
+        <div class="meta-label">Distributor</div>
+        <div class="meta-value">{{ provider_name }}</div>
+      </td>
+      <td>
+        <div class="meta-label">Date</div>
+        <div class="meta-value">{{ order_date }}</div>
+      </td>
+    </tr>
+  </table>
+
+  <div class="section-heading">Ship to</div>
+  <div class="ship-to-box">
+    {{ ship_to.name }}{% if ship_to.attention %} &mdash; Attn: {{ ship_to.attention }}{% endif %}<br />
+    {{ ship_to.address1 }}{% if ship_to.address2 %}, {{ ship_to.address2 }}{% endif %}<br />
+    {{ ship_to.city }}, {{ ship_to.state }} {{ ship_to.postal_code }}, {{ ship_to.country }}<br />
+    {% if ship_to.phone %}Phone: {{ ship_to.phone }}{% endif %}
+  </div>
+
+  <div class="section-heading">Line items</div>
+  <table class="items">
+    <thead>
+      <tr>
+        <th>Part #</th>
+        <th>Description</th>
+        <th class="num">Qty</th>
+        <th class="num">Unit cost</th>
+        <th class="num">Line total</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for item in line_items %}
+      <tr>
+        <td>{{ item.part_number }}{% if item.brand_name %}<br /><span style="color:#8A8F99;">{{ item.brand_name }}</span>{% endif %}</td>
+        <td>{{ item.description }}</td>
+        <td class="num">{{ item.quantity }}</td>
+        <td class="num">{% if item.unit_cost is not None %}${{ item.unit_cost }}{% endif %}</td>
+        <td class="num">{% if item.line_total is not None %}${{ item.line_total }}{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <table class="totals">
+    <tr>
+      <td class="label">Subtotal</td>
+      <td class="value">{% if subtotal is not None %}${{ subtotal }}{% else %}&mdash;{% endif %}</td>
+    </tr>
+    <tr class="grand">
+      <td class="label">Total</td>
+      <td class="value">{% if subtotal is not None %}${{ subtotal }}{% else %}To be confirmed{% endif %}</td>
+    </tr>
+  </table>
+
+  {% if notes %}
+  <div class="notes"><strong>Notes:</strong> {{ notes }}</div>
+  {% endif %}
+
+  <div class="footer">
+    Sent via AftermarketScout on behalf of {{ company_name }} to {{ rep_email }}{% if cc_email %} (cc: {{ cc_email }}){% endif %}.
+    Please confirm pricing, availability, and shipping directly with {{ company_name }}.
+  </div>
+
+</body>
+</html>

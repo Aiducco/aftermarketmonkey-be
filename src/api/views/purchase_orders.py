@@ -341,6 +341,32 @@ class PurchaseOrderDetailView(views.View):
         return _json_response(result)
 
 
+class PurchaseOrderPdfView(views.View):
+    """GET /purchase-orders/<id>/pdf/ — regenerates and downloads the PDF that was emailed for
+    an email-channel PO (see src.integrations.orders.email_order.EmailOrderAdapter). 404s for a
+    PO that was never submitted via the email channel."""
+
+    def get(self, request: http.HttpRequest, *args, **kwargs) -> http.HttpResponse:
+        company_id, _user_id, err = _require_auth(request)
+        if err:
+            return err
+
+        po_id = kwargs.get("id")
+        try:
+            pdf_bytes = purchase_orders_services.get_purchase_order_pdf_bytes(
+                company_id=company_id, purchase_order_id=po_id
+            )
+        except purchase_orders_services.PurchaseOrderServiceError as e:
+            return _error_response(str(e), status=404)
+        except Exception:
+            logger.exception("{} Error rendering PDF for purchase order id={}".format(_LOG_PREFIX, po_id))
+            return _error_response("Error rendering purchase order PDF", status=500)
+
+        response = http.HttpResponse(content=pdf_bytes, content_type="application/pdf")
+        response["Content-Disposition"] = 'attachment; filename="PO-{}.pdf"'.format(po_id)
+        return response
+
+
 class PurchaseOrderConfirmedDetailView(views.View):
     """GET /purchase-orders/<id>/confirmed-details/ -- standardized, distributor-agnostic view
     of a placed order (distributor status/tracking/invoice ids/line items read straight off

@@ -165,6 +165,11 @@ PROVIDER_CATALOG = [
         # instead of assuming it does because the feed connected fine. See
         # _validate_turn14_order_connection in src/api/services/integrations.py.
         "order_connection_required_fields": ["client_id", "client_secret"],
+        # Email-channel ordering — always available regardless of whether the API adapter above
+        # is connected; see src.enums.OrderMethod and src/integrations/orders/email_order.py.
+        # A company picks the channel per order account (Settings > Integrations > Ordering).
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["cc_email"],
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
             "<p>Turn 14 connections use OAuth2. Your <strong>client ID</strong> and <strong>client secret</strong> "
@@ -199,6 +204,9 @@ PROVIDER_CATALOG = [
         # from the FTP catalog feed above. Optional: a company can connect the FTP feed without
         # ever filling these in; order placement simply stays unavailable until they do.
         "order_connection_required_fields": ["account_number", "security_key"],
+        # Email-channel ordering — see the matching note on Turn 14 above.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["cc_email"],
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
             "<p><strong>Keystone</strong> data is loaded from their FTP inventory feed using your account credentials.</p>"
@@ -229,6 +237,11 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/rough_country.png",
         "category": "Distributors",
         "connection_required_fields": [ROUGH_COUNTRY_CREDENTIALS_FEED_URL],
+        # Email-channel ordering — Rough Country has no order API of its own, so this is the
+        # only way to place orders through AfterMarketScout for it. See the matching note on
+        # Turn 14 above.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["cc_email"],
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
             "<p><strong>Rough Country</strong> uses a downloadable Excel jobber feed URL per dealer account.</p>"
@@ -238,6 +251,11 @@ PROVIDER_CATALOG = [
             "should start with <code>https://feeds.roughcountry.com/jobber_</code>.</li>"
             "<li>Paste that URL into <strong>feed_url</strong> below and save the connection.</li>"
             "</ol>"
+            "<p><strong>Optional: place orders through AfterMarketScout</strong></p>"
+            "<p>Rough Country has no ordering API — orders are emailed to your Rough Country rep as a PDF "
+            "purchase order instead. Enter your rep's <strong>email</strong> below (and an optional internal "
+            "<strong>CC</strong> address) and save. You can skip it if you don't plan to place orders through "
+            "AfterMarketScout.</p>"
         ),
     },
     {
@@ -265,6 +283,9 @@ PROVIDER_CATALOG = [
         # doesn't apply to a dealer connection). Optional: a company can connect the SFTP feed
         # without ever filling these in; order placement simply stays unavailable until they do.
         "order_connection_required_fields": ["username", "password"],
+        # Email-channel ordering — see the matching note on Turn 14 above.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["cc_email"],
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
             "<p><strong>Wheel Pros</strong> inventory and pricing CSVs (wheels, tires, accessories) are on Wheel "
@@ -310,6 +331,9 @@ PROVIDER_CATALOG = [
         # feed without ever filling these in; order placement simply stays unavailable until
         # they do.
         "order_connection_required_fields": ["api_key", "customer_number"],
+        # Email-channel ordering — see the matching note on Turn 14 above.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["cc_email"],
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
             "<p>AfterMarketScout has already created a dedicated SFTP account for your company. "
@@ -377,7 +401,15 @@ PROVIDER_CATALOG = [
             "<p>No credentials to enter here &mdash; just click <strong>Connect</strong>. "
             "Connecting also schedules a pricing refresh for your company where supported. "
             "Questions: <a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a>.</p>"
+            "<p><strong>Optional: place orders through AfterMarketScout</strong></p>"
+            "<p>A-Tech has no ordering API — orders are emailed to your A-Tech rep as a PDF purchase order "
+            "instead. Enter your rep's <strong>email</strong> below (and an optional internal <strong>CC</strong> "
+            "address) and save. You can skip it if you don't plan to place orders through AfterMarketScout.</p>"
         ),
+        # Email-channel ordering — A-Tech has no order API of its own; see the matching note on
+        # Turn 14 above.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["cc_email"],
     },
     {
         "kind": enums.BrandProviderKind.DLG,
@@ -404,10 +436,18 @@ PROVIDER_CATALOG = [
             "so we can tell which company a message belongs to. Use the mailbox DLG actually uses, not a personal alias "
             "unless that is the address DLG targets.</li>"
             "</ul>"
+            "<p><strong>Optional: place orders through AfterMarketScout</strong></p>"
+            "<p>DLG has no ordering API — orders are emailed to your DLG rep as a PDF purchase order instead. "
+            "Enter your rep's <strong>email</strong> below (and an optional internal <strong>CC</strong> "
+            "address) and save. You can skip it if you don't plan to place orders through AfterMarketScout.</p>"
         ).format(
             dlg_fwd=DLG_INVENTORY_FORWARD_TO_EMAIL,
             email_from_key=DLG_CREDENTIALS_EMAIL_FROM,
         ),
+        # Email-channel ordering — DLG has no order API of its own; see the matching note on
+        # Turn 14 above.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["cc_email"],
     },
     {
         "kind": enums.BrandProviderKind.AUTOMATIC_DISTRIBUTORS,
@@ -724,6 +764,9 @@ PROVIDER_CATALOG = [
         # Optional: a company can connect the FTP feed without ever filling this in; order
         # placement simply stays unavailable until they do.
         "order_connection_required_fields": ["api_key"],
+        # Email-channel ordering — see the matching note on Turn 14 above.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["cc_email"],
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
             "<p><strong>APG Wholesale (Premier)</strong> delivers a daily inventory and pricing feed via their FTP server. "
@@ -890,7 +933,15 @@ PROVIDER_CATALOG = [
             "cost = price &times; (1 &minus; discount_percent / 100).</li>"
             "<li>Save the connection.</li>"
             "</ol>"
+            "<p><strong>Optional: place orders through AfterMarketScout</strong></p>"
+            "<p>Vossen has no ordering API — orders are emailed to your Vossen rep as a PDF purchase order "
+            "instead. Enter your rep's <strong>email</strong> below (and an optional internal <strong>CC</strong> "
+            "address) and save. You can skip it if you don't plan to place orders through AfterMarketScout.</p>"
         ).format(VOSSEN_FEED_URL_HOST_PREFIX),
+        # Email-channel ordering — Vossen has no order API of its own; see the matching note on
+        # Turn 14 above.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["cc_email"],
     },
     {
         "kind": enums.BrandProviderKind.TIRERACK,
@@ -913,7 +964,15 @@ PROVIDER_CATALOG = [
             "<strong>port</strong>, <strong>username</strong>, and <strong>password</strong>.</li>"
             "<li>Enter them below and save the connection.</li>"
             "</ol>"
+            "<p><strong>Optional: place orders through AfterMarketScout</strong></p>"
+            "<p>TireRack has no ordering API — orders are emailed to your TireRack rep as a PDF purchase order "
+            "instead. Enter your rep's <strong>email</strong> below (and an optional internal <strong>CC</strong> "
+            "address) and save. You can skip it if you don't plan to place orders through AfterMarketScout.</p>"
         ),
+        # Email-channel ordering — TireRack has no order API of its own; see the matching note
+        # on Turn 14 above.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["cc_email"],
     },
 ]
 
