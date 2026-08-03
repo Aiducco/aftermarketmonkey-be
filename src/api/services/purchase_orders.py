@@ -302,7 +302,10 @@ def _serialize_purchase_order(po: src_models.PurchaseOrder, include_line_items: 
     return result
 
 
-def _serialize_purchase_order_list_item(po: src_models.PurchaseOrder) -> typing.Dict:
+def _serialize_purchase_order_list_item(
+    po: src_models.PurchaseOrder,
+    distributor_order_status_name: typing.Optional[str] = None,
+) -> typing.Dict:
     """
     Lean row shape for GET /purchase-orders/ (the order-history table) -- exactly the columns
     that view renders (internal ref #, PO, distributor, status, recipient, ship method, total,
@@ -312,6 +315,13 @@ def _serialize_purchase_order_list_item(po: src_models.PurchaseOrder) -> typing.
     distributor_orders (whose raw_response/processed_order columns can now be large -- Keystone's
     full GetOrderHistory dump, Premier's full order + tracking, Turn14's orders/po lookup -- see
     confirmed_purchase_order_sync), and a per-PO invoices query, none of which this table shows.
+
+    ``distributor_order_status_name`` is the distributor's own raw order status (see
+    PurchaseOrderDistributorOrder.distributor_order_status_name) -- distinct from status/
+    status_name above, which is our internal fulfillment lifecycle -- passed in by
+    list_purchase_orders from a separate lean query rather than a prefetch, for the same
+    heavy-columns reason. None when this PO has no distributor order yet, or hasn't been
+    refreshed (only Turn14 currently translates this field).
     """
     provider = po.company_provider.provider
     return {
@@ -320,6 +330,7 @@ def _serialize_purchase_order_list_item(po: src_models.PurchaseOrder) -> typing.
         "po_name": po.po_name,
         "status": po.status,
         "status_name": po.status_name,
+        "distributor_order_status_name": distributor_order_status_name,
         "company_provider_id": po.company_provider_id,
         "provider_kind_name": provider.kind_name,
         "provider_name": provider.name,
@@ -970,8 +981,11 @@ def list_purchase_orders(
     used to be prefetched here for a shape (_serialize_purchase_order) this list no longer uses;
     that prefetch pulled every PurchaseOrderDistributorOrder column, including raw_response/
     processed_order, which can now be large (Keystone's full GetOrderHistory dump, Premier's
-    full order + tracking, Turn14's orders/po lookup) for every PO in the list. See
-    _serialize_purchase_order_list_item for exactly what this response shape carries."""
+    full order + tracking, Turn14's orders/po lookup) for every PO in the list. distributor_order_
+    status_name is instead fetched via a second, narrow .values() query below (just the two
+    columns needed), scoped to only the page's own PO ids, rather than reintroducing that
+    prefetch. See _serialize_purchase_order_list_item for exactly what this response shape
+    carries."""
     qs = (
         src_models.PurchaseOrder.objects.filter(company_id=company_id)
         .exclude(id__in=_cart_queryset(company_id).values("id"))
@@ -987,7 +1001,30 @@ def list_purchase_orders(
             qs = qs.filter(status=status_value)
     if company_provider_id is not None:
         qs = qs.filter(company_provider_id=company_provider_id)
-    return [_serialize_purchase_order_list_item(po) for po in qs[:200]]
+    pos = list(qs[:200])
+
+    # Most-recently-updated distributor order per PO (a PO can fan out to more than one -- e.g.
+    # Meyer's Orders array -- though none do today; this stays correct if that changes). Narrow
+    # .values() query, not a prefetch, to skip the heavy raw_response/processed_order columns.
+    distributor_status_by_po_id: typing.Dict[int, str] = {}
+    distributor_rows = (
+        src_models.PurchaseOrderDistributorOrder.objects.filter(
+            purchase_order_id__in=[po.id for po in pos],
+        )
+        .exclude(distributor_order_status_name__isnull=True)
+        .exclude(distributor_order_status_name="")
+        .order_by("-updated_at")
+        .values("purchase_order_id", "distributor_order_status_name")
+    )
+    for row in distributor_rows:
+        distributor_status_by_po_id.setdefault(
+            row["purchase_order_id"], row["distributor_order_status_name"]
+        )
+
+    return [
+        _serialize_purchase_order_list_item(po, distributor_status_by_po_id.get(po.id))
+        for po in pos
+    ]
 
 
 def list_purchase_order_invoices(
