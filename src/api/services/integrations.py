@@ -281,6 +281,8 @@ def get_providers_catalog(company_id: int) -> typing.Dict:
             "order_credentials_mirror_feed": _catalog_order_credentials_mirror_feed(entry),
             "order_connection_required_fields": entry.get("order_connection_required_fields", []),
             "order_connection_optional_fields": entry.get("order_connection_optional_fields", []),
+            "email_order_connection_required_fields": entry.get("email_order_connection_required_fields", []),
+            "email_order_connection_optional_fields": entry.get("email_order_connection_optional_fields", []),
             "installation_instructions_html": _render_relay_instructions_html(entry, company),
             "relay_provisioned": bool(entry.get("relay_provisioned")),
             "connected": connected,
@@ -1962,6 +1964,8 @@ def get_company_provider_by_id(company_id: int, provider_id: int) -> typing.Opti
             "connection_optional_fields": list(catalog_entry.get("connection_optional_fields") or []),
             "order_connection_required_fields": list(catalog_entry.get("order_connection_required_fields") or []),
             "order_connection_optional_fields": list(catalog_entry.get("order_connection_optional_fields") or []),
+            "email_order_connection_required_fields": list(catalog_entry.get("email_order_connection_required_fields") or []),
+            "email_order_connection_optional_fields": list(catalog_entry.get("email_order_connection_optional_fields") or []),
             "supports_ordering": _catalog_supports_ordering_display(catalog_entry) if catalog_entry else False,
             "order_credentials_mirror_feed": (
                 _catalog_order_credentials_mirror_feed(catalog_entry) if catalog_entry else False
@@ -2148,6 +2152,8 @@ def get_company_provider_connection_detail(
     out["connection_optional_fields"] = list(catalog_entry.get("connection_optional_fields") or [])
     out["order_connection_required_fields"] = list(catalog_entry.get("order_connection_required_fields") or [])
     out["order_connection_optional_fields"] = list(catalog_entry.get("order_connection_optional_fields") or [])
+    out["email_order_connection_required_fields"] = list(catalog_entry.get("email_order_connection_required_fields") or [])
+    out["email_order_connection_optional_fields"] = list(catalog_entry.get("email_order_connection_optional_fields") or [])
     out["relay_provisioned"] = bool(catalog_entry.get("relay_provisioned"))
     out["supports_ordering"] = _catalog_supports_ordering_display(catalog_entry)
     out["order_credentials_mirror_feed"] = _catalog_order_credentials_mirror_feed(catalog_entry)
