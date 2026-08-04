@@ -209,22 +209,52 @@ def resolve_normalized_matches(
 
     for normalized_key, feed_rows in by_normalized.items():
         found = candidates.get(normalized_key) or []
+        if not found:
+            skipped["no_candidate"] += len(feed_rows)
+            continue
+
+        # Strongest possible evidence, checked before anything else: this provider already has a
+        # ProviderPart on a candidate under the *same* provider_external_id. That is not an
+        # inference from spelling -- the distributor's own catalog id says it is this part, and
+        # the link already exists (an earlier sync made it, or the merge script moved it here).
+        # It therefore outranks both the ambiguity check and the GTIN corroboration the
+        # punctuation tiers otherwise require: re-deriving identity we already hold would refuse
+        # the row and re-create the duplicate the merge just removed. This is exactly how a
+        # T3/T4 part with a missing GTIN on either side used to leak back in.
+        # Lowest id first: if a duplicate has already been created (this provider ends up linked
+        # under the same external id on both rows), the older row is the canonical one, and
+        # collapsing onto it lets the next cleanup run remove the newer copy. Without this the
+        # choice would follow query order and could flip between syncs.
+        already_linked_by_external_id = {}
+        for cand in sorted(found, key=lambda c: c.master_part_id):
+            for external_id in external_ids_on_candidate.get(cand.master_part_id) or ():
+                already_linked_by_external_id.setdefault(external_id, cand)
+
+        unresolved_rows = []
+        for feed_part in feed_rows:
+            own = (feed_part.provider_external_id or "").strip()
+            linked = already_linked_by_external_id.get(own) if own else None
+            if linked is not None:
+                resolved[(feed_part.brand_id, feed_part.part_number)] = linked.master_part_id
+                skipped["relinked_by_external_id"] += 1
+            else:
+                unresolved_rows.append(feed_part)
+        if not unresolved_rows:
+            continue
+
         if len(found) != 1:
-            skipped["ambiguous" if found else "no_candidate"] += len(feed_rows)
+            skipped["ambiguous"] += len(unresolved_rows)
             continue
         candidate = found[0]
         existing_external_ids = external_ids_on_candidate.get(candidate.master_part_id) or set()
 
         candidate_gtin = pn_util.normalize_gtin(candidate.gtin)
-        for feed_part in feed_rows:
+        for feed_part in unresolved_rows:
             if existing_external_ids:
-                own = (feed_part.provider_external_id or "").strip()
-                # Same external id -> this feed row is already attached here (earlier run, or the
-                # merge script moved it); matching is correct. Anything else means the provider
+                # Reaching here means this feed row's own id is NOT among them, so the provider
                 # lists a genuinely different part on this master part.
-                if not own or own not in existing_external_ids:
-                    skipped["provider_lists_other_part_here"] += 1
-                    continue
+                skipped["provider_lists_other_part_here"] += 1
+                continue
             spellings = [feed_part.part_number, candidate.part_number]
             if pn_util.has_sign_conflict(spellings):
                 skipped["sign_conflict"] += 1
