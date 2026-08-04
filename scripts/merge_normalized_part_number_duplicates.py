@@ -68,6 +68,14 @@ GTIN_LESS_PROVIDER_KINDS = frozenset({
     src_enums.BrandProviderKind.TIRERACK.value,
 })
 
+# Providers whose ingest still resolves master parts by exact string match only -- they do NOT
+# call master_part_matching.extend_with_normalized_matches. Their spelling must survive a merge
+# or their next sync resurrects the duplicate; see _pick_canonical. Keep this in sync with which
+# _ingest_* functions in master_parts.py actually call the resolver.
+EXACT_MATCH_ONLY_PROVIDER_KINDS = frozenset({
+    src_enums.BrandProviderKind.TURN_14.value,
+})
+
 # Groups larger than this are almost always a shared/bogus identifier rather than one part spelled
 # several ways; they go to review regardless of what the other gates say.
 MAX_GROUP_SIZE = 4
@@ -353,17 +361,27 @@ def _pick_canonical(rows: typing.Sequence[MasterPartRow]) -> typing.Tuple[Master
     """
     Choose the row to keep, in order:
 
-    1. most ProviderPart links -- the spelling the most distributors already agree on;
-    2. keeps its punctuation -- manufacturers publish separators more often than not, and a
+    1. **carries a provider whose ingest still matches on the exact string only** (Turn14) --
+       see EXACT_MATCH_ONLY_PROVIDER_KINDS. This one is a correctness requirement, not a
+       preference: deleting the row Turn14 points at makes Turn14's next sync fail its exact
+       lookup, insert a fresh row, and add a *second* ProviderPart while the stale one remains.
+       Turn14 then sits on both rows, the group fails the provider-disjointness gate, and it can
+       never be auto-merged again. Keeping Turn14's spelling means its exact match keeps hitting;
+       every other provider is wired for normalized matching and finds the row regardless.
+       Provider-disjointness (enforced before we get here) guarantees at most one row in the
+       group carries it, so this never has to break a tie between two such rows.
+    2. most ProviderPart links -- the spelling the most distributors already agree on;
+    3. keeps its punctuation -- manufacturers publish separators more often than not, and a
        distributor that stripped them is the one that departed from the published number;
-    3. most uppercase characters -- part numbers are conventionally uppercase, and some feeds
+    4. most uppercase characters -- part numbers are conventionally uppercase, and some feeds
        lowercase them wholesale ('253100ct' from Turn14 vs '253100CT' from TireRack);
-    4. lowest id, purely so the choice is stable across runs.
+    5. lowest id, purely so the choice is stable across runs.
     """
     def sort_key(row: MasterPartRow):
+        exact_only = 0 if (row.provider_kinds & EXACT_MATCH_ONLY_PROVIDER_KINDS) else 1
         punctuation = sum(1 for ch in row.part_number if not ch.isalnum())
         uppercase = sum(1 for ch in row.part_number if ch.isupper())
-        return (-len(row.provider_ids), -punctuation, -uppercase, row.id)
+        return (exact_only, -len(row.provider_ids), -punctuation, -uppercase, row.id)
 
     ordered = sorted(rows, key=sort_key)
     return ordered[0], list(ordered[1:])
@@ -535,6 +553,153 @@ def _merge_rows(rows: typing.Sequence[MasterPartRow], dry_run: bool) -> bool:
             dup_obj.delete()
             print("      [OK] deleted MasterPart {}".format(dup.id))
     return True
+
+
+_BULK_BACKFILL_FIELDS = ("description", "image_url", "aaia_code", "gtin", "sku",
+                         "overview_category", "category")
+
+# unique_together on MasterPartFitment, in order -- used to skip fitments that would collide.
+_FITMENT_KEY_COLUMNS = ("year_start", "year_end", "make", "model", "submodel", "engine", "drive_type")
+
+
+def merge_groups_bulk(groups: typing.Sequence[Group], dry_run: bool = True,
+                      chunk_size: int = 400) -> typing.Dict[str, typing.Any]:
+    """
+    Set-based equivalent of ``merge_batch`` for gate-passing groups, ~70x faster over a remote
+    connection because it issues a handful of statements per *chunk* rather than ~25 round trips
+    per *group* (row-by-row is 27 hours for the full set; this is minutes).
+
+    Only valid for groups that cleared ``evaluate_group``, and it re-asserts the property it
+    depends on: **provider-disjointness**. Because no two rows in a group share a provider, no
+    ProviderPart is ever deleted -- they are only repointed, which keeps their ids and so carries
+    inventory, company pricing and kit components along untouched, and never trips the
+    ``PROTECT`` on ``PurchaseOrderLineItem.provider_part``.
+
+    Anything that is not a clean disjoint merge (a duplicate that also has MasterPartData when
+    the keeper does) is handed back to the careful row-by-row path rather than approximated.
+    """
+    groups = [g for g in groups if g.safe]
+    results: typing.Dict[str, typing.Any] = {"merged": 0, "deleted": 0, "fallback": [], "failed": []}
+
+    for start in range(0, len(groups), chunk_size):
+        chunk = groups[start : start + chunk_size]
+        pairs: typing.List[typing.Tuple[int, int]] = []   # (dup_id, keep_id)
+        keep_ids: typing.List[int] = []
+        for group in chunk:
+            if _providers_overlap(group.rows):
+                results["failed"].append((group.normalized_part_number, "providers overlap"))
+                continue
+            keep, dups = _pick_canonical(group.rows)
+            keep_ids.append(keep.id)
+            pairs.extend((d.id, keep.id) for d in dups)
+        if not pairs:
+            continue
+
+        dup_ids = [d for d, _ in pairs]
+        try:
+            with transaction.atomic():
+                values = ", ".join(["(%s::bigint, %s::bigint)"] * len(pairs))
+                params = [x for pair in pairs for x in pair]
+
+                # Backfill blank descriptive fields on the keeper from its duplicates. DISTINCT ON
+                # picks one donor deterministically when a group has several duplicates.
+                sets = ", ".join(
+                    "{f} = COALESCE(NULLIF(mp.{f}, ''), d.{f})".format(f=f)
+                    for f in _BULK_BACKFILL_FIELDS
+                )
+                with connection.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE master_parts mp SET {sets}
+                        FROM (
+                            SELECT DISTINCT ON (m.keep_id) m.keep_id, {cols}
+                            FROM (VALUES {values}) AS m(dup_id, keep_id)
+                            JOIN master_parts src ON src.id = m.dup_id
+                            ORDER BY m.keep_id, m.dup_id
+                        ) AS d(keep_id, {cols})
+                        WHERE mp.id = d.keep_id
+                        """.format(
+                            sets=sets,
+                            cols=", ".join(_BULK_BACKFILL_FIELDS),
+                            values=values,
+                        ),
+                        params,
+                    )
+
+                    # Repoint provider parts. Disjointness means no unique_together conflict.
+                    cur.execute(
+                        """
+                        UPDATE provider_parts pp SET master_part_id = m.keep_id
+                        FROM (VALUES {values}) AS m(dup_id, keep_id)
+                        WHERE pp.master_part_id = m.dup_id
+                        """.format(values=values),
+                        params,
+                    )
+
+                    # MasterPartData is OneToOne: move it only where the keeper has none.
+                    cur.execute(
+                        """
+                        UPDATE master_part_data d SET master_part_id = m.keep_id
+                        FROM (VALUES {values}) AS m(dup_id, keep_id)
+                        WHERE d.master_part_id = m.dup_id
+                          AND NOT EXISTS (SELECT 1 FROM master_part_data k WHERE k.master_part_id = m.keep_id)
+                        """.format(values=values),
+                        params,
+                    )
+                    # Whatever is left would need a field-level merge; hand those groups back.
+                    cur.execute(
+                        "SELECT master_part_id FROM master_part_data WHERE master_part_id IN %s",
+                        (tuple(dup_ids),),
+                    )
+                    needs_field_merge = {row[0] for row in cur.fetchall()}
+
+                    # Fitments: move the ones that do not collide, drop the rest.
+                    match = " AND ".join(
+                        "k.{c} = f.{c}".format(c=c) for c in _FITMENT_KEY_COLUMNS
+                    )
+                    cur.execute(
+                        """
+                        UPDATE master_part_fitments f SET master_part_id = m.keep_id
+                        FROM (VALUES {values}) AS m(dup_id, keep_id)
+                        WHERE f.master_part_id = m.dup_id
+                          AND NOT EXISTS (
+                              SELECT 1 FROM master_part_fitments k
+                              WHERE k.master_part_id = m.keep_id AND {match}
+                          )
+                        """.format(values=values, match=match),
+                        params,
+                    )
+                    cur.execute(
+                        "DELETE FROM master_part_fitments WHERE master_part_id IN %s",
+                        (tuple(dup_ids),),
+                    )
+
+                    deletable = [d for d in dup_ids if d not in needs_field_merge]
+                    if deletable:
+                        # Belt and braces: never delete a row that still owns provider parts.
+                        cur.execute(
+                            """
+                            DELETE FROM master_parts
+                            WHERE id IN %s
+                              AND NOT EXISTS (SELECT 1 FROM provider_parts pp WHERE pp.master_part_id = master_parts.id)
+                            """,
+                            (tuple(deletable),),
+                        )
+                        results["deleted"] += cur.rowcount
+                results["merged"] += len(chunk) - len(needs_field_merge)
+            if needs_field_merge:
+                results["fallback"].extend(sorted(needs_field_merge))
+        except Exception as exc:
+            print("[ERROR] chunk at {}: {}".format(start, exc))
+            import traceback
+            traceback.print_exc()
+            results["failed"].append((start, str(exc)))
+
+        print("[bulk] {}/{} groups | deleted={} fallback={} failed={}".format(
+            min(start + chunk_size, len(groups)), len(groups),
+            results["deleted"], len(results["fallback"]), len(results["failed"])))
+
+    return results
 
 
 def merge_batch(groups: typing.Sequence[Group], dry_run: bool = True,
