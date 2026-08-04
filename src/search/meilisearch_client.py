@@ -3,6 +3,7 @@ Meilisearch client for parts search index.
 Backend uses master key for indexing; frontend will use a public read-only key.
 """
 import hashlib
+import json
 import logging
 import time
 import typing
@@ -20,6 +21,17 @@ INDEX_NAME_VEHICLES = getattr(settings, "MEILISEARCH_INDEX_VEHICLES", "vehicles"
 # Larger batches + multiple parallel upload threads are faster; retries still cover transient HTTP errors.
 REINDEX_DEFAULT_BATCH_SIZE = getattr(settings, "MEILISEARCH_REINDEX_BATCH_SIZE", 20000)
 REINDEX_DEFAULT_UPLOAD_WORKERS = getattr(settings, "MEILISEARCH_REINDEX_UPLOAD_WORKERS", 8)
+
+# Some MasterParts (bearing kits, oil, axle hardware -- anything genuinely near-universal-fit)
+# have hundreds to thousands of MasterPartFitment rows, which expand into a fitment_keys array
+# that alone can run 100s of KB per document (confirmed live: one part with 2685 raw fitment
+# rows produced a 13,036-entry, 459KB fitment_keys array). A flat row-count batch size doesn't
+# account for this -- a batch that happens to land on an id range dense with these parts can
+# balloon to tens of MB in one HTTP request, which reliably times out regardless of how long the
+# client-side timeout is (confirmed live: the same two batches failed every night for 5+ days
+# even at a 30-minute timeout). Splitting oversized batches by estimated payload bytes (not just
+# doc count) keeps every individual request to a sane size without changing what's indexed.
+_MAX_UPLOAD_BATCH_BYTES = 4_000_000
 
 _REINDEX_ADD_RETRIES = 4
 _REINDEX_TRANSIENT_SUBSTRINGS = (
@@ -284,25 +296,51 @@ def _build_docs_for_batch(
     return docs
 
 
-def _upload_raw_docs(
-    docs: typing.List[typing.Dict],
-    index_name: str = INDEX_NAME,
-    wait_for_completion: bool = False,
-) -> bool:
-    """
-    Upload pre-built document dicts to Meilisearch with retries.
-    Returns True on success. Workers and single-threaded paths both use this.
-    Pass ``index_name`` to target a staging index during zero-downtime reindex.
+def _estimate_docs_bytes(docs: typing.List[typing.Dict]) -> int:
+    """Rough UTF-8 payload size of ``docs`` if sent as a JSON array. Every field in a Meilisearch
+    parts doc is already a JSON-native type (see _build_docs_for_batch) so plain json.dumps is
+    safe here -- this is only a threshold check, not the actual wire payload (the meilisearch SDK
+    does its own serialization), so exactness doesn't matter, just staying in the right ballpark."""
+    if not docs:
+        return 0
+    return len(json.dumps(docs).encode("utf-8"))
 
-    Meilisearch's add_documents() only enqueues an async task - a successful call here does
-    NOT mean the documents were actually accepted (e.g. an invalid document id fails
-    asynchronously, after this call already returned). Pass ``wait_for_completion=True`` to
-    poll the task and treat a non-"succeeded" status as a real failure instead of a false
-    positive. Off by default for the large parts-index bulk reindex (waiting per-batch would
-    meaningfully slow down a ~2.9M-row run, and its document ids are always plain MasterPart
-    integers so this specific failure mode can't occur there); the small vehicles index turns
-    it on since correctness matters more than throughput at that scale.
+
+def _split_docs_by_bytes(
+    docs: typing.List[typing.Dict], max_bytes: int = _MAX_UPLOAD_BATCH_BYTES,
+) -> typing.List[typing.List[typing.Dict]]:
     """
+    Greedily group ``docs`` into chunks whose estimated JSON size stays under ``max_bytes``.
+    A single document larger than max_bytes on its own still gets its own one-doc chunk rather
+    than looping forever or silently dropping it -- Meilisearch's own document size limit is far
+    above anything one MasterPart doc could realistically produce, so a lone oversized chunk is
+    still fine to upload, just not batched with anything else.
+    """
+    if not docs:
+        return []
+    chunks: typing.List[typing.List[typing.Dict]] = []
+    current: typing.List[typing.Dict] = []
+    current_bytes = 2  # account for the enclosing "[" "]"
+    for doc in docs:
+        doc_bytes = _estimate_docs_bytes([doc])
+        if current and current_bytes + doc_bytes > max_bytes:
+            chunks.append(current)
+            current = []
+            current_bytes = 2
+        current.append(doc)
+        current_bytes += doc_bytes
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _upload_one_chunk_raw(
+    docs: typing.List[typing.Dict],
+    index_name: str,
+    wait_for_completion: bool,
+) -> bool:
+    """Single add_documents call with retries -- one already-size-checked chunk. See
+    _upload_raw_docs for the size-splitting wrapper that calls this."""
     if not docs:
         return True
     last_err: typing.Optional[BaseException] = None
@@ -342,6 +380,42 @@ def _upload_raw_docs(
     if last_err:
         logger.exception("Meilisearch _upload_raw_docs: exhausted retries | index=%s err=%s", index_name, last_err)
     return False
+
+
+def _upload_raw_docs(
+    docs: typing.List[typing.Dict],
+    index_name: str = INDEX_NAME,
+    wait_for_completion: bool = False,
+) -> bool:
+    """
+    Upload pre-built document dicts to Meilisearch with retries.
+    Returns True on success. Workers and single-threaded paths both use this.
+    Pass ``index_name`` to target a staging index during zero-downtime reindex.
+
+    Meilisearch's add_documents() only enqueues an async task - a successful call here does
+    NOT mean the documents were actually accepted (e.g. an invalid document id fails
+    asynchronously, after this call already returned). Pass ``wait_for_completion=True`` to
+    poll the task and treat a non-"succeeded" status as a real failure instead of a false
+    positive. Off by default for the large parts-index bulk reindex (waiting per-batch would
+    meaningfully slow down a ~2.9M-row run, and its document ids are always plain MasterPart
+    integers so this specific failure mode can't occur there); the small vehicles index turns
+    it on since correctness matters more than throughput at that scale.
+
+    Splits into byte-sized sub-chunks first (see _split_docs_by_bytes) -- a handful of
+    near-universal-fit parts with huge fitment_keys arrays can otherwise inflate one "batch" of
+    otherwise-ordinary documents into a multi-MB request that reliably times out regardless of
+    how long the client-side timeout is.
+    """
+    if not docs:
+        return True
+    chunks = _split_docs_by_bytes(docs)
+    if len(chunks) > 1:
+        logger.info(
+            "Meilisearch _upload_raw_docs: split oversized batch | index=%s total_docs=%s "
+            "total_bytes=%s chunks=%s",
+            index_name, len(docs), _estimate_docs_bytes(docs), len(chunks),
+        )
+    return all(_upload_one_chunk_raw(chunk, index_name, wait_for_completion) for chunk in chunks)
 
 
 def _part_to_document(part) -> typing.Dict:
@@ -637,16 +711,15 @@ def add_documents_in_batches(
     return total_ok, total_fail
 
 
-def _upload_docs_with_retries(
+def _upload_one_chunk_with_retries(
     docs: typing.List[typing.Dict],
     target_index_name: str,
-    batch_index: int,
+    batch_label: str,
     id_first: int,
     id_last: int,
 ) -> typing.Tuple[int, int]:
-    """Upload pre-built doc dicts to Meilisearch, retrying transient errors. Standalone (not a
-    closure) so both the cursor-based parallel path (upload-only workers) and the id-list
-    parallel path (fetch+build+upload workers, see _add_documents_parallel_by_ids) can share it."""
+    """Single add_documents call with retries -- one already-size-checked chunk. See
+    _upload_docs_with_retries for the size-splitting wrapper that calls this."""
     if not docs:
         return 0, 0
     last_err: typing.Optional[BaseException] = None
@@ -662,7 +735,7 @@ def _upload_docs_with_retries(
                 logger.info(
                     "Meilisearch parallel batch: success after retries | batch=%s id_range=%s..%s "
                     "size=%s attempts=%s batch_s=%.3f dps=%.0f",
-                    batch_index,
+                    batch_label,
                     id_first,
                     id_last,
                     len(docs),
@@ -673,7 +746,7 @@ def _upload_docs_with_retries(
             else:
                 logger.info(
                     "Meilisearch parallel batch: ok | batch=%s id_range=%s..%s size=%s batch_s=%.3f dps=%.0f",
-                    batch_index,
+                    batch_label,
                     id_first,
                     id_last,
                     len(docs),
@@ -688,7 +761,7 @@ def _upload_docs_with_retries(
                 logger.warning(
                     "Meilisearch parallel batch: transient (will retry) | batch=%s id_range=%s..%s "
                     "size=%s attempt=%s/%s wait_s=%.1f err_type=%s err=%s",
-                    batch_index,
+                    batch_label,
                     id_first,
                     id_last,
                     len(docs),
@@ -702,7 +775,7 @@ def _upload_docs_with_retries(
                 continue
             logger.exception(
                 "Meilisearch parallel batch: failed | batch=%s id_range=%s..%s size=%s err_type=%s",
-                batch_index,
+                batch_label,
                 id_first,
                 id_last,
                 len(docs),
@@ -712,12 +785,52 @@ def _upload_docs_with_retries(
     if last_err:
         logger.exception(
             "Meilisearch parallel batch: exhausted retries | batch=%s id_range=%s..%s err=%s",
-            batch_index,
+            batch_label,
             id_first,
             id_last,
             last_err,
         )
     return 0, len(docs)
+
+
+def _upload_docs_with_retries(
+    docs: typing.List[typing.Dict],
+    target_index_name: str,
+    batch_index: int,
+    id_first: int,
+    id_last: int,
+) -> typing.Tuple[int, int]:
+    """Upload pre-built doc dicts to Meilisearch, retrying transient errors. Standalone (not a
+    closure) so both the cursor-based parallel path (upload-only workers) and the id-list
+    parallel path (fetch+build+upload workers, see _add_documents_parallel_by_ids) can share it.
+
+    Splits into byte-sized sub-chunks first (see _split_docs_by_bytes) -- a handful of
+    near-universal-fit parts with huge fitment_keys arrays can otherwise inflate one "batch" of
+    otherwise-ordinary documents into a multi-MB request that reliably times out regardless of
+    how long the client-side timeout is (confirmed live: the same id range failed every night for
+    5+ days even at a 30-minute timeout).
+    """
+    if not docs:
+        return 0, 0
+    chunks = _split_docs_by_bytes(docs)
+    if len(chunks) == 1:
+        return _upload_one_chunk_with_retries(docs, target_index_name, str(batch_index), id_first, id_last)
+
+    logger.info(
+        "Meilisearch parallel batch: split oversized batch | batch=%s id_range=%s..%s total_docs=%s "
+        "total_bytes=%s chunks=%s",
+        batch_index, id_first, id_last, len(docs), _estimate_docs_bytes(docs), len(chunks),
+    )
+    total_ok = 0
+    total_fail = 0
+    for i, chunk in enumerate(chunks, start=1):
+        chunk_label = "{}.{}/{}".format(batch_index, i, len(chunks))
+        ok, fail = _upload_one_chunk_with_retries(
+            chunk, target_index_name, chunk_label, chunk[0]["id"], chunk[-1]["id"],
+        )
+        total_ok += ok
+        total_fail += fail
+    return total_ok, total_fail
 
 
 def _add_documents_parallel_by_ids(
