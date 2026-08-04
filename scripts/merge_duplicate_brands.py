@@ -139,6 +139,10 @@ def _get_mappings_for_brand(brand):
         out.append("dlg")
     if src_models.BrandPremierBrandMapping.objects.filter(brand=brand).exists():
         out.append("premier")
+    if src_models.BrandTireRackBrandMapping.objects.filter(brand=brand).exists():
+        out.append("tirerack")
+    if src_models.BrandVossenBrandMapping.objects.filter(brand=brand).exists():
+        out.append("vossen")
     return out
 
 
@@ -290,6 +294,52 @@ def merge_brands(brand_to_keep, brand_to_delete, confirm=_confirm):
             if confirm(
                 "  Update mapping id={} brand_id {} -> {} (premier_brand={})?".format(
                     m.id, delete_id, keep_id, m.premier_brand.name
+                )
+            ):
+                m.brand_id = keep_id
+                m.save()
+
+    # 5d. BrandTireRackBrandMapping
+    tirerack_list = list(
+        src_models.BrandTireRackBrandMapping.objects.filter(brand_id=delete_id).select_related("tirerack_brand")
+    )
+    print("\n--- BrandTireRackBrandMapping: {} to process ---".format(len(tirerack_list)))
+    for m in tirerack_list:
+        existing = src_models.BrandTireRackBrandMapping.objects.filter(
+            brand_id=keep_id, tirerack_brand=m.tirerack_brand
+        ).first()
+        if existing:
+            if confirm(
+                "  Delete mapping id={} (tirerack_brand={})? Keep already has.".format(m.id, m.tirerack_brand.name)
+            ):
+                m.delete()
+        else:
+            if confirm(
+                "  Update mapping id={} brand_id {} -> {} (tirerack_brand={})?".format(
+                    m.id, delete_id, keep_id, m.tirerack_brand.name
+                )
+            ):
+                m.brand_id = keep_id
+                m.save()
+
+    # 5e. BrandVossenBrandMapping
+    vossen_list = list(
+        src_models.BrandVossenBrandMapping.objects.filter(brand_id=delete_id).select_related("vossen_brand")
+    )
+    print("\n--- BrandVossenBrandMapping: {} to process ---".format(len(vossen_list)))
+    for m in vossen_list:
+        existing = src_models.BrandVossenBrandMapping.objects.filter(
+            brand_id=keep_id, vossen_brand=m.vossen_brand
+        ).first()
+        if existing:
+            if confirm(
+                "  Delete mapping id={} (vossen_brand={})? Keep already has.".format(m.id, m.vossen_brand.name)
+            ):
+                m.delete()
+        else:
+            if confirm(
+                "  Update mapping id={} brand_id {} -> {} (vossen_brand={})?".format(
+                    m.id, delete_id, keep_id, m.vossen_brand.name
                 )
             ):
                 m.brand_id = keep_id

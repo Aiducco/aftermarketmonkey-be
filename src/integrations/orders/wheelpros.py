@@ -17,20 +17,57 @@ Confirmed, real API limitations that shape this adapter (from Wheel Pros' own Op
    Turn14-style "let the distributor auto-pick" option. This adapter reads
    ``PurchaseOrderLineItem.warehouse_code`` (set from the line's last quote/selection) at submit
    time; submit_order() raises if a line has no warehouse selected yet.
+
+   UNRESOLVED, confirmed against the live CreateOrderEdiRequest schema (developer.wheelpros.com
+   -> Ordering -> Specifications; the ReDoc page is JS-rendered, its embedded __redoc_state
+   has the real schema): the request's own top-level ``required`` list includes
+   ``addressCode``, even though the only place that field is documented at all is nested under
+   ``shipping`` (there marked "required if shipping address information is not available in the
+   request" — which it always is here, see _client's shipping payload). No top-level
+   ``addressCode`` property even exists in the schema, so this may just be a spec-generation
+   artifact; but GET /v1/track's own ``addressCode`` query param ("must be supplied ... if
+   addressCode was supplied in the initial sales order create request") implies this is Wheel
+   Pros' equivalent of Meyer's registered AccountAddresses — a customer-specific ship-to code,
+   not a freeform address. No "list registered addresses" endpoint exists anywhere in Wheel
+   Pros' docs to resolve one. This adapter never sends one. As of this writing no real Wheel
+   Pros order has been placed/confirmed through this system — the first live submit_order()
+   call is the only way to learn whether Wheel Pros actually enforces this: if it 400s citing
+   addressCode, that confirms a real per-account code is needed (open a ticket with Wheel Pros
+   support to get one, then thread it through CompanyProviderOrderAccount the same way Meyer's
+   AddressCode is resolved); if it succeeds, this was a harmless spec artifact.
 3. The order-create response only confirms overall success + a single ``supplierOrderNumber`` —
    no per-line confirmation detail. Every submitted line is treated as confirmed at the
    submitted quantity, same fallback Premier's adapter uses for the identical limitation.
-4. GET /orders/v1/track's "salesOrders"/"trackings" response schema is not expanded in Wheel
-   Pros' public docs (collapsed to bare ``[{}]`` in their own OpenAPI example) — the field names
-   read in get_order_status() are inferred from REST conventions used elsewhere in this same
-   API, not confirmed against a live response. Verify against Wheel Pros' test environment
-   before relying on this in production.
+4. GET /orders/v1/track's "salesOrders"/"trackings" response schema IS fully specified in Wheel
+   Pros' live OrderTrackingResponseSchema (confirmed the same way as point 2 above — a prior
+   pass here believed it was collapsed/unexpanded, but that was this same JS-rendering issue,
+   not a real documentation gap). Two real corrections from that confirmed schema, both fixed
+   in get_order_status(): (a) the per-order id field is ``salesOrder``, not
+   ``salesOrderNumber``/``orderNumber`` (neither of which exist); (b) ``salesOrders[]`` carries
+   NO order-level status/orderStatus field at all — the only completion signal is each order's
+   own single ``trackingNumber`` cross-referenced into ``trackings[].trackingInfo[].statusCode``
+   (ZN/ZP/ZR/ZU/ZC/ZX/DL, spelled out in the schema's own field description). ``trackings[]``
+   itself carries no per-order linking field (no salesOrderNumber, no carrier) — matching a
+   tracking entry to a specific sales order is only possible via that order's own singular
+   ``trackingNumber``, not by filtering the whole trackings array.
 5. There is no pre-shipment cancel endpoint — only a post-fulfillment return/RMA flow
    (POST /orders/v1/return), which is a distinct capability this adapter doesn't implement (see
    cancel_order()).
 6. There is no invoice API anywhere in Wheel Pros' docs (confirmed against both the Core API
    and as much of the Legacy Postman collection as was reachable) — supports_invoices() stays
    at its inherited False default, deliberately, not by omission.
+7. CORRECTED (previously not handled at all): ``ProviderPart.provider_external_id`` is NOT
+   Wheel Pros' real SKU/part number for this distributor — it's a composite
+   ``"{wp_brand_id}_{part_number}"`` key (see master_parts._wheelpros_provider_external_id),
+   needed only for our own DB uniqueness since the same part_number can recur across different
+   Wheel Pros brands. A previous version of get_shipping_quote()/submit_order() sent that
+   composite key straight through as ``sku``/``partNumber`` to Wheel Pros' real Inventory
+   Search/Orders API, which would never match a real part — every quote would report every line
+   as unavailable, and every real submission would likely be rejected or silently drop every
+   line. Fixed by ``_wheelpros_item_number`` below — the exact same shape as
+   ``orders.premier._premier_item_number`` (product_details' "sku" entry carries the real
+   part_number; see master_parts._wheelpros_product_details), used everywhere this adapter
+   talks to Wheel Pros' real API.
 
 SAFETY: submit_order() places a REAL order against Wheel Pros. It must only ever be invoked from
 an explicit, user-approved submission — never from exploratory/dev code, automated tests, or
@@ -65,12 +102,17 @@ _SHIPPING_METHODS = [
 ]
 
 # GET /orders/v1/track's trackingInfo[].statusCode vocabulary, confirmed directly from Wheel
-# Pros' OpenAPI spec (unlike the rest of the tracking response shape — see module docstring,
-# point 4) — mapped to DistributorOrderStatus.delivery_status's normalized vocabulary. Left
-# unmapped (None) for the earlier pre-shipment stages (ZN/ZP/ZR/ZU); any other code passes
-# through directly from the carrier per the spec and isn't one of these constants.
+# Pros' live OpenAPI spec (see module docstring, point 4) — mapped to DistributorOrderStatus.
+# delivery_status's normalized vocabulary. Left unmapped (None) for the earlier pre-shipment
+# stages (ZN/ZP/ZR/ZU) and for DB ("drilled from blank wheel" — a wheel-manufacturing status,
+# not a shipping one); any other code passes through directly from the carrier per the spec and
+# isn't one of these constants.
 _STATUS_CODE_DELIVERY_STATUS = {
-    "ZC": "in_transit",  # tracking # exists, fully invoiced, no carrier info (local carriers)
+    # "Complete - ... fully invoiced, but there is no tracking information from the carrier -
+    # Local carriers" per Wheel Pros' own field description — this is terminal/done, same as DL,
+    # just without carrier-level tracking detail. Previously mapped to "in_transit", which
+    # reported a finished, fully-invoiced local-carrier delivery as still moving.
+    "ZC": "delivered",
     "DL": "delivered",  # tracking # exists, fully invoiced, delivery finalized
     "ZX": "cancelled",  # order cancelled
 }
@@ -93,16 +135,42 @@ def _parse_wheelpros_event_date(value: typing.Optional[str]) -> typing.Optional[
 
 def _summarize_wheelpros_tracking_events(
     tracking_info: typing.List[typing.Dict],
-) -> typing.Tuple[typing.Optional[str], typing.Optional[datetime.date]]:
+) -> typing.Tuple[typing.Optional[str], typing.Optional[str], typing.Optional[datetime.date]]:
     """Collapses one tracking number's trackingInfo[] events (only populated when
-    realtimeShipmentStatus=True was requested) into (delivery_status, latest_event_date) — the
-    most recent event by statusDate/statusTime wins."""
+    realtimeShipmentStatus=True was requested) into (raw_status_code, delivery_status,
+    latest_event_date) — the most recent event by statusDate/statusTime wins. raw_status_code
+    (Wheel Pros' own ZN/ZP/ZR/ZU/ZC/ZX/DL/etc vocabulary) is returned alongside the normalized
+    delivery_status so get_order_status() can carry the real distributor status code in
+    DistributorOrderStatus.status_code, the same "raw code, not just the normalized bucket"
+    convention Keystone/Premier's own status_code already follows — salesOrders[] itself has no
+    status field of its own to use instead (see module docstring, point 4)."""
     if not tracking_info:
-        return None, None
+        return None, None, None
     latest = max(tracking_info, key=lambda e: (e.get("statusDate") or "", e.get("statusTime") or ""))
-    return _STATUS_CODE_DELIVERY_STATUS.get(latest.get("statusCode")), _parse_wheelpros_event_date(
-        latest.get("statusDate")
+    status_code = latest.get("statusCode")
+    return (
+        status_code,
+        _STATUS_CODE_DELIVERY_STATUS.get(status_code),
+        _parse_wheelpros_event_date(latest.get("statusDate")),
     )
+
+
+def _wheelpros_item_number(provider_part: src_models.ProviderPart) -> str:
+    """Wheel Pros' real part number/SKU — NOT ProviderPart.provider_external_id, which for Wheel
+    Pros is a composite ``"{wp_brand_id}_{part_number}"`` key (see master_parts.
+    _wheelpros_provider_external_id), needed only for our own DB uniqueness since the same
+    part_number can recur across different Wheel Pros brands. Sending that composite key
+    straight to Wheel Pros' Inventory Search/Orders API would never match a real SKU (see module
+    docstring, point 7). Mirrors orders.premier._premier_item_number exactly: product_details'
+    "sku" entry (see master_parts._wheelpros_product_details) carries the raw part number
+    directly; fall back to splitting provider_external_id on its first "_" (the brand id prefix
+    is always purely numeric) if product_details is ever missing/stale."""
+    for entry in provider_part.product_details or []:
+        if entry.get("key") == "sku" and entry.get("value"):
+            return str(entry["value"]).strip()
+    ext_id = provider_part.provider_external_id or ""
+    _, _, remainder = ext_id.partition("_")
+    return (remainder or ext_id).strip()
 
 
 def _load_wheelpros_warehouse_names() -> typing.Dict[str, str]:
@@ -169,7 +237,9 @@ class WheelProsOrderAdapter(base.DistributorOrderAdapter):
         ship_to: base.ShipToAddress,
         ship_method: typing.Optional[str] = None,
     ) -> base.ShippingQuoteResult:
-        skus = [li.provider_part.provider_external_id for li in line_items]
+        # Wheel Pros' real SKU, not our own composite provider_external_id -- see module
+        # docstring, point 7 / _wheelpros_item_number.
+        skus = [_wheelpros_item_number(li.provider_part) for li in line_items]
         data = {"skus": skus, "country_codes": [(ship_to.country or "US").upper()]}
         try:
             response = self._client.search_inventory(
@@ -190,7 +260,7 @@ class WheelProsOrderAdapter(base.DistributorOrderAdapter):
         warehouse_names = _load_wheelpros_warehouse_names()
 
         try:
-            by_external_id = {li.provider_part.provider_external_id: li for li in line_items}
+            by_external_id = {_wheelpros_item_number(li.provider_part): li for li in line_items}
             lines: typing.List[base.ShippingQuoteLine] = []
             seen: typing.Set[str] = set()
 
@@ -275,16 +345,29 @@ class WheelProsOrderAdapter(base.DistributorOrderAdapter):
 
         items_payload = []
         for li in line_items:
+            # warehouse_codes is keyed by our own composite provider_external_id (see
+            # _load_warehouse_codes, purely an internal DB lookup) -- item_number below is the
+            # separate, real Wheel Pros SKU actually sent on the wire (see module docstring,
+            # point 7 / _wheelpros_item_number). These must not be conflated: a previous version
+            # used provider_external_id for both, which happened to work for the warehouse-code
+            # lookup but sent the wrong value as partNumber.
             external_id = li.provider_part.provider_external_id
+            item_number = _wheelpros_item_number(li.provider_part)
             warehouse_code = warehouse_codes.get(external_id)
             if not warehouse_code:
                 raise order_exceptions.OrderValidationError(
-                    "No warehouse selected for item {} — run a shipping quote first.".format(external_id)
+                    "No warehouse selected for item {} — run a shipping quote first.".format(item_number)
                 )
+            # No itemPrice/itemPriceCurrencyCode here -- confirmed against the live
+            # CreateOrderEdiRequest schema, itemPrice is a sell-price *override* gated behind a
+            # special API permission, not a required echo of our own price. A previous version
+            # sent {"itemprice": "0"} (wrong key casing -- the real field is "itemPrice"), which
+            # Wheel Pros' backend simply never matched to anything; omitted entirely now rather
+            # than "fixed" to the real key, since sending a real itemPrice override without that
+            # permission risks a 403/validation rejection this account may not have granted.
             items_payload.append(
                 {
-                    "itemprice": "0",
-                    "partNumber": external_id,
+                    "partNumber": item_number,
                     "quantity": li.quantity,
                     "warehouseCode": int(warehouse_code) if str(warehouse_code).isdigit() else warehouse_code,
                 }
@@ -376,11 +459,11 @@ class WheelProsOrderAdapter(base.DistributorOrderAdapter):
         except wheelpros_client_exceptions.WheelProsException as e:
             self._handle_error(e)
 
-        # See module docstring, point 4 — "salesOrders"/"trackings" field names below are
-        # inferred, not confirmed against a live response. Any parse failure falls back to a
-        # single "OPEN, no tracking yet" entry rather than raising, since that's the far more
-        # common case for a routine status-poll on a fresh order (same defensive default
-        # Premier's adapter uses for its own unconfirmed tracking schema).
+        # See module docstring, point 4 — the shape below is now confirmed directly against Wheel
+        # Pros' live OrderTrackingResponseSchema. Any parse failure still falls back to a single
+        # "OPEN, no tracking yet" entry rather than raising, since that's the far more common
+        # case for a routine status-poll on a fresh order (same defensive default Premier's
+        # adapter uses for its own tracking schema).
         fallback_order_number = sales_order_number or base.resolve_po_number(purchase_order)
         try:
             sales_orders = response.get("salesOrders") or []
@@ -396,50 +479,41 @@ class WheelProsOrderAdapter(base.DistributorOrderAdapter):
                     ]
                 )
 
-            # {trackingNumber: entry} for the realtimeShipmentStatus=True "trackings" array —
-            # trackingNumber is the one field its schema confirms (see module docstring, point 4).
+            # {trackingNumber: entry} for the realtimeShipmentStatus=True "trackings" array.
             trackings_by_number = {t.get("trackingNumber"): t for t in trackings if t.get("trackingNumber")}
 
             orders: typing.List[base.DistributorOrderStatus] = []
             for so in sales_orders:
-                so_number = str(so.get("salesOrderNumber") or so.get("orderNumber") or fallback_order_number)
-                related = [
-                    t
-                    for t in trackings
-                    if not t.get("salesOrderNumber") or str(t.get("salesOrderNumber")) == so_number
-                ]
-                tracking_numbers = {t.get("trackingNumber") for t in related if t.get("trackingNumber")}
-                # salesOrders[].trackingNumber is confirmed directly in Wheel Pros' OpenAPI spec
-                # (unlike the "trackings" array's own shape) — include it even if the "trackings"
-                # cross-reference above missed it.
-                if so.get("trackingNumber"):
-                    tracking_numbers.add(so["trackingNumber"])
+                # "salesOrder" is the real per-order id field (confirmed against the live schema)
+                # -- salesOrders[] has no "salesOrderNumber"/"orderNumber" field at all, so those
+                # lookups previously always missed and fell through to fallback_order_number.
+                so_number = str(so.get("salesOrder") or fallback_order_number)
+                # trackings[] carries no field linking an entry back to a specific sales order
+                # (no salesOrderNumber, confirmed against the live schema) -- each order's own
+                # singular trackingNumber is the only reliable join key, not a filter over the
+                # whole trackings array (which would wrongly attribute every tracking number to
+                # every sales order whenever a response ever contains more than one).
+                tracking_number = so.get("trackingNumber")
+                tracking_numbers = {tracking_number} if tracking_number else set()
 
-                # Latest carrier-level event across every tracking # tied to this order — only
-                # populated when realtimeShipmentStatus=True was requested above.
-                delivery_status, ship_date = None, None
-                for tracking_number in tracking_numbers:
+                # Wheel Pros' salesOrders[] carries no order-level status field of its own
+                # (confirmed against the live schema) -- the tracking entry's own statusCode
+                # (ZN/ZP/ZR/ZU/ZC/ZX/DL) is the only status signal available, only populated when
+                # realtimeShipmentStatus=True was requested above.
+                status_code, delivery_status, ship_date = None, None, None
+                if tracking_number:
                     entry = trackings_by_number.get(tracking_number)
-                    if not entry:
-                        continue
-                    ds, ev_date = _summarize_wheelpros_tracking_events(entry.get("trackingInfo") or [])
-                    if ds:
-                        delivery_status, ship_date = ds, ev_date
-                        if ds == "cancelled":
-                            break
+                    if entry:
+                        status_code, delivery_status, ship_date = _summarize_wheelpros_tracking_events(
+                            entry.get("trackingInfo") or []
+                        )
 
                 orders.append(
                     base.DistributorOrderStatus(
                         distributor_order_number=so_number,
-                        status_code=str(so.get("status") or so.get("orderStatus") or "OPEN"),
-                        tracking_numbers=sorted(t for t in tracking_numbers if t),
-                        # carrier/carrierName are confirmed salesOrders[] fields; fall back to the
-                        # "trackings" cross-reference (unconfirmed shape) only if both are absent.
-                        carrier=(
-                            so.get("carrierName")
-                            or so.get("carrier")
-                            or next((t.get("carrier") for t in related if t.get("carrier")), None)
-                        ),
+                        status_code=status_code or "OPEN",
+                        tracking_numbers=sorted(tracking_numbers),
+                        carrier=so.get("carrierName") or so.get("carrier"),
                         delivery_status=delivery_status,
                         ship_date=ship_date,
                         raw_response=so,

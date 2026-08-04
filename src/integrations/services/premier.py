@@ -819,11 +819,99 @@ def _build_company_pricing_instances(
     return instances
 
 
+def fetch_and_save_premier_company_pricing_for_company_provider(company_provider_id: int) -> None:
+    """
+    One company's own Premier FTP feed -> PremierCompanyPricing for that company only. Mirrors
+    sync_keystone_catalog_and_company_pricing_for_company_provider /
+    sync_meyer_company_pricing_for_company_provider - the per-provider pattern
+    integration_pricing_sync_jobs._fetch_raw_pricing dispatches to for every other distributor.
+
+    Separate from fetch_and_save_all_premier_brand_parts, which maintains the SHARED
+    PremierParts/PremierBrand catalog via only the primary CompanyProvider - this assumes that
+    catalog is already populated and only resolves EXISTING brand/part rows to attach this
+    company's own pricing to, via _part_number_brand_id_lookup/_build_company_pricing_instances
+    (both written for exactly this purpose, but previously never called from anywhere - see the
+    IntegrationPricingSyncJob dispatch this now backs). Rows whose brand/part aren't found yet
+    are silently skipped, same as every other provider's per-company pricing sync.
+
+    Uses a company-scoped local file path (unlike the shared default path
+    fetch_and_save_all_premier_brand_parts uses, safe there since only the primary
+    CompanyProvider ever calls it) since different companies have different Premier
+    accounts/credentials and therefore different CSV contents - reusing the shared default path
+    here would let one company's cached download leak into another's pricing sync.
+    """
+    cp = (
+        src_models.CompanyProviders.objects.filter(
+            id=company_provider_id,
+            provider__kind=src_enums.BrandProviderKind.PREMIER_PERFORMANCE.value,
+            provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
+        )
+        .select_related("company")
+        .first()
+    )
+    if not cp:
+        logger.warning(
+            "{} No active Premier CompanyProviders id={}. Skipping.".format(_LOG_PREFIX, company_provider_id)
+        )
+        return
+
+    company = cp.company
+    try:
+        ftp_client = premier_client.PremierFTPClient(
+            credentials=credentials_helper.get_feed_credentials(cp),
+            local_file_path="/tmp/premier_pricing_company_{}.csv".format(company.id),
+        )
+    except ValueError as e:
+        logger.error("{} Invalid Premier credentials company={}: {}.".format(_LOG_PREFIX, company.name, str(e)))
+        raise
+
+    try:
+        records = list(ftp_client.iter_inventory_records(force_download=True))
+    except premier_exceptions.PremierException as e:
+        logger.error("{} FTP error company={}: {}.".format(_LOG_PREFIX, company.name, str(e)))
+        raise
+
+    if not records:
+        logger.warning("{} No inventory records company={}.".format(_LOG_PREFIX, company.name))
+        return
+
+    brand_names = {_clean(row.get("Brand")) for row in records if _clean(row.get("Brand"))}
+    brand_name_to_premier_brand = {
+        b.name: b for b in src_models.PremierBrand.objects.filter(name__in=brand_names)
+    }
+    if not brand_name_to_premier_brand:
+        logger.warning(
+            "{} None of this feed's brands exist in PremierBrand yet (catalog sync hasn't run "
+            "yet?) company={}.".format(_LOG_PREFIX, company.name)
+        )
+        return
+
+    part_lookup = _part_number_brand_id_lookup(records, brand_name_to_premier_brand)
+    if not part_lookup:
+        logger.warning(
+            "{} None of this feed's parts exist in PremierParts yet (catalog sync hasn't run "
+            "yet?) company={}.".format(_LOG_PREFIX, company.name)
+        )
+        return
+
+    pricing_instances = _build_company_pricing_instances(
+        records, brand_name_to_premier_brand, company, part_lookup
+    )
+    total = _pgbulk_upsert_premier_company_pricing_batches(
+        pricing_instances, PREMIER_PGBULK_BATCH_SIZE, PREMIER_PGBULK_BATCH_DELAY_SECONDS
+    )
+    logger.info(
+        "{} Synced {} PremierCompanyPricing rows for company={}.".format(_LOG_PREFIX, total, company.name)
+    )
+
+
 def fetch_and_save_all_premier_brand_parts() -> None:
     """
-    Download the Premier CSV per active CompanyProvider and upsert PremierParts + PremierCompanyPricing.
-    The primary CompanyProvider drives the shared catalog upsert (PremierParts);
-    every active company gets PremierCompanyPricing from its own feed.
+    Download the Premier CSV per active CompanyProvider and upsert the shared PremierParts
+    catalog. Only the primary CompanyProvider's feed drives this upsert. Per-company pricing
+    (PremierCompanyPricing) is NOT handled here - see
+    fetch_and_save_premier_company_pricing_for_company_provider, called independently per
+    CompanyProvider by IntegrationPricingSyncJob.
     """
     logger.info("{} Fetching all Premier brand parts.".format(_LOG_PREFIX))
 

@@ -9,8 +9,8 @@ Policy: a fresh order needs checking often at first, then rarely --
   - After that: check at most once per calendar day, tracked via
     PurchaseOrder.distributor_status_checked_at.
 
-Turn14, Keystone, Meyer, and Premier are implemented so far (per-provider dispatch in
-_refresh_purchase_order, via _REFRESH_HANDLERS) -- any other provider kind is logged and
+Turn14, Keystone, Meyer, Premier, and Wheel Pros are implemented so far (per-provider dispatch
+in _refresh_purchase_order, via _REFRESH_HANDLERS) -- any other provider kind is logged and
 skipped, not crashed on, so this command is safe to run against a mixed-distributor CONFIRMED
 queue today and grows adapter-by-adapter later.
 
@@ -84,6 +84,22 @@ distributor_order_status/distributor_order_status_name (src.enums.DistributorOrd
 Premier gives no OPEN/CLOSED field of its own, so an order with at least one invoice is
 considered CLOSED, matching the same "invoiced == closed" rule Keystone/Meyer/Turn14 apply to
 their own literal status fields.
+
+For Wheel Pros: distributor_order_number IS the real supplierOrderNumber from the create
+response (see WheelProsOrderAdapter.submit_order/_parse_submit_response) -- like Premier/
+Keystone, Wheel Pros never fans one submission out into several distributor orders (no per-line
+confirmation detail at all, per that adapter's own module docstring), so there's no
+searching/matching among several entries sharing one PO reference either. adapter.
+get_order_status(purchase_order) already resolves the query by pdo.distributor_order_number
+whenever at least one PurchaseOrderDistributorOrder exists for this PO (see
+WheelProsOrderAdapter.get_order_status), the same drift-safe pattern Keystone/Meyer's own
+get_order_status_by_reference enforces, so no separate by-reference call is needed here. Wheel
+Pros has no invoice API at all (supports_invoices() stays False) and no order-level status field
+of its own either (confirmed against its live OrderTrackingResponseSchema) -- delivery_status
+(already normalized from trackingInfo[].statusCode by get_order_status) is the only completion
+signal available, so distributor_order_status is derived from that instead: CLOSED once every
+order's delivery_status is a terminal one ("delivered" or "cancelled"), OPEN while any is still
+missing/"in_transit".
 """
 import datetime
 import logging
@@ -99,6 +115,7 @@ from src.integrations.orders import meyer as meyer_adapter
 from src.integrations.orders import premier as premier_adapter
 from src.integrations.orders import registry as order_registry
 from src.integrations.orders import turn_14 as turn_14_adapter
+from src.integrations.orders import wheelpros as wheelpros_adapter
 
 logger = logging.getLogger(__name__)
 _LOG_PREFIX = "[CONFIRMED-PO-SYNC]"
@@ -414,12 +431,79 @@ def _refresh_premier_distributor_order(
     )
 
 
+# Delivery statuses that mean "nothing further will happen to this order" -- see
+# _refresh_wheelpros_distributor_order.
+_WHEELPROS_TERMINAL_DELIVERY_STATUSES = {"delivered", "cancelled"}
+
+
+def _refresh_wheelpros_distributor_order(
+    adapter: wheelpros_adapter.WheelProsOrderAdapter,
+    po: src_models.PurchaseOrder,
+    pdo: src_models.PurchaseOrderDistributorOrder,
+) -> None:
+    """
+    Wheel Pros never fans one PurchaseOrder out into multiple distributor orders (single
+    supplierOrderNumber per submission, no per-line confirmation detail -- see
+    WheelProsOrderAdapter.submit_order), so like Premier/Keystone there's no searching/matching a
+    specific entry among several sharing one PO reference. adapter.get_order_status(purchase_order)
+    already keys its lookup off pdo.distributor_order_number whenever at least one
+    PurchaseOrderDistributorOrder exists for this PO, the same drift-safe pattern Keystone/Meyer's
+    own get_order_status_by_reference enforces -- no separate by-reference call needed here.
+
+    Wheel Pros has no invoice API (supports_invoices() stays False) and no order-level
+    OPEN/CLOSED field of its own either -- confirmed against its live OrderTrackingResponseSchema,
+    salesOrders[] carries no status/orderStatus field at all (see get_order_status). The only
+    completion signal available is each result order's own delivery_status (already normalized
+    from trackingInfo[].statusCode) -- CLOSED once every returned order's delivery_status is
+    terminal ("delivered" or "cancelled"), OPEN while any order has none yet or is still
+    "in_transit". No delivery_status at all (e.g. a fresh order Wheel Pros hasn't shipped yet)
+    leaves distributor_order_status unset this round rather than guessing OPEN vs. CLOSED from
+    nothing.
+    """
+    try:
+        result = adapter.get_order_status(po)
+    except order_exceptions.OrderAdapterError:
+        logger.exception(
+            "{} get_order_status failed for PurchaseOrderDistributorOrder id={}.".format(_LOG_PREFIX, pdo.id)
+        )
+        return
+
+    tracking_numbers = sorted({t for o in result.orders for t in o.tracking_numbers if t})
+    carriers = sorted({o.carrier for o in result.orders if o.carrier})
+
+    update_fields = ["raw_response", "tracking_numbers", "updated_at"]
+    pdo.raw_response = {"orders": [o.raw_response for o in result.orders if o.raw_response]}
+    pdo.tracking_numbers = tracking_numbers
+    if carriers:
+        pdo.carrier = ", ".join(carriers)
+        update_fields.append("carrier")
+
+    delivery_statuses = [o.delivery_status for o in result.orders if o.delivery_status]
+    if delivery_statuses:
+        raw_status = (
+            src_enums.DistributorOrderRawStatus.CLOSED
+            if all(s in _WHEELPROS_TERMINAL_DELIVERY_STATUSES for s in delivery_statuses)
+            else src_enums.DistributorOrderRawStatus.OPEN
+        )
+        pdo.distributor_order_status = raw_status.value
+        pdo.distributor_order_status_name = raw_status.name
+        update_fields += ["distributor_order_status", "distributor_order_status_name"]
+
+    pdo.save(update_fields=update_fields)
+    logger.info(
+        "{} Updated raw_response for PurchaseOrderDistributorOrder id={} (distributor_order_number={}).".format(
+            _LOG_PREFIX, pdo.id, pdo.distributor_order_number
+        )
+    )
+
+
 # Per-adapter-type refresh handler, all sharing the (adapter, po, pdo) signature -- add an entry
 # here (and its own _refresh_<x>_distributor_order function) as each new distributor is wired up.
 _REFRESH_HANDLERS = {
     turn_14_adapter.Turn14OrderAdapter: _refresh_turn14_distributor_order,
     keystone_adapter.KeystoneOrderAdapter: _refresh_keystone_distributor_order,
     meyer_adapter.MeyerOrderAdapter: _refresh_meyer_distributor_order,
+    wheelpros_adapter.WheelProsOrderAdapter: _refresh_wheelpros_distributor_order,
     premier_adapter.PremierOrderAdapter: _refresh_premier_distributor_order,
 }
 
