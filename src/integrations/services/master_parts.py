@@ -877,6 +877,7 @@ def _ingest_keystone_parts_for_mapped_brands(
             {(mp.brand_id, mp.part_number): mp.gtin for mp in master_parts},
             provider_id=keystone_provider.id,
             provider_kind=src_enums.BrandProviderKind.KEYSTONE.value,
+            external_id_by_key={v: k for k, v in vcpn_to_brand_part.items()},
         )
 
         new_parts = [mp for mp in master_parts if (mp.brand_id, mp.part_number) not in existing_by_key]
@@ -1267,6 +1268,7 @@ def _ingest_meyer_parts_for_mapped_brands(
             {(mp.brand_id, mp.part_number): mp.gtin for mp in master_parts_list},
             provider_id=meyer_provider.id,
             provider_kind=src_enums.BrandProviderKind.MEYER.value,
+            external_id_by_key={v: k for k, v in meyer_part_to_brand_part.items()},
         )
 
         new_parts = [
@@ -1538,6 +1540,10 @@ def _ingest_atech_parts_for_mapped_brands(
             {(mp.brand_id, mp.part_number): mp.gtin for mp in master_parts_list},
             provider_id=atech_provider.id,
             provider_kind=src_enums.BrandProviderKind.ATECH.value,
+            external_id_by_key={
+                bp: _atech_provider_external_id(feed_brand_id, feed_pn)
+                for (feed_brand_id, feed_pn), bp in atech_feed_brand_pn_to_brand_part.items()
+            },
         )
 
         new_parts = [mp for mp in master_parts_list if (mp.brand_id, mp.part_number) not in existing_by_key]
@@ -1793,6 +1799,7 @@ def _ingest_rough_country_parts_for_mapped_brands(
             {(mp.brand_id, mp.part_number): mp.gtin for mp in master_parts},
             provider_id=rc_provider.id,
             provider_kind=src_enums.BrandProviderKind.ROUGH_COUNTRY.value,
+            external_id_by_key={v: k for k, v in rc_external_id_to_brand_part.items()},
         )
 
         new_parts = [mp for mp in master_parts if (mp.brand_id, mp.part_number) not in existing_by_key]
@@ -2038,6 +2045,7 @@ def _ingest_dlg_parts_for_mapped_brands(
             {(mp.brand_id, mp.part_number): mp.gtin for mp in master_parts},
             provider_id=dlg_provider.id,
             provider_kind=src_enums.BrandProviderKind.DLG.value,
+            external_id_by_key={v: k for k, v in dlg_external_to_brand_part.items()},
         )
 
         new_parts = [mp for mp in master_parts if (mp.brand_id, mp.part_number) not in existing_by_key]
@@ -3298,6 +3306,7 @@ def _ingest_vossen_parts_for_mapped_brands(
             {(mp.brand_id, mp.part_number): mp.gtin for mp in master_parts},
             provider_id=vossen_provider.id,
             provider_kind=src_enums.BrandProviderKind.VOSSEN.value,
+            external_id_by_key={v: k for k, v in vossen_external_id_to_brand_part.items()},
         )
 
         new_parts = [mp for mp in master_parts if (mp.brand_id, mp.part_number) not in existing_by_key]
@@ -4071,6 +4080,7 @@ def _ingest_wheelpros_parts_for_mapped_brands(
             {(mp.brand_id, mp.part_number): mp.gtin for mp in master_parts},
             provider_id=wp_provider.id,
             provider_kind=src_enums.BrandProviderKind.WHEELPROS.value,
+            external_id_by_key={v: k for k, v in wp_external_id_to_brand_part.items()},
         )
 
         new_parts = [mp for mp in master_parts if existing_by_key.get((mp.brand_id, mp.part_number)) is None]
@@ -6962,6 +6972,7 @@ def _ingest_tirerack_parts_for_mapped_brands(
             {(mp.brand_id, mp.part_number): mp.gtin for mp in master_parts},
             provider_id=tirerack_provider.id,
             provider_kind=src_enums.BrandProviderKind.TIRERACK.value,
+            external_id_by_key={v: k for k, v in tirerack_external_to_brand_part.items()},
         )
 
         new_parts = [mp for mp in master_parts if (mp.brand_id, mp.part_number) not in existing_by_key]
@@ -7767,6 +7778,7 @@ def _ingest_premier_parts_for_mapped_brands(
             {(mp.brand_id, mp.part_number): mp.gtin for mp in master_parts_list},
             provider_id=premier_provider.id,
             provider_kind=src_enums.BrandProviderKind.PREMIER_PERFORMANCE.value,
+            external_id_by_key={v: k for k, v in premier_ext_to_brand_part.items()},
         )
 
         new_parts = [mp for mp in master_parts_list if (mp.brand_id, mp.part_number) not in existing_by_key]

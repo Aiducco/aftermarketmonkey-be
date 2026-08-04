@@ -56,6 +56,10 @@ class FeedPart(typing.NamedTuple):
     brand_id: int
     part_number: str
     gtin: typing.Optional[str] = None
+    # This distributor's own id for the part (vcpn, meyer_part, ...). Required to tell "the
+    # distributor lists these as two different parts" apart from "a previous merge already
+    # attached this very feed row to the candidate" -- see resolve_normalized_matches.
+    provider_external_id: typing.Optional[str] = None
 
 
 class _Candidate(typing.NamedTuple):
@@ -93,23 +97,32 @@ def _fetch_candidates(
     return found
 
 
-def _master_parts_with_provider(
+def _provider_external_ids_on(
     master_part_ids: typing.Set[int], provider_id: int
-) -> typing.Set[int]:
-    """Which of these MasterParts already carry a ProviderPart for the provider being ingested."""
-    taken: typing.Set[int] = set()
+) -> typing.Dict[int, typing.Set[str]]:
+    """
+    For each candidate MasterPart, the provider_external_ids this provider already has on it.
+
+    Not just "does a ProviderPart exist": after the duplicate cleanup
+    (scripts/merge_normalized_part_number_duplicates.py) the provider is *expected* to sit on the
+    canonical row, because the merge moved its ProviderPart there. Distinguishing "this is the
+    same feed row we already attached" from "this distributor genuinely lists two parts" needs
+    the external id, not just presence.
+    """
+    found: typing.Dict[int, typing.Set[str]] = collections.defaultdict(set)
     for chunk in _chunked(sorted(master_part_ids)):
         with connection.cursor() as cur:
             cur.execute(
                 """
-                SELECT DISTINCT master_part_id
+                SELECT master_part_id, provider_external_id
                 FROM provider_parts
                 WHERE provider_id = %s AND master_part_id IN %s
                 """,
                 (provider_id, tuple(chunk)),
             )
-            taken.update(row[0] for row in cur.fetchall())
-    return taken
+            for master_part_id, external_id in cur.fetchall():
+                found[master_part_id].add((external_id or "").strip())
+    return found
 
 
 def _blind_master_parts(master_part_ids: typing.Set[int]) -> typing.Set[int]:
@@ -154,9 +167,14 @@ def resolve_normalized_matches(
 
     - **Exactly one candidate.** More than one existing row shares the normalized key, so the
       feed's spelling is genuinely ambiguous (this is what keeps the ``+12`` / ``-12`` pair apart).
-    - **The candidate has no ProviderPart for this provider.** If it does, this distributor is
-      listing both spellings as separate parts in its own catalog -- a deliberate distinction by
-      the party closest to the manufacturer, not a formatting accident.
+    - **The candidate carries no *other* part from this provider.** If this provider already has a
+      ProviderPart on the candidate under a *different* ``provider_external_id``, the distributor
+      is listing both spellings as separate parts in its own catalog -- a deliberate distinction
+      by the party closest to the manufacturer, not a formatting accident. A ProviderPart with the
+      *same* external id is this very feed row, already attached by an earlier run or by the
+      duplicate-merge script, and must match rather than be refused; refusing it would re-create
+      the duplicate the merge just removed. Callers that do not pass ``provider_external_id`` get
+      the old conservative behaviour (any existing link refuses the match).
     - **No ``+``/``-`` sign conflict** between the feed spelling and the candidate's.
     - **Tier.** Case-only and whitespace-only differences cannot change which physical part is
       meant, so they pass here. Hyphen/dot and other punctuation differences additionally require
@@ -180,7 +198,7 @@ def resolve_normalized_matches(
     if not candidate_ids:
         return {}
 
-    already_linked = _master_parts_with_provider(candidate_ids, provider_id=provider_id)
+    external_ids_on_candidate = _provider_external_ids_on(candidate_ids, provider_id=provider_id)
     # Only needed for the punctuation tiers; skipped entirely when the provider itself has no
     # barcodes, since those rows can never reach the GTIN-gated branch anyway.
     provider_is_blind = provider_kind in GTIN_LESS_PROVIDER_KINDS
@@ -195,12 +213,18 @@ def resolve_normalized_matches(
             skipped["ambiguous" if found else "no_candidate"] += len(feed_rows)
             continue
         candidate = found[0]
-        if candidate.master_part_id in already_linked:
-            skipped["provider_already_on_candidate"] += len(feed_rows)
-            continue
+        existing_external_ids = external_ids_on_candidate.get(candidate.master_part_id) or set()
 
         candidate_gtin = pn_util.normalize_gtin(candidate.gtin)
         for feed_part in feed_rows:
+            if existing_external_ids:
+                own = (feed_part.provider_external_id or "").strip()
+                # Same external id -> this feed row is already attached here (earlier run, or the
+                # merge script moved it); matching is correct. Anything else means the provider
+                # lists a genuinely different part on this master part.
+                if not own or own not in existing_external_ids:
+                    skipped["provider_lists_other_part_here"] += 1
+                    continue
             spellings = [feed_part.part_number, candidate.part_number]
             if pn_util.has_sign_conflict(spellings):
                 skipped["sign_conflict"] += 1
@@ -231,6 +255,9 @@ def extend_with_normalized_matches(
     gtin_by_key: typing.Mapping[typing.Tuple[int, str], typing.Optional[str]],
     provider_id: int,
     provider_kind: typing.Optional[int] = None,
+    external_id_by_key: typing.Optional[
+        typing.Mapping[typing.Tuple[int, str], typing.Optional[str]]
+    ] = None,
 ) -> int:
     """
     Ingest-facing wrapper: fill in the ``(brand_id, part_number) -> master_part_id`` entries that
@@ -247,9 +274,15 @@ def extend_with_normalized_matches(
     unplaced = [key for key in pairs if existing_by_key.get(key) is None]
     if not unplaced:
         return 0
+    external_id_by_key = external_id_by_key or {}
     matches = resolve_normalized_matches(
         [
-            FeedPart(brand_id=brand_id, part_number=part_number, gtin=gtin_by_key.get((brand_id, part_number)))
+            FeedPart(
+                brand_id=brand_id,
+                part_number=part_number,
+                gtin=gtin_by_key.get((brand_id, part_number)),
+                provider_external_id=external_id_by_key.get((brand_id, part_number)),
+            )
             for brand_id, part_number in unplaced
         ],
         provider_id=provider_id,
