@@ -4791,6 +4791,25 @@ def sync_provider_pricing_from_meyer_for_company(company_id: int) -> None:
 
     now = timezone.now()
 
+    # Watermark: meyer.py's raw-pricing upsert only bumps MeyerCompanyPricing.updated_at when a
+    # row's price actually changed (see _flush_buf), so filtering on it here means we only walk
+    # what changed since the last successful propagation instead of the whole per-company raw
+    # table every cycle -- this is what was blowing up memory (16 parallel workers each paging
+    # through the full, mostly-unchanged, dataset). Captured at the START of this run, before
+    # querying, so it's a safe (if slightly conservative) lower bound for next time regardless
+    # of how long this run takes. Null (never propagated / row missing) means "process everything",
+    # matching prior behavior.
+    sync_started_at = timezone.now()
+    company_provider = src_models.CompanyProviders.objects.filter(
+        company_id=company_id, provider__kind=src_enums.BrandProviderKind.MEYER.value,
+    ).first()
+    watermark = company_provider.pricing_propagation_watermark if company_provider else None
+    logger.info(
+        "{} Meyer pricing company={}: propagation watermark={}.".format(
+            _LOG_PREFIX, company_id, watermark or "none (processing everything)",
+        )
+    )
+
     def _worker(catalog_ids: typing.Set[int]) -> int:
         if not catalog_ids:
             return 0
@@ -4799,12 +4818,15 @@ def sync_provider_pricing_from_meyer_for_company(company_id: int) -> None:
         last_id = 0
         while True:
             batch_num += 1
+            qs = src_models.MeyerCompanyPricing.objects.filter(
+                id__gt=last_id,
+                company_id=company_id,
+                part__brand_id__in=catalog_ids,
+            )
+            if watermark:
+                qs = qs.filter(updated_at__gte=watermark)
             batch = list(
-                src_models.MeyerCompanyPricing.objects.filter(
-                    id__gt=last_id,
-                    company_id=company_id,
-                    part__brand_id__in=catalog_ids,
-                )
+                qs
                 .order_by("id")
                 .values(
                     "id",
@@ -4873,6 +4895,10 @@ def sync_provider_pricing_from_meyer_for_company(company_id: int) -> None:
     logger.info("{} Synced {} Meyer pricing records for company_id={}.".format(
         _LOG_PREFIX, total_upserted, company_id,
     ))
+
+    if company_provider:
+        company_provider.pricing_propagation_watermark = sync_started_at
+        company_provider.save(update_fields=["pricing_propagation_watermark"])
 
 
 def sync_provider_pricing_from_dlg_for_company(company_id: int) -> None:

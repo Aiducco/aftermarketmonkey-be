@@ -1603,45 +1603,76 @@ def sync_meyer_company_pricing_for_company_provider(
         )
     )
     buf: typing.Dict[typing.Tuple[int, str], typing.Dict[str, typing.Any]] = {}
-    total_upserted = 0
+    total_considered = 0
+    total_written = 0
     batch_num = 0
 
     def _flush_buf() -> None:
-        nonlocal total_upserted, batch_num
+        nonlocal total_considered, total_written, batch_num
         if not buf:
             return
-        pricing_rows: typing.List[src_models.MeyerCompanyPricing] = []
+        rows: typing.List[typing.Tuple] = []
+        now = timezone.now()
         for (bid, sku), pdata in buf.items():
             part_id = id_by_brand_sku.get((bid, sku))
             if not part_id:
                 continue
-            pricing_rows.append(
-                src_models.MeyerCompanyPricing(
-                    part_id=part_id,
-                    company=cp.company,
-                    jobber_price=pdata.get("jobber_price"),
-                    cost=pdata.get("cost"),
-                    core_charge=pdata.get("core_charge"),
-                    map_price=pdata.get("map_price"),
+            rows.append(
+                (
+                    part_id,
+                    cp.company_id,
+                    pdata.get("jobber_price"),
+                    pdata.get("cost"),
+                    pdata.get("core_charge"),
+                    pdata.get("map_price"),
+                    now,
+                    now,
                 )
             )
-        n_upserted = 0
-        if pricing_rows:
-            pgbulk.upsert(
-                src_models.MeyerCompanyPricing,
-                pricing_rows,
-                unique_fields=["part", "company"],
-                update_fields=["jobber_price", "cost", "core_charge", "map_price", "updated_at"],
-                returning=False,
-            )
-            n_upserted = len(pricing_rows)
-            total_upserted += n_upserted
+        n_written = 0
+        if rows:
+            # Hand-written upsert (not pgbulk) so unchanged rows are skipped in the same
+            # statement via IS DISTINCT FROM, instead of touching updated_at on every one of
+            # ~millions of rows every cycle regardless of whether the price actually moved --
+            # see the memory/timing investigation for company_provider_id=19 this was built
+            # from. updated_at is deliberately excluded from the comparison (it always differs)
+            # but still gets set to "now" whenever a real value changes, so it stays usable as
+            # a "this row's price last changed at" watermark for sync_provider_pricing_from_
+            # meyer_for_company (master_parts.py) to filter on downstream.
+            placeholders = ", ".join(["(%s, %s, %s, %s, %s, %s, %s, %s)"] * len(rows))
+            params = [v for row in rows for v in row]
+            with connection.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO meyer_company_pricing
+                        (part_id, company_id, jobber_price, cost, core_charge, map_price,
+                         created_at, updated_at)
+                    VALUES {}
+                    ON CONFLICT (part_id, company_id) DO UPDATE SET
+                        jobber_price = EXCLUDED.jobber_price,
+                        cost = EXCLUDED.cost,
+                        core_charge = EXCLUDED.core_charge,
+                        map_price = EXCLUDED.map_price,
+                        updated_at = EXCLUDED.updated_at
+                    WHERE (meyer_company_pricing.jobber_price, meyer_company_pricing.cost,
+                           meyer_company_pricing.core_charge, meyer_company_pricing.map_price)
+                        IS DISTINCT FROM
+                          (EXCLUDED.jobber_price, EXCLUDED.cost, EXCLUDED.core_charge,
+                           EXCLUDED.map_price)
+                    """.format(placeholders),
+                    params,
+                )
+                n_written = cur.rowcount
+            total_written += n_written
+        total_considered += len(rows)
         batch_num += 1
         connection.close()
         buf.clear()
         logger.info(
-            "{} MeyerCompanyPricing batch {}: upserted {} rows (total={}) company_provider_id={}.".format(
-                _LOG_PREFIX, batch_num, n_upserted, total_upserted, company_provider_id,
+            "{} MeyerCompanyPricing batch {}: {} considered, {} actually written (unchanged "
+            "skipped) (total considered={}, total written={}) company_provider_id={}.".format(
+                _LOG_PREFIX, batch_num, len(rows), n_written, total_considered, total_written,
+                company_provider_id,
             )
         )
 
@@ -1661,7 +1692,8 @@ def sync_meyer_company_pricing_for_company_provider(
     _flush_buf()
 
     logger.info(
-        "{} MeyerCompanyPricing upserted {} rows total for company_provider id={}.".format(
-            _LOG_PREFIX, total_upserted, company_provider_id,
+        "{} MeyerCompanyPricing considered {} rows, actually wrote {} for company_provider "
+        "id={}.".format(
+            _LOG_PREFIX, total_considered, total_written, company_provider_id,
         )
     )

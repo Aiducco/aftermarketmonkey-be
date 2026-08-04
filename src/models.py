@@ -163,6 +163,14 @@ class CompanyProviders(django_db_models.Model):
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
 
+    # High-water mark for the master-pricing-layer propagation step (e.g.
+    # sync_provider_pricing_from_meyer_for_company): rows in the provider's raw pricing table
+    # with updated_at >= this only get touched by their real value changing (see the
+    # hand-written upsert in meyer.py's _flush_buf), so this lets that propagation step process
+    # just what changed since last time instead of the whole raw pricing table every cycle.
+    # Null means "never propagated" -- process everything. Only wired for Meyer so far.
+    pricing_propagation_watermark = django_db_models.DateTimeField(null=True, blank=True)
+
     class Meta:
         db_table = "company_providers"
         unique_together = ["company", "provider"]
