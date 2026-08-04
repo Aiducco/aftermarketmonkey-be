@@ -21,6 +21,7 @@ from src import constants as src_constants
 from src import enums as src_enums
 from src import models as src_models
 from src.integrations import credentials as credentials_helper
+from src.integrations.utils import master_part_matching as mp_matching
 from src.integrations.services.vossen import dealer_cost_from_price as vossen_dealer_cost_from_price
 from src.integrations.services.wheelpros import dealer_cost_from_msrp
 
@@ -867,6 +868,17 @@ def _ingest_keystone_parts_for_mapped_brands(
                     mp_id, b_id, p_num = sql_row
                     existing_by_key[(b_id, p_num)] = mp_id
 
+        # Keystone spells manufacturer part numbers differently from the other feeds
+        # ('MS 96587' vs 'MS96587'), so anything the exact match missed gets a second,
+        # heavily-guarded pass on the punctuation/case-insensitive form.
+        mp_matching.extend_with_normalized_matches(
+            existing_by_key,
+            pairs,
+            {(mp.brand_id, mp.part_number): mp.gtin for mp in master_parts},
+            provider_id=keystone_provider.id,
+            provider_kind=src_enums.BrandProviderKind.KEYSTONE.value,
+        )
+
         new_parts = [mp for mp in master_parts if (mp.brand_id, mp.part_number) not in existing_by_key]
         existing_keys = [k for k in pairs if k in existing_by_key]
 
@@ -899,12 +911,15 @@ def _ingest_keystone_parts_for_mapped_brands(
                     params,
                 )
 
-        brand_part_to_master = {}
-        if pairs:
+        # Seed from the resolved ids first: a row matched on formatting has no MasterPart under
+        # the feed's own spelling, so re-querying by exact part_number below would not find it.
+        brand_part_to_master = mp_matching.master_part_stubs_for(existing_by_key)
+        unresolved_pairs = [k for k in pairs if k not in brand_part_to_master]
+        if unresolved_pairs:
             with connection.cursor() as cur:
                 cur.execute(
                     "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
-                    (tuple(pairs),),
+                    (tuple(unresolved_pairs),),
                 )
                 for sql_row in cur.fetchall():
                     mp_id, b_id, p_num = sql_row
@@ -1244,6 +1259,16 @@ def _ingest_meyer_parts_for_mapped_brands(
                     sku_match = sku_candidates[0][0]
                 existing_by_key[(b_id, p_num)] = sku_match or existing_by_part.get((b_id, p_num))
 
+        # Neither the sku bridge nor the exact part number placed these, so try the
+        # punctuation/case-insensitive form (Meyer's '211172-1X' is A-Tech's '2111721X').
+        mp_matching.extend_with_normalized_matches(
+            existing_by_key,
+            pairs,
+            {(mp.brand_id, mp.part_number): mp.gtin for mp in master_parts_list},
+            provider_id=meyer_provider.id,
+            provider_kind=src_enums.BrandProviderKind.MEYER.value,
+        )
+
         new_parts = [
             mp for mp in master_parts_list if existing_by_key.get((mp.brand_id, mp.part_number)) is None
         ]
@@ -1285,8 +1310,17 @@ def _ingest_meyer_parts_for_mapped_brands(
 
         brand_part_to_master = {}
         for (b_id, p_num), mp_id in existing_by_key.items():
-            if mp_id is not None and mp_id in id_to_mp:
+            if mp_id is None:
+                continue
+            if mp_id in id_to_mp:
                 brand_part_to_master[(b_id, p_num)] = id_to_mp[mp_id]
+            else:
+                # Resolved on the normalized part number, so neither the sku nor the exact
+                # lookup above preloaded a stub for this id.
+                mp = src_models.MasterPart()
+                mp.id = mp_id
+                mp.brand_id = b_id
+                brand_part_to_master[(b_id, p_num)] = mp
         new_pairs = [(b_id, p_num) for (b_id, p_num) in pairs if (b_id, p_num) not in brand_part_to_master]
         if new_pairs:
             for i in range(0, len(new_pairs), WHEELPROS_LOOKUP_CHUNK):
@@ -1495,6 +1529,17 @@ def _ingest_atech_parts_for_mapped_brands(
                     mp_id, b_id, p_num = row
                     existing_by_key[(b_id, p_num)] = mp_id
 
+        # A-Tech often strips punctuation the manufacturer publishes (its '2111721X' is Meyer's
+        # '211172-1X'), so anything the exact match missed gets a second, heavily-guarded pass
+        # on the normalized form.
+        mp_matching.extend_with_normalized_matches(
+            existing_by_key,
+            pairs,
+            {(mp.brand_id, mp.part_number): mp.gtin for mp in master_parts_list},
+            provider_id=atech_provider.id,
+            provider_kind=src_enums.BrandProviderKind.ATECH.value,
+        )
+
         new_parts = [mp for mp in master_parts_list if (mp.brand_id, mp.part_number) not in existing_by_key]
         existing_keys = [k for k in pairs if k in existing_by_key]
 
@@ -1530,12 +1575,15 @@ def _ingest_atech_parts_for_mapped_brands(
                     params,
                 )
 
-        brand_part_to_master = {}
-        if pairs:
+        # Seed from the resolved ids first: a row matched on formatting has no MasterPart
+        # under the feed's own spelling, so the exact-part_number query below cannot find it.
+        brand_part_to_master = mp_matching.master_part_stubs_for(existing_by_key)
+        unresolved_pairs = [k for k in pairs if k not in brand_part_to_master]
+        if unresolved_pairs:
             with connection.cursor() as cur:
                 cur.execute(
                     "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
-                    (tuple(pairs),),
+                    (tuple(unresolved_pairs),),
                 )
                 for row in cur.fetchall():
                     mp_id, b_id, p_num = row
@@ -1737,6 +1785,16 @@ def _ingest_rough_country_parts_for_mapped_brands(
                     mp_id, b_id, p_num = row
                     existing_by_key[(b_id, p_num)] = mp_id
 
+        # Rough Country spells manufacturer part numbers in its own house style, so anything the exact
+        # match missed gets a second, heavily-guarded pass on the normalized form.
+        mp_matching.extend_with_normalized_matches(
+            existing_by_key,
+            pairs,
+            {(mp.brand_id, mp.part_number): mp.gtin for mp in master_parts},
+            provider_id=rc_provider.id,
+            provider_kind=src_enums.BrandProviderKind.ROUGH_COUNTRY.value,
+        )
+
         new_parts = [mp for mp in master_parts if (mp.brand_id, mp.part_number) not in existing_by_key]
         existing_keys = [k for k in pairs if k in existing_by_key]
 
@@ -1772,12 +1830,15 @@ def _ingest_rough_country_parts_for_mapped_brands(
                     params,
                 )
 
-        brand_part_to_master = {}
-        if pairs:
+        # Seed from the resolved ids first: a row matched on formatting has no MasterPart
+        # under the feed's own spelling, so the exact-part_number query below cannot find it.
+        brand_part_to_master = mp_matching.master_part_stubs_for(existing_by_key)
+        unresolved_pairs = [k for k in pairs if k not in brand_part_to_master]
+        if unresolved_pairs:
             with connection.cursor() as cur:
                 cur.execute(
                     "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
-                    (tuple(pairs),),
+                    (tuple(unresolved_pairs),),
                 )
                 for row in cur.fetchall():
                     mp_id, b_id, p_num = row
@@ -1969,6 +2030,16 @@ def _ingest_dlg_parts_for_mapped_brands(
                     mp_id, b_id, p_num = row
                     existing_by_key[(b_id, p_num)] = mp_id
 
+        # DLG spells manufacturer part numbers in its own house style, so anything the exact
+        # match missed gets a second, heavily-guarded pass on the normalized form.
+        mp_matching.extend_with_normalized_matches(
+            existing_by_key,
+            pairs,
+            {(mp.brand_id, mp.part_number): mp.gtin for mp in master_parts},
+            provider_id=dlg_provider.id,
+            provider_kind=src_enums.BrandProviderKind.DLG.value,
+        )
+
         new_parts = [mp for mp in master_parts if (mp.brand_id, mp.part_number) not in existing_by_key]
         existing_keys = [k for k in pairs if k in existing_by_key]
 
@@ -2002,12 +2073,15 @@ def _ingest_dlg_parts_for_mapped_brands(
                     params,
                 )
 
-        brand_part_to_master = {}
-        if pairs:
+        # Seed from the resolved ids first: a row matched on formatting has no MasterPart
+        # under the feed's own spelling, so the exact-part_number query below cannot find it.
+        brand_part_to_master = mp_matching.master_part_stubs_for(existing_by_key)
+        unresolved_pairs = [k for k in pairs if k not in brand_part_to_master]
+        if unresolved_pairs:
             with connection.cursor() as cur:
                 cur.execute(
                     "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
-                    (tuple(pairs),),
+                    (tuple(unresolved_pairs),),
                 )
                 for row in cur.fetchall():
                     mp_id, b_id, p_num = row
@@ -3216,6 +3290,16 @@ def _ingest_vossen_parts_for_mapped_brands(
                     mp_id, b_id, p_num = row
                     existing_by_key[(b_id, p_num)] = mp_id
 
+        # Vossen spells manufacturer part numbers in its own house style, so anything the exact
+        # match missed gets a second, heavily-guarded pass on the normalized form.
+        mp_matching.extend_with_normalized_matches(
+            existing_by_key,
+            pairs,
+            {(mp.brand_id, mp.part_number): mp.gtin for mp in master_parts},
+            provider_id=vossen_provider.id,
+            provider_kind=src_enums.BrandProviderKind.VOSSEN.value,
+        )
+
         new_parts = [mp for mp in master_parts if (mp.brand_id, mp.part_number) not in existing_by_key]
 
         if new_parts:
@@ -3230,12 +3314,15 @@ def _ingest_vossen_parts_for_mapped_brands(
             )
             total_master += len(new_parts)
 
-        brand_part_to_master = {}
-        if pairs:
+        # Seed from the resolved ids first: a row matched on formatting has no MasterPart
+        # under the feed's own spelling, so the exact-part_number query below cannot find it.
+        brand_part_to_master = mp_matching.master_part_stubs_for(existing_by_key)
+        unresolved_pairs = [k for k in pairs if k not in brand_part_to_master]
+        if unresolved_pairs:
             with connection.cursor() as cur:
                 cur.execute(
                     "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
-                    (tuple(pairs),),
+                    (tuple(unresolved_pairs),),
                 )
                 for row in cur.fetchall():
                     mp_id, b_id, p_num = row
@@ -3975,6 +4062,17 @@ def _ingest_wheelpros_parts_for_mapped_brands(
                     sku_match = sku_candidates[0][0]
                 existing_by_key[(b_id, p_num)] = sku_match or existing_by_part.get((b_id, p_num))
 
+        # Neither the sku bridge nor the exact part number placed these. WheelPros ships no
+        # barcode, so only case/whitespace differences can clear the guards here -- punctuation
+        # differences need a matching GTIN and will fall through to creating a new MasterPart.
+        mp_matching.extend_with_normalized_matches(
+            existing_by_key,
+            pairs,
+            {(mp.brand_id, mp.part_number): mp.gtin for mp in master_parts},
+            provider_id=wp_provider.id,
+            provider_kind=src_enums.BrandProviderKind.WHEELPROS.value,
+        )
+
         new_parts = [mp for mp in master_parts if existing_by_key.get((mp.brand_id, mp.part_number)) is None]
         existing_keys = [k for k in pairs if existing_by_key.get(k) is not None]
 
@@ -4020,8 +4118,17 @@ def _ingest_wheelpros_parts_for_mapped_brands(
         # (brand_id, part_number) -> MasterPart; id_to_mp already filled from lookup above
         brand_part_to_master = {}
         for (b_id, p_num), mp_id in existing_by_key.items():
-            if mp_id is not None and mp_id in id_to_mp:
+            if mp_id is None:
+                continue
+            if mp_id in id_to_mp:
                 brand_part_to_master[(b_id, p_num)] = id_to_mp[mp_id]
+            else:
+                # Resolved on the normalized part number, so neither the sku nor the exact
+                # lookup above preloaded a stub for this id.
+                mp = src_models.MasterPart()
+                mp.id = mp_id
+                mp.brand_id = b_id
+                brand_part_to_master[(b_id, p_num)] = mp
         new_pairs = [(b_id, p_num) for (b_id, p_num) in pairs if (b_id, p_num) not in brand_part_to_master]
         if new_pairs:
             for i in range(0, len(new_pairs), WHEELPROS_LOOKUP_CHUNK):
@@ -6821,6 +6928,16 @@ def _ingest_tirerack_parts_for_mapped_brands(
                     mp_id, b_id, p_num = row
                     existing_by_key[(b_id, p_num)] = mp_id
 
+        # TireRack keeps hyphens/'+' that other feeds drop ('964SB-29051-00' vs '964SB2905100'), so anything the exact
+        # match missed gets a second, heavily-guarded pass on the normalized form.
+        mp_matching.extend_with_normalized_matches(
+            existing_by_key,
+            pairs,
+            {(mp.brand_id, mp.part_number): mp.gtin for mp in master_parts},
+            provider_id=tirerack_provider.id,
+            provider_kind=src_enums.BrandProviderKind.TIRERACK.value,
+        )
+
         new_parts = [mp for mp in master_parts if (mp.brand_id, mp.part_number) not in existing_by_key]
         existing_keys = [k for k in pairs if k in existing_by_key]
 
@@ -6854,12 +6971,15 @@ def _ingest_tirerack_parts_for_mapped_brands(
                     params,
                 )
 
-        brand_part_to_master = {}
-        if pairs:
+        # Seed from the resolved ids first: a row matched on formatting has no MasterPart
+        # under the feed's own spelling, so the exact-part_number query below cannot find it.
+        brand_part_to_master = mp_matching.master_part_stubs_for(existing_by_key)
+        unresolved_pairs = [k for k in pairs if k not in brand_part_to_master]
+        if unresolved_pairs:
             with connection.cursor() as cur:
                 cur.execute(
                     "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
-                    (tuple(pairs),),
+                    (tuple(unresolved_pairs),),
                 )
                 for row in cur.fetchall():
                     mp_id, b_id, p_num = row
@@ -7613,6 +7733,16 @@ def _ingest_premier_parts_for_mapped_brands(
                     mp_id, b_id, p_num = sql_row
                     existing_by_key[(b_id, p_num)] = mp_id
 
+        # Premier spells manufacturer part numbers in its own house style, so anything the exact
+        # match missed gets a second, heavily-guarded pass on the normalized form.
+        mp_matching.extend_with_normalized_matches(
+            existing_by_key,
+            pairs,
+            {(mp.brand_id, mp.part_number): mp.gtin for mp in master_parts_list},
+            provider_id=premier_provider.id,
+            provider_kind=src_enums.BrandProviderKind.PREMIER_PERFORMANCE.value,
+        )
+
         new_parts = [mp for mp in master_parts_list if (mp.brand_id, mp.part_number) not in existing_by_key]
         existing_keys = [k for k in pairs if k in existing_by_key]
 
@@ -7653,12 +7783,15 @@ def _ingest_premier_parts_for_mapped_brands(
                     params,
                 )
 
-        brand_part_to_master: typing.Dict[typing.Tuple[int, str], src_models.MasterPart] = {}
-        if pairs:
+        # Seed from the resolved ids first: a row matched on formatting has no MasterPart
+        # under the feed's own spelling, so the exact-part_number query below cannot find it.
+        brand_part_to_master = mp_matching.master_part_stubs_for(existing_by_key)
+        unresolved_pairs = [k for k in pairs if k not in brand_part_to_master]
+        if unresolved_pairs:
             with connection.cursor() as cur:
                 cur.execute(
                     "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
-                    (tuple(pairs),),
+                    (tuple(unresolved_pairs),),
                 )
                 for sql_row in cur.fetchall():
                     mp_id, b_id, p_num = sql_row
