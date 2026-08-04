@@ -647,28 +647,75 @@ def _pgbulk_upsert_premier_company_pricing_batches(
     batch_size: int,
     batch_delay_seconds: float,
 ) -> int:
+    """
+    Hand-written upsert (not pgbulk) so unchanged rows are skipped in the same statement via
+    IS DISTINCT FROM, instead of touching updated_at on every row every cycle regardless of
+    whether the price actually moved -- same fix as Meyer's _flush_buf, built from the memory/
+    timing investigation for company_provider_id=19. updated_at is excluded from the comparison
+    (it always differs) but still gets set to "now" whenever a real value changes, so it stays
+    usable as a watermark for sync_provider_pricing_from_premier_for_company (master_parts.py)
+    to filter on downstream. Returns the number of rows ACTUALLY written (unchanged skipped),
+    not the number considered.
+    """
     if not pricing_instances:
         return 0
     num_batches = (len(pricing_instances) + batch_size - 1) // batch_size
-    total = 0
+    total_written = 0
     for i in range(0, len(pricing_instances), batch_size):
         batch = pricing_instances[i: i + batch_size]
         batch_num = (i // batch_size) + 1
-        pgbulk.upsert(
-            src_models.PremierCompanyPricing,
-            batch,
-            unique_fields=["part", "company"],
-            update_fields=["customer_price", "jobber_price", "map_price", "core_charge", "customer_cad_price", "updated_at"],
-            returning=False,
+        now = timezone.now()
+        rows = [
+            (
+                p.part_id,
+                p.company_id,
+                p.customer_price,
+                p.jobber_price,
+                p.map_price,
+                p.core_charge,
+                p.customer_cad_price,
+                now,
+                now,
+            )
+            for p in batch
+        ]
+        placeholders = ", ".join(["(%s, %s, %s, %s, %s, %s, %s, %s, %s)"] * len(rows))
+        params = [v for row in rows for v in row]
+        with connection.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO premier_company_pricing
+                    (part_id, company_id, customer_price, jobber_price, map_price, core_charge,
+                     customer_cad_price, created_at, updated_at)
+                VALUES {}
+                ON CONFLICT (part_id, company_id) DO UPDATE SET
+                    customer_price = EXCLUDED.customer_price,
+                    jobber_price = EXCLUDED.jobber_price,
+                    map_price = EXCLUDED.map_price,
+                    core_charge = EXCLUDED.core_charge,
+                    customer_cad_price = EXCLUDED.customer_cad_price,
+                    updated_at = EXCLUDED.updated_at
+                WHERE (premier_company_pricing.customer_price, premier_company_pricing.jobber_price,
+                       premier_company_pricing.map_price, premier_company_pricing.core_charge,
+                       premier_company_pricing.customer_cad_price)
+                    IS DISTINCT FROM
+                      (EXCLUDED.customer_price, EXCLUDED.jobber_price, EXCLUDED.map_price,
+                       EXCLUDED.core_charge, EXCLUDED.customer_cad_price)
+                """.format(placeholders),
+                params,
+            )
+            n_written = cur.rowcount
+        total_written += n_written
+        logger.info(
+            "{} PremierCompanyPricing batch {}/{}: {} considered, {} actually written "
+            "(unchanged skipped).".format(
+                _LOG_PREFIX, batch_num, num_batches, len(batch), n_written,
+            )
         )
-        total += len(batch)
-        logger.info("{} Upserted PremierCompanyPricing batch {}/{} ({} rows).".format(
-            _LOG_PREFIX, batch_num, num_batches, len(batch),
-        ))
         connection.close()
         if batch_num < num_batches:
             time.sleep(batch_delay_seconds)
-    return total
+    return total_written
 
 
 def _transform_single_premier_row(

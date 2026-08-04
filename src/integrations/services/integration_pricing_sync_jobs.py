@@ -171,9 +171,14 @@ def _fetch_raw_pricing(cp: src_models.CompanyProviders, use_delta_fetch: bool = 
         dlg_services.sync_dlg_company_pricing_for_company_provider(cp.id)
 
     elif kind == src_enums.BrandProviderKind.PREMIER_PERFORMANCE.value:
-        # Premier pricing is embedded in the parts feed — fetch the full parts catalog
-        # (same call as Phase 1 ingest; only needed for on-demand/new-company runs).
-        premier_services.fetch_and_save_all_premier_brand_parts()
+        # NOT fetch_and_save_all_premier_brand_parts() -- that only maintains the SHARED
+        # PremierParts/PremierBrand catalog via the primary CompanyProvider (still called from
+        # ingest_all_providers' Phase 1) and never touches this company's own pricing. This was
+        # the dispatch call here for a while, which meant non-primary companies' Premier pricing
+        # was never actually synced despite jobs reporting success every cycle -- confirmed live
+        # (two companies with zero PremierCompanyPricing rows ever, one 8 days stale). Use the
+        # per-company function instead, mirroring every other provider's pattern.
+        premier_services.fetch_and_save_premier_company_pricing_for_company_provider(cp.id)
 
     elif kind == src_enums.BrandProviderKind.VOSSEN.value:
         vossen_services.sync_vossen_company_pricing_for_company_provider(cp.id)
