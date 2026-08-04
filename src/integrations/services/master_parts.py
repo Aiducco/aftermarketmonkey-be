@@ -4950,6 +4950,18 @@ def sync_provider_pricing_from_dlg_for_company(company_id: int) -> None:
 
     now = timezone.now()
 
+    # Watermark -- see sync_provider_pricing_from_meyer_for_company for the full rationale.
+    sync_started_at = timezone.now()
+    company_provider = src_models.CompanyProviders.objects.filter(
+        company_id=company_id, provider__kind=src_enums.BrandProviderKind.DLG.value,
+    ).first()
+    watermark = company_provider.pricing_propagation_watermark if company_provider else None
+    logger.info(
+        "{} DLG pricing company={}: propagation watermark={}.".format(
+            _LOG_PREFIX, company_id, watermark or "none (processing everything)",
+        )
+    )
+
     def _worker(catalog_ids: typing.Set[int]) -> int:
         if not catalog_ids:
             return 0
@@ -4958,12 +4970,15 @@ def sync_provider_pricing_from_dlg_for_company(company_id: int) -> None:
         last_id = 0
         while True:
             batch_num += 1
+            qs = src_models.DlgCompanyPricing.objects.filter(
+                id__gt=last_id,
+                company_id=company_id,
+                part__brand_id__in=catalog_ids,
+            )
+            if watermark:
+                qs = qs.filter(updated_at__gte=watermark)
             batch = list(
-                src_models.DlgCompanyPricing.objects.filter(
-                    id__gt=last_id,
-                    company_id=company_id,
-                    part__brand_id__in=catalog_ids,
-                )
+                qs
                 .order_by("id")
                 .values(
                     "id",
@@ -5031,6 +5046,10 @@ def sync_provider_pricing_from_dlg_for_company(company_id: int) -> None:
         _LOG_PREFIX, total_upserted, company_id,
     ))
 
+    if company_provider:
+        company_provider.pricing_propagation_watermark = sync_started_at
+        company_provider.save(update_fields=["pricing_propagation_watermark"])
+
 
 def _atech_company_pricing_batch_row_id_to_provider_part(
     batch: typing.List[typing.Dict],
@@ -5076,10 +5095,16 @@ def _atech_company_pricing_batch_row_id_to_provider_part(
     return row_id_to_pp
 
 
-def _run_atech_provider_pricing_sync(company_id: typing.Optional[int]) -> int:
+def _run_atech_provider_pricing_sync(
+    company_id: typing.Optional[int], watermark: typing.Optional["timezone.datetime"] = None,
+) -> int:
     """
     Fan out AtechCompanyPricing -> ProviderPartCompanyPricing.
     If company_id is None, process all companies (single pass by id, like Keystone / Rough Country).
+    ``watermark``, when given (only meaningful with a specific company_id -- see
+    sync_provider_pricing_from_atech_for_company), filters to rows changed since then instead of
+    the whole per-company raw table every cycle -- see sync_provider_pricing_from_meyer_for_company
+    for the full rationale.
     """
     atech_provider = src_models.Providers.objects.filter(
         kind=src_enums.BrandProviderKind.ATECH.value,
@@ -5112,6 +5137,8 @@ def _run_atech_provider_pricing_sync(company_id: typing.Optional[int]) -> int:
             )
             if company_id is not None:
                 qs = qs.filter(company_id=company_id)
+            if watermark:
+                qs = qs.filter(updated_at__gte=watermark)
             batch = list(
                 qs.order_by("id")
                 .values(
@@ -5198,10 +5225,26 @@ def sync_provider_pricing_from_atech() -> None:
 
 def sync_provider_pricing_from_atech_for_company(company_id: int) -> None:
     logger.info("{} Syncing A-Tech provider pricing for company_id={}.".format(_LOG_PREFIX, company_id))
-    total = _run_atech_provider_pricing_sync(company_id)
+
+    sync_started_at = timezone.now()
+    company_provider = src_models.CompanyProviders.objects.filter(
+        company_id=company_id, provider__kind=src_enums.BrandProviderKind.ATECH.value,
+    ).first()
+    watermark = company_provider.pricing_propagation_watermark if company_provider else None
+    logger.info(
+        "{} A-Tech pricing company={}: propagation watermark={}.".format(
+            _LOG_PREFIX, company_id, watermark or "none (processing everything)",
+        )
+    )
+
+    total = _run_atech_provider_pricing_sync(company_id, watermark=watermark)
     logger.info("{} Synced {} A-Tech pricing records for company_id={}.".format(
         _LOG_PREFIX, total, company_id,
     ))
+
+    if company_provider:
+        company_provider.pricing_propagation_watermark = sync_started_at
+        company_provider.save(update_fields=["pricing_propagation_watermark"])
 
 
 def sync_provider_pricing_from_rough_country_for_company(company_id: int) -> None:
@@ -5224,6 +5267,18 @@ def sync_provider_pricing_from_rough_country_for_company(company_id: int) -> Non
 
     now = timezone.now()
 
+    # Watermark -- see sync_provider_pricing_from_meyer_for_company for the full rationale.
+    sync_started_at = timezone.now()
+    company_provider = src_models.CompanyProviders.objects.filter(
+        company_id=company_id, provider__kind=src_enums.BrandProviderKind.ROUGH_COUNTRY.value,
+    ).first()
+    watermark = company_provider.pricing_propagation_watermark if company_provider else None
+    logger.info(
+        "{} Rough Country pricing company={}: propagation watermark={}.".format(
+            _LOG_PREFIX, company_id, watermark or "none (processing everything)",
+        )
+    )
+
     def _worker(catalog_ids: typing.Set[int]) -> int:
         if not catalog_ids:
             return 0
@@ -5232,12 +5287,15 @@ def sync_provider_pricing_from_rough_country_for_company(company_id: int) -> Non
         last_id = 0
         while True:
             batch_num += 1
+            qs = src_models.RoughCountryCompanyPricing.objects.filter(
+                id__gt=last_id,
+                company_id=company_id,
+                part__brand_id__in=catalog_ids,
+            )
+            if watermark:
+                qs = qs.filter(updated_at__gte=watermark)
             batch = list(
-                src_models.RoughCountryCompanyPricing.objects.filter(
-                    id__gt=last_id,
-                    company_id=company_id,
-                    part__brand_id__in=catalog_ids,
-                )
+                qs
                 .order_by("id")
                 .values(
                     "id",
@@ -5334,6 +5392,10 @@ def sync_provider_pricing_from_rough_country_for_company(company_id: int) -> Non
         _LOG_PREFIX, total_upserted, company_id,
     ))
 
+    if company_provider:
+        company_provider.pricing_propagation_watermark = sync_started_at
+        company_provider.save(update_fields=["pricing_propagation_watermark"])
+
 
 def sync_provider_pricing_from_vossen_for_company(company_id: int) -> None:
     logger.info("{} Syncing Vossen provider pricing for company_id={}.".format(_LOG_PREFIX, company_id))
@@ -5360,6 +5422,15 @@ def sync_provider_pricing_from_vossen_for_company(company_id: int) -> None:
 
     now = timezone.now()
 
+    # Watermark -- see sync_provider_pricing_from_meyer_for_company for the full rationale.
+    sync_started_at = timezone.now()
+    watermark = company_provider.pricing_propagation_watermark if company_provider else None
+    logger.info(
+        "{} Vossen pricing company={}: propagation watermark={}.".format(
+            _LOG_PREFIX, company_id, watermark or "none (processing everything)",
+        )
+    )
+
     def _worker(catalog_ids: typing.Set[int]) -> int:
         if not catalog_ids:
             return 0
@@ -5368,12 +5439,15 @@ def sync_provider_pricing_from_vossen_for_company(company_id: int) -> None:
         last_id = 0
         while True:
             batch_num += 1
+            qs = src_models.VossenCompanyPricing.objects.filter(
+                id__gt=last_id,
+                company_id=company_id,
+                part__brand_id__in=catalog_ids,
+            )
+            if watermark:
+                qs = qs.filter(updated_at__gte=watermark)
             batch = list(
-                src_models.VossenCompanyPricing.objects.filter(
-                    id__gt=last_id,
-                    company_id=company_id,
-                    part__brand_id__in=catalog_ids,
-                )
+                qs
                 .order_by("id")
                 .values("id", "company_id", "price", "part__brand_id", "part__sku")[:BATCH_SIZE_PRICING]
             )
@@ -5450,6 +5524,10 @@ def sync_provider_pricing_from_vossen_for_company(company_id: int) -> None:
         _LOG_PREFIX, total_upserted, company_id,
     ))
 
+    if company_provider:
+        company_provider.pricing_propagation_watermark = sync_started_at
+        company_provider.save(update_fields=["pricing_propagation_watermark"])
+
 
 def sync_provider_pricing_from_wheelpros_for_company(company_id: int) -> None:
     logger.info("{} Syncing WheelPros provider pricing for company_id={}.".format(_LOG_PREFIX, company_id))
@@ -5476,6 +5554,15 @@ def sync_provider_pricing_from_wheelpros_for_company(company_id: int) -> None:
     ).first()
     company_creds = credentials_helper.get_feed_credentials(company_cp) if company_cp else {}
 
+    # Watermark -- see sync_provider_pricing_from_meyer_for_company for the full rationale.
+    sync_started_at = timezone.now()
+    watermark = company_cp.pricing_propagation_watermark if company_cp else None
+    logger.info(
+        "{} WheelPros pricing company={}: propagation watermark={}.".format(
+            _LOG_PREFIX, company_id, watermark or "none (processing everything)",
+        )
+    )
+
     def _worker(catalog_ids: typing.Set[int]) -> int:
         if not catalog_ids:
             return 0
@@ -5484,12 +5571,15 @@ def sync_provider_pricing_from_wheelpros_for_company(company_id: int) -> None:
         last_id = 0
         while True:
             batch_num += 1
+            qs = src_models.WheelProsCompanyPricing.objects.filter(
+                id__gt=last_id,
+                company_id=company_id,
+                part__brand_id__in=catalog_ids,
+            )
+            if watermark:
+                qs = qs.filter(updated_at__gte=watermark)
             batch = list(
-                src_models.WheelProsCompanyPricing.objects.filter(
-                    id__gt=last_id,
-                    company_id=company_id,
-                    part__brand_id__in=catalog_ids,
-                )
+                qs
                 .order_by("id")
                 .values(
                     "id",
@@ -5575,6 +5665,10 @@ def sync_provider_pricing_from_wheelpros_for_company(company_id: int) -> None:
     logger.info("{} Synced {} WheelPros pricing records for company_id={}.".format(
         _LOG_PREFIX, total_upserted, company_id,
     ))
+
+    if company_cp:
+        company_cp.pricing_propagation_watermark = sync_started_at
+        company_cp.save(update_fields=["pricing_propagation_watermark"])
 
 
 def _parse_turn14_inventory(inv: typing.Dict) -> typing.Tuple[typing.Optional[int], typing.Optional[date], int]:
@@ -7320,13 +7414,29 @@ def sync_provider_pricing_from_tirerack_for_company(company_id: int) -> None:
         return
 
     now = timezone.now()
+
+    # Watermark -- see sync_provider_pricing_from_meyer_for_company for the full rationale.
+    sync_started_at = timezone.now()
+    company_provider = src_models.CompanyProviders.objects.filter(
+        company_id=company_id, provider__kind=src_enums.BrandProviderKind.TIRERACK.value,
+    ).first()
+    watermark = company_provider.pricing_propagation_watermark if company_provider else None
+    logger.info(
+        "{} TireRack pricing company={}: propagation watermark={}.".format(
+            _LOG_PREFIX, company_id, watermark or "none (processing everything)",
+        )
+    )
+
     total_upserted = 0
     batch_num = 0
     last_id = 0
     while True:
         batch_num += 1
+        qs = src_models.TireRackCompanyPricing.objects.filter(id__gt=last_id, company_id=company_id)
+        if watermark:
+            qs = qs.filter(updated_at__gte=watermark)
         batch = list(
-            src_models.TireRackCompanyPricing.objects.filter(id__gt=last_id, company_id=company_id)
+            qs
             .order_by("id")
             .values("id", "total_price", "part__brand_id", "part__part_number")[:BATCH_SIZE_PRICING]
         )
@@ -7371,6 +7481,10 @@ def sync_provider_pricing_from_tirerack_for_company(company_id: int) -> None:
     logger.info("{} Synced {} TireRack pricing records for company_id={}.".format(
         _LOG_PREFIX, total_upserted, company_id,
     ))
+
+    if company_provider:
+        company_provider.pricing_propagation_watermark = sync_started_at
+        company_provider.save(update_fields=["pricing_propagation_watermark"])
 
 
 def sync_provider_pricing_from_tirerack() -> None:

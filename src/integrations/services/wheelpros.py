@@ -928,14 +928,30 @@ def sync_wheelpros_company_pricing_for_company_provider(
         batch_total = 0
         for j in range(0, len(pricing_to_upsert), WP_PRICING_UPSERT_BATCH):
             batch = pricing_to_upsert[j : j + WP_PRICING_UPSERT_BATCH]
-            pgbulk.upsert(
-                src_models.WheelProsCompanyPricing,
-                batch,
-                unique_fields=["part", "company"],
-                update_fields=["msrp_usd", "map_usd", "cost_usd", "updated_at"],
-                returning=False,
-            )
-            batch_total += len(batch)
+            # Hand-written upsert (not pgbulk) so unchanged rows are skipped in the same
+            # statement via IS DISTINCT FROM -- see Meyer's _flush_buf for the full rationale.
+            now = timezone.now()
+            rows = [(p.part_id, p.company_id, p.msrp_usd, p.map_usd, p.cost_usd, now, now) for p in batch]
+            placeholders = ", ".join(["(%s, %s, %s, %s, %s, %s, %s)"] * len(rows))
+            params = [v for row in rows for v in row]
+            with connection.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO wheelpros_company_pricing
+                        (part_id, company_id, msrp_usd, map_usd, cost_usd, created_at, updated_at)
+                    VALUES {}
+                    ON CONFLICT (part_id, company_id) DO UPDATE SET
+                        msrp_usd = EXCLUDED.msrp_usd,
+                        map_usd = EXCLUDED.map_usd,
+                        cost_usd = EXCLUDED.cost_usd,
+                        updated_at = EXCLUDED.updated_at
+                    WHERE (wheelpros_company_pricing.msrp_usd, wheelpros_company_pricing.map_usd,
+                           wheelpros_company_pricing.cost_usd)
+                        IS DISTINCT FROM (EXCLUDED.msrp_usd, EXCLUDED.map_usd, EXCLUDED.cost_usd)
+                    """.format(placeholders),
+                    params,
+                )
+                batch_total += cur.rowcount
             connection.close()
         total_all += batch_total
         logger.info(

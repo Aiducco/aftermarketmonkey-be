@@ -1183,43 +1183,64 @@ def sync_atech_company_pricing_for_company_provider(
         nonlocal total_upserted, batch_num
         if not buf:
             return
-        pricing_rows: typing.List[src_models.AtechCompanyPricing] = []
+        rows = []
+        now = timezone.now()
         for feed_fn, pdata in buf.items():
             k = (feed_fn or "").strip()
             part_id = id_by_feed.get(k)
             if not part_id:
                 continue
-            pricing_rows.append(
-                src_models.AtechCompanyPricing(
-                    part_id=part_id,
-                    company=cp.company,
-                    cost=pdata.get("cost"),
-                    retail_price=pdata.get("retail_price"),
-                    jobber_price=pdata.get("jobber_price"),
-                    core_charge=pdata.get("core_charge"),
-                    fee_hazmat=pdata.get("fee_hazmat"),
-                    fee_truck_us=pdata.get("fee_truck_us"),
-                    fee_handling_ground=pdata.get("fee_handling_ground"),
-                    fee_handling_air=pdata.get("fee_handling_air"),
+            rows.append((
+                part_id, cp.company_id,
+                pdata.get("cost"), pdata.get("retail_price"), pdata.get("jobber_price"),
+                pdata.get("core_charge"), pdata.get("fee_hazmat"), pdata.get("fee_truck_us"),
+                pdata.get("fee_handling_ground"), pdata.get("fee_handling_air"),
+                now, now,
+            ))
+        n_written = 0
+        if rows:
+            # Hand-written upsert (not pgbulk) so unchanged rows are skipped in the same
+            # statement via IS DISTINCT FROM -- see Meyer's _flush_buf for the full rationale.
+            placeholders = ", ".join(["(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"] * len(rows))
+            params = [v for row in rows for v in row]
+            with connection.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO atech_company_pricing
+                        (part_id, company_id, cost, retail_price, jobber_price, core_charge,
+                         fee_hazmat, fee_truck_us, fee_handling_ground, fee_handling_air,
+                         created_at, updated_at)
+                    VALUES {}
+                    ON CONFLICT (part_id, company_id) DO UPDATE SET
+                        cost = EXCLUDED.cost,
+                        retail_price = EXCLUDED.retail_price,
+                        jobber_price = EXCLUDED.jobber_price,
+                        core_charge = EXCLUDED.core_charge,
+                        fee_hazmat = EXCLUDED.fee_hazmat,
+                        fee_truck_us = EXCLUDED.fee_truck_us,
+                        fee_handling_ground = EXCLUDED.fee_handling_ground,
+                        fee_handling_air = EXCLUDED.fee_handling_air,
+                        updated_at = EXCLUDED.updated_at
+                    WHERE (atech_company_pricing.cost, atech_company_pricing.retail_price,
+                           atech_company_pricing.jobber_price, atech_company_pricing.core_charge,
+                           atech_company_pricing.fee_hazmat, atech_company_pricing.fee_truck_us,
+                           atech_company_pricing.fee_handling_ground, atech_company_pricing.fee_handling_air)
+                        IS DISTINCT FROM
+                          (EXCLUDED.cost, EXCLUDED.retail_price, EXCLUDED.jobber_price,
+                           EXCLUDED.core_charge, EXCLUDED.fee_hazmat, EXCLUDED.fee_truck_us,
+                           EXCLUDED.fee_handling_ground, EXCLUDED.fee_handling_air)
+                    """.format(placeholders),
+                    params,
                 )
-            )
-        n_upserted = 0
-        if pricing_rows:
-            pgbulk.upsert(
-                src_models.AtechCompanyPricing,
-                pricing_rows,
-                unique_fields=["part", "company"],
-                update_fields=ATECH_COMPANY_PRICING_UPDATE_FIELDS,
-                returning=False,
-            )
-            n_upserted = len(pricing_rows)
-            total_upserted += n_upserted
+                n_written = cur.rowcount
+            total_upserted += n_written
         batch_num += 1
         connection.close()
         buf.clear()
         logger.info(
-            "{} AtechCompanyPricing batch {}: upserted {} rows (total={}) company_provider_id={}.".format(
-                _LOG_PREFIX, batch_num, n_upserted, total_upserted, company_provider_id,
+            "{} AtechCompanyPricing batch {}: {} considered, {} actually written (unchanged "
+            "skipped) (total written={}) company_provider_id={}.".format(
+                _LOG_PREFIX, batch_num, len(rows), n_written, total_upserted, company_provider_id,
             )
         )
 

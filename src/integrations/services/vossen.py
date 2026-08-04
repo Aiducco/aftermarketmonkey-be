@@ -12,6 +12,7 @@ import typing
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 import pgbulk
+from django.db import connection
 from django.utils import timezone
 
 from src import constants as src_constants
@@ -365,15 +366,33 @@ def sync_vossen_company_pricing_for_company_provider(
         )
         return
 
-    pgbulk.upsert(
-        src_models.VossenCompanyPricing,
-        pricing_to_upsert,
-        unique_fields=["part", "company"],
-        update_fields=["price", "updated_at"],
-        returning=False,
-    )
+    # Hand-written upsert (not pgbulk) so unchanged rows are skipped in the same statement via
+    # IS DISTINCT FROM -- see Meyer's _flush_buf for the full rationale.
+    now = timezone.now()
+    total_written = 0
+    batch_size = 5000
+    for i in range(0, len(pricing_to_upsert), batch_size):
+        batch = pricing_to_upsert[i : i + batch_size]
+        rows = [(p.part_id, p.company_id, p.price, now, now) for p in batch]
+        placeholders = ", ".join(["(%s, %s, %s, %s, %s)"] * len(rows))
+        params = [v for row in rows for v in row]
+        with connection.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO vossen_company_pricing (part_id, company_id, price, created_at, updated_at)
+                VALUES {}
+                ON CONFLICT (part_id, company_id) DO UPDATE SET
+                    price = EXCLUDED.price,
+                    updated_at = EXCLUDED.updated_at
+                WHERE vossen_company_pricing.price IS DISTINCT FROM EXCLUDED.price
+                """.format(placeholders),
+                params,
+            )
+            total_written += cur.rowcount
+        connection.close()
     logger.info(
-        "{} VossenCompanyPricing upserted {} rows for company_provider id={}.".format(
-            _LOG_PREFIX, len(pricing_to_upsert), company_provider_id,
+        "{} VossenCompanyPricing considered {} rows, actually wrote {} (unchanged skipped) "
+        "for company_provider id={}.".format(
+            _LOG_PREFIX, len(pricing_to_upsert), total_written, company_provider_id,
         )
     )

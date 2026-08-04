@@ -690,14 +690,25 @@ def _upsert_dlg_company_pricing_for_company(
     total = 0
     for j in range(0, len(pricing_rows), DLG_PRICING_UPSERT_BATCH):
         batch = pricing_rows[j : j + DLG_PRICING_UPSERT_BATCH]
-        pgbulk.upsert(
-            src_models.DlgCompanyPricing,
-            batch,
-            unique_fields=["part", "company"],
-            update_fields=["base_price", "updated_at"],
-            returning=False,
-        )
-        total += len(batch)
+        # Hand-written upsert (not pgbulk) so unchanged rows are skipped in the same statement
+        # via IS DISTINCT FROM -- see Meyer's _flush_buf for the full rationale.
+        now = timezone.now()
+        rows = [(p.part_id, p.company_id, p.base_price, now, now) for p in batch]
+        placeholders = ", ".join(["(%s, %s, %s, %s, %s)"] * len(rows))
+        params = [v for row in rows for v in row]
+        with connection.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO dlg_company_pricing (part_id, company_id, base_price, created_at, updated_at)
+                VALUES {}
+                ON CONFLICT (part_id, company_id) DO UPDATE SET
+                    base_price = EXCLUDED.base_price,
+                    updated_at = EXCLUDED.updated_at
+                WHERE dlg_company_pricing.base_price IS DISTINCT FROM EXCLUDED.base_price
+                """.format(placeholders),
+                params,
+            )
+            total += cur.rowcount
         connection.close()
     return total
 

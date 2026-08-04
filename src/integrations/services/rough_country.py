@@ -862,17 +862,44 @@ def sync_rough_country_company_pricing_for_company_provider(
     total_cp = 0
     for j in range(0, len(pricing_to_upsert), RC_PRICING_UPSERT_BATCH):
         batch = pricing_to_upsert[j : j + RC_PRICING_UPSERT_BATCH]
-        pgbulk.upsert(
-            src_models.RoughCountryCompanyPricing,
-            batch,
-            unique_fields=["part", "company"],
-            update_fields=["price", "sale_price", "cost", "cnd_map", "cnd_price", "updated_at"],
-            returning=False,
-        )
-        total_cp += len(batch)
+        # Hand-written upsert (not pgbulk) so unchanged rows are skipped in the same statement
+        # via IS DISTINCT FROM -- see Meyer's _flush_buf for the full rationale.
+        now = timezone.now()
+        rows = [
+            (p.part_id, p.company_id, p.price, p.sale_price, p.cost, p.cnd_map, p.cnd_price, now, now)
+            for p in batch
+        ]
+        placeholders = ", ".join(["(%s, %s, %s, %s, %s, %s, %s, %s, %s)"] * len(rows))
+        params = [v for row in rows for v in row]
+        with connection.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO rough_country_company_pricing
+                    (part_id, company_id, price, sale_price, cost, cnd_map, cnd_price,
+                     created_at, updated_at)
+                VALUES {}
+                ON CONFLICT (part_id, company_id) DO UPDATE SET
+                    price = EXCLUDED.price,
+                    sale_price = EXCLUDED.sale_price,
+                    cost = EXCLUDED.cost,
+                    cnd_map = EXCLUDED.cnd_map,
+                    cnd_price = EXCLUDED.cnd_price,
+                    updated_at = EXCLUDED.updated_at
+                WHERE (rough_country_company_pricing.price, rough_country_company_pricing.sale_price,
+                       rough_country_company_pricing.cost, rough_country_company_pricing.cnd_map,
+                       rough_country_company_pricing.cnd_price)
+                    IS DISTINCT FROM
+                      (EXCLUDED.price, EXCLUDED.sale_price, EXCLUDED.cost, EXCLUDED.cnd_map,
+                       EXCLUDED.cnd_price)
+                """.format(placeholders),
+                params,
+            )
+            n_written = cur.rowcount
+        total_cp += n_written
         connection.close()
     logger.info(
-        "{} RoughCountryCompanyPricing upserted {} rows for company_provider id={}.".format(
+        "{} RoughCountryCompanyPricing actually wrote {} rows (unchanged skipped) for "
+        "company_provider id={}.".format(
             _LOG_PREFIX, total_cp, company_provider_id,
         )
     )
