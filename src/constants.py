@@ -142,6 +142,14 @@ WHEELPROS_FEED_PATHS = {
     "accessories": "CommonFeed/USD/ACCESSORIES/accessoriesInvPriceData.csv",
 }
 
+# Egress IP dealers must add under My Profile -> My IPs in Keystone's SDK portal. Keystone
+# IP-allowlists per SDK key for both the FTP feed and the order API, and neither Keystone client
+# goes through a proxy (unlike Meyer, see MEYER_ORDER_PROXY_URL) — so this is the app server's own
+# outbound address, the same box as the relay SFTP host above. Shown verbatim in Keystone's
+# installation instructions; if the server ever moves, every connected dealer has to re-enter it,
+# so change this and the copy together.
+KEYSTONE_ALLOWLIST_IP = "5.161.121.143"
+
 """
 Provider catalog: list of all available providers for the integrations catalog.
 Used by seed_providers command and catalog endpoint.
@@ -278,26 +286,96 @@ PROVIDER_CATALOG = [
         "email_order_connection_required_fields": ["rep_email"],
         "email_order_connection_optional_fields": ["cc_email"],
         "integration_time": "Data available within 1-2 hours",
+        # Screenshots live in ``resources/uploads`` and are served from ``{_UPLOADS}`` — see the
+        # matching note on Turn 14 above. The allowlist IP is interpolated from
+        # KEYSTONE_ALLOWLIST_IP rather than typed out, so the copy can't drift from the constant.
         "installation_instructions_html": (
-            "<p><strong>Keystone</strong> data is loaded from their FTP inventory feed using your account credentials.</p>"
+            "<p><strong>Keystone</strong> connects to AfterMarketScout in two parts, using different "
+            "credentials for each:</p>"
+            "<ul>"
+            "<li><strong>Product feed</strong> &mdash; inventory and your dealer pricing, delivered over FTP "
+            "(FTP username + password).</li>"
+            "<li><strong>Ordering</strong> &mdash; purchase orders and tracking, over Keystone's API "
+            "(account number + Production Key).</li>"
+            "</ul>"
+            "<p>Both are granted through Keystone's SDK portal. Access must be requested from your Keystone "
+            "Sales Rep, and your SDK profile must be complete before anything will connect &mdash; so follow "
+            "these steps in order.</p>"
+
+            "<p><strong>1. Request SDK access</strong></p>"
+            "<p>Skip this if you already have SDK portal login credentials.</p>"
+            "<p>Email your Keystone Sales Rep:</p>"
+            "<blockquote>Could you please grant us SDK access to allow FTP inventory data and API ordering?</blockquote>"
+            "<p>Ask for both in the same email even if you only want the product feed today &mdash; requesting "
+            "ordering later means a second round trip with your rep. Your rep will send back your SDK portal "
+            "login credentials.</p>"
+
+            "<p><strong>2. Complete your SDK profile</strong></p>"
+            "<p>Sign in to <a href=\"https://sdkportal.ekeystone.com/\" target=\"_blank\" rel=\"noopener noreferrer\">"
+            "https://sdkportal.ekeystone.com/</a> and scroll to <strong>My Profile</strong>. Keystone will not "
+            "activate access until all three items below are saved.</p>"
+            "<p><img src=\"https://api.aftermarketscout.com/uploads/keystone_step2_sdk_profile.png\" "
+            "alt=\"Keystone SDK portal, My Profile section\" style=\"max-width:100%;height:auto;\" /></p>"
             "<ol>"
-            "<li>Obtain your Keystone FTP <strong>username</strong> and <strong>password</strong> "
-            "(from Keystone onboarding or your rep).</li>"
-            "<li>Enter them exactly as provided—no <code>ftp://</code> prefix in the username field.</li>"
-            "<li>Save the connection. We will pull inventory and pricing from the standard Keystone CSV layouts.</li>"
+            "<li><strong>Registered Contacts</strong> &mdash; enter your contact details.</li>"
+            "<li><strong>My IPs</strong> &mdash; add <code>"
+            + KEYSTONE_ALLOWLIST_IP +
+            "</code>, the address AfterMarketScout connects from.</li>"
+            "<li><strong>Signed NDA</strong> &mdash; sign the NDA form and upload it as directed.</li>"
             "</ol>"
-            "<p><strong>Optional: place orders through AfterMarketScout</strong></p>"
+            "<p><img src=\"https://api.aftermarketscout.com/uploads/keystone_step2_allowlist_ip.png\" "
+            "alt=\"AfterMarketScout Keystone panel with the IP address to allowlist highlighted\" "
+            "style=\"max-width:100%;height:auto;\" /></p>"
+            "<p>Keystone blocks any connection from an IP that isn't on this list. If it's missing, your "
+            "credentials will save successfully but no data will come through.</p>"
+
+            "<p><strong>3. Copy your FTP credentials</strong></p>"
+            "<p>In the SDK portal, locate your <strong>FTP Username</strong> and <strong>FTP Password</strong>.</p>"
+            "<p><img src=\"https://api.aftermarketscout.com/uploads/keystone_step3_ftp_credentials.png\" "
+            "alt=\"Keystone SDK portal, FTP credentials\" style=\"max-width:100%;height:auto;\" /></p>"
+            "<p>Paste them into the <strong>Product feed</strong> fields below and click "
+            "<strong>Save feed credentials</strong>. AfterMarketScout uses them only to retrieve your Keystone "
+            "inventory and pricing. Once validated, this integration shows <strong>Feed Connected</strong>.</p>"
+
+            "<p><strong>4. Optional &mdash; place orders through AfterMarketScout</strong></p>"
+            "<p>Skip this if you don't plan to send purchase orders from AfterMarketScout.</p>"
+            "<p>First, find your <strong>Production Key</strong> in the SDK portal.</p>"
+            "<p><img src=\"https://api.aftermarketscout.com/uploads/keystone_step4_production_key.png\" "
+            "alt=\"Keystone SDK portal, Production Key\" style=\"max-width:100%;height:auto;\" /></p>"
+            "<p>A development or test key will not work for live orders. If you don't have a Production Key, "
+            "contact your Keystone Sales Rep and request one.</p>"
+            "<p>Then add the account in the <strong>Ordering</strong> section below:</p>"
             "<ol>"
-            "<li>Ask your Keystone rep for access to the <strong>Electronic Order Web Service (SDK)</strong>, "
-            "and for your <strong>account number</strong> and <strong>security key</strong>. Keystone issues "
-            "separate test and production security keys—use the production key for live orders.</li>"
-            "<li>Keystone requires the IP address AfterMarketScout uses to reach their API to be "
-            "whitelisted for your key; contact <a href=\"mailto:info@aftermarketscout.com\">"
-            "info@aftermarketscout.com</a> for that IP if your rep asks for it.</li>"
-            "<li>Enter your <strong>account_number</strong> and <strong>security_key</strong> below and save. "
-            "This is separate from the FTP catalog connection above—you can skip it if you don't plan to place "
-            "orders through AfterMarketScout.</li>"
+            "<li>Click <strong>+ Add account</strong>.</li>"
+            "<li><strong>Label</strong> &mdash; name the account (e.g. &ldquo;Primary&rdquo;, "
+            "&ldquo;Dropship&rdquo;).</li>"
+            "<li><strong>Account Number</strong> &mdash; your Keystone account number. This is usually the "
+            "numeric part of your SDK username: if your username is <code>123456admin</code>, your account "
+            "number is <code>123456</code>.</li>"
+            "<li><strong>Security Key</strong> &mdash; paste your Keystone Production Key.</li>"
+            "<li>Click <strong>Add Account</strong>.</li>"
             "</ol>"
+            "<p><img src=\"https://api.aftermarketscout.com/uploads/keystone_step4_ordering_account.png\" "
+            "alt=\"AfterMarketScout Keystone panel, Ordering section with a saved account\" "
+            "style=\"max-width:100%;height:auto;\" /></p>"
+            "<p>Once saved, the account shows as <strong>Active</strong> and this integration shows "
+            "<strong>Ordering Connected</strong>.</p>"
+            "<p><strong>Multiple Keystone accounts?</strong> Brick-and-mortar, drop-ship, and per-location "
+            "accounts each have their own account number and Production Key &mdash; you can't reuse one across "
+            "accounts. Repeat these steps for each, then use the <strong>&#8942;</strong> menu to set your "
+            "default.</p>"
+
+            "<p><strong>Troubleshooting</strong></p>"
+            "<ul>"
+            "<li><strong>No data after saving?</strong> The most common cause is a missing IP entry. Check "
+            "<strong>My Profile &rarr; My IPs</strong> in the SDK portal and confirm <code>"
+            + KEYSTONE_ALLOWLIST_IP +
+            "</code> is listed exactly as shown.</li>"
+            "<li><strong>Feed works but orders fail?</strong> Confirm you're using your Production Key, not a "
+            "test key, and that the account number matches the numeric portion of your SDK username.</li>"
+            "<li><strong>Don't know who your Sales Rep is?</strong> Contact Keystone customer service with your "
+            "account number &mdash; SDK access can only be granted by Keystone.</li>"
+            "</ul>"
         ),
     },
     {
