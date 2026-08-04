@@ -78,14 +78,49 @@ those groups are genuinely different parts.
 
 ## 4. Merging
 
+Use the **bulk** path for the auto-mergeable set. It does the same work as a few set-based
+statements per chunk instead of ~25 round trips per group:
+
 ```python
-ns["merge_batch"](report.auto_mergeable, dry_run=True)     # preview — prints every action
-ns["merge_batch"](report.auto_mergeable, dry_run=False)    # apply
+ns["merge_groups_bulk"](report.auto_mergeable, dry_run=False)
 ```
 
-Each group runs in its own transaction, so one failure cannot roll back the rest. Everything is
-printed. After merging, **reindex Meilisearch** — deleted master part ids remain in the search
-index otherwise (`part_number` is a searchable attribute, see `src/search/meilisearch_client.py`).
+Measured against production over a remote connection: **16.7 groups/sec**, versus 0.367/sec
+row-by-row — 35 minutes for the full set instead of 27.5 hours. Run it on the server if you can;
+almost all the remaining cost is network latency.
+
+`merge_groups_bulk` is only valid for groups that cleared the gates, and it re-asserts the
+property it relies on: provider-disjointness. Because no two rows in a group share a provider, no
+`ProviderPart` is ever deleted — they are repointed, keeping their ids, so inventory, company
+pricing and kit components follow untouched and the `PROTECT` on
+`PurchaseOrderLineItem.provider_part` is never tripped. Duplicates that would need a field-level
+`MasterPartData` merge are returned in `result["fallback"]` and must go through `merge_batch`.
+
+`merge_batch` remains the careful row-by-row path — use it for the fallbacks and for anything you
+approve by hand. Each group runs in its own transaction, so one failure cannot roll back the rest.
+
+**Verify a sample before trusting a large run.** Confirm `ProviderPart` counts are identical
+before and after (none may be lost), the duplicates are gone, and the keeper holds the union of
+providers.
+
+After merging, **reindex Meilisearch** — deleted master part ids remain in the search index
+otherwise (`part_number` is a searchable attribute, see `src/search/meilisearch_client.py`).
+
+### Why the kept row is chosen the way it is
+
+`_pick_canonical` prefers, above everything else, the row carrying a provider listed in
+`EXACT_MATCH_ONLY_PROVIDER_KINDS` — currently just **Turn14**, the one ingest that does not call
+the normalized resolver.
+
+This is a correctness requirement, not cosmetics. Delete the row Turn14 points at and its next
+sync fails the exact lookup, inserts a fresh row, and adds a *second* `ProviderPart` while the
+stale one remains. Turn14 then sits on **both** rows, the group fails provider-disjointness, and
+it can never be auto-merged again. This was hit for real: 5,493 of 35,595 groups were headed
+there before the rule was added.
+
+**If you ever wire Turn14 for normalized matching, remove it from that set. If you onboard
+another distributor and do not wire it, add it.** The two must agree, or merges will quietly
+create un-mergeable pairs.
 
 For the review pile:
 
@@ -172,9 +207,16 @@ should have cleaned up), or `sign_conflict` rising (a feed changed convention).
 ## 7. Things deliberately not handled
 
 - **Prefix/suffix differences** — ATI `916910-10` vs `ATI916910-10`, Brembo `09-5843-11` vs
-  `09584311C02`. ~14,500 groups. String shape alone cannot separate these from real variants
-  (`JE PISTONS 361310` vs `361310-6`), so they are out of scope. They resolve only if a shared
-  GTIN puts them together.
+  `09584311C02`. ~14,500 groups (9,494 prefix + 4,968 suffix). String shape alone cannot separate
+  these from real variants (`JE PISTONS 361310` vs `361310-6`), so they are out of scope for the
+  string rules.
+
+  **These are not resolved by GTIN either.** GTIN is used only to *verify* a candidate already
+  found by normalized part number — there is no lookup keyed on barcode, so two rows whose part
+  numbers differ by more than punctuation stay separate even when their GTINs are identical.
+  Adding a barcode lookup would catch this family, but needs its own guards: 2,259 groups have
+  more than five rows sharing one GTIN (shared or placeholder barcodes), so a naive
+  match-by-GTIN would merge unrelated parts.
 - **The `gtin` column is not normalized in place.** `normalize_gtin` runs at comparison time.
   642k values are zero-padded differently, 154k are placeholders (`NA`), 2.6k have a `.0` float
   artifact, and some feeds drop the check digit entirely. If a future feature needs barcode

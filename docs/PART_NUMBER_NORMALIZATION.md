@@ -255,15 +255,23 @@ whatever the primary source says. Add a **non-unique** index on
 Then change each provider ingest's resolution to a fallback ladder:
 
 1. exact `(brand_id, part_number)` — unchanged, still wins
-2. `(brand_id, normalized_gtin)` — **only for the 7 feeds that carry a UPC/GTIN** (§2b)
-3. `(brand_id, normalized_part_number)` — **only** when all three guards hold:
+2. `(brand_id, normalized_part_number)` — **only** when all the guards hold:
    - it resolves to exactly one existing row (ambiguous → skip),
    - that row has no `ProviderPart` for the provider being ingested,
-   - no sign conflict in the group (§3).
+   - no sign conflict between the two spellings,
+   - for punctuation-level differences, a **validated GTIN equal on both sides**, and the
+     candidate is not backed solely by barcode-less feeds (§2b).
 
-Step 3's guards are what keep `XBCPXL+5` and `XBCPXL-5` apart: they normalize to the same key so
+Step 2's guards are what keep `XBCPXL+5` and `XBCPXL-5` apart: they normalize to the same key so
 the lookup is ambiguous, both come from Meyer so the provider guard fires, and the sign test fires
 as well. Three independent reasons to skip.
+
+> **As built.** An earlier draft of this plan had a middle rung that looked parts up *by*
+> `normalized_gtin`. That was not implemented: GTIN is used only to **verify** a candidate already
+> found by normalized part number, never as a lookup key of its own. The consequence is that the
+> prefix/suffix classes below (~14,500 groups) are not resolved at ingest even when both sides
+> carry the same barcode. Adding a barcode lookup needs its own guards — 2,259 groups have >5 rows
+> sharing one GTIN — so it is deliberately left as a follow-up rather than bolted on.
 
 **TireRack, WheelPros, DLG and Vossen skip step 2 entirely** and reach the catalog only through
 step 3. That is acceptable — step 3's guards do not depend on GTIN — but it means these four get
@@ -326,7 +334,8 @@ check digit from the body and re-validate. Leave the raw `gtin` untouched.
 - Merging on prefix/suffix similarity alone (classes B/C, ~14,500 groups). Without a GTIN anchor
   the false-positive rate is unacceptable — `JE PISTONS 361310` vs `361310-6` and
   `DIABLO PKITJGCV817` vs `PKITJGCV817-I3` are indistinguishable from real variants by string
-  shape alone. These should ride on the GTIN path in 6a, or wait for a review queue.
+  shape alone. Since the barcode lookup rung was not built (see the note in 6a), this family is
+  currently addressed by **neither** the ingest nor the auto-merge, and remains open work.
 - Changing `unique_together` to use the normalized key. It would reject legitimately distinct
   parts (`XBCPXL+5` / `XBCPXL-5`) at write time.
 - Auto-merging the 1,317 GTIN-blind groups (§2b) on string shape alone. These are predominantly
