@@ -59,20 +59,48 @@ report = ns["find_merge_candidates"]()
 ns["print_summary"](report)
 ```
 
-Read-only, takes a few minutes. Baseline as of the 2026-08-04 survey (2,990,906 master parts):
+Read-only, takes a few minutes.
 
-| | groups |
+### Current baseline — measured 2026-08-04, immediately after the first full merge
+
+| | value |
 |---|---|
-| auto-mergeable | 35,595 |
-| needs review | 7,942 |
-| provider links that would be reunited | 36,961 |
+| `master_parts` | **2,954,432** (was 2,990,906; 36,474 merged away) |
+| `provider_parts` | **4,128,240** (unchanged by the merge — no link may ever be lost) |
+| auto-mergeable groups | **0** |
+| needs-review groups | **7,942** |
 
-**After the first merge runs, auto-mergeable should drop to near zero and stay there.** If it
-climbs back into the thousands, the ingest guards are not doing their job — check the
-`[MASTER_PART_MATCHING]` log lines (see §6) before re-merging.
+**Auto-mergeable must stay at or near 0.** That is the health signal. If it climbs into the
+thousands, the ingest guards have stopped working — read the `[MASTER_PART_MATCHING]` log lines
+(§6) and find out why *before* merging again, or you will just be papering over a regression.
 
-The `needs review` count should stay roughly flat. It is not a backlog to burn down; most of
-those groups are genuinely different parts.
+The needs-review count should stay roughly flat. It is not a backlog to burn down; most of those
+groups are genuinely different parts.
+
+### Checking after a full ingest of all providers
+
+The point of the ingest changes is that a sync no longer re-splits what the merge joined. After
+running all provider syncs:
+
+```sql
+-- expect ~7,942, and specifically NOT a jump back toward 43,500
+SELECT count(*) FROM (
+  SELECT 1 FROM master_parts WHERE part_number <> ''
+  GROUP BY brand_id, upper(regexp_replace(part_number, '[^A-Za-z0-9]', '', 'g'))
+  HAVING count(*) > 1
+) t;
+
+-- provider links should only ever grow (new parts), never shrink
+SELECT count(*) FROM provider_parts;
+```
+
+Then re-run `find_merge_candidates()`; `auto_mergeable` should still be ~0. A handful of new ones
+is normal — genuinely new parts arriving under a second spelling. Thousands means a regression.
+
+Known exception: **Turn14 accounts for ~1,190 rows** whose stored `part_number` does not match its
+feed's `mfr_part_number` (prefix drift such as `ALABSK4415X617` vs `BSK4415X617`). These predate
+the merge, are part of the unhandled prefix/suffix family (§7), and Turn14 has always re-created
+them. Do not read them as a regression.
 
 ---
 
