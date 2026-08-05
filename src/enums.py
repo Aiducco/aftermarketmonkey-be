@@ -74,6 +74,7 @@ class BrandProviderKind(enum.Enum):
     ASAP_NETWORK = 34
     VOSSEN = 35
     TIRERACK = 36
+    QUADRATEC = 37
 
 class BrandProviderStatus(enum.Enum):
     ACTIVE = 1

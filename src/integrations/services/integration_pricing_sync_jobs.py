@@ -27,6 +27,7 @@ from src.integrations.services import dlg as dlg_services
 from src.integrations.services import meyer as meyer_services
 from src.integrations.services import notifications as notifications_services
 from src.integrations.services import premier as premier_services
+from src.integrations.services import quadratec as quadratec_services
 from src.integrations.services import rough_country as rough_country_services
 from src.integrations.services import tirerack as tirerack_services
 from src.integrations.services import turn_14 as turn_14_services
@@ -49,6 +50,7 @@ _PRICING_SYNC_KINDS = frozenset(
         src_enums.BrandProviderKind.PREMIER_PERFORMANCE.value,
         src_enums.BrandProviderKind.VOSSEN.value,
         src_enums.BrandProviderKind.TIRERACK.value,
+        src_enums.BrandProviderKind.QUADRATEC.value,
     }
 )
 
@@ -186,6 +188,9 @@ def _fetch_raw_pricing(cp: src_models.CompanyProviders, use_delta_fetch: bool = 
     elif kind == src_enums.BrandProviderKind.TIRERACK.value:
         tirerack_services.sync_tirerack_company_pricing_for_company_provider(cp.id)
 
+    elif kind == src_enums.BrandProviderKind.QUADRATEC.value:
+        quadratec_services.sync_quadratec_company_pricing_for_company_provider(cp.id)
+
     else:
         raise ValueError("Unsupported provider kind for raw pricing fetch: {}".format(kind))
 
@@ -227,6 +232,9 @@ def _sync_master_pricing(cp: src_models.CompanyProviders) -> None:
 
     elif kind == src_enums.BrandProviderKind.TIRERACK.value:
         master_parts.sync_provider_pricing_from_tirerack_for_company(company_id)
+
+    elif kind == src_enums.BrandProviderKind.QUADRATEC.value:
+        master_parts.sync_provider_pricing_from_quadratec_for_company(company_id)
 
     else:
         raise ValueError("Unsupported provider kind for master pricing sync: {}".format(kind))

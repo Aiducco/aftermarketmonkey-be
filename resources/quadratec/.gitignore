@@ -1,0 +1,7 @@
+# Bundled Quadratec static feeds are large (~46MB) — kept locally, not committed.
+# Drop the two dealer feed files here (or point QUADRATEC_*_LOCAL_FILE at them):
+#   pricingSheet_quad.xlsx      (catalog: PN, MPN, desc, UPC, brand, retail/wholesale, surcharge)
+#   quadratec_wholesale.csv     (inventory + cost + MAP, keyed on Quadratec PN)
+*.xlsx
+*.csv
+!.gitignore

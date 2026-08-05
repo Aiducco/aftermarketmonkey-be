@@ -51,6 +51,7 @@ from src.integrations.services import (
     master_parts,
     meyer,
     premier,
+    quadratec,
     rough_country,
     tirerack,
     turn_14,
@@ -166,6 +167,7 @@ class Command(BaseCommand):
                 ("premier",       self._run_premier),
                 ("vossen",        self._run_vossen),
                 ("tirerack",      self._run_tirerack),
+                ("quadratec",     self._run_quadratec),
             ]
             for name, run_fn in phase1_providers:
                 self._ingest_log("phase 1 | starting {} fetch".format(name))
@@ -299,6 +301,16 @@ class Command(BaseCommand):
                 download=True,
             )
             rough_country.sync_unmapped_rough_country_brands_to_brands()
+
+    def _run_quadratec(self) -> None:
+        with self._audited_step(
+            "ingest_all_providers_quadratec",
+            "Quadratec source fetch + unmapped brand sync complete (derived in sync_all).",
+            continue_on_error=True,
+        ):
+            self._ingest_log("Quadratec: feeds + unmapped brand sync")
+            quadratec.fetch_and_save_quadratec()
+            quadratec.sync_unmapped_quadratec_brands_to_brands()
 
     def _run_dlg(self) -> None:
         with self._audited_step(

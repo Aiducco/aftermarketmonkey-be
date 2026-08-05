@@ -1586,6 +1586,104 @@ class BrandRoughCountryBrandMapping(django_db_models.Model):
         unique_together = ["brand", "rough_country_brand"]
 
 
+class QuadratecBrand(django_db_models.Model):
+    """Single brand from the Quadratec feed (feed 'Brand' column, stored uppercase)."""
+    external_id = django_db_models.CharField(max_length=255)
+    name = django_db_models.CharField(max_length=255)
+    aaia_code = django_db_models.CharField(max_length=255, null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "quadratec_brands"
+        unique_together = [["external_id"]]
+
+
+class QuadratecPart(django_db_models.Model):
+    """
+    Part from the Quadratec feeds (catalog + distributor-wide inventory; not per-company --
+    see QuadratecCompanyPricing for per-company price). ``sku`` is Quadratec's own part number
+    (Quadratec PN); ``mpn`` is the manufacturer part number (MPN / Part No). Warehouse stock
+    columns come from the wholesale feed and are Quadratec-wide, like RoughCountryPart's
+    nv_stock/tn_stock. Prices live per company on QuadratecCompanyPricing.
+    """
+    brand = django_db_models.ForeignKey(
+        QuadratecBrand,
+        on_delete=django_db_models.CASCADE,
+        related_name="parts",
+    )
+    sku = django_db_models.CharField(max_length=255)
+    mpn = django_db_models.CharField(max_length=255, null=True, blank=True)
+    title = django_db_models.CharField(max_length=512, null=True, blank=True)
+    description = django_db_models.TextField(null=True, blank=True)
+    upc = django_db_models.CharField(max_length=255, null=True, blank=True)
+    inv_pa1 = django_db_models.IntegerField(null=True, blank=True)
+    inv_pa2 = django_db_models.IntegerField(null=True, blank=True)
+    inv_nv1 = django_db_models.IntegerField(null=True, blank=True)
+    inv_total = django_db_models.IntegerField(null=True, blank=True)
+    shipping_surcharge = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    raw_data = django_db_models.JSONField(null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "quadratec_parts"
+        unique_together = [["brand", "sku"]]
+
+
+class QuadratecCompanyPricing(django_db_models.Model):
+    """
+    Per-company Quadratec pricing for a catalog row (QuadratecPart). Catalog/non-price fields
+    live on QuadratecPart; feed prices are stored per company so ProviderPartCompanyPricing sync
+    keys off (part, company) like other providers. ``cost`` is the dealer cost from the wholesale
+    feed; ``retail_price``/``map`` are MSRP/MAP; ``wholesale_price`` is the pricing-sheet wholesale.
+    """
+    part = django_db_models.ForeignKey(
+        QuadratecPart,
+        on_delete=django_db_models.CASCADE,
+        related_name="company_pricing",
+    )
+    company = django_db_models.ForeignKey(
+        Company,
+        on_delete=django_db_models.CASCADE,
+        related_name="quadratec_company_pricing",
+    )
+    retail_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    wholesale_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    cost = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    map = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "quadratec_company_pricing"
+        unique_together = [["part", "company"]]
+
+
+class BrandQuadratecBrandMapping(django_db_models.Model):
+    """Maps our Brands to QuadratecBrand (for master parts sync)."""
+    brand = django_db_models.ForeignKey(
+        Brands,
+        on_delete=django_db_models.CASCADE,
+        related_name="quadratec_brand_mappings",
+    )
+    quadratec_brand = django_db_models.ForeignKey(
+        QuadratecBrand,
+        on_delete=django_db_models.CASCADE,
+        related_name="brand_mappings",
+    )
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "brand_quadratec_brand_mapping"
+        unique_together = ["brand", "quadratec_brand"]
+
+
 class VossenBrand(django_db_models.Model):
     """Single brand from the Vossen feed — always one row, "VOSSEN" (Vossen is brand=distributor)."""
     external_id = django_db_models.CharField(max_length=255)

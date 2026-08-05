@@ -3654,6 +3654,631 @@ def sync_provider_pricing_from_vossen() -> None:
     logger.info("{} Synced {} Vossen pricing records total.".format(_LOG_PREFIX, total_upserted))
 
 
+# ============================================================
+# QUADRATEC
+# ============================================================
+
+def _quadratec_provider_external_id(quadratec_brand_id: int, quadratec_pn: str) -> str:
+    """
+    Stable Quadratec ProviderPart key: quadratec_brand row id + the Quadratec part number
+    (Quadratec's own PN, which is unique within the feed), same compound shape as every other
+    provider's external id.
+    """
+    pn = (quadratec_pn or "").strip()
+    return "{}_{}".format(int(quadratec_brand_id), pn)
+
+
+def _quadratec_master_part_number(mpn: typing.Optional[str], quadratec_pn: str) -> str:
+    """
+    MasterPart part number for a Quadratec row: the manufacturer part number (``mpn``) when the
+    feed carries one, else the Quadratec PN. Keying on the MPN lets the same physical part from
+    Quadratec dedupe against the same part from other distributors; Quadratec house-brand items
+    (Quadratec / QuadraTop / TACTIK ...) have no separate MPN, so they fall back to the Quadratec PN.
+    """
+    m = (mpn or "").strip()
+    return m if m else (quadratec_pn or "").strip()
+
+
+def _quadratec_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
+    """product_details for a QuadratecPart row (shown on ProviderPart)."""
+    return [
+        {"key": "quadratec_pn", "label": "Quadratec Part No", "value": row.get("sku") or None},
+        {"key": "mpn", "label": "MPN", "value": row.get("mpn") or None},
+        {"key": "upc", "label": "UPC", "value": row.get("upc") or None},
+        {"key": "description", "label": "Description", "value": row.get("description") or None},
+    ]
+
+
+def _quadratec_inventory_warehouse_availability(row: typing.Dict) -> typing.Dict[str, typing.Any]:
+    """Per-warehouse stock from a QuadratecPart row (PA1/PA2/NV1)."""
+    return {
+        "PA1": row.get("inv_pa1"),
+        "PA2": row.get("inv_pa2"),
+        "NV1": row.get("inv_nv1"),
+    }
+
+
+def _ingest_quadratec_parts_for_mapped_brands(
+    mapped_catalog_brand_ids: typing.Set[int],
+    quadratec_provider: src_models.Providers,
+    quadratec_brand_to_brand: typing.Dict[int, src_models.Brands],
+    category_by_source: typing.Dict[str, typing.Tuple[typing.Optional[str], typing.Optional[str]]],
+) -> typing.Tuple[int, int]:
+    """Batch-ingest QuadratecPart rows for one disjoint set of Quadratec catalog brand PKs."""
+    if not mapped_catalog_brand_ids:
+        return 0, 0
+
+    total_master = 0
+    total_provider = 0
+    batch_num = 0
+    last_id = 0
+
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.QuadratecPart.objects.filter(
+                brand_id__in=mapped_catalog_brand_ids,
+                id__gt=last_id,
+            )
+            .order_by("id")
+            .values("id", "brand_id", "sku", "mpn", "description", "updated_at")[:BATCH_SIZE_MASTER_PARTS]
+        )
+        if not batch:
+            break
+
+        last_id = batch[-1]["id"]
+        seen = set()
+        master_parts = []
+        external_id_to_brand_part = {}
+
+        for row in batch:
+            brand = quadratec_brand_to_brand.get(row["brand_id"])
+            if not brand:
+                continue
+
+            part_number = _quadratec_master_part_number(row.get("mpn"), row.get("sku"))
+            if not part_number:
+                continue
+
+            key = (brand.id, part_number)
+            if key not in seen:
+                seen.add(key)
+                master_parts.append(
+                    src_models.MasterPart(
+                        brand=brand,
+                        part_number=part_number,
+                        sku=part_number,
+                        description=row.get("description"),
+                    )
+                )
+            external_id_to_brand_part[
+                _quadratec_provider_external_id(row["brand_id"], row["sku"])
+            ] = (brand.id, part_number)
+
+        if not master_parts:
+            connection.close()
+            if len(batch) == BATCH_SIZE_MASTER_PARTS:
+                time.sleep(BATCH_DELAY_SECONDS)
+            continue
+
+        pairs = list(seen)
+        existing_by_key = {}
+        if pairs:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(pairs),),
+                )
+                for r in cur.fetchall():
+                    mp_id, b_id, p_num = r
+                    existing_by_key[(b_id, p_num)] = mp_id
+
+        mp_matching.extend_with_normalized_matches(
+            existing_by_key,
+            pairs,
+            {(mp.brand_id, mp.part_number): mp.gtin for mp in master_parts},
+            provider_id=quadratec_provider.id,
+            provider_kind=src_enums.BrandProviderKind.QUADRATEC.value,
+            external_id_by_key={v: k for k, v in external_id_to_brand_part.items()},
+        )
+
+        new_parts = [mp for mp in master_parts if (mp.brand_id, mp.part_number) not in existing_by_key]
+
+        if new_parts:
+            new_parts = _dedupe_master_parts_for_upsert(
+                new_parts, context="Quadratec new_parts batch={}".format(batch_num)
+            )
+            pgbulk.upsert(
+                src_models.MasterPart,
+                new_parts,
+                unique_fields=["brand", "part_number"],
+                update_fields=[],
+            )
+            total_master += len(new_parts)
+
+        brand_part_to_master = mp_matching.master_part_stubs_for(existing_by_key)
+        unresolved_pairs = [k for k in pairs if k not in brand_part_to_master]
+        if unresolved_pairs:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(unresolved_pairs),),
+                )
+                for r in cur.fetchall():
+                    mp_id, b_id, p_num = r
+                    mp = src_models.MasterPart()
+                    mp.id = mp_id
+                    mp.brand_id = b_id
+                    mp.part_number = p_num
+                    brand_part_to_master[(b_id, p_num)] = mp
+
+        provider_parts_by_key = {}
+        for row in batch:
+            ext_id = _quadratec_provider_external_id(row["brand_id"], row["sku"])
+            key = external_id_to_brand_part.get(ext_id)
+            if not key:
+                continue
+            master_part = brand_part_to_master.get(key)
+            if not master_part:
+                continue
+            pp_key = (master_part.id, quadratec_provider.id)
+            provider_parts_by_key[pp_key] = src_models.ProviderPart(
+                master_part=master_part,
+                provider=quadratec_provider,
+                provider_external_id=ext_id,
+                distributor_refreshed_at=row.get("updated_at"),
+            )
+
+        provider_parts = list(provider_parts_by_key.values())
+        if provider_parts:
+            pgbulk.upsert(
+                src_models.ProviderPart,
+                provider_parts,
+                unique_fields=["master_part", "provider"],
+                update_fields=_PROVIDER_PART_SYNC_UPDATE_FIELDS,
+            )
+            total_provider += len(provider_parts)
+
+        logger.info("{} Quadratec batch {}: {} items -> {} master, {} provider (last_id={})".format(
+            _LOG_PREFIX, batch_num, len(batch), len(master_parts), len(provider_parts), last_id
+        ))
+        connection.close()
+        if len(batch) == BATCH_SIZE_MASTER_PARTS:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    return total_master, total_provider
+
+
+def sync_master_parts_from_quadratec() -> None:
+    """
+    Create/update MasterPart and ProviderPart from QuadratecPart. Only processes parts whose
+    QuadratecBrand has a BrandQuadratecBrandMapping. Same cursor-based, two-phase upsert pattern
+    as every other provider.
+    """
+    logger.info("{} Syncing master parts from Quadratec (batched, cursor-based).".format(_LOG_PREFIX))
+
+    quadratec_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.QUADRATEC.value,
+    ).first()
+    if not quadratec_provider:
+        logger.info("{} No Quadratec provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandQuadratecBrandMapping.objects.select_related("brand", "quadratec_brand")
+    )
+    quadratec_brand_to_brand = {m.quadratec_brand_id: m.brand for m in mappings}
+    if not quadratec_brand_to_brand:
+        logger.info("{} No BrandQuadratecBrandMapping found. Nothing to sync.".format(_LOG_PREFIX))
+        return
+
+    category_by_source = _load_category_mapping_by_source()
+    chunks = _partition_mapped_brands_for_parallel_ingest(mappings, MASTER_PARTS_SYNC_MAX_WORKERS)
+    total_master, total_provider = _run_parallel_master_parts_ingest(
+        chunks,
+        mappings,
+        "quadratec_brand",
+        lambda cids: _ingest_quadratec_parts_for_mapped_brands(
+            cids,
+            quadratec_provider,
+            quadratec_brand_to_brand,
+            category_by_source,
+        ),
+    )
+    logger.info("{} Synced {} master parts and {} provider parts from Quadratec total.".format(
+        _LOG_PREFIX, total_master, total_provider
+    ))
+
+
+def sync_provider_inventory_from_quadratec() -> None:
+    """
+    Sync ProviderPartInventory from QuadratecPart per-warehouse stock (PA1/PA2/NV1 + total).
+    Also refreshes ProviderPart.product_details.
+    """
+    logger.info("{} Syncing provider inventory from Quadratec.".format(_LOG_PREFIX))
+
+    quadratec_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.QUADRATEC.value,
+    ).first()
+    if not quadratec_provider:
+        logger.info("{} No Quadratec provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandQuadratecBrandMapping.objects.select_related("brand", "quadratec_brand")
+    )
+    if not mappings:
+        logger.info("{} No BrandQuadratecBrandMapping found.".format(_LOG_PREFIX))
+        return
+
+    provider_parts = {
+        row["provider_external_id"]: src_models.ProviderPart(id=row["id"])
+        for row in src_models.ProviderPart.objects.filter(provider=quadratec_provider).values(
+            "id", "provider_external_id"
+        )
+    }
+
+    now = timezone.now()
+
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            batch = list(
+                src_models.QuadratecPart.objects.filter(id__gt=last_id, brand_id__in=catalog_ids)
+                .order_by("id")
+                .values(
+                    "id", "brand_id", "sku", "mpn", "upc", "description",
+                    "inv_pa1", "inv_pa2", "inv_nv1", "inv_total",
+                )[:BATCH_SIZE_INVENTORY]
+            )
+            if not batch:
+                break
+
+            last_id = batch[-1]["id"]
+            to_upsert = []
+            for row in batch:
+                ext_id = _quadratec_provider_external_id(row["brand_id"], row["sku"])
+                provider_part = provider_parts.get(ext_id)
+                if not provider_part:
+                    continue
+                to_upsert.append(
+                    src_models.ProviderPartInventory(
+                        provider_part=provider_part,
+                        warehouse_total_qty=row.get("inv_total") or 0,
+                        manufacturer_inventory=None,
+                        manufacturer_esd=None,
+                        warehouse_availability=_quadratec_inventory_warehouse_availability(row),
+                        last_synced_at=now,
+                        updated_at=now,
+                    )
+                )
+
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_inventory_for_upsert(
+                    to_upsert, context="Quadratec inventory batch={}".format(batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartInventory,
+                    to_upsert,
+                    unique_fields=["provider_part"],
+                    update_fields=[
+                        "warehouse_total_qty",
+                        "manufacturer_inventory",
+                        "manufacturer_esd",
+                        "warehouse_availability",
+                        "last_synced_at",
+                        "updated_at",
+                    ],
+                )
+                total_upserted += len(to_upsert)
+
+            pp_details_to_update = []
+            for row in batch:
+                ext_id = _quadratec_provider_external_id(row["brand_id"], row["sku"])
+                pp = provider_parts.get(ext_id)
+                if pp:
+                    pp.product_details = _quadratec_product_details(row)
+                    pp_details_to_update.append(pp)
+            if pp_details_to_update:
+                src_models.ProviderPart.objects.bulk_update(
+                    pp_details_to_update, ["product_details"], batch_size=500
+                )
+
+            logger.info("{} Quadratec inventory batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_INVENTORY:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "quadratec_brand", _worker)
+    logger.info("{} Synced {} Quadratec inventory records total.".format(_LOG_PREFIX, total_upserted))
+
+
+def _quadratec_provider_part_company_pricing_from_row(
+    row: typing.Dict,
+    provider_part: src_models.ProviderPart,
+    company: src_models.Company,
+    now,
+) -> src_models.ProviderPartCompanyPricing:
+    """Map a QuadratecCompanyPricing row to a ProviderPartCompanyPricing instance."""
+    return src_models.ProviderPartCompanyPricing(
+        provider_part=provider_part,
+        company=company,
+        cost=row.get("cost"),
+        jobber_price=row.get("wholesale_price"),
+        map_price=row.get("map"),
+        msrp=row.get("retail_price"),
+        retail_price=row.get("retail_price"),
+        last_synced_at=now,
+    )
+
+
+def _quadratec_pricing_master_keys(
+    batch: typing.List[typing.Dict],
+    quadratec_brand_to_brand: typing.Dict[int, src_models.Brands],
+) -> typing.List[typing.Tuple[int, str]]:
+    keys = []
+    for row in batch:
+        brand = quadratec_brand_to_brand.get(row.get("part__brand_id"))
+        if not brand:
+            continue
+        part_number = _quadratec_master_part_number(row.get("part__mpn"), row.get("part__sku"))
+        if not part_number:
+            continue
+        keys.append((brand.id, part_number))
+    return keys
+
+
+_QUADRATEC_PRICING_VALUES = (
+    "id", "company_id", "cost", "wholesale_price", "map", "retail_price",
+    "part__brand_id", "part__mpn", "part__sku",
+)
+_QUADRATEC_PRICING_UPSERT_FIELDS = ["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"]
+
+
+def sync_provider_pricing_from_quadratec() -> None:
+    """Sync ProviderPartCompanyPricing from QuadratecCompanyPricing (all companies)."""
+    logger.info("{} Syncing provider pricing from Quadratec.".format(_LOG_PREFIX))
+
+    quadratec_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.QUADRATEC.value,
+    ).first()
+    if not quadratec_provider:
+        logger.info("{} No Quadratec provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandQuadratecBrandMapping.objects.select_related("brand", "quadratec_brand")
+    )
+    quadratec_brand_to_brand = {m.quadratec_brand_id: m.brand for m in mappings}
+    if not quadratec_brand_to_brand:
+        logger.info("{} No BrandQuadratecBrandMapping found. Nothing to price.".format(_LOG_PREFIX))
+        return
+
+    now = timezone.now()
+
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            batch = list(
+                src_models.QuadratecCompanyPricing.objects.filter(
+                    id__gt=last_id, part__brand_id__in=catalog_ids
+                )
+                .order_by("id")
+                .values(*_QUADRATEC_PRICING_VALUES)[:BATCH_SIZE_PRICING]
+            )
+            if not batch:
+                break
+
+            last_id = batch[-1]["id"]
+            batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
+            companies_by_id = {
+                c.id: c for c in src_models.Company.objects.filter(id__in=batch_company_ids)
+            }
+            pp_by_key = _provider_parts_by_master_brand_and_part_number(
+                quadratec_provider, _quadratec_pricing_master_keys(batch, quadratec_brand_to_brand)
+            )
+
+            to_upsert = []
+            for row in batch:
+                brand = quadratec_brand_to_brand.get(row.get("part__brand_id"))
+                if not brand:
+                    continue
+                part_number = _quadratec_master_part_number(row.get("part__mpn"), row.get("part__sku"))
+                if not part_number:
+                    continue
+                provider_part = pp_by_key.get((brand.id, part_number))
+                if not provider_part:
+                    continue
+                company = companies_by_id.get(row.get("company_id"))
+                if not company:
+                    continue
+                to_upsert.append(
+                    _quadratec_provider_part_company_pricing_from_row(row, provider_part, company, now)
+                )
+
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                    to_upsert, context="Quadratec pricing batch={}".format(batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartCompanyPricing,
+                    to_upsert,
+                    unique_fields=["provider_part", "company"],
+                    update_fields=_QUADRATEC_PRICING_UPSERT_FIELDS,
+                )
+                total_upserted += len(to_upsert)
+
+            logger.info("{} Quadratec pricing batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_PRICING:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "quadratec_brand", _worker)
+    logger.info("{} Synced {} Quadratec pricing records total.".format(_LOG_PREFIX, total_upserted))
+
+
+def sync_provider_pricing_from_quadratec_for_company(company_id: int) -> None:
+    logger.info("{} Syncing Quadratec provider pricing for company_id={}.".format(_LOG_PREFIX, company_id))
+
+    quadratec_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.QUADRATEC.value,
+    ).first()
+    if not quadratec_provider:
+        logger.info("{} No Quadratec provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandQuadratecBrandMapping.objects.select_related("brand", "quadratec_brand")
+    )
+    quadratec_brand_to_brand = {m.quadratec_brand_id: m.brand for m in mappings}
+    if not quadratec_brand_to_brand:
+        logger.info("{} No BrandQuadratecBrandMapping found. Nothing to price.".format(_LOG_PREFIX))
+        return
+
+    company_provider = src_models.CompanyProviders.objects.filter(
+        company_id=company_id, provider_id=quadratec_provider.id
+    ).first()
+
+    now = timezone.now()
+
+    # Watermark -- see sync_provider_pricing_from_meyer_for_company for the full rationale.
+    sync_started_at = timezone.now()
+    watermark = company_provider.pricing_propagation_watermark if company_provider else None
+    logger.info(
+        "{} Quadratec pricing company={}: propagation watermark={}.".format(
+            _LOG_PREFIX, company_id, watermark or "none (processing everything)",
+        )
+    )
+
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            qs = src_models.QuadratecCompanyPricing.objects.filter(
+                id__gt=last_id,
+                company_id=company_id,
+                part__brand_id__in=catalog_ids,
+            )
+            if watermark:
+                qs = qs.filter(updated_at__gte=watermark)
+            batch = list(
+                qs.order_by("id").values(*_QUADRATEC_PRICING_VALUES)[:BATCH_SIZE_PRICING]
+            )
+            if not batch:
+                break
+
+            last_id = batch[-1]["id"]
+            batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
+            companies_by_id = {
+                c.id: c for c in src_models.Company.objects.filter(id__in=batch_company_ids)
+            }
+            pp_by_key = _provider_parts_by_master_brand_and_part_number(
+                quadratec_provider, _quadratec_pricing_master_keys(batch, quadratec_brand_to_brand)
+            )
+
+            to_upsert = []
+            for row in batch:
+                brand = quadratec_brand_to_brand.get(row.get("part__brand_id"))
+                if not brand:
+                    continue
+                part_number = _quadratec_master_part_number(row.get("part__mpn"), row.get("part__sku"))
+                if not part_number:
+                    continue
+                provider_part = pp_by_key.get((brand.id, part_number))
+                if not provider_part:
+                    continue
+                company = companies_by_id.get(row.get("company_id"))
+                if not company:
+                    continue
+                to_upsert.append(
+                    _quadratec_provider_part_company_pricing_from_row(row, provider_part, company, now)
+                )
+
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                    to_upsert, context="Quadratec pricing company={} batch={}".format(company_id, batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartCompanyPricing,
+                    to_upsert,
+                    unique_fields=["provider_part", "company"],
+                    update_fields=_QUADRATEC_PRICING_UPSERT_FIELDS,
+                )
+                total_upserted += len(to_upsert)
+
+            logger.info("{} Quadratec pricing company={} batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, company_id, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_PRICING:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "quadratec_brand", _worker)
+    logger.info("{} Synced {} Quadratec pricing records for company_id={}.".format(
+        _LOG_PREFIX, total_upserted, company_id,
+    ))
+
+    if company_provider:
+        company_provider.pricing_propagation_watermark = sync_started_at
+        company_provider.save(update_fields=["pricing_propagation_watermark"])
+
+
+def sync_derived_from_quadratec(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False, skip_pricing: bool = False) -> None:
+    """
+    Propagate Quadratec source data into MasterPart, ProviderPart, ProviderPartInventory, and
+    ProviderPartCompanyPricing. Call after Quadratec feed ingest. No fitment sync -- the Quadratec
+    feeds carry no vehicle fitment.
+
+    Pass ``skip_master_parts=True`` to run only inventory + pricing (fast incremental path).
+    Pass ``skip_pricing=True`` to run only master parts + inventory (global catalog sync path).
+    """
+    logger.info("{} Starting Quadratec-only derived sync ({}).".format(
+        _LOG_PREFIX,
+        "inventory + pricing only" if skip_master_parts else "parts, inventory" + ("" if skip_pricing else ", pricing"),
+    ))
+    if not skip_master_parts:
+        sync_master_parts_from_quadratec()
+        connection.close()
+
+    def _cont() -> None:
+        sync_provider_inventory_from_quadratec()
+        connection.close()
+        if not skip_pricing:
+            sync_provider_pricing_from_quadratec()
+            connection.close()
+
+    if skip_master_parts:
+        _cont()
+    else:
+        _maybe_reindex_meilisearch_after_master_parts(
+            reindex_meilisearch=reindex_meilisearch,
+            provider_label="Quadratec",
+            continuation=_cont,
+        )
+    logger.info("{} Completed Quadratec-only derived sync.".format(_LOG_PREFIX))
+
+
 def _wheelpros_provider_external_id(wp_brand_id: int, part_number: str) -> str:
     """Unique per WheelPros provider: wp_brand_id + part_number."""
     return "{}_{}".format(wp_brand_id, part_number)
@@ -8768,6 +9393,8 @@ def sync_all_master_parts_global() -> None:
     sync_derived_from_vossen(skip_pricing=True)
     _reclaim_memory()
     sync_derived_from_tirerack(skip_pricing=True)
+    _reclaim_memory()
+    sync_derived_from_quadratec(skip_pricing=True)
 
     logger.info("{} Completed global master parts sync (catalog + inventory, no pricing).".format(_LOG_PREFIX))
 
@@ -8797,5 +9424,6 @@ def sync_all_master_parts_incremental() -> None:
     sync_derived_from_premier(skip_master_parts=True)
     sync_derived_from_vossen(skip_master_parts=True)
     sync_derived_from_tirerack(skip_master_parts=True)
+    sync_derived_from_quadratec(skip_master_parts=True)
 
     logger.info("{} Completed incremental master parts sync.".format(_LOG_PREFIX))

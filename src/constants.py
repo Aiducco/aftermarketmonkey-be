@@ -34,6 +34,7 @@ PROVIDER_DISPLAY_NAMES = {
     "ATD": "ATD",
     "VOSSEN": "Vossen",
     "TIRERACK": "TireRack",
+    "QUADRATEC": "Quadratec",
 }
 
 # Provider kind_name -> image URL (used by parts API)
@@ -70,6 +71,7 @@ PROVIDER_IMAGE_URLS = {
     "ATD": "https://api.aftermarketscout.com/uploads/atd_logo.png",
     "VOSSEN": "https://api.aftermarketscout.com/uploads/vossen_logo.png",
     "TIRERACK": "https://api.aftermarketscout.com/uploads/tirerack_logo.png",
+    "QUADRATEC": "https://api.aftermarketscout.com/uploads/quadratec_logo.png",
 }
 
 # Public "open in distributor" links (parts API ``provider_go_to_link``); ``urllib.parse.quote`` at call sites.
@@ -117,6 +119,16 @@ def dlg_b2b_search_keywords(dlg_brand_name: typing.Optional[str], part_number: s
 
 # CompanyProviders.credentials JSON key for Rough Country: jobber Excel URL (required per connection).
 ROUGH_COUNTRY_CREDENTIALS_FEED_URL = "feed_url"
+
+# CompanyProviders.credentials JSON keys for Quadratec: two per-connection feed URLs. The catalog
+# feed (pricingSheet_quad.xlsx: Quadratec PN, MPN, Description, UPC, Brand, Retail/Wholesale price,
+# Shipping Surcharge) and the pricing/inventory feed (quadratec_wholesale.csv: Quadratec Part No,
+# Part No, Description, Brand, per-warehouse + total inventory, Cost, Surcharge, UPC, MAP). Both key
+# on the Quadratec part number. While these are collected per connection, the ingest currently reads
+# two bundled static files (see src.integrations.clients.quadratec.client DEFAULT_*_LOCAL_FILE) so a
+# connection can be provisioned before the dealer's live URLs are wired up.
+QUADRATEC_CREDENTIALS_CATALOG_FEED_URL = "catalog_feed_url"
+QUADRATEC_CREDENTIALS_PRICING_FEED_URL = "pricing_feed_url"
 
 # CompanyProviders.credentials JSON key for Vossen: AfterMarket.aspx CSV feed URL (required per connection).
 VOSSEN_CREDENTIALS_FEED_URL = "feed_url"
@@ -401,6 +413,40 @@ PROVIDER_CATALOG = [
             "purchase order instead. Enter your rep's <strong>email</strong> below (and an optional internal "
             "<strong>CC</strong> address) and save. You can skip it if you don't plan to place orders through "
             "AfterMarketScout.</p>"
+        ),
+    },
+    {
+        "kind": enums.BrandProviderKind.QUADRATEC,
+        "name": "Quadratec",
+        "description": "Access catalog, per-company pricing, and inventory from Quadratec via two downloadable feeds.",
+        "icon_url": "https://api.aftermarketscout.com/uploads/quadratec_logo.png",
+        "category": "Distributors",
+        "connection_required_fields": [
+            QUADRATEC_CREDENTIALS_CATALOG_FEED_URL,
+            QUADRATEC_CREDENTIALS_PRICING_FEED_URL,
+        ],
+        # Email-channel ordering — Quadratec has no order API of its own (same pattern as Rough
+        # Country / Vossen), so this is the only way to place orders through AfterMarketScout for it.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["cc_email"],
+        "integration_time": "Data available within 1-2 hours",
+        "installation_instructions_html": (
+            "<p><strong>Quadratec</strong> provides two downloadable dealer feeds — a catalog/pricing "
+            "sheet and a wholesale cost + inventory file. Both are per dealer account.</p>"
+            "<ol>"
+            "<li>In your Quadratec dealer portal, locate your <strong>catalog/pricing feed</strong> "
+            "(Quadratec PN, MPN, description, UPC, brand, retail &amp; wholesale price). Copy its full "
+            "HTTPS URL and paste it into <strong>catalog_feed_url</strong> below.</li>"
+            "<li>Locate your <strong>wholesale cost &amp; inventory feed</strong> (Quadratec Part No, "
+            "part no, brand, per-warehouse and total inventory, cost, UPC, MAP). Copy its full HTTPS URL "
+            "and paste it into <strong>pricing_feed_url</strong> below.</li>"
+            "<li>Save the connection.</li>"
+            "</ol>"
+            "<p><strong>Optional: place orders through AfterMarketScout</strong></p>"
+            "<p>Quadratec has no ordering API — orders are emailed to your Quadratec rep as a PDF "
+            "purchase order instead. Enter your rep's <strong>email</strong> below (and an optional "
+            "internal <strong>CC</strong> address) and save. You can skip it if you don't plan to place "
+            "orders through AfterMarketScout.</p>"
         ),
     },
     {
