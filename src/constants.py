@@ -1360,21 +1360,63 @@ PROVIDER_CATALOG = [
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
             "<p><strong>Vossen</strong> provides a downloadable CSV inventory feed "
-            "(<code>AfterMarket.aspx</code>) per dealer account.</p>"
+            "(<code>AfterMarket.aspx</code>), unique to each dealer account. There's no API key or password "
+            "&mdash; the URL itself is your credential, so treat it as private.</p>"
+            "<p>The feed carries Vossen's <strong>list price</strong> rather than your dealer cost, so you'll "
+            "also enter your discount percentage and we'll calculate cost from it.</p>"
+            "<p>Vossen has no ordering API. If you want to place orders through AfterMarketScout, they're sent "
+            "to your rep as a PDF purchase order by email.</p>"
+
+            "<p><strong>1. Get your dealer feed URL</strong></p>"
+            "<p>Contact your Vossen rep and ask for your dealer inventory feed URL. It starts with "
+            "<code>{host_prefix}</code> and ends in <code>AfterMarket.aspx</code>.</p>"
+            "<p>The URL is specific to your dealer account &mdash; another dealer's link won't return your "
+            "pricing.</p>"
+
+            "<p><strong>2. Paste the URL and set your discount</strong></p>"
             "<ol>"
-            "<li>Contact your Vossen rep for your dealer <strong>feed URL</strong> — it starts with "
-            "<code>{}</code>.</li>"
-            "<li>Paste the full URL into <strong>feed_url</strong> below.</li>"
-            "<li>Enter <strong>discount_percent</strong> — the percent <em>off</em> the feed's list "
-            "price (0–100) that is your dealer cost. We derive cost as: "
-            "cost = price &times; (1 &minus; discount_percent / 100).</li>"
-            "<li>Save the connection.</li>"
+            "<li>Paste the full URL into <strong>{feed_url_key}</strong> below.</li>"
+            "<li>Enter your <strong>{discount_key}</strong> &mdash; the percent <em>off</em> the feed's list "
+            "price (0&ndash;100) that represents your dealer cost.</li>"
+            "<li>Click <strong>Save</strong>.</li>"
             "</ol>"
-            "<p><strong>Optional: place orders through AfterMarketScout</strong></p>"
-            "<p>Vossen has no ordering API — orders are emailed to your Vossen rep as a PDF purchase order "
-            "instead. Enter your rep's <strong>email</strong> below (and an optional internal <strong>CC</strong> "
-            "address) and save. You can skip it if you don't plan to place orders through AfterMarketScout.</p>"
-        ).format(VOSSEN_FEED_URL_HOST_PREFIX),
+            "<p>We calculate cost as:</p>"
+            + _CALLOUT_OPEN +
+            "<p><code>cost = price &times; (1 &minus; {discount_key} / 100)</code></p>"
+            "</div>"
+            "<p>So a 40% dealer discount on a $1,000 wheel gives a cost of $600. If you're unsure of your "
+            "percentage, your Vossen rep can confirm it &mdash; entering the wrong number won't break the "
+            "connection, but every cost and margin figure will be off.</p>"
+
+            "<p><strong>3. Optional &mdash; place orders through AfterMarketScout</strong></p>"
+            "<p>Skip this if you don't plan to send purchase orders from AfterMarketScout. Vossen has no "
+            "ordering API, so orders are emailed to your rep as a PDF purchase order instead.</p>"
+            "<ol>"
+            "<li>Enter your Vossen rep's <strong>email</strong> address below.</li>"
+            "<li>Optionally add an internal <strong>CC</strong> address so your own team receives a copy of "
+            "every order.</li>"
+            "<li>Click <strong>Save</strong>.</li>"
+            "</ol>"
+            "<p>Because orders arrive as email rather than through an API, confirmation and tracking come back "
+            "from your rep directly, not automatically into AfterMarketScout.</p>"
+
+            "<p><strong>Notes</strong></p>"
+            "<ul>"
+            "<li><strong>Costs look wrong across the board.</strong> This is almost always the discount "
+            "percentage. Check <strong>{discount_key}</strong> against what your rep quoted &mdash; it's a "
+            "percent <em>off</em> list, not the percentage you pay.</li>"
+            "<li><strong>Your discount changed.</strong> Update <strong>{discount_key}</strong> here and save. "
+            "Costs recalculate from the feed's list prices; there's no need to touch the URL.</li>"
+            "<li><strong>Feed stopped updating.</strong> Ask your Vossen rep to confirm your feed URL is still "
+            "active &mdash; dealer links can be reissued.</li>"
+            "<li><strong>Need help?</strong> Contact "
+            "<a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a>.</li>"
+            "</ul>"
+        ).format(
+            host_prefix=VOSSEN_FEED_URL_HOST_PREFIX,
+            feed_url_key=VOSSEN_CREDENTIALS_FEED_URL,
+            discount_key=VOSSEN_CREDENTIALS_DISCOUNT_PERCENT,
+        ),
         # Email-channel ordering — Vossen has no order API of its own; see the matching note on
         # Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
