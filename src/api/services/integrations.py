@@ -72,7 +72,7 @@ def _render_relay_instructions_html(
         return (
             "<p>Your dedicated SFTP account is being created and will appear here shortly &mdash; "
             "check back in a few minutes. Still missing? Contact "
-            "<a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a>.</p>"
+            "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a>.</p>"
         )
     return template.replace("{{SFTP_USER}}", username).replace("{{SFTP_PASSWORD}}", password)
 
@@ -982,7 +982,7 @@ def connect_provider(
                 ))
                 return (
                     None,
-                    "Your SFTP account could not be created. Please contact info@aftermarketscout.com.",
+                    "Your SFTP account could not be created. Please contact support@aftermarketscout.com.",
                     CONNECTION_ERROR_CONNECTION_FAILED,
                 )
         # "feed" is always system-generated for relay providers — never user-submitted, so it's

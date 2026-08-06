@@ -729,10 +729,10 @@ PROVIDER_CATALOG = [
             "grants. Confirm your rep issued an API key specifically for ordering &mdash; feed setup alone "
             "doesn't enable it.</li>"
             "<li><strong>Multiple Meyer accounts?</strong> Each account needs its own feed delivery from Meyer. "
-            "Contact <a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a> and we'll set up "
+            "Contact <a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a> and we'll set up "
             "an additional SFTP endpoint for you.</li>"
             "<li><strong>Need help?</strong> Contact "
-            "<a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a>.</li>"
+            "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a>.</li>"
             "</ul>"
         ),
     },
@@ -811,10 +811,10 @@ PROVIDER_CATALOG = [
             "<li><strong>Prices look stale.</strong> Pricing updates only when your rep refreshes your file. If "
             "costs haven't moved in a while, ask them to send a fresh extract.</li>"
             "<li><strong>Multiple A-Tech accounts?</strong> Each account needs its own delivery. Contact "
-            "<a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a> and we'll set up an "
+            "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a> and we'll set up an "
             "additional SFTP endpoint.</li>"
             "<li><strong>Need help?</strong> Contact "
-            "<a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a>.</li>"
+            "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a>.</li>"
             "</ul>"
         ),
         # Email-channel ordering — A-Tech has no order API of its own; see the matching note on
@@ -968,7 +968,7 @@ PROVIDER_CATALOG = [
             "</ul>"
             "<p>No credentials to enter here &mdash; just click <strong>Connect</strong>. "
             "For assistance contact: "
-            "<a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a>.</p>"
+            "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a>.</p>"
         ),
     },
     {
@@ -1123,7 +1123,7 @@ PROVIDER_CATALOG = [
             "<strong>FTP Login</strong>, and <strong>FTP Password</strong> below and save the connection.</li>"
             "</ol>"
             "<p>For assistance contact: "
-            "<a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a>.</p>"
+            "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a>.</p>"
         ),
     },
     {
@@ -1168,7 +1168,7 @@ PROVIDER_CATALOG = [
             "<li>Enter the token in the <strong>Access Token</strong> field below and save.</li>"
             "</ol>"
             "<p>For assistance contact: "
-            "<a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a>.</p>"
+            "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a>.</p>"
         ),
     },
     {
@@ -1262,7 +1262,7 @@ PROVIDER_CATALOG = [
             "won't appear until the next pull.</li>"
             "<li><strong>Need help?</strong> Feed: "
             "<a href=\"mailto:datateam@premierwd.com\">datateam@premierwd.com</a> &middot; AfterMarketScout: "
-            "<a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a></li>"
+            "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a></li>"
             "</ul>"
         ),
     },
@@ -1449,7 +1449,7 @@ PROVIDER_CATALOG = [
             "<li><strong>Feed stopped updating.</strong> Ask your Vossen rep to confirm your feed URL is still "
             "active &mdash; dealer links can be reissued.</li>"
             "<li><strong>Need help?</strong> Contact "
-            "<a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a>.</li>"
+            "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a>.</li>"
             "</ul>"
         ).format(
             host_prefix=VOSSEN_FEED_URL_HOST_PREFIX,
@@ -1526,7 +1526,7 @@ PROVIDER_CATALOG = [
             "<li><strong>Multiple Tire Rack accounts?</strong> Each dealer account has its own SFTP login. "
             "Connect them separately.</li>"
             "<li><strong>Need help?</strong> Contact "
-            "<a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a>.</li>"
+            "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a>.</li>"
             "</ul>"
         ),
         # Email-channel ordering — TireRack has no order API of its own; see the matching note
