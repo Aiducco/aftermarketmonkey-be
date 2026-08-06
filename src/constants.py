@@ -649,11 +649,19 @@ PROVIDER_CATALOG = [
         "email_order_connection_required_fields": ["rep_email"],
         "email_order_connection_optional_fields": ["cc_email"],
         "integration_time": "Data available within 1-2 hours",
+        # {{SFTP_USER}}/{{SFTP_PASSWORD}} are substituted per company by
+        # _render_relay_instructions_html (src/api/services/integrations.py) — they must stay
+        # verbatim here, including inside the sample email below.
         "installation_instructions_html": (
-            "<p>AfterMarketScout has already created a dedicated SFTP account for your company. "
-            "Send the details below to your Meyer account representative and ask them to set up the feed "
-            "to connect to <strong>our</strong> SFTP endpoint.</p>"
-            "<p><strong>Endpoint for your Meyer rep</strong></p>"
+            "<p><strong>Meyer</strong> works differently from the other distributors: you don't enter any feed "
+            "credentials. AfterMarketScout has already created a dedicated SFTP account for your company, and "
+            "Meyer pushes your catalog and pricing files to it. Your only job is to pass the connection details "
+            "to your Meyer rep.</p>"
+            "<p>Ordering is separate and optional, and uses an API key rather than the SFTP account.</p>"
+
+            "<p><strong>1. Send the endpoint details to your Meyer rep</strong></p>"
+            "<p>The details below are unique to your company &mdash; they're generated automatically and shown "
+            "here already filled in.</p>"
             "<ul>"
             "<li><strong>SFTP:</strong> <code>5.161.121.143</code></li>"
             "<li><strong>Port:</strong> <code>22</code></li>"
@@ -662,19 +670,48 @@ PROVIDER_CATALOG = [
             "<li><strong>Username:</strong> <code>{{SFTP_USER}}</code></li>"
             "<li><strong>Password:</strong> <code>{{SFTP_PASSWORD}}</code></li>"
             "</ul>"
-            "<p>No credentials to enter here &mdash; just click <strong>Connect</strong>. "
-            "For help, contact <a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a>.</p>"
-            "<p><strong>Optional: place orders through AfterMarketScout</strong></p>"
+            "<p>Email your Meyer account representative and ask them to set up the feed to deliver to this "
+            "endpoint:</p>"
+            "<blockquote>"
+            "<p>Could you please set up our pricing and inventory feed to deliver to the SFTP endpoint below? "
+            "The files should be named <code>Meyer Pricing.csv</code> and <code>Meyer Inventory.csv</code> and "
+            "placed in the <code>uploads</code> folder.</p>"
+            "<p>Host: <code>5.161.121.143</code> &middot; Port: <code>22</code> &middot; "
+            "Username: <code>{{SFTP_USER}}</code> &middot; Password: <code>{{SFTP_PASSWORD}}</code></p>"
+            "</blockquote>"
+            "<p>Treat these details as private &mdash; anyone with them can write to your feed folder.</p>"
+
+            "<p><strong>2. Click Connect</strong></p>"
+            "<p>There are no credentials to enter. Click <strong>Connect</strong> and AfterMarketScout will "
+            "start watching the folder for your files.</p>"
+            "<p>Data appears once Meyer sends the first delivery, which depends on how quickly your rep sets it "
+            "up on their side. If nothing arrives after a few days, follow up with your rep and confirm they're "
+            "using the exact host, folder, and file names above.</p>"
+
+            "<p><strong>3. Optional &mdash; place orders through AfterMarketScout</strong></p>"
+            "<p>Skip this if you don't plan to send purchase orders from AfterMarketScout. Meyer's order API is "
+            "a separate grant from the SFTP feed, and requires two things from your rep:</p>"
             "<ol>"
-            "<li>Ask your Meyer rep for API access — they'll provide a <strong>username</strong> and "
-            "<strong>password</strong> for the Meyer order API, separate from the SFTP feed above.</li>"
-            "<li>Ask your rep for your <strong>customer number</strong>, which Meyer requires on every "
-            "order.</li>"
-            "<li>Enter your <strong>username</strong>, <strong>password</strong>, and "
-            "<strong>customer_number</strong> below and save. This is separate from the SFTP catalog "
-            "connection above — you can skip it if you don't plan to place orders through "
-            "AfterMarketScout.</li>"
+            "<li>Ask your Meyer rep for API access. They'll issue an <strong>API key</strong> for the Meyer "
+            "order API.</li>"
+            "<li>Ask for your <strong>customer number</strong> &mdash; Meyer requires it on every order.</li>"
+            "<li>Enter the <strong>api_key</strong> and <strong>customer_number</strong> below and save.</li>"
             "</ol>"
+
+            "<p><strong>Notes</strong></p>"
+            "<ul>"
+            "<li><strong>No files arriving.</strong> The most common cause is a mismatch on Meyer's side "
+            "&mdash; a different folder, or file names that don't match <code>Meyer Pricing.csv</code> and "
+            "<code>Meyer Inventory.csv</code> exactly. Ask your rep to confirm both.</li>"
+            "<li><strong>Feed works but orders fail.</strong> The SFTP feed and the order API are separate "
+            "grants. Confirm your rep issued an API key specifically for ordering &mdash; feed setup alone "
+            "doesn't enable it.</li>"
+            "<li><strong>Multiple Meyer accounts?</strong> Each account needs its own feed delivery from Meyer. "
+            "Contact <a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a> and we'll set up "
+            "an additional SFTP endpoint for you.</li>"
+            "<li><strong>Need help?</strong> Contact "
+            "<a href=\"mailto:info@aftermarketscout.com\">info@aftermarketscout.com</a>.</li>"
+            "</ul>"
         ),
     },
     {
