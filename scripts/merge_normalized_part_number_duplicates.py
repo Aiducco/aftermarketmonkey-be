@@ -97,6 +97,9 @@ class MasterPartRow(typing.NamedTuple):
     normalized_gtin: typing.Optional[str]
     provider_ids: typing.FrozenSet[int]
     provider_kinds: typing.FrozenSet[int]
+    # (provider_id, provider_external_id) pairs. Needed to tell "this distributor lists two
+    # different parts" apart from "the same distributor SKU got attached to both rows".
+    provider_external_ids: typing.FrozenSet[typing.Tuple[int, str]]
 
 
 class Group(typing.NamedTuple):
@@ -150,13 +153,15 @@ def _load_rows(ids: typing.Iterable[int]) -> typing.Dict[int, MasterPartRow]:
     ids = list(ids)
     providers_by_master: typing.Dict[int, typing.Set[int]] = collections.defaultdict(set)
     kinds_by_master: typing.Dict[int, typing.Set[int]] = collections.defaultdict(set)
+    external_by_master: typing.Dict[int, typing.Set[typing.Tuple[int, str]]] = collections.defaultdict(set)
     for chunk in _chunked(ids):
         rows = src_models.ProviderPart.objects.filter(master_part_id__in=chunk).values_list(
-            "master_part_id", "provider_id", "provider__kind"
+            "master_part_id", "provider_id", "provider__kind", "provider_external_id"
         )
-        for master_part_id, provider_id, kind in rows:
+        for master_part_id, provider_id, kind, external_id in rows:
             providers_by_master[master_part_id].add(provider_id)
             kinds_by_master[master_part_id].add(kind)
+            external_by_master[master_part_id].add((provider_id, (external_id or "").strip()))
 
     out: typing.Dict[int, MasterPartRow] = {}
     for chunk in _chunked(ids):
@@ -173,6 +178,7 @@ def _load_rows(ids: typing.Iterable[int]) -> typing.Dict[int, MasterPartRow]:
                 normalized_gtin=pn_util.normalize_gtin(row["gtin"]),
                 provider_ids=frozenset(providers_by_master.get(row["id"], ())),
                 provider_kinds=frozenset(kinds_by_master.get(row["id"], ())),
+                provider_external_ids=frozenset(external_by_master.get(row["id"], ())),
             )
     return out
 
@@ -187,18 +193,30 @@ def _gtin_verdict(rows: typing.Sequence[MasterPartRow]) -> str:
 
 def _providers_overlap(rows: typing.Sequence[MasterPartRow]) -> bool:
     """
-    True when one distributor appears on more than one row of the group.
+    True when one distributor lists *genuinely different parts* across the rows of this group.
 
-    That distributor is listing both spellings as separate parts in its own catalog, which is the
-    strongest available signal that they really are separate parts -- it is a deliberate
-    distinction by the party closest to the manufacturer, not a formatting accident.
+    Being on more than one row is not enough on its own. What counts is whether the distributor's
+    own catalog ids differ:
+
+    - **different external ids** -> that distributor really is selling two products, the strongest
+      available signal that the rows are distinct, since it is a deliberate distinction by the
+      party closest to the manufacturer;
+    - **the same external id on both** -> one catalog entry attached to two master parts. That is
+      damage, not evidence. It happens when a newly created duplicate copies another
+      distributor's spelling and then wins their *exact* match on the next sync (the
+      Quadratec / Baja Designs case: Meyer's BAJ66-8413-2 ended up on both rows). Reading it as
+      "these are different parts" would make the duplicate permanently unmergeable.
     """
-    seen: typing.Set[int] = set()
+    external_by_provider: typing.Dict[int, typing.Set[str]] = collections.defaultdict(set)
+    rows_by_provider: typing.Dict[int, int] = collections.defaultdict(int)
     for row in rows:
-        if seen & row.provider_ids:
-            return True
-        seen |= row.provider_ids
-    return False
+        for provider_id, external_id in row.provider_external_ids:
+            external_by_provider[provider_id].add(external_id)
+            rows_by_provider[provider_id] += 1
+    return any(
+        rows_by_provider[provider_id] > 1 and len(external_ids) > 1
+        for provider_id, external_ids in external_by_provider.items()
+    )
 
 
 def evaluate_group(brand_id: int, normalized_part_number: str,
