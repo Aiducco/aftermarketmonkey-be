@@ -162,6 +162,18 @@ WHEELPROS_FEED_PATHS = {
 # so change this and the copy together.
 KEYSTONE_ALLOWLIST_IP = "5.161.121.143"
 
+# Wrapper for the blocks in installation_instructions_html a dealer is meant to copy out — relay
+# endpoint details, draft emails to a distributor rep. Styles are inline because the panel renders
+# this HTML with no stylesheet of its own: a bare <blockquote> came out flush with the body copy,
+# so the draft email read as more instructions instead of something to send. Greys are rgba around
+# mid-grey so the box reads the same on a light or dark panel background. If the frontend ever
+# strips style attributes this degrades to an unstyled div — no worse than the blockquote was.
+_INSTRUCTIONS_CALLOUT_STYLE = (
+    "border:1px solid rgba(127,127,127,0.3);border-radius:8px;"
+    "padding:4px 16px;margin:16px 0;background:rgba(127,127,127,0.08);"
+)
+_CALLOUT_OPEN = '<div style="' + _INSTRUCTIONS_CALLOUT_STYLE + '">'
+
 """
 Provider catalog: list of all available providers for the integrations catalog.
 Used by seed_providers command and catalog endpoint.
@@ -317,7 +329,9 @@ PROVIDER_CATALOG = [
             "<p><strong>1. Request SDK access</strong></p>"
             "<p>Skip this if you already have SDK portal login credentials.</p>"
             "<p>Email your Keystone Sales Rep:</p>"
-            "<blockquote>Could you please grant us SDK access to allow FTP inventory data and API ordering?</blockquote>"
+            + _CALLOUT_OPEN +
+            "<p>Could you please grant us SDK access to allow FTP inventory data and API ordering?</p>"
+            "</div>"
             "<p>Ask for both in the same email even if you only want the product feed today &mdash; requesting "
             "ordering later means a second round trip with your rep. Your rep will send back your SDK portal "
             "login credentials.</p>"
@@ -547,10 +561,12 @@ PROVIDER_CATALOG = [
             "<li>Register at <a href=\"https://data.wheelpros.com/auth/register\" target=\"_blank\" "
             "rel=\"noopener noreferrer\">https://data.wheelpros.com/auth/register</a> using your Wheel Pros "
             "dealer account.</li>"
-            "<li>Email your Wheel Pros Sales Rep:"
-            "<blockquote>We've registered for an account on data.wheelpros.com. Could you please grant us "
-            "access to allow FTP inventory data and API ordering?</blockquote></li>"
+            "<li>Email your Wheel Pros Sales Rep:</li>"
             "</ol>"
+            + _CALLOUT_OPEN +
+            "<p>We've registered for an account on data.wheelpros.com. Could you please grant us access to "
+            "allow FTP inventory data and API ordering?</p>"
+            "</div>"
             "<p>Ask for both in the same email even if you only want the product feed today &mdash; requesting "
             "ordering later means a second round trip with your rep. If you don't have a Wheel Pros dealer "
             "account yet, open one first &mdash; the portal registration requires it.</p>"
@@ -662,6 +678,7 @@ PROVIDER_CATALOG = [
             "<p><strong>1. Send the endpoint details to your Meyer rep</strong></p>"
             "<p>The details below are unique to your company &mdash; they're generated automatically and shown "
             "here already filled in.</p>"
+            + _CALLOUT_OPEN +
             "<ul>"
             "<li><strong>SFTP:</strong> <code>5.161.121.143</code></li>"
             "<li><strong>Port:</strong> <code>22</code></li>"
@@ -670,15 +687,16 @@ PROVIDER_CATALOG = [
             "<li><strong>Username:</strong> <code>{{SFTP_USER}}</code></li>"
             "<li><strong>Password:</strong> <code>{{SFTP_PASSWORD}}</code></li>"
             "</ul>"
+            "</div>"
             "<p>Email your Meyer account representative and ask them to set up the feed to deliver to this "
             "endpoint:</p>"
-            "<blockquote>"
+            + _CALLOUT_OPEN +
             "<p>Could you please set up our pricing and inventory feed to deliver to the SFTP endpoint below? "
             "The files should be named <code>Meyer Pricing.csv</code> and <code>Meyer Inventory.csv</code> and "
             "placed in the <code>uploads</code> folder.</p>"
             "<p>Host: <code>5.161.121.143</code> &middot; Port: <code>22</code> &middot; "
             "Username: <code>{{SFTP_USER}}</code> &middot; Password: <code>{{SFTP_PASSWORD}}</code></p>"
-            "</blockquote>"
+            "</div>"
             "<p>Treat these details as private &mdash; anyone with them can write to your feed folder.</p>"
 
             "<p><strong>2. Click Connect</strong></p>"
@@ -738,6 +756,7 @@ PROVIDER_CATALOG = [
             "<p><strong>1. Send the relay details to your A-Tech rep</strong></p>"
             "<p>The details below are unique to your company &mdash; they're generated automatically and shown "
             "here already filled in.</p>"
+            + _CALLOUT_OPEN +
             "<ul>"
             "<li><strong>Host:</strong> <code>5.161.121.143</code> (SFTP)</li>"
             "<li><strong>Port:</strong> <code>22</code></li>"
@@ -745,13 +764,14 @@ PROVIDER_CATALOG = [
             "<li><strong>Username:</strong> <code>{{SFTP_USER}}</code></li>"
             "<li><strong>Password:</strong> <code>{{SFTP_PASSWORD}}</code></li>"
             "</ul>"
+            "</div>"
             "<p>Email your A-Tech representative:</p>"
-            "<blockquote>"
+            + _CALLOUT_OPEN +
             "<p>Could you please deliver our standard combined catalog and pricing extract to the SFTP endpoint "
             "below? Please place the file in the <code>uploads</code> directory.</p>"
             "<p>Host: <code>5.161.121.143</code> &middot; Port: <code>22</code> &middot; "
             "Username: <code>{{SFTP_USER}}</code> &middot; Password: <code>{{SFTP_PASSWORD}}</code></p>"
-            "</blockquote>"
+            "</div>"
             "<p>No special file format is needed &mdash; A-Tech's standard extract is what we read. Treat these "
             "details as private; anyone with them can write to your feed directory.</p>"
 
