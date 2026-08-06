@@ -3721,7 +3721,7 @@ def _ingest_quadratec_parts_for_mapped_brands(
                 id__gt=last_id,
             )
             .order_by("id")
-            .values("id", "brand_id", "sku", "mpn", "description", "updated_at")[:BATCH_SIZE_MASTER_PARTS]
+            .values("id", "brand_id", "sku", "mpn", "description", "updated_at", "upc")[:BATCH_SIZE_MASTER_PARTS]
         )
         if not batch:
             break
@@ -3749,6 +3749,13 @@ def _ingest_quadratec_parts_for_mapped_brands(
                         part_number=part_number,
                         sku=part_number,
                         description=row.get("description"),
+                        # Without this every Quadratec master part is created with a null gtin,
+                        # so the gtin map handed to extend_with_normalized_matches below is all
+                        # None and every hyphen/dot-level match is refused for want of
+                        # corroboration -- Quadratec then creates its own row spelled the way
+                        # another distributor spells it, and that row steals their exact match
+                        # on the next sync. 58,946 of its 96,649 feed rows carry a upc.
+                        gtin=row.get("upc") or None,
                     )
                 )
             external_id_to_brand_part[
