@@ -1227,8 +1227,15 @@ def reindex_all_master_parts_zero_downtime(
             return ok, fail
 
         # --- Step 4: atomic swap ---
+        # timeout_in_ms is how long we wait to CONFIRM the swap, not how long the swap itself
+        # takes (that's an instant metadata rename) -- but Meilisearch's task queue can still be
+        # settling other work right after a ~90-minute, ~3M-document upload finishes, so the
+        # confirmation itself can take longer than a minute. Confirmed live 2 nights running: the
+        # swap actually completed successfully well under this window both times, but the old
+        # 60_000 (1 min) timeout was too short to observe it, so the job logged a false error and
+        # skipped its own cleanup (Step 5) despite the swap having genuinely gone through.
         swap_task = client.swap_indexes([{"indexes": [INDEX_NAME, staging_name]}])
-        client.wait_for_task(swap_task.task_uid, timeout_in_ms=60_000)
+        client.wait_for_task(swap_task.task_uid, timeout_in_ms=1_200_000)
         logger.info(
             "Meilisearch zero-downtime reindex: swap_indexes done | %s now live, %s has old data",
             INDEX_NAME,
