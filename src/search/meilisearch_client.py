@@ -1189,6 +1189,12 @@ def reindex_all_master_parts_zero_downtime(
         staging = client.index(staging_name)
         staging.update_searchable_attributes(SEARCHABLE_ATTRIBUTES)
         staging.update_filterable_attributes(FILTERABLE_ATTRIBUTES)
+        # setup_index() applies this to a manually-configured index, but the staging index
+        # created fresh here never went through that path -- every nightly swap silently reset
+        # the live index back to Meilisearch's default maxValuesPerFacet (100), truncating the
+        # brand_name facet distribution to the first 100 of ~3,824 brands (alphabetically) even
+        # though every brand's parts were always fully indexed and searchable.
+        staging.update_faceting_settings({"maxValuesPerFacet": PARTS_MAX_VALUES_PER_FACET})
         logger.info("Meilisearch zero-downtime reindex: staging index configured")
 
         # --- Step 2: delete any stale docs in staging (from previous failed run) ---
