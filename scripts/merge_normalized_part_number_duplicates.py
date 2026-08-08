@@ -60,12 +60,14 @@ from src.integrations.utils import part_numbers as pn_util
 
 # Distributors whose feed carries no UPC/GTIN column at all, so a MasterPart backed only by these
 # providers can never be corroborated by barcode. Confirmed against the raw tables: wheelpros_parts,
-# dlg_parts, vossen_parts and tirerack_parts have no upc/gtin/barcode column.
+# dlg_parts, vossen_parts, tirerack_parts and both elitewheels_part_* tables have no
+# upc/gtin/barcode column.
 GTIN_LESS_PROVIDER_KINDS = frozenset({
     src_enums.BrandProviderKind.WHEELPROS.value,
     src_enums.BrandProviderKind.DLG.value,
     src_enums.BrandProviderKind.VOSSEN.value,
     src_enums.BrandProviderKind.TIRERACK.value,
+    src_enums.BrandProviderKind.ELITE_WHEEL.value,
 })
 
 # Providers whose ingest still resolves master parts by exact string match only -- they do NOT

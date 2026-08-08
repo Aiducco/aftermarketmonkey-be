@@ -87,6 +87,23 @@ ATECH_DC_QTY_FIELD_TO_LOCATION_LABEL = {
     "qty_mcdonough": "McDonough, GA",
     "qty_arlington": "Arlington, TX",
 }
+# ``EliteWheelPartWheel`` / ``EliteWheelPartTire`` qty_* columns -> the workbook's own location
+# labels, stored in ``ProviderPartInventory.warehouse_availability`` (parts API). Elite names its
+# columns "<Location> Available"; any location outside this set is still ingested (kept in
+# ``location_availability`` and counted in the total) but has no dedicated column yet.
+ELITE_WHEEL_QTY_FIELD_TO_LOCATION_LABEL = {
+    "qty_tampa": "Tampa, FL",
+    "qty_atlanta": "Atlanta, GA",
+    "qty_miami": "Miami, FL",
+    "qty_decatur": "Decatur, AL",
+}
+# Workbook location label (the part before " Available") -> the qty_* column it lands in.
+ELITE_WHEEL_LOCATION_TO_QTY_FIELD = {
+    "Tampa": "qty_tampa",
+    "Atlanta": "qty_atlanta",
+    "Miami": "qty_miami",
+    "Decatur": "qty_decatur",
+}
 # Premier Performance (APG Wholesale) warehouse qty fields -> user-facing location labels (FE display).
 PREMIER_WAREHOUSE_QTY_FIELD_TO_LOCATION_LABEL = {
     "nv_qty": "Nevada",
@@ -131,6 +148,25 @@ ROUGH_COUNTRY_CREDENTIALS_FEED_URL = "feed_url"
 # connection can be provisioned before the dealer's live URLs are wired up.
 QUADRATEC_CREDENTIALS_CATALOG_FEED_URL = "catalog_feed_url"
 QUADRATEC_CREDENTIALS_PRICING_FEED_URL = "pricing_feed_url"
+
+# CompanyProviders.credentials JSON keys for Elite Wheel & Tire. Elite drops one
+# TriWeeklyUpdate<MM-DD-YYYY>.xlsx per update (three per week) holding the whole warehouse
+# snapshot -- a worksheet per wheel manufacturer plus a Tires sheet. Two transports read the same
+# workbook (see src.integrations.clients.elite_wheel.client):
+#   * the dealer's own SFTP account (sftp_host/sftp_port/sftp_user/sftp_password, optional
+#     sftp_directory) -- what Elite hands out from their inventory request form, and the only
+#     source that carries dealer prices;
+#   * Elite's public inventory share (public_share_id, optionally public_share_url for a different
+#     host) -- inventory only, no prices, used until a dealer account is provisioned.
+# A connection with SFTP credentials uses SFTP; otherwise it falls back to the public share. Set
+# ELITE_WHEEL_FORCE_PUBLIC_SHARE=True in settings to pin every connection to the public share.
+ELITE_WHEEL_CREDENTIALS_SFTP_HOST = "sftp_host"
+ELITE_WHEEL_CREDENTIALS_SFTP_PORT = "sftp_port"
+ELITE_WHEEL_CREDENTIALS_SFTP_USER = "sftp_user"
+ELITE_WHEEL_CREDENTIALS_SFTP_PASSWORD = "sftp_password"
+ELITE_WHEEL_CREDENTIALS_SFTP_DIRECTORY = "sftp_directory"
+ELITE_WHEEL_CREDENTIALS_PUBLIC_SHARE_ID = "public_share_id"
+ELITE_WHEEL_CREDENTIALS_PUBLIC_SHARE_URL = "public_share_url"
 
 # CompanyProviders.credentials JSON key for Vossen: AfterMarket.aspx CSV feed URL (required per connection).
 VOSSEN_CREDENTIALS_FEED_URL = "feed_url"
@@ -1077,12 +1113,29 @@ PROVIDER_CATALOG = [
         "description": "Access Elite Wheel & Tire inventory and pricing via SFTP, updated hourly.",
         "icon_url": "https://api.aftermarketscout.com/uploads/elite_wheel_logo.png",
         "category": "Distributors",
-        "connection_required_fields": ["sftp_host", "sftp_port", "sftp_user", "sftp_password"],
+        "connection_required_fields": [
+            ELITE_WHEEL_CREDENTIALS_SFTP_HOST,
+            ELITE_WHEEL_CREDENTIALS_SFTP_PORT,
+            ELITE_WHEEL_CREDENTIALS_SFTP_USER,
+            ELITE_WHEEL_CREDENTIALS_SFTP_PASSWORD,
+        ],
+        # sftp_directory: only needed if Elite drops the workbook somewhere other than the account
+        # home. public_share_id / public_share_url override the inventory-only public share the
+        # shared catalog reads from (see ELITE_WHEEL_CREDENTIALS_* above).
+        "connection_optional_fields": [
+            ELITE_WHEEL_CREDENTIALS_SFTP_DIRECTORY,
+            ELITE_WHEEL_CREDENTIALS_PUBLIC_SHARE_ID,
+            ELITE_WHEEL_CREDENTIALS_PUBLIC_SHARE_URL,
+        ],
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
             "<p><strong>Elite Wheel &amp; Tire</strong> delivers your inventory and pricing over SFTP, updated "
             "hourly. You request access through a form on their dealer site, and they send back the SFTP "
             "connection details to enter here.</p>"
+
+            "<p>Elite&rsquo;s wheel and tire availability is already in AfterMarketScout &mdash; they publish a "
+            "warehouse-wide inventory file we read on your behalf. Connecting your own SFTP account is what adds "
+            "<strong>your dealer pricing</strong> on top of it.</p>"
 
             "<p><strong>1. Sign in to the Elite dealer site</strong></p>"
             "<p>Go to <a href=\"https://shop.ewwfl.com/\" target=\"_blank\" rel=\"noopener noreferrer\">"

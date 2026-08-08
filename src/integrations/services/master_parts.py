@@ -4286,6 +4286,618 @@ def sync_derived_from_quadratec(*, reindex_meilisearch: bool = False, skip_maste
     logger.info("{} Completed Quadratec-only derived sync.".format(_LOG_PREFIX))
 
 
+# ==========================================================================================
+# Motor State Distributing
+# ==========================================================================================
+def _motorstate_provider_external_id(motorstate_brand_id: int, part_number: str) -> str:
+    """
+    Stable Motor State ProviderPart key: motorstate_brand row id + Motor State's own part
+    number (unique across their catalog), same compound shape as every other provider.
+    """
+    pn = (part_number or "").strip()
+    return "{}_{}".format(int(motorstate_brand_id), pn)
+
+
+def _motorstate_master_part_number(
+    vendor_part_number: typing.Optional[str], part_number: str
+) -> str:
+    """
+    MasterPart part number for a Motor State row: the manufacturer part number
+    (``VendorPartNumber``) when present, else Motor State's own part number.
+
+    Motor State's own PartNumber is brand-code-prefixed (``AAA01816`` for MPN ``A1P01816``), so
+    keying on it would never dedupe against the same physical part from another distributor.
+    ~100% of found rows carry a VendorPartNumber, so the fallback is a rare safety net.
+    """
+    v = (vendor_part_number or "").strip()
+    return v if v else (part_number or "").strip()
+
+
+def _motorstate_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
+    """product_details for a MotorStateProduct row (shown on ProviderPart)."""
+    return [
+        {"key": "motorstate_pn", "label": "Motor State Part No", "value": row.get("part_number") or None},
+        {"key": "mpn", "label": "MPN", "value": row.get("vendor_part_number") or None},
+        {"key": "description", "label": "Description", "value": row.get("short_description") or None},
+        {"key": "supersede", "label": "Superseded By", "value": row.get("supersede_part_number") or None},
+    ]
+
+
+def _motorstate_catalog_company_id(
+    motorstate_provider: src_models.Providers,
+) -> typing.Optional[int]:
+    """
+    Company whose MotorStateAvailability rows drive global inventory.
+
+    MotorStateProduct (catalog) and MotorStateCompanyPricing (prices) are already split by
+    company, but the availability spine is still fetched per API key, so one connection has to
+    stand in for distributor-wide stock: the primary one (else first active by id) -- the same
+    role quadratec._catalog_company_provider plays there.
+    """
+    base = src_models.CompanyProviders.objects.filter(
+        provider=motorstate_provider,
+        provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
+        active=True,
+    ).order_by("id")
+    cp = base.filter(primary=True).first() or base.first()
+    return cp.company_id if cp else None
+
+
+def _ingest_motorstate_parts_for_mapped_brands(
+    mapped_catalog_brand_ids: typing.Set[int],
+    motorstate_provider: src_models.Providers,
+    motorstate_brand_to_brand: typing.Dict[int, src_models.Brands],
+) -> typing.Tuple[int, int]:
+    """Batch-ingest MotorStateProduct rows for one disjoint set of Motor State brand PKs."""
+    if not mapped_catalog_brand_ids:
+        return 0, 0
+
+    total_master = 0
+    total_provider = 0
+    batch_num = 0
+    last_id = 0
+
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.MotorStateProduct.objects.filter(
+                brand_id__in=mapped_catalog_brand_ids,
+                found=True,
+                id__gt=last_id,
+            )
+            .order_by("id")
+            .values(
+                "id", "brand_id", "part_number", "vendor_part_number", "short_description",
+                "supersede_part_number", "updated_at",
+            )[:BATCH_SIZE_MASTER_PARTS]
+        )
+        if not batch:
+            break
+
+        last_id = batch[-1]["id"]
+        seen = set()
+        master_parts = []
+        external_id_to_brand_part = {}
+
+        for row in batch:
+            brand = motorstate_brand_to_brand.get(row["brand_id"])
+            if not brand:
+                continue
+
+            part_number = _motorstate_master_part_number(
+                row.get("vendor_part_number"), row.get("part_number")
+            )
+            if not part_number:
+                continue
+
+            key = (brand.id, part_number)
+            if key not in seen:
+                seen.add(key)
+                master_parts.append(
+                    src_models.MasterPart(
+                        brand=brand,
+                        part_number=part_number,
+                        sku=part_number,
+                        description=row.get("short_description"),
+                        # Motor State's /api/Product carries no UPC/GTIN (confirmed against the
+                        # live payload), so normalized cross-distributor matching has no
+                        # corroborating identifier here -- left null rather than faked.
+                        gtin=None,
+                    )
+                )
+            external_id_to_brand_part[
+                _motorstate_provider_external_id(row["brand_id"], row["part_number"])
+            ] = (brand.id, part_number)
+
+        if not master_parts:
+            connection.close()
+            if len(batch) == BATCH_SIZE_MASTER_PARTS:
+                time.sleep(BATCH_DELAY_SECONDS)
+            continue
+
+        pairs = list(seen)
+        existing_by_key = {}
+        if pairs:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(pairs),),
+                )
+                for r in cur.fetchall():
+                    mp_id, b_id, p_num = r
+                    existing_by_key[(b_id, p_num)] = mp_id
+
+        mp_matching.extend_with_normalized_matches(
+            existing_by_key,
+            pairs,
+            {(mp.brand_id, mp.part_number): mp.gtin for mp in master_parts},
+            provider_id=motorstate_provider.id,
+            provider_kind=src_enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING.value,
+            external_id_by_key={v: k for k, v in external_id_to_brand_part.items()},
+        )
+
+        new_parts = [mp for mp in master_parts if (mp.brand_id, mp.part_number) not in existing_by_key]
+
+        if new_parts:
+            new_parts = _dedupe_master_parts_for_upsert(
+                new_parts, context="MotorState new_parts batch={}".format(batch_num)
+            )
+            pgbulk.upsert(
+                src_models.MasterPart,
+                new_parts,
+                unique_fields=["brand", "part_number"],
+                update_fields=[],
+            )
+            total_master += len(new_parts)
+
+        brand_part_to_master = mp_matching.master_part_stubs_for(existing_by_key)
+        unresolved_pairs = [k for k in pairs if k not in brand_part_to_master]
+        if unresolved_pairs:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(unresolved_pairs),),
+                )
+                for r in cur.fetchall():
+                    mp_id, b_id, p_num = r
+                    mp = src_models.MasterPart()
+                    mp.id = mp_id
+                    mp.brand_id = b_id
+                    mp.part_number = p_num
+                    brand_part_to_master[(b_id, p_num)] = mp
+
+        provider_parts_by_key = {}
+        for row in batch:
+            ext_id = _motorstate_provider_external_id(row["brand_id"], row["part_number"])
+            key = external_id_to_brand_part.get(ext_id)
+            if not key:
+                continue
+            master_part = brand_part_to_master.get(key)
+            if not master_part:
+                continue
+            pp_key = (master_part.id, motorstate_provider.id)
+            provider_parts_by_key[pp_key] = src_models.ProviderPart(
+                master_part=master_part,
+                provider=motorstate_provider,
+                provider_external_id=ext_id,
+                distributor_refreshed_at=row.get("updated_at"),
+            )
+
+        provider_parts = list(provider_parts_by_key.values())
+        if provider_parts:
+            pgbulk.upsert(
+                src_models.ProviderPart,
+                provider_parts,
+                unique_fields=["master_part", "provider"],
+                update_fields=_PROVIDER_PART_SYNC_UPDATE_FIELDS,
+            )
+            total_provider += len(provider_parts)
+
+        logger.info("{} MotorState batch {}: {} items -> {} master, {} provider (last_id={})".format(
+            _LOG_PREFIX, batch_num, len(batch), len(master_parts), len(provider_parts), last_id
+        ))
+        connection.close()
+        if len(batch) == BATCH_SIZE_MASTER_PARTS:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    return total_master, total_provider
+
+
+def sync_master_parts_from_motorstate() -> None:
+    """
+    Create/update MasterPart and ProviderPart from MotorStateProduct (a global catalog table --
+    prices live per company on MotorStateCompanyPricing). Only processes parts whose
+    MotorStateBrand has a BrandMotorStateBrandMapping. Same cursor-based, two-phase upsert
+    pattern as every other provider.
+    """
+    logger.info("{} Syncing master parts from Motor State (batched, cursor-based).".format(_LOG_PREFIX))
+
+    motorstate_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING.value,
+    ).first()
+    if not motorstate_provider:
+        logger.info("{} No Motor State provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandMotorStateBrandMapping.objects.select_related("brand", "motorstate_brand")
+    )
+    motorstate_brand_to_brand = {m.motorstate_brand_id: m.brand for m in mappings}
+    if not motorstate_brand_to_brand:
+        logger.info("{} No BrandMotorStateBrandMapping found. Nothing to sync.".format(_LOG_PREFIX))
+        return
+
+    chunks = _partition_mapped_brands_for_parallel_ingest(mappings, MASTER_PARTS_SYNC_MAX_WORKERS)
+    total_master, total_provider = _run_parallel_master_parts_ingest(
+        chunks,
+        mappings,
+        "motorstate_brand",
+        lambda cids: _ingest_motorstate_parts_for_mapped_brands(
+            cids,
+            motorstate_provider,
+            motorstate_brand_to_brand,
+        ),
+    )
+    logger.info("{} Synced {} master parts and {} provider parts from Motor State total.".format(
+        _LOG_PREFIX, total_master, total_provider
+    ))
+
+
+def sync_provider_inventory_from_motorstate() -> None:
+    """
+    Sync ProviderPartInventory from MotorStateAvailability (quantity + StatusType) for the
+    catalog company. Motor State exposes no per-warehouse breakdown -- QuantityAvailable is a
+    single distributor-wide number -- so warehouse_availability carries the status instead.
+    Also refreshes ProviderPart.product_details from the matching MotorStateProduct row.
+    """
+    logger.info("{} Syncing provider inventory from Motor State.".format(_LOG_PREFIX))
+
+    motorstate_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING.value,
+    ).first()
+    if not motorstate_provider:
+        logger.info("{} No Motor State provider found.".format(_LOG_PREFIX))
+        return
+
+    availability_company_id = _motorstate_catalog_company_id(motorstate_provider)
+    if not availability_company_id:
+        logger.info("{} No active Motor State connection; nothing to sync.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandMotorStateBrandMapping.objects.select_related("brand", "motorstate_brand")
+    )
+    if not mappings:
+        logger.info("{} No BrandMotorStateBrandMapping found.".format(_LOG_PREFIX))
+        return
+
+    provider_parts = {
+        row["provider_external_id"]: src_models.ProviderPart(id=row["id"])
+        for row in src_models.ProviderPart.objects.filter(provider=motorstate_provider).values(
+            "id", "provider_external_id"
+        )
+    }
+
+    now = timezone.now()
+
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            batch = list(
+                src_models.MotorStateProduct.objects.filter(
+                    id__gt=last_id,
+                    brand_id__in=catalog_ids,
+                    found=True,
+                )
+                .order_by("id")
+                .values(
+                    "id", "brand_id", "part_number", "vendor_part_number", "short_description",
+                    "supersede_part_number", "quantity", "is_stocking",
+                )[:BATCH_SIZE_INVENTORY]
+            )
+            if not batch:
+                break
+
+            last_id = batch[-1]["id"]
+
+            # Availability is the fresher stock signal (polled incrementally between full
+            # product hydrates), so prefer its quantity over the product row's snapshot.
+            part_numbers = [r["part_number"] for r in batch]
+            availability = {
+                a["part_number"]: a
+                for a in src_models.MotorStateAvailability.objects.filter(
+                    company_id=availability_company_id, part_number__in=part_numbers
+                ).values("part_number", "quantity_available", "status_type")
+            }
+
+            to_upsert = []
+            for row in batch:
+                ext_id = _motorstate_provider_external_id(row["brand_id"], row["part_number"])
+                provider_part = provider_parts.get(ext_id)
+                if not provider_part:
+                    continue
+                avail = availability.get(row["part_number"]) or {}
+                qty = avail.get("quantity_available")
+                if qty is None:
+                    qty = row.get("quantity")
+                status_type = (avail.get("status_type") or "").upper() or None
+                to_upsert.append(
+                    src_models.ProviderPartInventory(
+                        provider_part=provider_part,
+                        warehouse_total_qty=qty or 0,
+                        manufacturer_inventory=None,
+                        manufacturer_esd=None,
+                        warehouse_availability={"status_type": status_type, "total": qty or 0},
+                        last_synced_at=now,
+                        updated_at=now,
+                    )
+                )
+
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_inventory_for_upsert(
+                    to_upsert, context="MotorState inventory batch={}".format(batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartInventory,
+                    to_upsert,
+                    unique_fields=["provider_part"],
+                    update_fields=[
+                        "warehouse_total_qty",
+                        "manufacturer_inventory",
+                        "manufacturer_esd",
+                        "warehouse_availability",
+                        "last_synced_at",
+                        "updated_at",
+                    ],
+                )
+                total_upserted += len(to_upsert)
+
+            pp_details_to_update = []
+            for row in batch:
+                ext_id = _motorstate_provider_external_id(row["brand_id"], row["part_number"])
+                pp = provider_parts.get(ext_id)
+                if pp:
+                    pp.product_details = _motorstate_product_details(row)
+                    pp_details_to_update.append(pp)
+            if pp_details_to_update:
+                src_models.ProviderPart.objects.bulk_update(
+                    pp_details_to_update, ["product_details"], batch_size=500
+                )
+
+            logger.info("{} MotorState inventory batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_INVENTORY:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "motorstate_brand", _worker)
+    logger.info("{} Synced {} Motor State inventory records total.".format(_LOG_PREFIX, total_upserted))
+
+
+def _motorstate_provider_part_company_pricing_from_row(
+    row: typing.Dict,
+    provider_part: src_models.ProviderPart,
+    company: src_models.Company,
+    now,
+) -> src_models.ProviderPartCompanyPricing:
+    """
+    Map a MotorStateCompanyPricing row to a ProviderPartCompanyPricing instance.
+
+    ``customer_price`` is this account's actual buy price (what they pay); ``base_price`` is
+    Motor State's undiscounted wholesale, mapped to jobber. ``list_price`` is MSRP.
+    """
+    return src_models.ProviderPartCompanyPricing(
+        provider_part=provider_part,
+        company=company,
+        cost=row.get("customer_price"),
+        jobber_price=row.get("base_price"),
+        map_price=row.get("map_price"),
+        msrp=row.get("list_price"),
+        retail_price=row.get("list_price"),
+        last_synced_at=now,
+    )
+
+
+def _motorstate_pricing_master_keys(
+    batch: typing.List[typing.Dict],
+    motorstate_brand_to_brand: typing.Dict[int, src_models.Brands],
+) -> typing.List[typing.Tuple[int, str]]:
+    keys = []
+    for row in batch:
+        brand = motorstate_brand_to_brand.get(row.get("product__brand_id"))
+        if not brand:
+            continue
+        part_number = _motorstate_master_part_number(
+            row.get("product__vendor_part_number"), row.get("product__part_number")
+        )
+        if not part_number:
+            continue
+        keys.append((brand.id, part_number))
+    return keys
+
+
+_MOTORSTATE_PRICING_VALUES = (
+    "id", "company_id",
+    "product__brand_id", "product__part_number", "product__vendor_part_number",
+    "customer_price", "base_price", "map_price", "list_price",
+)
+_MOTORSTATE_PRICING_UPSERT_FIELDS = [
+    "cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at",
+]
+
+
+def _sync_motorstate_pricing(company_id: typing.Optional[int] = None) -> None:
+    """
+    Shared body for the all-companies and single-company Motor State pricing syncs.
+    ``company_id=None`` processes every company's rows.
+    """
+    scope = "company_id={}".format(company_id) if company_id else "all companies"
+    logger.info("{} Syncing provider pricing from Motor State ({}).".format(_LOG_PREFIX, scope))
+
+    motorstate_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING.value,
+    ).first()
+    if not motorstate_provider:
+        logger.info("{} No Motor State provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandMotorStateBrandMapping.objects.select_related("brand", "motorstate_brand")
+    )
+    motorstate_brand_to_brand = {m.motorstate_brand_id: m.brand for m in mappings}
+    if not motorstate_brand_to_brand:
+        logger.info("{} No BrandMotorStateBrandMapping found. Nothing to price.".format(_LOG_PREFIX))
+        return
+
+    company_provider = None
+    watermark = None
+    sync_started_at = timezone.now()
+    if company_id:
+        company_provider = src_models.CompanyProviders.objects.filter(
+            company_id=company_id, provider_id=motorstate_provider.id
+        ).first()
+        # Watermark -- see sync_provider_pricing_from_meyer_for_company for the full rationale.
+        watermark = company_provider.pricing_propagation_watermark if company_provider else None
+        logger.info(
+            "{} Motor State pricing company={}: propagation watermark={}.".format(
+                _LOG_PREFIX, company_id, watermark or "none (processing everything)",
+            )
+        )
+
+    now = timezone.now()
+
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            qs = src_models.MotorStateCompanyPricing.objects.filter(
+                id__gt=last_id, product__brand_id__in=catalog_ids, product__found=True
+            )
+            if company_id:
+                qs = qs.filter(company_id=company_id)
+            if watermark:
+                qs = qs.filter(updated_at__gte=watermark)
+            batch = list(
+                qs.order_by("id").values(*_MOTORSTATE_PRICING_VALUES)[:BATCH_SIZE_PRICING]
+            )
+            if not batch:
+                break
+
+            last_id = batch[-1]["id"]
+            batch_company_ids = {r["company_id"] for r in batch if r.get("company_id")}
+            companies_by_id = {
+                c.id: c for c in src_models.Company.objects.filter(id__in=batch_company_ids)
+            }
+            pp_by_key = _provider_parts_by_master_brand_and_part_number(
+                motorstate_provider, _motorstate_pricing_master_keys(batch, motorstate_brand_to_brand)
+            )
+
+            to_upsert = []
+            for row in batch:
+                brand = motorstate_brand_to_brand.get(row.get("product__brand_id"))
+                if not brand:
+                    continue
+                part_number = _motorstate_master_part_number(
+                    row.get("product__vendor_part_number"), row.get("product__part_number")
+                )
+                if not part_number:
+                    continue
+                provider_part = pp_by_key.get((brand.id, part_number))
+                if not provider_part:
+                    continue
+                company = companies_by_id.get(row.get("company_id"))
+                if not company:
+                    continue
+                to_upsert.append(
+                    _motorstate_provider_part_company_pricing_from_row(row, provider_part, company, now)
+                )
+
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                    to_upsert, context="MotorState pricing {} batch={}".format(scope, batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartCompanyPricing,
+                    to_upsert,
+                    unique_fields=["provider_part", "company"],
+                    update_fields=_MOTORSTATE_PRICING_UPSERT_FIELDS,
+                )
+                total_upserted += len(to_upsert)
+
+            logger.info("{} MotorState pricing {} batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, scope, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_PRICING:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "motorstate_brand", _worker)
+    logger.info("{} Synced {} Motor State pricing records ({}).".format(
+        _LOG_PREFIX, total_upserted, scope,
+    ))
+
+    if company_provider:
+        company_provider.pricing_propagation_watermark = sync_started_at
+        company_provider.save(update_fields=["pricing_propagation_watermark"])
+
+
+def sync_provider_pricing_from_motorstate() -> None:
+    """Sync ProviderPartCompanyPricing from MotorStateProduct (all companies)."""
+    _sync_motorstate_pricing(company_id=None)
+
+
+def sync_provider_pricing_from_motorstate_for_company(company_id: int) -> None:
+    """Sync ProviderPartCompanyPricing from MotorStateProduct for one company."""
+    _sync_motorstate_pricing(company_id=company_id)
+
+
+def sync_derived_from_motorstate(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False, skip_pricing: bool = False) -> None:
+    """
+    Propagate Motor State source data into MasterPart, ProviderPart, ProviderPartInventory, and
+    ProviderPartCompanyPricing. Call after the Motor State raw ingest. No fitment sync -- the
+    Motor State API exposes no vehicle fitment.
+
+    Pass ``skip_master_parts=True`` to run only inventory + pricing (fast incremental path).
+    Pass ``skip_pricing=True`` to run only master parts + inventory (global catalog sync path).
+    """
+    logger.info("{} Starting Motor State-only derived sync ({}).".format(
+        _LOG_PREFIX,
+        "inventory + pricing only" if skip_master_parts else "parts, inventory" + ("" if skip_pricing else ", pricing"),
+    ))
+    if not skip_master_parts:
+        sync_master_parts_from_motorstate()
+        connection.close()
+
+    def _cont() -> None:
+        sync_provider_inventory_from_motorstate()
+        connection.close()
+        if not skip_pricing:
+            sync_provider_pricing_from_motorstate()
+            connection.close()
+
+    if skip_master_parts:
+        _cont()
+    else:
+        _maybe_reindex_meilisearch_after_master_parts(
+            reindex_meilisearch=reindex_meilisearch,
+            provider_label="Motor State",
+            continuation=_cont,
+        )
+    logger.info("{} Completed Motor State-only derived sync.".format(_LOG_PREFIX))
+
+
 def _wheelpros_provider_external_id(wp_brand_id: int, part_number: str) -> str:
     """Unique per WheelPros provider: wp_brand_id + part_number."""
     return "{}_{}".format(wp_brand_id, part_number)
@@ -9329,6 +9941,694 @@ def _reclaim_memory() -> None:
         ))
 
 
+# ============================================================
+# ELITE WHEEL & TIRE
+# ============================================================
+# Elite is the only provider whose catalog lives in two source tables (EliteWheelPartWheel /
+# EliteWheelPartTire) behind one provider and one brand mapping, because its workbook describes
+# wheels and tires with disjoint column sets. Both halves are handled by the same parametrized
+# ingest below rather than two near-identical copies; each half is identified by an
+# ``_EliteWheelHalf`` spec.
+
+
+def _elite_wheel_provider_external_id(elite_brand_id: int, part_number: str) -> str:
+    """
+    Stable Elite ProviderPart key: elite brand row id + part number, the same compound shape every
+    other provider uses. No wheel/tire marker is needed -- EliteWheelBrand rows are per half
+    (``WHEEL:AZARA`` vs ``TIRE:LEXANI``), so a brand id belongs to exactly one of the two tables.
+    """
+    return "{}_{}".format(int(elite_brand_id), (part_number or "").strip())
+
+
+def _elite_wheel_inventory_warehouse_availability(row: typing.Dict) -> typing.Dict[str, typing.Any]:
+    """
+    Per-location stock from an Elite part row; keys are user-facing labels (see
+    ``constants.ELITE_WHEEL_QTY_FIELD_TO_LOCATION_LABEL``). A location Elite adds before it gets a
+    ``qty_*`` column still shows up here, carried through from the part's raw
+    ``location_availability``, so new warehouses surface without a schema change.
+    """
+    availability = {
+        label: row.get(field)
+        for field, label in src_constants.ELITE_WHEEL_QTY_FIELD_TO_LOCATION_LABEL.items()
+    }
+    known_locations = set(src_constants.ELITE_WHEEL_LOCATION_TO_QTY_FIELD.keys())
+    for location, qty in (row.get("location_availability") or {}).items():
+        if str(location).strip() not in known_locations:
+            availability[str(location).strip()] = qty
+    return availability
+
+
+def _elite_wheel_wheel_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
+    """Wheel-spec attributes for an EliteWheelPartWheel row, shown as ProviderPart.product_details."""
+    bolt_patterns = [row.get("bolt_pattern_1"), row.get("bolt_pattern_2")]
+    bolt_pattern = " / ".join([bp for bp in bolt_patterns if bp])
+    return [
+        {"key": "part_number", "label": "Part Number", "value": row.get("part_number") or None},
+        {"key": "size", "label": "Size", "value": row.get("size") or None},
+        {"key": "bolt_pattern", "label": "Bolt Pattern", "value": bolt_pattern or None},
+        {"key": "offset", "label": "Offset", "value": row.get("offset") or None},
+        {"key": "center_bore", "label": "Centerbore", "value": row.get("center_bore") or None},
+        {"key": "finish", "label": "Finish", "value": row.get("finish") or None},
+    ]
+
+
+def _elite_wheel_tire_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
+    """Tire-spec attributes for an EliteWheelPartTire row, shown as ProviderPart.product_details."""
+    return [
+        {"key": "part_number", "label": "Part Number", "value": row.get("part_number") or None},
+        {"key": "model", "label": "Model", "value": row.get("model") or None},
+        {"key": "raw_size", "label": "Size", "value": row.get("raw_size") or None},
+        {"key": "tire_diameter", "label": "Rim Diameter", "value": row.get("tire_diameter") or None},
+    ]
+
+
+class _EliteWheelHalf(typing.NamedTuple):
+    """One side of Elite's split catalog, so both run through the same ingest code."""
+    label: str                      # "wheel" / "tire", for log lines
+    part_model: typing.Any          # EliteWheelPartWheel / EliteWheelPartTire
+    pricing_model: typing.Any       # EliteWheelWheelCompanyPricing / EliteWheelTireCompanyPricing
+    catalog_values: typing.Tuple[str, ...]
+    inventory_values: typing.Tuple[str, ...]
+    description_fields: typing.Tuple[str, ...]
+    product_details: typing.Callable[[typing.Dict], typing.List[typing.Dict]]
+
+
+def _elite_wheel_halves() -> typing.List[_EliteWheelHalf]:
+    return [
+        _EliteWheelHalf(
+            label="wheel",
+            part_model=src_models.EliteWheelPartWheel,
+            pricing_model=src_models.EliteWheelWheelCompanyPricing,
+            catalog_values=("id", "brand_id", "part_number", "group_label", "size", "finish", "updated_at"),
+            inventory_values=(
+                "id", "brand_id", "part_number", "total_available", "location_availability",
+                "qty_tampa", "qty_atlanta", "qty_miami", "qty_decatur",
+                "size", "bolt_pattern_1", "bolt_pattern_2", "offset", "center_bore", "finish",
+            ),
+            description_fields=("group_label", "size", "finish"),
+            product_details=_elite_wheel_wheel_product_details,
+        ),
+        _EliteWheelHalf(
+            label="tire",
+            part_model=src_models.EliteWheelPartTire,
+            pricing_model=src_models.EliteWheelTireCompanyPricing,
+            catalog_values=("id", "brand_id", "part_number", "model", "raw_size", "tire_diameter", "updated_at"),
+            inventory_values=(
+                "id", "brand_id", "part_number", "total_available", "location_availability",
+                "qty_tampa", "qty_atlanta", "qty_miami", "qty_decatur",
+                "model", "raw_size", "tire_diameter",
+            ),
+            description_fields=("model", "raw_size"),
+            product_details=_elite_wheel_tire_product_details,
+        ),
+    ]
+
+
+def _elite_wheel_description(row: typing.Dict, half: _EliteWheelHalf) -> typing.Optional[str]:
+    """
+    MasterPart description for an Elite row. The workbook has no description column, so it is
+    composed from the columns that actually identify the part to a human: for a wheel the
+    model/finish block title plus size, for a tire the model plus its size code.
+    """
+    parts = [str(row.get(field)).strip() for field in half.description_fields if row.get(field)]
+    # De-dupe while preserving order: a wheel's group_label ("XF-211 Gloss Black & Milled")
+    # already ends with the finish, so appending it again would read as a stutter.
+    seen: typing.List[str] = []
+    for part in parts:
+        if part and part not in " ".join(seen):
+            seen.append(part)
+    return " ".join(seen) or None
+
+
+def _ingest_elite_wheel_parts_for_mapped_brands(
+    mapped_catalog_brand_ids: typing.Set[int],
+    elite_provider: src_models.Providers,
+    elite_brand_to_brand: typing.Dict[int, src_models.Brands],
+    half: _EliteWheelHalf,
+) -> typing.Tuple[int, int]:
+    """Batch-ingest one half's Elite part rows for one disjoint set of Elite catalog brand PKs."""
+    if not mapped_catalog_brand_ids:
+        return 0, 0
+
+    total_master = 0
+    total_provider = 0
+    batch_num = 0
+    last_id = 0
+
+    while True:
+        batch_num += 1
+        batch = list(
+            half.part_model.objects.filter(
+                brand_id__in=mapped_catalog_brand_ids,
+                id__gt=last_id,
+            )
+            .order_by("id")
+            .values(*half.catalog_values)[:BATCH_SIZE_MASTER_PARTS]
+        )
+        if not batch:
+            break
+
+        last_id = batch[-1]["id"]
+        seen = set()
+        master_parts = []
+        elite_external_id_to_brand_part = {}
+
+        for row in batch:
+            brand = elite_brand_to_brand.get(row["brand_id"])
+            if not brand:
+                continue
+
+            part_number = (row.get("part_number") or "").strip()
+            if not part_number:
+                continue
+
+            key = (brand.id, part_number)
+            if key not in seen:
+                seen.add(key)
+                master_parts.append(
+                    src_models.MasterPart(
+                        brand=brand,
+                        part_number=part_number,
+                        sku=part_number,
+                        description=_elite_wheel_description(row, half),
+                    )
+                )
+            elite_external_id_to_brand_part[
+                _elite_wheel_provider_external_id(row["brand_id"], part_number)
+            ] = (brand.id, part_number)
+
+        if not master_parts:
+            connection.close()
+            if len(batch) == BATCH_SIZE_MASTER_PARTS:
+                time.sleep(BATCH_DELAY_SECONDS)
+            continue
+
+        pairs = list(seen)
+        existing_by_key = {}
+        if pairs:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(pairs),),
+                )
+                for mp_id, b_id, p_num in cur.fetchall():
+                    existing_by_key[(b_id, p_num)] = mp_id
+
+        # Elite spells manufacturer part numbers in its own house style (offset suffixes like
+        # "+12GBM" that other feeds punctuate differently), so anything the exact match missed
+        # gets a second, heavily-guarded pass on the normalized form.
+        mp_matching.extend_with_normalized_matches(
+            existing_by_key,
+            pairs,
+            {(mp.brand_id, mp.part_number): mp.gtin for mp in master_parts},
+            provider_id=elite_provider.id,
+            provider_kind=src_enums.BrandProviderKind.ELITE_WHEEL.value,
+            external_id_by_key={v: k for k, v in elite_external_id_to_brand_part.items()},
+        )
+
+        new_parts = [mp for mp in master_parts if (mp.brand_id, mp.part_number) not in existing_by_key]
+
+        if new_parts:
+            new_parts = _dedupe_master_parts_for_upsert(
+                new_parts, context="Elite {} new_parts batch={}".format(half.label, batch_num)
+            )
+            pgbulk.upsert(
+                src_models.MasterPart,
+                new_parts,
+                unique_fields=["brand", "part_number"],
+                update_fields=[],
+            )
+            total_master += len(new_parts)
+
+        # Seed from the resolved ids first: a row matched on formatting has no MasterPart under
+        # the feed's own spelling, so the exact-part_number query below cannot find it.
+        brand_part_to_master = mp_matching.master_part_stubs_for(existing_by_key)
+        unresolved_pairs = [k for k in pairs if k not in brand_part_to_master]
+        if unresolved_pairs:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(unresolved_pairs),),
+                )
+                for mp_id, b_id, p_num in cur.fetchall():
+                    mp = src_models.MasterPart()
+                    mp.id = mp_id
+                    mp.brand_id = b_id
+                    mp.part_number = p_num
+                    brand_part_to_master[(b_id, p_num)] = mp
+
+        provider_parts_by_key = {}
+        for row in batch:
+            ext_id = _elite_wheel_provider_external_id(
+                row["brand_id"], (row.get("part_number") or "").strip()
+            )
+            key = elite_external_id_to_brand_part.get(ext_id)
+            if not key:
+                continue
+            master_part = brand_part_to_master.get(key)
+            if not master_part:
+                continue
+            provider_parts_by_key[(master_part.id, elite_provider.id)] = src_models.ProviderPart(
+                master_part=master_part,
+                provider=elite_provider,
+                provider_external_id=ext_id,
+                distributor_refreshed_at=row.get("updated_at"),
+            )
+
+        provider_parts = list(provider_parts_by_key.values())
+        if provider_parts:
+            pgbulk.upsert(
+                src_models.ProviderPart,
+                provider_parts,
+                unique_fields=["master_part", "provider"],
+                update_fields=_PROVIDER_PART_SYNC_UPDATE_FIELDS,
+            )
+            total_provider += len(provider_parts)
+
+        logger.info("{} Elite {} batch {}: {} items -> {} master, {} provider (last_id={})".format(
+            _LOG_PREFIX, half.label, batch_num, len(batch), len(master_parts), len(provider_parts), last_id
+        ))
+        connection.close()
+        if len(batch) == BATCH_SIZE_MASTER_PARTS:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    return total_master, total_provider
+
+
+def _elite_wheel_provider_and_mappings(
+    action: str,
+) -> typing.Tuple[
+    typing.Optional[src_models.Providers],
+    typing.List[src_models.BrandEliteWheelBrandMapping],
+    typing.Dict[int, src_models.Brands],
+]:
+    """Shared preamble for every Elite derived sync: provider row + brand mappings, or empties."""
+    elite_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.ELITE_WHEEL.value,
+    ).first()
+    if not elite_provider:
+        logger.info("{} No Elite Wheel provider found.".format(_LOG_PREFIX))
+        return None, [], {}
+
+    mappings = list(
+        src_models.BrandEliteWheelBrandMapping.objects.select_related("brand", "elite_wheel_brand")
+    )
+    elite_brand_to_brand = {m.elite_wheel_brand_id: m.brand for m in mappings}
+    if not elite_brand_to_brand:
+        logger.info(
+            "{} No BrandEliteWheelBrandMapping found. Nothing to {}.".format(_LOG_PREFIX, action)
+        )
+        return elite_provider, [], {}
+    return elite_provider, mappings, elite_brand_to_brand
+
+
+def sync_master_parts_from_elite_wheel() -> None:
+    """
+    Create/update MasterPart and ProviderPart from EliteWheelPartWheel and EliteWheelPartTire.
+    Only processes parts whose EliteWheelBrand has a BrandEliteWheelBrandMapping. Same
+    cursor-based, two-phase upsert pattern as every other provider, run once per half.
+    """
+    logger.info("{} Syncing master parts from Elite Wheel (batched, cursor-based).".format(_LOG_PREFIX))
+
+    elite_provider, mappings, elite_brand_to_brand = _elite_wheel_provider_and_mappings("sync")
+    if not elite_provider or not elite_brand_to_brand:
+        return
+
+    chunks = _partition_mapped_brands_for_parallel_ingest(mappings, MASTER_PARTS_SYNC_MAX_WORKERS)
+    grand_master, grand_provider = 0, 0
+    for half in _elite_wheel_halves():
+        total_master, total_provider = _run_parallel_master_parts_ingest(
+            chunks,
+            mappings,
+            "elite_wheel_brand",
+            lambda cids, half=half: _ingest_elite_wheel_parts_for_mapped_brands(
+                cids,
+                elite_provider,
+                elite_brand_to_brand,
+                half,
+            ),
+        )
+        grand_master += total_master
+        grand_provider += total_provider
+        logger.info("{} Elite {}: {} master parts, {} provider parts.".format(
+            _LOG_PREFIX, half.label, total_master, total_provider
+        ))
+
+    logger.info("{} Synced {} master parts and {} provider parts from Elite Wheel total.".format(
+        _LOG_PREFIX, grand_master, grand_provider
+    ))
+
+
+def sync_provider_inventory_from_elite_wheel() -> None:
+    """
+    Sync ProviderPartInventory from both Elite part tables: ``total_available`` as the total plus
+    per-location stock in ``warehouse_availability``. Also refreshes ProviderPart.product_details
+    with the wheel- or tire-spec attributes for that half.
+    """
+    logger.info("{} Syncing provider inventory from Elite Wheel.".format(_LOG_PREFIX))
+
+    elite_provider, mappings, elite_brand_to_brand = _elite_wheel_provider_and_mappings("sync")
+    if not elite_provider or not elite_brand_to_brand:
+        return
+
+    provider_parts = {
+        row["provider_external_id"]: src_models.ProviderPart(id=row["id"])
+        for row in src_models.ProviderPart.objects.filter(provider=elite_provider).values(
+            "id", "provider_external_id"
+        )
+    }
+
+    now = timezone.now()
+    grand_total = 0
+
+    for half in _elite_wheel_halves():
+
+        def _worker(catalog_ids: typing.Set[int], half: _EliteWheelHalf = half) -> int:
+            if not catalog_ids:
+                return 0
+            total_upserted = 0
+            batch_num = 0
+            last_id = 0
+            while True:
+                batch_num += 1
+                batch = list(
+                    half.part_model.objects.filter(id__gt=last_id, brand_id__in=catalog_ids)
+                    .order_by("id")
+                    .values(*half.inventory_values)[:BATCH_SIZE_INVENTORY]
+                )
+                if not batch:
+                    break
+
+                last_id = batch[-1]["id"]
+                to_upsert = []
+                for row in batch:
+                    ext_id = _elite_wheel_provider_external_id(
+                        row["brand_id"], (row.get("part_number") or "").strip()
+                    )
+                    provider_part = provider_parts.get(ext_id)
+                    if not provider_part:
+                        continue
+                    to_upsert.append(
+                        src_models.ProviderPartInventory(
+                            provider_part=provider_part,
+                            warehouse_total_qty=row.get("total_available") or 0,
+                            manufacturer_inventory=None,
+                            manufacturer_esd=None,
+                            warehouse_availability=_elite_wheel_inventory_warehouse_availability(row),
+                            last_synced_at=now,
+                            updated_at=now,
+                        )
+                    )
+
+                if to_upsert:
+                    to_upsert = _dedupe_provider_part_inventory_for_upsert(
+                        to_upsert,
+                        context="Elite {} inventory batch={}".format(half.label, batch_num),
+                    )
+                    pgbulk.upsert(
+                        src_models.ProviderPartInventory,
+                        to_upsert,
+                        unique_fields=["provider_part"],
+                        update_fields=[
+                            "warehouse_total_qty",
+                            "manufacturer_inventory",
+                            "manufacturer_esd",
+                            "warehouse_availability",
+                            "last_synced_at",
+                            "updated_at",
+                        ],
+                    )
+                    total_upserted += len(to_upsert)
+
+                pp_details_to_update = []
+                for row in batch:
+                    ext_id = _elite_wheel_provider_external_id(
+                        row["brand_id"], (row.get("part_number") or "").strip()
+                    )
+                    pp = provider_parts.get(ext_id)
+                    if pp:
+                        pp.product_details = half.product_details(row)
+                        pp_details_to_update.append(pp)
+                if pp_details_to_update:
+                    src_models.ProviderPart.objects.bulk_update(
+                        pp_details_to_update, ["product_details"], batch_size=500
+                    )
+
+                logger.info("{} Elite {} inventory batch {}: {} records (last_id={})".format(
+                    _LOG_PREFIX, half.label, batch_num, len(to_upsert), last_id
+                ))
+                connection.close()
+                if len(batch) == BATCH_SIZE_INVENTORY:
+                    time.sleep(BATCH_DELAY_SECONDS)
+            return total_upserted
+
+        grand_total += _run_parallel_mapped_brand_int_worker(mappings, "elite_wheel_brand", _worker)
+
+    logger.info("{} Synced {} Elite Wheel inventory records total.".format(_LOG_PREFIX, grand_total))
+
+
+_ELITE_WHEEL_PRICING_UPSERT_FIELDS = [
+    "cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"
+]
+
+
+def _elite_wheel_pricing_rows_to_upsert(
+    batch: typing.List[typing.Dict],
+    elite_provider: src_models.Providers,
+    elite_brand_to_brand: typing.Dict[int, src_models.Brands],
+    now,
+) -> typing.List[src_models.ProviderPartCompanyPricing]:
+    """Map one batch of Elite*CompanyPricing rows onto ProviderPartCompanyPricing instances."""
+    master_keys = []
+    for row in batch:
+        brand = elite_brand_to_brand.get(row.get("part__brand_id"))
+        part_number = (row.get("part__part_number") or "").strip()
+        if brand and part_number:
+            master_keys.append((brand.id, part_number))
+    pp_by_key = _provider_parts_by_master_brand_and_part_number(elite_provider, master_keys)
+
+    company_ids = {r["company_id"] for r in batch if r.get("company_id")}
+    companies_by_id = {c.id: c for c in src_models.Company.objects.filter(id__in=company_ids)}
+
+    to_upsert = []
+    for row in batch:
+        brand = elite_brand_to_brand.get(row.get("part__brand_id"))
+        part_number = (row.get("part__part_number") or "").strip()
+        if not brand or not part_number:
+            continue
+        provider_part = pp_by_key.get((brand.id, part_number))
+        if not provider_part:
+            continue
+        company = companies_by_id.get(row.get("company_id"))
+        if not company:
+            continue
+        to_upsert.append(
+            src_models.ProviderPartCompanyPricing(
+                provider_part=provider_part,
+                company=company,
+                cost=row.get("cost"),
+                jobber_price=None,
+                map_price=row.get("map"),
+                msrp=row.get("retail_price"),
+                retail_price=row.get("retail_price"),
+                last_synced_at=now,
+            )
+        )
+    return to_upsert
+
+
+_ELITE_WHEEL_PRICING_VALUES = (
+    "id", "company_id", "cost", "map", "retail_price", "part__brand_id", "part__part_number",
+)
+
+
+def sync_provider_pricing_from_elite_wheel() -> None:
+    """
+    Sync ProviderPartCompanyPricing from both Elite company-pricing tables (all companies).
+    Elite's feed has no jobber column, and its retail price doubles as MSRP.
+    """
+    logger.info("{} Syncing provider pricing from Elite Wheel.".format(_LOG_PREFIX))
+
+    elite_provider, mappings, elite_brand_to_brand = _elite_wheel_provider_and_mappings("price")
+    if not elite_provider or not elite_brand_to_brand:
+        return
+
+    now = timezone.now()
+    grand_total = 0
+
+    for half in _elite_wheel_halves():
+
+        def _worker(catalog_ids: typing.Set[int], half: _EliteWheelHalf = half) -> int:
+            if not catalog_ids:
+                return 0
+            total_upserted = 0
+            batch_num = 0
+            last_id = 0
+            while True:
+                batch_num += 1
+                batch = list(
+                    half.pricing_model.objects.filter(
+                        id__gt=last_id, part__brand_id__in=catalog_ids
+                    )
+                    .order_by("id")
+                    .values(*_ELITE_WHEEL_PRICING_VALUES)[:BATCH_SIZE_PRICING]
+                )
+                if not batch:
+                    break
+
+                last_id = batch[-1]["id"]
+                to_upsert = _elite_wheel_pricing_rows_to_upsert(
+                    batch, elite_provider, elite_brand_to_brand, now
+                )
+
+                if to_upsert:
+                    to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                        to_upsert, context="Elite {} pricing batch={}".format(half.label, batch_num)
+                    )
+                    pgbulk.upsert(
+                        src_models.ProviderPartCompanyPricing,
+                        to_upsert,
+                        unique_fields=["provider_part", "company"],
+                        update_fields=_ELITE_WHEEL_PRICING_UPSERT_FIELDS,
+                    )
+                    total_upserted += len(to_upsert)
+
+                logger.info("{} Elite {} pricing batch {}: {} records (last_id={})".format(
+                    _LOG_PREFIX, half.label, batch_num, len(to_upsert), last_id
+                ))
+                connection.close()
+                if len(batch) == BATCH_SIZE_PRICING:
+                    time.sleep(BATCH_DELAY_SECONDS)
+            return total_upserted
+
+        grand_total += _run_parallel_mapped_brand_int_worker(mappings, "elite_wheel_brand", _worker)
+
+    logger.info("{} Synced {} Elite Wheel pricing records total.".format(_LOG_PREFIX, grand_total))
+
+
+def sync_provider_pricing_from_elite_wheel_for_company(company_id: int) -> None:
+    """One company's Elite pricing — the per-company path used by IntegrationPricingSyncJob."""
+    logger.info("{} Syncing Elite Wheel provider pricing for company_id={}.".format(_LOG_PREFIX, company_id))
+
+    elite_provider, mappings, elite_brand_to_brand = _elite_wheel_provider_and_mappings("price")
+    if not elite_provider or not elite_brand_to_brand:
+        return
+
+    company_provider = src_models.CompanyProviders.objects.filter(
+        company_id=company_id, provider_id=elite_provider.id
+    ).first()
+
+    now = timezone.now()
+
+    # Watermark -- see sync_provider_pricing_from_meyer_for_company for the full rationale.
+    sync_started_at = timezone.now()
+    watermark = company_provider.pricing_propagation_watermark if company_provider else None
+    logger.info(
+        "{} Elite Wheel pricing company={}: propagation watermark={}.".format(
+            _LOG_PREFIX, company_id, watermark or "none (processing everything)",
+        )
+    )
+
+    grand_total = 0
+    for half in _elite_wheel_halves():
+
+        def _worker(catalog_ids: typing.Set[int], half: _EliteWheelHalf = half) -> int:
+            if not catalog_ids:
+                return 0
+            total_upserted = 0
+            batch_num = 0
+            last_id = 0
+            while True:
+                batch_num += 1
+                qs = half.pricing_model.objects.filter(
+                    id__gt=last_id,
+                    company_id=company_id,
+                    part__brand_id__in=catalog_ids,
+                )
+                if watermark:
+                    qs = qs.filter(updated_at__gte=watermark)
+                batch = list(
+                    qs.order_by("id").values(*_ELITE_WHEEL_PRICING_VALUES)[:BATCH_SIZE_PRICING]
+                )
+                if not batch:
+                    break
+
+                last_id = batch[-1]["id"]
+                to_upsert = _elite_wheel_pricing_rows_to_upsert(
+                    batch, elite_provider, elite_brand_to_brand, now
+                )
+
+                if to_upsert:
+                    to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                        to_upsert,
+                        context="Elite {} pricing company={} batch={}".format(
+                            half.label, company_id, batch_num
+                        ),
+                    )
+                    pgbulk.upsert(
+                        src_models.ProviderPartCompanyPricing,
+                        to_upsert,
+                        unique_fields=["provider_part", "company"],
+                        update_fields=_ELITE_WHEEL_PRICING_UPSERT_FIELDS,
+                    )
+                    total_upserted += len(to_upsert)
+
+                logger.info("{} Elite {} pricing company={} batch {}: {} records (last_id={})".format(
+                    _LOG_PREFIX, half.label, company_id, batch_num, len(to_upsert), last_id
+                ))
+                connection.close()
+                if len(batch) == BATCH_SIZE_PRICING:
+                    time.sleep(BATCH_DELAY_SECONDS)
+            return total_upserted
+
+        grand_total += _run_parallel_mapped_brand_int_worker(mappings, "elite_wheel_brand", _worker)
+
+    logger.info("{} Synced {} Elite Wheel pricing records for company_id={}.".format(
+        _LOG_PREFIX, grand_total, company_id,
+    ))
+
+    if company_provider:
+        company_provider.pricing_propagation_watermark = sync_started_at
+        company_provider.save(update_fields=["pricing_propagation_watermark"])
+
+
+def sync_derived_from_elite_wheel(
+    *, reindex_meilisearch: bool = False, skip_master_parts: bool = False, skip_pricing: bool = False
+) -> None:
+    """
+    Propagate Elite Wheel source data into MasterPart, ProviderPart, ProviderPartInventory, and
+    ProviderPartCompanyPricing. Call after the Elite feed ingest. No fitment sync -- the workbook
+    carries wheel/tire spec attributes, not vehicle fitment.
+
+    Pass ``skip_master_parts=True`` to run only inventory + pricing (fast incremental path).
+    Pass ``skip_pricing=True`` to run only master parts + inventory (global catalog sync path).
+    """
+    logger.info("{} Starting Elite Wheel-only derived sync ({}).".format(
+        _LOG_PREFIX,
+        "inventory + pricing only" if skip_master_parts else "parts, inventory" + ("" if skip_pricing else ", pricing"),
+    ))
+    if not skip_master_parts:
+        sync_master_parts_from_elite_wheel()
+        connection.close()
+
+    def _cont() -> None:
+        sync_provider_inventory_from_elite_wheel()
+        connection.close()
+        if not skip_pricing:
+            sync_provider_pricing_from_elite_wheel()
+            connection.close()
+
+    if skip_master_parts:
+        _cont()
+    else:
+        _maybe_reindex_meilisearch_after_master_parts(
+            reindex_meilisearch=reindex_meilisearch,
+            provider_label="Elite Wheel",
+            continuation=_cont,
+        )
+    logger.info("{} Completed Elite Wheel-only derived sync.".format(_LOG_PREFIX))
+
+
 def sync_all_master_parts() -> None:
     """
     Run each distributor's derived sync in order (master + provider parts, then inventory, then pricing
@@ -9359,6 +10659,8 @@ def sync_all_master_parts() -> None:
     sync_derived_from_vossen(reindex_meilisearch=False, skip_pricing=True)
     _reclaim_memory()
     sync_derived_from_tirerack(reindex_meilisearch=False, skip_pricing=True)
+    _reclaim_memory()
+    sync_derived_from_elite_wheel(reindex_meilisearch=False, skip_pricing=True)
 
     logger.info("{} Completed full master parts sync.".format(_LOG_PREFIX))
 
@@ -9402,6 +10704,10 @@ def sync_all_master_parts_global() -> None:
     sync_derived_from_tirerack(skip_pricing=True)
     _reclaim_memory()
     sync_derived_from_quadratec(skip_pricing=True)
+    _reclaim_memory()
+    sync_derived_from_elite_wheel(skip_pricing=True)
+    _reclaim_memory()
+    sync_derived_from_motorstate(skip_pricing=True)
 
     logger.info("{} Completed global master parts sync (catalog + inventory, no pricing).".format(_LOG_PREFIX))
 
@@ -9432,5 +10738,7 @@ def sync_all_master_parts_incremental() -> None:
     sync_derived_from_vossen(skip_master_parts=True)
     sync_derived_from_tirerack(skip_master_parts=True)
     sync_derived_from_quadratec(skip_master_parts=True)
+    sync_derived_from_elite_wheel(skip_master_parts=True)
+    sync_derived_from_motorstate(skip_master_parts=True)
 
     logger.info("{} Completed incremental master parts sync.".format(_LOG_PREFIX))

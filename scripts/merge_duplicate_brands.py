@@ -143,6 +143,8 @@ def _get_mappings_for_brand(brand):
         out.append("tirerack")
     if src_models.BrandVossenBrandMapping.objects.filter(brand=brand).exists():
         out.append("vossen")
+    if src_models.BrandEliteWheelBrandMapping.objects.filter(brand=brand).exists():
+        out.append("elite_wheel")
     return out
 
 
@@ -340,6 +342,35 @@ def merge_brands(brand_to_keep, brand_to_delete, confirm=_confirm):
             if confirm(
                 "  Update mapping id={} brand_id {} -> {} (vossen_brand={})?".format(
                     m.id, delete_id, keep_id, m.vossen_brand.name
+                )
+            ):
+                m.brand_id = keep_id
+                m.save()
+
+    # 5f. BrandEliteWheelBrandMapping -- a manufacturer selling both wheels and tires has two
+    # EliteWheelBrand rows (WHEEL:x and TIRE:x) mapped to the same Brands row, so expect up to two
+    # mappings per brand here rather than one.
+    elite_list = list(
+        src_models.BrandEliteWheelBrandMapping.objects.filter(brand_id=delete_id).select_related(
+            "elite_wheel_brand"
+        )
+    )
+    print("\n--- BrandEliteWheelBrandMapping: {} to process ---".format(len(elite_list)))
+    for m in elite_list:
+        existing = src_models.BrandEliteWheelBrandMapping.objects.filter(
+            brand_id=keep_id, elite_wheel_brand=m.elite_wheel_brand
+        ).first()
+        if existing:
+            if confirm(
+                "  Delete mapping id={} (elite_wheel_brand={})? Keep already has.".format(
+                    m.id, m.elite_wheel_brand.external_id
+                )
+            ):
+                m.delete()
+        else:
+            if confirm(
+                "  Update mapping id={} brand_id {} -> {} (elite_wheel_brand={})?".format(
+                    m.id, delete_id, keep_id, m.elite_wheel_brand.external_id
                 )
             ):
                 m.brand_id = keep_id

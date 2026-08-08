@@ -357,6 +357,30 @@ def get_distributor_credentials_info() -> dict:
             "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("VOSSEN", "Vossen"),
             "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("VOSSEN") or None,
         },
+        "elite_wheel": {
+            "required": [
+                src_constants.ELITE_WHEEL_CREDENTIALS_SFTP_HOST,
+                src_constants.ELITE_WHEEL_CREDENTIALS_SFTP_PORT,
+                src_constants.ELITE_WHEEL_CREDENTIALS_SFTP_USER,
+                src_constants.ELITE_WHEEL_CREDENTIALS_SFTP_PASSWORD,
+            ],
+            "optional": [
+                src_constants.ELITE_WHEEL_CREDENTIALS_SFTP_DIRECTORY,
+                src_constants.ELITE_WHEEL_CREDENTIALS_PUBLIC_SHARE_ID,
+                src_constants.ELITE_WHEEL_CREDENTIALS_PUBLIC_SHARE_URL,
+            ],
+            "description": (
+                "Elite Wheel & Tire dealer SFTP host, port, username, and password, per company. "
+                "Elite drops one TriWeeklyUpdate<MM-DD-YYYY>.xlsx per update holding wheels (one "
+                "sheet per manufacturer) and tires (one sheet), with on-hand per location. Wheel "
+                "and tire availability is already loaded from Elite's public inventory share, so "
+                "connecting your own account is what adds your dealer pricing on top of it. "
+                "Optional sftp_directory if the workbook is not in the account home; optional "
+                "public_share_id / public_share_url override the public inventory share."
+            ),
+            "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("ELITE_WHEEL", "Elite Wheel"),
+            "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("ELITE_WHEEL") or None,
+        },
         "tirerack": {
             "required": [
                 src_constants.TIRERACK_CREDENTIALS_SFTP_HOST,

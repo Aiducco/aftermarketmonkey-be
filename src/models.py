@@ -2886,3 +2886,357 @@ class PurchaseOrderJob(django_db_models.Model):
     class Meta:
         db_table = "purchase_order_jobs"
         ordering = ["id"]
+
+
+# ---------------------------------------------------------------------------
+# Motor State Distributing (kind=MOTOR_STATE_DISTRIBUTING) raw feed tables.
+#
+# Motor State's API has no bulk product export. Raw ingest is built from three
+# endpoints (see src.integrations.services.motorstate):
+#   * GET /api/Brands                    -> MotorStateBrand   (global catalog)
+#   * GET /api/ProductAvailabilityChange -> MotorStateAvailability (per-company
+#       stock/status feed; also the part-number spine, since a per-brand pass
+#       with fromDateTime=epoch is the only way to enumerate every part number)
+#   * GET /api/Product (<=15 part numbers) -> MotorStateProduct (per-company
+#       detail + account pricing)
+# These are deliberately thin raw mirrors; nothing here is wired into the
+# master-parts layer yet.
+# ---------------------------------------------------------------------------
+class MotorStateBrand(django_db_models.Model):
+    """A Motor State brand from GET /api/Brands. Global — brand catalog is not
+    account-specific. ``code`` is Motor State's brand code (e.g. "AAA"), used as
+    the ``brand`` filter on the availability endpoint."""
+    code = django_db_models.CharField(max_length=32)
+    name = django_db_models.CharField(max_length=255, null=True)
+    offered = django_db_models.BooleanField(default=False)
+    is_inventory_available = django_db_models.BooleanField(default=False)
+    # Full raw brand object (description, categories, resources, ...) kept verbatim
+    # so downstream work can pull fields without another sync.
+    data = django_db_models.JSONField(null=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "motorstate_brands"
+        unique_together = ["code"]
+
+
+class MotorStateAvailability(django_db_models.Model):
+    """One row per (company, part number) from GET /api/ProductAvailabilityChange.
+    Doubles as the catalog spine (initial per-brand epoch pass) and the live
+    stock/status feed (periodic fromDateTime=watermark polling).
+
+    Per-company because the data is only ever obtained through a single company's
+    API key; ``source_updated_on`` is Motor State's own UpdatedOn timestamp and is
+    the natural high-water mark for incremental polling. ``brand_code`` is the
+    brand the row was fetched under during the spine pass (null for rows first
+    seen via an unfiltered incremental poll)."""
+    company = django_db_models.ForeignKey(
+        Company, on_delete=django_db_models.CASCADE, related_name="motorstate_availability"
+    )
+    part_number = django_db_models.CharField(max_length=128)
+    brand_code = django_db_models.CharField(max_length=32, null=True)
+    # Motor State StatusType: S=stocking, O=order-as-needed, X=discontinued (raw, as returned).
+    status_type = django_db_models.CharField(max_length=8, null=True)
+    quantity_available = django_db_models.IntegerField(null=True)
+    # Motor State "UpdatedOn" for this part; the incremental-poll high-water mark.
+    source_updated_on = django_db_models.DateTimeField(null=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "motorstate_availability"
+        unique_together = ["company", "part_number"]
+        indexes = [
+            django_db_models.Index(fields=["company", "source_updated_on"]),
+            django_db_models.Index(fields=["company", "brand_code"]),
+        ]
+
+
+class MotorStateProduct(django_db_models.Model):
+    """One row per (company, part number) from GET /api/Product — catalog detail
+    plus account-specific pricing (Motor State returns both in one payload).
+    Per-company because prices are tied to the account behind the API key.
+    ``found`` mirrors the API's per-part Found flag; unfound part numbers are
+    still recorded so a later pass need not re-query them blindly."""
+    part_number = django_db_models.CharField(max_length=128, unique=True)
+    # Motor State's /api/Product does not return a brand, so this FK is carried over from the
+    # MotorStateAvailability spine (the brand the part was fetched under). Null when the part
+    # has no matching availability row. brand_code mirrors brand.code for join-free filtering.
+    brand = django_db_models.ForeignKey(
+        MotorStateBrand, on_delete=django_db_models.SET_NULL, null=True, related_name="products"
+    )
+    brand_code = django_db_models.CharField(max_length=32, null=True)
+    found = django_db_models.BooleanField(default=False)
+
+    vendor_part_number = django_db_models.CharField(max_length=128, null=True)
+    supersede_part_number = django_db_models.CharField(max_length=128, null=True)
+    short_description = django_db_models.TextField(null=True)
+    # Motor State numeric Status code (raw).
+    status = django_db_models.IntegerField(null=True)
+    is_stocking = django_db_models.BooleanField(default=False)
+    quantity = django_db_models.IntegerField(null=True)
+
+    # Ordering capabilities describe the part itself, so they stay on the catalog row; the
+    # per-account fees they imply live on MotorStateCompanyPricing.
+    can_special_order = django_db_models.BooleanField(default=False)
+    can_drop_ship = django_db_models.BooleanField(default=False)
+    can_regular_back_order = django_db_models.BooleanField(default=False)
+
+    # Full raw Product object kept verbatim (notes, duty/tariff, any fields not columned above).
+    data = django_db_models.JSONField(null=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "motorstate_products"
+        indexes = [
+            django_db_models.Index(fields=["brand"], name="ms_products_brand_idx"),
+        ]
+
+
+class MotorStateCompanyPricing(django_db_models.Model):
+    """
+    Per-company Motor State pricing for a catalog row (MotorStateProduct). Catalog/non-price
+    fields live on MotorStateProduct; prices are stored per company so
+    ProviderPartCompanyPricing sync keys off (part, company) like every other provider.
+
+    Motor State returns catalog and account pricing in the same /api/Product payload (there is
+    no price-only endpoint), so both tables are written by the same hydrate pass —
+    unlike distributors whose catalog and pricing arrive on separate feeds.
+
+    ``customer_price`` is this account's actual buy price; ``base_price`` is Motor State's
+    undiscounted wholesale; ``list_price`` is MSRP.
+    """
+    product = django_db_models.ForeignKey(
+        MotorStateProduct, on_delete=django_db_models.CASCADE, related_name="company_pricing"
+    )
+    company = django_db_models.ForeignKey(
+        Company, on_delete=django_db_models.CASCADE, related_name="motorstate_company_pricing"
+    )
+
+    customer_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True)
+    customer_price_non_promotional = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True)
+    base_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True)
+    list_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True)
+    map_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True)
+    is_map_restricted = django_db_models.BooleanField(default=False)
+
+    special_order_charge = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True)
+    drop_ship_charge = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "motorstate_company_pricing"
+        unique_together = ["product", "company"]
+
+
+class BrandMotorStateBrandMapping(django_db_models.Model):
+    """Maps our Brands to MotorStateBrand (for master parts sync). Motor State's /api/Brands
+    carries no AAIA code, so resolution is name-based only (see
+    motorstate.sync_unmapped_motorstate_brands_to_brands)."""
+    brand = django_db_models.ForeignKey(
+        Brands, on_delete=django_db_models.CASCADE, related_name="motorstate_brand_mappings"
+    )
+    motorstate_brand = django_db_models.ForeignKey(
+        MotorStateBrand, on_delete=django_db_models.CASCADE, related_name="brand_mappings"
+    )
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "brand_motorstate_brand_mapping"
+        unique_together = ["brand", "motorstate_brand"]
+
+
+class EliteWheelBrand(django_db_models.Model):
+    """
+    One manufacturer from Elite Wheel & Tire's inventory workbook. Elite's feed is split in two --
+    a worksheet per wheel manufacturer plus a single ``Tires`` sheet covering every tire
+    manufacturer -- and the two halves land in separate part tables (EliteWheelPartWheel /
+    EliteWheelPartTire), so ``product_type`` records which half a brand row belongs to.
+    ``external_id`` is ``"<product_type>:<NAME>"`` (e.g. ``"WHEEL:AZARA"``) rather than the bare
+    name: the same manufacturer can legitimately appear on both sides of the catalog, and each
+    side needs its own brand row to key its own parts.
+    """
+    PRODUCT_TYPE_WHEEL = "WHEEL"
+    PRODUCT_TYPE_TIRE = "TIRE"
+
+    external_id = django_db_models.CharField(max_length=255)
+    name = django_db_models.CharField(max_length=255)
+    product_type = django_db_models.CharField(max_length=16)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "elitewheels_brands"
+        unique_together = [["external_id"]]
+
+
+class EliteWheelPartWheel(django_db_models.Model):
+    """
+    A wheel from Elite's workbook (catalog + distributor-wide per-location stock; not per-company
+    -- see EliteWheelWheelCompanyPricing for price). Wheel-spec columns are CharField like
+    VossenPart's and WheelProsPart's equivalents because the sheet's own formats vary: a staggered
+    fitment ships as ``"22x9 / 22x10"`` with offset ``"32 / 38"``, and the bolt-pattern columns
+    carry placeholders such as ``"Blank 5x/6x"`` for undrilled blanks.
+
+    ``qty_*`` are Elite's four warehouses (see ``constants.ELITE_WHEEL_QTY_FIELD_TO_LOCATION_LABEL``);
+    ``location_availability`` keeps the raw per-location dict verbatim so a warehouse Elite adds
+    later is still captured (and counted in ``total_available``) before it gets a column here.
+    """
+    brand = django_db_models.ForeignKey(
+        EliteWheelBrand,
+        on_delete=django_db_models.CASCADE,
+        related_name="wheel_parts",
+    )
+    part_number = django_db_models.CharField(max_length=255)
+    # Model/finish block title the row sat under, e.g. "XF-211 Gloss Black & Milled".
+    group_label = django_db_models.CharField(max_length=512, null=True, blank=True)
+    size = django_db_models.CharField(max_length=128, null=True, blank=True)
+    bolt_pattern_1 = django_db_models.CharField(max_length=128, null=True, blank=True)
+    bolt_pattern_2 = django_db_models.CharField(max_length=128, null=True, blank=True)
+    offset = django_db_models.CharField(max_length=64, null=True, blank=True)
+    center_bore = django_db_models.CharField(max_length=64, null=True, blank=True)
+    finish = django_db_models.CharField(max_length=255, null=True, blank=True)
+
+    qty_tampa = django_db_models.IntegerField(null=True, blank=True)
+    qty_atlanta = django_db_models.IntegerField(null=True, blank=True)
+    qty_miami = django_db_models.IntegerField(null=True, blank=True)
+    qty_decatur = django_db_models.IntegerField(null=True, blank=True)
+    total_available = django_db_models.IntegerField(null=True, blank=True)
+    location_availability = django_db_models.JSONField(null=True, blank=True)
+
+    # Date from the workbook's "As of MM/DD/YYYY" banner, and the drop it was read from.
+    as_of_date = django_db_models.DateField(null=True, blank=True)
+    source_filename = django_db_models.CharField(max_length=255, null=True, blank=True)
+    raw_data = django_db_models.JSONField(null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "elitewheels_part_wheels"
+        unique_together = [["brand", "part_number"]]
+
+
+class EliteWheelPartTire(django_db_models.Model):
+    """
+    A tire from the workbook's ``Tires`` sheet (catalog + distributor-wide per-location stock; not
+    per-company -- see EliteWheelTireCompanyPricing for price). ``raw_size`` is the sheet's own
+    packed size code (``"1856514"`` for 185/65R14) kept verbatim rather than expanded, and
+    ``tire_diameter`` comes from the ``Inventory for Tire Diameter: <n>`` section the row sat under.
+    """
+    brand = django_db_models.ForeignKey(
+        EliteWheelBrand,
+        on_delete=django_db_models.CASCADE,
+        related_name="tire_parts",
+    )
+    part_number = django_db_models.CharField(max_length=255)
+    model = django_db_models.CharField(max_length=255, null=True, blank=True)
+    raw_size = django_db_models.CharField(max_length=64, null=True, blank=True)
+    tire_diameter = django_db_models.CharField(max_length=16, null=True, blank=True)
+
+    qty_tampa = django_db_models.IntegerField(null=True, blank=True)
+    qty_atlanta = django_db_models.IntegerField(null=True, blank=True)
+    qty_miami = django_db_models.IntegerField(null=True, blank=True)
+    qty_decatur = django_db_models.IntegerField(null=True, blank=True)
+    total_available = django_db_models.IntegerField(null=True, blank=True)
+    location_availability = django_db_models.JSONField(null=True, blank=True)
+
+    as_of_date = django_db_models.DateField(null=True, blank=True)
+    source_filename = django_db_models.CharField(max_length=255, null=True, blank=True)
+    raw_data = django_db_models.JSONField(null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "elitewheels_part_tires"
+        unique_together = [["brand", "part_number"]]
+
+
+class EliteWheelWheelCompanyPricing(django_db_models.Model):
+    """
+    Per-company Elite pricing for a wheel (EliteWheelPartWheel). Catalog and stock live on the part
+    and are shared; prices are per company so ProviderPartCompanyPricing sync keys off
+    (part, company) like every other provider. Two pricing tables rather than one with two nullable
+    FKs, mirroring the wheel/tire split of the part tables so each keeps a real FK and a
+    (part, company) unique constraint.
+
+    Elite's public inventory share carries no price columns at all, so these rows only appear once
+    a dealer's own feed is connected -- see
+    ``src.integrations.services.elite_wheel.sync_elite_wheel_company_pricing_for_company_provider``.
+    """
+    part = django_db_models.ForeignKey(
+        EliteWheelPartWheel,
+        on_delete=django_db_models.CASCADE,
+        related_name="company_pricing",
+    )
+    company = django_db_models.ForeignKey(
+        Company,
+        on_delete=django_db_models.CASCADE,
+        related_name="elite_wheel_wheel_company_pricing",
+    )
+    cost = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    map = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    retail_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "elitewheels_wheel_company_pricing"
+        unique_together = [["part", "company"]]
+
+
+class EliteWheelTireCompanyPricing(django_db_models.Model):
+    """Per-company Elite pricing for a tire (EliteWheelPartTire) -- see EliteWheelWheelCompanyPricing."""
+    part = django_db_models.ForeignKey(
+        EliteWheelPartTire,
+        on_delete=django_db_models.CASCADE,
+        related_name="company_pricing",
+    )
+    company = django_db_models.ForeignKey(
+        Company,
+        on_delete=django_db_models.CASCADE,
+        related_name="elite_wheel_tire_company_pricing",
+    )
+    cost = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    map = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    retail_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "elitewheels_tire_company_pricing"
+        unique_together = [["part", "company"]]
+
+
+class BrandEliteWheelBrandMapping(django_db_models.Model):
+    """Maps our Brands to EliteWheelBrand (for master parts sync)."""
+    brand = django_db_models.ForeignKey(
+        Brands,
+        on_delete=django_db_models.CASCADE,
+        related_name="elite_wheel_brand_mappings",
+    )
+    elite_wheel_brand = django_db_models.ForeignKey(
+        EliteWheelBrand,
+        on_delete=django_db_models.CASCADE,
+        related_name="brand_mappings",
+    )
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "brand_elite_wheel_brand_mapping"
+        unique_together = ["brand", "elite_wheel_brand"]

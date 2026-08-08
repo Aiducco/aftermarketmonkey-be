@@ -12,6 +12,7 @@ Two job modes controlled by the ``skip_raw_fetch`` field:
       Avoids double-downloading large pricing feeds for every active company.
 """
 import concurrent.futures
+import datetime
 import logging
 import typing
 
@@ -24,7 +25,9 @@ from src.integrations.services import keystone as keystone_services
 from src.integrations.services import master_parts
 from src.integrations.services import atech as atech_services
 from src.integrations.services import dlg as dlg_services
+from src.integrations.services import elite_wheel as elite_wheel_services
 from src.integrations.services import meyer as meyer_services
+from src.integrations.services import motorstate as motorstate_services
 from src.integrations.services import notifications as notifications_services
 from src.integrations.services import premier as premier_services
 from src.integrations.services import quadratec as quadratec_services
@@ -51,8 +54,47 @@ _PRICING_SYNC_KINDS = frozenset(
         src_enums.BrandProviderKind.VOSSEN.value,
         src_enums.BrandProviderKind.TIRERACK.value,
         src_enums.BrandProviderKind.QUADRATEC.value,
+        src_enums.BrandProviderKind.ELITE_WHEEL.value,
+        src_enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING.value,
     }
 )
+
+# Kinds whose *recurring* pricing refresh is deliberately slower than the nightly cycle,
+# mapped to their minimum interval. Motor State has no bulk pricing endpoint -- a refresh is
+# ~10.4k sequential /api/Product calls (15 part numbers each), far too heavy to repeat nightly,
+# and its dealer prices move slowly. The first sync for a connection is never throttled: it is
+# enqueued directly by connect/reconnect (enqueue_company_provider_pricing_sync), which does not
+# consult this map, so a newly connected company still gets a full pricing sync immediately.
+_RECURRING_PRICING_MIN_INTERVAL = {
+    src_enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING.value: datetime.timedelta(days=7),
+}
+
+
+def _recurring_pricing_sync_is_due(company_provider_id: int, kind: int) -> bool:
+    """
+    Whether the recurring cycle should enqueue this connection now.
+
+    True for every kind without a configured interval. For throttled kinds, True only when the
+    connection has no completed pricing job yet (so a connection that has never synced is always
+    due) or the last completed one is older than the interval.
+    """
+    min_interval = _RECURRING_PRICING_MIN_INTERVAL.get(kind)
+    if not min_interval:
+        return True
+
+    last_completed_at = (
+        src_models.IntegrationPricingSyncJob.objects.filter(
+            company_provider_id=company_provider_id,
+            status=src_enums.IntegrationPricingSyncJobStatus.COMPLETED.value,
+        )
+        .exclude(completed_at__isnull=True)
+        .order_by("-completed_at")
+        .values_list("completed_at", flat=True)
+        .first()
+    )
+    if not last_completed_at:
+        return True
+    return (timezone.now() - last_completed_at) >= min_interval
 
 
 def should_enqueue_pricing_sync(provider_kind: int) -> bool:
@@ -86,10 +128,25 @@ def enqueue_all_active_company_provider_pricing_jobs() -> int:
         .values_list("id", "provider__kind")
     )
     enqueued = 0
+    skipped_not_due = 0
     for cp_id, kind in qs:
+        if not _recurring_pricing_sync_is_due(cp_id, kind):
+            skipped_not_due += 1
+            logger.info(
+                "{} Skipping company_provider_id={} (kind={}): recurring pricing sync not due "
+                "yet (min interval {}).".format(
+                    _LOG_PREFIX, cp_id, kind, _RECURRING_PRICING_MIN_INTERVAL.get(kind),
+                )
+            )
+            continue
         use_delta_fetch = kind == src_enums.BrandProviderKind.TURN_14.value
         enqueue_company_provider_pricing_sync(cp_id, skip_raw_fetch=False, use_delta_fetch=use_delta_fetch)
         enqueued += 1
+    if skipped_not_due:
+        logger.info(
+            "{} enqueue_all_active_company_provider_pricing_jobs: skipped {} connection(s) not "
+            "yet due for a recurring pricing sync.".format(_LOG_PREFIX, skipped_not_due)
+        )
     logger.info(
         "{} enqueue_all_active_company_provider_pricing_jobs: enqueued {} job(s).".format(
             _LOG_PREFIX, enqueued
@@ -191,6 +248,12 @@ def _fetch_raw_pricing(cp: src_models.CompanyProviders, use_delta_fetch: bool = 
     elif kind == src_enums.BrandProviderKind.QUADRATEC.value:
         quadratec_services.sync_quadratec_company_pricing_for_company_provider(cp.id)
 
+    elif kind == src_enums.BrandProviderKind.ELITE_WHEEL.value:
+        elite_wheel_services.sync_elite_wheel_company_pricing_for_company_provider(cp.id)
+
+    elif kind == src_enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING.value:
+        motorstate_services.sync_motorstate_company_pricing_for_company_provider(cp.id)
+
     else:
         raise ValueError("Unsupported provider kind for raw pricing fetch: {}".format(kind))
 
@@ -235,6 +298,12 @@ def _sync_master_pricing(cp: src_models.CompanyProviders) -> None:
 
     elif kind == src_enums.BrandProviderKind.QUADRATEC.value:
         master_parts.sync_provider_pricing_from_quadratec_for_company(company_id)
+
+    elif kind == src_enums.BrandProviderKind.ELITE_WHEEL.value:
+        master_parts.sync_provider_pricing_from_elite_wheel_for_company(company_id)
+
+    elif kind == src_enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING.value:
+        master_parts.sync_provider_pricing_from_motorstate_for_company(company_id)
 
     else:
         raise ValueError("Unsupported provider kind for master pricing sync: {}".format(kind))

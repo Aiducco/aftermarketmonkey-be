@@ -15,6 +15,8 @@ from src import models as src_models
 from src.integrations import credentials as credentials_helper
 from src.integrations.clients.atech import client as atech_client
 from src.integrations.clients.atech import exceptions as atech_exceptions
+from src.integrations.clients.elite_wheel import client as elite_wheel_client
+from src.integrations.clients.elite_wheel import exceptions as elite_wheel_exceptions
 from src.integrations.clients.keystone import client as keystone_client
 from src.integrations.clients.keystone import exceptions as keystone_exceptions
 from src.integrations.clients.keystone import order_client as keystone_order_client
@@ -529,6 +531,29 @@ def _validate_vossen_connection(credentials: typing.Dict[str, typing.Any]) -> _V
     return None, None
 
 
+def _validate_elite_wheel_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
+    """
+    Validates the dealer's own Elite SFTP account: connect, list the feed directory, and confirm a
+    ``TriWeeklyUpdate*.xlsx`` workbook is actually there — an account that authenticates but is
+    pointed at an empty directory would otherwise look connected and never sync anything.
+    Credentials that carry no SFTP details fall back to Elite's public inventory share, which this
+    checks the same way (see EliteWheelFeedClient.source_mode).
+    """
+    try:
+        client = elite_wheel_client.EliteWheelFeedClient(credentials=credentials)
+    except ValueError as e:
+        return str(e), CONNECTION_ERROR_INVALID_INPUT
+    try:
+        client.test_connection()
+    except elite_wheel_exceptions.EliteWheelSFTPConnectionError as e:
+        return e.message, CONNECTION_ERROR_INVALID_CREDENTIALS
+    except elite_wheel_exceptions.EliteWheelFileNotFoundError as e:
+        return str(e), CONNECTION_ERROR_NOT_FOUND
+    except (elite_wheel_exceptions.EliteWheelException, ValueError) as e:
+        return str(e), CONNECTION_ERROR_CONNECTION_FAILED
+    return None, None
+
+
 def _validate_tirerack_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
     try:
         client = tirerack_client.TireRackSFTPClient(credentials=credentials)
@@ -555,6 +580,7 @@ _CONNECTION_VALIDATORS: typing.Dict[int, typing.Callable[[typing.Dict[str, typin
     src_enums.BrandProviderKind.ROUGH_COUNTRY.value: _validate_rough_country_connection,
     src_enums.BrandProviderKind.VOSSEN.value: _validate_vossen_connection,
     src_enums.BrandProviderKind.TIRERACK.value: _validate_tirerack_connection,
+    src_enums.BrandProviderKind.ELITE_WHEEL.value: _validate_elite_wheel_connection,
 }
 
 

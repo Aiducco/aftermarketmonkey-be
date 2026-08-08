@@ -46,6 +46,7 @@ GTIN_LESS_PROVIDER_KINDS = frozenset({
     src_enums.BrandProviderKind.DLG.value,
     src_enums.BrandProviderKind.VOSSEN.value,
     src_enums.BrandProviderKind.TIRERACK.value,
+    src_enums.BrandProviderKind.ELITE_WHEEL.value,
 })
 
 _LOOKUP_CHUNK = 2000

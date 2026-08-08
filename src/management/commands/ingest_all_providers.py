@@ -46,10 +46,12 @@ from src.audit import scheduled_tasks as audit_scheduled_tasks
 from src.integrations.services import (
     atech,
     dlg,
+    elite_wheel,
     integration_pricing_sync_jobs,
     keystone,
     master_parts,
     meyer,
+    motorstate,
     premier,
     quadratec,
     rough_country,
@@ -139,6 +141,8 @@ class Command(BaseCommand):
             "ingest_all_providers_premier",
             "ingest_all_providers_vossen",
             "ingest_all_providers_tirerack",
+            "ingest_all_providers_quadratec",
+            "ingest_all_providers_elite_wheel",
             "ingest_all_providers_sync_all_master_parts",
             "ingest_all_providers_enqueue_pricing_jobs",
             "ingest_all_providers_meilisearch_reindex",
@@ -168,6 +172,8 @@ class Command(BaseCommand):
                 ("vossen",        self._run_vossen),
                 ("tirerack",      self._run_tirerack),
                 ("quadratec",     self._run_quadratec),
+                ("elite_wheel",   self._run_elite_wheel),
+                ("motorstate",    self._run_motorstate),
             ]
             for name, run_fn in phase1_providers:
                 self._ingest_log("phase 1 | starting {} fetch".format(name))
@@ -311,6 +317,31 @@ class Command(BaseCommand):
             self._ingest_log("Quadratec: feeds + unmapped brand sync")
             quadratec.fetch_and_save_quadratec()
             quadratec.sync_unmapped_quadratec_brands_to_brands()
+
+    def _run_motorstate(self) -> None:
+        with self._audited_step(
+            "ingest_all_providers_motorstate",
+            "Motor State source fetch + unmapped brand sync complete (derived in sync_all).",
+            continue_on_error=True,
+        ):
+            # Brands + incremental availability only. The full per-brand spine rebuild and the
+            # ~10.4k-call product hydrate are far too heavy for the nightly window -- the spine
+            # is a one-off (fetch_motorstate_availability) and product detail/pricing refreshes
+            # on the throttled pricing-job cadence (see integration_pricing_sync_jobs).
+            self._ingest_log("Motor State: brands + availability updates + unmapped brand sync")
+            motorstate.fetch_and_save_motorstate_brands()
+            motorstate.fetch_and_save_motorstate_availability_updates()
+            motorstate.sync_unmapped_motorstate_brands_to_brands()
+
+    def _run_elite_wheel(self) -> None:
+        with self._audited_step(
+            "ingest_all_providers_elite_wheel",
+            "Elite Wheel source fetch + unmapped brand sync complete (derived in sync_all).",
+            continue_on_error=True,
+        ):
+            self._ingest_log("Elite Wheel: workbook + unmapped brand sync")
+            elite_wheel.fetch_and_save_elite_wheel()
+            elite_wheel.sync_unmapped_elite_wheel_brands_to_brands()
 
     def _run_dlg(self) -> None:
         with self._audited_step(

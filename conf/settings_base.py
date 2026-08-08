@@ -209,6 +209,24 @@ FRONTEND_BASE_URL = os.environ.get("FRONTEND_BASE_URL", "https://app.aftermarket
 
 TURN14_BASE_URL = 'https://api.turn14.com/v1'
 
+# Motor State Distributing read-only catalog/pricing API (see src.integrations.clients.motorstate).
+MOTOR_STATE_BASE_URL = os.environ.get("MOTOR_STATE_BASE_URL", "https://api.motorstate.com")
+
+# Elite Wheel & Tire (see src.integrations.clients.elite_wheel). Elite's SFTPGo server exposes the
+# same TriWeeklyUpdate*.xlsx drop folder both as per-dealer SFTP accounts and as a public,
+# inventory-only share; the shared catalog reads the public share, and a connected dealer's own
+# SFTP account is what adds their pricing. ELITE_WHEEL_FORCE_PUBLIC_SHARE=True pins every
+# connection to the public share (useful while dealer accounts are still being provisioned).
+ELITE_WHEEL_PUBLIC_SHARE_URL = os.environ.get(
+    "ELITE_WHEEL_PUBLIC_SHARE_URL", "https://sftp.elitewheelandtire.com"
+)
+ELITE_WHEEL_PUBLIC_SHARE_ID = os.environ.get(
+    "ELITE_WHEEL_PUBLIC_SHARE_ID", "84ypjmAqgkiZn9T2V4DboM"
+)
+ELITE_WHEEL_FORCE_PUBLIC_SHARE = (
+    os.environ.get("ELITE_WHEEL_FORCE_PUBLIC_SHARE", "false").strip().lower() == "true"
+)
+
 # Turn 14 Electronic Order API (quote/order/status) — separate hosts for their "testing" and
 # "production" environments; the "environment" value must also be set to match in every
 # request body (per Turn 14's docs: requests to apitest.turn14.com must carry "testing",
