@@ -986,21 +986,57 @@ PROVIDER_CATALOG = [
         "relay_provisioned": True,
         "relay_credential_fields": ("ftp_user", "ftp_password"),
         "integration_time": "Data available within 1-2 days",
+        # {{SFTP_USER}}/{{SFTP_PASSWORD}} are substituted per company by
+        # _render_relay_instructions_html — see the matching note on Meyer above.
         "installation_instructions_html": (
-            "<p>AfterMarketScout has already created a dedicated FTP account for your company. "
-            "Share the details below with your Crown account representative so they can push your "
-            "stock and pricing data to <strong>our</strong> endpoint.</p>"
-            "<p><strong>Endpoint for your Crown rep</strong></p>"
+            "<p><strong>Crown</strong> works like Meyer and A-Tech: you don't enter any credentials. "
+            "AfterMarketScout has already created a dedicated SFTP account for your company. Your only job is "
+            "to pass the connection details to your Crown rep so they can push your stock and pricing data to "
+            "it.</p>"
+
+            "<p><strong>1. Send the endpoint details to your Crown rep</strong></p>"
+            "<p>The details below are unique to your company &mdash; they're generated automatically and shown "
+            "here already filled in.</p>"
+            + _CALLOUT_OPEN +
             "<ul>"
-            "<li><strong>FTP:</strong> <code>5.161.121.143</code></li>"
+            "<li><strong>Host:</strong> <code>5.161.121.143</code> (SFTP)</li>"
             "<li><strong>Port:</strong> <code>22</code></li>"
             "<li><strong>Folder:</strong> <code>uploads</code></li>"
             "<li><strong>Username:</strong> <code>{{SFTP_USER}}</code></li>"
             "<li><strong>Password:</strong> <code>{{SFTP_PASSWORD}}</code></li>"
             "</ul>"
-            "<p>No credentials to enter here &mdash; just click <strong>Connect</strong>. "
-            "For assistance contact: "
-            "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a>.</p>"
+            "</div>"
+            "<p>Email your Crown account representative:</p>"
+            + _CALLOUT_OPEN +
+            "<p>Could you please push our stock and pricing data to the SFTP endpoint below? Please place the "
+            "files in the <code>uploads</code> folder.</p>"
+            "<p>"
+            "Host: <code>5.161.121.143</code><br />"
+            "Port: <code>22</code><br />"
+            "Username: <code>{{SFTP_USER}}</code><br />"
+            "Password: <code>{{SFTP_PASSWORD}}</code>"
+            "</p>"
+            "</div>"
+            "<p>Treat these details as private &mdash; anyone with them can write to your feed folder.</p>"
+
+            "<p><strong>2. Click Connect</strong></p>"
+            "<p>There are no credentials to enter. Click <strong>Connect</strong> and AfterMarketScout will "
+            "start watching the folder for your files.</p>"
+            "<p>Data appears once Crown sends the first delivery, which depends on how quickly your rep sets it "
+            "up on their side. If nothing arrives after a few days, follow up with your rep and confirm they're "
+            "using the exact host and folder above.</p>"
+
+            "<p><strong>Notes</strong></p>"
+            "<ul>"
+            "<li><strong>No files arriving.</strong> The most common cause is a mismatch on Crown's side "
+            "&mdash; usually a different folder. Ask your rep to confirm the files land in "
+            "<code>uploads</code>.</li>"
+            "<li><strong>Multiple Crown accounts?</strong> Each account needs its own feed delivery from Crown. "
+            "Contact <a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a> and we'll "
+            "set up an additional endpoint for you.</li>"
+            "<li><strong>Need help?</strong> Contact "
+            "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a>.</li>"
+            "</ul>"
         ),
     },
     {
