@@ -1045,6 +1045,9 @@ PROVIDER_CATALOG = [
         "description": "Access DIX Performance North inventory and pricing via FTP relay.",
         "icon_url": "https://api.aftermarketscout.com/uploads/dix_perf_north_logo.png",
         "category": "Distributors",
+        # Temporarily withheld from the catalog and onboarding picker — see the note on CTP
+        # Distributors above. Delete this line to bring it back.
+        "hidden": True,
         "connection_required_fields": [],
         "relay_provisioned": True,
         "relay_credential_fields": ("ftp_user", "ftp_password"),
