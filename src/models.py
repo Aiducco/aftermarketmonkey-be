@@ -3261,6 +3261,162 @@ class BrandMotorStateBrandMapping(django_db_models.Model):
         unique_together = ["brand", "motorstate_brand"]
 
 
+# ---------------------------------------------------------------------------
+# Helmet House (kind=HELMHOUSE) raw feed tables.
+#
+# Helmet House publishes their whole catalog as flat files on plain FTP, rewritten once a
+# day. One file (masterv.csv, ~41k rows) carries everything: brand, both part numbers,
+# prices, per-warehouse stock, dimensions, UPC and status -- so unlike WPS or Motor State
+# there is no second call to make and no incremental cursor to keep. See
+# src.integrations.clients.helmet_house for the file layout.
+#
+# The login is shared rather than issued per dealer, so in practice every connected company
+# reads the same file and sees the same dealer cost. Price is still stored per company
+# (HelmetHouseCompanyPricing) so the master pricing layer keys the same way as every other
+# provider, and so per-dealer logins would need no schema change.
+# ---------------------------------------------------------------------------
+class HelmetHouseBrand(django_db_models.Model):
+    """
+    One brand from the feed's ``Brand`` column. ``external_id``/``name`` are the normalised,
+    uppercase name we resolve against Brands; ``source_name`` keeps Helmet House's own spelling
+    so a feed value can always be traced back.
+
+    Helmet House spells a few brands in ways that would never match on their own -- "T/M" is
+    Tourmaster, "100 %" is 100% -- and files shields, decals and luggage under the non-brands
+    "MISC" and "BAGS". Both are handled by src.constants.HELMET_HOUSE_BRAND_ALIASES, which
+    folds the two buckets into a "HELMET HOUSE" house brand rather than creating literal
+    MISC/BAGS brands in the catalog.
+    """
+    external_id = django_db_models.CharField(max_length=255)
+    name = django_db_models.CharField(max_length=255)
+    source_name = django_db_models.CharField(max_length=255, null=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "helmet_house_brands"
+        unique_together = [["external_id"]]
+
+
+class HelmetHousePart(django_db_models.Model):
+    """
+    One row of the Helmet House catalog: distributor-wide catalog data plus their two-warehouse
+    stock. Prices live per company on HelmetHouseCompanyPricing.
+
+    ``sku`` is Helmet House's own part number ("0810-1234-00"), unique across the whole feed.
+    ``vendor_part_number`` is the manufacturer's number ("315012710-48" for an Alpinestars item)
+    and is what MasterPart keys on where it is usable -- see
+    master_parts._helmet_house_master_part_number for when it is not.
+
+    ``photo_filename`` is deliberately just the filename, not a URL: the feed's own image host
+    (ftp.helmethouse.com/Images11/) answers 404 for every file it names, so building a URL from
+    it would put a dead link on every master part. Kept so images can be wired up the day a
+    working host is available.
+    """
+    brand = django_db_models.ForeignKey(
+        HelmetHouseBrand, on_delete=django_db_models.CASCADE, related_name="parts"
+    )
+    sku = django_db_models.CharField(max_length=255)
+    # Helmet House's own part number with the dashes removed ("01-003" -> "01003"). Their
+    # "Alt Part#" column; not a separate part, and not a manufacturer number.
+    alt_part_number = django_db_models.CharField(max_length=255, null=True)
+    vendor_part_number = django_db_models.CharField(max_length=255, null=True)
+
+    description = django_db_models.CharField(max_length=512, null=True)
+    long_description = django_db_models.TextField(null=True)
+    upc = django_db_models.CharField(max_length=64, null=True)
+
+    # Feed values: OK, On Sale, Out of Stock, Discontinued.
+    status = django_db_models.CharField(max_length=32, null=True)
+    category = django_db_models.CharField(max_length=255, null=True)
+    product_class = django_db_models.CharField(max_length=255, null=True)
+    size = django_db_models.CharField(max_length=64, null=True)
+    color = django_db_models.CharField(max_length=128, null=True)
+    model = django_db_models.CharField(max_length=255, null=True)
+    country_of_origin = django_db_models.CharField(max_length=16, null=True)
+
+    weight = django_db_models.FloatField(null=True)
+    length = django_db_models.FloatField(null=True)
+    width = django_db_models.FloatField(null=True)
+    depth = django_db_models.FloatField(null=True)
+
+    photo_filename = django_db_models.CharField(max_length=255, null=True)
+    alt_photo_filenames = django_db_models.JSONField(null=True)
+
+    # Helmet House runs two distribution centres and reports each separately; total_qty is their
+    # own TTL Qty column, not a sum we compute, so it stays authoritative if they ever add a third.
+    west_qty = django_db_models.IntegerField(default=0)
+    east_qty = django_db_models.IntegerField(default=0)
+    total_qty = django_db_models.IntegerField(default=0)
+
+    has_map_policy = django_db_models.BooleanField(default=False)
+
+    # Which file this row was parsed from (masterv.csv normally, master.csv on a fallback), so a
+    # row missing its vendor part number can be explained without re-reading the feed.
+    source_filename = django_db_models.CharField(max_length=64, null=True)
+    raw_data = django_db_models.JSONField(null=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "helmet_house_parts"
+        unique_together = [["brand", "sku"]]
+        indexes = [
+            django_db_models.Index(fields=["sku"], name="hh_parts_sku_idx"),
+            django_db_models.Index(fields=["status"], name="hh_parts_status_idx"),
+        ]
+
+
+class HelmetHouseCompanyPricing(django_db_models.Model):
+    """
+    Per-company Helmet House pricing for a catalog row (HelmetHousePart).
+
+    ``dealer_price`` is the feed's Dealer column (cost), ``retail_price`` its Retail (MSRP) and
+    ``map_price`` its MAPP Price. MAP is only meaningful where ``has_map_policy`` is set: roughly
+    a third of rows carry no policy and leave the price blank, and storing that as 0.00 would
+    floor the price downstream.
+    """
+    part = django_db_models.ForeignKey(
+        HelmetHousePart, on_delete=django_db_models.CASCADE, related_name="company_pricing"
+    )
+    company = django_db_models.ForeignKey(
+        Company, on_delete=django_db_models.CASCADE, related_name="helmet_house_company_pricing"
+    )
+
+    dealer_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True)
+    retail_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True)
+    map_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True)
+    has_map_policy = django_db_models.BooleanField(default=False)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "helmet_house_company_pricing"
+        unique_together = ["part", "company"]
+
+
+class BrandHelmetHouseBrandMapping(django_db_models.Model):
+    """Maps our Brands to HelmetHouseBrand (for master parts sync). The feed carries no AAIA
+    code, so resolution is name-based only (see
+    helmet_house.sync_unmapped_helmet_house_brands_to_brands)."""
+    brand = django_db_models.ForeignKey(
+        Brands, on_delete=django_db_models.CASCADE, related_name="helmet_house_brand_mappings"
+    )
+    helmet_house_brand = django_db_models.ForeignKey(
+        HelmetHouseBrand, on_delete=django_db_models.CASCADE, related_name="brand_mappings"
+    )
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "brand_helmet_house_brand_mapping"
+        unique_together = ["brand", "helmet_house_brand"]
+
+
 class EliteWheelBrand(django_db_models.Model):
     """
     One manufacturer from Elite Wheel & Tire's inventory workbook. Elite's feed is split in two --
@@ -3446,3 +3602,175 @@ class BrandEliteWheelBrandMapping(django_db_models.Model):
     class Meta:
         db_table = "brand_elite_wheel_brand_mapping"
         unique_together = ["brand", "elite_wheel_brand"]
+
+
+class TheWheelGroupBrand(django_db_models.Model):
+    """
+    One house brand from The Wheel Group's US mastersheet (Touren, Mayhem, ION Alloy, Cali
+    Off-Road, Ridler, Dirty Life, Kraze, American Truxx, Mazzi, TuffStuff, ION Trailer).
+    ``external_id`` is the uppercased brand name -- unlike EliteWheelBrand there is no wheel/tire
+    split to disambiguate, TWG sells wheels only. ``aaia_code`` is the brand's dominant AAIA code
+    from the sheet's per-row ``AAIA CODE`` column, used when a matching Brands row has to be
+    created (same role as TurnFourteenBrand.aaia_code).
+    """
+    external_id = django_db_models.CharField(max_length=255)
+    name = django_db_models.CharField(max_length=255)
+    aaia_code = django_db_models.CharField(max_length=255, null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "thewheelgroup_brands"
+        unique_together = [["external_id"]]
+
+
+class TheWheelGroupPart(django_db_models.Model):
+    """
+    A wheel from TWG's ``US Data Mastersheet`` worksheet (catalog + list prices; per-company cost
+    lives on TheWheelGroupCompanyPricing).
+
+    Wheel-spec and dimension columns are CharField like VossenPart's and EliteWheelPartWheel's
+    equivalents: the sheet's own formats vary (bolt patterns as ``"5-114.3"``, backspace as a full
+    float expansion ``"4.751968503937007"``, blanks and Excel error cells), and coercing them would
+    silently drop values rather than surface them. Only ``msrp``/``map_price`` are numeric, because
+    they are the two fields the pricing layer actually computes on.
+
+    There is no quantity column here: the mastersheet is a catalog and list-price sheet with no
+    stock at all, so TWG parts get no ProviderPartInventory row until a real feed is delivered
+    (see ``master_parts.sync_provider_details_from_the_wheel_group``).
+    """
+    brand = django_db_models.ForeignKey(
+        TheWheelGroupBrand,
+        on_delete=django_db_models.CASCADE,
+        related_name="parts",
+    )
+    sku = django_db_models.CharField(max_length=255)
+    aaia_code = django_db_models.CharField(max_length=255, null=True, blank=True)
+
+    name = django_db_models.CharField(max_length=255, null=True, blank=True)
+    style_number = django_db_models.CharField(max_length=64, null=True, blank=True)
+    description = django_db_models.TextField(null=True, blank=True)
+    short_description = django_db_models.TextField(null=True, blank=True)
+
+    diameter = django_db_models.CharField(max_length=32, null=True, blank=True)
+    wheel_width = django_db_models.CharField(max_length=32, null=True, blank=True)
+    hub_bore = django_db_models.CharField(max_length=32, null=True, blank=True)
+    bolt_pattern_1 = django_db_models.CharField(max_length=64, null=True, blank=True)
+    bolt_pattern_2 = django_db_models.CharField(max_length=64, null=True, blank=True)
+    # OFFSETNUM (millimetres) and OFFSET (TWG's LOW/MID/HIGH/DUALLY class) respectively.
+    offset = django_db_models.CharField(max_length=32, null=True, blank=True)
+    offset_class = django_db_models.CharField(max_length=32, null=True, blank=True)
+    backspace = django_db_models.CharField(max_length=32, null=True, blank=True)
+    wheel_lip_size = django_db_models.CharField(max_length=32, null=True, blank=True)
+    load_rating = django_db_models.CharField(max_length=32, null=True, blank=True)
+    color = django_db_models.CharField(max_length=64, null=True, blank=True)
+    finish = django_db_models.CharField(max_length=128, null=True, blank=True)
+
+    upc = django_db_models.CharField(max_length=64, null=True, blank=True)
+    country_of_origin = django_db_models.CharField(max_length=64, null=True, blank=True)
+    division = django_db_models.CharField(max_length=64, null=True, blank=True)
+    group_code = django_db_models.CharField(max_length=64, null=True, blank=True)
+    # Companion SKUs, not attributes: the center cap and the hardware that ship with this wheel.
+    wheel_cap = django_db_models.CharField(max_length=64, null=True, blank=True)
+    screw = django_db_models.CharField(max_length=64, null=True, blank=True)
+
+    dually_wheel = django_db_models.BooleanField(null=True, blank=True)
+    winter_approved = django_db_models.BooleanField(null=True, blank=True)
+    tpms_compatible = django_db_models.BooleanField(null=True, blank=True)
+
+    lugnut_open_closed = django_db_models.CharField(max_length=32, null=True, blank=True)
+    lugnut_type_1 = django_db_models.CharField(max_length=32, null=True, blank=True)
+    lugnut_type_2 = django_db_models.CharField(max_length=32, null=True, blank=True)
+    lugseat_type = django_db_models.CharField(max_length=32, null=True, blank=True)
+
+    structure_warranty = django_db_models.CharField(max_length=128, null=True, blank=True)
+    finish_warranty = django_db_models.CharField(max_length=128, null=True, blank=True)
+    beadlock_instructions_url = django_db_models.CharField(max_length=512, null=True, blank=True)
+
+    # Shipping carton, not the wheel: WIDTH / HEIGHT / DEPTH and the two weight columns.
+    box_width = django_db_models.CharField(max_length=32, null=True, blank=True)
+    box_height = django_db_models.CharField(max_length=32, null=True, blank=True)
+    box_depth = django_db_models.CharField(max_length=32, null=True, blank=True)
+    product_weight = django_db_models.CharField(max_length=32, null=True, blank=True)
+    ship_weight = django_db_models.CharField(max_length=32, null=True, blank=True)
+
+    image_1 = django_db_models.CharField(max_length=1024, null=True, blank=True)
+    image_2 = django_db_models.CharField(max_length=1024, null=True, blank=True)
+    image_3 = django_db_models.CharField(max_length=1024, null=True, blank=True)
+    image_4 = django_db_models.CharField(max_length=1024, null=True, blank=True)
+
+    note = django_db_models.TextField(null=True, blank=True)
+    comment = django_db_models.TextField(null=True, blank=True)
+    bullet_points = django_db_models.TextField(null=True, blank=True)
+    sales_description = django_db_models.TextField(null=True, blank=True)
+
+    # Distributor-wide list prices from the sheet. ``map_price`` is null whenever MAP isn't
+    # enforced for the SKU -- TWG writes 0 in that case, which is not a price.
+    msrp = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    map_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    map_enforced = django_db_models.BooleanField(null=True, blank=True)
+
+    source_filename = django_db_models.CharField(max_length=255, null=True, blank=True)
+    raw_data = django_db_models.JSONField(null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "thewheelgroup_parts"
+        unique_together = [["brand", "sku"]]
+
+
+class TheWheelGroupCompanyPricing(django_db_models.Model):
+    """
+    Per-company TWG pricing for a catalog row (TheWheelGroupPart). Catalog and list prices live on
+    the part and are shared; prices are per company so ProviderPartCompanyPricing sync keys off
+    (part, company) like every other provider.
+
+    Until TWG delivers a real per-dealer feed, the public mastersheet is the only source and it
+    carries no dealer cost -- so ``cost`` stays null and ``map``/``retail_price`` mirror the
+    catalog's MAP/MSRP. See
+    ``src.integrations.services.the_wheel_group.sync_the_wheel_group_company_pricing_for_company_provider``.
+    """
+    part = django_db_models.ForeignKey(
+        TheWheelGroupPart,
+        on_delete=django_db_models.CASCADE,
+        related_name="company_pricing",
+    )
+    company = django_db_models.ForeignKey(
+        Company,
+        on_delete=django_db_models.CASCADE,
+        related_name="the_wheel_group_company_pricing",
+    )
+    cost = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    map = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    retail_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "thewheelgroup_company_pricing"
+        unique_together = [["part", "company"]]
+
+
+class BrandTheWheelGroupBrandMapping(django_db_models.Model):
+    """Maps our Brands to TheWheelGroupBrand (for master parts sync)."""
+    brand = django_db_models.ForeignKey(
+        Brands,
+        on_delete=django_db_models.CASCADE,
+        related_name="the_wheel_group_brand_mappings",
+    )
+    the_wheel_group_brand = django_db_models.ForeignKey(
+        TheWheelGroupBrand,
+        on_delete=django_db_models.CASCADE,
+        related_name="brand_mappings",
+    )
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "brand_the_wheel_group_brand_mapping"
+        unique_together = ["brand", "the_wheel_group_brand"]

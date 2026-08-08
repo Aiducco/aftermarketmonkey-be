@@ -17,6 +17,8 @@ from src.integrations.clients.atech import client as atech_client
 from src.integrations.clients.atech import exceptions as atech_exceptions
 from src.integrations.clients.elite_wheel import client as elite_wheel_client
 from src.integrations.clients.elite_wheel import exceptions as elite_wheel_exceptions
+from src.integrations.clients.helmet_house import client as helmet_house_client
+from src.integrations.clients.helmet_house import exceptions as helmet_house_exceptions
 from src.integrations.clients.keystone import client as keystone_client
 from src.integrations.clients.keystone import exceptions as keystone_exceptions
 from src.integrations.clients.keystone import order_client as keystone_order_client
@@ -30,6 +32,8 @@ from src.integrations.clients.premier import exceptions as premier_exceptions
 from src.integrations.clients.premier import order_client as premier_order_client
 from src.integrations.clients.rough_country import client as rough_country_client
 from src.integrations.clients.rough_country import exceptions as rough_country_exceptions
+from src.integrations.clients.the_wheel_group import client as the_wheel_group_client
+from src.integrations.clients.the_wheel_group import exceptions as the_wheel_group_exceptions
 from src.integrations.clients.tirerack import client as tirerack_client
 from src.integrations.clients.tirerack import exceptions as tirerack_exceptions
 from src.integrations.clients.turn_14 import client as turn14_client
@@ -604,6 +608,33 @@ def _validate_wps_connection(credentials: typing.Dict[str, typing.Any]) -> _Vali
     return None, None
 
 
+def _validate_helmet_house_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
+    """
+    Validates a Helmet House FTP login: connect on port 21, then confirm a catalog file
+    (masterv.csv, or master.csv as a fallback) is actually present. Never downloads the ~10 MB
+    file — an account that authenticates but is pointed at a directory without the catalog would
+    otherwise look connected and never sync anything.
+
+    Helmet House publishes one shared login rather than issuing an account per dealer, so a
+    rejected login usually means the shared credential has been rotated rather than that this
+    dealer's access was revoked. The message the user sees says as much (see the HELMHOUSE entry
+    in PROVIDER_CATALOG).
+    """
+    try:
+        client = helmet_house_client.HelmetHouseFTPClient(credentials=credentials)
+    except ValueError as e:
+        return str(e), CONNECTION_ERROR_INVALID_INPUT
+    try:
+        client.test_connection()
+    except helmet_house_exceptions.HelmetHouseFTPAuthError as e:
+        return str(e), CONNECTION_ERROR_INVALID_CREDENTIALS
+    except helmet_house_exceptions.HelmetHouseFileNotFoundError as e:
+        return str(e), CONNECTION_ERROR_NOT_FOUND
+    except (helmet_house_exceptions.HelmetHouseException, ValueError) as e:
+        return str(e), CONNECTION_ERROR_CONNECTION_FAILED
+    return None, None
+
+
 def _validate_tirerack_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
     try:
         client = tirerack_client.TireRackSFTPClient(credentials=credentials)
@@ -633,6 +664,7 @@ _CONNECTION_VALIDATORS: typing.Dict[int, typing.Callable[[typing.Dict[str, typin
     src_enums.BrandProviderKind.ELITE_WHEEL.value: _validate_elite_wheel_connection,
     src_enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING.value: _validate_motorstate_connection,
     src_enums.BrandProviderKind.WESTERN_POWER_SPORTS.value: _validate_wps_connection,
+    src_enums.BrandProviderKind.HELMHOUSE.value: _validate_helmet_house_connection,
 }
 
 
@@ -804,12 +836,13 @@ def _validate_order_connection_for_method(
     return _validate_order_connection(kind, credentials)
 
 
-# Relay-provisioned kinds we know an expected filename for — see _relay_feed_connection_status.
-# Other relay-provisioned kinds (CTP, Crown, DIX, The Wheel Group) have no ingest client built
-# yet, so there's no known filename to check against.
+# Relay-provisioned kinds we can actually check something for — see
+# _relay_feed_connection_status. Other relay-provisioned kinds (CTP, Crown, DIX) have no ingest
+# client built yet, so there's nothing to check against.
 _RELAY_FEED_CHECK_KINDS = {
     src_enums.BrandProviderKind.MEYER.value,
     src_enums.BrandProviderKind.ATECH.value,
+    src_enums.BrandProviderKind.THE_WHEEL_GROUP.value,
 }
 
 
@@ -822,6 +855,12 @@ def _relay_feed_connection_status(
     Returns (None, None) for any other kind — nothing to check. Single source of truth for this
     logic — used both here (to set an initial status at connect time) and by the
     check_company_provider_connections cron (to keep it fresh afterwards).
+
+    The Wheel Group is the one exception to "check the relay folder": their catalog and list
+    pricing come from the public mastersheet they publish, not from a relay drop, so a TWG
+    connection is already receiving data on the day it's made. It's checked against whichever
+    source it will actually read — the client decides, so this switches to the dealer's own relay
+    drop by itself once THE_WHEEL_GROUP_FORCE_PUBLIC_SHARE is turned off.
     """
     if kind not in _RELAY_FEED_CHECK_KINDS:
         return None, None
@@ -832,6 +871,21 @@ def _relay_feed_connection_status(
         )
 
     creds = {"sftp_user": company.relay_sftp_username, "sftp_password": company.relay_sftp_password}
+
+    if kind == src_enums.BrandProviderKind.THE_WHEEL_GROUP.value:
+        try:
+            the_wheel_group_client.TheWheelGroupFeedClient(credentials=creds).test_connection()
+        except (the_wheel_group_exceptions.TheWheelGroupException, ValueError) as e:
+            return (
+                src_enums.CompanyProviderConnectionStatus.FAILING,
+                "Could not reach The Wheel Group's feed: {}".format(e),
+            )
+        return (
+            src_enums.CompanyProviderConnectionStatus.INGESTING,
+            "Reading The Wheel Group's catalog — your own cost and stock follow once they deliver "
+            "your feed.",
+        )
+
     try:
         if kind == src_enums.BrandProviderKind.MEYER.value:
             client = meyer_client.MeyerSFTPClient(credentials=creds)

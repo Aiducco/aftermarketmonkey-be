@@ -215,6 +215,16 @@ WPS_BASE_URL = os.environ.get("WPS_BASE_URL", "https://api.wps-inc.com")
 # Motor State Distributing read-only catalog/pricing API (see src.integrations.clients.motorstate).
 MOTOR_STATE_BASE_URL = os.environ.get("MOTOR_STATE_BASE_URL", "https://api.motorstate.com")
 
+# Helmet House price/stock feed (see src.integrations.clients.helmet_house). Plain FTP, port 21 --
+# their server offers no TLS at all, so this cannot be upgraded to FTPS like Keystone's. Host and
+# port are fixed here rather than collected per connection: dealers are given only a username and
+# password (the HELMHOUSE entry in PROVIDER_CATALOG asks for nothing else).
+HELMET_HOUSE_FTP_HOST = os.environ.get("HELMET_HOUSE_FTP_HOST", "ftp.helmethouse.com")
+HELMET_HOUSE_FTP_PORT = int(os.environ.get("HELMET_HOUSE_FTP_PORT", "21"))
+HELMET_HOUSE_LOCAL_PATH = os.environ.get(
+    "HELMET_HOUSE_LOCAL_PATH", "/tmp/helmet_house_masterv.csv"
+)
+
 # Elite Wheel & Tire (see src.integrations.clients.elite_wheel). Elite's SFTPGo server exposes the
 # same TriWeeklyUpdate*.xlsx drop folder both as per-dealer SFTP accounts and as a public,
 # inventory-only share; the shared catalog reads the public share, and a connected dealer's own
@@ -229,6 +239,26 @@ ELITE_WHEEL_PUBLIC_SHARE_ID = os.environ.get(
 ELITE_WHEEL_FORCE_PUBLIC_SHARE = (
     os.environ.get("ELITE_WHEEL_FORCE_PUBLIC_SHARE", "false").strip().lower() == "true"
 )
+
+# The Wheel Group (see src.integrations.clients.the_wheel_group). TWG is a relay-provisioned
+# integration -- the long-term source is each company's own drop on our SFTP relay, the same
+# endpoint Meyer and A-Tech use. Nothing is being delivered there yet, so the catalog is read from
+# TWG's public Dropbox folder share (dl=1 returns the folder as a zip holding
+# "US Wheel Data Mastersheet.xlsx"). THE_WHEEL_GROUP_FORCE_PUBLIC_SHARE therefore defaults to
+# True: every connected company already has relay credentials stored, and without the override
+# each sync would read an empty relay folder. Set it to "false" once TWG starts delivering and
+# every connection switches to its own drop with no code change.
+THE_WHEEL_GROUP_PUBLIC_SHARE_URL = os.environ.get(
+    "THE_WHEEL_GROUP_PUBLIC_SHARE_URL",
+    "https://www.dropbox.com/scl/fo/dwls6ye5utcah34ptw61n/"
+    "AKgB7W8qs2E8h_C9uzxaKqs?rlkey=nud3j0hudfaakd3m9enf8ag35&dl=1",
+)
+THE_WHEEL_GROUP_FORCE_PUBLIC_SHARE = (
+    os.environ.get("THE_WHEEL_GROUP_FORCE_PUBLIC_SHARE", "true").strip().lower() == "true"
+)
+THE_WHEEL_GROUP_RELAY_HOST = os.environ.get("THE_WHEEL_GROUP_RELAY_HOST", "5.161.121.143")
+THE_WHEEL_GROUP_RELAY_PORT = int(os.environ.get("THE_WHEEL_GROUP_RELAY_PORT", "22"))
+THE_WHEEL_GROUP_RELAY_DIRECTORY = os.environ.get("THE_WHEEL_GROUP_RELAY_DIRECTORY", "uploads")
 
 # Turn 14 Electronic Order API (quote/order/status) — separate hosts for their "testing" and
 # "production" environments; the "environment" value must also be set to match in every

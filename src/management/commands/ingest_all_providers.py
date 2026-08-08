@@ -47,6 +47,7 @@ from src.integrations.services import (
     atech,
     dlg,
     elite_wheel,
+    helmet_house,
     integration_pricing_sync_jobs,
     keystone,
     master_parts,
@@ -55,6 +56,7 @@ from src.integrations.services import (
     premier,
     quadratec,
     rough_country,
+    the_wheel_group,
     tirerack,
     turn_14,
     vossen,
@@ -144,6 +146,8 @@ class Command(BaseCommand):
             "ingest_all_providers_tirerack",
             "ingest_all_providers_quadratec",
             "ingest_all_providers_elite_wheel",
+            "ingest_all_providers_the_wheel_group",
+            "ingest_all_providers_helmet_house",
             "ingest_all_providers_sync_all_master_parts",
             "ingest_all_providers_enqueue_pricing_jobs",
             "ingest_all_providers_meilisearch_reindex",
@@ -176,6 +180,8 @@ class Command(BaseCommand):
                 ("elite_wheel",   self._run_elite_wheel),
                 ("motorstate",    self._run_motorstate),
                 ("wps",           self._run_wps),
+                ("the_wheel_group", self._run_the_wheel_group),
+                ("helmet_house",  self._run_helmet_house),
             ]
             for name, run_fn in phase1_providers:
                 self._ingest_log("phase 1 | starting {} fetch".format(name))
@@ -350,6 +356,30 @@ class Command(BaseCommand):
             wps.fetch_and_save_wps_products()
             wps.fetch_and_save_wps_items_updates()
             wps.sync_unmapped_wps_brands_to_brands()
+
+    def _run_helmet_house(self) -> None:
+        with self._audited_step(
+            "ingest_all_providers_helmet_house",
+            "Helmet House source fetch + unmapped brand sync complete (derived in sync_all).",
+            continue_on_error=True,
+        ):
+            # One ~10 MB CSV holds the whole catalog and it is rewritten once a day, so there is
+            # no incremental path to take -- the nightly pass just re-reads it. force_download is
+            # left on so the nightly run never syncs yesterday's cached copy. Per-company pricing
+            # is not fetched here; that belongs to the pricing-job queue.
+            self._ingest_log("Helmet House: catalog CSV + unmapped brand sync")
+            helmet_house.fetch_and_save_helmet_house_catalog(force_download=True)
+            helmet_house.sync_unmapped_helmet_house_brands_to_brands()
+
+    def _run_the_wheel_group(self) -> None:
+        with self._audited_step(
+            "ingest_all_providers_the_wheel_group",
+            "The Wheel Group source fetch + unmapped brand sync complete (derived in sync_all).",
+            continue_on_error=True,
+        ):
+            self._ingest_log("The Wheel Group: mastersheet + unmapped brand sync")
+            the_wheel_group.fetch_and_save_the_wheel_group()
+            the_wheel_group.sync_unmapped_the_wheel_group_brands_to_brands()
 
     def _run_elite_wheel(self) -> None:
         with self._audited_step(

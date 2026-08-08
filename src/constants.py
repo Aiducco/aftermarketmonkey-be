@@ -185,6 +185,71 @@ TIRERACK_CREDENTIALS_SFTP_PORT = "sftp_port"
 TIRERACK_CREDENTIALS_SFTP_USER = "sftp_user"
 TIRERACK_CREDENTIALS_SFTP_PASSWORD = "sftp_password"
 
+# CompanyProviders.credentials JSON keys for Helmet House. Plain FTP on port 21 (no TLS -- their
+# server offers none), host fixed in settings, so a connection only carries the login. Unlike every
+# other distributor here this is NOT a per-dealer account: Helmet House publishes one shared login
+# for their whole feed, so every connected company reads the same file and therefore sees the same
+# dealer cost. Prices are still stored per company (HelmetHouseCompanyPricing) so the master pricing
+# layer keys the same way as every other provider, and so the day Helmet House does issue per-dealer
+# logins nothing downstream has to change.
+#
+# Never hardcode the shared username/password here -- it would commit a live credential to the repo
+# and surface it in the public provider catalog response. Dealers get it from Helmet House and enter
+# it themselves (see the HELMHOUSE entry in PROVIDER_CATALOG).
+HELMET_HOUSE_CREDENTIALS_FTP_HOST = "ftp_host"
+HELMET_HOUSE_CREDENTIALS_FTP_PORT = "ftp_port"
+HELMET_HOUSE_CREDENTIALS_FTP_USER = "ftp_user"
+HELMET_HOUSE_CREDENTIALS_FTP_PASSWORD = "ftp_password"
+# Optional per-connection override of the catalog filename (see the client's CATALOG_FILENAMES for
+# the default preference order).
+HELMET_HOUSE_CREDENTIALS_CATALOG_FILENAME = "catalog_filename"
+
+# Helmet House brand column -> the name we resolve against Brands. Their Brand column carries a few
+# in-house abbreviations that would otherwise never match ("T/M" is Tourmaster, whose own parts also
+# appear spelled out in the descriptions), plus two buckets that are not brands at all ("MISC",
+# "BAGS" -- shields, decals, luggage). Those two are folded into a Helmet House house brand rather
+# than creating literal MISC/BAGS brands in the catalog.
+#
+# The last two entries pin a name the shared fuzzy matcher resolves to the wrong Brands row, both
+# verified against live data:
+#   * "HJC" fuzzy-matches both HJC HELMETS and HJC MOTORSPORTS - INACTIVE, and
+#     best_fuzzy_brand_match breaks the tie on the longest name -- so all 10,363 HJC parts would
+#     land on the inactive stub (1 master part, 0 of the feed's numbers) instead of HJC HELMETS
+#     (1,652 master parts, 210 of the feed's numbers already present).
+#   * "SENA" already resolves correctly, but is pinned so the mapping cannot drift if another
+#     SENA* brand is ever created.
+#
+# "ALPINESTARS" is pinned for a different reason: the catalog carries three Alpinestars rows
+# (RACE, MX, USA) and none is a natural parent, so the choice is a taxonomy decision rather than
+# something the data settles -- the feed's 3,973 parts UPC-match only 26 rows in RACE and 13 in
+# MX. RACE is where Western Power Sports, the closest peer powersports distributor, keeps its
+# 4,187 Alpinestars parts, so sending Helmet House there is what lets the same physical part from
+# the two of them resolve to one master part.
+HELMET_HOUSE_HOUSE_BRAND_NAME = "HELMET HOUSE"
+HELMET_HOUSE_BRAND_ALIASES = {
+    "T/M": "TOURMASTER",
+    "100 %": "100%",
+    "MISC": HELMET_HOUSE_HOUSE_BRAND_NAME,
+    "BAGS": HELMET_HOUSE_HOUSE_BRAND_NAME,
+    "HJC": "HJC HELMETS",
+    "SENA": "SENA TECHNOLOGIES",
+    "ALPINESTARS": "ALPINESTARS RACE",
+}
+
+# Brands that must never be resolved by the fuzzy word-prefix phase -- exact and compact-key
+# matching only, otherwise create the brand.
+#
+# fuzzy_brand_name_matches treats a single token that is a >=3-character prefix of the other as a
+# match, so "FASTHOUSE" matches the unrelated existing brand "FAST" (Fuel Air Spark Technology, an
+# EFI brand) and would drag all 9,386 Fast House apparel parts onto it. Confirmed against live
+# data: 0 of the feed's 9,385 Fast House part numbers exist under FAST or FAST SHAFTS, while the
+# brands the matcher gets right overlap by 2-23%. Fast House has no existing Brands row, so the
+# correct outcome is to create one.
+#
+# This is a guard for this feed only; the shared matcher is used by a dozen other providers whose
+# existing mappings would shift if its tie-breaking were changed.
+HELMET_HOUSE_EXACT_MATCH_ONLY_BRANDS = frozenset({"FASTHOUSE"})
+
 # WheelPros SFTP feed paths (relative; leading / added by client when downloading)
 WHEELPROS_FEED_PATHS = {
     "wheel": "CommonFeed/USD/WHEEL/wheelInvPriceData.csv",
@@ -1565,13 +1630,13 @@ PROVIDER_CATALOG = [
     {
         "kind": enums.BrandProviderKind.THE_WHEEL_GROUP,
         "name": "The Wheel Group",
-        "description": "Access The Wheel Group inventory and pricing via AfterMarketScout's SFTP relay.",
+        "description": "Access The Wheel Group's wheel catalog and pricing via AfterMarketScout's SFTP relay.",
         "icon_url": "https://api.aftermarketscout.com/uploads/the_wheel_group_logo.png",
         "category": "Distributors",
         "connection_required_fields": [],
         "relay_provisioned": True,
         "relay_credential_fields": ("ftp_user", "ftp_password"),
-        "integration_time": "Data available within 1-2 days",
+        "integration_time": "Catalog available immediately; your pricing within 1-2 days",
         # {{SFTP_USER}}/{{SFTP_PASSWORD}} are substituted per company by
         # _render_relay_instructions_html — see the matching note on Meyer above.
         "installation_instructions_html": (
@@ -1579,6 +1644,11 @@ PROVIDER_CATALOG = [
             "credentials. AfterMarketScout has already created a dedicated SFTP account for your company. Your "
             "only job is to pass the connection details to your Wheel Group rep so they can push the feed to "
             "it.</p>"
+
+            "<p>The Wheel Group's wheel catalog &mdash; Touren, Mayhem, ION Alloy, Cali Off-Road, Ridler, "
+            "Dirty Life, Kraze, American Truxx, Mazzi, Tuff Stuff and ION Trailer, with full specs, images, "
+            "MSRP and MAP &mdash; is already in AfterMarketScout, read from the mastersheet they publish. "
+            "Connecting is what adds <strong>your dealer pricing and stock</strong> on top of it.</p>"
 
             "<p><strong>1. Send the relay details to your Wheel Group rep</strong></p>"
             "<p>The details below are unique to your company &mdash; they're generated automatically and shown "
@@ -1609,14 +1679,16 @@ PROVIDER_CATALOG = [
             "<p><strong>2. Click Connect</strong></p>"
             "<p>There are no credentials to enter. Click <strong>Connect</strong> and AfterMarketScout will "
             "start watching the folder for your files.</p>"
-            "<p>Data appears once The Wheel Group sends the first delivery, which depends on how quickly your "
-            "rep sets it up on their side. If nothing arrives after a few days, follow up and confirm they're "
+            "<p>The Wheel Group catalog with MSRP and MAP is available to you straight away. Your own cost and "
+            "stock appear once The Wheel Group sends the first delivery, which depends on how quickly your rep "
+            "sets it up on their side. If nothing arrives after a few days, follow up and confirm they're "
             "using the exact host and folder above.</p>"
 
             "<p><strong>Notes</strong></p>"
             "<ul>"
             "<li><strong>No files arriving.</strong> The most common cause is a mismatch on their side &mdash; "
-            "usually a different folder. Ask your rep to confirm the files land in <code>uploads</code>.</li>"
+            "usually a different folder. Ask your rep to confirm the files land in <code>uploads</code>. Your "
+            "catalog and list pricing keep working either way.</li>"
             "<li><strong>Multiple Wheel Group accounts?</strong> Each account needs its own feed delivery. "
             "Contact <a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a> and we'll "
             "set up an additional endpoint for you.</li>"

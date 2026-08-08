@@ -5444,6 +5444,595 @@ def sync_derived_from_wps(*, reindex_meilisearch: bool = False, skip_master_part
     logger.info("{} Completed WPS-only derived sync.".format(_LOG_PREFIX))
 
 
+# ==========================================================================================
+# Helmet House
+# ==========================================================================================
+def _helmet_house_provider_external_id(
+    helmet_house_brand_id: typing.Optional[int], sku: typing.Optional[str]
+) -> str:
+    """
+    Stable Helmet House ProviderPart key: helmet_house_brand row id + Helmet House's own part
+    number (unique across their whole feed), same compound shape as every other provider.
+    """
+    return "{}_{}".format(int(helmet_house_brand_id or 0), (sku or "").strip())
+
+
+def _helmet_house_master_part_number(
+    vendor_part_number: typing.Optional[str],
+    alt_part_number: typing.Optional[str],
+    sku: typing.Optional[str],
+) -> str:
+    """
+    MasterPart part number for a Helmet House row: the manufacturer part number (their
+    ``Vendor P/N``) when it looks like one, else Helmet House's own part number.
+
+    Their own part number is internal ("4009-0005-48"), so keying on it would never dedupe
+    against the same part from another distributor. Vendor P/N is the real manufacturer number
+    for the volume brands (Alpinestars 315012710-48, 100% 50002-252-01, Quad Lock QLP-360-HCB,
+    FastHouse 100000-00-08) and is populated on 99.9% of the 40,770-row feed. Two shapes in that
+    column are not part numbers and are rejected here, measured against the live file:
+
+      * 2,793 rows (6.9%) hold a note or a packed description rather than a number
+        ("000 PINPC OS", "50 QR-J BASE", "NC TRAVELERBAG"). Anything with internal whitespace is
+        treated as a note, same rule as WPS's supplier_product_id.
+      * 7,556 rows repeat Helmet House's own number with the dashes stripped -- exactly their
+        ``Alt Part#`` column, which is always the part number minus dashes. That is the house
+        brands (Cortech "8100-0105-03" -> "8100010503", NORU, Tourmaster): still an internal
+        number, just spelled differently, and using it would create a master part no other
+        distributor spells that way.
+
+    Collisions after those rejections are negligible (~130 across the whole feed, mostly HJC and
+    Sidi size runs) and are harmless: MasterPart dedupes on them by design, and ProviderPart
+    still keys on the feed-unique Helmet House number.
+    """
+    vendor = (vendor_part_number or "").strip()
+    alt = (alt_part_number or "").strip()
+    if vendor and " " not in vendor and vendor.upper() != alt.upper():
+        return vendor
+    return (sku or "").strip()
+
+
+def _helmet_house_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
+    """product_details for a HelmetHousePart row (shown on ProviderPart)."""
+    return [
+        {"key": "helmet_house_pn", "label": "Helmet House Part No", "value": row.get("sku") or None},
+        {"key": "mpn", "label": "MPN", "value": row.get("vendor_part_number") or None},
+        {"key": "upc", "label": "UPC", "value": row.get("upc") or None},
+        {"key": "description", "label": "Description", "value": row.get("description") or None},
+        {"key": "status", "label": "Status", "value": row.get("status") or None},
+        {"key": "size", "label": "Size", "value": row.get("size") or None},
+        {"key": "color", "label": "Color", "value": row.get("color") or None},
+    ]
+
+
+def _helmet_house_warehouse_availability(row: typing.Dict) -> typing.Dict[str, typing.Any]:
+    """Per-warehouse stock from a HelmetHousePart row (Helmet House runs two DCs, West and East)."""
+    return {
+        "West": row.get("west_qty") or 0,
+        "East": row.get("east_qty") or 0,
+    }
+
+
+def _ingest_helmet_house_parts_for_mapped_brands(
+    mapped_catalog_brand_ids: typing.Set[int],
+    helmet_house_provider: src_models.Providers,
+    helmet_house_brand_to_brand: typing.Dict[int, src_models.Brands],
+) -> typing.Tuple[int, int]:
+    """Batch-ingest HelmetHousePart rows for one disjoint set of Helmet House brand PKs."""
+    if not mapped_catalog_brand_ids:
+        return 0, 0
+
+    total_master = 0
+    total_provider = 0
+    batch_num = 0
+    last_id = 0
+
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.HelmetHousePart.objects.filter(
+                brand_id__in=mapped_catalog_brand_ids, id__gt=last_id
+            )
+            .order_by("id")
+            .values(
+                "id", "brand_id", "sku", "alt_part_number", "vendor_part_number",
+                "description", "long_description", "upc", "updated_at",
+            )[:BATCH_SIZE_MASTER_PARTS]
+        )
+        if not batch:
+            break
+
+        last_id = batch[-1]["id"]
+        seen = set()
+        master_parts = []
+        external_id_to_brand_part = {}
+
+        for row in batch:
+            brand = helmet_house_brand_to_brand.get(row["brand_id"])
+            if not brand:
+                continue
+            part_number = _helmet_house_master_part_number(
+                row.get("vendor_part_number"), row.get("alt_part_number"), row.get("sku")
+            )
+            if not part_number:
+                continue
+
+            key = (brand.id, part_number)
+            if key not in seen:
+                seen.add(key)
+                master_parts.append(
+                    src_models.MasterPart(
+                        brand=brand,
+                        part_number=part_number,
+                        sku=part_number,
+                        # Long Description is populated on every row but is usually the short
+                        # Description repeated; prefer it and fall back rather than picking the
+                        # shorter of the two per row.
+                        description=row.get("long_description") or row.get("description"),
+                        # No image_url: the feed names a photo file per row but its own image host
+                        # (ftp.helmethouse.com/Images11/) answers 404 for every one of them, so a
+                        # URL built from it would be a dead link on every part. The filename is
+                        # kept on HelmetHousePart.photo_filename for the day a host exists.
+                        image_url=None,
+                        # 95% of feed rows carry a UPC -- the corroboration
+                        # extend_with_normalized_matches needs to accept a formatting-only match.
+                        gtin=(row.get("upc") or None),
+                    )
+                )
+            external_id_to_brand_part[
+                _helmet_house_provider_external_id(row["brand_id"], row.get("sku"))
+            ] = (brand.id, part_number)
+
+        if not master_parts:
+            connection.close()
+            if len(batch) == BATCH_SIZE_MASTER_PARTS:
+                time.sleep(BATCH_DELAY_SECONDS)
+            continue
+
+        pairs = list(seen)
+        existing_by_key = {}
+        if pairs:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(pairs),),
+                )
+                for r in cur.fetchall():
+                    mp_id, b_id, p_num = r
+                    existing_by_key[(b_id, p_num)] = mp_id
+
+        mp_matching.extend_with_normalized_matches(
+            existing_by_key,
+            pairs,
+            {(mp.brand_id, mp.part_number): mp.gtin for mp in master_parts},
+            provider_id=helmet_house_provider.id,
+            provider_kind=src_enums.BrandProviderKind.HELMHOUSE.value,
+            external_id_by_key={v: k for k, v in external_id_to_brand_part.items()},
+        )
+
+        new_parts = [mp for mp in master_parts if (mp.brand_id, mp.part_number) not in existing_by_key]
+        if new_parts:
+            new_parts = _dedupe_master_parts_for_upsert(
+                new_parts, context="Helmet House new_parts batch={}".format(batch_num)
+            )
+            pgbulk.upsert(
+                src_models.MasterPart,
+                new_parts,
+                unique_fields=["brand", "part_number"],
+                update_fields=[],
+            )
+            total_master += len(new_parts)
+
+        brand_part_to_master = mp_matching.master_part_stubs_for(existing_by_key)
+        unresolved_pairs = [k for k in pairs if k not in brand_part_to_master]
+        if unresolved_pairs:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(unresolved_pairs),),
+                )
+                for r in cur.fetchall():
+                    mp_id, b_id, p_num = r
+                    mp = src_models.MasterPart()
+                    mp.id = mp_id
+                    mp.brand_id = b_id
+                    mp.part_number = p_num
+                    brand_part_to_master[(b_id, p_num)] = mp
+
+        provider_parts_by_key = {}
+        for row in batch:
+            ext_id = _helmet_house_provider_external_id(row["brand_id"], row.get("sku"))
+            key = external_id_to_brand_part.get(ext_id)
+            if not key:
+                continue
+            master_part = brand_part_to_master.get(key)
+            if not master_part:
+                continue
+            provider_parts_by_key[(master_part.id, helmet_house_provider.id)] = src_models.ProviderPart(
+                master_part=master_part,
+                provider=helmet_house_provider,
+                provider_external_id=ext_id,
+                distributor_refreshed_at=row.get("updated_at"),
+            )
+
+        provider_parts = list(provider_parts_by_key.values())
+        if provider_parts:
+            pgbulk.upsert(
+                src_models.ProviderPart,
+                provider_parts,
+                unique_fields=["master_part", "provider"],
+                update_fields=_PROVIDER_PART_SYNC_UPDATE_FIELDS,
+            )
+            total_provider += len(provider_parts)
+
+        logger.info("{} Helmet House batch {}: {} items -> {} master, {} provider (last_id={})".format(
+            _LOG_PREFIX, batch_num, len(batch), len(master_parts), len(provider_parts), last_id
+        ))
+        connection.close()
+        if len(batch) == BATCH_SIZE_MASTER_PARTS:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    return total_master, total_provider
+
+
+def sync_master_parts_from_helmet_house() -> None:
+    """
+    Create/update MasterPart and ProviderPart from HelmetHousePart (a distributor-wide catalog;
+    prices live per company on HelmetHouseCompanyPricing). Only processes parts whose
+    HelmetHouseBrand has a BrandHelmetHouseBrandMapping.
+    """
+    logger.info("{} Syncing master parts from Helmet House (batched, cursor-based).".format(_LOG_PREFIX))
+
+    helmet_house_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.HELMHOUSE.value,
+    ).first()
+    if not helmet_house_provider:
+        logger.info("{} No Helmet House provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandHelmetHouseBrandMapping.objects.select_related(
+            "brand", "helmet_house_brand"
+        )
+    )
+    helmet_house_brand_to_brand = {m.helmet_house_brand_id: m.brand for m in mappings}
+    if not helmet_house_brand_to_brand:
+        logger.info("{} No BrandHelmetHouseBrandMapping found. Nothing to sync.".format(_LOG_PREFIX))
+        return
+
+    chunks = _partition_mapped_brands_for_parallel_ingest(mappings, MASTER_PARTS_SYNC_MAX_WORKERS)
+    total_master, total_provider = _run_parallel_master_parts_ingest(
+        chunks,
+        mappings,
+        "helmet_house_brand",
+        lambda cids: _ingest_helmet_house_parts_for_mapped_brands(
+            cids, helmet_house_provider, helmet_house_brand_to_brand
+        ),
+    )
+    logger.info("{} Synced {} master parts and {} provider parts from Helmet House total.".format(
+        _LOG_PREFIX, total_master, total_provider
+    ))
+
+
+def sync_provider_inventory_from_helmet_house() -> None:
+    """
+    Sync ProviderPartInventory from HelmetHousePart's West/East stock. Also refreshes
+    ProviderPart.product_details.
+    """
+    logger.info("{} Syncing provider inventory from Helmet House.".format(_LOG_PREFIX))
+
+    helmet_house_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.HELMHOUSE.value,
+    ).first()
+    if not helmet_house_provider:
+        logger.info("{} No Helmet House provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandHelmetHouseBrandMapping.objects.select_related(
+            "brand", "helmet_house_brand"
+        )
+    )
+    if not mappings:
+        logger.info("{} No BrandHelmetHouseBrandMapping found.".format(_LOG_PREFIX))
+        return
+
+    provider_parts = {
+        row["provider_external_id"]: src_models.ProviderPart(id=row["id"])
+        for row in src_models.ProviderPart.objects.filter(
+            provider=helmet_house_provider
+        ).values("id", "provider_external_id")
+    }
+    now = timezone.now()
+
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            batch = list(
+                src_models.HelmetHousePart.objects.filter(
+                    id__gt=last_id, brand_id__in=catalog_ids
+                )
+                .order_by("id")
+                .values(
+                    "id", "brand_id", "sku", "vendor_part_number", "upc", "description",
+                    "status", "size", "color", "west_qty", "east_qty", "total_qty",
+                )[:BATCH_SIZE_INVENTORY]
+            )
+            if not batch:
+                break
+
+            last_id = batch[-1]["id"]
+            to_upsert = []
+            for row in batch:
+                ext_id = _helmet_house_provider_external_id(row["brand_id"], row.get("sku"))
+                provider_part = provider_parts.get(ext_id)
+                if not provider_part:
+                    continue
+                to_upsert.append(
+                    src_models.ProviderPartInventory(
+                        provider_part=provider_part,
+                        warehouse_total_qty=row.get("total_qty") or 0,
+                        manufacturer_inventory=None,
+                        manufacturer_esd=None,
+                        warehouse_availability=_helmet_house_warehouse_availability(row),
+                        last_synced_at=now,
+                        updated_at=now,
+                    )
+                )
+
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_inventory_for_upsert(
+                    to_upsert, context="Helmet House inventory batch={}".format(batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartInventory,
+                    to_upsert,
+                    unique_fields=["provider_part"],
+                    update_fields=[
+                        "warehouse_total_qty",
+                        "manufacturer_inventory",
+                        "manufacturer_esd",
+                        "warehouse_availability",
+                        "last_synced_at",
+                        "updated_at",
+                    ],
+                )
+                total_upserted += len(to_upsert)
+
+            pp_details_to_update = []
+            for row in batch:
+                ext_id = _helmet_house_provider_external_id(row["brand_id"], row.get("sku"))
+                pp = provider_parts.get(ext_id)
+                if pp:
+                    pp.product_details = _helmet_house_product_details(row)
+                    pp_details_to_update.append(pp)
+            if pp_details_to_update:
+                src_models.ProviderPart.objects.bulk_update(
+                    pp_details_to_update, ["product_details"], batch_size=500
+                )
+
+            logger.info("{} Helmet House inventory batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_INVENTORY:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "helmet_house_brand", _worker)
+    logger.info("{} Synced {} Helmet House inventory records total.".format(_LOG_PREFIX, total_upserted))
+
+
+_HELMET_HOUSE_PRICING_VALUES = (
+    "id", "company_id", "dealer_price", "retail_price", "map_price",
+    "part__brand_id", "part__sku", "part__vendor_part_number", "part__alt_part_number",
+)
+_HELMET_HOUSE_PRICING_UPSERT_FIELDS = [
+    "cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at",
+]
+
+
+def _helmet_house_pricing_master_keys(
+    batch: typing.List[typing.Dict],
+    helmet_house_brand_to_brand: typing.Dict[int, src_models.Brands],
+) -> typing.List[typing.Tuple[int, str]]:
+    keys = []
+    for row in batch:
+        brand = helmet_house_brand_to_brand.get(row.get("part__brand_id"))
+        if not brand:
+            continue
+        part_number = _helmet_house_master_part_number(
+            row.get("part__vendor_part_number"),
+            row.get("part__alt_part_number"),
+            row.get("part__sku"),
+        )
+        if not part_number:
+            continue
+        keys.append((brand.id, part_number))
+    return keys
+
+
+def _sync_helmet_house_pricing(company_id: typing.Optional[int] = None) -> None:
+    """Shared body for the all-companies and single-company Helmet House pricing syncs."""
+    scope = "company_id={}".format(company_id) if company_id else "all companies"
+    logger.info("{} Syncing provider pricing from Helmet House ({}).".format(_LOG_PREFIX, scope))
+
+    helmet_house_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.HELMHOUSE.value,
+    ).first()
+    if not helmet_house_provider:
+        logger.info("{} No Helmet House provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandHelmetHouseBrandMapping.objects.select_related(
+            "brand", "helmet_house_brand"
+        )
+    )
+    helmet_house_brand_to_brand = {m.helmet_house_brand_id: m.brand for m in mappings}
+    if not helmet_house_brand_to_brand:
+        logger.info("{} No BrandHelmetHouseBrandMapping found. Nothing to price.".format(_LOG_PREFIX))
+        return
+
+    company_provider = None
+    watermark = None
+    sync_started_at = timezone.now()
+    if company_id:
+        company_provider = src_models.CompanyProviders.objects.filter(
+            company_id=company_id, provider_id=helmet_house_provider.id
+        ).first()
+        watermark = company_provider.pricing_propagation_watermark if company_provider else None
+
+    now = timezone.now()
+
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            qs = src_models.HelmetHouseCompanyPricing.objects.filter(
+                id__gt=last_id, part__brand_id__in=catalog_ids
+            )
+            if company_id:
+                qs = qs.filter(company_id=company_id)
+            if watermark:
+                qs = qs.filter(updated_at__gte=watermark)
+            batch = list(
+                qs.order_by("id").values(*_HELMET_HOUSE_PRICING_VALUES)[:BATCH_SIZE_PRICING]
+            )
+            if not batch:
+                break
+
+            last_id = batch[-1]["id"]
+            companies_by_id = {
+                c.id: c
+                for c in src_models.Company.objects.filter(
+                    id__in={r["company_id"] for r in batch if r.get("company_id")}
+                )
+            }
+            pp_by_key = _provider_parts_by_master_brand_and_part_number(
+                helmet_house_provider,
+                _helmet_house_pricing_master_keys(batch, helmet_house_brand_to_brand),
+            )
+
+            to_upsert = []
+            for row in batch:
+                brand = helmet_house_brand_to_brand.get(row.get("part__brand_id"))
+                if not brand:
+                    continue
+                part_number = _helmet_house_master_part_number(
+                    row.get("part__vendor_part_number"),
+                    row.get("part__alt_part_number"),
+                    row.get("part__sku"),
+                )
+                if not part_number:
+                    continue
+                provider_part = pp_by_key.get((brand.id, part_number))
+                if not provider_part:
+                    continue
+                company = companies_by_id.get(row.get("company_id"))
+                if not company:
+                    continue
+                to_upsert.append(
+                    src_models.ProviderPartCompanyPricing(
+                        provider_part=provider_part,
+                        company=company,
+                        # Helmet House publishes one dealer price per part -- there is no separate
+                        # jobber tier -- so cost and jobber_price are the same figure, as for WPS.
+                        cost=row.get("dealer_price"),
+                        jobber_price=row.get("dealer_price"),
+                        # Already normalised to None for rows with no MAP policy at ingest
+                        # (helmet_house.sync_helmet_house_company_pricing_for_company_provider).
+                        map_price=row.get("map_price"),
+                        msrp=row.get("retail_price"),
+                        retail_price=row.get("retail_price"),
+                        last_synced_at=now,
+                    )
+                )
+
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                    to_upsert, context="Helmet House pricing {} batch={}".format(scope, batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartCompanyPricing,
+                    to_upsert,
+                    unique_fields=["provider_part", "company"],
+                    update_fields=_HELMET_HOUSE_PRICING_UPSERT_FIELDS,
+                )
+                total_upserted += len(to_upsert)
+
+            logger.info("{} Helmet House pricing {} batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, scope, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_PRICING:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "helmet_house_brand", _worker)
+    logger.info("{} Synced {} Helmet House pricing records ({}).".format(
+        _LOG_PREFIX, total_upserted, scope
+    ))
+
+    if company_provider:
+        company_provider.pricing_propagation_watermark = sync_started_at
+        company_provider.save(update_fields=["pricing_propagation_watermark"])
+
+
+def sync_provider_pricing_from_helmet_house() -> None:
+    """Sync ProviderPartCompanyPricing from HelmetHouseCompanyPricing (all companies)."""
+    _sync_helmet_house_pricing(company_id=None)
+
+
+def sync_provider_pricing_from_helmet_house_for_company(company_id: int) -> None:
+    """Sync ProviderPartCompanyPricing from HelmetHouseCompanyPricing for one company."""
+    _sync_helmet_house_pricing(company_id=company_id)
+
+
+def sync_derived_from_helmet_house(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False, skip_pricing: bool = False) -> None:
+    """
+    Propagate Helmet House source data into MasterPart, ProviderPart, ProviderPartInventory and
+    ProviderPartCompanyPricing. Call after the Helmet House catalog ingest. No fitment sync -- the
+    feed carries no vehicle fitment at all.
+
+    Pass ``skip_master_parts=True`` to run only inventory + pricing (fast incremental path).
+    Pass ``skip_pricing=True`` to run only master parts + inventory (global catalog sync path).
+    """
+    logger.info("{} Starting Helmet House-only derived sync ({}).".format(
+        _LOG_PREFIX,
+        "inventory + pricing only" if skip_master_parts else "parts, inventory" + ("" if skip_pricing else ", pricing"),
+    ))
+    if not skip_master_parts:
+        sync_master_parts_from_helmet_house()
+        connection.close()
+
+    def _cont() -> None:
+        sync_provider_inventory_from_helmet_house()
+        connection.close()
+        if not skip_pricing:
+            sync_provider_pricing_from_helmet_house()
+            connection.close()
+
+    if skip_master_parts:
+        _cont()
+    else:
+        _maybe_reindex_meilisearch_after_master_parts(
+            reindex_meilisearch=reindex_meilisearch,
+            provider_label="Helmet House",
+            continuation=_cont,
+        )
+    logger.info("{} Completed Helmet House-only derived sync.".format(_LOG_PREFIX))
+
+
 def _wheelpros_provider_external_id(wp_brand_id: int, part_number: str) -> str:
     """Unique per WheelPros provider: wp_brand_id + part_number."""
     return "{}_{}".format(wp_brand_id, part_number)
@@ -11175,6 +11764,621 @@ def sync_derived_from_elite_wheel(
     logger.info("{} Completed Elite Wheel-only derived sync.".format(_LOG_PREFIX))
 
 
+# ============================================================
+# THE WHEEL GROUP
+# ============================================================
+# TWG's mastersheet is a catalog and list-price sheet: wheel specs, images, marketing copy, MSRP
+# and MAP, with no quantity column anywhere. So this provider has no ProviderPartInventory step --
+# the product_details refresh that normally rides along with inventory is its own pass below
+# (sync_provider_details_from_the_wheel_group). Everything else is the standard single-source-table
+# shape, closest to Rough Country (aaia + gtin + image on MasterPart) and Vossen.
+
+
+def _the_wheel_group_provider_external_id(twg_brand_id: int, sku: str) -> str:
+    """Stable TWG ProviderPart key: TWG brand row id + SKU, the same compound shape every other
+    provider uses."""
+    return "{}_{}".format(int(twg_brand_id), (sku or "").strip())
+
+
+def _the_wheel_group_trimmed_number(value: typing.Any) -> typing.Optional[str]:
+    """
+    Round a numeric-looking spec to 2 decimals for display, trailing zeros removed. TWG's BACKSPACE
+    column is a raw mm-to-inch conversion that ships its full float expansion
+    ("4.5078740157480315"), which is unreadable as a spec line. Non-numeric text is passed through
+    untouched -- the stored value on TheWheelGroupPart stays verbatim either way.
+    """
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        return None
+    try:
+        rounded = round(float(text), 2)
+    except (TypeError, ValueError):
+        return text
+    return "{:g}".format(rounded)
+
+
+def _the_wheel_group_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
+    """Wheel-spec attributes for a TheWheelGroupPart row, shown as ProviderPart.product_details."""
+    bolt_patterns = [row.get("bolt_pattern_1"), row.get("bolt_pattern_2")]
+    bolt_pattern = " / ".join([bp for bp in bolt_patterns if bp])
+    size = None
+    if row.get("diameter") and row.get("wheel_width"):
+        size = "{}x{}".format(row.get("diameter"), row.get("wheel_width"))
+    return [
+        {"key": "part_number", "label": "Part Number", "value": row.get("sku") or None},
+        {"key": "size", "label": "Size", "value": size},
+        {"key": "bolt_pattern", "label": "Bolt Pattern", "value": bolt_pattern or None},
+        {"key": "offset", "label": "Offset", "value": row.get("offset") or None},
+        {"key": "center_bore", "label": "Centerbore", "value": row.get("hub_bore") or None},
+        {"key": "backspace", "label": "Backspacing", "value": _the_wheel_group_trimmed_number(row.get("backspace"))},
+        {"key": "finish", "label": "Finish", "value": row.get("finish") or None},
+        {"key": "load_rating", "label": "Load Rating", "value": row.get("load_rating") or None},
+        {
+            "key": "tpms_compatible",
+            "label": "TPMS Compatible",
+            "value": None if row.get("tpms_compatible") is None else ("Yes" if row.get("tpms_compatible") else "No"),
+        },
+        {"key": "ship_weight", "label": "Ship Weight (lbs)", "value": row.get("ship_weight") or None},
+    ]
+
+
+_THE_WHEEL_GROUP_CATALOG_VALUES = (
+    "id", "brand_id", "sku", "aaia_code", "description", "short_description", "image_1", "upc",
+    "updated_at",
+)
+
+_THE_WHEEL_GROUP_DETAILS_VALUES = (
+    "id", "brand_id", "sku", "diameter", "wheel_width", "hub_bore", "bolt_pattern_1",
+    "bolt_pattern_2", "offset", "backspace", "finish", "load_rating", "tpms_compatible",
+    "ship_weight",
+)
+
+
+def _ingest_the_wheel_group_parts_for_mapped_brands(
+    mapped_catalog_brand_ids: typing.Set[int],
+    twg_provider: src_models.Providers,
+    twg_brand_to_brand: typing.Dict[int, src_models.Brands],
+) -> typing.Tuple[int, int]:
+    """Batch-ingest TheWheelGroupPart rows for one disjoint set of TWG catalog brand PKs."""
+    if not mapped_catalog_brand_ids:
+        return 0, 0
+
+    total_master = 0
+    total_provider = 0
+    batch_num = 0
+    last_id = 0
+
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.TheWheelGroupPart.objects.filter(
+                brand_id__in=mapped_catalog_brand_ids,
+                id__gt=last_id,
+            )
+            .order_by("id")
+            .values(*_THE_WHEEL_GROUP_CATALOG_VALUES)[:BATCH_SIZE_MASTER_PARTS]
+        )
+        if not batch:
+            break
+
+        last_id = batch[-1]["id"]
+        seen = set()
+        master_parts = []
+        twg_external_id_to_brand_part = {}
+
+        for row in batch:
+            brand = twg_brand_to_brand.get(row["brand_id"])
+            if not brand:
+                continue
+
+            part_number = (row.get("sku") or "").strip()
+            if not part_number:
+                continue
+
+            key = (brand.id, part_number)
+            if key not in seen:
+                seen.add(key)
+                master_parts.append(
+                    src_models.MasterPart(
+                        brand=brand,
+                        part_number=part_number,
+                        sku=part_number,
+                        # DESCRIPTION is the full one-line spec ("ION 141 GLOSS BLACK MILLED
+                        # 20X10 8-170 -19MM 125.2MM"); SHORT_DESCRIPTION is the style/finish only.
+                        description=row.get("description") or row.get("short_description"),
+                        aaia_code=row.get("aaia_code"),
+                        image_url=row.get("image_1"),
+                        gtin=row.get("upc") or None,
+                    )
+                )
+            twg_external_id_to_brand_part[
+                _the_wheel_group_provider_external_id(row["brand_id"], part_number)
+            ] = (brand.id, part_number)
+
+        if not master_parts:
+            connection.close()
+            if len(batch) == BATCH_SIZE_MASTER_PARTS:
+                time.sleep(BATCH_DELAY_SECONDS)
+            continue
+
+        pairs = list(seen)
+        existing_by_key = {}
+        if pairs:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(pairs),),
+                )
+                for mp_id, b_id, p_num in cur.fetchall():
+                    existing_by_key[(b_id, p_num)] = mp_id
+
+        # TWG spells its SKUs in its own house style ("136-4665BX", "9317-7973M"), so anything the
+        # exact match missed gets a second, heavily-guarded pass on the normalized form.
+        mp_matching.extend_with_normalized_matches(
+            existing_by_key,
+            pairs,
+            {(mp.brand_id, mp.part_number): mp.gtin for mp in master_parts},
+            provider_id=twg_provider.id,
+            provider_kind=src_enums.BrandProviderKind.THE_WHEEL_GROUP.value,
+            external_id_by_key={v: k for k, v in twg_external_id_to_brand_part.items()},
+        )
+
+        new_parts = [mp for mp in master_parts if (mp.brand_id, mp.part_number) not in existing_by_key]
+        existing_keys = [k for k in pairs if k in existing_by_key]
+
+        if new_parts:
+            new_parts = _dedupe_master_parts_for_upsert(
+                new_parts, context="The Wheel Group new_parts batch={}".format(batch_num)
+            )
+            pgbulk.upsert(
+                src_models.MasterPart,
+                new_parts,
+                unique_fields=["brand", "part_number"],
+                update_fields=[],
+            )
+            total_master += len(new_parts)
+
+        if existing_keys:
+            key_to_mp = {(mp.brand_id, mp.part_number): mp for mp in master_parts}
+            values = [
+                (existing_by_key[k], key_to_mp[k].aaia_code, key_to_mp[k].gtin)
+                for k in existing_keys
+                if k in key_to_mp
+            ]
+            if values:
+                placeholders = ", ".join(["(%s::bigint, %s, %s)"] * len(values))
+                params = [x for row in values for x in row]
+                with connection.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE master_parts mp SET
+                            aaia_code = v.aaia_code,
+                            gtin = COALESCE(mp.gtin, v.gtin)
+                        FROM (VALUES {}) AS v(id, aaia_code, gtin)
+                        WHERE mp.id = v.id::bigint
+                        """.format(placeholders),
+                        params,
+                    )
+
+        # Seed from the resolved ids first: a row matched on formatting has no MasterPart under
+        # the feed's own spelling, so the exact-part_number query below cannot find it.
+        brand_part_to_master = mp_matching.master_part_stubs_for(existing_by_key)
+        unresolved_pairs = [k for k in pairs if k not in brand_part_to_master]
+        if unresolved_pairs:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(unresolved_pairs),),
+                )
+                for mp_id, b_id, p_num in cur.fetchall():
+                    mp = src_models.MasterPart()
+                    mp.id = mp_id
+                    mp.brand_id = b_id
+                    mp.part_number = p_num
+                    brand_part_to_master[(b_id, p_num)] = mp
+
+        provider_parts_by_key = {}
+        for row in batch:
+            ext_id = _the_wheel_group_provider_external_id(
+                row["brand_id"], (row.get("sku") or "").strip()
+            )
+            key = twg_external_id_to_brand_part.get(ext_id)
+            if not key:
+                continue
+            master_part = brand_part_to_master.get(key)
+            if not master_part:
+                continue
+            provider_parts_by_key[(master_part.id, twg_provider.id)] = src_models.ProviderPart(
+                master_part=master_part,
+                provider=twg_provider,
+                provider_external_id=ext_id,
+                distributor_refreshed_at=row.get("updated_at"),
+            )
+
+        provider_parts = list(provider_parts_by_key.values())
+        if provider_parts:
+            pgbulk.upsert(
+                src_models.ProviderPart,
+                provider_parts,
+                unique_fields=["master_part", "provider"],
+                update_fields=_PROVIDER_PART_SYNC_UPDATE_FIELDS,
+            )
+            total_provider += len(provider_parts)
+
+        logger.info("{} The Wheel Group batch {}: {} items -> {} master, {} provider (last_id={})".format(
+            _LOG_PREFIX, batch_num, len(batch), len(master_parts), len(provider_parts), last_id
+        ))
+        connection.close()
+        if len(batch) == BATCH_SIZE_MASTER_PARTS:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    return total_master, total_provider
+
+
+def _the_wheel_group_provider_and_mappings(
+    action: str,
+) -> typing.Tuple[
+    typing.Optional[src_models.Providers],
+    typing.List[src_models.BrandTheWheelGroupBrandMapping],
+    typing.Dict[int, src_models.Brands],
+]:
+    """Shared preamble for every TWG derived sync: provider row + brand mappings, or empties."""
+    twg_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.THE_WHEEL_GROUP.value,
+    ).first()
+    if not twg_provider:
+        logger.info("{} No The Wheel Group provider found.".format(_LOG_PREFIX))
+        return None, [], {}
+
+    mappings = list(
+        src_models.BrandTheWheelGroupBrandMapping.objects.select_related(
+            "brand", "the_wheel_group_brand"
+        )
+    )
+    twg_brand_to_brand = {m.the_wheel_group_brand_id: m.brand for m in mappings}
+    if not twg_brand_to_brand:
+        logger.info(
+            "{} No BrandTheWheelGroupBrandMapping found. Nothing to {}.".format(_LOG_PREFIX, action)
+        )
+        return twg_provider, [], {}
+    return twg_provider, mappings, twg_brand_to_brand
+
+
+def sync_master_parts_from_the_wheel_group() -> None:
+    """
+    Create/update MasterPart and ProviderPart from TheWheelGroupPart. Only processes parts whose
+    TheWheelGroupBrand has a BrandTheWheelGroupBrandMapping. Same cursor-based, two-phase upsert
+    pattern as every other provider.
+    """
+    logger.info("{} Syncing master parts from The Wheel Group (batched, cursor-based).".format(_LOG_PREFIX))
+
+    twg_provider, mappings, twg_brand_to_brand = _the_wheel_group_provider_and_mappings("sync")
+    if not twg_provider or not twg_brand_to_brand:
+        return
+
+    chunks = _partition_mapped_brands_for_parallel_ingest(mappings, MASTER_PARTS_SYNC_MAX_WORKERS)
+    total_master, total_provider = _run_parallel_master_parts_ingest(
+        chunks,
+        mappings,
+        "the_wheel_group_brand",
+        lambda cids: _ingest_the_wheel_group_parts_for_mapped_brands(
+            cids, twg_provider, twg_brand_to_brand
+        ),
+    )
+
+    logger.info("{} Synced {} master parts and {} provider parts from The Wheel Group.".format(
+        _LOG_PREFIX, total_master, total_provider
+    ))
+
+
+def sync_provider_details_from_the_wheel_group() -> None:
+    """
+    Refresh ProviderPart.product_details with TWG's wheel-spec attributes.
+
+    Deliberately no ProviderPartInventory: the mastersheet carries no stock at all, and writing
+    rows with a zero total would present every TWG part as out of stock rather than as
+    "availability unknown" (which is what a missing inventory row already means to the parts API).
+    When TWG starts delivering a feed with quantities, this is where the inventory upsert goes.
+    """
+    logger.info("{} Syncing provider product details from The Wheel Group.".format(_LOG_PREFIX))
+
+    twg_provider, mappings, twg_brand_to_brand = _the_wheel_group_provider_and_mappings("sync")
+    if not twg_provider or not twg_brand_to_brand:
+        return
+
+    provider_parts = {
+        row["provider_external_id"]: src_models.ProviderPart(id=row["id"])
+        for row in src_models.ProviderPart.objects.filter(provider=twg_provider).values(
+            "id", "provider_external_id"
+        )
+    }
+
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_updated = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            batch = list(
+                src_models.TheWheelGroupPart.objects.filter(
+                    id__gt=last_id, brand_id__in=catalog_ids
+                )
+                .order_by("id")
+                .values(*_THE_WHEEL_GROUP_DETAILS_VALUES)[:BATCH_SIZE_INVENTORY]
+            )
+            if not batch:
+                break
+
+            last_id = batch[-1]["id"]
+            to_update = []
+            for row in batch:
+                ext_id = _the_wheel_group_provider_external_id(
+                    row["brand_id"], (row.get("sku") or "").strip()
+                )
+                pp = provider_parts.get(ext_id)
+                if not pp:
+                    continue
+                pp.product_details = _the_wheel_group_product_details(row)
+                to_update.append(pp)
+
+            if to_update:
+                src_models.ProviderPart.objects.bulk_update(
+                    to_update, ["product_details"], batch_size=500
+                )
+                total_updated += len(to_update)
+
+            logger.info("{} The Wheel Group details batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, batch_num, len(to_update), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_INVENTORY:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_updated
+
+    grand_total = _run_parallel_mapped_brand_int_worker(mappings, "the_wheel_group_brand", _worker)
+    logger.info("{} Refreshed {} The Wheel Group product_details records.".format(
+        _LOG_PREFIX, grand_total
+    ))
+
+
+_THE_WHEEL_GROUP_PRICING_UPSERT_FIELDS = [
+    "cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"
+]
+
+_THE_WHEEL_GROUP_PRICING_VALUES = (
+    "id", "company_id", "cost", "map", "retail_price", "part__brand_id", "part__sku",
+)
+
+
+def _the_wheel_group_pricing_rows_to_upsert(
+    batch: typing.List[typing.Dict],
+    twg_provider: src_models.Providers,
+    twg_brand_to_brand: typing.Dict[int, src_models.Brands],
+    now,
+) -> typing.List[src_models.ProviderPartCompanyPricing]:
+    """Map one batch of TheWheelGroupCompanyPricing rows onto ProviderPartCompanyPricing instances."""
+    master_keys = []
+    for row in batch:
+        brand = twg_brand_to_brand.get(row.get("part__brand_id"))
+        part_number = (row.get("part__sku") or "").strip()
+        if brand and part_number:
+            master_keys.append((brand.id, part_number))
+    pp_by_key = _provider_parts_by_master_brand_and_part_number(twg_provider, master_keys)
+
+    company_ids = {r["company_id"] for r in batch if r.get("company_id")}
+    companies_by_id = {c.id: c for c in src_models.Company.objects.filter(id__in=company_ids)}
+
+    to_upsert = []
+    for row in batch:
+        brand = twg_brand_to_brand.get(row.get("part__brand_id"))
+        part_number = (row.get("part__sku") or "").strip()
+        if not brand or not part_number:
+            continue
+        provider_part = pp_by_key.get((brand.id, part_number))
+        if not provider_part:
+            continue
+        company = companies_by_id.get(row.get("company_id"))
+        if not company:
+            continue
+        to_upsert.append(
+            src_models.ProviderPartCompanyPricing(
+                provider_part=provider_part,
+                company=company,
+                cost=row.get("cost"),
+                jobber_price=None,
+                map_price=row.get("map"),
+                msrp=row.get("retail_price"),
+                retail_price=row.get("retail_price"),
+                last_synced_at=now,
+            )
+        )
+    return to_upsert
+
+
+def sync_provider_pricing_from_the_wheel_group() -> None:
+    """
+    Sync ProviderPartCompanyPricing from TheWheelGroupCompanyPricing (all companies). TWG's sheet
+    has no jobber column, and its MSRP doubles as retail.
+    """
+    logger.info("{} Syncing provider pricing from The Wheel Group.".format(_LOG_PREFIX))
+
+    twg_provider, mappings, twg_brand_to_brand = _the_wheel_group_provider_and_mappings("price")
+    if not twg_provider or not twg_brand_to_brand:
+        return
+
+    now = timezone.now()
+
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            batch = list(
+                src_models.TheWheelGroupCompanyPricing.objects.filter(
+                    id__gt=last_id, part__brand_id__in=catalog_ids
+                )
+                .order_by("id")
+                .values(*_THE_WHEEL_GROUP_PRICING_VALUES)[:BATCH_SIZE_PRICING]
+            )
+            if not batch:
+                break
+
+            last_id = batch[-1]["id"]
+            to_upsert = _the_wheel_group_pricing_rows_to_upsert(
+                batch, twg_provider, twg_brand_to_brand, now
+            )
+
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                    to_upsert, context="The Wheel Group pricing batch={}".format(batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartCompanyPricing,
+                    to_upsert,
+                    unique_fields=["provider_part", "company"],
+                    update_fields=_THE_WHEEL_GROUP_PRICING_UPSERT_FIELDS,
+                )
+                total_upserted += len(to_upsert)
+
+            logger.info("{} The Wheel Group pricing batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_PRICING:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    grand_total = _run_parallel_mapped_brand_int_worker(mappings, "the_wheel_group_brand", _worker)
+    logger.info("{} Synced {} The Wheel Group pricing records total.".format(_LOG_PREFIX, grand_total))
+
+
+def sync_provider_pricing_from_the_wheel_group_for_company(company_id: int) -> None:
+    """One company's TWG pricing — the per-company path used by IntegrationPricingSyncJob."""
+    logger.info("{} Syncing The Wheel Group provider pricing for company_id={}.".format(
+        _LOG_PREFIX, company_id
+    ))
+
+    twg_provider, mappings, twg_brand_to_brand = _the_wheel_group_provider_and_mappings("price")
+    if not twg_provider or not twg_brand_to_brand:
+        return
+
+    company_provider = src_models.CompanyProviders.objects.filter(
+        company_id=company_id, provider_id=twg_provider.id
+    ).first()
+
+    now = timezone.now()
+
+    # Watermark -- see sync_provider_pricing_from_meyer_for_company for the full rationale.
+    sync_started_at = timezone.now()
+    watermark = company_provider.pricing_propagation_watermark if company_provider else None
+    logger.info(
+        "{} The Wheel Group pricing company={}: propagation watermark={}.".format(
+            _LOG_PREFIX, company_id, watermark or "none (processing everything)",
+        )
+    )
+
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            qs = src_models.TheWheelGroupCompanyPricing.objects.filter(
+                id__gt=last_id,
+                company_id=company_id,
+                part__brand_id__in=catalog_ids,
+            )
+            if watermark:
+                qs = qs.filter(updated_at__gte=watermark)
+            batch = list(
+                qs.order_by("id").values(*_THE_WHEEL_GROUP_PRICING_VALUES)[:BATCH_SIZE_PRICING]
+            )
+            if not batch:
+                break
+
+            last_id = batch[-1]["id"]
+            to_upsert = _the_wheel_group_pricing_rows_to_upsert(
+                batch, twg_provider, twg_brand_to_brand, now
+            )
+
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                    to_upsert,
+                    context="The Wheel Group pricing company={} batch={}".format(
+                        company_id, batch_num
+                    ),
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartCompanyPricing,
+                    to_upsert,
+                    unique_fields=["provider_part", "company"],
+                    update_fields=_THE_WHEEL_GROUP_PRICING_UPSERT_FIELDS,
+                )
+                total_upserted += len(to_upsert)
+
+            logger.info("{} The Wheel Group pricing company={} batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, company_id, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_PRICING:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    grand_total = _run_parallel_mapped_brand_int_worker(mappings, "the_wheel_group_brand", _worker)
+    logger.info("{} Synced {} The Wheel Group pricing records for company_id={}.".format(
+        _LOG_PREFIX, grand_total, company_id,
+    ))
+
+    if company_provider:
+        company_provider.pricing_propagation_watermark = sync_started_at
+        company_provider.save(update_fields=["pricing_propagation_watermark"])
+
+
+def sync_derived_from_the_wheel_group(
+    *, reindex_meilisearch: bool = False, skip_master_parts: bool = False, skip_pricing: bool = False
+) -> None:
+    """
+    Propagate The Wheel Group source data into MasterPart, ProviderPart, ProviderPart.product_details
+    and ProviderPartCompanyPricing. Call after the TWG feed ingest. No fitment sync -- the sheet
+    carries wheel-spec attributes, not vehicle fitment; and no inventory sync -- it carries no
+    stock (see sync_provider_details_from_the_wheel_group).
+
+    Pass ``skip_master_parts=True`` to run only details + pricing (fast incremental path).
+    Pass ``skip_pricing=True`` to run only master parts + details (global catalog sync path).
+    """
+    logger.info("{} Starting The Wheel Group-only derived sync ({}).".format(
+        _LOG_PREFIX,
+        "details + pricing only" if skip_master_parts else "parts, details" + ("" if skip_pricing else ", pricing"),
+    ))
+    if not skip_master_parts:
+        sync_master_parts_from_the_wheel_group()
+        connection.close()
+
+    def _cont() -> None:
+        sync_provider_details_from_the_wheel_group()
+        connection.close()
+        if not skip_pricing:
+            sync_provider_pricing_from_the_wheel_group()
+            connection.close()
+
+    if skip_master_parts:
+        _cont()
+    else:
+        _maybe_reindex_meilisearch_after_master_parts(
+            reindex_meilisearch=reindex_meilisearch,
+            provider_label="The Wheel Group",
+            continuation=_cont,
+        )
+    logger.info("{} Completed The Wheel Group-only derived sync.".format(_LOG_PREFIX))
+
+
 def sync_all_master_parts() -> None:
     """
     Run each distributor's derived sync in order (master + provider parts, then inventory, then pricing
@@ -11207,6 +12411,8 @@ def sync_all_master_parts() -> None:
     sync_derived_from_tirerack(reindex_meilisearch=False, skip_pricing=True)
     _reclaim_memory()
     sync_derived_from_elite_wheel(reindex_meilisearch=False, skip_pricing=True)
+    _reclaim_memory()
+    sync_derived_from_the_wheel_group(reindex_meilisearch=False, skip_pricing=True)
 
     logger.info("{} Completed full master parts sync.".format(_LOG_PREFIX))
 
@@ -11256,6 +12462,10 @@ def sync_all_master_parts_global() -> None:
     sync_derived_from_motorstate(skip_pricing=True)
     _reclaim_memory()
     sync_derived_from_wps(skip_pricing=True)
+    _reclaim_memory()
+    sync_derived_from_helmet_house(skip_pricing=True)
+    _reclaim_memory()
+    sync_derived_from_the_wheel_group(skip_pricing=True)
 
     logger.info("{} Completed global master parts sync (catalog + inventory, no pricing).".format(_LOG_PREFIX))
 
@@ -11289,5 +12499,7 @@ def sync_all_master_parts_incremental() -> None:
     sync_derived_from_elite_wheel(skip_master_parts=True)
     sync_derived_from_motorstate(skip_master_parts=True)
     sync_derived_from_wps(skip_master_parts=True)
+    sync_derived_from_helmet_house(skip_master_parts=True)
+    sync_derived_from_the_wheel_group(skip_master_parts=True)
 
     logger.info("{} Completed incremental master parts sync.".format(_LOG_PREFIX))

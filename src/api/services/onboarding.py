@@ -396,4 +396,20 @@ def get_distributor_credentials_info() -> dict:
             "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("TIRERACK", "TireRack"),
             "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("TIRERACK") or None,
         },
+        "helmhouse": {
+            "required": [
+                src_constants.HELMET_HOUSE_CREDENTIALS_FTP_USER,
+                src_constants.HELMET_HOUSE_CREDENTIALS_FTP_PASSWORD,
+            ],
+            "description": (
+                "Helmet House FTP username and password (host ftp.helmethouse.com, port 21, is "
+                "fixed — there is nothing else to enter). Unlike every other distributor here this "
+                "is one shared login for their published feed rather than a per-dealer account, so "
+                "there is no application process; ask info@helmethouse.com for the current login. "
+                "Because it is shared, every connected company reads the same file and sees the "
+                "same dealer cost."
+            ),
+            "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("HELMHOUSE", "HelmHouse"),
+            "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("HELMHOUSE") or None,
+        },
     }
