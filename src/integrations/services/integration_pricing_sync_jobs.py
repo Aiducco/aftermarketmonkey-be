@@ -418,7 +418,16 @@ def run_integration_pricing_sync_job(job: src_models.IntegrationPricingSyncJob) 
     # can transition from "Ingesting data…" to showing live pricing. Also flips the
     # connection status straight to CONNECTED — check_company_provider_connections only
     # covers rows still pending their first sync, so this is the only place that sets it.
-    if not cp.initial_sync_completed:
+    #
+    # The status flip is deliberately NOT gated on initial_sync_completed. It used to be, which
+    # meant a row that reached initial_sync_completed=True while its status said something else
+    # (e.g. a reconnect landing between a job's completion and its status write) could never
+    # recover: every later job took the `already completed` path and skipped the flip forever.
+    # A successful job is proof the connection works, so re-assert CONNECTED every time it isn't
+    # already set. The one-time side effects below stay gated on the actual transition.
+    first_completion = not cp.initial_sync_completed
+    status_needs_flip = cp.status != src_enums.CompanyProviderConnectionStatus.CONNECTED.value
+    if first_completion or status_needs_flip:
         update_fields = dict(
             initial_sync_completed=True,
             status=src_enums.CompanyProviderConnectionStatus.CONNECTED.value,
@@ -453,11 +462,15 @@ def run_integration_pricing_sync_job(job: src_models.IntegrationPricingSyncJob) 
             )
         src_models.CompanyProviders.objects.filter(id=cp.id).update(**update_fields)
         logger.info(
-            "{} Job id={}: marked company_provider_id={} initial_sync_completed=True.".format(
-                _LOG_PREFIX, job.id, cp.id
+            "{} Job id={}: company_provider_id={} initial_sync_completed=True, status=CONNECTED "
+            "(first_completion={}, repaired_status={}).".format(
+                _LOG_PREFIX, job.id, cp.id, first_completion, not first_completion and status_needs_flip
             )
         )
-        notifications_services.send_first_sync_completed_email(cp)
+        # Only on the real first-sync transition — a status repair must not re-send the
+        # "your data is ready" email to a company that already got it.
+        if first_completion:
+            notifications_services.send_first_sync_completed_email(cp)
 
 
 def process_pricing_sync_jobs(limit: int = 10, workers: int = 1) -> int:
