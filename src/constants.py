@@ -903,17 +903,44 @@ PROVIDER_CATALOG = [
         "connection_required_fields": ["ftp_host", "ftp_port", "ftp_user", "ftp_password"],
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
-            "<p><strong>Automatic Distributors</strong> provides an FTP account for your product data. "
-            "However, a request must be raised with your account manager before they will create it. "
-            "These are the same credentials as their catalog connection.</p>"
+            "<p><strong>Automatic Distributors</strong> provides an FTP account for your product data, but it "
+            "isn't created automatically &mdash; a request has to be raised with your account manager first. "
+            "These are the same credentials as their catalog connection, so if you already have them, skip to "
+            "step 2.</p>"
+
+            "<p><strong>1. Request FTP access</strong></p>"
+            "<p>Contact your Automatic Distributors account manager and request FTP access for data feeds:</p>"
+            + _CALLOUT_OPEN +
+            "<p>Could you please create an FTP account for our data feeds? We're connecting our product data "
+            "to our inventory system.</p>"
+            "</div>"
+            "<p>They'll send you an <strong>FTP Host</strong>, <strong>FTP Port</strong>, "
+            "<strong>FTP Login</strong>, and <strong>FTP Password</strong>.</p>"
+
+            "<p><strong>2. Enter your credentials</strong></p>"
             "<ol>"
-            "<li>Contact your Automatic Distributors account manager and request FTP access for data feeds.</li>"
-            "<li>Once you receive your <strong>FTP Host</strong>, <strong>FTP Port</strong>, "
-            "<strong>FTP Login</strong>, and <strong>FTP Password</strong>, "
-            "enter them below and save the connection.</li>"
+            "<li>Enter the <strong>FTP Host</strong>, <strong>FTP Port</strong>, <strong>FTP Login</strong>, "
+            "and <strong>FTP Password</strong> below.</li>"
+            "<li>Click <strong>Save</strong>.</li>"
             "</ol>"
-            "<p>For assistance please contact: "
-            "<a href=\"mailto:Custserv@autodist.com\">Custserv@autodist.com</a>.</p>"
+            "<p>Paste each value rather than retyping it &mdash; a trailing space is the most common reason a "
+            "correct-looking connection fails.</p>"
+            "<p>Once validated, this integration shows <strong>Feed Connected</strong>.</p>"
+
+            "<p><strong>Notes</strong></p>"
+            "<ul>"
+            "<li><strong>Connection fails.</strong> Confirm the port with your account manager, then re-paste "
+            "the login and password to rule out a stray space.</li>"
+            "<li><strong>Already using these credentials elsewhere?</strong> They're the same as your Automatic "
+            "Distributors catalog connection, so you can reuse them here &mdash; no need to request a second "
+            "account.</li>"
+            "<li><strong>Placing orders.</strong> Automatic Distributors orders aren't sent through "
+            "AfterMarketScout yet &mdash; keep placing them the way you do today. This connection covers "
+            "product data only.</li>"
+            "<li><strong>Need help?</strong> Distributor: "
+            "<a href=\"mailto:Custserv@autodist.com\">Custserv@autodist.com</a> &middot; AfterMarketScout: "
+            "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a></li>"
+            "</ul>"
         ),
     },
     {
