@@ -34,6 +34,7 @@ PROVIDER_DISPLAY_NAMES = {
     "ATD": "ATD",
     "VOSSEN": "Vossen",
     "TIRERACK": "TireRack",
+    "MOTOR_STATE_DISTRIBUTING": "Motor State Distributing",
     "QUADRATEC": "Quadratec",
 }
 
@@ -71,6 +72,7 @@ PROVIDER_IMAGE_URLS = {
     "ATD": "https://api.aftermarketscout.com/uploads/atd_logo.png",
     "VOSSEN": "https://api.aftermarketscout.com/uploads/vossen_logo.png",
     "TIRERACK": "https://api.aftermarketscout.com/uploads/tirerack_logo.png",
+    "MOTOR_STATE_DISTRIBUTING": "https://api.aftermarketscout.com/uploads/motor_state_logo.png",
     "QUADRATEC": "https://api.aftermarketscout.com/uploads/quadratec_logo.png",
 }
 
@@ -1871,6 +1873,47 @@ PROVIDER_CATALOG = [
         "email_order_connection_required_fields": ["rep_email"],
         "email_order_connection_optional_fields": ["cc_email"],
     },
+    {
+        "kind": enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING,
+        "name": "Motor State Distributing",
+        "description": "Access Motor State Distributing inventory and pricing via their API.",
+        "icon_url": "https://api.aftermarketscout.com/uploads/motor_state_logo.png",
+        "category": "Distributors",
+        "connection_required_fields": ["api_key"],
+        "integration_time": "Data available within 1-2 hours",
+        "installation_instructions_html": (
+            "<p><strong>Motor State Distributing</strong> provides inventory and pricing through their API. "
+            "AfterMarketScout handles the connection &mdash; you only need to enter an API key.</p>"
+
+            "<p><strong>1. Request your API key</strong></p>"
+            "<p>Contact your Motor State account manager and request API access:</p>"
+            + _CALLOUT_OPEN +
+            "<p>Could you please issue an API key for our account so we can access inventory and pricing data? "
+            "We're connecting it to our inventory system.</p>"
+            "</div>"
+            "<p>Include your Motor State account number so they can match the request to your account.</p>"
+
+            "<p><strong>2. Enter your API key</strong></p>"
+            "<ol>"
+            "<li>Paste the <strong>API key</strong> into the field below.</li>"
+            "<li>Click <strong>Save</strong>.</li>"
+            "</ol>"
+            "<p>Paste the key rather than retyping it &mdash; these are long strings, and a single wrong "
+            "character or trailing space will fail validation.</p>"
+            "<p>Once validated, this integration shows <strong>Feed Connected</strong>.</p>"
+
+            "<p><strong>Notes</strong></p>"
+            "<ul>"
+            "<li><strong>Connection fails.</strong> Re-paste the key to rule out a stray space or a truncated "
+            "copy. If it still fails, ask your Motor State account manager to confirm the key is active for your "
+            "account.</li>"
+            "<li><strong>Key stopped working.</strong> API keys can be rotated or revoked. Request a new one and "
+            "paste it here &mdash; nothing else needs changing.</li>"
+            "<li><strong>Need help?</strong> Contact "
+            "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a>.</li>"
+            "</ul>"
+        ),
+    },
 ]
 
 
@@ -1889,7 +1932,6 @@ _UPLOADS = "https://api.aftermarketscout.com/uploads"
 COMING_SOON_PROVIDERS = [
     {"kind": enums.BrandProviderKind.ALLPRO_DISTRIBUTING,     "name": "AllPro Distributing",        "category": "Distributors", "icon_url": f"{_UPLOADS}/allpro_logo.png"},
     {"kind": enums.BrandProviderKind.HOLLEY_PERFORMANCE,      "name": "Holley Performance",         "category": "Distributors", "icon_url": f"{_UPLOADS}/holley_logo.png"},
-    {"kind": enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING,"name": "Motor State Distributing",   "category": "Distributors", "icon_url": f"{_UPLOADS}/motor_state_logo.png"},
 ]
 
 """
