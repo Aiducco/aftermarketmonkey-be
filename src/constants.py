@@ -1368,23 +1368,46 @@ PROVIDER_CATALOG = [
     {
         "kind": enums.BrandProviderKind.PARTS_UNLIMITED,
         "name": "Parts Unlimited",
-        "description": "Access Parts Unlimited inventory and pricing via their Price File API.",
+        "description": "Access Parts Unlimited inventory and pricing via their API.",
         "icon_url": "https://api.aftermarketscout.com/uploads/parts_unlimited_logo.png",
         "category": "Distributors",
-        "connection_required_fields": ["username", "password", "dealer_number"],
-        "integration_time": "Data available within 1-2 days",
+        "connection_required_fields": ["api_key"],
+        "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
-            "<p><strong>Parts Unlimited</strong> connection requires access to their "
-            "<strong>Price File API</strong>, which uses your dealer portal credentials.</p>"
+            "<p><strong>Parts Unlimited</strong> provides inventory and pricing through their API at "
+            "<code>api.parts-unlimited.com</code>. AfterMarketScout handles the connection &mdash; you only "
+            "need to enter an API key.</p>"
+
+            "<p><strong>1. Request an API key</strong></p>"
+            "<p>Contact Parts Unlimited at "
+            "<a href=\"mailto:AGelsinger@parts-unltd.com\">AGelsinger@parts-unltd.com</a>:</p>"
+            + _CALLOUT_OPEN +
+            "<p>Could you please issue an API key for our account so we can access inventory and pricing data? "
+            "We're connecting it to our inventory system.</p>"
+            "</div>"
+            "<p>Include your Parts Unlimited account number so they can match the request to your account.</p>"
+
+            "<p><strong>2. Enter your API key</strong></p>"
             "<ol>"
-            "<li>Use the same credentials you use to log in to the Parts Unlimited Dealer Login at "
-            "<a href=\"https://dealer.parts-unlimited.com/login\" target=\"_blank\" rel=\"noopener noreferrer\">"
-            "dealer.parts-unlimited.com/login</a>.</li>"
-            "<li>Enter your <strong>Username</strong>, <strong>Password</strong>, and "
-            "<strong>Dealer Number</strong> below and save.</li>"
+            "<li>Paste the <strong>API key</strong> into the field below.</li>"
+            "<li>Click <strong>Save</strong>.</li>"
             "</ol>"
-            "<p>For assistance contact: "
-            "<a href=\"mailto:AGelsinger@parts-unltd.com\">AGelsinger@parts-unltd.com</a>.</p>"
+            "<p>Paste the key rather than retyping it &mdash; these are long strings, and a single wrong "
+            "character or trailing space will fail validation.</p>"
+            "<p>Once validated, this integration shows <strong>Feed Connected</strong>.</p>"
+
+            "<p><strong>Notes</strong></p>"
+            "<ul>"
+            "<li><strong>Connection fails.</strong> Re-paste the key to rule out a stray space or a truncated "
+            "copy. If it still fails, ask <a href=\"mailto:AGelsinger@parts-unltd.com\">AGelsinger@parts-unltd.com</a> "
+            "to confirm the key is active for your account.</li>"
+            "<li><strong>Key stopped working.</strong> API keys can be rotated or revoked. Request a new one and "
+            "paste it here &mdash; nothing else needs changing.</li>"
+            "<li><strong>Need help?</strong> Distributor: "
+            "<a href=\"mailto:AGelsinger@parts-unltd.com\">AGelsinger@parts-unltd.com</a> &middot; "
+            "AfterMarketScout: "
+            "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a></li>"
+            "</ul>"
         ),
     },
     {
