@@ -1297,19 +1297,48 @@ PROVIDER_CATALOG = [
         "connection_required_fields": ["ftp_host", "ftp_port", "ftp_user", "ftp_password"],
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
-            "<p><strong>Parts Authority</strong> provides inventory and pricing via their FTP server.</p>"
+            "<p><strong>Parts Authority</strong> delivers inventory and pricing via their FTP server. You "
+            "request credentials from Parts Authority, then enter them here.</p>"
+            "<p>The host and port are usually the same for every account, so in most cases you only need a "
+            "login and password from them.</p>"
+
+            "<p><strong>1. Request your FTP credentials</strong></p>"
+            "<p>Contact Parts Authority &mdash; your account manager, or "
+            "<a href=\"mailto:contactus@partsauthority.com\">contactus@partsauthority.com</a>:</p>"
+            + _CALLOUT_OPEN +
+            "<p>Could you please provide the FTP credentials for our inventory and pricing feed? We're "
+            "connecting it to our inventory system.</p>"
+            "</div>"
+
+            "<p><strong>2. Enter the connection details</strong></p>"
             "<ol>"
-            "<li>Contact Parts Authority to obtain your FTP credentials.</li>"
-            "<li>Enter the <strong>FTP Host</strong>, <strong>FTP Port</strong>, "
-            "<strong>FTP Login</strong>, and <strong>FTP Password</strong> below and save.</li>"
+            "<li>Enter the <strong>FTP Host</strong>, <strong>FTP Port</strong>, <strong>FTP Login</strong>, "
+            "and <strong>FTP Password</strong> below.</li>"
+            "<li>Click <strong>Save</strong>.</li>"
             "</ol>"
-            "<p><strong>Default connection details</strong></p>"
+            "<p>Unless Parts Authority tells you otherwise, use these defaults:</p>"
+            + _CALLOUT_OPEN +
+            "<p>"
+            "FTP Host: <code>ftp.panetny.com</code><br />"
+            "FTP Port: <code>21</code>"
+            "</p>"
+            "</div>"
+            "<p>Paste the login and password rather than retyping them &mdash; a trailing space is the most "
+            "common reason a correct-looking connection fails.</p>"
+            "<p>Once validated, this integration shows <strong>Feed Connected</strong>.</p>"
+
+            "<p><strong>Notes</strong></p>"
             "<ul>"
-            "<li><strong>FTP Host:</strong> <code>ftp.panetny.com</code></li>"
-            "<li><strong>FTP Port:</strong> <code>21</code></li>"
+            "<li><strong>Connection fails.</strong> Confirm the host and port against anything Parts Authority "
+            "sent you &mdash; the defaults above cover most accounts, but some are pointed at a different "
+            "server. Then re-paste the login and password to rule out a stray space.</li>"
+            "<li><strong>Only received a username and password?</strong> That's normal. Use the default host "
+            "and port above.</li>"
+            "<li><strong>Need help?</strong> Distributor: "
+            "<a href=\"mailto:contactus@partsauthority.com\">contactus@partsauthority.com</a> &middot; "
+            "AfterMarketScout: "
+            "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a></li>"
             "</ul>"
-            "<p>For assistance contact: "
-            "<a href=\"mailto:contactus@partsauthority.com\">contactus@partsauthority.com</a>.</p>"
         ),
     },
     {
