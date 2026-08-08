@@ -1597,19 +1597,65 @@ PROVIDER_CATALOG = [
     {
         "kind": enums.BrandProviderKind.WESTERN_POWER_SPORTS,
         "name": "Western Power Sports",
-        "description": "Access Western Power Sports inventory and pricing via API key.",
+        "description": "Access Western Power Sports inventory and pricing via their Data Depot API.",
         "icon_url": "https://api.aftermarketscout.com/uploads/western_power_sports_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["api_key"],
-        "integration_time": "Data available within 1-2 days",
+        "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
-            "<p><strong>Western Power Sports (WPS)</strong> provides access via an API key.</p>"
+            "<p><strong>Western Power Sports (WPS)</strong> provides inventory and pricing through their Data "
+            "Depot API. AfterMarketScout handles the connection &mdash; you only need to enter an API token.</p>"
+            "<p>You generate the token yourself from the Data Depot; there's no waiting on a rep.</p>"
+
+            "<p><strong>1. Sign in to the Data Depot</strong></p>"
+            "<p>Go to <a href=\"https://www.wps-inc.com/data-depot/v4/front\" target=\"_blank\" "
+            "rel=\"noopener noreferrer\">https://www.wps-inc.com/data-depot/v4/front</a> and click "
+            "<strong>Log In</strong>. Sign in with your <strong>wpsorders.com</strong> credentials:</p>"
+            "<ul>"
+            "<li><strong>Dealer ID</strong> &mdash; your WPS Dealer ID with the letter in front, e.g. "
+            "<code>D12345</code> or <code>S12345</code>.</li>"
+            "<li><strong>Password</strong> &mdash; your wpsorders password.</li>"
+            "</ul>"
+            "<p>Your Dealer ID is never <code>admin</code> and never an individual user's name. If you don't "
+            "have wpsorders credentials, your WPS account manager can set them up.</p>"
+
+            "<p><strong>2. Generate your API token</strong></p>"
+            "<p>Once signed in, open <strong>API Documentation &rarr; API Token</strong> "
+            "(<a href=\"https://www.wps-inc.com/data-depot/v4/api/api-token\" target=\"_blank\" "
+            "rel=\"noopener noreferrer\">https://www.wps-inc.com/data-depot/v4/api/api-token</a>) and sign up "
+            "for an access token. Copy the token when it's issued.</p>"
+
+            "<p><strong>3. Enter your token</strong></p>"
             "<ol>"
-            "<li>Contact your WPS account manager to obtain your <strong>API Key</strong>.</li>"
-            "<li>Enter it below and save the connection.</li>"
+            "<li>Paste the <strong>API token</strong> into the field below.</li>"
+            "<li>Click <strong>Save</strong>.</li>"
             "</ol>"
-            "<p>For assistance contact: "
-            "<a href=\"mailto:webservices@wps-inc.com\">webservices@wps-inc.com</a>.</p>"
+            "<p>Paste the token rather than retyping it &mdash; these are long strings, and a single wrong "
+            "character or trailing space will fail validation.</p>"
+            "<p>Once validated, this integration shows <strong>Feed Connected</strong>.</p>"
+
+            "<p><strong>4. Optional &mdash; place orders through AfterMarketScout</strong></p>"
+            "<p>Skip this if you don't plan to send purchase orders from AfterMarketScout. WPS handles ordering "
+            "through the same Data Depot API, so in most cases the token from step 2 covers it and there's "
+            "nothing further to do.</p>"
+            "<p>If orders fail while the feed works, order processing may not be enabled on your account "
+            "&mdash; contact <a href=\"mailto:webservices@wps-inc.com\">webservices@wps-inc.com</a> and ask "
+            "them to enable it.</p>"
+
+            "<p><strong>Notes</strong></p>"
+            "<ul>"
+            "<li><strong>Can't sign in to the Data Depot.</strong> The Data Depot uses your wpsorders.com "
+            "login, not a separate account. Make sure you're entering the Dealer ID with its letter prefix "
+            "rather than a username.</li>"
+            "<li><strong>Connection fails.</strong> Re-paste the token to rule out a stray space or a truncated "
+            "copy. If it still fails, ask <a href=\"mailto:webservices@wps-inc.com\">webservices@wps-inc.com</a> "
+            "to confirm the token is active for your account.</li>"
+            "<li><strong>Token stopped working.</strong> Tokens can be rotated or revoked. Generate a new one "
+            "in the Data Depot and paste it here &mdash; nothing else needs changing.</li>"
+            "<li><strong>Need help?</strong> Distributor: "
+            "<a href=\"mailto:webservices@wps-inc.com\">webservices@wps-inc.com</a> &middot; AfterMarketScout: "
+            "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a></li>"
+            "</ul>"
         ),
     },
     {
