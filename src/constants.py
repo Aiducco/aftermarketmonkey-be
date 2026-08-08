@@ -1097,6 +1097,9 @@ PROVIDER_CATALOG = [
         "description": "Access FastCo inventory and pricing via FTP.",
         "icon_url": "https://api.aftermarketscout.com/uploads/fastco_logo.png",
         "category": "Distributors",
+        # Temporarily withheld from the catalog and onboarding picker — see the note on CTP
+        # Distributors above. Delete this line to bring it back.
+        "hidden": True,
         "connection_required_fields": ["ftp_host", "ftp_port", "ftp_user", "ftp_password"],
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
