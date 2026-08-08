@@ -1194,16 +1194,42 @@ PROVIDER_CATALOG = [
     {
         "kind": enums.BrandProviderKind.HELMHOUSE,
         "name": "HelmHouse",
-        "description": "Access HelmHouse public inventory and pricing — no account required.",
+        "description": "Access Helmet House price and stock data via their shared FTP feed.",
         "icon_url": "https://api.aftermarketscout.com/uploads/helmhouse_logo.png",
         "category": "Distributors",
-        "connection_required_fields": [],
-        "integration_time": "Data available within 1-2 days",
+        "connection_required_fields": ["ftp_user", "ftp_password"],
+        "integration_time": "Data available within 1-2 hours",
+        # The login is a single shared credential (not issued per dealer), so it is NOT stored
+        # here -- dealers get it from Helmet House and enter it themselves. Never hardcode the
+        # username/password into this copy: it would commit a live credential to the repo and
+        # surface it in the public catalog response.
         "installation_instructions_html": (
-            "<p><strong>Helmet House</strong> provides public price and stock data — "
-            "an account is not required. Simply save the connection to activate it.</p>"
-            "<p>For assistance contact: "
-            "<a href=\"mailto:info@helmethouse.com\">info@helmethouse.com</a>.</p>"
+            "<p><strong>Helmet House</strong> publishes price and stock data over plain FTP. "
+            "AfterMarketScout connects to <code>ftp.helmethouse.com</code> on port <code>21</code> "
+            "automatically &mdash; there's no host or port to enter. You only provide the login.</p>"
+            "<p>Unlike most distributors, this isn't a dealer-specific account: Helmet House uses one shared "
+            "login for their published feed, so there's no application process and nothing to request.</p>"
+
+            "<p><strong>1. Enter the FTP login</strong></p>"
+            "<ol>"
+            "<li>Enter the Helmet House FTP <strong>username</strong> and <strong>password</strong> below.</li>"
+            "<li>Click <strong>Save</strong>.</li>"
+            "</ol>"
+            "<p>Don't have the shared login, or think it's changed? Contact "
+            "<a href=\"mailto:info@helmethouse.com\">info@helmethouse.com</a> for the current FTP username and "
+            "password.</p>"
+            "<p>Once validated, this integration shows <strong>Feed Connected</strong>.</p>"
+
+            "<p><strong>Notes</strong></p>"
+            "<ul>"
+            "<li><strong>Connection fails.</strong> Re-paste the username and password to rule out a stray "
+            "space. If it still fails, ask <a href=\"mailto:info@helmethouse.com\">info@helmethouse.com</a> to "
+            "confirm the login is current &mdash; because it's shared rather than issued per dealer, it can "
+            "change without notice.</li>"
+            "<li><strong>Need help?</strong> Distributor: "
+            "<a href=\"mailto:info@helmethouse.com\">info@helmethouse.com</a> &middot; AfterMarketScout: "
+            "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a></li>"
+            "</ul>"
         ),
     },
     {
