@@ -1072,23 +1072,76 @@ PROVIDER_CATALOG = [
     {
         "kind": enums.BrandProviderKind.ELITE_WHEEL,
         "name": "Elite Wheel",
-        "description": "Access Elite Wheel & Tire inventory and pricing via API.",
+        "description": "Access Elite Wheel & Tire inventory and pricing via SFTP, updated hourly.",
         "icon_url": "https://api.aftermarketscout.com/uploads/elite_wheel_logo.png",
         "category": "Distributors",
-        "connection_required_fields": ["username", "password"],
-        "integration_time": "Data available within 1-2 days",
+        "connection_required_fields": ["sftp_host", "sftp_port", "sftp_user", "sftp_password"],
+        "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
-            "<p><strong>Elite Wheel &amp; Tire</strong> provides access via their API using a "
-            "<strong>Username</strong> and <strong>Password</strong>.</p>"
+            "<p><strong>Elite Wheel &amp; Tire</strong> delivers your inventory and pricing over SFTP, updated "
+            "hourly. You request access through a form on their dealer site, and they send back the SFTP "
+            "connection details to enter here.</p>"
+
+            "<p><strong>1. Sign in to the Elite dealer site</strong></p>"
+            "<p>Go to <a href=\"https://shop.ewwfl.com/\" target=\"_blank\" rel=\"noopener noreferrer\">"
+            "https://shop.ewwfl.com/</a> and sign in.</p>"
+            "<p>If you don't have a dealer account yet, apply first at "
+            "<a href=\"https://shop.ewwfl.com/dealer-application/\" target=\"_blank\" rel=\"noopener noreferrer\">"
+            "https://shop.ewwfl.com/dealer-application/</a> &mdash; the inventory request form is only available "
+            "to signed-in dealers.</p>"
+
+            "<p><strong>2. Submit the inventory request form</strong></p>"
+            "<p>Once signed in, open "
+            "<a href=\"https://shop.ewwfl.com/inventory-request-form/\" target=\"_blank\" "
+            "rel=\"noopener noreferrer\">https://shop.ewwfl.com/inventory-request-form/</a> and complete it. "
+            "Three answers matter for this integration:</p>"
+            "<ul>"
+            "<li><strong>Inventory Request Type</strong> &mdash; select <strong>SFTP (updated hourly)</strong>. "
+            "Don't select <em>Excel Sheet</em> (emailed a few times a week) or <em>API</em> &mdash; "
+            "AfterMarketScout reads the SFTP feed.</li>"
+            "<li><strong>What products are being requested</strong> &mdash; select <strong>Both</strong> unless "
+            "you only stock wheels or only tires.</li>"
+            "<li><strong>Location of products</strong> &mdash; select <strong>All</strong> to receive "
+            "availability across every Elite location.</li>"
+            "</ul>"
+            "<p>The rest is your business contact information. If you don't have an assigned Elite sales rep, "
+            "answer <strong>No</strong> and leave the rep name blank &mdash; a rep isn't required to get "
+            "access.</p>"
+            "<p><img src=\"https://api.aftermarketscout.com/uploads/elite_wheel_step2_inventory_request_form.png\" "
+            "alt=\"Elite inventory request form with SFTP selected\" style=\"max-width:100%;height:auto;\" /></p>"
+            "<p>Then click <strong>Send</strong>. Alternatively, you can email "
+            "<a href=\"mailto:it@ewwfl.com\">it@ewwfl.com</a> or contact your Elite sales rep directly, but the "
+            "form is the fastest route.</p>"
+
+            "<p><strong>3. Enter your SFTP details</strong></p>"
+            "<p>When Elite sends your SFTP connection details:</p>"
             "<ol>"
-            "<li>Fill out the "
-            "<a href=\"https://www.ewwfl.com\" target=\"_blank\" rel=\"noopener noreferrer\">Inventory Request Form</a> "
-            "on the Elite Wheel website — this is the most efficient way to get API access.</li>"
-            "<li>Alternatively, email <a href=\"mailto:it@ewwfl.com\">it@ewwfl.com</a> or contact your Elite sales rep.</li>"
-            "<li>Once you receive your credentials, enter your <strong>Username</strong> and <strong>Password</strong> "
-            "below and save the connection.</li>"
+            "<li>Enter them in the fields below &mdash; <strong>host</strong>, <strong>port</strong>, "
+            "<strong>username</strong>, and <strong>password</strong>.</li>"
+            "<li>Click <strong>Save</strong>.</li>"
             "</ol>"
-            "<p>For assistance contact: <a href=\"mailto:it@ewwfl.com\">it@ewwfl.com</a>.</p>"
+            "<p>Paste each value rather than retyping it &mdash; a trailing space is the most common reason a "
+            "correct-looking connection fails. If Elite's email is missing any of these, ask "
+            "<a href=\"mailto:it@ewwfl.com\">it@ewwfl.com</a> to confirm the full set before you try "
+            "connecting.</p>"
+            "<p>Once validated, this integration shows <strong>Feed Connected</strong>. The feed updates hourly, "
+            "so data appears after the next refresh rather than immediately.</p>"
+
+            "<p><strong>Notes</strong></p>"
+            "<ul>"
+            "<li><strong>Requested the wrong feed type?</strong> If you selected Excel Sheet or API by mistake, "
+            "email <a href=\"mailto:it@ewwfl.com\">it@ewwfl.com</a> and ask them to switch you to SFTP &mdash; "
+            "AfterMarketScout can't read an emailed spreadsheet.</li>"
+            "<li><strong>No response to the form.</strong> Follow up with "
+            "<a href=\"mailto:it@ewwfl.com\">it@ewwfl.com</a> or your Elite sales rep, referencing your business "
+            "name as entered on the form.</li>"
+            "<li><strong>Connection fails.</strong> Confirm the host and port match exactly what Elite sent, "
+            "then re-paste the username and password to rule out a stray space. If it still fails, ask "
+            "<a href=\"mailto:it@ewwfl.com\">it@ewwfl.com</a> to confirm the credentials are active.</li>"
+            "<li><strong>Need help?</strong> Distributor: <a href=\"mailto:it@ewwfl.com\">it@ewwfl.com</a> "
+            "&middot; AfterMarketScout: "
+            "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a></li>"
+            "</ul>"
         ),
     },
     {
@@ -1159,6 +1212,9 @@ PROVIDER_CATALOG = [
         "description": "Access Thibault (Importations Thibault) inventory via their open FTP feed.",
         "icon_url": "https://api.aftermarketscout.com/uploads/thibault_logo.png",
         "category": "Distributors",
+        # Temporarily withheld from the catalog and onboarding picker — see the note on CTP
+        # Distributors above. Delete this line to bring it back.
+        "hidden": True,
         "connection_required_fields": [],
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
@@ -1173,6 +1229,9 @@ PROVIDER_CATALOG = [
         "name": "Marcor",
         "description": "Access Marcor Automotive public inventory and pricing — no account required.",
         "icon_url": "https://api.aftermarketscout.com/uploads/marcor_logo.png",
+        # Temporarily withheld from the catalog and onboarding picker — see the note on CTP
+        # Distributors above. Delete this line to bring it back.
+        "hidden": True,
         "category": "Distributors",
         "connection_required_fields": [],
         "integration_time": "Data available within 1-2 days",
