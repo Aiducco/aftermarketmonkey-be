@@ -1681,18 +1681,49 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/atd_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["username", "password", "client_id", "location"],
-        "integration_time": "Data available within 1-2 days",
+        "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
-            "<p><strong>ATD (American Tire Distributors)</strong> provides inventory and pricing via their "
-            "Ship to Home API. You will need your ATD account credentials to connect.</p>"
+            "<p><strong>ATD (American Tire Distributors)</strong> delivers inventory and pricing through their "
+            "Ship to Home API. Connecting takes four values from ATD &mdash; they're issued together, so one "
+            "request covers everything.</p>"
+
+            "<p><strong>1. Request your API credentials</strong></p>"
+            "<p>Contact your ATD representative, or "
+            "<a href=\"mailto:bmoyer@atd-us.com\">bmoyer@atd-us.com</a>:</p>"
+            + _CALLOUT_OPEN +
+            "<p>Could you please provide our Ship to Home API credentials &mdash; username, password, client "
+            "ID, and location code? We're connecting our inventory and pricing to our inventory system.</p>"
+            "</div>"
+            "<p>Include your ATD account number so they can match the request to your account.</p>"
+
+            "<p><strong>2. Enter your credentials</strong></p>"
+            "<p>Enter all four values below, then click <strong>Save</strong>.</p>"
             "<ul>"
-            "<li><strong>Username</strong> — your ATD API username</li>"
-            "<li><strong>Password</strong> — your ATD API password</li>"
-            "<li><strong>Client ID</strong> — your ATD client identifier</li>"
-            "<li><strong>Location</strong> — your ATD location code</li>"
+            "<li><strong>Username</strong> &mdash; your ATD API username, issued for the API, not your ATD "
+            "website login.</li>"
+            "<li><strong>Password</strong> &mdash; your ATD API password.</li>"
+            "<li><strong>Client ID</strong> &mdash; your ATD client identifier.</li>"
+            "<li><strong>Location</strong> &mdash; your ATD location code, which determines the warehouse your "
+            "availability and pricing come from.</li>"
             "</ul>"
-            "<p>For access or assistance, contact your ATD representative at "
-            "<a href=\"mailto:bmoyer@atd-us.com\">bmoyer@atd-us.com</a>.</p>"
+            "<p>Paste each value rather than retyping it &mdash; a trailing space is the most common reason a "
+            "correct-looking connection fails.</p>"
+            "<p>Once validated, this integration shows <strong>Feed Connected</strong>.</p>"
+
+            "<p><strong>Notes</strong></p>"
+            "<ul>"
+            "<li><strong>Connection fails.</strong> Re-paste each value to rule out a stray space, then check "
+            "the client ID in particular &mdash; it's easy to confuse with the username. If it still fails, ask "
+            "your ATD rep to confirm the credentials are active.</li>"
+            "<li><strong>Connected, but availability looks wrong.</strong> Check the <strong>Location</strong> "
+            "code. If it points at a different warehouse than you buy from, stock and pricing will both look off "
+            "even though the connection is working.</li>"
+            "<li><strong>More than one ATD location?</strong> Each location code returns that warehouse's "
+            "availability. Ask your ATD rep which code matches the location you order from.</li>"
+            "<li><strong>Need help?</strong> Distributor: "
+            "<a href=\"mailto:bmoyer@atd-us.com\">bmoyer@atd-us.com</a> &middot; AfterMarketScout: "
+            "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a></li>"
+            "</ul>"
         ),
     },
     {
