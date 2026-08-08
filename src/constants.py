@@ -922,6 +922,11 @@ PROVIDER_CATALOG = [
         "description": "Access inventory and pricing from CTP Distributors via FTP relay.",
         "icon_url": "https://api.aftermarketscout.com/uploads/ctp_distributors_logo.png",
         "category": "Distributors",
+        # Temporarily withheld from the catalog and the onboarding picker — delete this line to
+        # bring it back. The entry itself stays in PROVIDER_CATALOG so credential validation,
+        # syncing, and provider detail lookups keep working for anyone already connected; only the
+        # two places that list connectable providers skip it (see visible_provider_catalog).
+        "hidden": True,
         "connection_required_fields": [],
         "relay_provisioned": True,
         "relay_credential_fields": ("ftp_user", "ftp_password"),
@@ -1535,6 +1540,17 @@ PROVIDER_CATALOG = [
         "email_order_connection_optional_fields": ["cc_email"],
     },
 ]
+
+
+def visible_provider_catalog() -> typing.List[typing.Dict[str, typing.Any]]:
+    """
+    PROVIDER_CATALOG minus entries flagged ``hidden`` — for the two places that list providers a
+    company can *start* connecting (integrations catalog, onboarding picker). Everything else
+    (validation, sync, provider detail) keeps reading PROVIDER_CATALOG directly, so hiding a
+    provider never orphans a company already connected to it.
+    """
+    return [entry for entry in PROVIDER_CATALOG if not entry.get("hidden")]
+
 
 _UPLOADS = "https://api.aftermarketscout.com/uploads"
 

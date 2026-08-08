@@ -254,7 +254,7 @@ def get_providers_catalog(company_id: int) -> typing.Dict:
     catalog = []
 
     # Active integrations — driven by PROVIDER_CATALOG
-    for entry in src_constants.PROVIDER_CATALOG:
+    for entry in src_constants.visible_provider_catalog():
         kind_value = entry["kind"].value
         provider = providers_by_kind.get(kind_value)
         if not provider:

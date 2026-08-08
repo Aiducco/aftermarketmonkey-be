@@ -220,7 +220,7 @@ def get_onboarding_status(company_id: int, user=None) -> dict:
         return {"onboarding_step": 0, "company_id": None}
 
     # Integrations catalog providers available during onboarding (same kinds as full catalog subset)
-    catalog_kinds = [e["kind"].value for e in src_constants.PROVIDER_CATALOG]
+    catalog_kinds = [e["kind"].value for e in src_constants.visible_provider_catalog()]
     providers = src_models.Providers.objects.filter(kind__in=catalog_kinds).values(
         "id", "name", "kind_name", "kind"
     )
