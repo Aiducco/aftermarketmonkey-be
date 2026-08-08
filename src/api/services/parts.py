@@ -429,6 +429,16 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
 
         providers_data.append(provider_info)
 
+    # Cheapest cost first, so the best buy is the top row. Rows without a cost — not connected,
+    # or connected with no company pricing synced yet — sort to the end and keep their relative
+    # order there (sort is stable), as do ties at the same cost.
+    providers_data.sort(
+        key=lambda row: (
+            (row["pricing"] or {}).get("cost") is None,
+            (row["pricing"] or {}).get("cost") or 0,
+        )
+    )
+
     base["provider_image_urls"] = _get_all_provider_image_urls()
     base["providers"] = providers_data
     return base
