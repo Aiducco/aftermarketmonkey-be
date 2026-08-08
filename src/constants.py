@@ -1347,6 +1347,9 @@ PROVIDER_CATALOG = [
         "description": "Access Parts Canada inventory and pricing via API access token.",
         "icon_url": "https://api.aftermarketscout.com/uploads/parts_canada_logo.png",
         "category": "Distributors",
+        # Temporarily withheld from the catalog and onboarding picker — see the note on CTP
+        # Distributors above. Delete this line to bring it back.
+        "hidden": True,
         "connection_required_fields": ["access_token"],
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
