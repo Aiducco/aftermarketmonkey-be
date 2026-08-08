@@ -49,7 +49,10 @@ class MotorStateApiClient(object):
     VALID_STATUS_CODES = [200]
 
     def __init__(self, credentials: typing.Dict):
-        self.api_key = (credentials or {}).get("api_key", "")
+        # Stripped because these keys are pasted: a trailing space or newline would otherwise
+        # be sent verbatim in the apiKey header, which requests rejects outright as an invalid
+        # header value (an internal error, not the "bad credentials" the user needs to see).
+        self.api_key = ((credentials or {}).get("api_key") or "").strip()
         if not self.api_key:
             raise ValueError("Invalid credentials parameter: missing api_key.")
         # Reuse one HTTP connection pool across calls (and across worker threads) so the

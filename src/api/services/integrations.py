@@ -23,6 +23,8 @@ from src.integrations.clients.keystone import order_client as keystone_order_cli
 from src.integrations.clients.meyer import client as meyer_client
 from src.integrations.clients.meyer import exceptions as meyer_exceptions
 from src.integrations.clients.meyer import order_client as meyer_order_client
+from src.integrations.clients.motorstate import client as motorstate_client
+from src.integrations.clients.motorstate import exceptions as motorstate_exceptions
 from src.integrations.clients.premier import client as premier_client
 from src.integrations.clients.premier import exceptions as premier_exceptions
 from src.integrations.clients.premier import order_client as premier_order_client
@@ -554,6 +556,31 @@ def _validate_elite_wheel_connection(credentials: typing.Dict[str, typing.Any]) 
     return None, None
 
 
+def _validate_motorstate_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
+    """
+    Validates the dealer's Motor State API key against GET /api/Brands — the cheapest real
+    endpoint (single unpaginated call, no account state needed).
+
+    Motor State answers 403 with an empty body both for an unknown/expired key and for a valid
+    key that lacks access to an endpoint, so the two are indistinguishable from the response
+    alone; the client raises MotorStatePermissionError for either and it is reported as bad
+    credentials, which is the actionable case for someone pasting a key into this form.
+    """
+    try:
+        client = motorstate_client.MotorStateApiClient(credentials=credentials)
+    except ValueError as e:
+        return str(e), CONNECTION_ERROR_INVALID_INPUT
+    try:
+        client.test_connection()
+    except motorstate_exceptions.MotorStatePermissionError as e:
+        return e.message, CONNECTION_ERROR_INVALID_CREDENTIALS
+    except motorstate_exceptions.MotorStateAPIBadResponseCodeError as e:
+        return e.message, CONNECTION_ERROR_CONNECTION_FAILED
+    except motorstate_exceptions.MotorStateAPIException as e:
+        return str(e), CONNECTION_ERROR_CONNECTION_FAILED
+    return None, None
+
+
 def _validate_tirerack_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
     try:
         client = tirerack_client.TireRackSFTPClient(credentials=credentials)
@@ -581,6 +608,7 @@ _CONNECTION_VALIDATORS: typing.Dict[int, typing.Callable[[typing.Dict[str, typin
     src_enums.BrandProviderKind.VOSSEN.value: _validate_vossen_connection,
     src_enums.BrandProviderKind.TIRERACK.value: _validate_tirerack_connection,
     src_enums.BrandProviderKind.ELITE_WHEEL.value: _validate_elite_wheel_connection,
+    src_enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING.value: _validate_motorstate_connection,
 }
 
 
