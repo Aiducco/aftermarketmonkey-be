@@ -209,7 +209,6 @@ def fetch_and_save_motorstate_availability_full(
         logger.info("{} No active Motor State provider found.".format(_LOG_PREFIX))
         return
 
-    company = company_provider.company
     client = _build_client(company_provider)
 
     brand_codes = list(
@@ -227,7 +226,7 @@ def fetch_and_save_motorstate_availability_full(
     total_rows = 0
     for idx, brand_code in enumerate(brand_codes, start=1):
         rows = _collect_brand_availability(client, brand_code)
-        instances = _transform_availability_rows(rows, company=company, brand_code=brand_code)
+        instances = _transform_availability_rows(rows, brand_code=brand_code)
         if instances:
             _upsert_availability(instances, update_fields=_AVAILABILITY_UPDATE_FIELDS_SPINE)
             total_rows += len(instances)
@@ -277,10 +276,9 @@ def fetch_and_save_motorstate_availability_updates(
         logger.info("{} No active Motor State provider found.".format(_LOG_PREFIX))
         return
 
-    company = company_provider.company
     client = _build_client(company_provider)
 
-    from_date_time = _incremental_from_date_time(company)
+    from_date_time = _incremental_from_date_time()
     logger.info("{} Availability updates fromDateTime={}.".format(_LOG_PREFIX, from_date_time))
 
     rows = client.get_product_availability_changes(from_date_time=from_date_time)
@@ -289,15 +287,15 @@ def fetch_and_save_motorstate_availability_updates(
         # row's timestamp until a call comes back under the cap.
         rows = _drain_incremental(client, seed_rows=rows)
 
-    instances = _transform_availability_rows(rows, company=company, brand_code=None)
+    instances = _transform_availability_rows(rows, brand_code=None)
     if instances:
         _upsert_availability(instances, update_fields=_AVAILABILITY_UPDATE_FIELDS_INCREMENTAL)
     logger.info("{} Availability updates done: {} rows.".format(_LOG_PREFIX, len(instances)))
 
 
-def _incremental_from_date_time(company: src_models.Company) -> str:
+def _incremental_from_date_time() -> str:
     latest = (
-        src_models.MotorStateAvailability.objects.filter(company=company)
+        src_models.MotorStateAvailability.objects
         .exclude(source_updated_on__isnull=True)
         .order_by("-source_updated_on")
         .values_list("source_updated_on", flat=True)
@@ -342,7 +340,6 @@ def _drain_incremental(
 
 def _transform_availability_rows(
     rows: typing.List[typing.Dict],
-    company: src_models.Company,
     brand_code: typing.Optional[str],
 ) -> typing.List[src_models.MotorStateAvailability]:
     # Dedupe within the batch — pgbulk rejects duplicate unique keys in one call.
@@ -352,7 +349,6 @@ def _transform_availability_rows(
         if not part_number:
             continue
         by_part[part_number] = src_models.MotorStateAvailability(
-            company=company,
             part_number=part_number,
             brand_code=brand_code,
             status_type=row.get("StatusType"),
@@ -369,7 +365,7 @@ def _upsert_availability(
     pgbulk.upsert(
         src_models.MotorStateAvailability,
         instances,
-        unique_fields=["company", "part_number"],
+        unique_fields=["part_number"],
         update_fields=update_fields,
         returning=False,
     )
@@ -384,11 +380,18 @@ def fetch_and_save_motorstate_products(
     workers: int = _DEFAULT_PRODUCT_WORKERS,
     include_discontinued: bool = False,
     flush_size: int = _PRODUCT_FLUSH_SIZE,
+    write_catalog: bool = True,
 ) -> None:
-    """Hydrate detail + pricing for ``part_numbers`` (default: this company's spine,
+    """Hydrate detail + pricing for ``part_numbers`` (default: the shared spine,
     minus discontinued parts — Motor State returns Found=false with no data for
     StatusType X, so hydrating them just burns API calls; pass include_discontinued
     to force them).
+
+    ``write_catalog=False`` writes only this company's MotorStateCompanyPricing rows and
+    leaves the shared MotorStateProduct catalog untouched -- what the per-company pricing
+    job uses, since catalog and inventory are distributor-wide and maintained once from the
+    primary connection. Parts absent from the shared catalog are skipped in that mode
+    (nothing to hang a price on until the next catalog sync picks them up).
 
     Worker threads do HTTP only (shared keep-alive session); the main thread buffers
     the parsed rows and flushes them with a single bulk upsert every ``flush_size``
@@ -405,10 +408,10 @@ def fetch_and_save_motorstate_products(
 
     # Motor State's /api/Product carries no brand, so resolve each part's brand from
     # the availability spine up front: part_number -> (MotorStateBrand id, brand code).
-    brand_by_part = _build_part_brand_map(company)
+    brand_by_part = _build_part_brand_map()
 
     if part_numbers is None:
-        availability = src_models.MotorStateAvailability.objects.filter(company=company)
+        availability = src_models.MotorStateAvailability.objects.all()
         if not include_discontinued:
             # StatusType X/x = discontinued; /api/Product has no detail for these.
             availability = availability.exclude(status_type__iexact="X")
@@ -423,8 +426,10 @@ def fetch_and_save_motorstate_products(
         for i in range(0, len(part_numbers), motorstate_client.MAX_PRODUCT_BATCH)
     ]
     logger.info(
-        "{} Hydrating {} part numbers in {} chunks, {} workers (discontinued={}).".format(
-            _LOG_PREFIX, len(part_numbers), len(chunks), workers, include_discontinued
+        "{} Hydrating {} part numbers in {} chunks, {} workers (discontinued={}, "
+        "mode={}).".format(
+            _LOG_PREFIX, len(part_numbers), len(chunks), workers, include_discontinued,
+            "catalog+pricing" if write_catalog else "pricing only",
         )
     )
 
@@ -439,7 +444,7 @@ def fetch_and_save_motorstate_products(
                 if pair is not None:
                     buffer.append(pair)
             if len(buffer) >= flush_size:
-                processed += _flush_product_buffer(buffer, company)
+                processed += _flush_product_buffer(buffer, company, write_catalog)
                 buffer = []
             if done % 200 == 0 or done == len(chunks):
                 logger.info(
@@ -447,19 +452,17 @@ def fetch_and_save_motorstate_products(
                         _LOG_PREFIX, done, len(chunks), processed, time.monotonic() - started
                     )
                 )
-    processed += _flush_product_buffer(buffer, company)
+    processed += _flush_product_buffer(buffer, company, write_catalog)
     logger.info("{} Product hydrate done: {} rows.".format(_LOG_PREFIX, processed))
 
 
-def _build_part_brand_map(
-    company: src_models.Company,
-) -> typing.Dict[str, typing.Tuple[typing.Optional[int], typing.Optional[str]]]:
-    """part_number -> (MotorStateBrand id, brand code) from the availability spine.
+def _build_part_brand_map() -> typing.Dict[str, typing.Tuple[typing.Optional[int], typing.Optional[str]]]:
+    """part_number -> (MotorStateBrand id, brand code) from the shared availability spine.
     Brand id is None for a code with no matching MotorStateBrand row."""
     brand_id_by_code = dict(src_models.MotorStateBrand.objects.values_list("code", "id"))
     mapping: typing.Dict[str, typing.Tuple[typing.Optional[int], typing.Optional[str]]] = {}
     for part_number, brand_code in (
-        src_models.MotorStateAvailability.objects.filter(company=company)
+        src_models.MotorStateAvailability.objects
         .values_list("part_number", "brand_code")
         .iterator()
     ):
@@ -483,10 +486,11 @@ def _fetch_product_chunk_rows(
 def _flush_product_buffer(
     buffer: typing.List[typing.Tuple[src_models.MotorStateProduct, typing.Dict]],
     company: src_models.Company,
+    write_catalog: bool = True,
 ) -> int:
     """
-    Bulk-upsert one buffer into both tables (main thread only): the global catalog rows first,
-    then this company's price rows keyed to them. Returns catalog rows written.
+    Bulk-upsert one buffer (main thread only): the shared catalog rows first when
+    ``write_catalog``, then this company's price rows keyed to them. Returns rows written.
     """
     if not buffer:
         return 0
@@ -497,15 +501,17 @@ def _flush_product_buffer(
         by_part[product.part_number] = (product, price_kwargs)
 
     products = [p for p, _ in by_part.values()]
-    pgbulk.upsert(
-        src_models.MotorStateProduct,
-        products,
-        unique_fields=["part_number"],
-        update_fields=_PRODUCT_UPDATE_FIELDS,
-        returning=False,
-    )
+    if write_catalog:
+        pgbulk.upsert(
+            src_models.MotorStateProduct,
+            products,
+            unique_fields=["part_number"],
+            update_fields=_PRODUCT_UPDATE_FIELDS,
+            returning=False,
+        )
 
-    # Re-read ids: pgbulk doesn't populate pks on the instances it upserts.
+    # Re-read ids: pgbulk doesn't populate pks on the instances it upserts. In pricing-only
+    # mode this also filters out parts the shared catalog doesn't carry yet.
     product_ids = dict(
         src_models.MotorStateProduct.objects.filter(
             part_number__in=list(by_part.keys())
@@ -527,7 +533,7 @@ def _flush_product_buffer(
             returning=False,
         )
 
-    return len(products)
+    return len(products) if write_catalog else len(pricing_rows)
 
 
 def _transform_product_row(
@@ -756,9 +762,10 @@ def sync_unmapped_motorstate_brands_to_brands() -> typing.List[src_models.MotorS
 # ---------------------------------------------------------------------------
 def sync_motorstate_company_pricing_for_company_provider(company_provider_id: int) -> None:
     """
-    Refresh this connection's own MotorStateProduct rows (detail + account pricing) using its
-    API key. Motor State returns catalog and price in the same /api/Product payload, so this is
-    the product hydrate scoped to one company — there is no separate price-only endpoint.
+    Refresh this connection's own MotorStateCompanyPricing rows using its API key. Motor State
+    returns catalog and price in the same /api/Product payload and has no price-only endpoint,
+    so this runs the product hydrate with write_catalog=False: the shared catalog and inventory
+    are left to the primary connection, and only this company's prices are written.
 
     Called by the IntegrationPricingSyncJob queue: on connect/reconnect (full first sync) and
     on the recurring cadence (see integration_pricing_sync_jobs, throttled to 7 days for Motor
@@ -781,15 +788,14 @@ def sync_motorstate_company_pricing_for_company_provider(company_provider_id: in
         )
         return
 
-    # A connection with no spine yet (freshly connected company) has nothing to price against,
-    # so build it first — otherwise the hydrate would have zero part numbers to ask about.
-    if not src_models.MotorStateAvailability.objects.filter(company=cp.company).exists():
-        logger.info(
-            "{} No availability spine for company={}; building it before pricing.".format(
-                _LOG_PREFIX, cp.company_id
-            )
+    # Brands, the availability spine and the product catalog are distributor-wide and are
+    # maintained once from the primary connection (nightly ingest / fetch_motorstate_*). This
+    # job only prices what that shared catalog already carries -- it never rebuilds the spine.
+    if not src_models.MotorStateAvailability.objects.exists():
+        logger.warning(
+            "{} No shared Motor State availability spine yet; run fetch_motorstate_availability "
+            "before pricing company_provider_id={}.".format(_LOG_PREFIX, cp.id)
         )
-        fetch_and_save_motorstate_brands(company_provider_id=cp.id)
-        fetch_and_save_motorstate_availability_full(company_provider_id=cp.id)
+        return
 
-    fetch_and_save_motorstate_products(company_provider_id=cp.id)
+    fetch_and_save_motorstate_products(company_provider_id=cp.id, write_catalog=False)

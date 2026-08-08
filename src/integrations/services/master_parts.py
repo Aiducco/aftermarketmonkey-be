@@ -4323,26 +4323,6 @@ def _motorstate_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
     ]
 
 
-def _motorstate_catalog_company_id(
-    motorstate_provider: src_models.Providers,
-) -> typing.Optional[int]:
-    """
-    Company whose MotorStateAvailability rows drive global inventory.
-
-    MotorStateProduct (catalog) and MotorStateCompanyPricing (prices) are already split by
-    company, but the availability spine is still fetched per API key, so one connection has to
-    stand in for distributor-wide stock: the primary one (else first active by id) -- the same
-    role quadratec._catalog_company_provider plays there.
-    """
-    base = src_models.CompanyProviders.objects.filter(
-        provider=motorstate_provider,
-        provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
-        active=True,
-    ).order_by("id")
-    cp = base.filter(primary=True).first() or base.first()
-    return cp.company_id if cp else None
-
-
 def _ingest_motorstate_parts_for_mapped_brands(
     mapped_catalog_brand_ids: typing.Set[int],
     motorstate_provider: src_models.Providers,
@@ -4545,8 +4525,8 @@ def sync_master_parts_from_motorstate() -> None:
 
 def sync_provider_inventory_from_motorstate() -> None:
     """
-    Sync ProviderPartInventory from MotorStateAvailability (quantity + StatusType) for the
-    catalog company. Motor State exposes no per-warehouse breakdown -- QuantityAvailable is a
+    Sync ProviderPartInventory from MotorStateAvailability (quantity + StatusType), which is
+    distributor-wide. Motor State exposes no per-warehouse breakdown -- QuantityAvailable is a
     single distributor-wide number -- so warehouse_availability carries the status instead.
     Also refreshes ProviderPart.product_details from the matching MotorStateProduct row.
     """
@@ -4557,11 +4537,6 @@ def sync_provider_inventory_from_motorstate() -> None:
     ).first()
     if not motorstate_provider:
         logger.info("{} No Motor State provider found.".format(_LOG_PREFIX))
-        return
-
-    availability_company_id = _motorstate_catalog_company_id(motorstate_provider)
-    if not availability_company_id:
-        logger.info("{} No active Motor State connection; nothing to sync.".format(_LOG_PREFIX))
         return
 
     mappings = list(
@@ -4611,7 +4586,7 @@ def sync_provider_inventory_from_motorstate() -> None:
             availability = {
                 a["part_number"]: a
                 for a in src_models.MotorStateAvailability.objects.filter(
-                    company_id=availability_company_id, part_number__in=part_numbers
+                    part_number__in=part_numbers
                 ).values("part_number", "quantity_available", "status_type")
             }
 

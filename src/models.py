@@ -2923,19 +2923,21 @@ class MotorStateBrand(django_db_models.Model):
 
 
 class MotorStateAvailability(django_db_models.Model):
-    """One row per (company, part number) from GET /api/ProductAvailabilityChange.
-    Doubles as the catalog spine (initial per-brand epoch pass) and the live
-    stock/status feed (periodic fromDateTime=watermark polling).
+    """
+    One row per Motor State part number from GET /api/ProductAvailabilityChange. Doubles as the
+    catalog spine (initial per-brand epoch pass) and the live stock/status feed (periodic
+    fromDateTime=watermark polling).
 
-    Per-company because the data is only ever obtained through a single company's
-    API key; ``source_updated_on`` is Motor State's own UpdatedOn timestamp and is
-    the natural high-water mark for incremental polling. ``brand_code`` is the
-    brand the row was fetched under during the spine pass (null for rows first
-    seen via an unfiltered incremental poll)."""
-    company = django_db_models.ForeignKey(
-        Company, on_delete=django_db_models.CASCADE, related_name="motorstate_availability"
-    )
-    part_number = django_db_models.CharField(max_length=128)
+    Distributor-wide, not per company: stock and status are the same whichever dealer's API key
+    asks, so this is maintained once from the primary connection (like every other provider's
+    shared catalog/inventory tables) and read by every company. Only price is account-specific
+    -- see MotorStateCompanyPricing.
+
+    ``source_updated_on`` is Motor State's own UpdatedOn timestamp and is the high-water mark
+    for incremental polling. ``brand_code`` is the brand the row was fetched under during the
+    spine pass (null for rows first seen via an unfiltered incremental poll).
+    """
+    part_number = django_db_models.CharField(max_length=128, unique=True)
     brand_code = django_db_models.CharField(max_length=32, null=True)
     # Motor State StatusType: S=stocking, O=order-as-needed, X=discontinued (raw, as returned).
     status_type = django_db_models.CharField(max_length=8, null=True)
@@ -2948,10 +2950,9 @@ class MotorStateAvailability(django_db_models.Model):
 
     class Meta:
         db_table = "motorstate_availability"
-        unique_together = ["company", "part_number"]
         indexes = [
-            django_db_models.Index(fields=["company", "source_updated_on"]),
-            django_db_models.Index(fields=["company", "brand_code"]),
+            django_db_models.Index(fields=["source_updated_on"], name="ms_avail_updated_on_idx"),
+            django_db_models.Index(fields=["brand_code"], name="ms_avail_brand_code_idx"),
         ]
 
 

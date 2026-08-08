@@ -145,6 +145,8 @@ def _get_mappings_for_brand(brand):
         out.append("vossen")
     if src_models.BrandEliteWheelBrandMapping.objects.filter(brand=brand).exists():
         out.append("elite_wheel")
+    if src_models.BrandMotorStateBrandMapping.objects.filter(brand=brand).exists():
+        out.append("motorstate")
     return out
 
 
@@ -371,6 +373,31 @@ def merge_brands(brand_to_keep, brand_to_delete, confirm=_confirm):
             if confirm(
                 "  Update mapping id={} brand_id {} -> {} (elite_wheel_brand={})?".format(
                     m.id, delete_id, keep_id, m.elite_wheel_brand.external_id
+                )
+            ):
+                m.brand_id = keep_id
+                m.save()
+
+    # 5g. BrandMotorStateBrandMapping
+    motorstate_list = list(
+        src_models.BrandMotorStateBrandMapping.objects.filter(brand_id=delete_id).select_related("motorstate_brand")
+    )
+    print("\n--- BrandMotorStateBrandMapping: {} to process ---".format(len(motorstate_list)))
+    for m in motorstate_list:
+        existing = src_models.BrandMotorStateBrandMapping.objects.filter(
+            brand_id=keep_id, motorstate_brand=m.motorstate_brand
+        ).first()
+        if existing:
+            if confirm(
+                "  Delete mapping id={} (motorstate_brand={})? Keep already has.".format(
+                    m.id, m.motorstate_brand.name
+                )
+            ):
+                m.delete()
+        else:
+            if confirm(
+                "  Update mapping id={} brand_id {} -> {} (motorstate_brand={})?".format(
+                    m.id, delete_id, keep_id, m.motorstate_brand.name
                 )
             ):
                 m.brand_id = keep_id
