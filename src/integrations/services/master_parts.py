@@ -21,6 +21,7 @@ from src import constants as src_constants
 from src import enums as src_enums
 from src import models as src_models
 from src.integrations import credentials as credentials_helper
+from src.integrations.services import wps as wps_services
 from src.integrations.utils import master_part_matching as mp_matching
 from src.integrations.services.vossen import dealer_cost_from_price as vossen_dealer_cost_from_price
 from src.integrations.services.wheelpros import dealer_cost_from_msrp
@@ -4871,6 +4872,576 @@ def sync_derived_from_motorstate(*, reindex_meilisearch: bool = False, skip_mast
             continuation=_cont,
         )
     logger.info("{} Completed Motor State-only derived sync.".format(_LOG_PREFIX))
+
+
+# ==========================================================================================
+# Western Power Sports
+# ==========================================================================================
+# WPS's supplier_product_id is free text, not a validated MPN column: most rows carry a clean
+# manufacturer number, some repeat the WPS sku verbatim, and a few are notes ("OLD 0923003A-4").
+# Anything with whitespace inside is treated as a note rather than a part number.
+_WPS_BAD_MPN_PREFIXES = ("OLD ", "OLD-", "USE ", "NLA ", "SEE ")
+
+
+def _wps_provider_external_id(wps_brand_id: typing.Optional[int], sku: str) -> str:
+    """Stable WPS ProviderPart key: wps_brand row id + WPS's own sku (unique in their catalog)."""
+    return "{}_{}".format(int(wps_brand_id or 0), (sku or "").strip())
+
+
+def _wps_master_part_number(
+    supplier_product_id: typing.Optional[str], sku: typing.Optional[str]
+) -> str:
+    """
+    MasterPart part number for a WPS row: the manufacturer part number
+    (``supplier_product_id``) when it looks like one, else WPS's own ``sku``.
+
+    Measured against live data before choosing: across 12 brands we already carry, WPS ``sku``
+    matched an existing MasterPart for 0% of rows on 11 of them (it is a WPS-internal number),
+    while supplier_product_id matched 15.8-100%. The one exception was FLY RACING, WPS's own
+    house brand, where sku and supplier_product_id are the same string anyway.
+
+    A *lookup* fallback on sku was measured too and rejected: it added 0.5% more matches while
+    risking attaching WPS to another distributor's part that happens to share a WPS-style
+    number. This is only a value-level fallback -- it picks which string to use, and never
+    matches on a WPS-internal number.
+    """
+    mpn = (supplier_product_id or "").strip()
+    upper = mpn.upper()
+    if mpn and " " not in mpn and not upper.startswith(_WPS_BAD_MPN_PREFIXES):
+        return mpn
+    return (sku or "").strip()
+
+
+def _wps_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
+    """product_details for a WpsItem row (shown on ProviderPart)."""
+    return [
+        {"key": "wps_sku", "label": "WPS Part No", "value": row.get("sku") or None},
+        {"key": "mpn", "label": "MPN", "value": row.get("supplier_product_id") or None},
+        {"key": "upc", "label": "UPC", "value": row.get("upc") or None},
+        {"key": "description", "label": "Description", "value": row.get("name") or None},
+        {"key": "status", "label": "Status", "value": row.get("status") or None},
+        {"key": "superseded_sku", "label": "Superseded By", "value": row.get("superseded_sku") or None},
+    ]
+
+
+def _wps_warehouse_availability(
+    inv: typing.Dict, warehouse_names: typing.Dict[str, str]
+) -> typing.Dict[str, typing.Any]:
+    """
+    Per-warehouse stock keyed by real place name (Boise, Fresno, ...) rather than the raw
+    ``pa2_warehouse`` column, using the GET /warehouses decode table.
+
+    Every figure is capped at 25 by WPS on purpose, so ``total`` is a floor, not a true count --
+    recorded here so downstream consumers do not read it as exact depth.
+    """
+    out: typing.Dict[str, typing.Any] = {}
+    for db2_key, column in wps_services.WAREHOUSE_COLUMN_BY_KEY.items():
+        label = warehouse_names.get(db2_key) or db2_key
+        out[label] = inv.get(column) or 0
+    out["total"] = inv.get("total") or 0
+    out["capped_at_25_per_warehouse"] = True
+    return out
+
+
+def _ingest_wps_items_for_mapped_brands(
+    mapped_catalog_brand_ids: typing.Set[int],
+    wps_provider: src_models.Providers,
+    wps_brand_to_brand: typing.Dict[int, src_models.Brands],
+) -> typing.Tuple[int, int]:
+    """Batch-ingest WpsItem rows for one disjoint set of WPS brand PKs."""
+    if not mapped_catalog_brand_ids:
+        return 0, 0
+
+    total_master = 0
+    total_provider = 0
+    batch_num = 0
+    last_id = 0
+
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.WpsItem.objects.filter(
+                brand_id__in=mapped_catalog_brand_ids, id__gt=last_id
+            )
+            .order_by("id")
+            .values(
+                "id", "brand_id", "sku", "name", "supplier_product_id", "upc",
+                "image_url", "source_updated_at", "product__description",
+            )[:BATCH_SIZE_MASTER_PARTS]
+        )
+        if not batch:
+            break
+
+        last_id = batch[-1]["id"]
+        seen = set()
+        master_parts = []
+        external_id_to_brand_part = {}
+
+        for row in batch:
+            brand = wps_brand_to_brand.get(row["brand_id"])
+            if not brand:
+                continue
+            part_number = _wps_master_part_number(row.get("supplier_product_id"), row.get("sku"))
+            if not part_number:
+                continue
+
+            key = (brand.id, part_number)
+            if key not in seen:
+                seen.add(key)
+                master_parts.append(
+                    src_models.MasterPart(
+                        brand=brand,
+                        part_number=part_number,
+                        sku=part_number,
+                        # The item's own name is a short label ("MULTIRATE FORK SPRINGS 35MM");
+                        # the long copy lives on the parent product.
+                        description=row.get("product__description") or row.get("name"),
+                        image_url=row.get("image_url"),
+                        # 47% of WPS items carry a upc -- the corroboration
+                        # extend_with_normalized_matches needs to accept a formatting-only match.
+                        gtin=(row.get("upc") or None),
+                    )
+                )
+            external_id_to_brand_part[
+                _wps_provider_external_id(row["brand_id"], row.get("sku"))
+            ] = (brand.id, part_number)
+
+        if not master_parts:
+            connection.close()
+            if len(batch) == BATCH_SIZE_MASTER_PARTS:
+                time.sleep(BATCH_DELAY_SECONDS)
+            continue
+
+        pairs = list(seen)
+        existing_by_key = {}
+        if pairs:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(pairs),),
+                )
+                for r in cur.fetchall():
+                    mp_id, b_id, p_num = r
+                    existing_by_key[(b_id, p_num)] = mp_id
+
+        mp_matching.extend_with_normalized_matches(
+            existing_by_key,
+            pairs,
+            {(mp.brand_id, mp.part_number): mp.gtin for mp in master_parts},
+            provider_id=wps_provider.id,
+            provider_kind=src_enums.BrandProviderKind.WESTERN_POWER_SPORTS.value,
+            external_id_by_key={v: k for k, v in external_id_to_brand_part.items()},
+        )
+
+        new_parts = [mp for mp in master_parts if (mp.brand_id, mp.part_number) not in existing_by_key]
+        if new_parts:
+            new_parts = _dedupe_master_parts_for_upsert(
+                new_parts, context="WPS new_parts batch={}".format(batch_num)
+            )
+            pgbulk.upsert(
+                src_models.MasterPart,
+                new_parts,
+                unique_fields=["brand", "part_number"],
+                update_fields=[],
+            )
+            total_master += len(new_parts)
+
+        brand_part_to_master = mp_matching.master_part_stubs_for(existing_by_key)
+        unresolved_pairs = [k for k in pairs if k not in brand_part_to_master]
+        if unresolved_pairs:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(unresolved_pairs),),
+                )
+                for r in cur.fetchall():
+                    mp_id, b_id, p_num = r
+                    mp = src_models.MasterPart()
+                    mp.id = mp_id
+                    mp.brand_id = b_id
+                    mp.part_number = p_num
+                    brand_part_to_master[(b_id, p_num)] = mp
+
+        provider_parts_by_key = {}
+        for row in batch:
+            ext_id = _wps_provider_external_id(row["brand_id"], row.get("sku"))
+            key = external_id_to_brand_part.get(ext_id)
+            if not key:
+                continue
+            master_part = brand_part_to_master.get(key)
+            if not master_part:
+                continue
+            provider_parts_by_key[(master_part.id, wps_provider.id)] = src_models.ProviderPart(
+                master_part=master_part,
+                provider=wps_provider,
+                provider_external_id=ext_id,
+                distributor_refreshed_at=row.get("source_updated_at"),
+            )
+
+        provider_parts = list(provider_parts_by_key.values())
+        if provider_parts:
+            pgbulk.upsert(
+                src_models.ProviderPart,
+                provider_parts,
+                unique_fields=["master_part", "provider"],
+                update_fields=_PROVIDER_PART_SYNC_UPDATE_FIELDS,
+            )
+            total_provider += len(provider_parts)
+
+        logger.info("{} WPS batch {}: {} items -> {} master, {} provider (last_id={})".format(
+            _LOG_PREFIX, batch_num, len(batch), len(master_parts), len(provider_parts), last_id
+        ))
+        connection.close()
+        if len(batch) == BATCH_SIZE_MASTER_PARTS:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    return total_master, total_provider
+
+
+def sync_master_parts_from_wps() -> None:
+    """
+    Create/update MasterPart and ProviderPart from WpsItem (a distributor-wide catalog; prices
+    live per company on WpsCompanyPricing). Only processes items whose WpsBrand has a
+    BrandWpsBrandMapping.
+    """
+    logger.info("{} Syncing master parts from WPS (batched, cursor-based).".format(_LOG_PREFIX))
+
+    wps_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.WESTERN_POWER_SPORTS.value,
+    ).first()
+    if not wps_provider:
+        logger.info("{} No WPS provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandWpsBrandMapping.objects.select_related("brand", "wps_brand")
+    )
+    wps_brand_to_brand = {m.wps_brand_id: m.brand for m in mappings}
+    if not wps_brand_to_brand:
+        logger.info("{} No BrandWpsBrandMapping found. Nothing to sync.".format(_LOG_PREFIX))
+        return
+
+    chunks = _partition_mapped_brands_for_parallel_ingest(mappings, MASTER_PARTS_SYNC_MAX_WORKERS)
+    total_master, total_provider = _run_parallel_master_parts_ingest(
+        chunks,
+        mappings,
+        "wps_brand",
+        lambda cids: _ingest_wps_items_for_mapped_brands(cids, wps_provider, wps_brand_to_brand),
+    )
+    logger.info("{} Synced {} master parts and {} provider parts from WPS total.".format(
+        _LOG_PREFIX, total_master, total_provider
+    ))
+
+
+def sync_provider_inventory_from_wps() -> None:
+    """
+    Sync ProviderPartInventory from WpsInventory. Warehouse columns are decoded to place names
+    through WpsWarehouse (GET /warehouses), so warehouse_availability reads
+    {"Boise": 25, "Fresno": 0, ...} rather than raw db2 keys.
+    """
+    logger.info("{} Syncing provider inventory from WPS.".format(_LOG_PREFIX))
+
+    wps_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.WESTERN_POWER_SPORTS.value,
+    ).first()
+    if not wps_provider:
+        logger.info("{} No WPS provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(src_models.BrandWpsBrandMapping.objects.select_related("brand", "wps_brand"))
+    if not mappings:
+        logger.info("{} No BrandWpsBrandMapping found.".format(_LOG_PREFIX))
+        return
+
+    warehouse_names = {
+        (w.db2_key or "").upper(): (w.name or "")
+        for w in src_models.WpsWarehouse.objects.all()
+    }
+    provider_parts = {
+        row["provider_external_id"]: src_models.ProviderPart(id=row["id"])
+        for row in src_models.ProviderPart.objects.filter(provider=wps_provider).values(
+            "id", "provider_external_id"
+        )
+    }
+    now = timezone.now()
+
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            batch = list(
+                src_models.WpsItem.objects.filter(id__gt=last_id, brand_id__in=catalog_ids)
+                .order_by("id")
+                .values(
+                    "id", "brand_id", "sku", "name", "supplier_product_id", "upc", "status",
+                    "superseded_sku",
+                    "inventory__ca_warehouse", "inventory__ga_warehouse", "inventory__id_warehouse",
+                    "inventory__in_warehouse", "inventory__pa_warehouse", "inventory__pa2_warehouse",
+                    "inventory__tx_warehouse", "inventory__total",
+                )[:BATCH_SIZE_INVENTORY]
+            )
+            if not batch:
+                break
+
+            last_id = batch[-1]["id"]
+            to_upsert = []
+            for row in batch:
+                ext_id = _wps_provider_external_id(row["brand_id"], row.get("sku"))
+                provider_part = provider_parts.get(ext_id)
+                if not provider_part:
+                    continue
+                inv = {
+                    col: row.get("inventory__{}".format(col))
+                    for col in (
+                        "ca_warehouse", "ga_warehouse", "id_warehouse", "in_warehouse",
+                        "pa_warehouse", "pa2_warehouse", "tx_warehouse", "total",
+                    )
+                }
+                to_upsert.append(
+                    src_models.ProviderPartInventory(
+                        provider_part=provider_part,
+                        warehouse_total_qty=inv.get("total") or 0,
+                        manufacturer_inventory=None,
+                        manufacturer_esd=None,
+                        warehouse_availability=_wps_warehouse_availability(inv, warehouse_names),
+                        last_synced_at=now,
+                        updated_at=now,
+                    )
+                )
+
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_inventory_for_upsert(
+                    to_upsert, context="WPS inventory batch={}".format(batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartInventory,
+                    to_upsert,
+                    unique_fields=["provider_part"],
+                    update_fields=[
+                        "warehouse_total_qty",
+                        "manufacturer_inventory",
+                        "manufacturer_esd",
+                        "warehouse_availability",
+                        "last_synced_at",
+                        "updated_at",
+                    ],
+                )
+                total_upserted += len(to_upsert)
+
+            pp_details_to_update = []
+            for row in batch:
+                ext_id = _wps_provider_external_id(row["brand_id"], row.get("sku"))
+                pp = provider_parts.get(ext_id)
+                if pp:
+                    pp.product_details = _wps_product_details(row)
+                    pp_details_to_update.append(pp)
+            if pp_details_to_update:
+                src_models.ProviderPart.objects.bulk_update(
+                    pp_details_to_update, ["product_details"], batch_size=500
+                )
+
+            logger.info("{} WPS inventory batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_INVENTORY:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "wps_brand", _worker)
+    logger.info("{} Synced {} WPS inventory records total.".format(_LOG_PREFIX, total_upserted))
+
+
+_WPS_PRICING_VALUES = (
+    "id", "company_id", "list_price", "dealer_price", "map_price",
+    "item__brand_id", "item__sku", "item__supplier_product_id",
+)
+_WPS_PRICING_UPSERT_FIELDS = ["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"]
+
+
+def _wps_pricing_master_keys(
+    batch: typing.List[typing.Dict],
+    wps_brand_to_brand: typing.Dict[int, src_models.Brands],
+) -> typing.List[typing.Tuple[int, str]]:
+    keys = []
+    for row in batch:
+        brand = wps_brand_to_brand.get(row.get("item__brand_id"))
+        if not brand:
+            continue
+        part_number = _wps_master_part_number(
+            row.get("item__supplier_product_id"), row.get("item__sku")
+        )
+        if not part_number:
+            continue
+        keys.append((brand.id, part_number))
+    return keys
+
+
+def _sync_wps_pricing(company_id: typing.Optional[int] = None) -> None:
+    """Shared body for the all-companies and single-company WPS pricing syncs."""
+    scope = "company_id={}".format(company_id) if company_id else "all companies"
+    logger.info("{} Syncing provider pricing from WPS ({}).".format(_LOG_PREFIX, scope))
+
+    wps_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.WESTERN_POWER_SPORTS.value,
+    ).first()
+    if not wps_provider:
+        logger.info("{} No WPS provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(src_models.BrandWpsBrandMapping.objects.select_related("brand", "wps_brand"))
+    wps_brand_to_brand = {m.wps_brand_id: m.brand for m in mappings}
+    if not wps_brand_to_brand:
+        logger.info("{} No BrandWpsBrandMapping found. Nothing to price.".format(_LOG_PREFIX))
+        return
+
+    company_provider = None
+    watermark = None
+    sync_started_at = timezone.now()
+    if company_id:
+        company_provider = src_models.CompanyProviders.objects.filter(
+            company_id=company_id, provider_id=wps_provider.id
+        ).first()
+        watermark = company_provider.pricing_propagation_watermark if company_provider else None
+
+    now = timezone.now()
+
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            qs = src_models.WpsCompanyPricing.objects.filter(
+                id__gt=last_id, item__brand_id__in=catalog_ids
+            )
+            if company_id:
+                qs = qs.filter(company_id=company_id)
+            if watermark:
+                qs = qs.filter(updated_at__gte=watermark)
+            batch = list(qs.order_by("id").values(*_WPS_PRICING_VALUES)[:BATCH_SIZE_PRICING])
+            if not batch:
+                break
+
+            last_id = batch[-1]["id"]
+            companies_by_id = {
+                c.id: c
+                for c in src_models.Company.objects.filter(
+                    id__in={r["company_id"] for r in batch if r.get("company_id")}
+                )
+            }
+            pp_by_key = _provider_parts_by_master_brand_and_part_number(
+                wps_provider, _wps_pricing_master_keys(batch, wps_brand_to_brand)
+            )
+
+            to_upsert = []
+            for row in batch:
+                brand = wps_brand_to_brand.get(row.get("item__brand_id"))
+                if not brand:
+                    continue
+                part_number = _wps_master_part_number(
+                    row.get("item__supplier_product_id"), row.get("item__sku")
+                )
+                if not part_number:
+                    continue
+                provider_part = pp_by_key.get((brand.id, part_number))
+                if not provider_part:
+                    continue
+                company = companies_by_id.get(row.get("company_id"))
+                if not company:
+                    continue
+                # WPS returns mapp_price "0.00" on rows that carry no MAP policy; storing that
+                # as a real 0.00 MAP would floor the price downstream.
+                map_price = row.get("map_price")
+                if not map_price:
+                    map_price = None
+                to_upsert.append(
+                    src_models.ProviderPartCompanyPricing(
+                        provider_part=provider_part,
+                        company=company,
+                        cost=row.get("dealer_price"),
+                        jobber_price=row.get("dealer_price"),
+                        map_price=map_price,
+                        msrp=row.get("list_price"),
+                        retail_price=row.get("list_price"),
+                        last_synced_at=now,
+                    )
+                )
+
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                    to_upsert, context="WPS pricing {} batch={}".format(scope, batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartCompanyPricing,
+                    to_upsert,
+                    unique_fields=["provider_part", "company"],
+                    update_fields=_WPS_PRICING_UPSERT_FIELDS,
+                )
+                total_upserted += len(to_upsert)
+
+            logger.info("{} WPS pricing {} batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, scope, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_PRICING:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "wps_brand", _worker)
+    logger.info("{} Synced {} WPS pricing records ({}).".format(_LOG_PREFIX, total_upserted, scope))
+
+    if company_provider:
+        company_provider.pricing_propagation_watermark = sync_started_at
+        company_provider.save(update_fields=["pricing_propagation_watermark"])
+
+
+def sync_provider_pricing_from_wps() -> None:
+    """Sync ProviderPartCompanyPricing from WpsCompanyPricing (all companies)."""
+    _sync_wps_pricing(company_id=None)
+
+
+def sync_provider_pricing_from_wps_for_company(company_id: int) -> None:
+    """Sync ProviderPartCompanyPricing from WpsCompanyPricing for one company."""
+    _sync_wps_pricing(company_id=company_id)
+
+
+def sync_derived_from_wps(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False, skip_pricing: bool = False) -> None:
+    """
+    Propagate WPS source data into MasterPart, ProviderPart, ProviderPartInventory and
+    ProviderPartCompanyPricing. Call after the WPS raw ingest. No fitment sync yet -- WPS does
+    expose /vehicles per item, but that needs its own vehicle-id mapping pass.
+    """
+    logger.info("{} Starting WPS-only derived sync ({}).".format(
+        _LOG_PREFIX,
+        "inventory + pricing only" if skip_master_parts else "parts, inventory" + ("" if skip_pricing else ", pricing"),
+    ))
+    if not skip_master_parts:
+        sync_master_parts_from_wps()
+        connection.close()
+
+    def _cont() -> None:
+        sync_provider_inventory_from_wps()
+        connection.close()
+        if not skip_pricing:
+            sync_provider_pricing_from_wps()
+            connection.close()
+
+    if skip_master_parts:
+        _cont()
+    else:
+        _maybe_reindex_meilisearch_after_master_parts(
+            reindex_meilisearch=reindex_meilisearch,
+            provider_label="WPS",
+            continuation=_cont,
+        )
+    logger.info("{} Completed WPS-only derived sync.".format(_LOG_PREFIX))
 
 
 def _wheelpros_provider_external_id(wp_brand_id: int, part_number: str) -> str:
@@ -10683,6 +11254,8 @@ def sync_all_master_parts_global() -> None:
     sync_derived_from_elite_wheel(skip_pricing=True)
     _reclaim_memory()
     sync_derived_from_motorstate(skip_pricing=True)
+    _reclaim_memory()
+    sync_derived_from_wps(skip_pricing=True)
 
     logger.info("{} Completed global master parts sync (catalog + inventory, no pricing).".format(_LOG_PREFIX))
 
@@ -10715,5 +11288,6 @@ def sync_all_master_parts_incremental() -> None:
     sync_derived_from_quadratec(skip_master_parts=True)
     sync_derived_from_elite_wheel(skip_master_parts=True)
     sync_derived_from_motorstate(skip_master_parts=True)
+    sync_derived_from_wps(skip_master_parts=True)
 
     logger.info("{} Completed incremental master parts sync.".format(_LOG_PREFIX))

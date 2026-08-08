@@ -209,6 +209,9 @@ FRONTEND_BASE_URL = os.environ.get("FRONTEND_BASE_URL", "https://app.aftermarket
 
 TURN14_BASE_URL = 'https://api.turn14.com/v1'
 
+# Western Power Sports Data Depot API (see src.integrations.clients.wps).
+WPS_BASE_URL = os.environ.get("WPS_BASE_URL", "https://api.wps-inc.com")
+
 # Motor State Distributing read-only catalog/pricing API (see src.integrations.clients.motorstate).
 MOTOR_STATE_BASE_URL = os.environ.get("MOTOR_STATE_BASE_URL", "https://api.motorstate.com")
 

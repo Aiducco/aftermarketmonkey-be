@@ -36,6 +36,7 @@ from src.integrations.services import tirerack as tirerack_services
 from src.integrations.services import turn_14 as turn_14_services
 from src.integrations.services import vossen as vossen_services
 from src.integrations.services import wheelpros as wheelpros_services
+from src.integrations.services import wps as wps_services
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,7 @@ _PRICING_SYNC_KINDS = frozenset(
         src_enums.BrandProviderKind.QUADRATEC.value,
         src_enums.BrandProviderKind.ELITE_WHEEL.value,
         src_enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING.value,
+        src_enums.BrandProviderKind.WESTERN_POWER_SPORTS.value,
     }
 )
 
@@ -254,6 +256,9 @@ def _fetch_raw_pricing(cp: src_models.CompanyProviders, use_delta_fetch: bool = 
     elif kind == src_enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING.value:
         motorstate_services.sync_motorstate_company_pricing_for_company_provider(cp.id)
 
+    elif kind == src_enums.BrandProviderKind.WESTERN_POWER_SPORTS.value:
+        wps_services.sync_wps_company_pricing_for_company_provider(cp.id)
+
     else:
         raise ValueError("Unsupported provider kind for raw pricing fetch: {}".format(kind))
 
@@ -304,6 +309,9 @@ def _sync_master_pricing(cp: src_models.CompanyProviders) -> None:
 
     elif kind == src_enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING.value:
         master_parts.sync_provider_pricing_from_motorstate_for_company(company_id)
+
+    elif kind == src_enums.BrandProviderKind.WESTERN_POWER_SPORTS.value:
+        master_parts.sync_provider_pricing_from_wps_for_company(company_id)
 
     else:
         raise ValueError("Unsupported provider kind for master pricing sync: {}".format(kind))

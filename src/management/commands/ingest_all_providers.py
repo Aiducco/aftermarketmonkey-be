@@ -59,6 +59,7 @@ from src.integrations.services import (
     turn_14,
     vossen,
     wheelpros,
+    wps,
 )
 from src.search.meilisearch_client import is_configured, reindex_all_master_parts_zero_downtime
 
@@ -174,6 +175,7 @@ class Command(BaseCommand):
                 ("quadratec",     self._run_quadratec),
                 ("elite_wheel",   self._run_elite_wheel),
                 ("motorstate",    self._run_motorstate),
+                ("wps",           self._run_wps),
             ]
             for name, run_fn in phase1_providers:
                 self._ingest_log("phase 1 | starting {} fetch".format(name))
@@ -332,6 +334,22 @@ class Command(BaseCommand):
             motorstate.fetch_and_save_motorstate_brands()
             motorstate.fetch_and_save_motorstate_availability_updates()
             motorstate.sync_unmapped_motorstate_brands_to_brands()
+
+    def _run_wps(self) -> None:
+        with self._audited_step(
+            "ingest_all_providers_wps",
+            "WPS source fetch + unmapped brand sync complete (derived in sync_all).",
+            continue_on_error=True,
+        ):
+            # Brands/warehouses/products are small and cheap to re-read; items run incrementally
+            # off filter[updated_at][gt] so the nightly pass moves only what changed. Per-company
+            # pricing is not fetched here -- that belongs to the pricing-job queue.
+            self._ingest_log("WPS: brands + warehouses + products + item updates")
+            wps.fetch_and_save_wps_brands()
+            wps.fetch_and_save_wps_warehouses()
+            wps.fetch_and_save_wps_products()
+            wps.fetch_and_save_wps_items_updates()
+            wps.sync_unmapped_wps_brands_to_brands()
 
     def _run_elite_wheel(self) -> None:
         with self._audited_step(

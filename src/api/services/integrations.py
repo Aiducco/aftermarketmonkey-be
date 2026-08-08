@@ -33,6 +33,8 @@ from src.integrations.clients.rough_country import exceptions as rough_country_e
 from src.integrations.clients.tirerack import client as tirerack_client
 from src.integrations.clients.tirerack import exceptions as tirerack_exceptions
 from src.integrations.clients.turn_14 import client as turn14_client
+from src.integrations.clients.wps import client as wps_client
+from src.integrations.clients.wps import exceptions as wps_exceptions
 from src.integrations.clients.turn_14 import exceptions as turn14_exceptions
 from src.integrations.clients.turn_14 import order_client as turn14_order_client
 from src.integrations.clients.vossen import client as vossen_client
@@ -581,6 +583,27 @@ def _validate_motorstate_connection(credentials: typing.Dict[str, typing.Any]) -
     return None, None
 
 
+def _validate_wps_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
+    """
+    Validates the dealer's WPS Data Depot bearer token by requesting a single item -- the
+    cheapest real read. WPS answers 401/403 for a revoked or unknown token; either way the
+    actionable message is the same for someone pasting a token into this form.
+    """
+    try:
+        client = wps_client.WpsApiClient(credentials=credentials)
+    except ValueError as e:
+        return str(e), CONNECTION_ERROR_INVALID_INPUT
+    try:
+        client.test_connection()
+    except wps_exceptions.WpsPermissionError as e:
+        return e.message, CONNECTION_ERROR_INVALID_CREDENTIALS
+    except wps_exceptions.WpsAPIBadResponseCodeError as e:
+        return e.message, CONNECTION_ERROR_CONNECTION_FAILED
+    except wps_exceptions.WpsAPIException as e:
+        return str(e), CONNECTION_ERROR_CONNECTION_FAILED
+    return None, None
+
+
 def _validate_tirerack_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
     try:
         client = tirerack_client.TireRackSFTPClient(credentials=credentials)
@@ -609,6 +632,7 @@ _CONNECTION_VALIDATORS: typing.Dict[int, typing.Callable[[typing.Dict[str, typin
     src_enums.BrandProviderKind.TIRERACK.value: _validate_tirerack_connection,
     src_enums.BrandProviderKind.ELITE_WHEEL.value: _validate_elite_wheel_connection,
     src_enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING.value: _validate_motorstate_connection,
+    src_enums.BrandProviderKind.WESTERN_POWER_SPORTS.value: _validate_wps_connection,
 }
 
 

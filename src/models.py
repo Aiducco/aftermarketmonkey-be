@@ -3037,6 +3037,211 @@ class MotorStateCompanyPricing(django_db_models.Model):
         unique_together = ["product", "company"]
 
 
+# ---------------------------------------------------------------------------
+# Western Power Sports (kind=WESTERN_POWER_SPORTS) raw feed tables.
+#
+# WPS exposes a proper cursor-paginated JSON:API (page[size] + page[cursor], sparse
+# fieldsets, filters, includes), so the whole catalog comes down in ~13 calls -- no
+# per-part hydrate like Motor State. Catalog, brands and inventory are distributor-wide
+# and maintained once from the primary connection; only price is per company (each
+# connection reads /items with its own bearer token).
+# ---------------------------------------------------------------------------
+class WpsBrand(django_db_models.Model):
+    """A brand from GET /brands. Global -- the brand catalog is not account-specific."""
+    external_id = django_db_models.CharField(max_length=32)
+    name = django_db_models.CharField(max_length=255, null=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "wps_brands"
+        unique_together = ["external_id"]
+
+
+class WpsWarehouse(django_db_models.Model):
+    """
+    WPS warehouse from GET /warehouses. ``db2_key`` (ID/CA/PA/IN/TX/GA/PA2) is the prefix of the
+    matching per-warehouse column on WpsInventory, so this table is what turns a bare
+    ``pa2_warehouse`` figure into "Jessup" for display.
+    """
+    external_id = django_db_models.CharField(max_length=32)
+    db2_key = django_db_models.CharField(max_length=16, null=True)
+    name = django_db_models.CharField(max_length=255, null=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "wps_warehouses"
+        unique_together = ["external_id"]
+
+
+class WpsProduct(django_db_models.Model):
+    """
+    Parent product from GET /products -- the marketing record a group of item variants (SKUs)
+    hangs off. This is where the long ``description`` lives; individual items carry only a short
+    ``name``, so MasterPart descriptions come from here.
+    """
+    external_id = django_db_models.CharField(max_length=32)
+    name = django_db_models.CharField(max_length=255, null=True)
+    description = django_db_models.TextField(null=True)
+    data = django_db_models.JSONField(null=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "wps_products"
+        unique_together = ["external_id"]
+
+
+class WpsItem(django_db_models.Model):
+    """
+    One SKU from GET /items -- WPS's own words: "the simplest form of a Product ... one
+    individual variant (specific configuration) or SKU". Distributor-wide catalog; prices
+    live per company on WpsCompanyPricing.
+
+    ``sku`` is WPS's own part number (e.g. "020-00010"); ``supplier_product_id`` is the
+    manufacturer's part number (e.g. "TC-M6M8") and is what MasterPart keys on, since the
+    WPS SKU would never dedupe against another distributor's catalog.
+    """
+    external_id = django_db_models.CharField(max_length=32)  # WPS item id
+    brand = django_db_models.ForeignKey(
+        WpsBrand, on_delete=django_db_models.SET_NULL, null=True, related_name="items"
+    )
+    sku = django_db_models.CharField(max_length=128, null=True)
+    name = django_db_models.CharField(max_length=255, null=True)
+    supplier_product_id = django_db_models.CharField(max_length=128, null=True)
+    upc = django_db_models.CharField(max_length=64, null=True)
+    superseded_sku = django_db_models.CharField(max_length=128, null=True)
+
+    # WPS status: STK stocking, NLA no longer available, NEW, DIR direct-ship, CLO closeout,
+    # NA not available, PRE pre-release, SPEC special order, DSC discontinued.
+    status = django_db_models.CharField(max_length=16, null=True)
+    product_type = django_db_models.CharField(max_length=255, null=True)
+
+    length = django_db_models.FloatField(null=True)
+    width = django_db_models.FloatField(null=True)
+    height = django_db_models.FloatField(null=True)
+    weight = django_db_models.FloatField(null=True)
+
+    has_map_policy = django_db_models.BooleanField(default=False)
+    drop_ship_eligible = django_db_models.BooleanField(default=False)
+    drop_ship_fee = django_db_models.CharField(max_length=32, null=True)
+
+    # Parent product (GET /products) -- carries the long marketing description.
+    product = django_db_models.ForeignKey(
+        WpsProduct, on_delete=django_db_models.SET_NULL, null=True, related_name="items"
+    )
+    # Enrichment pulled from ?include= on /items, since neither joins back to an item id
+    # from its own collection endpoint.
+    #   image_url  -- first image, assembled as https://{domain}{path}{filename}
+    #   images     -- every image for the item, same assembled shape
+    #   taxonomy   -- taxonomyterm names (WPS's category tree) for this item
+    image_url = django_db_models.TextField(null=True)
+    images = django_db_models.JSONField(null=True)
+    taxonomy = django_db_models.JSONField(null=True)
+
+    # WPS's own updated_at for the row; high-water mark for filter[updated_at][gt] polling.
+    source_updated_at = django_db_models.DateTimeField(null=True)
+    # Full raw item object (prop 65, carb, country/product/uom ids, anything not columned).
+    data = django_db_models.JSONField(null=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "wps_items"
+        unique_together = ["external_id"]
+        indexes = [
+            django_db_models.Index(fields=["brand"], name="wps_items_brand_idx"),
+            django_db_models.Index(fields=["source_updated_at"], name="wps_items_updated_idx"),
+            django_db_models.Index(fields=["sku"], name="wps_items_sku_idx"),
+        ]
+
+
+class WpsInventory(django_db_models.Model):
+    """
+    Per-warehouse stock from GET /inventory, distributor-wide.
+
+    WPS caps each warehouse figure at 25 ("If we have 25 or more of a particular item, we will
+    just show 25 ... so as to avoid disclosing our actual inventory levels"), so ``total`` is a
+    floor, not a true count -- fine for availability, wrong for anything that needs real depth.
+    """
+    item = django_db_models.OneToOneField(
+        WpsItem, on_delete=django_db_models.CASCADE, related_name="inventory"
+    )
+    external_id = django_db_models.CharField(max_length=32, null=True)  # WPS inventory row id
+    sku = django_db_models.CharField(max_length=128, null=True)
+
+    ca_warehouse = django_db_models.IntegerField(default=0)   # Fresno, CA
+    ga_warehouse = django_db_models.IntegerField(default=0)   # Midway, GA
+    id_warehouse = django_db_models.IntegerField(default=0)   # Boise, ID
+    in_warehouse = django_db_models.IntegerField(default=0)   # Ashley, IN
+    pa_warehouse = django_db_models.IntegerField(default=0)   # Elizabethtown, PA
+    pa2_warehouse = django_db_models.IntegerField(default=0)  # Jessup, PA
+    tx_warehouse = django_db_models.IntegerField(default=0)   # Midlothian, TX
+    total = django_db_models.IntegerField(default=0)
+
+    source_updated_at = django_db_models.DateTimeField(null=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "wps_inventory"
+
+
+class WpsCompanyPricing(django_db_models.Model):
+    """
+    Per-company WPS pricing for a catalog row (WpsItem). WPS has no pricing endpoint -- prices
+    come back on /items -- so each connection re-reads /items with its own bearer token and only
+    the price columns land here; catalog and inventory stay shared. That re-read is ~13 calls,
+    so unlike Motor State this needs no throttling.
+
+    ``dealer_price`` is WPS's standard_dealer_price (cost), ``list_price`` is MSRP, and
+    ``map_price`` is mapp_price (meaningful only when has_map_policy is set; WPS returns "0.00"
+    for plenty of rows that do carry a policy).
+    """
+    item = django_db_models.ForeignKey(
+        WpsItem, on_delete=django_db_models.CASCADE, related_name="company_pricing"
+    )
+    company = django_db_models.ForeignKey(
+        Company, on_delete=django_db_models.CASCADE, related_name="wps_company_pricing"
+    )
+
+    list_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True)
+    dealer_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True)
+    map_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True)
+    has_map_policy = django_db_models.BooleanField(default=False)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "wps_company_pricing"
+        unique_together = ["item", "company"]
+
+
+class BrandWpsBrandMapping(django_db_models.Model):
+    """Maps our Brands to WpsBrand (for master parts sync). WPS's /brands carries no AAIA code,
+    so resolution is name-based only (see wps.sync_unmapped_wps_brands_to_brands)."""
+    brand = django_db_models.ForeignKey(
+        Brands, on_delete=django_db_models.CASCADE, related_name="wps_brand_mappings"
+    )
+    wps_brand = django_db_models.ForeignKey(
+        WpsBrand, on_delete=django_db_models.CASCADE, related_name="brand_mappings"
+    )
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "brand_wps_brand_mapping"
+        unique_together = ["brand", "wps_brand"]
+
+
 class BrandMotorStateBrandMapping(django_db_models.Model):
     """Maps our Brands to MotorStateBrand (for master parts sync). Motor State's /api/Brands
     carries no AAIA code, so resolution is name-based only (see
