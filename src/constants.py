@@ -1489,6 +1489,9 @@ PROVIDER_CATALOG = [
         "description": "Access SSF Imported Auto Parts inventory and pricing via SFTP.",
         "icon_url": "https://api.aftermarketscout.com/uploads/ssf_logo.png",
         "category": "Distributors",
+        # Temporarily withheld from the catalog and onboarding picker — see the note on CTP
+        # Distributors above. Delete this line to bring it back.
+        "hidden": True,
         "connection_required_fields": ["account_number", "sftp_host", "sftp_port", "sftp_user", "sftp_password"],
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
