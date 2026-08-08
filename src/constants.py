@@ -1120,6 +1120,9 @@ PROVIDER_CATALOG = [
         "description": "Access GrandWest Enterprises inventory and pricing via account feed.",
         "icon_url": "https://api.aftermarketscout.com/uploads/grandwest_logo.png",
         "category": "Distributors",
+        # Temporarily withheld from the catalog and onboarding picker — see the note on CTP
+        # Distributors above. Delete this line to bring it back.
+        "hidden": True,
         "connection_required_fields": ["account_number"],
         "connection_optional_fields": ["access_token", "token_secret"],
         "integration_time": "Data available within 1-2 days",
