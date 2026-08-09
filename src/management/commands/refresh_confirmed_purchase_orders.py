@@ -6,8 +6,8 @@ from src.integrations.services import confirmed_purchase_order_sync
 class Command(BaseCommand):
     help = (
         "Refresh distributor order data for CONFIRMED purchase orders: checked on every run "
-        "within the first hour after submission, then at most once a day after that. See "
-        "confirmed_purchase_order_sync's module docstring for the exact policy. Turn14, "
+        "within the first hour after submission, then at most once every 4 hours after that. "
+        "See confirmed_purchase_order_sync's module docstring for the exact policy. Turn14, "
         "Keystone, Meyer, and Premier are implemented so far; other distributors are skipped "
         "with a log line."
     )

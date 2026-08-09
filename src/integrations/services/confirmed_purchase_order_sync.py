@@ -3,11 +3,18 @@ refresh_confirmed_purchase_orders — a distinct, lighter-weight distributor-ord
 CONFIRMED purchase orders, separate from the general STATUS_CHECK job (see
 sync_purchase_order_statuses / purchase_order_jobs._run_status_check, currently paused).
 
-Policy: a fresh order needs checking often at first, then rarely --
+Policy: a fresh order needs checking often at first, then less often --
   - Within the first hour after submission: check every time this command runs, so a new PO
     gets checked as often as cron invokes this command (e.g. every 5-10 minutes).
-  - After that: check at most once per calendar day, tracked via
-    PurchaseOrder.distributor_status_checked_at.
+  - After that: check at most once every _STALE_CHECK_INTERVAL, tracked via
+    PurchaseOrder.distributor_status_checked_at. A rolling interval rather than "once per
+    calendar day" -- the latter had up to ~24h of visible staleness for an order that finishes
+    processing on the distributor's side shortly after the calendar day's one check already ran
+    (confirmed live: a Turn14 order that closed a few hours after its fresh window ended sat as
+    "still open" here until the next day's check, even though a manual refresh at any point in
+    between showed the true CLOSED status immediately -- same underlying refresh logic either
+    way, just gated by how long since the calendar day flipped instead of how long since the
+    last real check).
 
 Turn14, Keystone, Meyer, Premier, and Wheel Pros are implemented so far (per-provider dispatch
 in _refresh_purchase_order, via _REFRESH_HANDLERS) -- any other provider kind is logged and
@@ -123,15 +130,23 @@ _LOG_PREFIX = "[CONFIRMED-PO-SYNC]"
 # How long after submission a PO counts as "fresh" and gets checked on every run.
 _FREQUENT_CHECK_WINDOW = datetime.timedelta(hours=1)
 
+# How long a PO can go between checks once it's past the fresh window. A rolling interval
+# (see the module docstring) rather than "once per calendar day" -- was hours=24 (as
+# once-per-calendar-day), narrowed after confirming live that a PO whose distributor-side
+# status changed shortly after the calendar day's single check already ran could sit visibly
+# stale here for up to ~24h despite being genuinely done, until either the next day's check or
+# a manual refresh (refresh_purchase_order_now) caught up.
+_STALE_CHECK_INTERVAL = datetime.timedelta(hours=4)
+
 
 def _should_check(po: src_models.PurchaseOrder, now: datetime.datetime) -> bool:
     """True if this PO is due for a distributor refresh right now, per the module's
-    frequent-then-daily policy."""
+    frequent-then-rolling-interval policy."""
     if po.submitted_at and (now - po.submitted_at) <= _FREQUENT_CHECK_WINDOW:
         return True
     if po.distributor_status_checked_at is None:
         return True
-    return po.distributor_status_checked_at.date() < now.date()
+    return (now - po.distributor_status_checked_at) >= _STALE_CHECK_INTERVAL
 
 
 def _refresh_turn14_distributor_order(
@@ -542,7 +557,7 @@ def refresh_purchase_order_now(po: src_models.PurchaseOrder) -> None:
     .../purchase-orders/<id>/refresh-status/ API endpoint (purchase_orders_services.
     refresh_purchase_order_status). Runs the exact same per-distributor refresh logic
     refresh_confirmed_purchase_orders' batch sweep uses, but bypasses _should_check's
-    frequent-then-daily cadence gate entirely, since this is an explicit, user-initiated
+    frequent-then-rolling-interval cadence gate entirely, since this is an explicit, user-initiated
     request rather than a scheduled poll -- a user clicking "refresh" should always get a real
     refresh, not "not due yet".
     """
