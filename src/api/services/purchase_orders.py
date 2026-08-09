@@ -221,6 +221,38 @@ def _po_fulfillment_channel(po: src_models.PurchaseOrder) -> str:
     return account.order_method_name.lower() if account else "api"
 
 
+def _fulfillment_channels_by_po_id(
+    pos: typing.List[src_models.PurchaseOrder],
+) -> typing.Dict[int, str]:
+    """
+    Bulk form of _po_fulfillment_channel for a whole page of POs, same 'api' | 'email' result
+    per PO. The per-PO helper falls back to credentials_helper.get_default_order_account() for
+    POs with no explicit order_account, which is one query each — fine for a single PO detail
+    response, an N+1 over the up-to-200 rows of list_purchase_orders. Here the default accounts
+    for every connection the page touches are fetched in one narrow .values() query instead, and
+    POs that DO name an account read it off the select_related("order_account") row.
+    """
+    default_method_by_cp_id: typing.Dict[int, str] = {}
+    cp_ids = {po.company_provider_id for po in pos if not po.order_account_id}
+    if cp_ids:
+        default_rows = src_models.CompanyProviderOrderAccount.objects.filter(
+            company_provider_id__in=cp_ids, is_default=True, active=True
+        ).values("company_provider_id", "order_method_name")
+        for row in default_rows:
+            default_method_by_cp_id.setdefault(
+                row["company_provider_id"], row["order_method_name"]
+            )
+
+    channels: typing.Dict[int, str] = {}
+    for po in pos:
+        if po.order_account_id:
+            method = po.order_account.order_method_name
+        else:
+            method = default_method_by_cp_id.get(po.company_provider_id)
+        channels[po.id] = method.lower() if method else "api"
+    return channels
+
+
 def _serialize_purchase_order(po: src_models.PurchaseOrder, include_line_items: bool = True) -> typing.Dict:
     provider = po.company_provider.provider
     result = {
@@ -327,6 +359,7 @@ def _serialize_purchase_order(po: src_models.PurchaseOrder, include_line_items: 
 def _serialize_purchase_order_list_item(
     po: src_models.PurchaseOrder,
     distributor_order_status_name: typing.Optional[str] = None,
+    fulfillment_channel: str = "api",
 ) -> typing.Dict:
     """
     Lean row shape for GET /purchase-orders/ (the order-history table) -- exactly the columns
@@ -344,6 +377,13 @@ def _serialize_purchase_order_list_item(
     list_purchase_orders from a separate lean query rather than a prefetch, for the same
     heavy-columns reason. None when this PO has no distributor order yet, or hasn't been
     refreshed (only Turn14 currently translates this field).
+
+    ``fulfillment_channel`` is the same 'api' | 'email' value the PO detail and confirmed-details
+    responses carry (see _po_fulfillment_channel), resolved in bulk by
+    _fulfillment_channels_by_po_id rather than per row. On this table it's what separates a row
+    whose status came back from the distributor's API from one that was merely emailed to a rep —
+    an emailed PO sits at SUBMITTED with no distributor_order_status_name and no ship_method
+    indefinitely, which reads as a stuck API order unless the channel is shown.
     """
     provider = po.company_provider.provider
     return {
@@ -353,6 +393,7 @@ def _serialize_purchase_order_list_item(
         "status": po.status,
         "status_name": po.status_name,
         "distributor_order_status_name": distributor_order_status_name,
+        "fulfillment_channel": fulfillment_channel,
         "company_provider_id": po.company_provider_id,
         "provider_kind_name": provider.kind_name,
         "provider_name": provider.name,
@@ -1039,8 +1080,10 @@ def list_purchase_orders(
     resurfacing as "an order" either — it's not in _cart_queryset (that would let it be
     silently reused as a fresh draft, undoing the discard), but it still isn't real history.
 
-    Lean by design: only select_related("company_provider__provider") — the one join the row
-    shape actually needs (distributor name) — and no prefetch_related at all. distributor_orders
+    Lean by design: only select_related("company_provider__provider", "order_account") — the two
+    joins the row shape actually needs (distributor name; the order account whose order_method_name
+    is the PO's fulfillment_channel, for the POs that name one) — and no prefetch_related at all.
+    distributor_orders
     used to be prefetched here for a shape (_serialize_purchase_order) this list no longer uses;
     that prefetch pulled every PurchaseOrderDistributorOrder column, including raw_response/
     processed_order, which can now be large (Keystone's full GetOrderHistory dump, Premier's
@@ -1053,7 +1096,7 @@ def list_purchase_orders(
         src_models.PurchaseOrder.objects.filter(company_id=company_id)
         .exclude(id__in=_cart_queryset(company_id).values("id"))
         .exclude(status=src_enums.PurchaseOrderStatus.DISCARDED.value)
-        .select_related("company_provider__provider")
+        .select_related("company_provider__provider", "order_account")
         .order_by("-created_at")
     )
     if isinstance(status, str) and status.strip().lower() == "open":
@@ -1084,8 +1127,14 @@ def list_purchase_orders(
             row["purchase_order_id"], row["distributor_order_status_name"]
         )
 
+    fulfillment_channel_by_po_id = _fulfillment_channels_by_po_id(pos)
+
     return [
-        _serialize_purchase_order_list_item(po, distributor_status_by_po_id.get(po.id))
+        _serialize_purchase_order_list_item(
+            po,
+            distributor_status_by_po_id.get(po.id),
+            fulfillment_channel_by_po_id.get(po.id, "api"),
+        )
         for po in pos
     ]
 
