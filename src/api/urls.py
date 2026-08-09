@@ -56,6 +56,7 @@ from src.api.views.parts import (
     PartAuditMyHistoryView,
     PartDetailView,
     PartProviderRefreshInventoryView,
+    PartsBulkPricingView,
     PartsSearchView,
 )
 from src.api.views.turn14_locations import Turn14LocationsView
@@ -255,6 +256,11 @@ urlpatterns = [
         "parts/<int:id>/",
         PartDetailView.as_view(),
         name="part_detail",
+    ),
+    path(
+        "parts/bulk-pricing/",
+        PartsBulkPricingView.as_view(),
+        name="parts_bulk_pricing",
     ),
     path(
         "parts/<int:id>/providers/<int:provider_id>/refresh-inventory/",

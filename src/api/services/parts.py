@@ -444,6 +444,99 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
     return base
 
 
+_BULK_PRICING_MAX_IDS = 50
+
+
+def get_parts_bulk_pricing(
+    master_part_ids: typing.List[int], company_id: int
+) -> typing.Dict[int, typing.Dict[str, typing.Any]]:
+    """
+    Price-by-provider plus best cost/provider for up to _BULK_PRICING_MAX_IDS MasterParts at
+    once -- built to hydrate a search-results table right after a Meilisearch page of hits
+    (Meilisearch itself carries no pricing; see the parts index in src/search/meilisearch_client.py),
+    not to replace GET /parts/<id>/. Deliberately lean: no fitments/product_details/inventory,
+    just enough to render a price column and highlight the cheapest row -- more fields can be
+    added here later without changing the shape callers already depend on.
+
+    Unlike get_part_detail, this does NOT consume billing.check_detail_view_limit -- that limit
+    is specifically for a user opening a single part's full detail page, and every search would
+    burn through a company's monthly quota in one page load if this bulk hydrate counted against
+    it too.
+
+    Only providers this company is actively connected to are considered (same as
+    get_part_detail's "pricing is null unless integrated" rule) -- a part carried by a
+    distributor this company has no connection to contributes nothing here, not even a
+    zero-cost/None row.
+
+    Returns one entry per requested id, even for ids with no connected-provider pricing at all
+    (best_cost/best_provider_* null, providers: []) -- so callers can always index the response
+    by every id they asked for rather than treating a missing key as "still loading".
+    """
+    ids = list(dict.fromkeys(master_part_ids or []))  # de-dupe, keep order, tolerate None input
+    if not ids:
+        raise PartsServiceError("master_part_ids is required.")
+    if len(ids) > _BULK_PRICING_MAX_IDS:
+        raise PartsServiceError(
+            "Too many ids: {} given, {} max.".format(len(ids), _BULK_PRICING_MAX_IDS)
+        )
+
+    result: typing.Dict[int, typing.Dict[str, typing.Any]] = {
+        mpid: {
+            "best_cost": None,
+            "best_provider_id": None,
+            "best_provider_name": None,
+            "best_provider_kind_name": None,
+            "providers": [],
+        }
+        for mpid in ids
+    }
+
+    connected_provider_ids = set(
+        src_models.CompanyProviders.objects.filter(
+            company_id=company_id, provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
+        ).values_list("provider_id", flat=True)
+    )
+    if not connected_provider_ids:
+        return result
+
+    provider_parts = list(
+        src_models.ProviderPart.objects.filter(
+            master_part_id__in=ids, provider_id__in=connected_provider_ids,
+        ).values(
+            "id", "master_part_id", "provider_id", "provider__name", "provider__kind_name",
+        )
+    )
+    if not provider_parts:
+        return result
+
+    cost_by_provider_part_id = {
+        row["provider_part_id"]: row["cost"]
+        for row in src_models.ProviderPartCompanyPricing.objects.filter(
+            company_id=company_id,
+            provider_part_id__in=[pp["id"] for pp in provider_parts],
+        ).values("provider_part_id", "cost")
+        if row["cost"] is not None
+    }
+
+    for pp in provider_parts:
+        mpid = pp["master_part_id"]
+        cost = cost_by_provider_part_id.get(pp["id"])
+        entry = result[mpid]
+        entry["providers"].append({
+            "provider_id": pp["provider_id"],
+            "provider_name": pp["provider__name"],
+            "provider_kind_name": pp["provider__kind_name"],
+            "cost": float(cost) if cost is not None else None,
+        })
+        if cost is not None and (entry["best_cost"] is None or float(cost) < entry["best_cost"]):
+            entry["best_cost"] = float(cost)
+            entry["best_provider_id"] = pp["provider_id"]
+            entry["best_provider_name"] = pp["provider__name"]
+            entry["best_provider_kind_name"] = pp["provider__kind_name"]
+
+    return result
+
+
 def refresh_provider_live_inventory(
     master_part_id: int, provider_id: int, company_id: int
 ) -> typing.Optional[typing.Dict]:

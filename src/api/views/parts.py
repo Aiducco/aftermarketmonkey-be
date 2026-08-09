@@ -175,6 +175,76 @@ class PartAuditCompanyHistoryView(views.View):
         )
 
 
+class PartsBulkPricingView(views.View):
+    """
+    POST /parts/bulk-pricing/ - price-by-provider plus best cost/provider for up to 50
+    MasterParts at once, to hydrate a search-results table right after a page of Meilisearch
+    hits (which carries no pricing itself). Body: {"master_part_ids": [123, 456, ...]}.
+    Does NOT count against the detail_views_per_month billing limit -- see
+    parts_services.get_parts_bulk_pricing's docstring.
+    """
+
+    def post(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
+        err, company_id = _auth_check(request)
+        if err:
+            return err
+        if not company_id:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "No company found in token"}),
+                status=400,
+            )
+
+        try:
+            body = simplejson.loads(request.body) if request.body else {}
+        except simplejson.JSONDecodeError:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Invalid JSON body"}),
+                status=400,
+            )
+        if not isinstance(body, dict):
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Invalid JSON body"}),
+                status=400,
+            )
+
+        master_part_ids = body.get("master_part_ids")
+        if not isinstance(master_part_ids, list) or not all(
+            isinstance(mpid, int) for mpid in master_part_ids
+        ):
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "master_part_ids must be a list of integers"}),
+                status=400,
+            )
+
+        try:
+            data = parts_services.get_parts_bulk_pricing(
+                master_part_ids=master_part_ids, company_id=company_id
+            )
+        except parts_services.PartsServiceError as e:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": e.message}),
+                status=e.status,
+            )
+        except Exception as e:
+            logger.exception("{} Bulk pricing error: {}".format(_LOG_PREFIX, str(e)))
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Error fetching bulk pricing"}),
+                status=500,
+            )
+
+        return http.HttpResponse(
+            headers={"Content-Type": "application/json"},
+            content=simplejson.dumps({"data": data}),
+            status=200,
+        )
+
+
 class PartDetailView(views.View):
     """GET /parts/<id>/ - MasterPart plus per-provider rows; inventory/pricing only if company integrates that provider."""
 
