@@ -58,7 +58,9 @@ SEARCHABLE_ATTRIBUTES = ["part_number", "sku", "description", "aaia_code"]
 # fitment_keys: one entry per (year, make, model) the part fits, plus a more specific
 # (year, make, model, submodel, drive_type, engine) entry when that data exists - see
 # _bulk_fitment_keys_map_for_ids().
-FILTERABLE_ATTRIBUTES = ["brand_name", "category", "overview_category", "fitment_keys"]
+# distributor_names: every distinct distributor with a ProviderPart for this MasterPart - see
+# _bulk_distributors_map_for_ids(). Small (max 9 of 36 possible today), unlike fitment_keys.
+FILTERABLE_ATTRIBUTES = ["brand_name", "category", "overview_category", "fitment_keys", "distributor_names"]
 
 # vehicles index: one doc per distinct (year, make, model, submodel, drive_type, engine) combo
 # from MasterPartFitment (expanded per-year). No searchable attributes - the FE drives this
@@ -209,6 +211,47 @@ def _bulk_category_map_for_ids(
     return result
 
 
+def _bulk_distributors_map_for_ids(
+    master_part_ids: typing.List[int],
+) -> typing.Dict[int, typing.Tuple[typing.List[int], typing.List[str]]]:
+    """
+    Single query: returns {master_part_id: ([provider_id, ...], [provider_name, ...])} -- every
+    distinct distributor with at least one ProviderPart for that master part. Same one-query,
+    grouped-in-Python shape as _bulk_category_map_for_ids -- no per-part N+1.
+
+    Small by construction: a MasterPart can only be carried by as many distinct distributors as
+    exist in the system (36 today), and in practice the real distribution is tiny -- confirmed
+    live against production: 74% of parts have exactly 1 distributor, average 1.43, and the
+    single most-carried part in the whole ~3.2M-row catalog has only 9. Nothing like
+    fitment_keys' up-to-13,036-entry arrays, so this doesn't need the same size-aware upload
+    batching consideration that field required.
+    """
+    from src.models import ProviderPart
+
+    result: typing.Dict[int, typing.Tuple[typing.List[int], typing.List[str]]] = {}
+    if not master_part_ids:
+        return result
+    seen: typing.Dict[int, typing.Set[int]] = {}
+    qs = (
+        ProviderPart.objects
+        .filter(master_part_id__in=master_part_ids)
+        .order_by("master_part_id")
+        .values("master_part_id", "provider_id", "provider__name")
+        .distinct()
+    )
+    for row in qs:
+        mpid = row["master_part_id"]
+        pid = row["provider_id"]
+        provider_ids_seen = seen.setdefault(mpid, set())
+        if pid in provider_ids_seen:
+            continue
+        provider_ids_seen.add(pid)
+        ids, names = result.setdefault(mpid, ([], []))
+        ids.append(pid)
+        names.append(row["provider__name"] or "")
+    return result
+
+
 def _fitment_keys_for_row(
     year_start: int,
     year_end: int,
@@ -265,18 +308,24 @@ def _build_docs_for_batch(
     parts: typing.List,
     cat_map: typing.Dict[int, typing.Tuple[str, str]],
     fitment_map: typing.Optional[typing.Dict[int, typing.List[str]]] = None,
+    distributors_map: typing.Optional[
+        typing.Dict[int, typing.Tuple[typing.List[int], typing.List[str]]]
+    ] = None,
 ) -> typing.List[typing.Dict]:
     """
     Build Meilisearch document dicts for a batch of MasterPart instances.
     ``cat_map`` comes from _bulk_category_map_for_ids(), ``fitment_map`` from
-    _bulk_fitment_keys_map_for_ids() — both pre-computed in the main thread so worker threads
-    only do the HTTP upload, not DB queries.
+    _bulk_fitment_keys_map_for_ids(), ``distributors_map`` from
+    _bulk_distributors_map_for_ids() — all three pre-computed in the main thread so worker
+    threads only do the HTTP upload, not DB queries.
     """
     fitment_map = fitment_map or {}
+    distributors_map = distributors_map or {}
     docs = []
     for part in parts:
         brand_name = _get_brand_name(part)
         category, overview_category = cat_map.get(part.id, ("", ""))
+        distributor_ids, distributor_names = distributors_map.get(part.id, ([], []))
         docs.append({
             "id": part.id,
             "brand_id": part.brand_id,
@@ -290,6 +339,8 @@ def _build_docs_for_batch(
             "category": category,
             "overview_category": overview_category,
             "fitment_keys": fitment_map.get(part.id, []),
+            "distributor_ids": distributor_ids,
+            "distributor_names": distributor_names,
             "created_at": part.created_at.isoformat() if part.created_at else None,
             "updated_at": part.updated_at.isoformat() if part.updated_at else None,
         })
@@ -433,7 +484,11 @@ def master_part_to_index_shape(part) -> typing.Dict:
     """
     brand_name = _get_brand_name(part)
     category, overview_category = _index_categories_for_master_part(part)
-    fitment_keys = _bulk_fitment_keys_map_for_ids([part.id]).get(part.id, []) if getattr(part, "id", None) else []
+    part_id = getattr(part, "id", None)
+    fitment_keys = _bulk_fitment_keys_map_for_ids([part_id]).get(part_id, []) if part_id else []
+    distributor_ids, distributor_names = (
+        _bulk_distributors_map_for_ids([part_id]).get(part_id, ([], [])) if part_id else ([], [])
+    )
     return {
         "id": part.id,
         "brand_id": part.brand_id,
@@ -447,6 +502,8 @@ def master_part_to_index_shape(part) -> typing.Dict:
         "category": category or "",
         "overview_category": overview_category or "",
         "fitment_keys": fitment_keys,
+        "distributor_ids": distributor_ids,
+        "distributor_names": distributor_names,
         "created_at": part.created_at.isoformat() if part.created_at else None,
         "updated_at": part.updated_at.isoformat() if part.updated_at else None,
     }
@@ -587,7 +644,8 @@ def add_documents_in_batches(
             batch_t0 = time.monotonic()
             cat_map = _bulk_category_map_for_ids([p.id for p in batch])
             fitment_map = _bulk_fitment_keys_map_for_ids([p.id for p in batch])
-            docs = _build_docs_for_batch(batch, cat_map, fitment_map)
+            distributors_map = _bulk_distributors_map_for_ids([p.id for p in batch])
+            docs = _build_docs_for_batch(batch, cat_map, fitment_map, distributors_map)
             ok = _upload_raw_docs(docs, index_name=target_index_name)
             batch_dt = time.monotonic() - batch_t0
             if ok:
@@ -664,7 +722,8 @@ def add_documents_in_batches(
             # Build docs in the main thread (DB queries) so workers only handle HTTP.
             cat_map = _bulk_category_map_for_ids([p.id for p in batch])
             fitment_map = _bulk_fitment_keys_map_for_ids([p.id for p in batch])
-            docs = _build_docs_for_batch(batch, cat_map, fitment_map)
+            distributors_map = _bulk_distributors_map_for_ids([p.id for p in batch])
+            docs = _build_docs_for_batch(batch, cat_map, fitment_map, distributors_map)
             in_flight.append(
                 executor.submit(
                     _upload_docs_with_retries, docs, target_index_name, batch_index, id_first, id_last
@@ -864,7 +923,8 @@ def _add_documents_parallel_by_ids(
             id_first, id_last = batch[0].id, batch[-1].id
             cat_map = _bulk_category_map_for_ids([p.id for p in batch])
             fitment_map = _bulk_fitment_keys_map_for_ids([p.id for p in batch])
-            docs = _build_docs_for_batch(batch, cat_map, fitment_map)
+            distributors_map = _bulk_distributors_map_for_ids([p.id for p in batch])
+            docs = _build_docs_for_batch(batch, cat_map, fitment_map, distributors_map)
         finally:
             connection.close()
         return _upload_docs_with_retries(docs, target_index_name, batch_index, id_first, id_last)
