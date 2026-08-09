@@ -208,9 +208,8 @@ def _active_elite_wheel_company_providers_queryset():
 
 def _catalog_company_provider() -> typing.Optional[src_models.CompanyProviders]:
     """
-    Primary Elite connection for the shared catalog; else the first active one. Unlike every other
-    provider this may legitimately be None -- the public inventory share needs no credentials, so
-    the catalog ingest runs before any dealer has connected.
+    Primary Elite connection, else the first active one. Only a *fallback* source for the shared
+    catalog -- see :func:`fetch_and_save_elite_wheel` for why the public share is preferred.
     """
     elite_provider = src_models.Providers.objects.filter(
         kind=src_enums.BrandProviderKind.ELITE_WHEEL.value,
@@ -327,6 +326,36 @@ def _build_tire_part(
     )
 
 
+def _zero_out_parts_missing_from_feed(model, as_of_date, label: str) -> int:
+    """
+    Zero the stock on parts that were in a previous workbook but not this one.
+
+    Elite's workbook states its own scope in the banner -- "Including items with more than 0
+    on-hand" -- so a part vanishing from the feed does not mean "unchanged", it means the last one
+    sold. Without this the row keeps advertising whatever it had the day it dropped off, which is
+    worse than showing nothing: it sends a dealer to order a tire Elite no longer has.
+
+    Only rows strictly older than this run's ``as_of_date`` are touched, so a workbook with no
+    readable banner (``as_of_date`` null) never triggers a mass zeroing.
+    """
+    if not as_of_date:
+        logger.warning(
+            "{} No as_of date on this workbook; skipping sold-out sweep for {}.".format(_LOG_PREFIX, label)
+        )
+        return 0
+    stale = model.objects.filter(as_of_date__lt=as_of_date).exclude(total_available=0)
+    updates = {field: 0 for field in _QTY_FIELDS}
+    updates.update(total_available=0, location_availability=None, updated_at=timezone.now())
+    count = stale.update(**updates)
+    if count:
+        logger.info(
+            "{} Zeroed {} {} no longer listed in the {} workbook (sold out).".format(
+                _LOG_PREFIX, count, label, as_of_date,
+            )
+        )
+    return count
+
+
 def _upsert_parts(
     model,
     instances: typing.List,
@@ -365,33 +394,52 @@ def fetch_and_save_elite_wheel(
 ) -> None:
     """
     Read the newest Elite workbook and upsert EliteWheelBrand plus both part tables (catalog +
-    distributor-wide per-location stock). Uses the primary Elite CompanyProvider's credentials when
-    one exists, and Elite's public inventory share otherwise -- the share needs no credentials, so
-    the catalog stays current even with no dealer connected. Per-company pricing
-    (EliteWheel*CompanyPricing) is handled separately by IntegrationPricingSyncJob for each
-    CompanyProvider.
+    distributor-wide per-location stock). Per-company pricing (EliteWheel*CompanyPricing) is
+    handled separately by IntegrationPricingSyncJob for each CompanyProvider.
+
+    Source order is public share first, dealer connection only as a fallback. That is deliberate,
+    and the opposite of what most providers do: Elite's public share needs no credentials, covers
+    every warehouse, and is the same workbook a dealer account serves minus the price columns --
+    which the catalog does not read anyway. Preferring a dealer connection here made the shared
+    catalog for *every* company hostage to one dealer's credentials, and that is exactly how it
+    broke: a connection saved with a placeholder host ("32") took the nightly Elite catalog down
+    for three consecutive runs while the public share sat there working.
     """
     logger.info("{} Starting Elite Wheel feed sync.".format(_LOG_PREFIX))
 
-    catalog_cp = _catalog_company_provider()
-    catalog_creds = credentials_helper.get_feed_credentials(catalog_cp) if catalog_cp else {}
-    if catalog_cp:
-        logger.info(
-            "{} Catalog feed using company_id={} (primary={}).".format(
-                _LOG_PREFIX, catalog_cp.company_id, catalog_cp.primary,
-            )
-        )
+    if local_file_path:
+        sources: typing.List[typing.Tuple[str, typing.Dict]] = [("local file", {})]
     else:
-        logger.info(
-            "{} No Elite CompanyProviders yet; reading the public inventory share.".format(_LOG_PREFIX)
-        )
+        sources = [("public inventory share", {})]
+        catalog_cp = _catalog_company_provider()
+        if catalog_cp:
+            sources.append(
+                (
+                    "company_id={} dealer feed".format(catalog_cp.company_id),
+                    credentials_helper.get_feed_credentials(catalog_cp),
+                )
+            )
 
-    client = _elite_wheel_client_for_credentials(catalog_creds, local_file_path, force_public_share)
-    try:
-        data = client.get_feed_data()
-    except elite_wheel_exceptions.EliteWheelException as e:
-        logger.error("{} Feed error: {}.".format(_LOG_PREFIX, str(e)))
-        raise
+    data = None
+    last_error: typing.Optional[Exception] = None
+    for label, creds in sources:
+        client = _elite_wheel_client_for_credentials(creds, local_file_path, force_public_share)
+        try:
+            data = client.get_feed_data()
+            logger.info("{} Catalog feed read from {}.".format(_LOG_PREFIX, label))
+            break
+        except elite_wheel_exceptions.EliteWheelException as e:
+            last_error = e
+            logger.warning(
+                "{} Catalog feed source {!r} failed: {}.".format(_LOG_PREFIX, label, str(e) or repr(e))
+            )
+    if data is None:
+        logger.error(
+            "{} Every Elite catalog feed source failed ({} tried).".format(_LOG_PREFIX, len(sources))
+        )
+        raise last_error if last_error else elite_wheel_exceptions.EliteWheelDownloadError(
+            "No Elite catalog feed source available."
+        )
 
     wheel_rows = data.get("wheels") or []
     tire_rows = data.get("tires") or []
@@ -442,6 +490,20 @@ def fetch_and_save_elite_wheel(
     tires_written = _upsert_parts(
         src_models.EliteWheelPartTire, list(tires_by_key.values()), _TIRE_PART_UPDATE_FIELDS, "tires"
     )
+
+    # Sold-out sweep, but only for a warehouse-wide source. A dealer's own feed may legitimately
+    # cover a subset of Elite's catalog, and treating everything outside that subset as sold out
+    # would blank the catalog for every other company.
+    source_mode = data.get("source_mode")
+    if source_mode in (elite_wheel_client.SOURCE_MODE_PUBLIC_SHARE, "local_file"):
+        _zero_out_parts_missing_from_feed(src_models.EliteWheelPartWheel, as_of_date, "wheels")
+        _zero_out_parts_missing_from_feed(src_models.EliteWheelPartTire, as_of_date, "tires")
+    else:
+        logger.info(
+            "{} Source is {!r}, not the warehouse-wide share; skipping the sold-out sweep.".format(
+                _LOG_PREFIX, source_mode,
+            )
+        )
 
     logger.info(
         "{} Elite Wheel feed sync complete ({} wheels, {} tires from {}, as_of={}).".format(
