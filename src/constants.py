@@ -1004,6 +1004,9 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/automatic_distributors_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["ftp_host", "ftp_port", "ftp_user", "ftp_password"],
+        # Email-channel ordering — see the matching note on Turn 14 above.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["cc_email"],
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>Automatic Distributors</strong> provides an FTP account for your product data, but it "
@@ -1037,9 +1040,10 @@ PROVIDER_CATALOG = [
             "<li><strong>Already using these credentials elsewhere?</strong> They're the same as your Automatic "
             "Distributors catalog connection, so you can reuse them here &mdash; no need to request a second "
             "account.</li>"
-            "<li><strong>Placing orders.</strong> Automatic Distributors orders aren't sent through "
-            "AfterMarketScout yet &mdash; keep placing them the way you do today. This connection covers "
-            "product data only.</li>"
+            "<li><strong>Placing orders.</strong> Automatic Distributors has no ordering API, so orders are "
+            "emailed to your rep as a PDF purchase order instead. Enter your rep's <strong>email</strong> "
+            "below (and an optional internal <strong>CC</strong> address) and save &mdash; skip it if you "
+            "don't plan to place orders through AfterMarketScout.</li>"
             "<li><strong>Need help?</strong> Distributor: "
             "<a href=\"mailto:Custserv@autodist.com\">Custserv@autodist.com</a> &middot; AfterMarketScout: "
             "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a></li>"
@@ -1060,6 +1064,9 @@ PROVIDER_CATALOG = [
         "connection_required_fields": [],
         "relay_provisioned": True,
         "relay_credential_fields": ("ftp_user", "ftp_password"),
+        # Email-channel ordering — see the matching note on Turn 14 above.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["cc_email"],
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p>AfterMarketScout has already created a dedicated FTP account for your company. "
@@ -1088,6 +1095,9 @@ PROVIDER_CATALOG = [
         "connection_required_fields": [],
         "relay_provisioned": True,
         "relay_credential_fields": ("ftp_user", "ftp_password"),
+        # Email-channel ordering — see the matching note on Turn 14 above.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["cc_email"],
         "integration_time": "Data available within 1-2 days",
         # {{SFTP_USER}}/{{SFTP_PASSWORD}} are substituted per company by
         # _render_relay_instructions_html — see the matching note on Meyer above.
@@ -1154,6 +1164,9 @@ PROVIDER_CATALOG = [
         "connection_required_fields": [],
         "relay_provisioned": True,
         "relay_credential_fields": ("ftp_user", "ftp_password"),
+        # Email-channel ordering — see the matching note on Turn 14 above.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["cc_email"],
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p>AfterMarketScout has already created a dedicated FTP account for your company. "
@@ -1192,6 +1205,9 @@ PROVIDER_CATALOG = [
             ELITE_WHEEL_CREDENTIALS_PUBLIC_SHARE_ID,
             ELITE_WHEEL_CREDENTIALS_PUBLIC_SHARE_URL,
         ],
+        # Email-channel ordering — see the matching note on Turn 14 above.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["cc_email"],
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
             "<p><strong>Elite Wheel &amp; Tire</strong> delivers your inventory and pricing over SFTP, updated "
@@ -1274,6 +1290,9 @@ PROVIDER_CATALOG = [
         # Distributors above. Delete this line to bring it back.
         "hidden": True,
         "connection_required_fields": ["ftp_host", "ftp_port", "ftp_user", "ftp_password"],
+        # Email-channel ordering — see the matching note on Turn 14 above.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["cc_email"],
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>FastCo</strong> provides an FTP account for your product data. "
@@ -1298,6 +1317,9 @@ PROVIDER_CATALOG = [
         "hidden": True,
         "connection_required_fields": ["account_number"],
         "connection_optional_fields": ["access_token", "token_secret"],
+        # Email-channel ordering — see the matching note on Turn 14 above.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["cc_email"],
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>GrandWest Enterprises</strong> provides a data feed to keep your stock and pricing up to date.</p>"
@@ -1318,6 +1340,9 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/helmet_house_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["ftp_user", "ftp_password"],
+        # Email-channel ordering — see the matching note on Turn 14 above.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["cc_email"],
         "integration_time": "Data available within 1-2 hours",
         # The login is a single shared credential (not issued per dealer), so it is NOT stored
         # here -- dealers get it from Helmet House and enter it themselves. Never hardcode the
@@ -1362,6 +1387,9 @@ PROVIDER_CATALOG = [
         # Distributors above. Delete this line to bring it back.
         "hidden": True,
         "connection_required_fields": [],
+        # Email-channel ordering — see the matching note on Turn 14 above.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["cc_email"],
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>Thibault</strong> (Importations Thibault) FTP feed is already enabled for all dealers — "
@@ -1380,6 +1408,9 @@ PROVIDER_CATALOG = [
         "hidden": True,
         "category": "Distributors",
         "connection_required_fields": [],
+        # Email-channel ordering — see the matching note on Turn 14 above.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["cc_email"],
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>Marcor Automotive</strong> provides a public price and stock data feed — "
@@ -1395,6 +1426,9 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/overland_vehicle_systems_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["ftp_host", "ftp_port", "ftp_user", "ftp_password"],
+        # Email-channel ordering — see the matching note on Turn 14 above.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["cc_email"],
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>Overland Vehicle Systems</strong> provides the pricing file via FTP. "
@@ -1415,6 +1449,9 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/parts_authority_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["ftp_host", "ftp_port", "ftp_user", "ftp_password"],
+        # Email-channel ordering — see the matching note on Turn 14 above.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["cc_email"],
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>Parts Authority</strong> delivers inventory and pricing via their FTP server. You "
@@ -1471,6 +1508,9 @@ PROVIDER_CATALOG = [
         # Distributors above. Delete this line to bring it back.
         "hidden": True,
         "connection_required_fields": ["access_token"],
+        # Email-channel ordering — see the matching note on Turn 14 above.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["cc_email"],
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>Parts Canada</strong> provides API access using an access token. "
@@ -1492,6 +1532,9 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/parts_unlimited_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["api_key"],
+        # Email-channel ordering — see the matching note on Turn 14 above.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["cc_email"],
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
             "<p><strong>Parts Unlimited</strong> provides inventory and pricing through their API at "
@@ -1613,6 +1656,9 @@ PROVIDER_CATALOG = [
         # Distributors above. Delete this line to bring it back.
         "hidden": True,
         "connection_required_fields": ["account_number", "sftp_host", "sftp_port", "sftp_user", "sftp_password"],
+        # Email-channel ordering — see the matching note on Turn 14 above.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["cc_email"],
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>SSF Imported Auto Parts</strong> provides FTP accounts for stock and pricing data. "
@@ -1636,6 +1682,9 @@ PROVIDER_CATALOG = [
         "connection_required_fields": [],
         "relay_provisioned": True,
         "relay_credential_fields": ("ftp_user", "ftp_password"),
+        # Email-channel ordering — see the matching note on Turn 14 above.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["cc_email"],
         "integration_time": "Catalog available immediately; your pricing within 1-2 days",
         # {{SFTP_USER}}/{{SFTP_PASSWORD}} are substituted per company by
         # _render_relay_instructions_html — see the matching note on Meyer above.
@@ -1708,6 +1757,9 @@ PROVIDER_CATALOG = [
         # Distributors above. Delete this line to bring it back.
         "hidden": True,
         "connection_required_fields": ["ftp_host", "ftp_port", "ftp_user", "ftp_password"],
+        # Email-channel ordering — see the matching note on Turn 14 above.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["cc_email"],
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>Thibert</strong> provides an FTP account for your product data. "
@@ -1728,6 +1780,9 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/wps_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["api_key"],
+        # Email-channel ordering — see the matching note on Turn 14 above.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["cc_email"],
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
             "<p><strong>Western Power Sports (WPS)</strong> provides inventory and pricing through their Data "
@@ -1792,6 +1847,9 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/xdp_logo.png",
         "category": "Distributors",
         "connection_required_fields": [],
+        # Email-channel ordering — see the matching note on Turn 14 above.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["cc_email"],
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>XDP (Xtreme Diesel Performance)</strong> provides a public price and stock data feed — "
@@ -1808,6 +1866,9 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/atd_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["username", "password", "client_id", "location"],
+        # Email-channel ordering — see the matching note on Turn 14 above.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["cc_email"],
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
             "<p><strong>ATD (American Tire Distributors)</strong> delivers inventory and pricing through their "
@@ -2005,6 +2066,9 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/motor_state_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["api_key"],
+        # Email-channel ordering — see the matching note on Turn 14 above.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["cc_email"],
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
             "<p><strong>Motor State Distributing</strong> provides inventory and pricing through their API. "
