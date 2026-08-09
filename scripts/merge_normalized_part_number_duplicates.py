@@ -68,6 +68,12 @@ GTIN_LESS_PROVIDER_KINDS = frozenset({
     src_enums.BrandProviderKind.VOSSEN.value,
     src_enums.BrandProviderKind.TIRERACK.value,
     src_enums.BrandProviderKind.ELITE_WHEEL.value,
+    # motorstate_products has no barcode column and the ingest sets gtin=None, so
+    # Motor State can never corroborate a match: 69,624 master parts are backed by it
+    # alone and not one carries a gtin. Its rows often *look* barcoded because other
+    # providers on the same master part supplied one -- that says nothing about a
+    # Motor-State-only candidate.
+    src_enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING.value,
 })
 
 # Providers whose ingest still resolves master parts by exact string match only -- they do NOT
