@@ -988,6 +988,90 @@ def _serialize_confirmed_distributor_order(
     }
 
 
+def _emailed_distributor_order_line_item(
+    li: src_models.PurchaseOrderLineItem, shipments_by_id: typing.Dict[str, typing.Dict]
+) -> typing.Dict:
+    """One PO line item in the same standardized shape the raw_response parsers emit (see
+    turn_14._parse_order_lines), so the confirmed-order view renders an emailed order through
+    exactly the same FE code path as an API one. Prices follow the same effective-price rule as
+    _serialize_line_item (distributor quote wins over the catalog snapshot when one exists),
+    which for an email account is just the catalog snapshot — no quote ever runs there.
+
+    ``status`` stays None rather than borrowing "confirmed": the distributor hasn't told us
+    anything about this line, only that a PDF was emailed. Keystone already emits None for a
+    line whose status code it can't map, so None is an established value here, not a new one.
+    """
+    return {
+        "part_number": li.provider_part.master_part.part_number if li.provider_part.master_part else None,
+        "quantity": li.quantity,
+        "unit_price": _decimal_to_float(
+            li.distributor_unit_price if li.distributor_unit_price is not None else li.unit_cost
+        ),
+        "line_total": _decimal_to_float(purchase_order_jobs.effective_line_total(li)),
+        "warehouse_code": li.warehouse_code,
+        "warehouse_name": _single_shipment_warehouse_name(li, shipments_by_id),
+        "status": None,
+    }
+
+
+def _serialize_emailed_distributor_orders(po: src_models.PurchaseOrder) -> typing.List[typing.Dict]:
+    """
+    Email-channel stand-in for _serialize_confirmed_distributor_order. There's no distributor
+    API behind an emailed PO, so its PurchaseOrderDistributorOrder.raw_response holds only the
+    delivery envelope ({channel, to, cc, sent_at} — see email_order.EmailOrderAdapter.
+    submit_order), no order body: parsing it yields the all-null/empty shape, which renders as a
+    blank confirmed-order screen. Fill the same fields from what we do know — our own line items
+    and computed totals, i.e. exactly what was printed on the PDF the rep received — so the FE
+    can show the order it placed.
+
+    Everything here is ours, not the distributor's, and the response says so: fulfillment_channel
+    is "email" at the top level, distributor_status/tracking/invoice ids stay null/empty (nobody
+    has confirmed, shipped or billed anything yet), and per-line status stays None. Only the
+    order contents and pricing are filled in.
+
+    Lines are attached to whichever distributor order they were placed on
+    (PurchaseOrderLineItem.distributor_order), falling back to the sole distributor order when
+    that FK was never set — an emailed PO always produces exactly one (distributor_order_numbers
+    is a single-element [po_reference]), so the fallback is the normal path, not an edge case.
+    """
+    pdos = list(po.distributor_orders.all())
+    if not pdos:
+        return []
+
+    shipments_by_id = {s["id"]: s for s in (po.shipments or [])}
+    lines_by_pdo_id: typing.Dict[typing.Optional[int], typing.List[typing.Dict]] = {}
+    for li in po.line_items.select_related("provider_part__master_part").order_by("id"):
+        lines_by_pdo_id.setdefault(li.distributor_order_id, []).append(
+            _emailed_distributor_order_line_item(li, shipments_by_id)
+        )
+
+    unassigned = lines_by_pdo_id.pop(None, []) if len(pdos) == 1 else []
+
+    serialized = []
+    for pdo in pdos:
+        line_items = lines_by_pdo_id.get(pdo.id, []) + unassigned
+        line_totals = [li["line_total"] for li in line_items if li["line_total"] is not None]
+        subtotal = round(sum(line_totals), 2) if line_totals else None
+        # po.subtotal/total are PO-wide, so they'd double-count across a multi-order fan-out.
+        # Only lend them to the single-order case (every emailed PO today); otherwise the
+        # summed line totals above stand on their own.
+        single_order = len(pdos) == 1
+        serialized.append(
+            {
+                "distributor_order_number": pdo.distributor_order_number,
+                "distributor_status": None,
+                "distributor_invoice_ids": [],
+                "tracking": [],
+                "total": _decimal_to_float(po.total) if single_order else None,
+                "freight": _decimal_to_float(po.estimated_shipping) if single_order else None,
+                "discount": None,
+                "subtotal": _decimal_to_float(po.subtotal) if single_order and po.subtotal is not None else subtotal,
+                "line_items": line_items,
+            }
+        )
+    return serialized
+
+
 def get_confirmed_purchase_order_detail(company_id: int, purchase_order_id: int) -> typing.Dict:
     """
     Standardized, distributor-agnostic view of a placed order: reads distributor_status/
@@ -1007,6 +1091,7 @@ def get_confirmed_purchase_order_detail(company_id: int, purchase_order_id: int)
 
     provider = po.company_provider.provider
     provider_kind = provider.kind
+    fulfillment_channel = _po_fulfillment_channel(po)
     return {
         "id": po.id,
         "po_internal_number": po.po_number,
@@ -1016,7 +1101,7 @@ def get_confirmed_purchase_order_detail(company_id: int, purchase_order_id: int)
         # somewhat aspirational: there's no real distributor confirmation behind it, just the
         # fact that a PDF was emailed — the FE should show a distinct "Emailed to distributor"
         # tag rather than implying the same live-API confirmation the other 5 distributors get.
-        "fulfillment_channel": _po_fulfillment_channel(po),
+        "fulfillment_channel": fulfillment_channel,
         "distributor": {"name": provider.name, "kind": provider.kind_name},
         "shipped_to": _serialize_confirmed_shipped_to(po),
         "created_at": po.created_at.isoformat(),
@@ -1027,9 +1112,14 @@ def get_confirmed_purchase_order_detail(company_id: int, purchase_order_id: int)
         "recent_order": bool(
             po.submitted_at and (django_timezone.now() - po.submitted_at) <= _RECENT_ORDER_WINDOW
         ),
-        "distributor_orders": [
-            _serialize_confirmed_distributor_order(pdo, provider_kind) for pdo in po.distributor_orders.all()
-        ],
+        # API orders keep reading straight off the distributor's stored raw_response; an emailed
+        # PO has no such response to read, so its contents come from our own line items instead
+        # — see _serialize_emailed_distributor_orders.
+        "distributor_orders": (
+            _serialize_emailed_distributor_orders(po)
+            if fulfillment_channel == "email"
+            else [_serialize_confirmed_distributor_order(pdo, provider_kind) for pdo in po.distributor_orders.all()]
+        ),
     }
 
 
