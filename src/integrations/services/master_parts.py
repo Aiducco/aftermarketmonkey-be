@@ -5463,33 +5463,110 @@ def _helmet_house_master_part_number(
     sku: typing.Optional[str],
 ) -> str:
     """
-    MasterPart part number for a Helmet House row: the manufacturer part number (their
-    ``Vendor P/N``) when it looks like one, else Helmet House's own part number.
+    MasterPart part number for a Helmet House row: **Helmet House's own part number**.
 
-    Their own part number is internal ("4009-0005-48"), so keying on it would never dedupe
-    against the same part from another distributor. Vendor P/N is the real manufacturer number
-    for the volume brands (Alpinestars 315012710-48, 100% 50002-252-01, Quad Lock QLP-360-HCB,
-    FastHouse 100000-00-08) and is populated on 99.9% of the 40,770-row feed. Two shapes in that
-    column are not part numbers and are rejected here, measured against the live file:
+    This deliberately does *not* prefer the manufacturer number, which is the opposite of the WPS
+    rule. Powersports distributors share a part-numbering convention (the Tucker / Parts Unlimited
+    style "0105-1510-03"), so Helmet House's own number is the one A-Tech, WPS and Motor State
+    also spell their rows with -- while the manufacturer's code ("X15MAQDZL101" for that same
+    Shoei X-15) is carried by nobody else. That is the reverse of the automotive aftermarket,
+    where the MPN is the shared key and the distributor number is internal.
 
-      * 2,793 rows (6.9%) hold a note or a packed description rather than a number
-        ("000 PINPC OS", "50 QR-J BASE", "NC TRAVELERBAG"). Anything with internal whitespace is
-        treated as a note, same rule as WPS's supplier_product_id.
-      * 7,556 rows repeat Helmet House's own number with the dashes stripped -- exactly their
-        ``Alt Part#`` column, which is always the part number minus dashes. That is the house
-        brands (Cortech "8100-0105-03" -> "8100010503", NORU, Tourmaster): still an internal
-        number, just spelled differently, and using it would create a master part no other
-        distributor spells that way.
+    Measured across the live 40,770-row feed against the existing catalog (exact + normalised
+    matches into the 8,398 non-Helmet-House master parts in these 18 brands):
 
-    Collisions after those rejections are negligible (~130 across the whole feed, mostly HJC and
-    Sidi size runs) and are harmless: MasterPart dedupes on them by design, and ProviderPart
-    still keys on the feed-unique Helmet House number.
+        keying strategy                                   exact   +normalised
+        Helmet House's own part number                     1173          1926
+        vendor P/N when usable, else own number (was)      1135          1307
+        vendor P/N always                                   410           436
+
+    The concrete failure the old rule caused: Helmet House sku ``0105-1510-03`` (Shoei X-15,
+    UPC 4512048804091) has a clean Vendor P/N ``X15MAQDZL101``, so it keyed on that and created a
+    second master part, while A-Tech already carried the identical part as ``0105-1510-03``. Same
+    UPC, two master parts, and the part showed only A-Tech as a supplier.
+
+    ``vendor_part_number`` and ``alt_part_number`` are still accepted as arguments (and kept on
+    HelmetHousePart) because they remain useful for matching -- see
+    ``_extend_with_helmet_house_upc_matches`` and the normalised pass, where the dash-stripped
+    ``Alt Part#`` is what bridges "0101-0105-03" to A-Tech's "0101010503".
     """
-    vendor = (vendor_part_number or "").strip()
-    alt = (alt_part_number or "").strip()
-    if vendor and " " not in vendor and vendor.upper() != alt.upper():
-        return vendor
     return (sku or "").strip()
+
+
+def _extend_with_helmet_house_upc_matches(
+    existing_by_key: typing.Dict[typing.Tuple[int, str], int],
+    pairs: typing.Sequence[typing.Tuple[int, str]],
+    gtin_by_key: typing.Mapping[typing.Tuple[int, str], typing.Optional[str]],
+) -> int:
+    """
+    Final matching step for Helmet House: place keys on UPC when neither the exact
+    ``(brand, part_number)`` lookup nor the normalised pass could.
+
+    Mutates ``existing_by_key`` in place and returns how many keys were placed, matching the
+    contract of ``mp_matching.extend_with_normalized_matches`` so everything downstream treats a
+    UPC match exactly like an exact one.
+
+    This catches the cases where the two catalogs simply disagree about the number and no amount
+    of punctuation-stripping will bridge them -- Shoei "10C49LSMO" vs A-Tech's "0214941500",
+    HJC "0805-0290-03" vs "469800", or a plain typo like Sena "SC-AO133" vs "SC-A0133" (letter O
+    for zero). Worth 1,425 additional matches on the live feed, on top of 1,173 exact and 753
+    normalised.
+
+    Two guards, both measured against live data before being relied on:
+
+      * **Ambiguous UPCs are skipped.** A UPC is only used when exactly one existing master part
+        in that brand carries it. Zero of the 8,299 (brand, UPC) keys in these brands are
+        ambiguous today, so this costs nothing now and stops a future bad-data drop from fanning
+        one Helmet House row onto several parts.
+      * **One master part is claimed at most once per batch.** Helmet House's own feed has 31
+        (brand, UPC) keys carrying more than one part -- their data error, e.g. Shoei
+        "0102-1405-07" and "0102-1410-03" sharing UPC 4512048901363 -- and without this the
+        second row would collapse onto the part the first one claimed. Only 1 row actually
+        collides today; it is left to create its own master part instead.
+    """
+    unplaced = [
+        key for key in pairs
+        if existing_by_key.get(key) is None and (gtin_by_key.get(key) or "").strip()
+    ]
+    if not unplaced:
+        return 0
+
+    gtins_by_brand: typing.Dict[int, typing.Set[str]] = {}
+    for key in unplaced:
+        gtins_by_brand.setdefault(key[0], set()).add((gtin_by_key.get(key) or "").strip())
+
+    # (brand_id, gtin) -> master_part_id, dropping any gtin that more than one part carries.
+    resolved: typing.Dict[typing.Tuple[int, str], int] = {}
+    ambiguous: typing.Set[typing.Tuple[int, str]] = set()
+    with connection.cursor() as cur:
+        for brand_id, gtins in gtins_by_brand.items():
+            gtin_list = [g for g in gtins if g]
+            if not gtin_list:
+                continue
+            cur.execute(
+                "SELECT id, gtin FROM master_parts WHERE brand_id = %s AND gtin IN %s",
+                (brand_id, tuple(gtin_list)),
+            )
+            for mp_id, gtin in cur.fetchall():
+                cache_key = (brand_id, (gtin or "").strip())
+                if cache_key in resolved and resolved[cache_key] != mp_id:
+                    ambiguous.add(cache_key)
+                else:
+                    resolved.setdefault(cache_key, mp_id)
+
+    already_claimed = set(existing_by_key.values())
+    placed = 0
+    for key in unplaced:
+        cache_key = (key[0], (gtin_by_key.get(key) or "").strip())
+        if cache_key in ambiguous:
+            continue
+        master_part_id = resolved.get(cache_key)
+        if not master_part_id or master_part_id in already_claimed:
+            continue
+        existing_by_key[key] = master_part_id
+        already_claimed.add(master_part_id)
+        placed += 1
+    return placed
 
 
 def _helmet_house_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
@@ -5601,14 +5678,20 @@ def _ingest_helmet_house_parts_for_mapped_brands(
                     mp_id, b_id, p_num = r
                     existing_by_key[(b_id, p_num)] = mp_id
 
+        # Match in three steps, cheapest and most certain first: exact (brand, part number) above,
+        # then punctuation-insensitive with GTIN corroboration, then GTIN alone. See
+        # _helmet_house_master_part_number and _extend_with_helmet_house_upc_matches for why all
+        # three are needed and what each is worth.
+        gtin_by_key = {(mp.brand_id, mp.part_number): mp.gtin for mp in master_parts}
         mp_matching.extend_with_normalized_matches(
             existing_by_key,
             pairs,
-            {(mp.brand_id, mp.part_number): mp.gtin for mp in master_parts},
+            gtin_by_key,
             provider_id=helmet_house_provider.id,
             provider_kind=src_enums.BrandProviderKind.HELMHOUSE.value,
             external_id_by_key={v: k for k, v in external_id_to_brand_part.items()},
         )
+        upc_matched = _extend_with_helmet_house_upc_matches(existing_by_key, pairs, gtin_by_key)
 
         new_parts = [mp for mp in master_parts if (mp.brand_id, mp.part_number) not in existing_by_key]
         if new_parts:
@@ -5665,9 +5748,13 @@ def _ingest_helmet_house_parts_for_mapped_brands(
             )
             total_provider += len(provider_parts)
 
-        logger.info("{} Helmet House batch {}: {} items -> {} master, {} provider (last_id={})".format(
-            _LOG_PREFIX, batch_num, len(batch), len(master_parts), len(provider_parts), last_id
-        ))
+        logger.info(
+            "{} Helmet House batch {}: {} items -> {} master, {} provider, {} matched on UPC "
+            "(last_id={})".format(
+                _LOG_PREFIX, batch_num, len(batch), len(master_parts), len(provider_parts),
+                upc_matched, last_id,
+            )
+        )
         connection.close()
         if len(batch) == BATCH_SIZE_MASTER_PARTS:
             time.sleep(BATCH_DELAY_SECONDS)
