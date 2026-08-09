@@ -125,6 +125,7 @@ def send_purchase_order_email(
     purchase_order: src_models.PurchaseOrder,
     to_email: str,
     cc_email: typing.Optional[str],
+    reply_to: typing.Optional[str] = None,
     pdf_bytes: bytes,
     pdf_filename: str,
 ) -> str:
@@ -132,6 +133,12 @@ def send_purchase_order_email(
     Emails a generated purchase-order PDF to a distributor rep, called by
     EmailOrderAdapter.submit_order() (src/integrations/orders/email_order.py). Returns Resend's
     message id on success.
+
+    ``reply_to``, when set (from the order account's optional "reply_to" credential field --
+    see PROVIDER_CATALOG's email_order_connection_optional_fields), routes the rep's reply
+    directly wherever the company wants it. Without it, a rep hitting "Reply" defaults to
+    ``from_email`` -- a generic platform address nobody actively monitors for order-specific
+    replies, not the company that actually placed the order.
 
     Unlike send_first_sync_completed_email above (fire-and-forget — a missed "you're live" email
     isn't worth failing a sync job over), this one RAISES on failure as OrderValidationError. The
@@ -167,6 +174,8 @@ def send_purchase_order_email(
     }
     if cc_list:
         payload["cc"] = cc_list
+    if reply_to:
+        payload["reply_to"] = reply_to
 
     try:
         response = requests.post(

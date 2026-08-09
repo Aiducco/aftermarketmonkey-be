@@ -304,7 +304,7 @@ PROVIDER_CATALOG = [
         # is connected; see src.enums.OrderMethod and src/integrations/orders/email_order.py.
         # A company picks the channel per order account (Settings > Integrations > Ordering).
         "email_order_connection_required_fields": ["rep_email"],
-        "email_order_connection_optional_fields": ["cc_email"],
+        "email_order_connection_optional_fields": ["cc_email", "reply_to"],
         "integration_time": "Data available within 1-2 hours",
         # Screenshots referenced below live in ``resources/uploads`` and are served from
         # ``{_UPLOADS}`` (same host/dir as every provider ``icon_url``) — add the PNG there and it
@@ -411,7 +411,7 @@ PROVIDER_CATALOG = [
         "order_connection_required_fields": ["account_number", "security_key"],
         # Email-channel ordering — see the matching note on Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
-        "email_order_connection_optional_fields": ["cc_email"],
+        "email_order_connection_optional_fields": ["cc_email", "reply_to"],
         "integration_time": "Data available within 1-2 hours",
         # Screenshots live in ``resources/uploads`` and are served from ``{_UPLOADS}`` — see the
         # matching note on Turn 14 above. The allowlist IP is interpolated from
@@ -515,7 +515,7 @@ PROVIDER_CATALOG = [
         # only way to place orders through AfterMarketScout for it. See the matching note on
         # Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
-        "email_order_connection_optional_fields": ["cc_email"],
+        "email_order_connection_optional_fields": ["cc_email", "reply_to"],
         "integration_time": "Data available within 1-2 hours",
         # Screenshots live in ``resources/uploads`` and are served from ``{_UPLOADS}`` — see the
         # matching note on Turn 14 above.
@@ -593,7 +593,7 @@ PROVIDER_CATALOG = [
         # Email-channel ordering — Quadratec has no order API of its own (same pattern as Rough
         # Country / Vossen), so this is the only way to place orders through AfterMarketScout for it.
         "email_order_connection_required_fields": ["rep_email"],
-        "email_order_connection_optional_fields": ["cc_email"],
+        "email_order_connection_optional_fields": ["cc_email", "reply_to"],
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
             "<p><strong>Quadratec</strong> provides two downloadable dealer feeds — a catalog/pricing "
@@ -641,7 +641,7 @@ PROVIDER_CATALOG = [
         "order_connection_required_fields": ["username", "password"],
         # Email-channel ordering — see the matching note on Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
-        "email_order_connection_optional_fields": ["cc_email"],
+        "email_order_connection_optional_fields": ["cc_email", "reply_to"],
         "integration_time": "Data available within 1-2 hours",
         # Screenshots live in ``resources/uploads`` and are served from ``{_UPLOADS}`` — see the
         # matching note on Turn 14 above.
@@ -766,7 +766,7 @@ PROVIDER_CATALOG = [
         "order_connection_required_fields": ["api_key", "customer_number"],
         # Email-channel ordering — see the matching note on Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
-        "email_order_connection_optional_fields": ["cc_email"],
+        "email_order_connection_optional_fields": ["cc_email", "reply_to"],
         "integration_time": "Data available within 1-2 hours",
         # {{SFTP_USER}}/{{SFTP_PASSWORD}} are substituted per company by
         # _render_relay_instructions_html (src/api/services/integrations.py) — they must stay
@@ -923,7 +923,7 @@ PROVIDER_CATALOG = [
         # Email-channel ordering — A-Tech has no order API of its own; see the matching note on
         # Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
-        "email_order_connection_optional_fields": ["cc_email"],
+        "email_order_connection_optional_fields": ["cc_email", "reply_to"],
     },
     {
         "kind": enums.BrandProviderKind.DLG,
@@ -995,7 +995,7 @@ PROVIDER_CATALOG = [
         # Email-channel ordering — DLG has no order API of its own; see the matching note on
         # Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
-        "email_order_connection_optional_fields": ["cc_email"],
+        "email_order_connection_optional_fields": ["cc_email", "reply_to"],
     },
     {
         "kind": enums.BrandProviderKind.AUTOMATIC_DISTRIBUTORS,
@@ -1006,7 +1006,7 @@ PROVIDER_CATALOG = [
         "connection_required_fields": ["ftp_host", "ftp_port", "ftp_user", "ftp_password"],
         # Email-channel ordering — see the matching note on Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
-        "email_order_connection_optional_fields": ["cc_email"],
+        "email_order_connection_optional_fields": ["cc_email", "reply_to"],
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>Automatic Distributors</strong> provides an FTP account for your product data, but it "
@@ -1066,7 +1066,7 @@ PROVIDER_CATALOG = [
         "relay_credential_fields": ("ftp_user", "ftp_password"),
         # Email-channel ordering — see the matching note on Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
-        "email_order_connection_optional_fields": ["cc_email"],
+        "email_order_connection_optional_fields": ["cc_email", "reply_to"],
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p>AfterMarketScout has already created a dedicated FTP account for your company. "
@@ -1097,7 +1097,7 @@ PROVIDER_CATALOG = [
         "relay_credential_fields": ("ftp_user", "ftp_password"),
         # Email-channel ordering — see the matching note on Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
-        "email_order_connection_optional_fields": ["cc_email"],
+        "email_order_connection_optional_fields": ["cc_email", "reply_to"],
         "integration_time": "Data available within 1-2 days",
         # {{SFTP_USER}}/{{SFTP_PASSWORD}} are substituted per company by
         # _render_relay_instructions_html — see the matching note on Meyer above.
@@ -1166,7 +1166,7 @@ PROVIDER_CATALOG = [
         "relay_credential_fields": ("ftp_user", "ftp_password"),
         # Email-channel ordering — see the matching note on Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
-        "email_order_connection_optional_fields": ["cc_email"],
+        "email_order_connection_optional_fields": ["cc_email", "reply_to"],
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p>AfterMarketScout has already created a dedicated FTP account for your company. "
@@ -1207,7 +1207,7 @@ PROVIDER_CATALOG = [
         ],
         # Email-channel ordering — see the matching note on Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
-        "email_order_connection_optional_fields": ["cc_email"],
+        "email_order_connection_optional_fields": ["cc_email", "reply_to"],
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
             "<p><strong>Elite Wheel &amp; Tire</strong> delivers your inventory and pricing over SFTP, updated "
@@ -1292,7 +1292,7 @@ PROVIDER_CATALOG = [
         "connection_required_fields": ["ftp_host", "ftp_port", "ftp_user", "ftp_password"],
         # Email-channel ordering — see the matching note on Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
-        "email_order_connection_optional_fields": ["cc_email"],
+        "email_order_connection_optional_fields": ["cc_email", "reply_to"],
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>FastCo</strong> provides an FTP account for your product data. "
@@ -1319,7 +1319,7 @@ PROVIDER_CATALOG = [
         "connection_optional_fields": ["access_token", "token_secret"],
         # Email-channel ordering — see the matching note on Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
-        "email_order_connection_optional_fields": ["cc_email"],
+        "email_order_connection_optional_fields": ["cc_email", "reply_to"],
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>GrandWest Enterprises</strong> provides a data feed to keep your stock and pricing up to date.</p>"
@@ -1342,7 +1342,7 @@ PROVIDER_CATALOG = [
         "connection_required_fields": ["ftp_user", "ftp_password"],
         # Email-channel ordering — see the matching note on Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
-        "email_order_connection_optional_fields": ["cc_email"],
+        "email_order_connection_optional_fields": ["cc_email", "reply_to"],
         "integration_time": "Data available within 1-2 hours",
         # The login is a single shared credential (not issued per dealer), so it is NOT stored
         # here -- dealers get it from Helmet House and enter it themselves. Never hardcode the
@@ -1389,7 +1389,7 @@ PROVIDER_CATALOG = [
         "connection_required_fields": [],
         # Email-channel ordering — see the matching note on Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
-        "email_order_connection_optional_fields": ["cc_email"],
+        "email_order_connection_optional_fields": ["cc_email", "reply_to"],
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>Thibault</strong> (Importations Thibault) FTP feed is already enabled for all dealers — "
@@ -1410,7 +1410,7 @@ PROVIDER_CATALOG = [
         "connection_required_fields": [],
         # Email-channel ordering — see the matching note on Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
-        "email_order_connection_optional_fields": ["cc_email"],
+        "email_order_connection_optional_fields": ["cc_email", "reply_to"],
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>Marcor Automotive</strong> provides a public price and stock data feed — "
@@ -1428,7 +1428,7 @@ PROVIDER_CATALOG = [
         "connection_required_fields": ["ftp_host", "ftp_port", "ftp_user", "ftp_password"],
         # Email-channel ordering — see the matching note on Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
-        "email_order_connection_optional_fields": ["cc_email"],
+        "email_order_connection_optional_fields": ["cc_email", "reply_to"],
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>Overland Vehicle Systems</strong> provides the pricing file via FTP. "
@@ -1451,7 +1451,7 @@ PROVIDER_CATALOG = [
         "connection_required_fields": ["ftp_host", "ftp_port", "ftp_user", "ftp_password"],
         # Email-channel ordering — see the matching note on Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
-        "email_order_connection_optional_fields": ["cc_email"],
+        "email_order_connection_optional_fields": ["cc_email", "reply_to"],
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>Parts Authority</strong> delivers inventory and pricing via their FTP server. You "
@@ -1510,7 +1510,7 @@ PROVIDER_CATALOG = [
         "connection_required_fields": ["access_token"],
         # Email-channel ordering — see the matching note on Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
-        "email_order_connection_optional_fields": ["cc_email"],
+        "email_order_connection_optional_fields": ["cc_email", "reply_to"],
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>Parts Canada</strong> provides API access using an access token. "
@@ -1534,7 +1534,7 @@ PROVIDER_CATALOG = [
         "connection_required_fields": ["api_key"],
         # Email-channel ordering — see the matching note on Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
-        "email_order_connection_optional_fields": ["cc_email"],
+        "email_order_connection_optional_fields": ["cc_email", "reply_to"],
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
             "<p><strong>Parts Unlimited</strong> provides inventory and pricing through their API at "
@@ -1591,7 +1591,7 @@ PROVIDER_CATALOG = [
         "order_connection_required_fields": ["api_key"],
         # Email-channel ordering — see the matching note on Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
-        "email_order_connection_optional_fields": ["cc_email"],
+        "email_order_connection_optional_fields": ["cc_email", "reply_to"],
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
             "<p><strong>APG Wholesale (Premier)</strong> delivers a daily inventory and pricing feed via their "
@@ -1658,7 +1658,7 @@ PROVIDER_CATALOG = [
         "connection_required_fields": ["account_number", "sftp_host", "sftp_port", "sftp_user", "sftp_password"],
         # Email-channel ordering — see the matching note on Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
-        "email_order_connection_optional_fields": ["cc_email"],
+        "email_order_connection_optional_fields": ["cc_email", "reply_to"],
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>SSF Imported Auto Parts</strong> provides FTP accounts for stock and pricing data. "
@@ -1684,7 +1684,7 @@ PROVIDER_CATALOG = [
         "relay_credential_fields": ("ftp_user", "ftp_password"),
         # Email-channel ordering — see the matching note on Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
-        "email_order_connection_optional_fields": ["cc_email"],
+        "email_order_connection_optional_fields": ["cc_email", "reply_to"],
         "integration_time": "Catalog available immediately; your pricing within 1-2 days",
         # {{SFTP_USER}}/{{SFTP_PASSWORD}} are substituted per company by
         # _render_relay_instructions_html — see the matching note on Meyer above.
@@ -1759,7 +1759,7 @@ PROVIDER_CATALOG = [
         "connection_required_fields": ["ftp_host", "ftp_port", "ftp_user", "ftp_password"],
         # Email-channel ordering — see the matching note on Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
-        "email_order_connection_optional_fields": ["cc_email"],
+        "email_order_connection_optional_fields": ["cc_email", "reply_to"],
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>Thibert</strong> provides an FTP account for your product data. "
@@ -1782,7 +1782,7 @@ PROVIDER_CATALOG = [
         "connection_required_fields": ["api_key"],
         # Email-channel ordering — see the matching note on Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
-        "email_order_connection_optional_fields": ["cc_email"],
+        "email_order_connection_optional_fields": ["cc_email", "reply_to"],
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
             "<p><strong>Western Power Sports (WPS)</strong> provides inventory and pricing through their Data "
@@ -1849,7 +1849,7 @@ PROVIDER_CATALOG = [
         "connection_required_fields": [],
         # Email-channel ordering — see the matching note on Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
-        "email_order_connection_optional_fields": ["cc_email"],
+        "email_order_connection_optional_fields": ["cc_email", "reply_to"],
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>XDP (Xtreme Diesel Performance)</strong> provides a public price and stock data feed — "
@@ -1868,7 +1868,7 @@ PROVIDER_CATALOG = [
         "connection_required_fields": ["username", "password", "client_id", "location"],
         # Email-channel ordering — see the matching note on Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
-        "email_order_connection_optional_fields": ["cc_email"],
+        "email_order_connection_optional_fields": ["cc_email", "reply_to"],
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
             "<p><strong>ATD (American Tire Distributors)</strong> delivers inventory and pricing through their "
@@ -1984,7 +1984,7 @@ PROVIDER_CATALOG = [
         # Email-channel ordering — Vossen has no order API of its own; see the matching note on
         # Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
-        "email_order_connection_optional_fields": ["cc_email"],
+        "email_order_connection_optional_fields": ["cc_email", "reply_to"],
     },
     {
         "kind": enums.BrandProviderKind.TIRERACK,
@@ -2057,7 +2057,7 @@ PROVIDER_CATALOG = [
         # Email-channel ordering — TireRack has no order API of its own; see the matching note
         # on Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
-        "email_order_connection_optional_fields": ["cc_email"],
+        "email_order_connection_optional_fields": ["cc_email", "reply_to"],
     },
     {
         "kind": enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING,
@@ -2068,7 +2068,7 @@ PROVIDER_CATALOG = [
         "connection_required_fields": ["api_key"],
         # Email-channel ordering — see the matching note on Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
-        "email_order_connection_optional_fields": ["cc_email"],
+        "email_order_connection_optional_fields": ["cc_email", "reply_to"],
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
             "<p><strong>Motor State Distributing</strong> provides inventory and pricing through their API. "

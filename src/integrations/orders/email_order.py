@@ -49,6 +49,10 @@ class EmailOrderAdapter(base.DistributorOrderAdapter):
         creds = credentials_helper.get_order_credentials(company_provider, order_account)
         self.rep_email = (creds.get("rep_email") or "").strip()
         self.cc_email = (creds.get("cc_email") or "").strip() or None
+        # Optional -- when set, the rep's reply goes here instead of defaulting to whatever
+        # NOTIFICATIONS_FROM_EMAIL is (a generic platform address nobody monitors for
+        # order-specific replies). See notifications.send_purchase_order_email.
+        self.reply_to = (creds.get("reply_to") or "").strip() or None
         if not self.rep_email:
             raise ValueError("rep_email is required for email-based ordering.")
 
@@ -174,6 +178,7 @@ class EmailOrderAdapter(base.DistributorOrderAdapter):
                 purchase_order=purchase_order,
                 to_email=self.rep_email,
                 cc_email=self.cc_email,
+                reply_to=self.reply_to,
                 pdf_bytes=pdf_bytes,
                 pdf_filename="PO-{}.pdf".format(po_reference),
             )

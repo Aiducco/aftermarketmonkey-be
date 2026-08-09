@@ -804,11 +804,11 @@ def _validate_email_order_connection(credentials: typing.Dict[str, typing.Any]) 
     Validator for the Email order channel (src.enums.OrderMethod.EMAIL) — checked whenever an
     order account's order_method is EMAIL, regardless of provider kind. Unlike
     _ORDER_CONNECTION_VALIDATORS above (one live-API-testing validator per distributor kind),
-    there's no live endpoint to test against here — just that rep_email/cc_email, when present,
-    are actually well-formed addresses. No network call, so this always runs synchronously and
-    cheaply, same as the format-only feed validators elsewhere in this module.
+    there's no live endpoint to test against here — just that rep_email/cc_email/reply_to, when
+    present, are actually well-formed addresses. No network call, so this always runs
+    synchronously and cheaply, same as the format-only feed validators elsewhere in this module.
     """
-    for field in ("rep_email", "cc_email"):
+    for field in ("rep_email", "cc_email", "reply_to"):
         value = (credentials.get(field) or "").strip()
         if not value:
             continue
