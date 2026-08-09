@@ -147,6 +147,12 @@ def _get_mappings_for_brand(brand):
         out.append("elite_wheel")
     if src_models.BrandMotorStateBrandMapping.objects.filter(brand=brand).exists():
         out.append("motorstate")
+    if src_models.BrandWpsBrandMapping.objects.filter(brand=brand).exists():
+        out.append("wps")
+    if src_models.BrandHelmetHouseBrandMapping.objects.filter(brand=brand).exists():
+        out.append("helmet_house")
+    if src_models.BrandTheWheelGroupBrandMapping.objects.filter(brand=brand).exists():
+        out.append("the_wheel_group")
     return out
 
 
@@ -398,6 +404,83 @@ def merge_brands(brand_to_keep, brand_to_delete, confirm=_confirm):
             if confirm(
                 "  Update mapping id={} brand_id {} -> {} (motorstate_brand={})?".format(
                     m.id, delete_id, keep_id, m.motorstate_brand.name
+                )
+            ):
+                m.brand_id = keep_id
+                m.save()
+
+    # 5h. BrandWpsBrandMapping
+    wps_list = list(
+        src_models.BrandWpsBrandMapping.objects.filter(brand_id=delete_id).select_related("wps_brand")
+    )
+    print("\n--- BrandWpsBrandMapping: {} to process ---".format(len(wps_list)))
+    for m in wps_list:
+        existing = src_models.BrandWpsBrandMapping.objects.filter(
+            brand_id=keep_id, wps_brand=m.wps_brand
+        ).first()
+        if existing:
+            if confirm(
+                "  Delete mapping id={} (wps_brand={})? Keep already has.".format(m.id, m.wps_brand.name)
+            ):
+                m.delete()
+        else:
+            if confirm(
+                "  Update mapping id={} brand_id {} -> {} (wps_brand={})?".format(
+                    m.id, delete_id, keep_id, m.wps_brand.name
+                )
+            ):
+                m.brand_id = keep_id
+                m.save()
+
+    # 5i. BrandHelmetHouseBrandMapping
+    helmet_house_list = list(
+        src_models.BrandHelmetHouseBrandMapping.objects.filter(brand_id=delete_id).select_related(
+            "helmet_house_brand"
+        )
+    )
+    print("\n--- BrandHelmetHouseBrandMapping: {} to process ---".format(len(helmet_house_list)))
+    for m in helmet_house_list:
+        existing = src_models.BrandHelmetHouseBrandMapping.objects.filter(
+            brand_id=keep_id, helmet_house_brand=m.helmet_house_brand
+        ).first()
+        if existing:
+            if confirm(
+                "  Delete mapping id={} (helmet_house_brand={})? Keep already has.".format(
+                    m.id, m.helmet_house_brand.name
+                )
+            ):
+                m.delete()
+        else:
+            if confirm(
+                "  Update mapping id={} brand_id {} -> {} (helmet_house_brand={})?".format(
+                    m.id, delete_id, keep_id, m.helmet_house_brand.name
+                )
+            ):
+                m.brand_id = keep_id
+                m.save()
+
+    # 5j. BrandTheWheelGroupBrandMapping
+    twg_list = list(
+        src_models.BrandTheWheelGroupBrandMapping.objects.filter(brand_id=delete_id).select_related(
+            "the_wheel_group_brand"
+        )
+    )
+    print("\n--- BrandTheWheelGroupBrandMapping: {} to process ---".format(len(twg_list)))
+    for m in twg_list:
+        existing = src_models.BrandTheWheelGroupBrandMapping.objects.filter(
+            brand_id=keep_id, the_wheel_group_brand=m.the_wheel_group_brand
+        ).first()
+        if existing:
+            if confirm(
+                "  Delete mapping id={} (the_wheel_group_brand={})? Keep already has.".format(
+                    m.id, m.the_wheel_group_brand.name
+                )
+            ):
+                m.delete()
+        else:
+            if confirm(
+                "  Update mapping id={} brand_id {} -> {} (the_wheel_group_brand={})?".format(
+                    m.id, delete_id, keep_id, m.the_wheel_group_brand.name
                 )
             ):
                 m.brand_id = keep_id
