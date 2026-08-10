@@ -62,6 +62,10 @@ SEARCHABLE_ATTRIBUTES = ["part_number", "sku", "description", "aaia_code", "gtin
 # _bulk_distributors_map_for_ids(). Small (max 9 of 36 possible today), unlike fitment_keys.
 FILTERABLE_ATTRIBUTES = ["brand_name", "category", "overview_category", "fitment_keys", "distributor_names"]
 
+# Sortable: brand_name/created_at need no extra data (already on every doc). distributor_count
+# (len(distributor_ids)) is a proxy for "easiest to source" -- carried by more distributors.
+SORTABLE_ATTRIBUTES = ["brand_name", "created_at", "distributor_count"]
+
 # vehicles index: one doc per distinct (year, make, model, submodel, drive_type, engine) combo
 # from MasterPartFitment (expanded per-year). No searchable attributes - the FE drives this
 # purely through facet distribution + filters (cascading Year -> Make -> Model, then an optional
@@ -114,10 +118,11 @@ def setup_index() -> bool:
 
         index.update_searchable_attributes(SEARCHABLE_ATTRIBUTES)
         index.update_filterable_attributes(FILTERABLE_ATTRIBUTES)
+        index.update_sortable_attributes(SORTABLE_ATTRIBUTES)
         index.update_faceting_settings({"maxValuesPerFacet": PARTS_MAX_VALUES_PER_FACET})
 
-        logger.info("Meilisearch index '%s' configured: searchable=%s, filterable=%s, maxValuesPerFacet=%s",
-                    INDEX_NAME, SEARCHABLE_ATTRIBUTES, FILTERABLE_ATTRIBUTES, PARTS_MAX_VALUES_PER_FACET)
+        logger.info("Meilisearch index '%s' configured: searchable=%s, filterable=%s, sortable=%s, maxValuesPerFacet=%s",
+                    INDEX_NAME, SEARCHABLE_ATTRIBUTES, FILTERABLE_ATTRIBUTES, SORTABLE_ATTRIBUTES, PARTS_MAX_VALUES_PER_FACET)
         return True
     except Exception as e:
         logger.exception("Meilisearch setup failed: %s", str(e))
@@ -341,6 +346,7 @@ def _build_docs_for_batch(
             "fitment_keys": fitment_map.get(part.id, []),
             "distributor_ids": distributor_ids,
             "distributor_names": distributor_names,
+            "distributor_count": len(distributor_ids),
             "created_at": part.created_at.isoformat() if part.created_at else None,
             "updated_at": part.updated_at.isoformat() if part.updated_at else None,
         })
@@ -504,6 +510,7 @@ def master_part_to_index_shape(part) -> typing.Dict:
         "fitment_keys": fitment_keys,
         "distributor_ids": distributor_ids,
         "distributor_names": distributor_names,
+        "distributor_count": len(distributor_ids),
         "created_at": part.created_at.isoformat() if part.created_at else None,
         "updated_at": part.updated_at.isoformat() if part.updated_at else None,
     }
@@ -1249,6 +1256,7 @@ def reindex_all_master_parts_zero_downtime(
         staging = client.index(staging_name)
         staging.update_searchable_attributes(SEARCHABLE_ATTRIBUTES)
         staging.update_filterable_attributes(FILTERABLE_ATTRIBUTES)
+        staging.update_sortable_attributes(SORTABLE_ATTRIBUTES)
         # setup_index() applies this to a manually-configured index, but the staging index
         # created fresh here never went through that path -- every nightly swap silently reset
         # the live index back to Meilisearch's default maxValuesPerFacet (100), truncating the
