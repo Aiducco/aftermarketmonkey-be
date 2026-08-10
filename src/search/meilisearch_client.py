@@ -85,6 +85,15 @@ VEHICLES_MAX_VALUES_PER_FACET = 150
 # would silently drop the vast majority of brands. Sized with headroom above the current count.
 PARTS_MAX_VALUES_PER_FACET = 4000
 
+# Meilisearch's default pagination.maxTotalHits (1000) caps offset+limit for EVERY search query,
+# not just full-catalog browsing -- confirmed live: offset=998/limit=5 on a distinct=brand_name
+# query only returned 2 hits, silently making every brand alphabetically past ~"D" unreachable
+# via pagination (~4,200 distinct brands exist). Raised with headroom the same way as
+# PARTS_MAX_VALUES_PER_FACET above. This is what lets a paginated "all brands" listing use the
+# regular /search endpoint directly (distinct=brand_name + sort=["brand_name:asc"] +
+# limit/offset) instead of needing a separate endpoint.
+PARTS_MAX_TOTAL_HITS = 5000
+
 
 def _get_client():
     """Lazy import to avoid import errors when meilisearch is not installed."""
@@ -120,9 +129,10 @@ def setup_index() -> bool:
         index.update_filterable_attributes(FILTERABLE_ATTRIBUTES)
         index.update_sortable_attributes(SORTABLE_ATTRIBUTES)
         index.update_faceting_settings({"maxValuesPerFacet": PARTS_MAX_VALUES_PER_FACET})
+        index.update_pagination_settings({"maxTotalHits": PARTS_MAX_TOTAL_HITS})
 
-        logger.info("Meilisearch index '%s' configured: searchable=%s, filterable=%s, sortable=%s, maxValuesPerFacet=%s",
-                    INDEX_NAME, SEARCHABLE_ATTRIBUTES, FILTERABLE_ATTRIBUTES, SORTABLE_ATTRIBUTES, PARTS_MAX_VALUES_PER_FACET)
+        logger.info("Meilisearch index '%s' configured: searchable=%s, filterable=%s, sortable=%s, maxValuesPerFacet=%s, maxTotalHits=%s",
+                    INDEX_NAME, SEARCHABLE_ATTRIBUTES, FILTERABLE_ATTRIBUTES, SORTABLE_ATTRIBUTES, PARTS_MAX_VALUES_PER_FACET, PARTS_MAX_TOTAL_HITS)
         return True
     except Exception as e:
         logger.exception("Meilisearch setup failed: %s", str(e))
@@ -1263,6 +1273,10 @@ def reindex_all_master_parts_zero_downtime(
         # brand_name facet distribution to the first 100 of ~3,824 brands (alphabetically) even
         # though every brand's parts were always fully indexed and searchable.
         staging.update_faceting_settings({"maxValuesPerFacet": PARTS_MAX_VALUES_PER_FACET})
+        # Same reset-every-swap risk as maxValuesPerFacet above, but for pagination.maxTotalHits
+        # -- Meilisearch's default (1000) silently makes any offset+limit beyond the first 1000
+        # matches (e.g. paginating the full ~4,200-brand list) return nothing past that point.
+        staging.update_pagination_settings({"maxTotalHits": PARTS_MAX_TOTAL_HITS})
         logger.info("Meilisearch zero-downtime reindex: staging index configured")
 
         # --- Step 2: delete any stale docs in staging (from previous failed run) ---
