@@ -271,7 +271,15 @@ def get_providers_catalog(company_id: int) -> typing.Dict:
             continue
 
         company_provider = company_providers_by_provider_id.get(provider.id)
-        connected = company_provider is not None
+        # "Connected" tracks the Product feed specifically, not just row existence -- a company
+        # can have a CompanyProviders row with only Ordering configured and feed credentials
+        # empty (see connect_provider's docstring: a distributor can be "connected" via Ordering
+        # alone), or with the feed explicitly disconnected (disconnect_provider(namespace="feed")
+        # clears credentials.feed to {} without deleting the row if Ordering still exists). Either
+        # way there's no catalog/pricing/inventory data flowing, so the card should read as "not
+        # connected" even though company_provider_id is still populated below for managing the
+        # Ordering side. order_status/order_status_* already carry Ordering's own connectivity.
+        connected = bool(company_provider and (company_provider.credentials or {}).get("feed"))
 
         kind_name = provider.kind_name or ""
         display_name = src_constants.PROVIDER_DISPLAY_NAMES.get(
