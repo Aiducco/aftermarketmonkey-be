@@ -429,13 +429,17 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
 
         providers_data.append(provider_info)
 
-    # Cheapest cost first, so the best buy is the top row. Rows without a cost — not connected,
-    # or connected with no company pricing synced yet — sort to the end and keep their relative
-    # order there (sort is stable), as do ties at the same cost.
+    # Best buy first: rows without a cost (not connected, or connected with no company pricing
+    # synced yet) always sort last. Among priced rows, in-stock beats out-of-stock regardless of
+    # price -- a cheaper row nobody can fulfill isn't the better pick -- then cheapest cost wins,
+    # then higher warehouse_total_qty breaks remaining ties. Same ranking as
+    # get_parts_bulk_pricing's best_cost selection, kept consistent across both endpoints.
     providers_data.sort(
         key=lambda row: (
             (row["pricing"] or {}).get("cost") is None,
+            not bool((row["inventory"] or {}).get("warehouse_total_qty")),
             (row["pricing"] or {}).get("cost") or 0,
+            -((row["inventory"] or {}).get("warehouse_total_qty") or 0),
         )
     )
 
@@ -463,12 +467,17 @@ def get_parts_bulk_pricing(
     burn through a company's monthly quota in one page load if this bulk hydrate counted against
     it too.
 
-    Only providers this company is actively connected to are considered (same as
-    get_part_detail's "pricing is null unless integrated" rule) -- a part carried by a
-    distributor this company has no connection to contributes nothing here, not even a
-    zero-cost/None row.
+    Every provider that carries the part is included, connected or not -- same as
+    get_part_detail's "providers" list -- so the caller can render a "connect this distributor"
+    prompt for a provider with better pricing the company hasn't connected yet, instead of that
+    row silently vanishing. Unlike get_part_detail, stock (in_stock/warehouse_total_qty) is
+    shown regardless of connection -- inventory isn't company-specific data, it's the same
+    warehouse quantity for every company, and seeing "12 in stock at Meyer" is exactly what
+    should motivate connecting. Cost stays company-specific and is only ever populated for
+    providers this company is actively connected to; each row's ``connected`` flag tells the
+    caller which is which -- when False, cost is always null, never a real (if stale) value.
 
-    Returns one entry per requested id, even for ids with no connected-provider pricing at all
+    Returns one entry per requested id, even for ids with no providers at all
     (best_cost/best_provider_* null, providers: []) -- so callers can always index the response
     by every id they asked for rather than treating a missing key as "still loading".
 
@@ -505,27 +514,27 @@ def get_parts_bulk_pricing(
             company_id=company_id, provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
         ).values_list("provider_id", flat=True)
     )
-    if not connected_provider_ids:
-        return result
 
     provider_parts = list(
-        src_models.ProviderPart.objects.filter(
-            master_part_id__in=ids, provider_id__in=connected_provider_ids,
-        ).values(
+        src_models.ProviderPart.objects.filter(master_part_id__in=ids).values(
             "id", "master_part_id", "provider_id", "provider__name", "provider__kind_name",
         )
     )
     if not provider_parts:
         return result
 
+    connected_provider_part_ids = [
+        pp["id"] for pp in provider_parts if pp["provider_id"] in connected_provider_ids
+    ]
     cost_by_provider_part_id = {
         row["provider_part_id"]: row["cost"]
         for row in src_models.ProviderPartCompanyPricing.objects.filter(
             company_id=company_id,
-            provider_part_id__in=[pp["id"] for pp in provider_parts],
+            provider_part_id__in=connected_provider_part_ids,
         ).values("provider_part_id", "cost")
         if row["cost"] is not None
     }
+    # Not company-scoped like cost -- shown regardless of connection, see docstring.
     qty_by_provider_part_id = {
         row["provider_part_id"]: row["warehouse_total_qty"]
         for row in src_models.ProviderPartInventory.objects.filter(
@@ -535,7 +544,8 @@ def get_parts_bulk_pricing(
 
     for pp in provider_parts:
         mpid = pp["master_part_id"]
-        cost = cost_by_provider_part_id.get(pp["id"])
+        connected = pp["provider_id"] in connected_provider_ids
+        cost = cost_by_provider_part_id.get(pp["id"]) if connected else None
         qty = qty_by_provider_part_id.get(pp["id"]) or 0
         in_stock = qty > 0
         entry = result[mpid]
@@ -543,6 +553,7 @@ def get_parts_bulk_pricing(
             "provider_id": pp["provider_id"],
             "provider_name": pp["provider__name"],
             "provider_kind_name": pp["provider__kind_name"],
+            "connected": connected,
             "cost": float(cost) if cost is not None else None,
             "in_stock": in_stock,
             "warehouse_total_qty": qty,
