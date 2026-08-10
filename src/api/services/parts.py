@@ -471,6 +471,12 @@ def get_parts_bulk_pricing(
     Returns one entry per requested id, even for ids with no connected-provider pricing at all
     (best_cost/best_provider_* null, providers: []) -- so callers can always index the response
     by every id they asked for rather than treating a missing key as "still loading".
+
+    "Best" prioritizes availability over price: a provider with stock on hand always outranks one
+    with none, even if the out-of-stock provider is cheaper -- a lower price nobody can actually
+    fulfill isn't the better pick to surface first. Within the same stock status, cheapest cost
+    wins, and among equal cost+stock, higher warehouse_total_qty wins. If nothing is in stock,
+    falls back to cheapest cost among out-of-stock providers.
     """
     ids = list(dict.fromkeys(master_part_ids or []))  # de-dupe, keep order, tolerate None input
     if not ids:
@@ -486,10 +492,13 @@ def get_parts_bulk_pricing(
             "best_provider_id": None,
             "best_provider_name": None,
             "best_provider_kind_name": None,
+            "best_in_stock": None,
+            "best_warehouse_total_qty": None,
             "providers": [],
         }
         for mpid in ids
     }
+    best_key_by_mpid: typing.Dict[int, typing.Tuple[float, int, int]] = {}
 
     connected_provider_ids = set(
         src_models.CompanyProviders.objects.filter(
@@ -517,22 +526,38 @@ def get_parts_bulk_pricing(
         ).values("provider_part_id", "cost")
         if row["cost"] is not None
     }
+    qty_by_provider_part_id = {
+        row["provider_part_id"]: row["warehouse_total_qty"]
+        for row in src_models.ProviderPartInventory.objects.filter(
+            provider_part_id__in=[pp["id"] for pp in provider_parts],
+        ).values("provider_part_id", "warehouse_total_qty")
+    }
 
     for pp in provider_parts:
         mpid = pp["master_part_id"]
         cost = cost_by_provider_part_id.get(pp["id"])
+        qty = qty_by_provider_part_id.get(pp["id"]) or 0
+        in_stock = qty > 0
         entry = result[mpid]
         entry["providers"].append({
             "provider_id": pp["provider_id"],
             "provider_name": pp["provider__name"],
             "provider_kind_name": pp["provider__kind_name"],
             "cost": float(cost) if cost is not None else None,
+            "in_stock": in_stock,
+            "warehouse_total_qty": qty,
         })
-        if cost is not None and (entry["best_cost"] is None or float(cost) < entry["best_cost"]):
+        if cost is None:
+            continue
+        candidate_key = (0 if in_stock else 1, float(cost), -qty)
+        if mpid not in best_key_by_mpid or candidate_key < best_key_by_mpid[mpid]:
+            best_key_by_mpid[mpid] = candidate_key
             entry["best_cost"] = float(cost)
             entry["best_provider_id"] = pp["provider_id"]
             entry["best_provider_name"] = pp["provider__name"]
             entry["best_provider_kind_name"] = pp["provider__kind_name"]
+            entry["best_in_stock"] = in_stock
+            entry["best_warehouse_total_qty"] = qty
 
     return result
 
