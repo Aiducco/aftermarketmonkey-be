@@ -52,7 +52,7 @@ def _transient_meilisearch_error(exc: BaseException) -> bool:
     return any(s in msg for s in _REINDEX_TRANSIENT_SUBSTRINGS)
 
 # Searchable: what the user types to find results (brand_name is on the document for filtering only)
-SEARCHABLE_ATTRIBUTES = ["part_number", "sku", "description", "aaia_code"]
+SEARCHABLE_ATTRIBUTES = ["part_number", "sku", "description", "aaia_code", "gtin"]
 
 # Filterable: for sidebar / API filters; categories come from first ProviderPart with non-empty category
 # fitment_keys: one entry per (year, make, model) the part fits, plus a more specific
