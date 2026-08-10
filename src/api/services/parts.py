@@ -257,7 +257,18 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
             }
             for provider_id, cp in company_provider_objs.items()
         }
-    connected_provider_ids: typing.Set[int] = set(company_provider_map)
+    # "Connected" (gates pricing/inventory/product_details below, and company_integration.connected
+    # in the response) means the Product feed is actually configured, not just that a
+    # CompanyProviders row exists -- same fix as get_providers_catalog's connected flag and
+    # get_parts_bulk_pricing's connected_provider_ids (see integrations.py / parts.py). A feed can
+    # be disconnected (credentials.feed cleared to {}) while the row survives because Ordering is
+    # still configured -- company_provider_objs/company_provider_map above intentionally still
+    # include those rows (can_order_in_app below needs them), only this set is feed-specific.
+    connected_provider_ids: typing.Set[int] = {
+        provider_id
+        for provider_id, cp in company_provider_objs.items()
+        if (cp.credentials or {}).get("feed")
+    }
 
     # Provider-kind -> catalog entry, precomputed once rather than scanning PROVIDER_CATALOG
     # per row below. Used to answer "does this provider support ordering at all" independent of
@@ -359,9 +370,14 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
             # covers the API-adapter case and would incorrectly hide "Add to PO" for a
             # connection that's configured for email ordering on a kind with no API adapter.
             # Those rows keep provider_go_to_link only until an order method is configured.
+            # Ordering works independently of the feed (see connect_provider's "connected via
+            # Ordering alone" docstring) -- gated on the connection existing at all, not on
+            # `integrated` (which is feed-specific as of the fix above), else an Ordering-only
+            # company would wrongly lose "Add to PO" the moment we started requiring feed
+            # credentials for `integrated`.
             "can_order_in_app": bool(
-                integrated
-                and pp.provider_id
+                pp.provider_id
+                and pp.provider_id in company_provider_objs
                 and order_registry.get_adapter(company_provider_objs[pp.provider_id])
             ),
             # Whether this DISTRIBUTOR supports in-app ordering at all, independent of any one
@@ -373,15 +389,24 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
             # available" affordance/prompt versus hiding ordering entirely for this provider.
             "supports_ordering": bool(pp.provider_id) and _provider_supports_ordering(pp.provider.kind),
             "company_integration": {
+                # connected/initial_sync_completed/status/status_name are feed-specific (see
+                # `integrated` above). order_status/order_status_name are NOT -- Ordering has its
+                # own independent connectivity (see can_order_in_app above), so those two stay
+                # gated on the row existing at all, else an Ordering-only company's real
+                # order_status would wrongly read as null.
                 "connected": integrated,
                 "initial_sync_completed": (
                     company_provider_map[pp.provider_id]["initial_sync_completed"] if integrated else None
                 ),
                 "status": company_provider_map[pp.provider_id]["status"] if integrated else None,
                 "status_name": company_provider_map[pp.provider_id]["status_name"] if integrated else None,
-                "order_status": company_provider_map[pp.provider_id]["order_status"] if integrated else None,
+                "order_status": (
+                    company_provider_map[pp.provider_id]["order_status"]
+                    if pp.provider_id in company_provider_objs else None
+                ),
                 "order_status_name": (
-                    company_provider_map[pp.provider_id]["order_status_name"] if integrated else None
+                    company_provider_map[pp.provider_id]["order_status_name"]
+                    if pp.provider_id in company_provider_objs else None
                 ),
             },
             "is_discontinued": pp.is_discontinued,
@@ -509,10 +534,17 @@ def get_parts_bulk_pricing(
     }
     best_key_by_mpid: typing.Dict[int, typing.Tuple[float, int, int]] = {}
 
+    # "Connected" means the Product feed is actually configured, not just that a CompanyProviders
+    # row exists -- same fix as get_providers_catalog's connected flag (see integrations.py). A
+    # feed can be disconnected (credentials.feed cleared to {}) while the row survives because
+    # Ordering is still configured, leaving stale ProviderPartCompanyPricing/ProviderPartInventory
+    # rows from before the disconnect that must not be shown as this company's current pricing.
     connected_provider_ids = set(
-        src_models.CompanyProviders.objects.filter(
+        cp.provider_id
+        for cp in src_models.CompanyProviders.objects.filter(
             company_id=company_id, provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
-        ).values_list("provider_id", flat=True)
+        ).only("provider_id", "credentials")
+        if (cp.credentials or {}).get("feed")
     )
 
     provider_parts = list(
