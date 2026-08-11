@@ -11,6 +11,7 @@ from django.db.models import Prefetch
 from src import constants as src_constants
 from src import enums as src_enums
 from src import models as src_models
+from src.integrations import credentials as credentials_helper
 from src.integrations.live_inventory import exceptions as live_inventory_exceptions
 from src.integrations.live_inventory import registry as live_inventory_registry
 from src.integrations.orders import registry as order_registry
@@ -343,6 +344,10 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
             else None
         )
         distributor_logo_image_url = _get_provider_image_url(kind_name)
+        default_order_account = (
+            credentials_helper.get_default_order_account(company_provider_objs[pp.provider_id])
+            if pp.provider_id in company_provider_objs else None
+        )
         provider_info = {
             "provider_id": pp.provider_id,
             "provider_name": pp.provider.name if pp.provider else None,
@@ -380,6 +385,15 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
                 and pp.provider_id in company_provider_objs
                 and order_registry.get_adapter(company_provider_objs[pp.provider_id])
             ),
+            # Which channel this connection currently places orders through -- see
+            # src.enums.OrderMethod. Read straight off the default CompanyProviderOrderAccount
+            # (order credentials/settings live there, not on CompanyProviders) rather than
+            # inferred from can_order_in_app, since a row can be order-connected via email with
+            # no API adapter at all. Null when no order account is configured yet.
+            "order_method": default_order_account.order_method if default_order_account else None,
+            "order_method_name": (
+                default_order_account.order_method_name if default_order_account else None
+            ),
             # Whether this DISTRIBUTOR supports in-app ordering at all, independent of any one
             # company's connection — same "does the catalog offer it" question the integrations
             # catalog endpoint answers via its own supports_ordering field. A row can have
@@ -388,6 +402,22 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
             # isn't connected at all) — use this to decide whether to show an "ordering
             # available" affordance/prompt versus hiding ordering entirely for this provider.
             "supports_ordering": bool(pp.provider_id) and _provider_supports_ordering(pp.provider.kind),
+            # Whether this DISTRIBUTOR has an on-demand live-inventory API integration at all
+            # (src.integrations.live_inventory.registry), independent of any one company's
+            # connection -- same "does the capability exist" role supports_ordering plays above.
+            "supports_live_inventory_refresh": (
+                bool(pp.provider_id) and live_inventory_registry.supports_live_inventory(pp.provider.kind)
+            ),
+            # Whether THIS connection can actually call it right now -- registry.get_provider()
+            # returns None both when no implementation is registered for this kind AND when this
+            # connection's credentials are missing/invalid (see its docstring), so this alone
+            # tells the frontend whether to enable the "check live inventory" click; no separate
+            # credential check needed.
+            "can_refresh_live_inventory": bool(
+                pp.provider_id
+                and pp.provider_id in company_provider_objs
+                and live_inventory_registry.get_provider(company_provider_objs[pp.provider_id])
+            ),
             "company_integration": {
                 # connected/initial_sync_completed/status/status_name are feed-specific (see
                 # `integrated` above). order_status/order_status_name are NOT -- Ordering has its
@@ -686,7 +716,11 @@ def list_part_detail_audit_history(
             action="detail",
         )
         .exclude(master_part_id__isnull=True)
-        .order_by("-created_at")
+        # "-id" tiebreaks rows with an identical created_at (real: rapid page views/reloads of the
+        # same part land within the same microsecond) -- "-created_at" alone has no guaranteed
+        # order for ties, so offset/limit pagination could return a row twice or skip one across
+        # page boundaries depending on how Postgres happens to order the tie each time.
+        .order_by("-created_at", "-id")
     )
     if user_id is not None:
         qs = qs.filter(user_id=user_id)
