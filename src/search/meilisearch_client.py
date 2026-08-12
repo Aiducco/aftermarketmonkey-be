@@ -267,6 +267,29 @@ def _bulk_distributors_map_for_ids(
     return result
 
 
+def _bulk_image_fallback_map_for_ids(master_part_ids: typing.List[int]) -> typing.Dict[int, str]:
+    """
+    {master_part_id: first_image_url} for parts whose MasterPartData has at least one image --
+    used as a fallback when MasterPart.image_url itself is blank (e.g. a part whose originating
+    distributor feed never supplied a primary image, but ASAP Network or another enrichment
+    source later filled MasterPartData.images). One query, grouped in Python, no per-part N+1 --
+    same shape as the other bulk maps above.
+    """
+    from src.models import MasterPartData
+
+    result: typing.Dict[int, str] = {}
+    if not master_part_ids:
+        return result
+    qs = MasterPartData.objects.filter(
+        master_part_id__in=master_part_ids, images__isnull=False
+    ).values("master_part_id", "images")
+    for row in qs:
+        images = row["images"]
+        if isinstance(images, list) and images:
+            result[row["master_part_id"]] = images[0]
+    return result
+
+
 def _fitment_keys_for_row(
     year_start: int,
     year_end: int,
@@ -326,16 +349,19 @@ def _build_docs_for_batch(
     distributors_map: typing.Optional[
         typing.Dict[int, typing.Tuple[typing.List[int], typing.List[str]]]
     ] = None,
+    image_fallback_map: typing.Optional[typing.Dict[int, str]] = None,
 ) -> typing.List[typing.Dict]:
     """
     Build Meilisearch document dicts for a batch of MasterPart instances.
     ``cat_map`` comes from _bulk_category_map_for_ids(), ``fitment_map`` from
     _bulk_fitment_keys_map_for_ids(), ``distributors_map`` from
-    _bulk_distributors_map_for_ids() — all three pre-computed in the main thread so worker
+    _bulk_distributors_map_for_ids(), ``image_fallback_map`` from
+    _bulk_image_fallback_map_for_ids() — all four pre-computed in the main thread so worker
     threads only do the HTTP upload, not DB queries.
     """
     fitment_map = fitment_map or {}
     distributors_map = distributors_map or {}
+    image_fallback_map = image_fallback_map or {}
     docs = []
     for part in parts:
         brand_name = _get_brand_name(part)
@@ -349,7 +375,7 @@ def _build_docs_for_batch(
             "sku": part.sku or "",
             "description": (part.description or "")[:10000],
             "aaia_code": part.aaia_code or "",
-            "image_url": part.image_url or "",
+            "image_url": part.image_url or image_fallback_map.get(part.id) or "",
             "gtin": part.gtin or "",
             "category": category,
             "overview_category": overview_category,
@@ -505,6 +531,7 @@ def master_part_to_index_shape(part) -> typing.Dict:
     distributor_ids, distributor_names = (
         _bulk_distributors_map_for_ids([part_id]).get(part_id, ([], [])) if part_id else ([], [])
     )
+    image_fallback = _bulk_image_fallback_map_for_ids([part_id]).get(part_id) if part_id else None
     return {
         "id": part.id,
         "brand_id": part.brand_id,
@@ -513,7 +540,7 @@ def master_part_to_index_shape(part) -> typing.Dict:
         "sku": part.sku or "",
         "description": (part.description or "")[:10000],  # Meilisearch has limits
         "aaia_code": part.aaia_code or "",
-        "image_url": part.image_url or "",
+        "image_url": part.image_url or image_fallback or "",
         "gtin": part.gtin or "",
         "category": category or "",
         "overview_category": overview_category or "",
@@ -662,7 +689,8 @@ def add_documents_in_batches(
             cat_map = _bulk_category_map_for_ids([p.id for p in batch])
             fitment_map = _bulk_fitment_keys_map_for_ids([p.id for p in batch])
             distributors_map = _bulk_distributors_map_for_ids([p.id for p in batch])
-            docs = _build_docs_for_batch(batch, cat_map, fitment_map, distributors_map)
+            image_fallback_map = _bulk_image_fallback_map_for_ids([p.id for p in batch])
+            docs = _build_docs_for_batch(batch, cat_map, fitment_map, distributors_map, image_fallback_map)
             ok = _upload_raw_docs(docs, index_name=target_index_name)
             batch_dt = time.monotonic() - batch_t0
             if ok:
@@ -740,7 +768,8 @@ def add_documents_in_batches(
             cat_map = _bulk_category_map_for_ids([p.id for p in batch])
             fitment_map = _bulk_fitment_keys_map_for_ids([p.id for p in batch])
             distributors_map = _bulk_distributors_map_for_ids([p.id for p in batch])
-            docs = _build_docs_for_batch(batch, cat_map, fitment_map, distributors_map)
+            image_fallback_map = _bulk_image_fallback_map_for_ids([p.id for p in batch])
+            docs = _build_docs_for_batch(batch, cat_map, fitment_map, distributors_map, image_fallback_map)
             in_flight.append(
                 executor.submit(
                     _upload_docs_with_retries, docs, target_index_name, batch_index, id_first, id_last
@@ -941,7 +970,8 @@ def _add_documents_parallel_by_ids(
             cat_map = _bulk_category_map_for_ids([p.id for p in batch])
             fitment_map = _bulk_fitment_keys_map_for_ids([p.id for p in batch])
             distributors_map = _bulk_distributors_map_for_ids([p.id for p in batch])
-            docs = _build_docs_for_batch(batch, cat_map, fitment_map, distributors_map)
+            image_fallback_map = _bulk_image_fallback_map_for_ids([p.id for p in batch])
+            docs = _build_docs_for_batch(batch, cat_map, fitment_map, distributors_map, image_fallback_map)
         finally:
             connection.close()
         return _upload_docs_with_retries(docs, target_index_name, batch_index, id_first, id_last)
@@ -1351,6 +1381,26 @@ def reindex_all_master_parts_zero_downtime(
 
     except Exception as e:
         logger.exception("Meilisearch zero-downtime reindex: unexpected error: %s", e)
+        # A failure here (e.g. the DB connection dying mid-upload, confirmed live: the shared
+        # disk filling up broke Postgres, which broke this loop's own DB queries) can leave
+        # staging partially filled with a near-full duplicate of the live index -- tens of GB
+        # that would otherwise just sit there wasting disk until the next run's Step 2 clears it,
+        # or until someone notices and deletes it by hand (which is what caused two consecutive
+        # nightly Postgres outages: nothing freed that space until manual intervention hours
+        # later). Best-effort delete it now instead. Re-fetches its own client rather than
+        # reusing the try block's `client` local, since that name may not be bound yet if
+        # _get_client() itself is what failed.
+        try:
+            cleanup_client = _get_client()
+            del_task = cleanup_client.delete_index(staging_name)
+            cleanup_client.wait_for_task(del_task.task_uid, timeout_in_ms=120_000)
+            logger.info("Meilisearch zero-downtime reindex: staging index deleted after failure")
+        except Exception as cleanup_exc:
+            logger.warning(
+                "Meilisearch zero-downtime reindex: staging cleanup after failure also failed "
+                "(non-fatal, next run's Step 2 will still clear it): %s",
+                cleanup_exc,
+            )
         return 0, 0
 
 
