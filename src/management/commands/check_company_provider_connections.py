@@ -2,7 +2,11 @@
 Periodic connectivity check for CompanyProviders connections. Scheduled via cron (see
 command_runner.sh), every few minutes.
 
-Feed status — only rows whose initial pricing sync hasn't completed yet:
+Feed status — only rows whose initial pricing sync hasn't completed yet AND that actually have
+feed credentials configured (credentials.feed non-empty) -- a row with feed credentials cleared
+(e.g. disconnect_provider(namespace="feed"), which clears them without deleting the row when
+Ordering is still configured) has nothing to check and is left untouched, not re-validated or
+resurrected from a stale relay file:
   - Kinds with a live credential validator (Turn 14, Keystone, Wheel Pros, Premier, Rough
     Country — same registry used at connect/update time): re-run that check against the
     stored credentials.
@@ -71,6 +75,16 @@ class Command(BaseCommand):
                 kind = cp.provider.kind if cp.provider else None
 
                 if not cp.initial_sync_completed:
+                    # A row can reach here with no feed credentials at all -- disconnect_provider
+                    # (namespace="feed") clears credentials.feed to {} and initial_sync_completed
+                    # to False without deleting the row when Ordering is still configured. There's
+                    # nothing to check in that case: a validated kind would just get called with
+                    # blank credentials (some validators raise cleanly, but not a guarantee), and a
+                    # relay-feed kind's file-presence check is credential-blind entirely, so a file
+                    # dropped before the disconnect would make it look connected/ingesting again.
+                    if not credentials_helper.get_feed_credentials(cp):
+                        skipped += 1
+                        continue
                     try:
                         if kind in integrations_services._CONNECTION_VALIDATORS:
                             self._check_validated(cp, kind)

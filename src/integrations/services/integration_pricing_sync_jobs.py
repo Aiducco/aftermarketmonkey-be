@@ -32,6 +32,7 @@ from src.integrations.services import motorstate as motorstate_services
 from src.integrations.services import notifications as notifications_services
 from src.integrations.services import premier as premier_services
 from src.integrations.services import quadratec as quadratec_services
+from src.integrations import credentials as credentials_helper
 from src.integrations.services import rough_country as rough_country_services
 from src.integrations.services import the_wheel_group as the_wheel_group_services
 from src.integrations.services import tirerack as tirerack_services
@@ -438,6 +439,21 @@ def run_integration_pricing_sync_job(job: src_models.IntegrationPricingSyncJob) 
         update_fields=["status", "status_name", "message", "completed_at", "updated_at"]
     )
 
+    # `cp` was fetched once at the top of this function; a disconnect (credentials.feed cleared
+    # to {}, initial_sync_completed reset to False) can land concurrently while this job was
+    # still running its fetch/sync steps, which can legitimately succeed against data fetched
+    # before the disconnect. Re-check feed credentials fresh from the DB right before flipping
+    # status -- a successful job must not resurrect a connection the user just disconnected.
+    cp.refresh_from_db(fields=["credentials"])
+    if not credentials_helper.get_feed_credentials(cp):
+        logger.info(
+            "{} Job id={}: company_provider_id={} succeeded but feed credentials are now empty "
+            "(disconnected while this job was running) -- not flipping to CONNECTED.".format(
+                _LOG_PREFIX, job.id, cp.id
+            )
+        )
+        return
+
     # Mark the company-provider as having completed its initial sync so the frontend
     # can transition from "Ingesting data…" to showing live pricing. Also flips the
     # connection status straight to CONNECTED — check_company_provider_connections only
@@ -464,11 +480,10 @@ def run_integration_pricing_sync_job(job: src_models.IntegrationPricingSyncJob) 
         # is, promote them to CONNECTED too, on both the default CompanyProviderOrderAccount row
         # (the source of truth for its own status) and this mirror. An ERROR order status is left
         # alone; that's a real credential problem, unrelated to feed sync completing. Local
-        # imports: avoids a circular import, since src.api.services.integrations already imports
+        # import: avoids a circular import, since src.api.services.integrations already imports
         # this module (enqueue_company_provider_pricing_sync/should_enqueue_pricing_sync).
         if cp.order_status == src_enums.CompanyProviderOrderConnectionStatus.WAITING.value:
             from src.api.services import integrations as integrations_services
-            from src.integrations import credentials as credentials_helper
 
             default_account = credentials_helper.get_default_order_account(cp)
             if (
