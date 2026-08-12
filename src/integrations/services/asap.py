@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from django.conf import settings
 from django.db import transaction
+from django.db.models import Exists, OuterRef, Q, QuerySet
 from django.db.models.functions import Upper
 from django.utils import timezone
 
@@ -159,6 +160,39 @@ def _match_unmapped_asap_brands() -> int:
             )
         )
     return len(to_update)
+
+
+def brands_needing_sync() -> QuerySet:
+    """
+    AsapBrand rows actually worth spending a paid product-sync call on: matched to a canonical
+    Brand, a brand we actually carry (at least one MasterPart), and missing fitment and/or
+    MasterPartData somewhere across that brand's parts. Existence-only check per dimension --
+    any single fitment row anywhere under the brand counts as "has fitment" for that brand, not
+    a coverage-percentage threshold.
+
+    This is the default candidate set for the sync_asap_network command when --brands isn't
+    given (--all opts back into every matched brand regardless of gap, the old, less precise
+    behavior). The existing last_synced_at skip inside sync_asap_products_for_brand still
+    applies on top of this -- a brand appearing here that's already been synced is filtered
+    there, not here, unless --force.
+    """
+    from src.models import MasterPart, MasterPartData, MasterPartFitment
+
+    carried = MasterPart.objects.filter(brand_id=OuterRef("brand_id"))
+    has_fitment = MasterPartFitment.objects.filter(master_part__brand_id=OuterRef("brand_id"))
+    has_data = MasterPartData.objects.filter(master_part__brand_id=OuterRef("brand_id"))
+
+    return (
+        src_models.AsapBrand.objects.filter(brand__isnull=False)
+        .annotate(
+            _carried=Exists(carried),
+            _has_fitment=Exists(has_fitment),
+            _has_data=Exists(has_data),
+        )
+        .filter(_carried=True)
+        .filter(Q(_has_fitment=False) | Q(_has_data=False))
+        .order_by("id")
+    )
 
 
 def sync_asap_products_for_brand(asap_brand: src_models.AsapBrand, force: bool = False) -> typing.Dict[str, typing.Any]:
