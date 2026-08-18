@@ -324,7 +324,10 @@ PLANS = {
             "distributor_connections": 2,
             "seats": 1,
             "po_checkout_allowed": False,
-            "multi_warehouse_visibility": False,
+            # Not gated on Scout — per-warehouse stock breakdown is returned to every plan,
+            # unlike the other plan-tier limits above. Kept as an explicit feature flag (rather
+            # than deleting the gate in parts.py) so it stays easy to re-lock later if needed.
+            "multi_warehouse_visibility": True,
             # Stubs — not wired into any enforcement yet; future code reads these once the
             # underlying features exist.
             "sms_integration": False,
