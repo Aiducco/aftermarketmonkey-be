@@ -3774,3 +3774,68 @@ class BrandTheWheelGroupBrandMapping(django_db_models.Model):
     class Meta:
         db_table = "brand_the_wheel_group_brand_mapping"
         unique_together = ["brand", "the_wheel_group_brand"]
+
+
+class ConnectionAttempt(django_db_models.Model):
+    """
+    Audit log of every distributor connect/update attempt — successful or rejected — including
+    the raw submitted credentials, as typed. Exists because a rejected attempt leaves no other
+    trace at all: connect_provider()/update_connection() return early on validation failure,
+    before ever touching CompanyProviders, so without this row there is nothing anywhere (no DB
+    row, no application log) recording what a company tried when a connection was rejected.
+
+    SECURITY: ``credentials`` is stored in plaintext, matching CompanyProviders.credentials'
+    existing convention (also plaintext, no field-level encryption anywhere in this codebase) —
+    this table is not introducing a new risk tier, just extending the existing one to failed
+    attempts too. A "rejected" attempt is very often a typo of a real, working credential, so
+    treat rows here with the same sensitivity as CompanyProviders.credentials: never return this
+    field verbatim over the API (see credentials_helper._credential_key_sensitive's redaction
+    convention), and prefer purging old rows on a retention schedule rather than keeping them
+    indefinitely.
+    """
+    company = django_db_models.ForeignKey(
+        Company, on_delete=django_db_models.CASCADE, related_name="connection_attempts"
+    )
+    provider = django_db_models.ForeignKey(
+        Providers, on_delete=django_db_models.CASCADE, related_name="connection_attempts"
+    )
+    # Null when the row predates a user (shouldn't happen) or the user was later deleted --
+    # SET_NULL rather than CASCADE so the attempt record (and its credentials) survives that.
+    user = django_db_models.ForeignKey(
+        auth_models.User, on_delete=django_db_models.SET_NULL, null=True, blank=True,
+        related_name="connection_attempts",
+    )
+    # Set only for an "update" action against an existing connection (PATCH by id) -- null for a
+    # fresh "connect" attempt, and also null (but action stays "connect") if a connect attempt
+    # was rejected before any CompanyProviders row could be created.
+    company_provider = django_db_models.ForeignKey(
+        CompanyProviders, on_delete=django_db_models.SET_NULL, null=True, blank=True,
+        related_name="connection_attempts",
+    )
+
+    # "connect" (ProviderConnectView -> connect_provider) or "update" (ProviderConnectionView
+    # PATCH -> update_connection) -- the two entry points that accept submitted credentials.
+    action = django_db_models.CharField(max_length=16)
+    # Raw, as submitted -- same {"feed": {...}, "order": {...}} shape as CompanyProviders.credentials,
+    # not just whichever namespace(s) this particular request touched.
+    credentials = django_db_models.JSONField()
+
+    success = django_db_models.BooleanField()
+    # One of the CONNECTION_ERROR_* codes from integrations.py (e.g. "invalid_credentials",
+    # "connection_failed") -- null on success.
+    error_code = django_db_models.CharField(max_length=64, null=True, blank=True)
+    error_message = django_db_models.TextField(null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "connection_attempts"
+        indexes = [
+            django_db_models.Index(fields=["company", "provider", "-created_at"], name="conn_attempt_co_pr_crt_idx"),
+            django_db_models.Index(fields=["success", "-created_at"], name="conn_attempt_success_crt_idx"),
+        ]
+
+    def __str__(self):
+        return "{} {} attempt by company {} ({})".format(
+            self.provider_id, self.action, self.company_id, "ok" if self.success else "failed"
+        )

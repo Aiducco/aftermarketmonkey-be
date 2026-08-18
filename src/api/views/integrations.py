@@ -93,6 +93,17 @@ class ProviderConnectView(views.View):
             provider_id=provider_id,
             credentials=credentials,
         )
+        integrations_services.log_connection_attempt(
+            company_id=company_id,
+            provider_id=provider_id,
+            user_id=request.user.id,
+            credentials=credentials,
+            action="connect",
+            success=err is None,
+            error_code=error_code,
+            error_message=err,
+            company_provider_id=(data or {}).get("id") if err is None else None,
+        )
         if err:
             is_plan_limit = error_code == integrations_services.CONNECTION_ERROR_PLAN_LIMIT_REACHED
             return http.HttpResponse(
@@ -214,6 +225,16 @@ class ProviderConnectionView(views.View):
             company_id=company_id,
             company_provider_id=cpi,
             credentials=patch,
+        )
+        integrations_services.log_connection_attempt(
+            company_id=company_id,
+            user_id=request.user.id,
+            credentials=patch,
+            action="update",
+            success=err is None,
+            company_provider_id=cpi,
+            error_code=error_code,
+            error_message=err,
         )
         if err:
             status = 404 if error_code == integrations_services.CONNECTION_ERROR_NOT_FOUND else 400

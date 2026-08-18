@@ -1066,6 +1066,58 @@ def _validate_and_resolve_order_status(
     return order_validated, order_status_enum, order_status_reason, None, None
 
 
+def log_connection_attempt(
+    *,
+    company_id: int,
+    user_id: typing.Optional[int],
+    credentials: typing.Any,
+    action: str,
+    success: bool,
+    provider_id: typing.Optional[int] = None,
+    company_provider_id: typing.Optional[int] = None,
+    error_code: typing.Optional[str] = None,
+    error_message: typing.Optional[str] = None,
+) -> None:
+    """
+    Records this connect/update attempt, including the raw submitted credentials, so a rejected
+    attempt leaves a trace — see ConnectionAttempt's own docstring for why this exists and the
+    security posture around storing credentials in it. Best-effort: writing this audit row must
+    never break the actual connect/update flow, so failures here are logged, not raised.
+
+    ``provider_id`` is required by the model but optional here — an update_connection() caller
+    (PATCH by company_provider_id) only knows company_provider_id, so when provider_id is omitted
+    it's resolved from that row instead, letting both call sites stay simple.
+    """
+    try:
+        if provider_id is None and company_provider_id is not None:
+            provider_id = src_models.CompanyProviders.objects.filter(
+                id=company_provider_id
+            ).values_list("provider_id", flat=True).first()
+        if provider_id is None:
+            logger.warning(
+                "{} Skipping ConnectionAttempt log -- no resolvable provider_id "
+                "(company_id={}, company_provider_id={})".format(_LOG_PREFIX, company_id, company_provider_id)
+            )
+            return
+        src_models.ConnectionAttempt.objects.create(
+            company_id=company_id,
+            provider_id=provider_id,
+            user_id=user_id,
+            company_provider_id=company_provider_id,
+            action=action,
+            credentials=credentials if isinstance(credentials, dict) else {},
+            success=success,
+            error_code=error_code,
+            error_message=error_message,
+        )
+    except Exception:
+        logger.exception(
+            "{} Failed to record ConnectionAttempt for company_id={} provider_id={}".format(
+                _LOG_PREFIX, company_id, provider_id
+            )
+        )
+
+
 def connect_provider(
     company_id: int,
     provider_id: int,
