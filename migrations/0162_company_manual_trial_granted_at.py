@@ -8,7 +8,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("src", "0161_leer_lead"),
+        ("src", "0160_connection_attempt"),
     ]
 
     operations = [

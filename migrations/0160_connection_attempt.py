@@ -11,7 +11,7 @@ import django.db.models.deletion
 class Migration(migrations.Migration):
     dependencies = [
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
-        ("src", "0159_realtruck_lead_qualification"),
+        ("src", "0156_helmet_house_raw_tables"),
     ]
 
     operations = [
