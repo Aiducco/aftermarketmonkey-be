@@ -22,6 +22,7 @@ from django.utils import timezone as django_timezone
 
 from src import enums as src_enums
 from src import models as src_models
+from src.api.services import billing as billing_services
 from src.integrations import credentials as credentials_helper
 from src.integrations.orders import base as order_base
 from src.integrations.orders import raw_response_parsers
@@ -662,6 +663,10 @@ def add_cart_item(
     nor its order-submit call can handle a kit VCPN cleanly, confirmed live, so the kit's own
     VCPN must never reach that far in the first place.
     """
+    allowed, plan_reason = billing_services.check_po_checkout_allowed(company_id)
+    if not allowed:
+        raise PurchaseOrderServiceError(plan_reason)
+
     if not provider_id:
         raise PurchaseOrderServiceError("provider_id is required.")
     if not master_part_id:
@@ -1386,6 +1391,10 @@ def submit_purchase_order(
     instead of aborting the whole request. Returns the serialized PurchaseOrder either way;
     check status/error_message to see whether it actually went through.
     """
+    allowed, plan_reason = billing_services.check_po_checkout_allowed(company_id)
+    if not allowed:
+        raise PurchaseOrderServiceError(plan_reason)
+
     po = src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id).first()
     if not po:
         raise PurchaseOrderServiceError("Purchase order not found.")

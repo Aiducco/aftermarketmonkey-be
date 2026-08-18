@@ -12,6 +12,7 @@ from django.utils import timezone
 from src import constants as src_constants
 from src import enums as src_enums
 from src import models as src_models
+from src.api.services import billing as billing_services
 from src.integrations import credentials as credentials_helper
 from src.integrations.clients.atech import client as atech_client
 from src.integrations.clients.atech import exceptions as atech_exceptions
@@ -62,6 +63,7 @@ CONNECTION_ERROR_INVALID_CREDENTIALS = "invalid_credentials"
 CONNECTION_ERROR_PERMISSION_DENIED = "permission_denied"
 CONNECTION_ERROR_CONNECTION_FAILED = "connection_failed"
 CONNECTION_ERROR_NOT_FOUND = "not_found"
+CONNECTION_ERROR_PLAN_LIMIT_REACHED = "plan_limit_reached"
 
 
 def _render_relay_instructions_html(
@@ -1108,6 +1110,21 @@ def connect_provider(
     existing_creds = dict(existing.credentials or {}) if existing else None
     if existing:
         existing_creds["order"] = credentials_helper.get_order_credentials(existing)
+
+    # Distributor-connection cap: only relevant when this call would newly connect this
+    # provider's PRODUCT FEED for the first time — relay-provisioned providers always populate
+    # "feed" on first connect; non-relay providers only if this request's payload includes
+    # "feed". An already-feed-connected provider being re-submitted (credential rotation, a
+    # later order-only call) never counts as "new" and is never blocked here.
+    already_has_feed = bool(existing and (existing.credentials or {}).get("feed"))
+    will_add_new_feed = not already_has_feed and (
+        bool(catalog_entry.get("relay_provisioned"))
+        or bool(isinstance(credentials, dict) and credentials.get("feed"))
+    )
+    if will_add_new_feed:
+        allowed, plan_reason = billing_services.check_distributor_connection_limit(company_id)
+        if not allowed:
+            return None, plan_reason, CONNECTION_ERROR_PLAN_LIMIT_REACHED
 
     if catalog_entry.get("relay_provisioned"):
         company = src_models.Company.objects.filter(id=company_id).first()

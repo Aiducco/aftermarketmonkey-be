@@ -298,43 +298,124 @@ ROUGH_COUNTRY_FEED_URL = "https://feeds.roughcountry.com/jobber_pc2A.xlsx"
 STRIPE_SECRET_KEY = ""  # Set via env; required for billing
 BILLING_PORTAL_RETURN_URL = ""  # Optional default return_url when not provided in request
 
-# Plan IDs -> Stripe Product IDs (prod_xxx)
-STRIPE_PLANS = {
-    "starter": "prod_UAb7IngirFX1mo",   # $49/mo
-    "pro": "prod_UAb7rv9k8zoPwE",       # $99/mo
-    "growth": "prod_UAb7VPi46dLlIo",    # $199/mo
-}
-# Plan amounts in smallest currency unit (cents); currency per plan
-STRIPE_PLAN_AMOUNTS = {
-    "starter": 4900,
-    "pro": 9900,
-    "growth": 19900,
-}
-STRIPE_PLAN_CURRENCIES = {
-    "starter": "usd",
-    "pro": "usd",
-    "growth": "usd",
-}
-
 # Stripe webhook signing secret — set via env (STRIPE_WEBHOOK_SECRET)
 STRIPE_WEBHOOK_SECRET = ""
 
-# Per-plan feature limits. -1 means unlimited. Searches are always unlimited.
-# None key = free/unsubscribed tier.
-PLAN_LIMITS = {
-    None: {
-        "detail_views_per_month": 50,
+# Plan catalog — single source of truth for pricing display, Stripe price references, and
+# feature/limit gating. Keys are the plan_id values stored in Company.subscription_plan
+# (None/unset, or a subscription_status that isn't active/trialing, is treated as "scout" — see
+# billing._plan_key()). -1 in any numeric feature means unlimited.
+#
+# Stripe subscribes to a PRICE, not a bare product, and each paid plan now has two prices
+# (monthly + annual) — stripe_price_id_monthly/annual below are placeholders until
+# `python manage.py provision_stripe_billing_catalog` is run and its output is pasted in.
+PLANS = {
+    "scout": {
+        "name": "Scout",
+        "description": "Run real jobs through it before you commit.",
+        "stripe_product_id": None,       # free plan — no Stripe object, no checkout
+        "stripe_price_id_monthly": None,
+        "stripe_price_id_annual": None,
+        "amount_monthly": 0,
+        "amount_annual": 0,
+        "currency": "usd",
+        "features": {
+            "detail_views_per_month": 50,
+            "distributor_connections": 2,
+            "seats": 1,
+            "po_checkout_allowed": False,
+            "multi_warehouse_visibility": False,
+            # Stubs — not wired into any enforcement yet; future code reads these once the
+            # underlying features exist.
+            "sms_integration": False,
+            "saved_parts_lists": False,
+            "spend_reporting": False,
+        },
     },
-    "starter": {
-        "detail_views_per_month": 500,
+    "tracker": {
+        "name": "Tracker",
+        "description": "Unlimited search across every distributor you buy from.",
+        "stripe_product_id": "prod_V5tmPy9cjgjE2A",
+        "stripe_price_id_monthly": "price_1U5hzP70L1K5o6zmnvvTaD3o",
+        "stripe_price_id_annual": "price_1U5hzP70L1K5o6zmrbMYaC24",
+        "amount_monthly": 4900,   # $49.00
+        "amount_annual": 48000,   # $480.00 ($40/mo effective)
+        "currency": "usd",
+        "features": {
+            "detail_views_per_month": -1,
+            "distributor_connections": -1,
+            "seats": 3,
+            "po_checkout_allowed": False,
+            "multi_warehouse_visibility": True,
+            "sms_integration": False,
+            "saved_parts_lists": False,
+            "spend_reporting": False,
+        },
     },
-    "pro": {
-        "detail_views_per_month": 2500,
+    "hunter": {
+        "name": "Hunter",
+        "description": "Search, quote, and order without leaving AftermarketScout.",
+        "stripe_product_id": "prod_V5tnkLcrXX8s96",
+        "stripe_price_id_monthly": "price_1U5hzQ70L1K5o6zmMinCigsO",
+        "stripe_price_id_annual": "price_1U5hzR70L1K5o6zmXlU6sCxR",
+        "amount_monthly": 9900,   # $99.00
+        "amount_annual": 96000,   # $960.00 ($80/mo effective)
+        "currency": "usd",
+        "features": {
+            "detail_views_per_month": -1,
+            "distributor_connections": -1,
+            "seats": 6,
+            "po_checkout_allowed": True,
+            "multi_warehouse_visibility": True,
+            "sms_integration": False,
+            "saved_parts_lists": False,
+            "spend_reporting": False,
+        },
     },
-    "growth": {
-        "detail_views_per_month": -1,  # unlimited
+    "pack": {
+        "name": "Pack",
+        "description": (
+            "For groups and multi-location shops. Priced per location — functionally identical "
+            "to Hunter today (no real multi-location data model exists yet; see "
+            "PACK_LOCATION_MAX_QUANTITY / create_checkout_session's adjustable_quantity). All "
+            "units purchased share ONE company account with Hunter-equivalent limits."
+        ),
+        "stripe_product_id": "prod_V5tnEO5lXp7jcK",
+        "stripe_price_id_monthly": "price_1U5hzS70L1K5o6zmlwXNiOgu",
+        "stripe_price_id_annual": "price_1U5hzT70L1K5o6zmvfUkwr8J",
+        "amount_monthly": 7900,   # $79.00 per unit/location
+        "amount_annual": 78000,   # $780.00 per unit/location ($65/mo effective)
+        "currency": "usd",
+        "features": {
+            "detail_views_per_month": -1,
+            "distributor_connections": -1,
+            "seats": -1,
+            "po_checkout_allowed": True,
+            "multi_warehouse_visibility": True,
+            "sms_integration": False,
+            "saved_parts_lists": False,
+            "spend_reporting": False,
+        },
     },
 }
+
+# Extra-seat add-on (Tracker/Hunter, $9/mo or $90/yr per the pricing spec). NOT itself a plan_id —
+# never appears in Company.subscription_plan or PLANS. Provisioned by the same management command
+# as PLANS; not currently wired into any checkout flow (no "buy extra seat" endpoint exists yet) —
+# this entry exists so a future add-seat checkout/portal flow has real Price IDs to reference.
+EXTRA_SEAT_ADDON = {
+    "stripe_product_id": "prod_V5tnSrAWWtMYAf",
+    "stripe_price_id_monthly": "price_1U5hzU70L1K5o6zmze3QzwI5",
+    "stripe_price_id_annual": "price_1U5hzU70L1K5o6zmP6lVBzzv",
+    "amount_monthly": 900,   # $9.00
+    "amount_annual": 9000,   # $90.00
+    "currency": "usd",
+}
+
+# Pack is sold "per location" via Stripe Checkout's adjustable_quantity on its line item — see
+# billing.create_checkout_session. This caps how many units/locations a single checkout can
+# select; all units share ONE company account (no real per-location rollup/split exists yet).
+PACK_LOCATION_MAX_QUANTITY = 20
 
 # WheelPros SFTP: host/port for all connections (override via env). Per-company user/password in
 # CompanyProviders.credentials; optional WHEELPROS_SFTP_USER/PASSWORD for local/dev sync only.

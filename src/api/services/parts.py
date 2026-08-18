@@ -11,6 +11,7 @@ from django.db.models import Prefetch
 from src import constants as src_constants
 from src import enums as src_enums
 from src import models as src_models
+from src.api.services import billing as billing_services
 from src.integrations import credentials as credentials_helper
 from src.integrations.live_inventory import exceptions as live_inventory_exceptions
 from src.integrations.live_inventory import registry as live_inventory_registry
@@ -329,6 +330,10 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
             if pn:
                 t14_eid_to_part_number[row["external_id"]] = pn
 
+    # Scout-tier companies see only the aggregate warehouse_total_qty below, not the
+    # per-warehouse breakdown — "Multi-warehouse stock visibility" is a paid-plan feature.
+    can_see_multi_warehouse = billing_services.has_multi_warehouse_visibility(company_id)
+
     providers_data = []
     for pp in provider_parts:
         try:
@@ -459,7 +464,9 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
                     "warehouse_total_qty": inv_obj.warehouse_total_qty,
                     "manufacturer_inventory": inv_obj.manufacturer_inventory,
                     "manufacturer_esd": inv_obj.manufacturer_esd.isoformat() if inv_obj.manufacturer_esd else None,
-                    "warehouse_availability": wh_avail,
+                    # Scout sees only the aggregate total above; the per-warehouse breakdown is
+                    # a paid-plan feature (see billing.has_multi_warehouse_visibility).
+                    "warehouse_availability": wh_avail if can_see_multi_warehouse else None,
                     "last_synced_at": inv_obj.last_synced_at.isoformat() if inv_obj.last_synced_at else None,
                 }
 

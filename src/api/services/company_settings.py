@@ -7,6 +7,7 @@ from django.contrib.auth import models as auth_models
 from django.db import transaction
 
 from src import models as src_models
+from src.api.services import billing as billing_services
 
 logger = logging.getLogger(__name__)
 
@@ -205,6 +206,15 @@ def add_company_user(
         if profile and profile.company_id == company_id:
             return "User is already in this company"
 
+    # Every path past this point (re-adding an existing user to this company, or creating a
+    # brand-new user below) consumes one of this company's seats — gate once, here, before
+    # either branch. Must come AFTER the "already in this company" early-return above (that's
+    # not a new seat) but BEFORE both the existing-user and new-user creation paths.
+    allowed, seat_reason = billing_services.check_seat_limit(company_id)
+    if not allowed:
+        return seat_reason
+
+    if existing_user:
         if profile:
             profile.company = company
             profile.is_company_admin = is_company_admin

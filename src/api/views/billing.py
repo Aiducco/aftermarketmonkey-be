@@ -144,7 +144,8 @@ class CreateCheckoutSessionView(views.View):
     POST /api/billing/create-checkout-session/
     Creates a Stripe Checkout session for new plan subscriptions.
     Use the Billing Portal (create-portal-session) for upgrade/downgrade of existing subscriptions.
-    Request body: { "plan_id": "starter"|"pro"|"growth", "success_url": "...", "cancel_url": "..." }
+    Request body: { "plan_id": "tracker"|"hunter"|"pack", "billing_period": "monthly"|"annual",
+                     "quantity": 1 (optional, pack only, 1-20), "success_url": "...", "cancel_url": "..." }
     Response: { "url": "https://checkout.stripe.com/c/pay/cs_xxx" }
     """
 
@@ -177,10 +178,12 @@ class CreateCheckoutSessionView(views.View):
         url = billing_services.create_checkout_session(
             company_id=company_id,
             plan_id=validated["plan_id"],
+            billing_period=validated["billing_period"],
             success_url=validated["success_url"],
             cancel_url=validated["cancel_url"],
             customer_email=customer_email,
             customer_name=f"{request.user.first_name or ''} {request.user.last_name or ''}".strip() or customer_email,
+            quantity=validated.get("quantity", 1),
         )
         if not url:
             return _json_response(

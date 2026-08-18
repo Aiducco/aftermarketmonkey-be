@@ -94,10 +94,15 @@ class ProviderConnectView(views.View):
             credentials=credentials,
         )
         if err:
+            is_plan_limit = error_code == integrations_services.CONNECTION_ERROR_PLAN_LIMIT_REACHED
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
-                content=simplejson.dumps({"message": err, "error_code": error_code}),
-                status=400,
+                content=simplejson.dumps({
+                    "message": err,
+                    "error_code": error_code,
+                    **({"upgrade_required": True} if is_plan_limit else {}),
+                }),
+                status=402 if is_plan_limit else 400,
             )
 
         return http.HttpResponse(

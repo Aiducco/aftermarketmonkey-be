@@ -14,12 +14,6 @@ from src import models as src_models
 
 logger = logging.getLogger(__name__)
 
-PLAN_DISPLAY_NAMES = {
-    "starter": "Starter",
-    "pro": "Pro",
-    "growth": "Growth",
-}
-
 ACTIVE_STATUSES = {"active", "trialing"}
 DISPLAYABLE_STATUSES = {"active", "trialing", "past_due"}
 
@@ -35,17 +29,33 @@ def _api_key() -> Optional[str]:
     return key
 
 
-def _plan_limits(plan_id: Optional[str]) -> dict:
-    limits = getattr(settings, "PLAN_LIMITS", {})
-    return limits.get(plan_id, limits.get(None, {}))
+def _plan_key(company: src_models.Company) -> str:
+    """Which PLANS key applies: the company's Stripe plan_id if actively subscribed, else
+    "scout" (the free tier — replaces the old None-key convention on PLAN_LIMITS)."""
+    plan_id = company.subscription_plan if company.subscription_status in ACTIVE_STATUSES else None
+    return plan_id or "scout"
+
+
+def _plan_entry(plan_key: str) -> dict:
+    plans = getattr(settings, "PLANS", {})
+    return plans.get(plan_key, plans.get("scout", {}))
+
+
+def _plan_features(plan_key: str) -> dict:
+    return _plan_entry(plan_key).get("features", {})
+
+
+def _plan_name(plan_key: str) -> str:
+    return _plan_entry(plan_key).get("name", plan_key.title())
 
 
 def _product_to_plan_map() -> dict:
-    plans = getattr(settings, "STRIPE_PLANS", {})
-    mapping = {v: k for k, v in plans.items()}
-    # Legacy test product
-    mapping["prod_UAc2GCQQHcZwSz"] = "starter"
-    return mapping
+    plans = getattr(settings, "PLANS", {})
+    return {
+        entry["stripe_product_id"]: plan_id
+        for plan_id, entry in plans.items()
+        if entry.get("stripe_product_id")
+    }
 
 
 def _sync_company_subscription(company: src_models.Company, sub: dict) -> None:
@@ -155,24 +165,33 @@ def create_portal_session(
 def create_checkout_session(
     company_id: int,
     plan_id: str,
+    billing_period: str,
     success_url: str,
     cancel_url: str,
     customer_email: str,
     customer_name: str = "",
+    quantity: int = 1,
 ) -> Optional[str]:
+    """
+    ``billing_period`` is "monthly" or "annual" — each paid plan has two pre-created Stripe
+    Prices (see settings.PLANS), so checkout always references a real Price id rather than
+    building price_data inline. ``quantity`` is only meaningful for plan_id="pack" (sold
+    per-location via an adjustable-quantity line item); every other plan is always quantity 1.
+    """
     api_key = _api_key()
     if not api_key:
         return None
 
-    plans = getattr(settings, "STRIPE_PLANS", {})
-    amounts = getattr(settings, "STRIPE_PLAN_AMOUNTS", {})
-    currencies = getattr(settings, "STRIPE_PLAN_CURRENCIES", {})
-    product_id = plans.get(plan_id)
-    unit_amount = amounts.get(plan_id)
-    currency = currencies.get(plan_id, "usd")
-
-    if not product_id or unit_amount is None:
+    plans = getattr(settings, "PLANS", {})
+    entry = plans.get(plan_id)
+    if not entry:
         logger.error("Invalid plan_id: %s", plan_id)
+        return None
+
+    price_field = "stripe_price_id_monthly" if billing_period == "monthly" else "stripe_price_id_annual"
+    price_id = entry.get(price_field)
+    if not price_id:
+        logger.error("No Stripe price configured for plan_id=%s billing_period=%s", plan_id, billing_period)
         return None
 
     customer_id = get_or_create_stripe_customer(
@@ -181,25 +200,24 @@ def create_checkout_session(
     if not customer_id:
         return None
 
+    # Only Pack is sold per-unit/location; every other plan is a fixed quantity-1 subscription.
+    effective_quantity = quantity if plan_id == "pack" else 1
+    line_item: dict = {"price": price_id, "quantity": effective_quantity}
+    if plan_id == "pack":
+        max_qty = getattr(settings, "PACK_LOCATION_MAX_QUANTITY", 20)
+        line_item["adjustable_quantity"] = {"enabled": True, "minimum": 1, "maximum": max_qty}
+
     try:
         session = stripe.checkout.Session.create(
             api_key=api_key,
             customer=customer_id,
             mode="subscription",
-            line_items=[
-                {
-                    "price_data": {
-                        "currency": currency,
-                        "product": product_id,
-                        "unit_amount": unit_amount,
-                        "recurring": {"interval": "month"},
-                    },
-                    "quantity": 1,
-                }
-            ],
+            line_items=[line_item],
             success_url=success_url,
             cancel_url=cancel_url,
-            metadata={"company_id": str(company_id), "plan_id": plan_id},
+            metadata={
+                "company_id": str(company_id), "plan_id": plan_id, "billing_period": billing_period,
+            },
         )
         return session.url
     except stripe.StripeError as e:
@@ -210,6 +228,48 @@ def create_checkout_session(
 # ---------------------------------------------------------------------------
 # Subscription state (local-first, Stripe as fallback)
 # ---------------------------------------------------------------------------
+
+def _live_price_display(company: src_models.Company, plan_key: str) -> tuple[str, Optional[str]]:
+    """
+    One extra live Stripe call to read the real current price/interval off the company's active
+    subscription. Needed because each paid plan now has TWO Prices (monthly/annual) and Company
+    doesn't locally cache which one a subscription is on — a static settings lookup alone can't
+    tell "$40/mo" (annual, effective) from "$49/mo" (monthly). Not a hot path — this only runs on
+    a billing-settings page load, unlike check_detail_view_limit. Falls back to the plan's listed
+    monthly amount if the live call fails for any reason.
+    Returns (price_display, billing_period) where billing_period is "monthly"/"annual"/None.
+    """
+    entry = _plan_entry(plan_key)
+    currency = entry.get("currency", "usd")
+    symbol = "€" if currency == "eur" else "$"
+    fallback_amount = entry.get("amount_monthly")
+    fallback = f"{symbol}{fallback_amount / 100:.2f}/mo" if fallback_amount else "—"
+
+    api_key = _api_key()
+    if not api_key or not company.subscription_id:
+        return fallback, None
+
+    try:
+        sub = stripe.Subscription.retrieve(
+            company.subscription_id, expand=["items.data.price"], api_key=api_key,
+        )
+        items = sub.get("items", {}).get("data", [])
+        if not items:
+            return fallback, None
+        price_obj = items[0].get("price", {})
+        unit_amount = price_obj.get("unit_amount")
+        interval = (price_obj.get("recurring") or {}).get("interval")
+        billing_period = {"month": "monthly", "year": "annual"}.get(interval)
+        if unit_amount is None:
+            return fallback, billing_period
+        price_currency = price_obj.get("currency", currency)
+        price_symbol = "€" if price_currency == "eur" else "$"
+        suffix = {"month": "/mo", "year": "/yr"}.get(interval, "")
+        return f"{price_symbol}{unit_amount / 100:.2f}{suffix}", billing_period
+    except stripe.StripeError as e:
+        logger.exception("Failed to fetch live price for company %s: %s", company.id, e)
+        return fallback, None
+
 
 def get_subscription(company_id: int) -> Optional[dict]:
     """
@@ -222,21 +282,19 @@ def get_subscription(company_id: int) -> Optional[dict]:
 
     # Use locally cached state if available
     if company.subscription_status and company.subscription_status in DISPLAYABLE_STATUSES:
-        plan_id = company.subscription_plan
-        amounts = getattr(settings, "STRIPE_PLAN_AMOUNTS", {})
-        currencies = getattr(settings, "STRIPE_PLAN_CURRENCIES", {})
-        unit_amount = amounts.get(plan_id)
-        currency = currencies.get(plan_id, "usd")
-        symbol = "€" if currency == "eur" else "$"
-        price_display = f"{symbol}{unit_amount / 100:.2f}/mo" if unit_amount else "—"
+        plan_key = _plan_key(company)
+        price_display, billing_period = (
+            _live_price_display(company, plan_key) if plan_key != "scout" else ("Free", None)
+        )
         renewal_date = (
             company.subscription_period_end.strftime("%Y-%m-%d")
             if company.subscription_period_end else None
         )
         return {
-            "plan_id": plan_id,
-            "plan": PLAN_DISPLAY_NAMES.get(plan_id, (plan_id or "").title()),
+            "plan_id": company.subscription_plan,
+            "plan": _plan_name(plan_key),
             "price": price_display,
+            "billing_period": billing_period,
             "renewal_date": renewal_date,
             "status": company.subscription_status,
         }
@@ -286,17 +344,32 @@ def _period_start(company: src_models.Company):
     return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
 
+def _connected_distributor_count(company_id: int) -> int:
+    """Count CompanyProviders rows whose credentials carry a truthy "feed" namespace — the same
+    "connected" convention used at integrations.py:282,1553 and parts.py:275,581. Order-only rows
+    (feed empty) don't count."""
+    creds_list = src_models.CompanyProviders.objects.filter(
+        company_id=company_id
+    ).values_list("credentials", flat=True)
+    return sum(1 for c in creds_list if (c or {}).get("feed"))
+
+
+def _seat_count(company_id: int) -> int:
+    return src_models.UserProfile.objects.filter(company_id=company_id).count()
+
+
 def get_usage(company_id: int) -> dict:
     """
-    Return current billing-period product-view usage and plan limit.
-    Searches are always unlimited — only detail views are metered.
+    Return current billing-period usage vs plan limits: product-view (usage-counted, resets
+    monthly), distributor connections and seats (point-in-time counts, not usage-counted — plan
+    tier just caps how many can exist, no reset window). Searches are always unlimited.
     """
     company = src_models.Company.objects.filter(id=company_id).first()
     if not company:
         return {}
 
-    plan_id = company.subscription_plan if company.subscription_status in ACTIVE_STATUSES else None
-    limits = _plan_limits(plan_id)
+    plan_key = _plan_key(company)
+    features = _plan_features(plan_key)
     period_start = _period_start(company)
     period_end = company.subscription_period_end
 
@@ -307,13 +380,21 @@ def get_usage(company_id: int) -> dict:
     ).count()
 
     return {
-        "plan_id": plan_id,
-        "plan": PLAN_DISPLAY_NAMES.get(plan_id, "Free") if plan_id else "Free",
+        "plan_id": company.subscription_plan,
+        "plan": _plan_name(plan_key),
         "period_start": period_start.strftime("%Y-%m-%d"),
         "period_end": period_end.strftime("%Y-%m-%d") if period_end else None,
         "detail_views": {
             "used": detail_views_used,
-            "limit": limits.get("detail_views_per_month", 0),
+            "limit": features.get("detail_views_per_month", 0),
+        },
+        "distributor_connections": {
+            "used": _connected_distributor_count(company_id),
+            "limit": features.get("distributor_connections", 0),
+        },
+        "seats": {
+            "used": _seat_count(company_id),
+            "limit": features.get("seats", 0),
         },
     }
 
@@ -330,9 +411,8 @@ def check_detail_view_limit(company_id: int) -> tuple[bool, str]:
     if not company:
         return False, "Company not found"
 
-    plan_id = company.subscription_plan if company.subscription_status in ACTIVE_STATUSES else None
-    limits = _plan_limits(plan_id)
-    limit = limits.get("detail_views_per_month", 0)
+    plan_key = _plan_key(company)
+    limit = _plan_features(plan_key).get("detail_views_per_month", 0)
 
     if limit == -1:
         return True, ""
@@ -345,10 +425,98 @@ def check_detail_view_limit(company_id: int) -> tuple[bool, str]:
     ).count()
 
     if used >= limit:
-        plan_name = PLAN_DISPLAY_NAMES.get(plan_id, "Free") if plan_id else "Free"
-        return False, f"Monthly product view limit reached for {plan_name} plan ({used}/{limit})"
+        return False, f"Monthly product view limit reached for {_plan_name(plan_key)} plan ({used}/{limit})"
 
     return True, ""
+
+
+def check_distributor_connection_limit(company_id: int) -> tuple[bool, str]:
+    """
+    Check if company can connect one more distributor's product feed.
+    Returns (allowed: bool, reason: str). -1 limit means unlimited.
+    """
+    company = src_models.Company.objects.filter(id=company_id).only(
+        "subscription_plan", "subscription_status",
+    ).first()
+    if not company:
+        return False, "Company not found"
+
+    plan_key = _plan_key(company)
+    limit = _plan_features(plan_key).get("distributor_connections", 0)
+    if limit == -1:
+        return True, ""
+
+    used = _connected_distributor_count(company_id)
+    if used >= limit:
+        return False, (
+            f"Distributor connection limit reached for {_plan_name(plan_key)} plan "
+            f"({used}/{limit}). Upgrade to connect more distributors."
+        )
+    return True, ""
+
+
+def check_seat_limit(company_id: int) -> tuple[bool, str]:
+    """
+    Check if company can add one more user account.
+    Returns (allowed: bool, reason: str). -1 limit means unlimited.
+    """
+    company = src_models.Company.objects.filter(id=company_id).only(
+        "subscription_plan", "subscription_status",
+    ).first()
+    if not company:
+        return False, "Company not found"
+
+    plan_key = _plan_key(company)
+    limit = _plan_features(plan_key).get("seats", 1)
+    if limit == -1:
+        return True, ""
+
+    used = _seat_count(company_id)
+    if used >= limit:
+        return False, (
+            f"Seat limit reached for {_plan_name(plan_key)} plan ({used}/{limit}). "
+            f"Upgrade your plan to add more team members."
+        )
+    return True, ""
+
+
+def check_po_checkout_allowed(company_id: int) -> tuple[bool, str]:
+    """
+    Whether this company's plan allows placing purchase orders in-app at all (Hunter/Pack only).
+    Unlike the other checks here, this isn't a usage counter — it's a binary feature gate.
+    Returns (allowed: bool, reason: str).
+    """
+    company = src_models.Company.objects.filter(id=company_id).only(
+        "subscription_plan", "subscription_status",
+    ).first()
+    if not company:
+        return False, "Company not found"
+
+    plan_key = _plan_key(company)
+    if _plan_features(plan_key).get("po_checkout_allowed", False):
+        return True, ""
+    return False, (
+        f"Purchase order checkout isn't available on the {_plan_name(plan_key)} plan. "
+        f"Upgrade to Hunter or Pack to place orders in-app."
+    )
+
+
+def has_multi_warehouse_visibility(company_id: Optional[int]) -> bool:
+    """
+    Whether this company's plan shows the full per-warehouse stock breakdown
+    (warehouse_availability) vs only the aggregate warehouse_total_qty. Scout=False, all paid
+    plans=True. Used by parts.get_part_detail's inventory block — a display toggle, never
+    raises/blocks, so no (bool, str) tuple like the check_* functions above.
+    """
+    if company_id is None:
+        return False
+    company = src_models.Company.objects.filter(id=company_id).only(
+        "subscription_plan", "subscription_status",
+    ).first()
+    if not company:
+        return False
+    plan_key = _plan_key(company)
+    return bool(_plan_features(plan_key).get("multi_warehouse_visibility", False))
 
 
 # ---------------------------------------------------------------------------

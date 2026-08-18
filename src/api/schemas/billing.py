@@ -6,6 +6,11 @@ class CreatePortalSessionSchema(Schema):
 
 
 class CreateCheckoutSessionSchema(Schema):
-    plan_id = fields.String(required=True, validate=validate.OneOf(["starter", "pro", "growth"]))
+    # "scout" is free — no checkout session for it.
+    plan_id = fields.String(required=True, validate=validate.OneOf(["tracker", "hunter", "pack"]))
+    billing_period = fields.String(required=True, validate=validate.OneOf(["monthly", "annual"]))
+    # Only meaningful for plan_id="pack" (sold per-location); the service layer clamps this to 1
+    # for every other plan rather than rejecting a client that always sends quantity=1.
+    quantity = fields.Integer(required=False, load_default=1, validate=validate.Range(min=1, max=20))
     success_url = fields.Url(required=True)
     cancel_url = fields.Url(required=True)
