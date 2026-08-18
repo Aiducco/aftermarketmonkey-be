@@ -27,6 +27,11 @@ class Company(django_db_models.Model):
     subscription_id = django_db_models.CharField(max_length=255, null=True, blank=True)
     subscription_status = django_db_models.CharField(max_length=32, null=True, blank=True)
     subscription_period_end = django_db_models.DateTimeField(null=True, blank=True)
+    # Set only when subscription_plan/status above were granted manually (comp'd trial, not a
+    # real Stripe subscription) -- lets demote_expired_trials.py find these rows without
+    # touching companies on a real paid or Stripe-trialing subscription. Cleared as soon as a
+    # real Stripe subscription is synced onto this company (see billing._sync_company_subscription).
+    manual_trial_granted_at = django_db_models.DateTimeField(null=True, blank=True)
 
     # Dedicated SFTP relay account (one per company) — auto-provisioned in the background so
     # relay-based distributors (Meyer, A-Tech, etc.) can be connected with one click instead of

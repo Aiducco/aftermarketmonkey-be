@@ -3,12 +3,15 @@ Onboarding flow services for B2B sign-up.
 
 Steps 1+2 are atomic: User is never created without complete company details.
 """
+import datetime
 import logging
 import re
 import uuid
 
+from django.conf import settings
 from django.contrib.auth import models as auth_models
 from django.db import transaction
+from django.utils import timezone
 
 from src import constants as src_constants
 from src import enums as src_enums
@@ -87,6 +90,11 @@ def register_user(
     def _opt(val):
         return (val or "").strip() or None
 
+    # Reverse-trial signup: comp them onto the trial plan immediately (no card required) so they
+    # get the full product experience; demote_expired_trials.py (cron) drops them back to Scout
+    # if they haven't converted to a real Stripe subscription by the time it expires.
+    now = timezone.now()
+    trial_days = getattr(settings, "NEW_SIGNUP_TRIAL_DAYS", 21)
     company = src_models.Company.objects.create(
         name=company_name,
         slug=_generate_slug(company_name),
@@ -99,6 +107,10 @@ def register_user(
         postal_code=_opt(postal_code),
         tax_id=_opt(tax_id),
         onboarding_step=2,  # Step 1+2 done; next is step 3 (personalization)
+        subscription_plan=getattr(settings, "NEW_SIGNUP_TRIAL_PLAN", "hunter"),
+        subscription_status="trialing",
+        subscription_period_end=now + datetime.timedelta(days=trial_days),
+        manual_trial_granted_at=now,
     )
 
     # Create user

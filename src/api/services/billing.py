@@ -83,9 +83,12 @@ def _sync_company_subscription(company: src_models.Company, sub: dict) -> None:
     company.subscription_plan = plan_id
     company.subscription_status = sub.get("status")
     company.subscription_period_end = period_end
+    # A real Stripe subscription is now the source of truth -- clear any comp'd-trial marker so
+    # demote_expired_trials.py leaves this company alone.
+    company.manual_trial_granted_at = None
     company.save(update_fields=[
         "subscription_id", "subscription_plan",
-        "subscription_status", "subscription_period_end",
+        "subscription_status", "subscription_period_end", "manual_trial_granted_at",
     ])
 
 
@@ -94,9 +97,10 @@ def _clear_company_subscription(company: src_models.Company) -> None:
     company.subscription_plan = None
     company.subscription_status = "canceled"
     company.subscription_period_end = None
+    company.manual_trial_granted_at = None
     company.save(update_fields=[
         "subscription_id", "subscription_plan",
-        "subscription_status", "subscription_period_end",
+        "subscription_status", "subscription_period_end", "manual_trial_granted_at",
     ])
 
 

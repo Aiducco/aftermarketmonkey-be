@@ -420,6 +420,13 @@ EXTRA_SEAT_ADDON = {
 # select; all units share ONE company account (no real per-location rollup/split exists yet).
 PACK_LOCATION_MAX_QUANTITY = 20
 
+# Reverse-trial signup: every newly-registered company is auto-granted this plan on a comp'd
+# trial (Company.manual_trial_granted_at set) for this many days, then demoted back to Scout by
+# the demote_expired_trials management command (cron) unless they've converted to a real Stripe
+# subscription by then. See src/api/services/onboarding.py:register_user.
+NEW_SIGNUP_TRIAL_PLAN = "hunter"
+NEW_SIGNUP_TRIAL_DAYS = 21
+
 # WheelPros SFTP: host/port for all connections (override via env). Per-company user/password in
 # CompanyProviders.credentials; optional WHEELPROS_SFTP_USER/PASSWORD for local/dev sync only.
 WHEELPROS_SFTP_HOST = os.environ.get("WHEELPROS_SFTP_HOST", "sftp.wheelpros.com")
