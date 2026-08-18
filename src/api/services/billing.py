@@ -17,6 +17,11 @@ logger = logging.getLogger(__name__)
 ACTIVE_STATUSES = {"active", "trialing"}
 DISPLAYABLE_STATUSES = {"active", "trialing", "past_due"}
 
+# Shared error code for every plan-tier gate (distributor connections, seats, PO checkout) so
+# the frontend can branch on one constant regardless of which endpoint blocked the request.
+# integrations.CONNECTION_ERROR_PLAN_LIMIT_REACHED references this same value.
+PLAN_LIMIT_ERROR_CODE = "plan_limit_reached"
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -384,6 +389,10 @@ def get_usage(company_id: int) -> dict:
         "plan": _plan_name(plan_key),
         "period_start": period_start.strftime("%Y-%m-%d"),
         "period_end": period_end.strftime("%Y-%m-%d") if period_end else None,
+        # Full boolean/limit feature map for the current plan — lets the FE gate UI proactively
+        # (e.g. disable "Add to PO" before the click) instead of only reacting to a 402/400 after
+        # the fact, without hardcoding its own plan->feature map that would drift from PLANS.
+        "features": features,
         "detail_views": {
             "used": detail_views_used,
             "limit": features.get("detail_views_per_month", 0),

@@ -5,6 +5,7 @@ import typing
 import simplejson
 from django import http, views
 
+from src.api.services import billing as billing_services
 from src.api.services import purchase_orders as purchase_orders_services
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,26 @@ def _error_response(message: str, status: int = 400) -> http.HttpResponse:
         headers={"Content-Type": "application/json"},
         content=simplejson.dumps({"message": message}),
         status=status,
+    )
+
+
+def _error_response_for(e: purchase_orders_services.PurchaseOrderServiceError) -> http.HttpResponse:
+    """
+    Same as _error_response(str(e)), except a plan-limit-tagged error (see
+    PurchaseOrderServiceError.error_code) returns 402 + upgrade_required instead of a plain 400
+    — matching ProviderConnectView's existing convention for the same class of error, so the
+    frontend's single 402 handler covers this case too instead of it surfacing as a generic
+    error toast.
+    """
+    error_code = getattr(e, "error_code", None)
+    is_plan_limit = error_code == billing_services.PLAN_LIMIT_ERROR_CODE
+    return http.HttpResponse(
+        headers={"Content-Type": "application/json"},
+        content=simplejson.dumps({
+            "message": str(e),
+            **({"error_code": error_code, "upgrade_required": True} if is_plan_limit else {}),
+        }),
+        status=402 if is_plan_limit else 400,
     )
 
 
@@ -99,7 +120,7 @@ class CartItemsView(views.View):
                 order_account_id=body.get("order_account_id"),
             )
         except purchase_orders_services.PurchaseOrderServiceError as e:
-            return _error_response(str(e))
+            return _error_response_for(e)
         except Exception:
             logger.exception("{} Error adding cart item for company_id={}".format(_LOG_PREFIX, company_id))
             return _error_response("Error adding cart item", status=500)
@@ -426,7 +447,7 @@ class PurchaseOrderSubmitView(views.View):
                 po_name=body.get("po_name"),
             )
         except purchase_orders_services.PurchaseOrderServiceError as e:
-            return _error_response(str(e))
+            return _error_response_for(e)
         except Exception:
             logger.exception("{} Error submitting purchase order id={}".format(_LOG_PREFIX, po_id))
             return _error_response("Error submitting purchase order", status=500)

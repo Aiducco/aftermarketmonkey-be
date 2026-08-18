@@ -63,7 +63,7 @@ CONNECTION_ERROR_INVALID_CREDENTIALS = "invalid_credentials"
 CONNECTION_ERROR_PERMISSION_DENIED = "permission_denied"
 CONNECTION_ERROR_CONNECTION_FAILED = "connection_failed"
 CONNECTION_ERROR_NOT_FOUND = "not_found"
-CONNECTION_ERROR_PLAN_LIMIT_REACHED = "plan_limit_reached"
+CONNECTION_ERROR_PLAN_LIMIT_REACHED = billing_services.PLAN_LIMIT_ERROR_CODE
 
 
 def _render_relay_instructions_html(

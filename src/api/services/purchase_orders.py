@@ -42,8 +42,15 @@ _RECENT_ORDER_WINDOW = datetime.timedelta(minutes=20)
 
 
 class PurchaseOrderServiceError(Exception):
-    """Raised for any client-correctable error (bad input, not found, wrong state)."""
-    pass
+    """
+    Raised for any client-correctable error (bad input, not found, wrong state).
+    ``error_code``, when set, lets the view branch on the reason instead of the message text —
+    currently only used for billing_services.PLAN_LIMIT_ERROR_CODE (see add_cart_item /
+    submit_purchase_order), so the view can return 402 + upgrade_required instead of a plain 400.
+    """
+    def __init__(self, message: str, error_code: typing.Optional[str] = None) -> None:
+        super().__init__(message)
+        self.error_code = error_code
 
 
 # -- Serialization ------------------------------------------------------------------------
@@ -665,7 +672,7 @@ def add_cart_item(
     """
     allowed, plan_reason = billing_services.check_po_checkout_allowed(company_id)
     if not allowed:
-        raise PurchaseOrderServiceError(plan_reason)
+        raise PurchaseOrderServiceError(plan_reason, error_code=billing_services.PLAN_LIMIT_ERROR_CODE)
 
     if not provider_id:
         raise PurchaseOrderServiceError("provider_id is required.")
@@ -1393,7 +1400,7 @@ def submit_purchase_order(
     """
     allowed, plan_reason = billing_services.check_po_checkout_allowed(company_id)
     if not allowed:
-        raise PurchaseOrderServiceError(plan_reason)
+        raise PurchaseOrderServiceError(plan_reason, error_code=billing_services.PLAN_LIMIT_ERROR_CODE)
 
     po = src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id).first()
     if not po:

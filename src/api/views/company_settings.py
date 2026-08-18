@@ -15,6 +15,7 @@ from common import utils as common_utils
 
 from src import models as src_models
 from src.api.schemas import company_settings as company_settings_schema
+from src.api.services import billing as billing_services
 from src.api.services import company_settings as company_settings_services
 
 logger = logging.getLogger(__name__)
@@ -169,6 +170,17 @@ class CompanyTeamView(views.View):
         ok, admin_err = company_settings_services._is_company_admin(request.user, company_id)
         if not ok:
             return _json_response({"message": admin_err or "Admin access required"}, status=403)
+
+        # Checked here too (not just inside add_company_user) so a seat-limit block returns 402 +
+        # upgrade_required — matching ProviderConnectView's convention for the same class of
+        # error — instead of the plain 400 a service-layer string error gets below. The
+        # service-layer check stays as a safety net for any other future caller.
+        seat_allowed, seat_reason = billing_services.check_seat_limit(company_id)
+        if not seat_allowed:
+            return _json_response(
+                {"message": seat_reason, "error_code": billing_services.PLAN_LIMIT_ERROR_CODE, "upgrade_required": True},
+                status=402,
+            )
 
         try:
             body = json.loads(request.body) if request.body else {}
