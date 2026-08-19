@@ -22,7 +22,7 @@ from django.conf import settings
 
 from common import enums as common_enums
 from common import utils as common_utils
-from src.integrations.clients.turn_14 import exceptions
+from src.integrations.clients.turn_14 import USER_AGENT, exceptions
 
 TOKEN_EXPIRATION_BUFFER_SECONDS = 60
 REQUEST_TIMEOUT_SECONDS = 30
@@ -71,7 +71,7 @@ class Turn14OrderApiClient(object):
         response = requests.request(
             url="{}/token".format(self.api_base_url),
             method=common_enums.HttpMethod.POST.value,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
             json={
                 "grant_type": "client_credentials",
                 "client_id": self.client_id,
@@ -112,6 +112,7 @@ class Turn14OrderApiClient(object):
         url = "{}/{}".format(self.api_base_url, endpoint)
         headers = {
             "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
             "Authorization": "Bearer {}".format(self._get_valid_token()),
         }
         try:

@@ -9,7 +9,7 @@ from ratelimit import limits, sleep_and_retry  # Add ratelimit imports
 
 from common import enums as common_enums
 from common import utils as common_utils
-from src.integrations.clients.turn_14 import exceptions
+from src.integrations.clients.turn_14 import USER_AGENT, exceptions
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +143,7 @@ class Turn14ApiClient(object):
                 method=common_enums.HttpMethod.POST.value,
                 headers={
                     "Content-Type": "application/json",
+                    "User-Agent": USER_AGENT,
                 },
                 json={
                     "grant_type": "client_credentials",
@@ -398,6 +399,7 @@ class Turn14ApiClient(object):
         url = f"{self.API_BASE_URL}/{endpoint}"
         headers = {
             "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
         }
 
         if include_auth:
