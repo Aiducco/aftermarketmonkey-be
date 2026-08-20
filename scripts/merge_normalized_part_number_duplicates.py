@@ -706,6 +706,40 @@ _BULK_BACKFILL_FIELDS = ("description", "image_url", "aaia_code", "gtin", "sku",
 _FITMENT_KEY_COLUMNS = ("year_start", "year_end", "make", "model", "submodel", "engine", "drive_type")
 
 
+# Every table with a foreign key to master_parts. The merge has to relocate or drop each one
+# before a duplicate row can be deleted; miss one and Postgres rejects the delete, rolling back
+# the whole chunk. This has already happened twice as other work landed -- product_group_member
+# appeared mid-run and took out ~1,200 groups a chunk at a time -- so the set is asserted against
+# the live schema rather than assumed. Adding a table here means teaching _merge_rows and
+# merge_groups_bulk what to do with it.
+_KNOWN_MASTER_PART_REFERENCES = frozenset({
+    "provider_parts",
+    "master_part_data",
+    "master_part_fitments",
+    "product_group_member",
+})
+
+
+def assert_all_master_part_references_handled() -> None:
+    """Fail before touching anything if a new table now references master_parts."""
+    with connection.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT c.conrelid::regclass::text
+            FROM pg_constraint c
+            WHERE c.confrelid = 'master_parts'::regclass AND c.contype = 'f'
+            """
+        )
+        live = {row[0] for row in cur.fetchall()}
+    unknown = live - _KNOWN_MASTER_PART_REFERENCES
+    if unknown:
+        raise RuntimeError(
+            "Refusing to merge: {} now reference(s) master_parts and the merge does not handle "
+            "them. Teach _merge_rows and merge_groups_bulk what to do with each, then add them "
+            "to _KNOWN_MASTER_PART_REFERENCES.".format(", ".join(sorted(unknown)))
+        )
+
+
 def merge_groups_bulk(groups: typing.Sequence[Group], dry_run: bool = True,
                       chunk_size: int = 400) -> typing.Dict[str, typing.Any]:
     """
@@ -722,6 +756,7 @@ def merge_groups_bulk(groups: typing.Sequence[Group], dry_run: bool = True,
     Anything that is not a clean disjoint merge (a duplicate that also has MasterPartData when
     the keeper does) is handed back to the careful row-by-row path rather than approximated.
     """
+    assert_all_master_part_references_handled()
     groups = [g for g in groups if g.safe]
     results: typing.Dict[str, typing.Any] = {"merged": 0, "deleted": 0, "fallback": [], "failed": []}
 
@@ -837,6 +872,24 @@ def merge_groups_bulk(groups: typing.Sequence[Group], dry_run: bool = True,
                     )
                     cur.execute(
                         "DELETE FROM master_part_fitments WHERE master_part_id IN %s",
+                        (tuple(dup_ids),),
+                    )
+
+                    # Product grouping: OneToOne on master_part, so move it only where the
+                    # keeper has none and drop the rest. Same shape as master_part_data.
+                    cur.execute(
+                        """
+                        UPDATE product_group_member g SET master_part_id = m.keep_id
+                        FROM (VALUES {values}) AS m(dup_id, keep_id)
+                        WHERE g.master_part_id = m.dup_id
+                          AND NOT EXISTS (
+                              SELECT 1 FROM product_group_member k WHERE k.master_part_id = m.keep_id
+                          )
+                        """.format(values=values),
+                        params,
+                    )
+                    cur.execute(
+                        "DELETE FROM product_group_member WHERE master_part_id IN %s",
                         (tuple(dup_ids),),
                     )
 
