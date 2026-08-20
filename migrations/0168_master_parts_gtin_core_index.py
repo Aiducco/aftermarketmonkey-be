@@ -29,12 +29,16 @@ class Migration(migrations.Migration):
 
     atomic = False
 
-    # Depends on both current leaves so the graph has a single head again. 0167 (pcdb) branched
-    # off 0162 while 0166 (realtruck) came off 0165, leaving two parallel tips; this migration
-    # touches neither of their tables, it just rejoins them.
+    # Originally depended on both 0167 (pcdb) and 0166 (realtruck) to rejoin two parallel tips
+    # into a single head -- but 0157-0166 (the realtruck branch) were never actually committed
+    # to git, only ever present as local uncommitted files, so that second dependency broke
+    # every deploy with NodeNotFoundError (same class of bug fixed in commit fff1801 for
+    # 0160/0162 earlier). Dropped back to depending on 0167 alone. Whoever commits the realtruck
+    # branch will need to either renumber it to descend from here or add a fresh merge migration
+    # at that point -- this migration touches neither branch's tables, so nothing here depends
+    # on which one wins.
     dependencies = [
         ("src", "0167_pcdb_tables"),
-        ("src", "0166_realtruck_lead_priority"),
     ]
 
     operations = [

@@ -4133,3 +4133,40 @@ class PcdbTerminologyFlat(django_db_models.Model):
             django_db_models.Index(fields=["category_id"], name="pcdb_term_flat_category_idx"),
             django_db_models.Index(fields=["is_active"], name="pcdb_term_flat_active_idx"),
         ]
+
+
+# ---------------------------------------------------------------------------
+# Product-line grouping (Stage 1 of the part-classification pipeline) -- see
+# src/domain/title_mask.py and src/integrations/services/product_grouping.py.
+# ---------------------------------------------------------------------------
+
+class ProductGroup(django_db_models.Model):
+    """
+    A terminology-homogeneous grouping of MasterPart rows within one brand, found by masked-title
+    n-gram mining and/or part-number prefix mining (see product_grouping.py). group_key is the
+    masked n-gram or PN prefix that defines the group, not necessarily its real marketing name --
+    display_name is a human-readable label derived from it.
+    """
+    brand = django_db_models.ForeignKey(Brands, on_delete=django_db_models.CASCADE, related_name="product_groups")
+    group_key = django_db_models.TextField()
+    display_name = django_db_models.TextField()
+    method = django_db_models.CharField(max_length=16)  # ngram | prefix | both | llm | manual
+    grouping_confidence = django_db_models.DecimalField(max_digits=3, decimal_places=2)
+    sku_count = django_db_models.IntegerField()
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "product_group"
+        unique_together = ["brand", "group_key"]
+
+
+class ProductGroupMember(django_db_models.Model):
+    master_part = django_db_models.OneToOneField(
+        MasterPart, on_delete=django_db_models.CASCADE, primary_key=True, related_name="product_group_membership",
+    )
+    group = django_db_models.ForeignKey(ProductGroup, on_delete=django_db_models.CASCADE, related_name="members")
+
+    class Meta:
+        db_table = "product_group_member"
