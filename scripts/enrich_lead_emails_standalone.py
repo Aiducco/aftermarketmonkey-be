@@ -22,6 +22,7 @@ Requirements:
   pip3 install psycopg2-binary requests anthropic curl_cffi
 """
 import argparse
+import random
 import json
 import re
 import time
@@ -125,6 +126,14 @@ def _extract_emails(text: str) -> list[str]:
 
 
 # ------------------------------------------------------------------
+TABLES = {
+    "lead": "id",
+    "realtruck_leads": "id",
+    "leer_leads": "location_id",
+}
+
+IMPERSONATE = ["chrome131", "chrome124", "chrome120", "safari17_0", "edge101"]
+
 # Stage 1: direct website scraping (curl_cffi → plain requests fallback)
 # ------------------------------------------------------------------
 
@@ -134,7 +143,7 @@ def _fetch(url: str) -> str | None:
         try:
             resp = cffi_requests.get(
                 url, timeout=TIMEOUT, headers=HEADERS,
-                allow_redirects=True, impersonate="chrome124", verify=False,
+                allow_redirects=True, impersonate=random.choice(IMPERSONATE), verify=False,
             )
             if resp.status_code == 200:
                 return resp.text
@@ -287,7 +296,7 @@ def bulk_save_emails(conn, batch: list[tuple]):
     with conn.cursor() as cur:
         psycopg2.extras.execute_batch(
             cur,
-            "UPDATE lead SET emails = %s WHERE id = %s",
+            f"UPDATE {TABLE} SET emails = %s WHERE {PK} = %s",
             batch,
             page_size=100,
         )
@@ -297,7 +306,7 @@ def bulk_save_emails(conn, batch: list[tuple]):
 def bulk_mark_not_found(conn, ids: list[int]):
     with conn.cursor() as cur:
         cur.execute(
-            "UPDATE lead SET emails_not_found = TRUE WHERE id = ANY(%s)",
+            f"UPDATE {TABLE} SET emails_not_found = TRUE WHERE {PK} = ANY(%s)",
             (ids,)
         )
     conn.commit()
@@ -315,6 +324,10 @@ def main():
     parser.add_argument("--live-only", action="store_true", help="Only leads where website_live=TRUE")
     parser.add_argument("--refetch",   action="store_true", help="Re-scrape even if emails already found")
     parser.add_argument("--no-tavily", action="store_true", help="Disable Tavily+Claude fallback")
+    parser.add_argument("--table", default="lead", choices=sorted(TABLES),
+                        help="Which lead table to enrich")
+    parser.add_argument("--qualified-only", action="store_true",
+                        help="Only rows the AI marked qualified")
     parser.add_argument("--limit",     type=int, default=None)
     parser.add_argument("--workers",   type=int, default=WORKERS, help=f"Parallel workers (default: {WORKERS})")
     args = parser.parse_args()
@@ -338,13 +351,19 @@ def main():
         connect_timeout=10,
     )
 
+    TABLE, PK = args.table, TABLES[args.table]
+    globals()["TABLE"], globals()["PK"] = TABLE, PK
+
     with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
         query = """
-            SELECT id, name, city, state, website
-            FROM lead
+            SELECT {pk} AS id, name, city, state, website
+            FROM {table}
             WHERE website IS NOT NULL AND website <> ''
-        """
+        """.format(pk=PK, table=TABLE)
         params = []
+
+        if args.qualified_only:
+            query += " AND is_qualified IS TRUE"
 
         if args.live_only:
             query += " AND website_live = TRUE"

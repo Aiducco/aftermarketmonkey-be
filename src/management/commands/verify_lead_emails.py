@@ -22,7 +22,13 @@ import requests
 from django.conf import settings
 from django.core.management.base import BaseCommand
 
-from src.models import Lead, LeadEmail
+from src.models import Lead, LeadEmail, RealTruckLead, RealTruckLeadEmail
+
+# Each source has its own lead table and its own verified-email table.
+SOURCES = {
+    "google": (Lead, LeadEmail),
+    "realtruck": (RealTruckLead, RealTruckLeadEmail),
+}
 
 REOON_CREATE_URL = "https://emailverifier.reoon.com/api/v1/create-bulk-verification-task/"
 REOON_RESULT_URL = "https://emailverifier.reoon.com/api/v1/get-result-bulk-verification-task/"
@@ -33,10 +39,43 @@ MAX_EMAILS_PER_TASK = 50_000
 BATCH_SIZE = 200
 
 
+
+# Reoon's per-status booleans vary by plan and status, and a naive `a or b or c` chain silently
+# turns an explicit False into None -- which recorded every invalid address as "unknown" and made
+# the verification useless for filtering. Read booleans with an explicit None check, and fall back
+# to the status string, which is always present.
+DELIVERABLE_STATUSES = {"safe", "valid", "deliverable"}
+UNDELIVERABLE_STATUSES = {"invalid", "disabled", "spamtrap", "disposable", "undeliverable", "bounce"}
+
+
+def _first_bool(data: dict, *keys):
+    """First key whose value is an actual bool; None if none are present."""
+    for k in keys:
+        v = data.get(k)
+        if isinstance(v, bool):
+            return v
+    return None
+
+
+def _derive_valid(data: dict, status: str | None):
+    """True = safe to send, False = known bad, None = genuinely uncertain (catch_all/unknown)."""
+    explicit = _first_bool(data, "is_safe_to_send", "is_valid_email", "is_valid")
+    if explicit is not None:
+        return explicit
+    s = (status or "").lower()
+    if s in DELIVERABLE_STATUSES:
+        return True
+    if s in UNDELIVERABLE_STATUSES:
+        return False
+    return None   # catch_all, role_account, unknown -- deliverability not established
+
+
 class Command(BaseCommand):
     help = "Verify lead emails in bulk using Reoon API (Power mode)"
 
     def add_arguments(self, parser):
+        parser.add_argument("--source", default="google", choices=sorted(SOURCES),
+                            help="Which lead table's emails to verify")
         parser.add_argument("--state", default=None, help="Filter by state code (e.g. TX)")
         parser.add_argument("--reverify", action="store_true", help="Re-verify already verified emails")
         parser.add_argument("--limit", type=int, default=None, help="Max leads to process")
@@ -51,20 +90,22 @@ class Command(BaseCommand):
         self._check_balance(api_key)
 
         # Collect emails to verify
-        qs = Lead.objects.filter(is_qualified=True).exclude(emails=[])
+        lead_model, email_model = SOURCES[options["source"]]
+        self.email_model = email_model
+        qs = lead_model.objects.filter(is_qualified=True).exclude(emails=[])
         if options["state"]:
             qs = qs.filter(state=options["state"].upper())
         if options["limit"]:
             qs = qs[:options["limit"]]
 
-        leads = list(qs.only("id", "name", "website", "emails"))
+        leads = list(qs.only(lead_model._meta.pk.name, "name", "website", "emails"))
 
         # Build (lead_id, email) pairs, skip already verified unless --reverify
         already_verified = set()
         if not options["reverify"]:
             already_verified = set(
-                LeadEmail.objects.filter(
-                    lead_id__in=[l.id for l in leads],
+                email_model.objects.filter(
+                    lead_id__in=[l.pk for l in leads],
                     verified_at__isnull=False,
                 ).values_list("lead_id", "email")
             )
@@ -73,8 +114,8 @@ class Command(BaseCommand):
         email_to_lead: dict[str, int] = {}
         for lead in leads:
             for email in (lead.emails or []):
-                if (lead.id, email) not in already_verified:
-                    email_to_lead[email] = lead.id
+                if (lead.pk, email) not in already_verified:
+                    email_to_lead[email] = lead.pk
 
         all_emails = list(email_to_lead.keys())
         total = len(all_emails)
@@ -163,7 +204,7 @@ class Command(BaseCommand):
         valid_count = 0
         invalid_count = 0
         unknown_count = 0
-        batch: list[LeadEmail] = []
+        batch = []
         now = datetime.now(timezone.utc)
 
         for email, data in results.items():
@@ -172,7 +213,7 @@ class Command(BaseCommand):
                 continue
 
             status = data.get("status")
-            is_valid = data.get("is_safe_to_send") or data.get("is_valid_email") or data.get("is_valid")
+            is_valid = _derive_valid(data, status)
 
             if is_valid:
                 valid_count += 1
@@ -181,15 +222,17 @@ class Command(BaseCommand):
             else:
                 unknown_count += 1
 
-            batch.append(LeadEmail(
+            batch.append(self.email_model(
                 lead_id=lead_id,
                 email=email.lower(),
                 status=status,
                 is_valid=is_valid,
-                is_disposable=data.get("is_disposable") or data.get("is_disposable_email"),
-                is_free_email=data.get("is_free_email"),
-                is_role_based=data.get("is_role_based") or data.get("is_role_based_email"),
-                mx_found=data.get("mx_accepts_mail") or data.get("mx_found"),
+                is_disposable=_first_bool(data, "is_disposable", "is_disposable_email")
+                               or (status == "disposable" or None),
+                is_free_email=_first_bool(data, "is_free_email"),
+                is_role_based=_first_bool(data, "is_role_based", "is_role_based_email")
+                               or (status == "role_account" or None),
+                mx_found=_first_bool(data, "mx_accepts_mail", "mx_found"),
                 verified_at=now,
             ))
 
@@ -204,8 +247,8 @@ class Command(BaseCommand):
             f"  Saved — Valid: {valid_count}  Invalid: {invalid_count}  Unknown: {unknown_count}"
         ))
 
-    def _flush(self, batch: list[LeadEmail]):
-        LeadEmail.objects.bulk_create(
+    def _flush(self, batch: list):
+        self.email_model.objects.bulk_create(
             batch,
             update_conflicts=True,
             unique_fields=["lead_id", "email"],

@@ -26,7 +26,13 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from django.core.management.base import BaseCommand
 from django.db.models import Q
 
-from src.models import Lead
+from src.models import Lead, LeerLead, RealTruckLead
+
+SOURCES = {
+    "google": Lead,
+    "realtruck": RealTruckLead,
+    "leer": LeerLead,
+}
 
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 CONTACT_TIMEOUT   = 10
@@ -76,7 +82,7 @@ SCRAPE_PATHS = ["", "/contact", "/contact-us", "/about", "/about-us"]
 # Tavily search
 # ------------------------------------------------------------------
 
-def _tavily_results(lead, api_key: str) -> list[dict]:
+def _tavily_results(lead, api_key: str) -> tuple[list[dict], bool]:
     """
     Return up to 7 Tavily results using two queries:
     - first with exact name in quotes (precise)
@@ -85,6 +91,7 @@ def _tavily_results(lead, api_key: str) -> list[dict]:
     """
     seen_domains = set()
     combined = []
+    search_ok = False   # did at least one query actually succeed?
 
     queries = [
         f'"{lead.name}" {lead.city} {lead.state}',
@@ -105,6 +112,7 @@ def _tavily_results(lead, api_key: str) -> list[dict]:
                 timeout=20,
             )
             if resp.status_code == 200:
+                search_ok = True
                 for r in resp.json().get("results", []):
                     from urllib.parse import urlparse as _up
                     domain = _up(r.get("url", "")).netloc.lstrip("www.")
@@ -114,7 +122,7 @@ def _tavily_results(lead, api_key: str) -> list[dict]:
         except Exception:
             pass
 
-    return combined[:8]
+    return combined[:8], search_ok
 
 
 # ------------------------------------------------------------------
@@ -241,7 +249,9 @@ def _scrape_contact(website_url: str) -> dict:
 
 def _process(lead, tavily_key: str, anthropic_client) -> dict:
     # 1. Get Tavily candidates (2 queries, deduped)
-    results = _tavily_results(lead, tavily_key)
+    results, search_ok = _tavily_results(lead, tavily_key)
+    if not search_ok:
+        return None   # search itself failed -- leave the lead untouched for a later retry
 
     # 2. Claude picks website + extracts any visible phone/email from snippets
     claude_data = _claude_analyze(lead, results, anthropic_client)
@@ -277,6 +287,8 @@ class Command(BaseCommand):
     help = "Find websites for leads using Tavily search + Claude Haiku to pick the best result"
 
     def add_arguments(self, parser):
+        parser.add_argument("--source",  default="google", choices=sorted(SOURCES),
+                            help="Which lead table to search for websites")
         parser.add_argument("--state",   default=None, help="Two-letter state code")
         parser.add_argument("--limit",   type=int, default=None)
         parser.add_argument("--workers", type=int, default=5,
@@ -318,13 +330,15 @@ class Command(BaseCommand):
                 "ANTHROPIC_API_KEY not set — will use raw Tavily results without LLM validation"
             ))
 
-        qs = Lead.objects.filter(Q(website__isnull=True) | Q(website="")).filter(website_not_found=False)
+        model = SOURCES[options["source"]]
+        qs = model.objects.filter(Q(website__isnull=True) | Q(website="")).filter(website_not_found=False)
         if options["state"]:
             qs = qs.filter(state=options["state"].upper())
         if options["limit"]:
             qs = qs[:options["limit"]]
 
-        leads = list(qs.only("id", "name", "city", "state", "phone", "email", "emails"))
+        pk_name = model._meta.pk.name
+        leads = list(qs.only(pk_name, "name", "city", "state", "phone", "email", "emails"))
         total = len(leads)
 
         if not total:
@@ -340,12 +354,13 @@ class Command(BaseCommand):
 
         found = 0
         not_found = 0
+        search_failed = 0
         BATCH_SIZE = 50
         pending: list[tuple] = []
 
         def flush(batch):
             for lead_id, upd in batch:
-                Lead.objects.filter(pk=lead_id).update(**upd)
+                model.objects.filter(pk=lead_id).update(**upd)
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
@@ -364,6 +379,15 @@ class Command(BaseCommand):
                     not_found += 1
                     continue
 
+                if updates is None:
+                    # Search backend failed (e.g. Tavily 402 on an unpaid account). Don't write
+                    # website_not_found -- that would permanently disqualify a lead we never
+                    # actually searched for.
+                    search_failed += 1
+                    self.stdout.write(self.style.ERROR(
+                        f"  [{i}/{total}] !  {lead.name} — search failed, left for retry"))
+                    continue
+
                 if updates.get("website"):
                     found += 1
                     parts = [f"website={updates['website']}"]
@@ -376,7 +400,7 @@ class Command(BaseCommand):
                     )
                     for p in parts:
                         self.stdout.write(f"           {p}")
-                    pending.append((lead.id, updates))
+                    pending.append((lead.pk, updates))
                 elif updates:
                     # No website but found phone/email in snippets
                     not_found += 1
@@ -390,11 +414,11 @@ class Command(BaseCommand):
                     )
                     for p in parts:
                         self.stdout.write(f"           {p}")
-                    pending.append((lead.id, updates))
+                    pending.append((lead.pk, updates))
                 else:
                     not_found += 1
                     self.stdout.write(f"  [{i}/{total}] —  {lead.name} ({lead.city}, {lead.state})")
-                    pending.append((lead.id, {"website_not_found": True}))
+                    pending.append((lead.pk, {"website_not_found": True}))
 
                 if len(pending) >= BATCH_SIZE:
                     flush(pending)
@@ -406,5 +430,5 @@ class Command(BaseCommand):
             self.stdout.write(f"  -- saved {len(pending)} to DB --")
 
         self.stdout.write(self.style.SUCCESS(
-            f"\nDone.  Found: {found}  Not found: {not_found}  Total: {total}"
+            f"\nDone.  Found: {found}  Not found: {not_found}  Search failed (retryable): {search_failed}  Total: {total}"
         ))

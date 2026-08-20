@@ -76,6 +76,27 @@ class BrandProviderKind(enum.Enum):
     TIRERACK = 36
     QUADRATEC = 37
 
+class ProductType(enum.Enum):
+    """
+    What a ``MasterPart`` physically is. Stored on ``MasterPart.product_type``.
+
+    String-valued, unlike every other enum in this module, on purpose: the value is written
+    verbatim into the Meilisearch ``parts`` index as a filter term (``product_type = "wheel"``),
+    and classifying 3.2M rows means a lot of ad-hoc coverage SQL where ``= 'wheel'`` beats
+    remembering that 2 means wheel.
+
+    ``PART`` is everything that is not a rim or a tire -- lug nuts, center caps, spacers, TPMS
+    sensors, valve stems, inner tubes and tire chains all land here. See
+    ``src.integrations.utils.product_type`` for the rules and why accessories are excluded.
+
+    There is deliberately no ``UNKNOWN`` member: a part we cannot classify is left NULL rather
+    than labelled, so the gap stays measurable instead of being absorbed into ``PART``.
+    """
+    PART = "part"
+    WHEEL = "wheel"
+    TIRE = "tire"
+
+
 class BrandProviderStatus(enum.Enum):
     ACTIVE = 1
     INACTIVE = 2

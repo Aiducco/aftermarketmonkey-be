@@ -19,6 +19,7 @@ Usage:
 """
 import json
 import logging
+import random
 import re
 import time
 import warnings
@@ -32,7 +33,13 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 from django.core.management.base import BaseCommand
 
-from src.models import Lead
+from src.models import Lead, LeerLead, RealTruckLead
+
+SOURCES = {
+    "google": Lead,
+    "realtruck": RealTruckLead,
+    "leer": LeerLead,
+}
 
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 
@@ -107,21 +114,50 @@ def _extract_emails(text: str) -> list[str]:
 # Stage 1: direct website scraping
 # ------------------------------------------------------------------
 
-def _scrape_website(website: str) -> list[str]:
+# Rotating TLS fingerprints -- a site that blocks one Chrome build often serves another.
+IMPERSONATE = ["chrome131", "chrome124", "chrome120", "safari17_0", "edge101"]
+
+try:
+    from curl_cffi import requests as cffi_requests
+    HAS_CURL_CFFI = True
+except ImportError:
+    HAS_CURL_CFFI = False
+
+
+def _fetch_html(url: str) -> str | None:
+    """HTML for one page, trying impersonated clients before plain requests."""
+    if HAS_CURL_CFFI:
+        for imp in random.sample(IMPERSONATE, k=3):
+            try:
+                r = cffi_requests.get(url, timeout=TIMEOUT, headers=HEADERS,
+                                      allow_redirects=True, impersonate=imp, verify=False)
+                if r.status_code == 200:
+                    return r.text
+            except Exception:
+                continue
+    try:
+        r = requests.get(url, timeout=TIMEOUT, headers=HEADERS, allow_redirects=True, verify=False)
+        if r.status_code == 200:
+            return r.text
+    except Exception:
+        pass
+    return None
+
+
+def _scrape_website(website: str) -> tuple[list[str], bool]:
     parsed = urlparse(website)
     base_url = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
     all_emails: list[str] = []
     seen: set[str] = set()
+    fetched_any = False   # did any page actually load?
 
     for path in SCRAPE_PATHS:
         try:
-            resp = requests.get(
-                base_url + path, timeout=TIMEOUT, headers=HEADERS,
-                allow_redirects=True, verify=False,
-            )
-            if resp.status_code != 200:
+            html = _fetch_html(base_url + path)
+            if not html:
                 continue
-            for em in _extract_emails(resp.text):
+            fetched_any = True
+            for em in _extract_emails(html):
                 if em not in seen:
                     seen.add(em)
                     all_emails.append(em)
@@ -130,7 +166,7 @@ def _scrape_website(website: str) -> list[str]:
         finally:
             time.sleep(0.05)
 
-    return all_emails
+    return all_emails, fetched_any
 
 
 # ------------------------------------------------------------------
@@ -233,7 +269,7 @@ def _process_lead(lead, tavily_key: str, anthropic_client, use_tavily: bool) -> 
     method is one of: 'scrape', 'tavily+claude', 'none'
     """
     # Stage 1: scrape the website directly
-    emails = _scrape_website(lead.website)
+    emails, reachable = _scrape_website(lead.website)
     if emails:
         return emails, "scrape"
 
@@ -244,7 +280,9 @@ def _process_lead(lead, tavily_key: str, anthropic_client, use_tavily: bool) -> 
         if emails:
             return emails, "tavily+claude"
 
-    return [], "none"
+    # "unreachable" is deliberately distinct from "none": the caller must not write
+    # emails_not_found for a site it never managed to load.
+    return [], ("none" if reachable else "unreachable")
 
 
 # ------------------------------------------------------------------
@@ -255,6 +293,10 @@ class Command(BaseCommand):
     help = "Scrape emails from lead websites; falls back to Tavily+Claude if scraping finds nothing"
 
     def add_arguments(self, parser):
+        parser.add_argument("--source", default="google", choices=sorted(SOURCES),
+                            help="Which lead table to enrich")
+        parser.add_argument("--qualified-only", action="store_true",
+                            help="Only leads the AI marked qualified (is_qualified=True)")
         parser.add_argument("--state",     default=None, help="Filter by state code (e.g. TX)")
         parser.add_argument("--refetch",   action="store_true", help="Re-scrape even if emails already populated")
         parser.add_argument("--limit",     type=int, default=None)
@@ -288,7 +330,10 @@ class Command(BaseCommand):
             except ImportError:
                 pass
 
-        qs = Lead.objects.filter(website__isnull=False).exclude(website="")
+        model = SOURCES[options["source"]]
+        qs = model.objects.filter(website__isnull=False).exclude(website="")
+        if options["qualified_only"]:
+            qs = qs.filter(is_qualified=True)
         if options["state"]:
             qs = qs.filter(state=options["state"].upper())
         if options["live_only"]:
@@ -298,7 +343,7 @@ class Command(BaseCommand):
         if options["limit"]:
             qs = qs[:options["limit"]]
 
-        leads = list(qs.only("id", "name", "city", "state", "website", "emails"))
+        leads = list(qs.only(model._meta.pk.name, "name", "city", "state", "website", "emails"))
         total = len(leads)
 
         if not total:
@@ -320,6 +365,7 @@ class Command(BaseCommand):
         found_scrape  = 0
         found_tavily  = 0
         not_found     = 0
+        unreachable   = 0
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
@@ -336,7 +382,7 @@ class Command(BaseCommand):
                     continue
 
                 if emails:
-                    Lead.objects.filter(pk=lead.pk).update(emails=emails)
+                    model.objects.filter(pk=lead.pk).update(emails=emails)
                     tag = f"[{method}]"
                     if method == "scrape":
                         found_scrape += 1
@@ -351,7 +397,10 @@ class Command(BaseCommand):
                     self.stdout.write(f"           {emails}")
                 else:
                     not_found += 1
-                    Lead.objects.filter(pk=lead.pk).update(emails_not_found=True)
+                    if method == "unreachable":
+                        unreachable += 1
+                        continue   # leave it retryable -- a US-IP run may well get in
+                    model.objects.filter(pk=lead.pk).update(emails_not_found=True)
                     self.stdout.write(f"  [{i}/{total}] —  {lead.website}")
 
         self.stdout.write(self.style.SUCCESS(
@@ -359,5 +408,6 @@ class Command(BaseCommand):
             f"  Found via scraping      : {found_scrape}\n"
             f"  Found via Tavily+Claude : {found_tavily}\n"
             f"  Not found               : {not_found}\n"
+            f"  Unreachable (retryable) : {unreachable}\n"
             f"  Total                   : {total}"
         ))

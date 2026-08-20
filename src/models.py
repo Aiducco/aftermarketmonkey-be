@@ -2,6 +2,7 @@ import enum
 from django.contrib.auth import models as auth_models
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db import models as django_db_models
+from django.utils import timezone
 
 class Company(django_db_models.Model):
     name = django_db_models.CharField(max_length=255)
@@ -1889,6 +1890,17 @@ class MasterPart(django_db_models.Model):
     gtin = django_db_models.CharField(max_length=255, null=True, blank=True)
     overview_category = django_db_models.CharField(max_length=255, null=True, blank=True)
     category = django_db_models.CharField(max_length=255, null=True, blank=True)
+    # wheel / tire / part -- see src.enums.ProductType and the rules in
+    # src.integrations.utils.product_type. NULL means "not classified yet", never "part":
+    # 1.65M master parts reach us only through distributors that ship no type signal at all
+    # (A-Tech, Keystone, Motor State, Quadratec, DLG), and guessing on those would bury the gap.
+    product_type = django_db_models.CharField(max_length=16, null=True, blank=True, db_index=True)
+    # Which rule produced product_type, e.g. "wheelpros:feed_type", "turn14:category",
+    # "pcdb:7644", "keyword:tirerack-tire-size". Provenance is what makes a
+    # 3.2M-row classification auditable and selectively re-runnable -- the inferential tiers
+    # (brand:, keyword:) can be reverted on their own with a single DELETE-shaped UPDATE without
+    # touching anything a distributor actually told us.
+    product_type_source = django_db_models.CharField(max_length=64, null=True, blank=True)
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
@@ -2375,6 +2387,183 @@ class LeadEmail(django_db_models.Model):
     def __str__(self):
         return f"{self.email} ({self.status})"
 
+
+
+class RealTruckLead(django_db_models.Model):
+    """
+    Dealers scraped from RealTruck's dealer locator. The table is populated by the scraper
+    outside of Django (hence the text primary key coming straight from RealTruck), so the
+    columns below mirror what already exists in ``realtruck_leads``.
+    """
+
+    id = django_db_models.TextField(primary_key=True)  # RealTruck's own dealer id
+    name = django_db_models.TextField()
+
+    phone = django_db_models.TextField(null=True, blank=True)
+    website = django_db_models.TextField(null=True, blank=True)
+    # True = Tavily+Claude searched and genuinely found nothing. Only set on a search that ran --
+    # a failed search leaves this alone so the lead can be retried.
+    website_not_found = django_db_models.BooleanField(default=False, blank=True)
+    website_live = django_db_models.BooleanField(null=True, blank=True)  # None = not checked yet
+    website_checked_at = django_db_models.DateTimeField(null=True, blank=True)
+    email = django_db_models.EmailField(max_length=255, null=True, blank=True)
+    emails = django_db_models.JSONField(default=list, blank=True)
+    emails_not_found = django_db_models.BooleanField(default=False, blank=True)  # scraped, nothing there
+
+    address = django_db_models.TextField(null=True, blank=True)
+    city = django_db_models.TextField(null=True, blank=True)
+    state = django_db_models.TextField(null=True, blank=True)
+    zipcode = django_db_models.TextField(null=True, blank=True)
+    country = django_db_models.TextField(null=True, blank=True)
+    full_address = django_db_models.TextField(null=True, blank=True)
+    lat = django_db_models.FloatField(null=True, blank=True)
+    lng = django_db_models.FloatField(null=True, blank=True)
+
+    # RealTruck dealer badges
+    is_preferred = django_db_models.BooleanField(default=False)
+    is_double_warranty = django_db_models.BooleanField(default=False)
+    is_next_gen = django_db_models.BooleanField(default=False)
+    is_real_pro = django_db_models.BooleanField(default=False)
+    is_international = django_db_models.BooleanField(default=False)
+
+    sort_order = django_db_models.IntegerField(null=True, blank=True)
+    brand_count = django_db_models.IntegerField(null=True, blank=True)
+    preferred_brands = django_db_models.TextField(null=True, blank=True)
+    all_brands = django_db_models.TextField(null=True, blank=True)
+    brands = django_db_models.JSONField(null=True, blank=True)
+
+    # Outreach prioritisation — which qualified shops to contact first.
+    # outreach_priority is a 0-100 composite of the LLM's read of the site and hard signals
+    # (locations, RealTruck dealer tier, brand count); tier is just its A/B/C bucketing.
+    outreach_priority = django_db_models.IntegerField(null=True, blank=True)
+    priority_tier = django_db_models.CharField(max_length=1, null=True, blank=True)
+    website_quality = django_db_models.IntegerField(null=True, blank=True)   # LLM 0-100
+    location_count = django_db_models.IntegerField(null=True, blank=True)    # sites sharing this domain
+    priority_signals = django_db_models.JSONField(default=dict, blank=True)  # what drove the score
+    priority_reasoning = django_db_models.TextField(null=True, blank=True)
+    prioritized_at = django_db_models.DateTimeField(null=True, blank=True)
+
+    # AI qualification — same shape as Lead, so both sources report identically
+    is_qualified = django_db_models.BooleanField(null=True, blank=True)
+    business_typology = django_db_models.CharField(max_length=64, null=True, blank=True)
+    confidence_score = django_db_models.IntegerField(null=True, blank=True)
+    brands_mentioned = django_db_models.JSONField(default=list, blank=True)
+    ai_reasoning = django_db_models.TextField(null=True, blank=True)
+    ai_skip_reason = django_db_models.CharField(max_length=255, null=True, blank=True)
+    ai_qualified_at = django_db_models.DateTimeField(null=True, blank=True)
+
+    # Scrape metadata
+    found_via = django_db_models.TextField(null=True, blank=True)  # the search location that surfaced it
+    distance_mi = django_db_models.FloatField(null=True, blank=True)
+    first_seen_at = django_db_models.DateTimeField(default=timezone.now)
+    last_seen_at = django_db_models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        db_table = "realtruck_leads"
+        indexes = [
+            django_db_models.Index(fields=["state"], name="realtruck_leads_state_idx"),
+            django_db_models.Index(fields=["is_preferred"], name="realtruck_leads_preferred_idx"),
+        ]
+
+    def __str__(self):
+        return f"{self.name} ({self.city}, {self.state})"
+
+
+class RealTruckLeadEmail(django_db_models.Model):
+    """
+    One row per email found on a qualified RealTruck dealer's site, with Reoon results.
+
+    A separate table rather than a nullable FK on LeadEmail: that model's ``lead`` is non-null and
+    existing code dereferences it freely, so rows with no ``lead`` would break those paths.
+    """
+
+    lead = django_db_models.ForeignKey(
+        RealTruckLead, on_delete=django_db_models.CASCADE, related_name="verified_emails"
+    )
+    email = django_db_models.EmailField(max_length=255)
+
+    # Reoon verification results
+    status = django_db_models.CharField(max_length=32, null=True, blank=True)
+    is_valid = django_db_models.BooleanField(null=True, blank=True)
+    is_disposable = django_db_models.BooleanField(null=True, blank=True)
+    is_free_email = django_db_models.BooleanField(null=True, blank=True)
+    is_role_based = django_db_models.BooleanField(null=True, blank=True)
+    mx_found = django_db_models.BooleanField(null=True, blank=True)
+
+    verified_at = django_db_models.DateTimeField(null=True, blank=True)
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "realtruck_lead_email"
+        unique_together = [("lead", "email")]
+        indexes = [
+            django_db_models.Index(fields=["email"], name="rt_lead_email_email_idx"),
+            django_db_models.Index(fields=["status"], name="rt_lead_email_status_idx"),
+            django_db_models.Index(fields=["is_valid"], name="rt_lead_email_valid_idx"),
+        ]
+
+    def __str__(self):
+        return f"{self.email} ({self.status})"
+
+
+class LeerLead(django_db_models.Model):
+    """
+    Dealers scraped from LEER's dealer locator. Like RealTruckLead the table is populated outside
+    Django, so the first block mirrors what already exists in ``leer_leads``.
+
+    Unlike RealTruck, LEER's locator publishes no website at all -- not in a column and not in the
+    ``raw`` payload -- so ``website`` starts empty for every row and has to be discovered
+    (``find_missing_websites --source leer``) before the liveness and qualification steps have
+    anything to work with.
+    """
+
+    location_id = django_db_models.TextField(primary_key=True)  # LEER's own location id
+    name = django_db_models.TextField()
+
+    phone = django_db_models.TextField(null=True, blank=True)
+    phone_digits = django_db_models.TextField(null=True, blank=True)
+    address = django_db_models.TextField(null=True, blank=True)
+    city = django_db_models.TextField(null=True, blank=True)
+    state = django_db_models.TextField(null=True, blank=True)
+    zipcode = django_db_models.TextField(null=True, blank=True)
+    full_address = django_db_models.TextField(null=True, blank=True)
+    lat = django_db_models.FloatField(null=True, blank=True)
+    lng = django_db_models.FloatField(null=True, blank=True)
+    company_id = django_db_models.TextField(null=True, blank=True)
+
+    # Scrape metadata
+    found_via = django_db_models.TextField(null=True, blank=True)
+    distance_mi = django_db_models.FloatField(null=True, blank=True)
+    raw = django_db_models.JSONField(null=True, blank=True)
+    first_seen_at = django_db_models.DateTimeField(default=timezone.now)
+    last_seen_at = django_db_models.DateTimeField(default=timezone.now)
+
+    # Discovered contact details — none of this ships with the locator data
+    website = django_db_models.TextField(null=True, blank=True)
+    website_not_found = django_db_models.BooleanField(default=False, blank=True)
+    website_live = django_db_models.BooleanField(null=True, blank=True)
+    website_checked_at = django_db_models.DateTimeField(null=True, blank=True)
+    email = django_db_models.EmailField(max_length=255, null=True, blank=True)
+    emails = django_db_models.JSONField(default=list, blank=True)
+
+    # AI qualification — same shape as Lead and RealTruckLead
+    is_qualified = django_db_models.BooleanField(null=True, blank=True)
+    business_typology = django_db_models.CharField(max_length=64, null=True, blank=True)
+    confidence_score = django_db_models.IntegerField(null=True, blank=True)
+    brands_mentioned = django_db_models.JSONField(default=list, blank=True)
+    ai_reasoning = django_db_models.TextField(null=True, blank=True)
+    ai_skip_reason = django_db_models.CharField(max_length=255, null=True, blank=True)
+    ai_qualified_at = django_db_models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "leer_leads"
+        indexes = [
+            django_db_models.Index(fields=["state"], name="leer_leads_state_idx"),
+            django_db_models.Index(fields=["zipcode"], name="leer_leads_zipcode_idx"),
+        ]
+
+    def __str__(self):
+        return f"{self.name} ({self.city}, {self.state})"
 
 
 class NotificationEmailLog(django_db_models.Model):
