@@ -1895,6 +1895,13 @@ class MasterPart(django_db_models.Model):
     # 1.65M master parts reach us only through distributors that ship no type signal at all
     # (A-Tech, Keystone, Motor State, Quadratec, DLG), and guessing on those would bury the gap.
     product_type = django_db_models.CharField(max_length=16, null=True, blank=True, db_index=True)
+    # AutoCare PCdb PartTerminologyID -- see PcdbTerminologyFlat for the terminology table and
+    # ProductLineTerminologyMap for the group-level classification this is propagated from.
+    # Not a Django FK to PcdbTerminologyFlat, matching how the Pcdb* tables avoid FKs to each
+    # other (see src/models.py's Pcdb* section) -- validated by application code instead, so a
+    # PCdb reload/migration never has to touch every classified MasterPart row's constraint.
+    # NULL means "not classified yet" -- same never-guess convention as product_type above.
+    part_terminology_id = django_db_models.IntegerField(null=True, blank=True, db_index=True)
     # Which rule produced product_type, e.g. "wheelpros:feed_type", "turn14:category",
     # "pcdb:7644", "keyword:tirerack-tire-size". Provenance is what makes a
     # 3.2M-row classification auditable and selectively re-runnable -- the inferential tiers
@@ -4331,10 +4338,11 @@ class PcdbTerminologyFlat(django_db_models.Model):
 
 class ProductGroup(django_db_models.Model):
     """
-    A terminology-homogeneous grouping of MasterPart rows within one brand, found by masked-title
-    n-gram mining and/or part-number prefix mining (see product_grouping.py). group_key is the
-    masked n-gram or PN prefix that defines the group, not necessarily its real marketing name --
-    display_name is a human-readable label derived from it.
+    A terminology-homogeneous grouping of MasterPart rows within one brand, found by an LLM
+    proposing validated literal-substring match rules from a sample of masked-title residues,
+    applied deterministically across the whole brand (see product_grouping.py: Stages B-F).
+    group_key is a normalized form of display_name (lowercased), which is the canonical name the
+    LLM assigned -- not necessarily the brand's real marketing name for the product line.
     """
     brand = django_db_models.ForeignKey(Brands, on_delete=django_db_models.CASCADE, related_name="product_groups")
     group_key = django_db_models.TextField()
@@ -4359,3 +4367,34 @@ class ProductGroupMember(django_db_models.Model):
 
     class Meta:
         db_table = "product_group_member"
+
+
+class ProductLineTerminologyMap(django_db_models.Model):
+    """
+    Stage I: the PCdb classification decided for one ProductGroup (Stages G/H, see
+    classification.py). One row per group -- a OneToOneField keyed on the group itself rather
+    than a (brand_id, group_key) compound key, since ProductGroup already enforces that
+    uniqueness and this avoids duplicating it.
+
+    part_terminology_id is NULL when nothing could be determined (no retrieval candidates even
+    after keyword-expansion, or the model legitimately found no good match) -- never guessed.
+    splits is set when Stage H found the group's residues aren't actually one terminology; a
+    split map is never auto-applied to MasterPart.part_terminology_id, only surfaced for review
+    (see propagate_to_master_parts in classification.py).
+    """
+    group = django_db_models.OneToOneField(
+        ProductGroup, on_delete=django_db_models.CASCADE, primary_key=True, related_name="terminology_map",
+    )
+    part_terminology_id = django_db_models.IntegerField(null=True, blank=True)
+    confidence = django_db_models.DecimalField(max_digits=3, decimal_places=2, default=0)
+    source = django_db_models.CharField(max_length=32)  # gate | model | model_split | no_candidates | ...
+    splits = django_db_models.JSONField(null=True, blank=True)
+    reasoning = django_db_models.TextField(null=True, blank=True)
+    reviewed_by = django_db_models.CharField(max_length=255, null=True, blank=True)
+    reviewed_at = django_db_models.DateTimeField(null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "product_line_terminology_map"
