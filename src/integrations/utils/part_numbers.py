@@ -172,6 +172,82 @@ TIER_OTHER_PUNCTUATION = "T4_other_punctuation"
 _LOW_RISK_PUNCTUATION = frozenset("-. ")
 
 
+# --------------------------------------------------------------------------------------------
+# Evidence grading for rows that share a brand and a validated GTIN
+#
+# The part-number tiers above cannot relate two spellings that are not string-similar at all --
+# Premier ships Toyo's '357280' as 'TOY357280'; A-Tech numbers ~41,000 rows 'S0845'-style because
+# its feed has no manufacturer part number for them (confirmed: its mfr_part_number column repeats
+# the same placeholder). Only a shared barcode links those.
+#
+# A shared barcode alone is NOT enough: in production 7,185 groups have the same distributor on
+# both sides under different SKUs -- genuinely two products -- and a single wrong barcode in one
+# feed would silently merge unrelated parts. So groups are graded by whether anything *else*
+# corroborates, and callers decide how weak a grade they will act on.
+#
+# Used by both master_part_matching (at ingest) and the cleanup script, so the two can never
+# disagree about what counts as evidence.
+# --------------------------------------------------------------------------------------------
+
+GTIN_EVIDENCE_SKU_BRIDGE = 1      # one row's sku IS the other's part number -- two signals
+GTIN_EVIDENCE_PLACEHOLDER = 2     # 'S####' is a catalog artifact, not a competing product
+GTIN_EVIDENCE_LEADING_ZERO = 3    # '010140' vs '10140'
+GTIN_EVIDENCE_PREFIX_SUFFIX = 4   # 'TOY357280' vs '357280' -- substring plus barcode
+GTIN_EVIDENCE_UNRELATED = 5       # the barcode is the ONLY link
+
+GTIN_EVIDENCE_LABELS = {
+    GTIN_EVIDENCE_SKU_BRIDGE: "sku bridges the two spellings",
+    GTIN_EVIDENCE_PLACEHOLDER: "placeholder part number vs real part",
+    GTIN_EVIDENCE_LEADING_ZERO: "leading zeros differ",
+    GTIN_EVIDENCE_PREFIX_SUFFIX: "brand prefix / suffix",
+    GTIN_EVIDENCE_UNRELATED: "unrelated part numbers (barcode alone)",
+}
+
+# A-Tech's placeholder shape. Deliberately strict: a real manufacturer part number of this exact
+# form would be unusual, and being wrong here means merging two real products.
+_PLACEHOLDER_PART_NUMBER_RE = re.compile(r"^S\d{4}$")
+
+
+def is_placeholder_part_number(part_number: typing.Optional[str]) -> bool:
+    """True for catalog-artifact part numbers such as A-Tech's ``S0845``."""
+    return bool(_PLACEHOLDER_PART_NUMBER_RE.match(strip_non_printable(part_number).upper()))
+
+
+def classify_gtin_evidence(
+    entries: typing.Sequence[typing.Tuple[str, typing.Optional[str]]],
+) -> int:
+    """
+    Grade what corroborates a shared barcode, given ``(part_number, sku)`` for each row.
+
+    Returns one of the ``GTIN_EVIDENCE_*`` constants, lowest (strongest) that applies. Callers
+    gate on it: accepting up to ``GTIN_EVIDENCE_PREFIX_SUFFIX`` acts only where something beyond
+    the barcode agrees, while ``GTIN_EVIDENCE_UNRELATED`` should normally be refused.
+    """
+    part_numbers = [p for p, _ in entries]
+    keys = {normalize_part_number(p) for p in part_numbers}
+
+    for part_number, sku in entries:
+        sku_key = normalize_part_number(sku or "")
+        if not sku_key:
+            continue
+        if any(sku_key == normalize_part_number(other) and other != part_number
+               for other in part_numbers):
+            return GTIN_EVIDENCE_SKU_BRIDGE
+
+    if any(is_placeholder_part_number(p) for p in part_numbers):
+        return GTIN_EVIDENCE_PLACEHOLDER
+
+    populated = sorted((k for k in keys if k), key=len)
+    if len(populated) >= 2:
+        shortest, longest = populated[0], populated[-1]
+        if shortest != longest:
+            if shortest.lstrip("0") == longest.lstrip("0"):
+                return GTIN_EVIDENCE_LEADING_ZERO
+            if longest.endswith(shortest) or longest.startswith(shortest):
+                return GTIN_EVIDENCE_PREFIX_SUFFIX
+    return GTIN_EVIDENCE_UNRELATED
+
+
 def classify_tier(part_numbers: typing.Iterable[str]) -> str:
     """
     Classify what actually differs between spellings that share a normalized key.

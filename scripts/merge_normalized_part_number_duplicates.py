@@ -43,6 +43,7 @@ Use ``run_name=...`` (not ``__main__``) so the script does not start the interac
 """
 import collections
 import csv
+import re
 import os
 import sys
 import typing
@@ -318,6 +319,123 @@ def find_merge_candidates(limit: typing.Optional[int] = None) -> Report:
             group = evaluate_group(members[0].brand_id, key, members)
             (auto if group.safe else review).append(group)
 
+    return Report(auto_mergeable=auto, needs_review=review)
+
+
+# --------------------------------------------------------------------------------------------
+# GTIN-anchored duplicates
+#
+# Everything above keys on the normalized part number, which by construction cannot see two rows
+# whose part numbers are not string-related at all. Three large families are invisible to it and
+# only a shared barcode links them:
+#
+#   * brand prefix/suffix -- Premier ships Toyo's '357280' as 'TOY357280'; the same habit shows up
+#     in Turn14 (ZON, ATI, CAM), Meyer, A-Tech, WheelPros and others across ~19,000 instances;
+#   * A-Tech placeholder part numbers -- 41,861 rows numbered 'S0845'-style rather than with the
+#     manufacturer's MPN, of which ~14,800 duplicate a real row;
+#   * leading-zero differences that also change length.
+#
+# A shared GTIN alone is NOT sufficient evidence: 7,185 groups have the same distributor on both
+# sides under different SKUs (genuinely two products), and 167 groups put more than four rows on
+# one barcode (shared or bogus). Those are excluded outright. Of what remains, groups are graded
+# by whether a *second* signal corroborates the barcode -- see pn_util.classify_gtin_evidence.
+# --------------------------------------------------------------------------------------------
+
+# GTIN digit-core: digits only, leading zeros stripped. Mirrors the first half of
+# pn_util.normalize_gtin so Postgres can group on it; the check digit is validated in Python.
+_GTIN_CORE_SQL = r"ltrim(regexp_replace(coalesce(gtin, ''), '\D', '', 'g'), '0')"
+
+
+
+# Evidence grading lives in pn_util so the ingest rung (master_part_matching.resolve_gtin_matches)
+# and this cleanup can never disagree about what counts as corroboration.
+
+
+def _gtin_candidate_id_groups() -> typing.List[typing.List[int]]:
+    """Narrow to rows sharing a brand and a GTIN digit-core, grouped in Postgres."""
+    with connection.cursor() as cur:
+        cur.execute(
+            """
+            SELECT array_agg(id ORDER BY id)
+            FROM master_parts
+            WHERE gtin IS NOT NULL AND gtin <> '' AND {core} <> ''
+            GROUP BY brand_id, {core}
+            HAVING count(*) > 1
+            """.format(core=_GTIN_CORE_SQL)
+        )
+        return [row[0] for row in cur.fetchall()]
+
+
+def _classify_gtin_group(rows: typing.Sequence[MasterPartRow]) -> int:
+    """Grade the corroborating evidence beyond the shared barcode (see pn_util)."""
+    return pn_util.classify_gtin_evidence([(r.part_number, r.sku) for r in rows])
+
+
+def evaluate_gtin_group(rows: typing.List[MasterPartRow], max_tier: int) -> Group:
+    """
+    Decide whether rows sharing a brand and barcode are safe to merge.
+
+    ``max_tier`` is the weakest evidence grade accepted (see pn_util); tier 5 -- where the
+    barcode is the only link -- should normally be excluded, since a single wrong barcode in one
+    feed would silently merge two unrelated parts and nothing in the data would reveal it.
+    """
+    gtins = {r.normalized_gtin for r in rows if r.normalized_gtin}
+    tier = _classify_gtin_group(rows)
+    overlap = _providers_overlap(rows)
+
+    def build(safe: bool, reason: str) -> Group:
+        return Group(
+            brand_id=rows[0].brand_id,
+            normalized_part_number="gtin:{}".format(sorted(gtins)[0] if gtins else "?"),
+            rows=rows, tier="G{}_{}".format(tier, pn_util.GTIN_EVIDENCE_LABELS[tier]),
+            gtin_verdict=GTIN_AGREE if len(gtins) == 1 else GTIN_CONFLICT,
+            providers_overlap=overlap, sign_conflict=False,
+            has_gtin_blind_side=False, safe=safe, reason=reason,
+        )
+
+    if len(gtins) != 1:
+        return build(False, "barcodes do not actually agree once validated")
+    if len(rows) > MAX_GROUP_SIZE:
+        return build(False, "group larger than {} rows (shared/bogus barcode)".format(MAX_GROUP_SIZE))
+    if overlap:
+        return build(False, "same provider on both sides (distinct products)")
+    if len({pn_util.normalize_part_number(r.part_number) for r in rows}) < 2:
+        return build(False, "same normalized part number (handled by the part-number pass)")
+    if tier > max_tier:
+        return build(False, "tier {} ({}) -- needs review".format(tier, pn_util.GTIN_EVIDENCE_LABELS[tier]))
+    return build(True, "safe: tier {} ({}) + barcode agrees + providers disjoint".format(
+        tier, pn_util.GTIN_EVIDENCE_LABELS[tier]))
+
+
+def find_gtin_merge_candidates(max_tier: int = pn_util.GTIN_EVIDENCE_PREFIX_SUFFIX,
+                               limit: typing.Optional[int] = None) -> Report:
+    """
+    Find duplicates that share a brand and a validated GTIN but whose part numbers the
+    normalized-part-number pass cannot relate. Read-only.
+
+    Defaults to accepting tiers 1-4 and holding tier 5 (barcode-only) for review.
+    """
+    id_groups = _gtin_candidate_id_groups()
+    if limit is not None:
+        id_groups = id_groups[:limit]
+    print("Found {} candidate barcode groups from SQL; re-judging in Python...".format(len(id_groups)))
+
+    rows_by_id = _load_rows([i for group in id_groups for i in group])
+    auto: typing.List[Group] = []
+    review: typing.List[Group] = []
+    for ids in id_groups:
+        rows = [rows_by_id[i] for i in ids if i in rows_by_id]
+        # Re-group on the *validated* GTIN: the SQL core ignores the check digit, so one SQL
+        # group can hold rows whose barcodes do not really match.
+        by_gtin: typing.Dict[str, typing.List[MasterPartRow]] = collections.defaultdict(list)
+        for row in rows:
+            if row.normalized_gtin:
+                by_gtin[row.normalized_gtin].append(row)
+        for members in by_gtin.values():
+            if len(members) < 2:
+                continue
+            group = evaluate_gtin_group(members, max_tier=max_tier)
+            (auto if group.safe else review).append(group)
     return Report(auto_mergeable=auto, needs_review=review)
 
 

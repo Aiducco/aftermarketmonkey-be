@@ -8,12 +8,19 @@ Every provider ingest in ``master_parts.py`` looks up existing rows with an exac
 creates its own MasterPart, splitting one physical part across several rows with disjoint
 provider sets. See ``docs/PART_NUMBER_NORMALIZATION.md`` for the production survey.
 
-This module is the *second* rung of each ingest's lookup ladder, tried only for feed rows that
-the exact match already failed to place:
+This module supplies rungs 2-4 of each ingest's lookup ladder, tried in order for feed rows the
+exact match failed to place:
 
-1. exact ``(brand_id, part_number)``            -- unchanged, always wins
-2. ``resolve_normalized_matches`` (this module) -- formatting-only differences, heavily guarded
-3. otherwise                                    -- create a new MasterPart, as before
+1. exact ``(brand_id, part_number)``   -- unchanged, always wins
+2. ``resolve_normalized_matches``      -- formatting-only differences ('MS 96587' / 'MS96587')
+3. ``resolve_sku_matches``             -- same sku within the brand; the bridging value
+                                          distributors agree on when part numbers differ, and the
+                                          only rung that reaches the ~706,000 barcode-less rows
+4. ``resolve_gtin_matches``            -- same validated barcode; the only rung that can relate
+                                          part numbers with no string similarity at all, such as
+                                          Premier's 'TOY357280' for Toyo's '357280' or A-Tech's
+                                          'S0845' placeholders
+   otherwise                           -- create a new MasterPart, as before
 
 **The guards are the point, not the normalization.** Punctuation is load-bearing in this domain:
 ``942B-89060+12`` and ``942B-89060-12`` are different wheel offsets that normalize to the same
@@ -25,6 +32,7 @@ costs a duplicate row; a wrong match puts the wrong physical part in a customer'
 """
 import collections
 import logging
+import re
 import typing
 
 from django.db import connection
@@ -67,12 +75,16 @@ class FeedPart(typing.NamedTuple):
     # distributor lists these as two different parts" apart from "a previous merge already
     # attached this very feed row to the candidate" -- see resolve_normalized_matches.
     provider_external_id: typing.Optional[str] = None
+    # The bridging value distributors tend to agree on even when part numbers differ; see
+    # resolve_sku_matches. Optional -- ingests that do not set a sku simply skip that rung.
+    sku: typing.Optional[str] = None
 
 
 class _Candidate(typing.NamedTuple):
     master_part_id: int
     part_number: str
     gtin: typing.Optional[str]
+    sku: typing.Optional[str] = None
 
 
 def _chunked(items, size=_LOOKUP_CHUNK):
@@ -286,6 +298,244 @@ def resolve_normalized_matches(
     return resolved
 
 
+# Must stay identical to the expression in migration 0168, or Postgres will not use the index.
+# Digits only, leading zeros stripped -- the first half of pn_util.normalize_gtin. The check
+# digit is validated in Python, so this groups slightly more loosely and only ever widens the
+# candidate set.
+_GTIN_CORE_SQL = r"ltrim(regexp_replace(coalesce(gtin, ''), '\D', '', 'g'), '0')"
+
+_NON_DIGIT_RE = re.compile(r"\D")
+
+# Weakest evidence grade the ingest will act on. Tier 5 (barcode is the only link) is refused:
+# a single wrong barcode in one feed would silently attach a part to the wrong master part, and
+# nothing in the data would reveal it. The cleanup script defaults to the same ceiling.
+MAX_GTIN_EVIDENCE_TIER = pn_util.GTIN_EVIDENCE_PREFIX_SUFFIX
+
+# More than this many rows on one barcode means a shared or bogus barcode, not one part.
+_MAX_GTIN_CANDIDATES = 4
+
+
+def _gtin_cores(raw: typing.Optional[str]) -> typing.Set[str]:
+    """
+    Index keys to probe for a feed barcode.
+
+    Two, because ``normalize_gtin`` repairs values whose check digit the feed dropped: such a row
+    may be stored either as shipped or as repaired, and both forms must be found.
+    """
+    validated = pn_util.normalize_gtin(raw)
+    if not validated:
+        return set()
+    cores = {validated.lstrip("0")}
+    as_shipped = _NON_DIGIT_RE.sub("", pn_util.strip_non_printable(raw)).lstrip("0")
+    if as_shipped:
+        cores.add(as_shipped)
+    return {c for c in cores if c}
+
+
+def resolve_sku_matches(
+    feed_parts: typing.Sequence[FeedPart],
+    provider_id: int,
+) -> typing.Dict[typing.Tuple[int, str], int]:
+    """
+    Map ``(brand_id, part_number)`` -> existing ``MasterPart.id`` where an existing row carries
+    the *same sku* within the brand.
+
+    ``sku`` is the bridging value distributors already agree on even when their part numbers
+    differ: A-Tech ships BDS's ``BDS123263`` while Premier ships ``123263``, and *both* rows carry
+    ``sku='BDS123263'``. Meyer and WheelPros have always resolved on ``(brand_id, sku)`` first;
+    the other ingests never did, which is why those pairs split.
+
+    This rung matters most for the ~706,000 master parts with no barcode at all, which
+    ``resolve_gtin_matches`` can never help. Uses the existing ``master_parts_brand_sku_idx``.
+
+    **A conflicting barcode vetoes the match.** In production 32 groups share a brand and sku, and
+    look like a clean prefix pair, yet carry different validated barcodes (BDS ``BDS55382`` vs
+    ``55382`` on two different BDS barcode ranges). Those would be silent wrong merges, so a sku
+    match is refused whenever both sides have a barcode and the barcodes disagree.
+    """
+    if not feed_parts:
+        return {}
+
+    probes: typing.Dict[typing.Tuple[int, str], typing.List[FeedPart]] = collections.defaultdict(list)
+    for feed_part in feed_parts:
+        sku_key = pn_util.normalize_part_number(feed_part.sku or "")
+        if sku_key:
+            probes[(feed_part.brand_id, sku_key)].append(feed_part)
+    if not probes:
+        return {}
+
+    candidates: typing.Dict[typing.Tuple[int, str], typing.List[_Candidate]] = collections.defaultdict(list)
+    for chunk in _chunked(sorted(probes)):
+        brand_ids = {b for b, _ in chunk}
+        with connection.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, brand_id, part_number, sku, gtin
+                FROM master_parts
+                WHERE brand_id IN %s AND sku IS NOT NULL AND sku <> ''
+                """,
+                (tuple(sorted(brand_ids)),),
+            )
+            wanted = set(chunk)
+            for master_part_id, brand_id, part_number, sku, gtin in cur.fetchall():
+                key = (brand_id, pn_util.normalize_part_number(sku))
+                if key in wanted:
+                    candidates[key].append(
+                        _Candidate(master_part_id=master_part_id, part_number=part_number or "",
+                                   gtin=gtin, sku=sku)
+                    )
+
+    candidate_ids = {c.master_part_id for group in candidates.values() for c in group}
+    if not candidate_ids:
+        return {}
+    external_ids_on_candidate = _provider_external_ids_on(candidate_ids, provider_id=provider_id)
+
+    resolved: typing.Dict[typing.Tuple[int, str], int] = {}
+    skipped = collections.Counter()
+    for (brand_id, sku_key), feed_rows in probes.items():
+        found = candidates.get((brand_id, sku_key)) or []
+        for feed_part in feed_rows:
+            feed_key = pn_util.normalize_part_number(feed_part.part_number)
+            # A row already under this part number is the exact-match case, not ours.
+            usable = [c for c in found
+                      if pn_util.normalize_part_number(c.part_number) != feed_key]
+            if not usable:
+                skipped["no_sku_candidate"] += 1
+                continue
+            if len({c.master_part_id for c in usable}) > 1:
+                skipped["ambiguous_sku"] += 1
+                continue
+            candidate = usable[0]
+
+            existing = external_ids_on_candidate.get(candidate.master_part_id) or set()
+            own = (feed_part.provider_external_id or "").strip()
+            if existing and own not in existing:
+                skipped["provider_lists_other_part_here"] += 1
+                continue
+
+            feed_gtin = pn_util.normalize_gtin(feed_part.gtin)
+            candidate_gtin = pn_util.normalize_gtin(candidate.gtin)
+            if feed_gtin and candidate_gtin and feed_gtin != candidate_gtin:
+                skipped["barcode_conflict"] += 1
+                continue
+
+            resolved[(feed_part.brand_id, feed_part.part_number)] = candidate.master_part_id
+            skipped["matched"] += 1
+
+    if resolved or skipped:
+        logger.info(
+            "{} provider_id={}: sku rung, {} rows -> {} matched; {}".format(
+                _LOG_PREFIX, provider_id, len(feed_parts), len(resolved), dict(skipped)
+            )
+        )
+    return resolved
+
+
+def resolve_gtin_matches(
+    feed_parts: typing.Sequence[FeedPart],
+    provider_id: int,
+    max_evidence_tier: int = MAX_GTIN_EVIDENCE_TIER,
+) -> typing.Dict[typing.Tuple[int, str], int]:
+    """
+    Map ``(brand_id, part_number)`` -> existing ``MasterPart.id`` for feed rows whose *barcode*
+    identifies an existing row, even though the part numbers are not string-related.
+
+    This is the third and last rung of the ladder, for rows the exact and normalized lookups both
+    failed to place. It exists because those two can never see:
+
+    - a distributor that prefixes the manufacturer number (Premier's ``TOY357280`` for Toyo's
+      ``357280``; Turn14, Meyer, A-Tech and WheelPros do the same for other brands);
+    - A-Tech's ~41,000 ``S0845``-style placeholder part numbers, which its feed supplies because
+      it has no manufacturer part number for those rows at all.
+
+    Guarded the same way as the normalized rung, plus an evidence grade: a shared barcode on its
+    own is refused (see ``pn_util.classify_gtin_evidence``), because production has 7,185 groups
+    where one distributor sells two different products under one barcode.
+    """
+    if not feed_parts:
+        return {}
+
+    probes: typing.Dict[typing.Tuple[int, str], typing.List[FeedPart]] = collections.defaultdict(list)
+    for feed_part in feed_parts:
+        for core in _gtin_cores(feed_part.gtin):
+            probes[(feed_part.brand_id, core)].append(feed_part)
+    if not probes:
+        return {}
+
+    candidates: typing.Dict[typing.Tuple[int, str], typing.List[_Candidate]] = collections.defaultdict(list)
+    for chunk in _chunked(sorted(probes)):
+        with connection.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, brand_id, part_number, sku, gtin
+                FROM master_parts
+                WHERE gtin IS NOT NULL AND gtin <> '' AND (brand_id, {core}) IN %s
+                """.format(core=_GTIN_CORE_SQL),
+                (tuple(chunk),),
+            )
+            for master_part_id, brand_id, part_number, sku, gtin in cur.fetchall():
+                for core in _gtin_cores(gtin):
+                    candidates[(brand_id, core)].append(
+                        _Candidate(master_part_id=master_part_id, part_number=part_number or "",
+                                   gtin=gtin, sku=sku)
+                    )
+
+    candidate_ids = {c.master_part_id for group in candidates.values() for c in group}
+    if not candidate_ids:
+        return {}
+    external_ids_on_candidate = _provider_external_ids_on(candidate_ids, provider_id=provider_id)
+
+    resolved: typing.Dict[typing.Tuple[int, str], int] = {}
+    skipped = collections.Counter()
+    for feed_part in feed_parts:
+        feed_gtin = pn_util.normalize_gtin(feed_part.gtin)
+        if not feed_gtin:
+            continue
+        found = {}
+        for core in _gtin_cores(feed_part.gtin):
+            for cand in candidates.get((feed_part.brand_id, core), ()):
+                if pn_util.normalize_gtin(cand.gtin) == feed_gtin:
+                    found[cand.master_part_id] = cand
+        # A row already carrying this part number is the exact-match case, not ours to touch.
+        found = {
+            k: c for k, c in found.items()
+            if pn_util.normalize_part_number(c.part_number)
+            != pn_util.normalize_part_number(feed_part.part_number)
+        }
+        if not found:
+            skipped["no_barcode_candidate"] += 1
+            continue
+        if len(found) > 1 or len(found) > _MAX_GTIN_CANDIDATES:
+            skipped["ambiguous_barcode"] += 1
+            continue
+        candidate = next(iter(found.values()))
+
+        existing = external_ids_on_candidate.get(candidate.master_part_id) or set()
+        own = (feed_part.provider_external_id or "").strip()
+        if existing and own not in existing:
+            # This provider already sells something else off that master part.
+            skipped["provider_lists_other_part_here"] += 1
+            continue
+
+        tier = pn_util.classify_gtin_evidence([
+            (feed_part.part_number, None),
+            (candidate.part_number, candidate.sku),
+        ])
+        if tier > max_evidence_tier:
+            skipped["evidence_tier_{}".format(tier)] += 1
+            continue
+        resolved[(feed_part.brand_id, feed_part.part_number)] = candidate.master_part_id
+        skipped["matched_tier_{}".format(tier)] += 1
+
+    if resolved or skipped:
+        logger.info(
+            "{} provider_id={}: barcode rung, {} rows -> {} matched; {}".format(
+                _LOG_PREFIX, provider_id, len(feed_parts), len(resolved), dict(skipped)
+            )
+        )
+    return resolved
+
+
 def extend_with_normalized_matches(
     existing_by_key: typing.Dict[typing.Tuple[int, str], int],
     pairs: typing.Sequence[typing.Tuple[int, str]],
@@ -293,6 +543,9 @@ def extend_with_normalized_matches(
     provider_id: int,
     provider_kind: typing.Optional[int] = None,
     external_id_by_key: typing.Optional[
+        typing.Mapping[typing.Tuple[int, str], typing.Optional[str]]
+    ] = None,
+    sku_by_key: typing.Optional[
         typing.Mapping[typing.Tuple[int, str], typing.Optional[str]]
     ] = None,
 ) -> int:
@@ -312,6 +565,7 @@ def extend_with_normalized_matches(
     if not unplaced:
         return 0
     external_id_by_key = external_id_by_key or {}
+    sku_by_key = sku_by_key or {}
     matches = resolve_normalized_matches(
         [
             FeedPart(
@@ -326,6 +580,45 @@ def extend_with_normalized_matches(
         provider_kind=provider_kind,
     )
     existing_by_key.update(matches)
+
+    # Third rung: rows the exact and normalized lookups both failed to place may still be
+    # identifiable by barcode alone -- a prefixed part number, or a placeholder the feed supplies
+    # because it has no manufacturer part number. Refused unless something beyond the barcode
+    # corroborates; see resolve_gtin_matches.
+    still_unplaced = [key for key in pairs if existing_by_key.get(key) is None]
+    if still_unplaced and sku_by_key:
+        by_sku = resolve_sku_matches(
+            [
+                FeedPart(
+                    brand_id=brand_id,
+                    part_number=part_number,
+                    gtin=gtin_by_key.get((brand_id, part_number)),
+                    provider_external_id=external_id_by_key.get((brand_id, part_number)),
+                    sku=sku_by_key.get((brand_id, part_number)),
+                )
+                for brand_id, part_number in still_unplaced
+            ],
+            provider_id=provider_id,
+        )
+        existing_by_key.update(by_sku)
+        matches = dict(matches, **by_sku)
+
+    still_unplaced = [key for key in pairs if existing_by_key.get(key) is None]
+    if still_unplaced:
+        by_barcode = resolve_gtin_matches(
+            [
+                FeedPart(
+                    brand_id=brand_id,
+                    part_number=part_number,
+                    gtin=gtin_by_key.get((brand_id, part_number)),
+                    provider_external_id=external_id_by_key.get((brand_id, part_number)),
+                )
+                for brand_id, part_number in still_unplaced
+            ],
+            provider_id=provider_id,
+        )
+        existing_by_key.update(by_barcode)
+        matches = dict(matches, **by_barcode)
     return len(matches)
 
 
