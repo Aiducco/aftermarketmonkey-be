@@ -3844,3 +3844,292 @@ class ConnectionAttempt(django_db_models.Model):
         return "{} {} attempt by company {} ({})".format(
             self.provider_id, self.action, self.company_id, "ok" if self.success else "failed"
         )
+
+
+# ---------------------------------------------------------------------------
+# AutoCare PCdb (Part Classification database) -- raw mirror tables + computed flat view.
+#
+# The Pcdb* models below are a verbatim, untransformed mirror of AutoCare's PCdb JSON export
+# (one model per JSON file, fields matching the JSON keys) -- loaded by the load_pcdb
+# management command. IDs are plain IntegerFields, not Django ForeignKeys: this data arrives
+# as flat files with no guaranteed load order and is meant to be joined in Python/SQL when
+# building PcdbTerminologyFlat, not relationally enforced at load time.
+#
+# NOTE: PCdb's own canonical schema historically shipped a denormalized CodeMaster table
+# (PartTerminologyID x PositionID x SubCategoryID x CategoryID in one row) as a convenience
+# join of PartCategory + PartPosition. The 2026-07-30 export used here dropped CodeMaster and
+# ships only the two normalized source tables (PcdbPartCategory, PcdbPartPosition) -- verified
+# against an older 2025-08-28 export that shipped both CodeMaster.json and an official
+# ChangeTableNames.json registry already listing PartCategory/PartPosition as the real table
+# names. PcdbTerminologyFlat does the category join itself; nothing here needs CodeMaster.
+# ---------------------------------------------------------------------------
+
+class PcdbVersion(django_db_models.Model):
+    database_name = django_db_models.TextField(null=True, blank=True)
+    version = django_db_models.TextField(null=True, blank=True)
+    publication_date = django_db_models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "pcdb_version"
+
+
+class PcdbCategories(django_db_models.Model):
+    category_id = django_db_models.IntegerField(primary_key=True)
+    category_name = django_db_models.TextField(null=True, blank=True)
+    culture_id = django_db_models.CharField(max_length=16, null=True, blank=True)
+    effective_date_time = django_db_models.DateTimeField(null=True, blank=True)
+    end_date_time = django_db_models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "pcdb_categories"
+
+
+class PcdbSubCategories(django_db_models.Model):
+    subcategory_id = django_db_models.IntegerField(primary_key=True)
+    subcategory_name = django_db_models.TextField(null=True, blank=True)
+    culture_id = django_db_models.CharField(max_length=16, null=True, blank=True)
+    effective_date_time = django_db_models.DateTimeField(null=True, blank=True)
+    end_date_time = django_db_models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "pcdb_subcategories"
+
+
+class PcdbParts(django_db_models.Model):
+    part_terminology_id = django_db_models.IntegerField(primary_key=True)
+    part_terminology_name = django_db_models.TextField(null=True, blank=True)
+    part_terminology_description = django_db_models.TextField(null=True, blank=True)
+    culture_id = django_db_models.CharField(max_length=16, null=True, blank=True)
+    effective_date_time = django_db_models.DateTimeField(null=True, blank=True)
+    end_date_time = django_db_models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "pcdb_parts"
+
+
+class PcdbPartCategory(django_db_models.Model):
+    part_category_id = django_db_models.IntegerField(primary_key=True)
+    part_terminology_id = django_db_models.IntegerField(db_index=True)
+    subcategory_id = django_db_models.IntegerField(null=True, blank=True)
+    category_id = django_db_models.IntegerField(null=True, blank=True)
+    effective_date_time = django_db_models.DateTimeField(null=True, blank=True)
+    end_date_time = django_db_models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "pcdb_part_category"
+
+
+class PcdbPositions(django_db_models.Model):
+    position_id = django_db_models.IntegerField(primary_key=True)
+    position = django_db_models.TextField(null=True, blank=True)
+    culture_id = django_db_models.CharField(max_length=16, null=True, blank=True)
+    effective_date_time = django_db_models.DateTimeField(null=True, blank=True)
+    end_date_time = django_db_models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "pcdb_positions"
+
+
+class PcdbPartPosition(django_db_models.Model):
+    part_position_id = django_db_models.IntegerField(primary_key=True)
+    part_terminology_id = django_db_models.IntegerField(db_index=True)
+    position_id = django_db_models.IntegerField(null=True, blank=True)
+    effective_date_time = django_db_models.DateTimeField(null=True, blank=True)
+    end_date_time = django_db_models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "pcdb_part_position"
+
+
+class PcdbAlias(django_db_models.Model):
+    alias_id = django_db_models.IntegerField(primary_key=True)
+    alias_name = django_db_models.TextField(null=True, blank=True)
+    culture_id = django_db_models.CharField(max_length=16, null=True, blank=True)
+    effective_date_time = django_db_models.DateTimeField(null=True, blank=True)
+    end_date_time = django_db_models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "pcdb_alias"
+
+
+class PcdbPartsToAlias(django_db_models.Model):
+    parts_to_alias_id = django_db_models.IntegerField(primary_key=True)
+    part_terminology_id = django_db_models.IntegerField(db_index=True)
+    alias_id = django_db_models.IntegerField(null=True, blank=True)
+    effective_date_time = django_db_models.DateTimeField(null=True, blank=True)
+    end_date_time = django_db_models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "pcdb_parts_to_alias"
+
+
+class PcdbUse(django_db_models.Model):
+    use_id = django_db_models.IntegerField(primary_key=True)
+    use_description = django_db_models.TextField(null=True, blank=True)
+    culture_id = django_db_models.CharField(max_length=16, null=True, blank=True)
+    effective_date_time = django_db_models.DateTimeField(null=True, blank=True)
+    end_date_time = django_db_models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "pcdb_use"
+
+
+class PcdbPartsToUse(django_db_models.Model):
+    parts_to_use_id = django_db_models.IntegerField(primary_key=True)
+    part_terminology_id = django_db_models.IntegerField(db_index=True)
+    use_id = django_db_models.IntegerField(null=True, blank=True)
+    effective_date_time = django_db_models.DateTimeField(null=True, blank=True)
+    end_date_time = django_db_models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "pcdb_parts_to_use"
+
+
+class PcdbPartsRelationship(django_db_models.Model):
+    parts_relationship_id = django_db_models.IntegerField(primary_key=True)
+    part_terminology_id = django_db_models.IntegerField(db_index=True)
+    related_part_terminology_id = django_db_models.IntegerField(null=True, blank=True)
+    effective_date_time = django_db_models.DateTimeField(null=True, blank=True)
+    end_date_time = django_db_models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "pcdb_parts_relationship"
+
+
+class PcdbPartsSupersession(django_db_models.Model):
+    parts_supersession_id = django_db_models.IntegerField(primary_key=True)
+    old_part_terminology_id = django_db_models.IntegerField(db_index=True)
+    old_part_terminology_name = django_db_models.TextField(null=True, blank=True)
+    new_part_terminology_id = django_db_models.IntegerField(null=True, blank=True, db_index=True)
+    new_part_terminology_name = django_db_models.TextField(null=True, blank=True)
+    note = django_db_models.TextField(null=True, blank=True)
+    culture_id = django_db_models.CharField(max_length=16, null=True, blank=True)
+    effective_date_time = django_db_models.DateTimeField(null=True, blank=True)
+    end_date_time = django_db_models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "pcdb_parts_supersession"
+
+
+class PcdbACESCodedValues(django_db_models.Model):
+    aces_coded_value_id = django_db_models.IntegerField(primary_key=True)
+    element = django_db_models.TextField(null=True, blank=True)
+    attribute = django_db_models.TextField(null=True, blank=True)
+    code_value = django_db_models.TextField(null=True, blank=True)
+    code_description = django_db_models.TextField(null=True, blank=True)
+    culture_id = django_db_models.CharField(max_length=16, null=True, blank=True)
+    effective_date_time = django_db_models.DateTimeField(null=True, blank=True)
+    end_date_time = django_db_models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "pcdb_aces_coded_values"
+
+
+class PcdbPIESSegment(django_db_models.Model):
+    segment_id = django_db_models.IntegerField(primary_key=True)
+    segment_abb = django_db_models.TextField(null=True, blank=True)
+    segment_name = django_db_models.TextField(null=True, blank=True)
+    segment_description = django_db_models.TextField(null=True, blank=True)
+    culture_id = django_db_models.CharField(max_length=16, null=True, blank=True)
+    effective_date_time = django_db_models.DateTimeField(null=True, blank=True)
+    end_date_time = django_db_models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "pcdb_pies_segment"
+
+
+class PcdbPIESField(django_db_models.Model):
+    field_id = django_db_models.IntegerField(primary_key=True)
+    segment_id = django_db_models.IntegerField(null=True, blank=True)
+    reference_field_number = django_db_models.TextField(null=True, blank=True)
+    field_name = django_db_models.TextField(null=True, blank=True)
+    culture_id = django_db_models.CharField(max_length=16, null=True, blank=True)
+    effective_date_time = django_db_models.DateTimeField(null=True, blank=True)
+    end_date_time = django_db_models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "pcdb_pies_field"
+
+
+class PcdbPIESCode(django_db_models.Model):
+    code_value_id = django_db_models.IntegerField(primary_key=True)
+    code_value = django_db_models.TextField(null=True, blank=True)
+    code_description = django_db_models.TextField(null=True, blank=True)
+    code_format = django_db_models.TextField(null=True, blank=True)
+    field_format = django_db_models.TextField(null=True, blank=True)
+    source = django_db_models.TextField(null=True, blank=True)
+    source_website_link = django_db_models.TextField(null=True, blank=True)
+    culture_id = django_db_models.CharField(max_length=16, null=True, blank=True)
+    effective_date_time = django_db_models.DateTimeField(null=True, blank=True)
+    end_date_time = django_db_models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "pcdb_pies_code"
+
+
+class PcdbPIESEXPIGroup(django_db_models.Model):
+    expi_group_id = django_db_models.IntegerField(primary_key=True)
+    expi_group_code = django_db_models.TextField(null=True, blank=True)
+    expi_group_description = django_db_models.TextField(null=True, blank=True)
+    culture_id = django_db_models.CharField(max_length=16, null=True, blank=True)
+    effective_date_time = django_db_models.DateTimeField(null=True, blank=True)
+    end_date_time = django_db_models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "pcdb_pies_expi_group"
+
+
+class PcdbPIESEXPICode(django_db_models.Model):
+    expi_code_id = django_db_models.IntegerField(primary_key=True)
+    expi_code = django_db_models.TextField(null=True, blank=True)
+    expi_code_description = django_db_models.TextField(null=True, blank=True)
+    expi_group_id = django_db_models.IntegerField(null=True, blank=True)
+    culture_id = django_db_models.CharField(max_length=16, null=True, blank=True)
+    effective_date_time = django_db_models.DateTimeField(null=True, blank=True)
+    end_date_time = django_db_models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "pcdb_pies_expi_code"
+
+
+class PcdbPIESReferenceFieldCode(django_db_models.Model):
+    reference_field_code_id = django_db_models.IntegerField(primary_key=True)
+    field_id = django_db_models.IntegerField(null=True, blank=True)
+    code_value_id = django_db_models.IntegerField(null=True, blank=True)
+    expi_code_id = django_db_models.IntegerField(null=True, blank=True)
+    reference_notes = django_db_models.TextField(null=True, blank=True)
+    culture_id = django_db_models.CharField(max_length=16, null=True, blank=True)
+    effective_date_time = django_db_models.DateTimeField(null=True, blank=True)
+    end_date_time = django_db_models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "pcdb_pies_reference_field_code"
+
+
+class PcdbTerminologyFlat(django_db_models.Model):
+    """
+    Computed from the raw Pcdb* mirror tables above (see load_pcdb management command) -- one
+    row per PCdb PartTerminologyID, with category/subcategory resolved, supersession walked to
+    its terminal replacement, and ACES/PIES validity flags attached. This is the table the
+    future part-classification pipeline reads from; the raw Pcdb* tables above are provenance,
+    not meant to be queried directly by that pipeline.
+    """
+    part_terminology_id = django_db_models.IntegerField(primary_key=True)
+    name = django_db_models.TextField()
+    category_id = django_db_models.IntegerField(null=True, blank=True)
+    category_name = django_db_models.TextField(null=True, blank=True)
+    subcategory_id = django_db_models.IntegerField(null=True, blank=True)
+    subcategory_name = django_db_models.TextField(null=True, blank=True)
+    description = django_db_models.TextField(null=True, blank=True)
+    aliases = django_db_models.JSONField(default=list, blank=True)
+    aces_valid = django_db_models.BooleanField()
+    pies_valid = django_db_models.BooleanField()
+    superseded_by = django_db_models.IntegerField(null=True, blank=True)
+    is_active = django_db_models.BooleanField()
+
+    class Meta:
+        db_table = "pcdb_terminology_flat"
+        indexes = [
+            django_db_models.Index(fields=["category_id"], name="pcdb_term_flat_category_idx"),
+            django_db_models.Index(fields=["is_active"], name="pcdb_term_flat_active_idx"),
+        ]
