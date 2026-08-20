@@ -741,6 +741,33 @@ def merge_groups_bulk(groups: typing.Sequence[Group], dry_run: bool = True,
 
         dup_ids = [d for d, _ in pairs]
         try:
+            # Decide what this chunk can handle BEFORE touching anything. A duplicate whose
+            # MasterPartData cannot simply be reassigned -- because the keeper already has one --
+            # needs a field-level merge this set-based path does not do. Discovering that after
+            # the provider parts and fitments have already moved leaves the duplicate stripped of
+            # its links but still present: a half-merged orphan. (That is exactly what an earlier
+            # version of this function produced, 3,853 of them, before this pre-filter existed.)
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT master_part_id FROM master_part_data WHERE master_part_id IN %s",
+                    (tuple(dup_ids + keep_ids),),
+                )
+                have_data = {row[0] for row in cur.fetchall()}
+            deferred_keeps = {
+                keep_id for dup_id, keep_id in pairs
+                if dup_id in have_data and keep_id in have_data
+            }
+            if deferred_keeps:
+                # Defer the whole group, not just the offending pair, so a multi-row group is
+                # never split across two different merge strategies.
+                results["fallback"].extend(
+                    sorted({dup_id for dup_id, keep_id in pairs if keep_id in deferred_keeps})
+                )
+                pairs = [(d, k) for d, k in pairs if k not in deferred_keeps]
+                dup_ids = [d for d, _ in pairs]
+                if not pairs:
+                    continue
+
             with transaction.atomic():
                 values = ", ".join(["(%s::bigint, %s::bigint)"] * len(pairs))
                 params = [x for pair in pairs for x in pair]
@@ -791,11 +818,6 @@ def merge_groups_bulk(groups: typing.Sequence[Group], dry_run: bool = True,
                         params,
                     )
                     # Whatever is left would need a field-level merge; hand those groups back.
-                    cur.execute(
-                        "SELECT master_part_id FROM master_part_data WHERE master_part_id IN %s",
-                        (tuple(dup_ids),),
-                    )
-                    needs_field_merge = {row[0] for row in cur.fetchall()}
 
                     # Fitments: move the ones that do not collide, drop the rest.
                     match = " AND ".join(
@@ -818,7 +840,7 @@ def merge_groups_bulk(groups: typing.Sequence[Group], dry_run: bool = True,
                         (tuple(dup_ids),),
                     )
 
-                    deletable = [d for d in dup_ids if d not in needs_field_merge]
+                    deletable = list(dup_ids)
                     if deletable:
                         # Belt and braces: never delete a row that still owns provider parts.
                         cur.execute(
@@ -830,9 +852,7 @@ def merge_groups_bulk(groups: typing.Sequence[Group], dry_run: bool = True,
                             (tuple(deletable),),
                         )
                         results["deleted"] += cur.rowcount
-                results["merged"] += len(chunk) - len(needs_field_merge)
-            if needs_field_merge:
-                results["fallback"].extend(sorted(needs_field_merge))
+                results["merged"] += len(pairs)
         except Exception as exc:
             print("[ERROR] chunk at {}: {}".format(start, exc))
             import traceback
