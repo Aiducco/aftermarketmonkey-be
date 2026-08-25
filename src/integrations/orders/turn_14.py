@@ -724,6 +724,19 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
         except turn14_client_exceptions.Turn14APIBadResponseCodeError as e:
             self._handle_error(e)
 
+    def get_invoices_bulk(self, start_date: str, end_date: str, page: int = 1) -> typing.Dict:
+        """GET /v1/invoices?start_date=&end_date=&page= -- bulk invoice list for this account.
+        Confirmed live: Turn 14's bulk GET /v1/orders never returns a closed order at all (a
+        known-Closed, in-range order was completely absent from it), so an invoice match is the
+        only bulk signal confirmed_purchase_order_sync has for that transition -- an order with
+        at least one invoice is treated as CLOSED, same "invoiced == closed" rule already applied
+        to Premier's own per-PO invoice check. Distinct from get_invoices(purchase_order) above,
+        which is the older per-PO invoices/po/{ref} lookup."""
+        try:
+            return self._client.get_invoices(start_date=start_date, end_date=end_date, page=page)
+        except turn14_client_exceptions.Turn14APIBadResponseCodeError as e:
+            self._handle_error(e)
+
     def supports_invoices(self) -> bool:
         return True
 

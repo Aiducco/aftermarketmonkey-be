@@ -416,26 +416,36 @@ Turn 14 catalog, which we cannot do today.
 
 All three are global-cache tables (no company FK).
 
-### Phase 5 — Order-side hourly sweeps (2 days)
+### Phase 5 — Order-side hourly refresh (done, revised 2026-08-25)
 
-Add to `order_client.py`: `get_tracking(start, end)`, `get_package_details(...)`,
-`get_invoices(start, end)`, `get_orders(start, end)`.
+Originally planned as a separate hourly `turn14_order_sweeps.py` service (tracking +
+package_details + invoices, standalone from order status). Superseded once live testing
+against company 16 showed the pieces don't actually separate cleanly:
 
-**Hard constraint:** tracking start/end must be **<= 3 days apart** or the API returns 400.
-Chunk any backfill accordingly.
+- `GET /v1/orders?start_date&end_date` **never returns a closed order at all** — confirmed
+  live, a real, verified-Closed order with entries spanning weeks was completely absent from
+  it for a date range that fully contained it, while the same account's currently-open orders
+  showed up fine. So bulk orders can only ever prove "still open", never "closed".
+- `GET /v1/invoices?start_date&end_date` filled that gap exactly: a live test batch of company
+  16's 20 confirmed Turn14 POs (all long since closed) were **all 20** present in one invoices
+  fetch over a ~5-week window, each carrying its own `tracking` array inline — making the
+  separate `GET /v1/tracking` call redundant for anything that's actually shipped.
 
-New service `turn14_order_sweeps.py`, hourly per company connection:
+So Phase 5 is now folded directly into `confirmed_purchase_order_sync._refresh_turn14_orders_for_company`
+instead of living in its own module: one bulk `GET /v1/orders` call plus one bulk
+`GET /v1/invoices` call per company per cycle (paginated — walks every page, not just the
+first, for the rolling-reconciliation batch), each indexed by `purchase_order_number` +
+`website_order_number` the same way the old per-PO match did. A reference found in the
+invoices index is treated as CLOSED (invoiced == shipped == done) and its invoice is persisted
+into `PurchaseOrderInvoice`; a reference found only in the orders index is OPEN. `get_tracking`/
+`get_package_details`/`tracking_date_chunks` remain on `order_client.py` (harmless, unused) but
+the standalone `turn_14_order_sweeps.py` service and `sync_turn14_order_sweeps` command have
+been deleted — there's no longer a separate hourly job to schedule for this at all, it's just
+part of `refresh_confirmed_purchase_orders`'s existing Turn14 branch, on its existing
+`_TURN14_STALE_CHECK_INTERVAL` (1h) cadence.
 
-1. If the company has open `PurchaseOrderDistributorOrder` rows: `GET /v1/tracking` with no
-   params (returns today's tracking) -> match on `purchase_order_number` -> update tracking,
-   then `GET /v1/tracking/package_details` for package-level insight.
-2. If the company has uninvoiced confirmed POs: `GET /v1/invoices?start_date=today&
-   end_date=tomorrow` -> match by PO -> persist via the existing
-   `confirmed_purchase_order_sync._persist_invoices`.
-
-Replaces N per-PO calls with ~2 calls per company per hour — Dan's "less I/O to get tracking
-and invoice per customer". Keep `refresh_confirmed_purchase_orders` as the fallback for POs
-older than the sweep window and for the immediate post-submit window.
+Replaces N per-PO calls with a handful of calls per company per cycle — Dan's "less I/O to get
+tracking and invoice per customer", just implemented as one path instead of two.
 
 ### Phase 6 — Cadence split (done, deployed 2026-08-25)
 
@@ -448,7 +458,7 @@ onto the dedicated commands below.
 |---|---|---|
 | every 10 min | `fetch_turn_14_inventory_updates --minutes 15` | `inventory/updates?minutes=15`, then a scoped `MasterPart`/`ProviderPartInventory` propagation pass |
 | every 4 h | `fetch_turn_14_items_updates --days 1` | `items/updates?days=1`, then scoped propagation |
-| hourly | `sync_turn14_order_sweeps` | `tracking`, `tracking/package_details`, `invoices` |
+| ~1 h (rolling, per-PO due date) | `refresh_confirmed_purchase_orders` (Turn14 branch) | `orders`, `invoices`, both paginated bulk — see Phase 5 |
 | daily | `sync_turn14_global_sweep` | `items`, `items/data`, `inventory`, `locations`, `dropship`, `shipping/item_estimation`, then propagation, then per-company `pricing` jobs enqueued for every active Turn 14 connection |
 | weekly | `sync_turn14_fitment_sweep` | `items/fitment`, decoded straight into `MasterPartFitment` (no `Turn14ItemFitment` intermediate) |
 

@@ -21,23 +21,39 @@ in _refresh_purchase_order, via _REFRESH_HANDLERS) -- any other provider kind is
 skipped, not crashed on, so this command is safe to run against a mixed-distributor CONFIRMED
 queue today and grows adapter-by-adapter later.
 
-For Turn14 specifically: rather than re-deriving the customer PO reference from the
-PurchaseOrder (see base.resolve_po_number, used by the general status-check path), this reads
-it straight from each PurchaseOrderDistributorOrder.raw_response -- either the original submit
-response's attributes.po_number, or (once this command has already run once) a previous run's
-stored attributes.purchase_order_number, since Turn14's orders/po/{ref} lookup response uses a
+For Turn14 specifically: _refresh_turn14_orders_for_company replaces one GET /v1/orders/po/{ref}
+call per PO with a handful of bulk, paginated GET /v1/orders and GET /v1/invoices calls per
+company. Confirmed live that these two aren't redundant: GET /v1/orders?start_date&end_date
+never returns a closed order at all (a real, verified-Closed order sat completely absent from
+it for a date range that fully contained it), while every one of a live 20-PO test batch's
+already-closed orders showed up in GET /v1/invoices for the same window. So orders is read as
+"currently open" and invoices is read as "closed" (an order with at least one invoice is done --
+the same "invoiced == closed" rule Premier's own per-PO invoice check already applies) -- an
+invoice match takes priority over an order match when a reference appears in both.
+
+The reference each PurchaseOrderDistributorOrder is matched against is read from
+PurchaseOrderDistributorOrder.raw_response -- either the original submit response's
+attributes.po_number, or (once this command has already run once) a previous run's stored
+attributes.purchase_order_number, since Turn14's orders/po/{ref} lookup response uses a
 different attribute name for the same value than the order-creation response does (confirmed
-directly from live examples of each). The lookup returns every order ever placed under that PO
-reference (there can be several over time), so the specific one this row's
-distributor_order_number was assigned to (matched against each entry's attributes.
-website_order_number -- confirmed live: a submit response's data.id, e.g. "20927114", equals
-website_order_number in the later orders/po lookup, NOT that lookup's own outer "id" field,
-which is a different, unrelated numbering the general status-check path incorrectly compares
-against instead) is found and its raw JSON entirely replaces this row's raw_response. That
-same matched entry's attributes.order_number (Turn14's own internal order id) is saved to
+directly from live examples of each). Both bulk endpoints return every order/invoice ever
+placed under that PO reference (there can be several over time, and Turn14 can split one
+reference into several distributor orders and even several invoices per distributor order --
+confirmed live), so the specific entry this row's distributor_order_number was assigned to is
+found by matching each candidate entry's attributes.website_order_number (confirmed live: a
+submit response's data.id, e.g. "20927114", equals website_order_number in both the orders and
+invoices lookups, NOT either lookup's own outer "id" field, which is a different, unrelated
+numbering the general status-check path incorrectly compares against instead).
+
+An order match's matched entry's raw JSON entirely replaces this row's raw_response;
+attributes.order_number (Turn14's own internal order id) is saved to
 distributor_internal_order_number, and attributes.status is translated via
 turn_14.translate_order_status into distributor_order_status/distributor_order_status_name
-(src.enums.DistributorOrderRawStatus) -- currently a direct OPEN/CLOSED passthrough.
+(src.enums.DistributorOrderRawStatus) -- always "Open" in practice, since GET /v1/orders never
+returns anything else. An invoice match instead sets distributor_order_status/_name directly to
+CLOSED (Turn14's invoice payload has no status field of its own to translate), stores the
+invoice entry as raw_response, and additionally persists the invoice into PurchaseOrderInvoice
+(_persist_turn14_invoice) -- something the old per-PO Turn14 path never did at all.
 
 For Keystone: distributor_order_number IS the po_number we submitted (Keystone hands back no
 separate order id at submit time -- see KeystoneOrderAdapter.submit_order). This calls
@@ -239,9 +255,11 @@ def _refresh_turn14_distributor_order(
     )
 
 
-def _index_turn14_orders_page(data: typing.Dict, index: typing.Dict[str, typing.List[typing.Dict]]) -> None:
-    """Add one GET /v1/orders page's rows to ``index``, keyed by attributes.purchase_order_number
-    (the same reference _refresh_turn14_distributor_order queries orders/po/{ref} with)."""
+def _index_by_po_reference(data: typing.Dict, index: typing.Dict[str, typing.List[typing.Dict]]) -> None:
+    """Add one GET /v1/orders or GET /v1/invoices page's rows to ``index``, keyed by
+    attributes.purchase_order_number -- the same field name and the same reference
+    _refresh_turn14_distributor_order queries orders/po/{ref} with, on both endpoints
+    (confirmed live)."""
     for entry in data.get("data", []):
         attrs = entry.get("attributes") or {}
         ref = attrs.get("purchase_order_number")
@@ -249,37 +267,58 @@ def _index_turn14_orders_page(data: typing.Dict, index: typing.Dict[str, typing.
             index.setdefault(str(ref), []).append(entry)
 
 
-def _match_and_update_turn14_pdo(
-    pdo: src_models.PurchaseOrderDistributorOrder, index: typing.Dict[str, typing.List[typing.Dict]]
-) -> None:
-    """Same matching + field-update logic as _refresh_turn14_distributor_order, sourced from a
-    pre-fetched bulk index instead of a live per-PO orders/po/{ref} call."""
-    reference = pdo.po_number or turn_14_adapter.extract_po_reference(pdo.raw_response)
-    if not reference:
-        logger.warning(
-            "{} No po_number/purchase_order_number found for PurchaseOrderDistributorOrder "
-            "id={}; skipping.".format(_LOG_PREFIX, pdo.id)
-        )
-        return
-
-    entries = index.get(str(reference), [])
-    matched = None
+def _find_by_website_order_number(
+    entries: typing.List[typing.Dict], distributor_order_number: typing.Optional[str]
+) -> typing.Optional[typing.Dict]:
     for entry in entries:
         attrs = entry.get("attributes") or {}
         website_order_number = attrs.get("website_order_number")
-        if website_order_number is not None and str(website_order_number) == str(pdo.distributor_order_number):
-            matched = entry
-            break
+        if website_order_number is not None and str(website_order_number) == str(distributor_order_number):
+            return entry
+    return None
 
-    if matched is None:
-        logger.info(
-            "{} No entry in the bulk orders index matched reference={} distributor_order_number={} "
-            "for PurchaseOrderDistributorOrder id={}.".format(
-                _LOG_PREFIX, reference, pdo.distributor_order_number, pdo.id
-            )
-        )
+
+def _persist_turn14_invoice(po: src_models.PurchaseOrder, attrs: typing.Dict) -> None:
+    """Writes one bulk GET /v1/invoices entry into PurchaseOrderInvoice -- the old per-PO Turn14
+    refresh never persisted invoices at all (unlike Premier/Meyer/Keystone's own paths), it only
+    used invoice presence as a status signal. Reads the raw attrs dict directly rather than going
+    through base.DistributorInvoice/_persist_invoices, since the bulk path has no adapter-level
+    parsing step for invoices the way the old per-PO get_invoices() does."""
+    invoice_number = str(attrs.get("invoice_number") or "")
+    if not invoice_number:
         return
 
+    order_id = None
+    for rel in attrs.get("relationships", []) or []:
+        order_rel = rel.get("order") if isinstance(rel, dict) else None
+        if order_rel and order_rel.get("order_id") is not None:
+            order_id = str(order_rel["order_id"])
+            break
+
+    invoice_date = attrs.get("date")
+    src_models.PurchaseOrderInvoice.objects.update_or_create(
+        purchase_order=po,
+        invoice_number=invoice_number,
+        defaults={
+            "invoice_date": datetime.date.fromisoformat(invoice_date) if invoice_date else None,
+            "distributor_order_number": order_id,
+            "website_order_number": attrs.get("website_order_number"),
+            "total_price": attrs.get("total_price"),
+            "freight": attrs.get("freight"),
+            "discount_amount": attrs.get("discount_amount"),
+            "paid_amount": attrs.get("paid_amount"),
+            "amount_due": attrs.get("amount_due"),
+            "tracking": attrs.get("tracking") or [],
+            "line_items": attrs.get("lines") or [],
+            "comments": attrs.get("comments"),
+            "raw_response": {"type": "Invoice", "attributes": attrs},
+        },
+    )
+
+
+def _apply_turn14_order_match(
+    pdo: src_models.PurchaseOrderDistributorOrder, matched: typing.Dict, reference: str
+) -> None:
     attrs = matched.get("attributes") or {}
     update_fields = ["raw_response", "updated_at"]
     pdo.raw_response = matched
@@ -305,8 +344,86 @@ def _match_and_update_turn14_pdo(
 
     pdo.save(update_fields=update_fields)
     logger.info(
-        "{} (bulk) Updated raw_response for PurchaseOrderDistributorOrder id={} "
+        "{} (bulk orders) Updated raw_response for PurchaseOrderDistributorOrder id={} "
         "(distributor_order_number={}).".format(_LOG_PREFIX, pdo.id, pdo.distributor_order_number)
+    )
+
+
+def _apply_turn14_invoice_match(
+    po: src_models.PurchaseOrder,
+    pdo: src_models.PurchaseOrderDistributorOrder,
+    matched: typing.Dict,
+    reference: str,
+) -> None:
+    """An invoice match means this distributor order shipped -- GET /v1/orders never surfaces a
+    closed order at all (confirmed live), so this is the only bulk signal available for that
+    transition. Same "invoiced == closed" rule _refresh_premier_distributor_order already
+    applies to its own per-PO invoice check."""
+    attrs = matched.get("attributes") or {}
+    update_fields = ["raw_response", "distributor_order_status", "distributor_order_status_name", "updated_at"]
+    pdo.raw_response = matched
+    if not pdo.po_number:
+        pdo.po_number = reference
+        update_fields.append("po_number")
+
+    order_id = None
+    for rel in attrs.get("relationships", []) or []:
+        order_rel = rel.get("order") if isinstance(rel, dict) else None
+        if order_rel and order_rel.get("order_id") is not None:
+            order_id = str(order_rel["order_id"])
+            break
+    if order_id:
+        pdo.distributor_internal_order_number = order_id
+        update_fields.append("distributor_internal_order_number")
+
+    pdo.distributor_order_status = src_enums.DistributorOrderRawStatus.CLOSED.value
+    pdo.distributor_order_status_name = src_enums.DistributorOrderRawStatus.CLOSED.name
+    pdo.save(update_fields=update_fields)
+
+    _persist_turn14_invoice(po, attrs)
+    logger.info(
+        "{} (bulk invoices) Marked PurchaseOrderDistributorOrder id={} CLOSED "
+        "(distributor_order_number={}).".format(_LOG_PREFIX, pdo.id, pdo.distributor_order_number)
+    )
+
+
+def _match_and_update_turn14_pdo(
+    po: src_models.PurchaseOrder,
+    pdo: src_models.PurchaseOrderDistributorOrder,
+    orders_index: typing.Dict[str, typing.List[typing.Dict]],
+    invoices_index: typing.Dict[str, typing.List[typing.Dict]],
+) -> None:
+    """Same matching + field-update logic as _refresh_turn14_distributor_order, sourced from
+    pre-fetched bulk indices instead of live per-PO calls. An invoices_index match wins over an
+    orders_index match when a reference appears in both -- invoiced is a stronger, later signal
+    than merely appearing in the (always-open) bulk orders list."""
+    reference = pdo.po_number or turn_14_adapter.extract_po_reference(pdo.raw_response)
+    if not reference:
+        logger.warning(
+            "{} No po_number/purchase_order_number found for PurchaseOrderDistributorOrder "
+            "id={}; skipping.".format(_LOG_PREFIX, pdo.id)
+        )
+        return
+
+    invoice_match = _find_by_website_order_number(
+        invoices_index.get(str(reference), []), pdo.distributor_order_number
+    )
+    if invoice_match is not None:
+        _apply_turn14_invoice_match(po, pdo, invoice_match, reference)
+        return
+
+    order_match = _find_by_website_order_number(
+        orders_index.get(str(reference), []), pdo.distributor_order_number
+    )
+    if order_match is not None:
+        _apply_turn14_order_match(pdo, order_match, reference)
+        return
+
+    logger.info(
+        "{} No entry in the bulk orders or invoices index matched reference={} "
+        "distributor_order_number={} for PurchaseOrderDistributorOrder id={}.".format(
+            _LOG_PREFIX, reference, pdo.distributor_order_number, pdo.id
+        )
     )
 
 
@@ -320,24 +437,44 @@ _RECENT_ORDERS_LOOKBACK_DAYS = 7
 _RECONCILE_ORDERS_LOOKBACK_DAYS = 90
 
 
+def _fetch_all_pages(
+    fetch_page: typing.Callable[[int], typing.Dict],
+) -> typing.Iterator[typing.Dict]:
+    """Keep calling ``fetch_page`` with successive page numbers (1, 2, 3, ...) until Turn 14's
+    own meta.total_pages says there's nothing left, yielding each page's raw response. Shared by
+    both the orders and the invoices reconciliation fetch below -- same JSON:API {data,
+    meta: {total_pages}} pagination shape on both endpoints (confirmed live)."""
+    page, total_pages = 1, 1
+    while page <= total_pages:
+        data = fetch_page(page)
+        yield data
+        total_pages = (data.get("meta") or {}).get("total_pages", 1)
+        page += 1
+
+
 def _refresh_turn14_orders_for_company(
     company_provider: src_models.CompanyProviders,
     pos: typing.List[src_models.PurchaseOrder],
     now: datetime.datetime,
 ) -> None:
     """
-    Bulk Turn14 refresh for every due CONFIRMED PO belonging to one company: one or a handful of
-    paginated GET /v1/orders calls instead of one GET /v1/orders/po/{ref} call per PO.
+    Bulk Turn14 refresh for every due CONFIRMED PO belonging to one company: a handful of
+    paginated GET /v1/orders + GET /v1/invoices calls instead of one GET /v1/orders/po/{ref}
+    call per PO. Both are needed -- confirmed live that GET /v1/orders never returns a closed
+    order at all, so invoices is the only bulk source for that transition (see the module
+    docstring and _apply_turn14_invoice_match).
 
     Splits the batch in two by why each PO is due (see _should_check):
-      - fresh (submitted within the last hour) or never-checked: cheap, page-1-only fetch over a
-        narrow recent window -- a just-submitted order is always on the newest page (Turn 14
-        returns orders newest-first, confirmed live).
-      - due only via the rolling _STALE_CHECK_INTERVAL: a full paginated fetch back to the
-        oldest PO being reconciled this run, so an order that's slipped past page 1 since it was
+      - fresh (submitted within the last hour) or never-checked: cheap, page-1-only fetch of
+        both endpoints over a narrow recent window -- a just-submitted order is always on the
+        newest page (Turn 14 returns both newest-first, confirmed live).
+      - due only via the rolling _STALE_CHECK_INTERVAL: a full paginated fetch of both endpoints
+        back to the oldest PO being reconciled this run ("keep calling" through every page, not
+        just the first), so an order or invoice that's slipped past page 1 since it was
         submitted is still found.
-    Both fetches land in the same reference->entries index; every due PO is then matched exactly
-    the same way _refresh_turn14_distributor_order already does, just against pre-fetched data.
+    Both fetches land in the same two reference->entries indices; every due PO is then matched
+    exactly the same way _refresh_turn14_distributor_order already does, just against
+    pre-fetched data.
     """
     adapter = order_registry.get_adapter(company_provider)
     if adapter is None or not isinstance(adapter, turn_14_adapter.Turn14OrderAdapter):
@@ -354,16 +491,21 @@ def _refresh_turn14_orders_for_company(
         is_never_checked = po.distributor_status_checked_at is None
         (recent_pos if (is_fresh or is_never_checked) else reconcile_pos).append(po)
 
-    index: typing.Dict[str, typing.List[typing.Dict]] = {}
+    orders_index: typing.Dict[str, typing.List[typing.Dict]] = {}
+    invoices_index: typing.Dict[str, typing.List[typing.Dict]] = {}
     end = now.date().isoformat()
 
     if recent_pos:
         start = (now - datetime.timedelta(days=_RECENT_ORDERS_LOOKBACK_DAYS)).date().isoformat()
-        data = adapter.get_orders(start_date=start, end_date=end, page=1)
-        _index_turn14_orders_page(data, index)
+        orders_data = adapter.get_orders(start_date=start, end_date=end, page=1)
+        _index_by_po_reference(orders_data, orders_index)
+        invoices_data = adapter.get_invoices_bulk(start_date=start, end_date=end, page=1)
+        _index_by_po_reference(invoices_data, invoices_index)
         logger.info(
-            "{} company_provider_id={}: recent fetch (page 1, since {}) -> {} order(s) indexed.".format(
-                _LOG_PREFIX, company_provider.id, start, len(data.get("data", []))
+            "{} company_provider_id={}: recent fetch (page 1, since {}) -> {} order(s), "
+            "{} invoice(s) indexed.".format(
+                _LOG_PREFIX, company_provider.id, start,
+                len(orders_data.get("data", [])), len(invoices_data.get("data", [])),
             )
         )
 
@@ -373,22 +515,33 @@ def _refresh_turn14_orders_for_company(
             default=now - datetime.timedelta(days=_RECONCILE_ORDERS_LOOKBACK_DAYS),
         )
         start = earliest.date().isoformat()
-        page, total_seen = 1, 0
-        while page is not None:
-            data = adapter.get_orders(start_date=start, end_date=end, page=page)
-            _index_turn14_orders_page(data, index)
-            total_seen += len(data.get("data", []))
-            total_pages = (data.get("meta") or {}).get("total_pages", 1)
-            page = page + 1 if page < total_pages else None
+
+        orders_seen, orders_pages = 0, 0
+        for data in _fetch_all_pages(lambda page: adapter.get_orders(start_date=start, end_date=end, page=page)):
+            _index_by_po_reference(data, orders_index)
+            orders_seen += len(data.get("data", []))
+            orders_pages += 1
+
+        invoices_seen, invoices_pages = 0, 0
+        for data in _fetch_all_pages(
+            lambda page: adapter.get_invoices_bulk(start_date=start, end_date=end, page=page)
+        ):
+            _index_by_po_reference(data, invoices_index)
+            invoices_seen += len(data.get("data", []))
+            invoices_pages += 1
+
         logger.info(
-            "{} company_provider_id={}: reconciliation fetch (since {}, {} page(s)) -> {} order(s) "
-            "indexed.".format(_LOG_PREFIX, company_provider.id, start, total_pages, total_seen)
+            "{} company_provider_id={}: reconciliation fetch (since {}) -> {} order(s) across "
+            "{} page(s), {} invoice(s) across {} page(s) indexed.".format(
+                _LOG_PREFIX, company_provider.id, start,
+                orders_seen, orders_pages, invoices_seen, invoices_pages,
+            )
         )
 
     for po in recent_pos + reconcile_pos:
         for pdo in po.distributor_orders.all():
             try:
-                _match_and_update_turn14_pdo(pdo, index)
+                _match_and_update_turn14_pdo(po, pdo, orders_index, invoices_index)
             except Exception:
                 logger.exception(
                     "{} Failed matching PurchaseOrderDistributorOrder id={} for "

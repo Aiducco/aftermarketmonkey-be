@@ -175,10 +175,12 @@ class Command(BaseCommand):
             self._ingest_log("phase 1 | starting sequential source fetches for all providers")
             # Turn14 is deliberately not in this list: it now runs entirely through dedicated
             # scheduled commands (sync_turn14_global_sweep daily, fetch_turn_14_items_updates
-            # 4-hourly, fetch_turn_14_inventory_updates every 10min, sync_turn14_order_sweeps
-            # hourly, sync_turn14_fitment_sweep weekly), per Dan Ziegler's cadence proposal —
-            # see docs/TURN14_HANDOFF.md and docs/TURN14_INTEGRATION_PLAN.md. Running it here too
-            # would duplicate those fetches against the same rate budget.
+            # 4-hourly, fetch_turn_14_inventory_updates every 10min, sync_turn14_fitment_sweep
+            # weekly), per Dan Ziegler's cadence proposal — see docs/TURN14_HANDOFF.md and
+            # docs/TURN14_INTEGRATION_PLAN.md. Order-status refresh for confirmed Turn14 POs is
+            # its own thing entirely: refresh_confirmed_purchase_orders (a separate command,
+            # shared with every other distributor). Running any of this here too would duplicate
+            # those fetches against the same rate budget.
             phase1_providers: typing.List[typing.Tuple[str, typing.Callable[[], None]]] = [
                 ("keystone",      self._run_keystone),
                 ("meyer",         self._run_meyer),

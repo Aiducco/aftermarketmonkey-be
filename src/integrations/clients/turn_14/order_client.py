@@ -304,15 +304,19 @@ class Turn14OrderApiClient(object):
             params=params or None,
         )
 
-    def get_invoices(self, start_date: str, end_date: str) -> typing.Dict:
+    def get_invoices(self, start_date: str, end_date: str, page: int = 1) -> typing.Dict:
         """
-        GET /v1/invoices?start_date=&end_date=. Invoices only exist once items ship, so an
-        hourly sweep over today..tomorrow is how an order stops being "uninvoiced".
+        GET /v1/invoices?start_date=&end_date=&page= -- paginated, same JSON:API shape as
+        get_orders. Invoices only exist once items ship, and confirmed live that Turn 14's bulk
+        GET /v1/orders never returns a closed order at all -- an invoice is the only bulk signal
+        available for that transition, which is why confirmed_purchase_order_sync's Turn14
+        refresh combines this with get_orders instead of treating it as a separate tracking-only
+        concern.
         """
         return self._request(
             endpoint="invoices",
             method=common_enums.HttpMethod.GET,
-            params={"start_date": start_date, "end_date": end_date},
+            params={"start_date": start_date, "end_date": end_date, "page": page},
         )
 
     def get_orders(self, start_date: str, end_date: str, page: int = 1) -> typing.Dict:
