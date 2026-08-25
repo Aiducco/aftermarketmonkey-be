@@ -76,8 +76,15 @@ class MeyerOrderApiClient(object):
             return
         if not isinstance(data, dict):
             return
-        error_code = data.get("errorCode")
-        error_message = data.get("errorMessage")
+        # Confirmed live (2026-08-25): a real over-limit response is
+        # {"StatusCode":500,"ErrorCode":40503,"ErrorMessage":"..."} -- PascalCase, not the
+        # lowercase errorCode/errorMessage this used to check for. That mismatch meant this
+        # never actually fired: every business-rule error response was silently returned as if
+        # it were one valid data row (get_item_information et al. wrap a non-list dict result in
+        # a single-element list). Checking both casings since Meyer's docs aren't consistent
+        # about it and there's no cost to accepting either.
+        error_code = data.get("ErrorCode", data.get("errorCode"))
+        error_message = data.get("ErrorMessage", data.get("errorMessage"))
         if error_code is not None or error_message is not None:
             raise exceptions.MeyerOrderValidationError(
                 message=error_message or "Meyer API rejected the request.",
