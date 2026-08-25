@@ -988,7 +988,53 @@ def sync_unmapped_meyer_brands_to_brands(dry_run: bool = False) -> typing.List[s
             created_cb,
         )
     )
+
+    # This function only ever visits UNMAPPED MeyerBrand rows, so a brand that got a
+    # BrandMeyerBrandMapping without its BrandProviders row can never be repaired here --
+    # a March 2026 batch left 960 such pairs, and Meyer looked like it stocked none of
+    # those brands. Reconcile every mapped brand on each run instead; additive and cheap.
+    reconciled = reconcile_meyer_brand_providers()
+    if reconciled:
+        logger.info(
+            "{} Reconciled {} mapped Meyer brand(s) that were missing BrandProviders.".format(
+                _LOG_PREFIX, reconciled,
+            )
+        )
     return unmapped
+
+
+def reconcile_meyer_brand_providers() -> int:
+    """
+    Create any BrandProviders row that a BrandMeyerBrandMapping implies but does not have.
+
+    Additive and idempotent: never updates or deletes, so it is safe to call on every sync.
+    Returns the number of rows created.
+    """
+    meyer_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.MEYER.value,
+    ).first()
+    if not meyer_provider:
+        logger.warning("{} Meyer provider not found; skipping BrandProviders reconcile.".format(_LOG_PREFIX))
+        return 0
+
+    mapped_brand_ids = set(
+        src_models.BrandMeyerBrandMapping.objects.values_list("brand_id", flat=True)
+    )
+    if not mapped_brand_ids:
+        return 0
+
+    linked_brand_ids = set(
+        src_models.BrandProviders.objects.filter(
+            provider_id=meyer_provider.id, brand_id__in=mapped_brand_ids,
+        ).values_list("brand_id", flat=True)
+    )
+    to_create = [
+        src_models.BrandProviders(brand_id=bid, provider_id=meyer_provider.id)
+        for bid in sorted(mapped_brand_ids - linked_brand_ids)
+    ]
+    if to_create:
+        src_models.BrandProviders.objects.bulk_create(to_create, ignore_conflicts=True)
+    return len(to_create)
 
 
 PRICING_UPDATE_FIELDS = [

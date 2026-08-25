@@ -502,7 +502,49 @@ def resolve_wheelpros_bucket_brands(dry_run: bool = True) -> typing.Dict[str, in
             time.sleep(PREMIER_PGBULK_BATCH_DELAY_SECONDS)
 
     logger.info("{} Wrote brand_override for {} rows.".format(_LOG_PREFIX, len(resolved_by_row_id)))
+
+    # A brand reached only through brand_override has no BrandPremierBrandMapping, so the
+    # feed-brand-level sync above (which is what normally creates BrandProviders) can never
+    # see it: without this, Premier stocks e.g. 914 Nitto parts while BrandProviders claims
+    # it carries no Nitto at all. Link them here, where the override is actually decided.
+    summary["brand_providers_created"] = _link_override_brands_to_premier(
+        {brand.id for brand in resolved_by_row_id.values()}
+    )
     return summary
+
+
+def _link_override_brands_to_premier(brand_ids: typing.Set[int]) -> int:
+    """
+    Ensure a BrandProviders row exists for Premier for every brand reached via
+    PremierParts.brand_override. Additive and idempotent -- returns the number created.
+    """
+    if not brand_ids:
+        return 0
+
+    premier_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.PREMIER_PERFORMANCE.value,
+    ).first()
+    if not premier_provider:
+        logger.warning("{} No Premier provider row; skipping BrandProviders link.".format(_LOG_PREFIX))
+        return 0
+
+    existing = set(
+        src_models.BrandProviders.objects.filter(
+            provider_id=premier_provider.id, brand_id__in=brand_ids,
+        ).values_list("brand_id", flat=True)
+    )
+    to_create = [
+        src_models.BrandProviders(brand_id=bid, provider_id=premier_provider.id)
+        for bid in sorted(brand_ids - existing)
+    ]
+    if to_create:
+        src_models.BrandProviders.objects.bulk_create(to_create, ignore_conflicts=True)
+        logger.info(
+            "{} Linked {} override-derived brand(s) to Premier in BrandProviders.".format(
+                _LOG_PREFIX, len(to_create),
+            )
+        )
+    return len(to_create)
 
 
 def cleanup_premier_brand_override_orphans() -> typing.Dict[str, int]:
