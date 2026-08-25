@@ -4518,7 +4518,8 @@ class Turn14DropshipController(django_db_models.Model):
 class Turn14ItemShippingEstimate(django_db_models.Model):
     """
     Turn 14's estimated ground shipping cost for a single item, from
-    GET /v1/shipping/item_estimation/brand/{brand_id}.
+    GET /v1/shipping/item_estimation (flat -- confirmed 2026-08-25 to be 1000 rows/page, same as
+    the brand-scoped variant, so swept flat rather than per-brand).
 
     Turn 14 is explicit that these are estimates -- good-faith numbers that can change at any
     time, excluding shipping promotions -- so treat them as a ranking and display input for
@@ -4547,6 +4548,28 @@ class Turn14ItemShippingEstimate(django_db_models.Model):
     class Meta:
         db_table = "turn14_item_shipping_estimates"
         unique_together = ["item_external_id"]
+
+
+class Turn14ShippingOption(django_db_models.Model):
+    """
+    Turn 14's available shipping service levels from GET /v1/shipping -- the account-wide
+    "which carriers/methods can we ship with" reference list (e.g. "UPS Ground", "UPS Next Day
+    Air"), not a per-item cost (that's Turn14ItemShippingEstimate, from the separate
+    /v1/shipping/item_estimation endpoint). Small and static -- 50 rows measured live -- so one
+    unpaginated request, same shape as Turn14Location. Part of Dan Ziegler's proposed Daily Full
+    Sweep list; previously fetched live and ad hoc from orders/turn_14.py at quote time only,
+    never cached.
+    """
+    external_id = django_db_models.CharField(max_length=32)
+    transportation_name = django_db_models.CharField(max_length=255)
+    carrier_name = django_db_models.CharField(max_length=255, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "turn14_shipping_options"
+        unique_together = ["external_id"]
 
 
 # Exact kg -> lb factor used by the published load-index charts.

@@ -402,6 +402,37 @@ def sweep_dropship_controllers(client=None) -> int:
     return len(instances)
 
 
+def sweep_shipping_options(client=None) -> int:
+    """
+    GET /v1/shipping -- the account-wide shipping service levels (e.g. "UPS Ground"), into
+    Turn14ShippingOption. Small and static (50 rows measured live) and not paginated -- one
+    request. Part of Dan Ziegler's proposed Daily Full Sweep list; previously only fetched live,
+    ad hoc, from orders/turn_14.py at quote time, never cached.
+    """
+    client = client or turn_14_global.get_global_client()
+
+    data = client.get_shipping_options()
+    instances = [
+        src_models.Turn14ShippingOption(
+            external_id=str(row.get("id", "")),
+            transportation_name=(row.get("attributes") or {}).get("transportation_name") or "",
+            carrier_name=(row.get("attributes") or {}).get("carrier_name") or "",
+            updated_at=timezone.now(),
+        )
+        for row in data
+        if row.get("id") is not None
+    ]
+    if instances:
+        pgbulk.upsert(
+            src_models.Turn14ShippingOption,
+            instances,
+            unique_fields=["external_id"],
+            update_fields=["transportation_name", "carrier_name", "updated_at"],
+        )
+    logger.info("{} Upserted {} shipping option(s).".format(_LOG_PREFIX, len(instances)))
+    return len(instances)
+
+
 def sweep_shipping_estimates(client=None, max_pages: typing.Optional[int] = None) -> typing.Tuple[int, int]:
     """
     GET /v1/shipping/item_estimation over the whole catalog into Turn14ItemShippingEstimate.

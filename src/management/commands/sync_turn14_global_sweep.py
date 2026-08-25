@@ -26,8 +26,9 @@ _TASK_NAME = "sync_turn14_global_sweep"
 
 class Command(BaseCommand):
     help = (
-        "Daily Turn 14 global sweep: brands, locations, items, items/data, inventory, "
-        "dropship controllers and shipping estimates, using the flat catalog-wide endpoints."
+        "Daily Turn 14 global sweep: brands, locations, shipping options, items, items/data, "
+        "inventory, dropship controllers and shipping estimates, using the flat catalog-wide "
+        "endpoints."
     )
 
     def add_arguments(self, parser):
@@ -64,6 +65,7 @@ class Command(BaseCommand):
             turn_14_services.fetch_and_save_turn_14_brands()
             turn_14_services.sync_unmapped_turn_14_brands_to_brands()
             turn_14_services.fetch_and_save_turn_14_locations()
+            results["shipping_options"] = turn_14_sweeps.sweep_shipping_options(client)
 
             results["items"] = turn_14_sweeps.sweep_items(client)
             results["items_data"] = turn_14_sweeps.sweep_items_data(client)

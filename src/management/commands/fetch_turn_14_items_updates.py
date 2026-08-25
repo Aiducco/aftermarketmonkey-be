@@ -35,8 +35,10 @@ class Command(BaseCommand):
             turn_14.fetch_and_save_turn_14_items_updates(days=options["days"])
             # Scoped to this run's window, not a full ~793k-row rescan -- ingest_all_providers no
             # longer runs Turn14 at all, so nothing else propagates this delta into
-            # MasterPart/ProviderPart if this doesn't.
-            master_parts.sync_derived_from_turn14(skip_pricing=True, since=since)
+            # MasterPart/ProviderPart if this doesn't. skip_inventory=True: items/updates carries
+            # no stock-level data, so there is nothing here for ProviderPartInventory to sync --
+            # that's fetch_turn_14_inventory_updates' job, on its own 10-minute delta.
+            master_parts.sync_derived_from_turn14(skip_inventory=True, skip_pricing=True, since=since)
         except Exception as e:
             meter.__exit__(None, None, None)
             audit_scheduled_tasks.mark_scheduled_task_failed(execution, error_message=str(e))

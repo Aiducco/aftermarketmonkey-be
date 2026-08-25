@@ -9377,6 +9377,7 @@ def sync_derived_from_turn14(
     *,
     reindex_meilisearch: bool = False,
     skip_master_parts: bool = False,
+    skip_inventory: bool = False,
     skip_pricing: bool = False,
     since: typing.Optional[typing.Any] = None,
 ) -> None:
@@ -9385,9 +9386,12 @@ def sync_derived_from_turn14(
     and ProviderPartCompanyPricing. Call after Turn14 item/catalog fetches so the unified
     layer stays aligned without waiting for the global ``sync_all_master_parts`` job.
 
-    Pass ``skip_master_parts=True`` to run only inventory + pricing (fast incremental path).
-    Pass ``skip_pricing=True`` to run only master parts + inventory (global catalog sync path;
-    pricing handled separately via IntegrationPricingSyncJob queue).
+    Pass ``skip_master_parts=True`` to skip MasterPart/ProviderPart (e.g. the 10-minute
+    inventory delta, which carries no item metadata to propagate).
+    Pass ``skip_inventory=True`` to skip ProviderPartInventory (e.g. the 4-hourly items delta,
+    which carries no stock-level data to propagate -- that's the separate inventory delta's job).
+    Pass ``skip_pricing=True`` to skip ProviderPartCompanyPricing (pricing handled separately via
+    the IntegrationPricingSyncJob queue, not this function, for every caller today).
 
     Pass ``since`` (a datetime) to scope both the master-parts and inventory passes to rows
     updated at/after that time instead of a full-catalog walk -- required for the 4-hourly items
@@ -9395,9 +9399,8 @@ def sync_derived_from_turn14(
     sync_provider_inventory_from_turn14 have no other scoping and a full run of either is a
     genuine ~793k-row walk (fine once daily via sync_turn14_global_sweep, not on a tight cadence).
     """
-    logger.info("{} Starting Turn14-only derived sync ({}{}).".format(
-        _LOG_PREFIX,
-        "inventory + pricing only" if skip_master_parts else "parts, inventory" + ("" if skip_pricing else ", pricing"),
+    logger.info("{} Starting Turn14-only derived sync (parts={} inventory={} pricing={}{}).".format(
+        _LOG_PREFIX, not skip_master_parts, not skip_inventory, not skip_pricing,
         ", since={}".format(since) if since else "",
     ))
     if not skip_master_parts:
@@ -9405,8 +9408,9 @@ def sync_derived_from_turn14(
         connection.close()
 
     def _cont() -> None:
-        sync_provider_inventory_from_turn14(since=since)
-        connection.close()
+        if not skip_inventory:
+            sync_provider_inventory_from_turn14(since=since)
+            connection.close()
         if not skip_pricing:
             sync_provider_pricing_from_turn14()
             connection.close()
