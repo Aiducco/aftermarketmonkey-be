@@ -38,14 +38,24 @@ class Command(BaseCommand):
 
         meter.__enter__()
         try:
-            seen, written = turn_14_sweeps.sweep_fitment(
-                turn_14_global.get_global_client(), max_pages=options["max_pages"]
+            seen, written = rate_limit_base.retry_on_rate_budget(
+                "fitment",
+                lambda: turn_14_sweeps.sweep_fitment(
+                    turn_14_global.get_global_client(), max_pages=options["max_pages"]
+                ),
+                self.stdout.write,
             )
         except rate_limit_base.RateBudgetExhausted as e:
+            # Reaches here only after retry_on_rate_budget's own retries were exhausted -- a
+            # genuinely stuck budget (the daily cap, or Turn 14 down), not an ordinary hourly
+            # cooldown, which the retry loop already waited out. Each retry restarts fitment
+            # from page 1 (sweep_fitment has no resume cursor) -- acceptable here since the
+            # whole sweep (~3 879 pages) already fits inside one hour's budget when uncontended,
+            # so a retry is a full redo, not a redo of everything ever attempted.
             meter.__exit__(None, None, None)
             audit_scheduled_tasks.mark_scheduled_task_failed(
-                execution, error_message="Deferred, rate budget spent: {} || {}".format(
-                    e, meter.summary("api_usage")
+                execution, error_message="Gave up after {} rate-limit retries: {} || {}".format(
+                    rate_limit_base.DEFAULT_MAX_RATE_LIMIT_RETRIES, e, meter.summary("api_usage")
                 ),
             )
             return

@@ -96,6 +96,42 @@ class RateBudgetExhausted(Exception):
         self.retry_after_seconds = retry_after_seconds
 
 
+# RateBudgetExhausted's own docstring already says the right response: "checkpoint and retry in
+# a later window." A hard bucket's cooldown is bounded by its own window (an hour bucket can
+# never report more than ~3600s), so for a long-running command that has already done real,
+# valuable work (a multi-step sweep, a multi-thousand-page walk), waiting out that cooldown and
+# resuming is strictly better than abandoning the whole run and starting over on the next cron
+# tick. Bounded retries so a genuinely stuck budget (the daily cap, or an upstream outage)
+# surfaces as a real failure rather than an unbounded sleep loop inside a cron-triggered process.
+DEFAULT_MAX_RATE_LIMIT_RETRIES = 5
+
+
+def retry_on_rate_budget(
+    step_name: str,
+    fn: typing.Callable[[], typing.Any],
+    log_fn: typing.Callable[[str], None],
+    max_retries: int = DEFAULT_MAX_RATE_LIMIT_RETRIES,
+) -> typing.Any:
+    """
+    Call ``fn()``, and on RateBudgetExhausted sleep the reported cooldown and retry, up to
+    ``max_retries`` times. Re-raises on the final attempt so the caller's own top-level handling
+    (mark the scheduled task failed, etc.) still applies to a genuinely unrecoverable exhaustion.
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            return fn()
+        except RateBudgetExhausted as e:
+            if attempt >= max_retries:
+                raise
+            wait_s = e.retry_after_seconds + 5
+            log_fn(
+                "{}: rate budget exhausted (attempt {}/{}), waiting {:.0f}s then retrying: {}".format(
+                    step_name, attempt, max_retries, wait_s, e
+                )
+            )
+            time.sleep(wait_s)
+
+
 class Bucket(typing.NamedTuple):
     """
     One fixed-window limit. ``scope`` is the human-readable name used in keys, logs and

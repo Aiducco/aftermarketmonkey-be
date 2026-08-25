@@ -62,19 +62,33 @@ class Command(BaseCommand):
         try:
             client = turn_14_global.get_global_client()
 
-            turn_14_services.fetch_and_save_turn_14_brands()
-            turn_14_services.sync_unmapped_turn_14_brands_to_brands()
-            turn_14_services.fetch_and_save_turn_14_locations()
-            results["shipping_options"] = turn_14_sweeps.sweep_shipping_options(client)
+            rate_limit_base.retry_on_rate_budget("brands", turn_14_services.fetch_and_save_turn_14_brands, self.stdout.write)
+            rate_limit_base.retry_on_rate_budget(
+                "brand_mapping", turn_14_services.sync_unmapped_turn_14_brands_to_brands, self.stdout.write
+            )
+            rate_limit_base.retry_on_rate_budget("locations", turn_14_services.fetch_and_save_turn_14_locations, self.stdout.write)
+            results["shipping_options"] = rate_limit_base.retry_on_rate_budget(
+                "shipping_options", lambda: turn_14_sweeps.sweep_shipping_options(client), self.stdout.write
+            )
 
-            results["items"] = turn_14_sweeps.sweep_items(client)
-            results["items_data"] = turn_14_sweeps.sweep_items_data(client)
-            results["inventory"] = turn_14_sweeps.sweep_inventory(client)
+            results["items"] = rate_limit_base.retry_on_rate_budget(
+                "items", lambda: turn_14_sweeps.sweep_items(client), self.stdout.write
+            )
+            results["items_data"] = rate_limit_base.retry_on_rate_budget(
+                "items_data", lambda: turn_14_sweeps.sweep_items_data(client), self.stdout.write
+            )
+            results["inventory"] = rate_limit_base.retry_on_rate_budget(
+                "inventory", lambda: turn_14_sweeps.sweep_inventory(client), self.stdout.write
+            )
 
             if not options["skip_dropship"]:
-                results["dropship"] = turn_14_sweeps.sweep_dropship_controllers(client)
+                results["dropship"] = rate_limit_base.retry_on_rate_budget(
+                    "dropship", lambda: turn_14_sweeps.sweep_dropship_controllers(client), self.stdout.write
+                )
             if not options["skip_shipping_estimates"]:
-                results["shipping_estimates"] = turn_14_sweeps.sweep_shipping_estimates(client)
+                results["shipping_estimates"] = rate_limit_base.retry_on_rate_budget(
+                    "shipping_estimates", lambda: turn_14_sweeps.sweep_shipping_estimates(client), self.stdout.write
+                )
 
             # Only after every raw sweep above completed -- propagating from a half-swept catalog
             # would push incomplete data into MasterPart/ProviderPart. Pricing sync itself stays
@@ -97,14 +111,17 @@ class Command(BaseCommand):
                 results["deactivated"] = turn_14_sweeps.deactivate_items_missing_from_sweep(started_at)
 
         except rate_limit_base.RateBudgetExhausted as e:
+            # Reaches here only after retry_on_rate_budget's own retries were exhausted -- a
+            # genuinely stuck budget (the daily cap, or Turn 14 down), not an ordinary hourly
+            # cooldown, which the retry loop already waited out.
             meter.__exit__(None, None, None)
             audit_scheduled_tasks.mark_scheduled_task_failed(
                 execution,
-                error_message="Deferred, rate budget spent: {} || partial={} || {}".format(
-                    e, results, meter.summary("api_usage")
+                error_message="Gave up after {} rate-limit retries: {} || partial={} || {}".format(
+                    rate_limit_base.DEFAULT_MAX_RATE_LIMIT_RETRIES, e, results, meter.summary("api_usage")
                 ),
             )
-            self.stderr.write("Rate budget exhausted: {}".format(e))
+            self.stderr.write("Rate budget exhausted after retries: {}".format(e))
             return
         except Exception as e:
             meter.__exit__(None, None, None)
