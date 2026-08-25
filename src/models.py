@@ -1,4 +1,6 @@
+import decimal
 import enum
+
 from django.contrib.auth import models as auth_models
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db import models as django_db_models
@@ -2167,6 +2169,13 @@ class IntegrationPricingSyncJob(django_db_models.Model):
     # through every mapped brand's full pricing. Set by the recurring ingest_all_providers
     # cycle; left False for the initial connect/reconnect sync, which still wants a full fetch.
     use_delta_fetch = django_db_models.BooleanField(default=False)
+
+    # Earliest time this job may be claimed. Set when a run is cut short by a distributor's
+    # hard rate budget (see src.integrations.rate_limit.RateBudgetExhausted): the job goes back
+    # to OPEN rather than FAILED, deferred until the budget window rolls over. Without this the
+    # processing loop would immediately re-claim the same job and burn the retry against a
+    # budget that is, by definition, already spent. Null means "claimable now".
+    not_before = django_db_models.DateTimeField(null=True, blank=True, db_index=True)
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
@@ -4398,3 +4407,333 @@ class ProductLineTerminologyMap(django_db_models.Model):
 
     class Meta:
         db_table = "product_line_terminology_map"
+
+
+class MLPartTerminologyClassification(django_db_models.Model):
+    """
+    Per-part PCdb terminology classification, produced by an offline two-stage pipeline
+    (category/subcategory routing, then terminology pick within that subcategory) run by a
+    standalone, Django-free script (scripts/qwen_classify_parts.py) against a self-hosted LLM on
+    external hardware. That script connects to this database directly (raw SQL, not the Django
+    ORM) and upserts rows here itself -- there is no separate export/import step.
+
+    One row per MasterPart. Deliberately separate from ProductLineTerminologyMap, which is keyed
+    on ProductGroup (a brand-level product line found by the grouped pipeline, see
+    classification.py) -- this table is the independent per-part path, not derived from
+    grouping, so the two are never conflated.
+
+    category/subcategory are the model's own free-text pick from the PCdb taxonomy (stored
+    verbatim, not FK'd, matching every other Pcdb-adjacent field in this file) -- kept alongside
+    the final part_terminology_id so a bad Stage 2 result can be traced back to a Stage 1 routing
+    miss (see the two-stage prototype's real findings: every wrong/null Stage 2 result this
+    session traced to Stage 1 picking the wrong subcategory, not Stage 2 misreading a good
+    candidate list).
+
+    status distinguishes "the model looked and found nothing" (unclassifiable, with a reasoning
+    string -- a real, useful answer) from "the pipeline itself failed" (error, with the exception/
+    parse-failure text in reasoning) -- both get a row rather than silently having no row at all,
+    so a bulk run's failures stay queryable instead of just being absences.
+    """
+    STATUS_CLASSIFIED = "classified"
+    STATUS_UNCLASSIFIABLE = "unclassifiable"
+    STATUS_ERROR = "error"
+
+    master_part = django_db_models.OneToOneField(
+        MasterPart, on_delete=django_db_models.CASCADE, primary_key=True, related_name="ml_terminology_classification",
+    )
+    status = django_db_models.CharField(max_length=16, default=STATUS_CLASSIFIED)
+    category = django_db_models.CharField(max_length=255, null=True, blank=True)
+    subcategory = django_db_models.CharField(max_length=255, null=True, blank=True)
+    stage1_confidence = django_db_models.DecimalField(max_digits=3, decimal_places=2, null=True, blank=True)
+    part_terminology_id = django_db_models.IntegerField(null=True, blank=True)
+    stage2_confidence = django_db_models.DecimalField(max_digits=3, decimal_places=2, null=True, blank=True)
+    reasoning = django_db_models.TextField(null=True, blank=True)
+    model_used = django_db_models.CharField(max_length=64, null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "ml_part_terminology_classification"
+
+class ApiRateBucket(django_db_models.Model):
+    """
+    Fixed-window request counter, shared across processes, backing
+    ``src.integrations.rate_limit``.
+
+    Distributor rate limits are enforced per set of credentials (Turn 14: 5 GET/s, 5 000 GET/h,
+    30 000 GET/day per client_id; 10 token requests/min per *IP*), but our workers run as several
+    independent OS processes -- the nightly ``ingest_all_providers``, the 10-minute inventory
+    delta cron, and ``process_pricing_sync_jobs`` can all be in flight at once. An in-process
+    counter (what the ``ratelimit`` decorators gave us) therefore under-counts by however many
+    processes are running, which is exactly the condition Turn 14 deactivates credentials for.
+    Postgres is the one thing every worker already shares, so the counter lives here.
+
+    One row per (scope, window). ``bucket_key`` embeds the window index -- e.g.
+    ``t14:get:hour:<client_id_hash>:487321`` -- so a new window is a new row rather than an
+    update race, and old rows are simply deleted once ``expires_at`` passes (see
+    ``rate_limit.purge_expired``). ``limit_value`` is stored on the row so the whole
+    check-and-increment is one atomic ``INSERT ... ON CONFLICT DO UPDATE ... WHERE`` statement
+    (it is read back through ``EXCLUDED``); it is a property of the window, never of the row's
+    history, so it is safe to overwrite on every hit.
+    """
+    bucket_key = django_db_models.CharField(max_length=255, unique=True)
+    count = django_db_models.IntegerField(default=0)
+    limit_value = django_db_models.IntegerField()
+    expires_at = django_db_models.DateTimeField(db_index=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "api_rate_buckets"
+
+
+class Turn14DropshipController(django_db_models.Model):
+    """
+    A Turn 14 dropship controller: the ruleset deciding whether a brand may ship direct from the
+    manufacturer, and what that costs. Referenced by ``Turn14Items.dropship_controller_id``,
+    which we have always stored and never resolved -- so dropship fees were invisible to landed
+    cost. Fetched from GET /v1/dropship/{id}.
+
+    ``charges`` is Turn 14's raw array of ``{range_start, range_end, charged_fee,
+    charged_percent}`` bands: a fee applies to orders whose value falls in the band, either flat
+    (``charged_fee``) or proportional (``charged_percent``). Kept as JSON rather than exploded
+    into rows because we only ever evaluate a whole schedule against one order total.
+
+    Global cache: one row per controller for every company, per Turn 14's model. Item id 0 is a
+    sentinel for "no controller" and is never fetched.
+    """
+    external_id = django_db_models.CharField(max_length=32)
+    charges = django_db_models.JSONField(null=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "turn14_dropship_controllers"
+        unique_together = ["external_id"]
+
+
+class Turn14ItemShippingEstimate(django_db_models.Model):
+    """
+    Turn 14's estimated ground shipping cost for a single item, from
+    GET /v1/shipping/item_estimation/brand/{brand_id}.
+
+    Turn 14 is explicit that these are estimates -- good-faith numbers that can change at any
+    time, excluding shipping promotions -- so treat them as a ranking and display input for
+    landed cost, never as a quotable price. A real number for a real cart comes from
+    POST /v1/quote.
+
+    ``can_ship`` False means the item cannot go ground to the continental US at all (LTL
+    freight, oversized, hazmat), in which case the min/average/max are null rather than zero.
+    ``fees`` holds the raw surcharge array (residential, additional handling, large package...);
+    entries may carry the string "Included" instead of an amount, which is why it stays JSON.
+    """
+    item_external_id = django_db_models.CharField(max_length=255)
+    brand = django_db_models.ForeignKey(
+        Turn14Brand, on_delete=django_db_models.CASCADE, related_name="item_shipping_estimates", null=True
+    )
+
+    can_ship = django_db_models.BooleanField(default=False)
+    min_rate = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
+    average_rate = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
+    max_rate = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
+    fees = django_db_models.JSONField(null=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "turn14_item_shipping_estimates"
+        unique_together = ["item_external_id"]
+
+
+# Exact kg -> lb factor used by the published load-index charts.
+KG_TO_LB = decimal.Decimal("2.20462")
+
+
+class TireLoadIndex(django_db_models.Model):
+    """
+    Tire load index -> maximum load per tire.
+
+    The standard (ISO 4000-1 / ETRTO / the same table Tire & Rim publishes) is defined in
+    kilograms, so kilograms are the stored value and pounds are derived from them. Published
+    lb charts disagree with each other by a pound or two because each rounds its own way --
+    deriving lb from the canonical kg means our numbers are internally consistent and match
+    whichever chart did the conversion the same way, instead of inheriting one chart's rounding.
+
+    Load index is a code, not a quantity: 91 is 615 kg, 92 is 630 kg, and the steps are uneven
+    (5 kg down low, 100 kg up top), so it can only ever be a lookup -- there is no formula.
+    Covers 60-150, which spans passenger, light truck and the LT/commercial range we actually
+    see in tire feeds; anything outside that is not something our catalog carries.
+
+    Values verified against 35 published anchors across the range.
+    """
+    load_index = django_db_models.PositiveSmallIntegerField(primary_key=True)
+    max_load_kg = django_db_models.PositiveIntegerField(
+        help_text="Maximum load per tire in kilograms -- the canonical value from the standard.",
+    )
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "tire_load_index"
+        ordering = ["load_index"]
+        constraints = [
+            django_db_models.CheckConstraint(
+                check=django_db_models.Q(max_load_kg__gt=0),
+                name="tire_load_index_max_load_kg_positive",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.load_index} ({self.max_load_kg} kg / {self.max_load_lb} lb)"
+
+    @property
+    def max_load_lb(self):
+        """
+        Pounds, derived from the canonical kilograms. Half-up rounding on the .5 case (Python's
+        round() is half-to-even, which would turn 2.5 into 2) so this matches the published lb
+        charts rather than drifting a pound below them.
+        """
+        return int((self.max_load_kg * KG_TO_LB).quantize(decimal.Decimal(1), rounding=decimal.ROUND_HALF_UP))
+
+
+# Exact km/h -> mph factor used by the published speed-rating charts.
+KMH_TO_MPH = decimal.Decimal("0.621371")
+
+
+class TireSpeedRating(django_db_models.Model):
+    """
+    Tire speed symbol -> maximum sustained speed.
+
+    km/h is the canonical value (the symbol is defined in km/h) and mph is derived from it, for
+    the same reason kilograms are canonical on ``TireLoadIndex``: published mph charts disagree
+    with each other, most visibly on P and Q, because each rounds its own conversion.
+
+    ``sort_order`` is by speed, not alphabetically -- H (210 km/h) sits between U (200) and
+    V (240), a historical accident of the symbol being assigned before the sequence was
+    regularised. Any UI that orders speed ratings must order by this column; ordering by ``code``
+    puts H in the middle of the low-speed letters and is simply wrong.
+
+    ``max_speed_kmh`` NULL is the (Y) symbol: "above 300 km/h, consult the manufacturer". It is
+    an open-ended rating, not a missing value, so it sorts last and has no derived mph.
+
+    ZR and Z are deliberately absent. They are size-designation markers rather than speed
+    symbols -- when a size reads e.g. 275/40ZR20, the actual rating is the letter in the service
+    description (W, Y or (Y)), and storing ZR here would let a parser mistake the marker for a
+    rating.
+    """
+    code = django_db_models.CharField(max_length=8, primary_key=True)
+    max_speed_kmh = django_db_models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text="Maximum sustained speed in km/h. NULL means the open-ended (Y): above 300 km/h.",
+    )
+    sort_order = django_db_models.PositiveSmallIntegerField(
+        unique=True,
+        help_text="Ascending by speed, not alphabetical -- H falls between U and V.",
+    )
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "speed_rating"
+        ordering = ["sort_order"]
+        constraints = [
+            django_db_models.CheckConstraint(
+                check=django_db_models.Q(max_speed_kmh__gt=0) | django_db_models.Q(max_speed_kmh__isnull=True),
+                name="speed_rating_max_speed_kmh_positive",
+            ),
+        ]
+
+    def __str__(self):
+        if self.max_speed_kmh is None:
+            return f"{self.code} (above 300 km/h)"
+        return f"{self.code} ({self.max_speed_kmh} km/h / {self.max_speed_mph} mph)"
+
+    @property
+    def max_speed_mph(self):
+        """
+        Miles per hour, derived from the canonical km/h. None for the open-ended (Y) -- there is
+        no ceiling to convert. Half-up rounding, as on TireLoadIndex.max_load_lb.
+        """
+        if self.max_speed_kmh is None:
+            return None
+        return int((self.max_speed_kmh * KMH_TO_MPH).quantize(decimal.Decimal(1), rounding=decimal.ROUND_HALF_UP))
+
+
+class TireLoadRange(django_db_models.Model):
+    """
+    Tire load range / load designation -> ply-rating equivalence.
+
+    Two mutually exclusive vocabularies live in this one table, told apart by ``applies_to``:
+    LT and ST tires carry letter codes A..N, while P-metric passenger tires carry SL or XL. A
+    given tire is described by one vocabulary or the other, never both, so a lookup that doesn't
+    filter on ``applies_to`` can match "E" against a passenger tire's designation and quietly
+    return a light-truck row.
+
+    ``ply_rating`` is a *strength equivalence* to historical bias-ply construction, not a count of
+    physical layers -- a modern Load Range E radial is rated equivalent to a 10-ply bias tire
+    while typically having two or three actual belts. Never present it to a user as a layer count.
+
+    ``typical_max_psi`` is INDICATIVE ONLY and exists for display hints, nothing else. Per the
+    Tire and Rim Association Year Book the same load range appears at different pressures
+    depending on construction -- Load Range E shows up at both 65 and 80 psi -- so the real
+    maximum pressure has to come per product from the tire's own data, and load capacity must
+    never be computed from this column. It is null above Load Range H, where the Year Book
+    stops publishing a single representative figure.
+
+    ``alias`` holds the other stamping for the same designation: XL is also stamped RF
+    ("Reinforced"), so a parser seeing either string should resolve to the XL row.
+
+    I, K and O are intentionally absent from the letter sequence -- the standard skips them
+    because they read as 1, and 0 on a sidewall. A gap there is the standard, not missing data.
+    """
+    APPLIES_TO_LT_ST = "lt_st"
+    APPLIES_TO_PASSENGER = "passenger"
+    APPLIES_TO_CHOICES = [
+        (APPLIES_TO_LT_ST, "LT / ST"),
+        (APPLIES_TO_PASSENGER, "Passenger (P-metric)"),
+    ]
+
+    load_range = django_db_models.CharField(max_length=8, primary_key=True)
+    ply_rating = django_db_models.PositiveSmallIntegerField(
+        help_text="Bias-ply strength equivalence, not a count of physical layers.",
+    )
+    applies_to = django_db_models.CharField(max_length=16, choices=APPLIES_TO_CHOICES)
+    typical_max_psi = django_db_models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text="Indicative only -- never derive load capacity from this. Use the product's own max pressure.",
+    )
+    alias = django_db_models.CharField(
+        max_length=8,
+        null=True,
+        blank=True,
+        help_text="Alternate sidewall stamping for the same designation (XL is also stamped RF).",
+    )
+    sort_order = django_db_models.PositiveSmallIntegerField(unique=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "load_range_ply"
+        ordering = ["sort_order"]
+        constraints = [
+            django_db_models.CheckConstraint(
+                check=django_db_models.Q(applies_to__in=[APPLIES_TO_LT_ST, APPLIES_TO_PASSENGER]),
+                name="load_range_ply_applies_to_valid",
+            ),
+            django_db_models.CheckConstraint(
+                check=django_db_models.Q(ply_rating__gt=0),
+                name="load_range_ply_ply_rating_positive",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.load_range} ({self.ply_rating}-ply equivalent, {self.get_applies_to_display()})"
