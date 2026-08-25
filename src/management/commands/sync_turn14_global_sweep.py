@@ -34,7 +34,7 @@ class Command(BaseCommand):
         parser.add_argument(
             "--skip-shipping-estimates",
             action="store_true",
-            help="Skip the per-brand shipping estimate sweep (464 brands, the slowest step).",
+            help="Skip the shipping estimate sweep (~795 requests, flat -- see turn_14_sweeps.sweep_shipping_estimates).",
         )
         parser.add_argument(
             "--skip-dropship",

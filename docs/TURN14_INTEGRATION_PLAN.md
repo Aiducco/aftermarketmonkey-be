@@ -412,7 +412,7 @@ Turn 14 catalog, which we cannot do today.
 |---|---|---|
 | `GET /v1/locations` | `Turn14Location` (exists) | Add to nightly. 4 stale rows today. |
 | `GET /v1/dropship/{id}` | new `Turn14DropshipController` (`external_id`, `charges` JSON) | Dropship fees for landed cost. Fetch distinct `dropship_controller_id` from `turn14_items`. |
-| `GET /v1/shipping/item_estimation/brand/{id}` | new `Turn14ItemShippingEstimate` (`item_external_id`, `can_ship`, min/avg/max, `fees` JSON) | Per-item shipping estimate -> true landed cost in search. |
+| `GET /v1/shipping/item_estimation` (flat -- confirmed 2026-08-25 to be 1000 rows/page same as the brand-scoped variant, 795 requests vs. 1081 walking brand by brand) | new `Turn14ItemShippingEstimate` (`item_external_id`, `can_ship`, min/avg/max, `fees` JSON) | Per-item shipping estimate -> true landed cost in search. |
 
 All three are global-cache tables (no company FK).
 

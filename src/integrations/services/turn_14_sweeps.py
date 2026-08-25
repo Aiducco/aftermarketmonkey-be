@@ -402,62 +402,53 @@ def sweep_dropship_controllers(client=None) -> int:
     return len(instances)
 
 
-def sweep_shipping_estimates(client=None) -> typing.Tuple[int, int]:
+def sweep_shipping_estimates(client=None, max_pages: typing.Optional[int] = None) -> typing.Tuple[int, int]:
     """
-    GET /v1/shipping/item_estimation/brand/{id} for every mapped brand into
-    Turn14ItemShippingEstimate.
+    GET /v1/shipping/item_estimation over the whole catalog into Turn14ItemShippingEstimate.
 
-    Brand-scoped rather than flat: ``/v1/shipping/item_estimation`` exists unscoped but returns
-    the same 200 rows/page, so there is no page-size advantage, and going brand by brand keeps
-    the brand attribution free instead of costing a Turn14Items lookup per batch.
+    Flat, not brand-scoped -- confirmed live 2026-08-25 both variants return 1000 rows/page
+    (contradicting the earlier assumption the per-brand one was 200/page, which was never
+    actually measured). Summed over every brand's own ceil(items/1000), the per-brand walk costs
+    1081 requests against this endpoint's 795 for the same catalog (measured live: 457 brands,
+    794581 items) -- 26.5% fewer requests, same efficiency gain items/items-data/inventory
+    already get from going flat. Brand attribution costs a Turn14Items lookup per batch here
+    (the flat response carries no brand_id), same trade the other flat sweeps already make.
     """
     client = client or turn_14_global.get_global_client()
-    brands = list(src_models.Turn14Brand.objects.all().order_by("id"))
-    total_seen = total_written = 0
 
-    for brand in brands:
-        def flush(rows: typing.List[typing.Dict], _brand=brand) -> int:
-            instances = []
-            for row in rows:
-                external_id = str(row.get("id", ""))
-                if not external_id:
-                    continue
-                attributes = row.get("attributes") or {}
-                rate = attributes.get("ground_continental_us_base_rate") or {}
-                instances.append(src_models.Turn14ItemShippingEstimate(
-                    item_external_id=external_id,
-                    brand=_brand,
-                    can_ship=bool(rate.get("can_ship", False)),
-                    min_rate=_to_decimal(rate.get("min")),
-                    average_rate=_to_decimal(rate.get("average")),
-                    max_rate=_to_decimal(rate.get("max")),
-                    fees=attributes.get("fees"),
-                    updated_at=timezone.now(),
-                ))
-            if not instances:
-                return 0
-            pgbulk.upsert(
-                src_models.Turn14ItemShippingEstimate,
-                instances,
-                unique_fields=["item_external_id"],
-                update_fields=[
-                    "brand", "can_ship", "min_rate", "average_rate", "max_rate", "fees",
-                    "updated_at",
-                ],
-            )
-            return len(instances)
-
-        seen, written = _sweep(
-            "shipping/item_estimation brand={}".format(brand.external_id),
-            lambda page, b=brand: client.get_item_shipping_estimates_for_brand(
-                brand_id=int(b.external_id), page=page
-            ),
-            flush,
+    def flush(rows: typing.List[typing.Dict]) -> int:
+        brand_ids = _brand_ids_for_items([str(r.get("id", "")) for r in rows])
+        instances = []
+        for row in rows:
+            external_id = str(row.get("id", ""))
+            if not external_id:
+                continue
+            attributes = row.get("attributes") or {}
+            rate = attributes.get("ground_continental_us_base_rate") or {}
+            instances.append(src_models.Turn14ItemShippingEstimate(
+                item_external_id=external_id,
+                brand_id=brand_ids.get(external_id),
+                can_ship=bool(rate.get("can_ship", False)),
+                min_rate=_to_decimal(rate.get("min")),
+                average_rate=_to_decimal(rate.get("average")),
+                max_rate=_to_decimal(rate.get("max")),
+                fees=attributes.get("fees"),
+                updated_at=timezone.now(),
+            ))
+        if not instances:
+            return 0
+        pgbulk.upsert(
+            src_models.Turn14ItemShippingEstimate,
+            instances,
+            unique_fields=["item_external_id"],
+            update_fields=[
+                "brand", "can_ship", "min_rate", "average_rate", "max_rate", "fees",
+                "updated_at",
+            ],
         )
-        total_seen += seen
-        total_written += written
+        return len(instances)
 
-    return total_seen, total_written
+    return _sweep("shipping/item_estimation", client.get_item_shipping_estimates, flush, max_pages=max_pages)
 
 
 def deactivate_items_missing_from_sweep(sweep_started_at) -> int:
