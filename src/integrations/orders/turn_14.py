@@ -206,6 +206,27 @@ def _parse_order_lines(attrs: typing.Dict, warehouse_names: typing.Dict[str, str
     return line_items
 
 
+def _parse_invoice_lines(attrs: typing.Dict, warehouse_names: typing.Dict[str, str]) -> typing.List[typing.Dict]:
+    """A bulk GET /v1/invoices entry's ``lines`` shape -- confirmed live to use unit_price/
+    total_price (not orders/po/{ref}'s price/total) and carry no open_quantity/delivered_quantity
+    at all, since every line on an invoice has, by definition, already shipped."""
+    line_items = []
+    for line in attrs.get("lines", []) or []:
+        warehouse_code = _normalize_warehouse_code(line.get("location_id"))
+        line_items.append(
+            {
+                "part_number": line.get("part_number"),
+                "quantity": line.get("quantity"),
+                "unit_price": _to_float(line.get("unit_price")),
+                "line_total": _to_float(line.get("total_price")),
+                "warehouse_code": warehouse_code,
+                "warehouse_name": warehouse_names.get(warehouse_code) if warehouse_code else None,
+                "status": "shipped",
+            }
+        )
+    return line_items
+
+
 def _parse_order_shipment_items(attrs: typing.Dict, warehouse_names: typing.Dict[str, str]) -> typing.List[typing.Dict]:
     """The create_order/promote_quote_to_order response's shape -- items nested under
     ``shipment``, before any refresh has replaced it with the flatter ``lines`` shape above."""
@@ -244,10 +265,20 @@ _EMPTY_PARSED_ORDER = {
 def parse_order_raw_response(raw_response: typing.Optional[typing.Dict]) -> typing.Dict:
     """
     Maps whatever shape PurchaseOrderDistributorOrder.raw_response currently holds for a Turn14
-    order (same create/promote vs. orders/po/{ref} shape tolerance as extract_po_reference)
-    into the purchase-order detail API's standardized distributor-order fields. Reads the raw
-    JSON fresh on every call instead of a separately-synced DB copy, so a status/tracking change
-    on Turn14's side shows up here without needing a background job to have already caught up.
+    order (same create/promote vs. orders/po/{ref} shape tolerance as extract_po_reference) into
+    the purchase-order detail API's standardized distributor-order fields. Reads the raw JSON
+    fresh on every call instead of a separately-synced DB copy, so a status/tracking change on
+    Turn14's side shows up here without needing a background job to have already caught up.
+
+    A third shape is possible too: a bulk GET /v1/invoices entry, stored as raw_response by
+    confirmed_purchase_order_sync._apply_turn14_invoice_match when a PO is matched via invoice
+    rather than via the (always-open, confirmed live) bulk orders endpoint. Its "type" is
+    "Invoice", not "Order" -- distinguishing the two mattered here: an invoice entry's money
+    fields are named total_price/discount_amount (not total/discount), its lines use
+    unit_price/total_price (not price/total) and carry no open_quantity/delivered_quantity at
+    all, and its relationships is a list keyed by "order" (not an order entry's own
+    {"invoice": [...]} dict) -- naively parsing it with the order-shaped logic below silently
+    produced None for total/discount/line pricing despite tracking happening to match by luck.
     """
     if not isinstance(raw_response, dict):
         return dict(_EMPTY_PARSED_ORDER)
@@ -265,6 +296,25 @@ def parse_order_raw_response(raw_response: typing.Optional[typing.Dict]) -> typi
         for t in (attrs.get("tracking") or [])
         if t.get("tracking_number")
     ]
+
+    if entry.get("type") == "Invoice":
+        warehouse_names = _load_warehouse_names()
+        line_items = _parse_invoice_lines(attrs, warehouse_names)
+        line_totals = [li["line_total"] for li in line_items if li["line_total"] is not None]
+        subtotal = round(sum(line_totals), 2) if line_totals else None
+        return {
+            # Turn14's invoice payload carries no status field of its own -- an invoice existing
+            # at all is our own closed signal (see _apply_turn14_invoice_match), so this is
+            # reported directly rather than left None like an unrecognized order status would be.
+            "distributor_status": "Closed",
+            "distributor_invoice_ids": [attrs["invoice_number"]] if attrs.get("invoice_number") else [],
+            "tracking": tracking,
+            "total": _to_float(attrs.get("total_price")),
+            "freight": _to_float(attrs.get("freight")),
+            "discount": _to_float(attrs.get("discount_amount")),
+            "subtotal": subtotal,
+            "line_items": line_items,
+        }
 
     # relationships.invoice is only present once an invoice has actually been generated against
     # this order (post-refresh shape) -- absent entirely on a freshly-submitted order. It lists
