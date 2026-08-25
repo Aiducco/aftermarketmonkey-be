@@ -715,6 +715,15 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
         except turn14_client_exceptions.Turn14APIBadResponseCodeError as e:
             self._handle_error(e)
 
+    def get_orders(self, start_date: str, end_date: str, page: int = 1) -> typing.Dict:
+        """GET /v1/orders?start_date=&end_date=&page= -- bulk order list for this account, used
+        by confirmed_purchase_order_sync's Turn14 refresh path instead of one
+        GET /v1/orders/po/{ref} call per confirmed PO."""
+        try:
+            return self._client.get_orders(start_date=start_date, end_date=end_date, page=page)
+        except turn14_client_exceptions.Turn14APIBadResponseCodeError as e:
+            self._handle_error(e)
+
     def supports_invoices(self) -> bool:
         return True
 

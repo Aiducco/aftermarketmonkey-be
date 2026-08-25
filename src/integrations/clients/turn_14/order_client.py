@@ -315,12 +315,17 @@ class Turn14OrderApiClient(object):
             params={"start_date": start_date, "end_date": end_date},
         )
 
-    def get_orders(self, start_date: str, end_date: str) -> typing.Dict:
-        """GET /v1/orders?start_date=&end_date= -- every order placed in the range."""
+    def get_orders(self, start_date: str, end_date: str, page: int = 1) -> typing.Dict:
+        """
+        GET /v1/orders?start_date=&end_date=&page= -- every order placed in the range, paginated
+        (confirmed live: same JSON:API {data, meta: {total_pages}, links} shape as the catalog
+        client's endpoints), newest first. One bulk call (or a handful, paginated) here replaces
+        what used to be one GET /v1/orders/po/{ref} call per confirmed PO.
+        """
         return self._request(
             endpoint="orders",
             method=common_enums.HttpMethod.GET,
-            params={"start_date": start_date, "end_date": end_date},
+            params={"start_date": start_date, "end_date": end_date, "page": page},
         )
 
     def get_shipping_options(self) -> typing.Dict:

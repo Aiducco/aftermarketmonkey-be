@@ -138,6 +138,12 @@ _FREQUENT_CHECK_WINDOW = datetime.timedelta(hours=1)
 # a manual refresh (refresh_purchase_order_now) caught up.
 _STALE_CHECK_INTERVAL = datetime.timedelta(hours=4)
 
+# Turn14-specific: a tighter rolling interval than every other provider's _STALE_CHECK_INTERVAL,
+# affordable only because the bulk GET /v1/orders refresh (_refresh_turn14_orders_for_company)
+# replaced one GET /v1/orders/po/{ref} call per PO with one/a few paginated calls per company --
+# checking more often no longer means more requests per PO checked.
+_TURN14_STALE_CHECK_INTERVAL = datetime.timedelta(hours=1)
+
 
 def _should_check(po: src_models.PurchaseOrder, now: datetime.datetime) -> bool:
     """True if this PO is due for a distributor refresh right now, per the module's
@@ -147,6 +153,16 @@ def _should_check(po: src_models.PurchaseOrder, now: datetime.datetime) -> bool:
     if po.distributor_status_checked_at is None:
         return True
     return (now - po.distributor_status_checked_at) >= _STALE_CHECK_INTERVAL
+
+
+def _should_check_turn14(po: src_models.PurchaseOrder, now: datetime.datetime) -> bool:
+    """Same frequent-window rule as _should_check, but _TURN14_STALE_CHECK_INTERVAL (1h) instead
+    of _STALE_CHECK_INTERVAL (4h) once past it."""
+    if po.submitted_at and (now - po.submitted_at) <= _FREQUENT_CHECK_WINDOW:
+        return True
+    if po.distributor_status_checked_at is None:
+        return True
+    return (now - po.distributor_status_checked_at) >= _TURN14_STALE_CHECK_INTERVAL
 
 
 def _refresh_turn14_distributor_order(
@@ -221,6 +237,163 @@ def _refresh_turn14_distributor_order(
             _LOG_PREFIX, pdo.id, pdo.distributor_order_number
         )
     )
+
+
+def _index_turn14_orders_page(data: typing.Dict, index: typing.Dict[str, typing.List[typing.Dict]]) -> None:
+    """Add one GET /v1/orders page's rows to ``index``, keyed by attributes.purchase_order_number
+    (the same reference _refresh_turn14_distributor_order queries orders/po/{ref} with)."""
+    for entry in data.get("data", []):
+        attrs = entry.get("attributes") or {}
+        ref = attrs.get("purchase_order_number")
+        if ref:
+            index.setdefault(str(ref), []).append(entry)
+
+
+def _match_and_update_turn14_pdo(
+    pdo: src_models.PurchaseOrderDistributorOrder, index: typing.Dict[str, typing.List[typing.Dict]]
+) -> None:
+    """Same matching + field-update logic as _refresh_turn14_distributor_order, sourced from a
+    pre-fetched bulk index instead of a live per-PO orders/po/{ref} call."""
+    reference = pdo.po_number or turn_14_adapter.extract_po_reference(pdo.raw_response)
+    if not reference:
+        logger.warning(
+            "{} No po_number/purchase_order_number found for PurchaseOrderDistributorOrder "
+            "id={}; skipping.".format(_LOG_PREFIX, pdo.id)
+        )
+        return
+
+    entries = index.get(str(reference), [])
+    matched = None
+    for entry in entries:
+        attrs = entry.get("attributes") or {}
+        website_order_number = attrs.get("website_order_number")
+        if website_order_number is not None and str(website_order_number) == str(pdo.distributor_order_number):
+            matched = entry
+            break
+
+    if matched is None:
+        logger.info(
+            "{} No entry in the bulk orders index matched reference={} distributor_order_number={} "
+            "for PurchaseOrderDistributorOrder id={}.".format(
+                _LOG_PREFIX, reference, pdo.distributor_order_number, pdo.id
+            )
+        )
+        return
+
+    attrs = matched.get("attributes") or {}
+    update_fields = ["raw_response", "updated_at"]
+    pdo.raw_response = matched
+    if not pdo.po_number:
+        pdo.po_number = reference
+        update_fields.append("po_number")
+
+    pdo.distributor_internal_order_number = attrs.get("order_number")
+    update_fields.append("distributor_internal_order_number")
+
+    raw_status = turn_14_adapter.translate_order_status(attrs.get("status"))
+    if raw_status is not None:
+        pdo.distributor_order_status = raw_status.value
+        pdo.distributor_order_status_name = raw_status.name
+        update_fields += ["distributor_order_status", "distributor_order_status_name"]
+    else:
+        logger.warning(
+            "{} Unrecognized Turn14 order status {!r} for PurchaseOrderDistributorOrder "
+            "id={}; leaving distributor_order_status unset.".format(
+                _LOG_PREFIX, attrs.get("status"), pdo.id
+            )
+        )
+
+    pdo.save(update_fields=update_fields)
+    logger.info(
+        "{} (bulk) Updated raw_response for PurchaseOrderDistributorOrder id={} "
+        "(distributor_order_number={}).".format(_LOG_PREFIX, pdo.id, pdo.distributor_order_number)
+    )
+
+
+# How many days back a "recent" fetch (fresh-submission or never-checked POs) looks -- generous
+# enough that a just-submitted order is always inside it, narrow enough to usually be one page.
+_RECENT_ORDERS_LOOKBACK_DAYS = 7
+
+# Fallback lookback for a reconciliation fetch when no due PO in the batch has a submitted_at
+# (shouldn't normally happen -- every PO gets one at submit time -- but a wide, bounded default
+# beats an unbounded "since forever" scan.
+_RECONCILE_ORDERS_LOOKBACK_DAYS = 90
+
+
+def _refresh_turn14_orders_for_company(
+    company_provider: src_models.CompanyProviders,
+    pos: typing.List[src_models.PurchaseOrder],
+    now: datetime.datetime,
+) -> None:
+    """
+    Bulk Turn14 refresh for every due CONFIRMED PO belonging to one company: one or a handful of
+    paginated GET /v1/orders calls instead of one GET /v1/orders/po/{ref} call per PO.
+
+    Splits the batch in two by why each PO is due (see _should_check):
+      - fresh (submitted within the last hour) or never-checked: cheap, page-1-only fetch over a
+        narrow recent window -- a just-submitted order is always on the newest page (Turn 14
+        returns orders newest-first, confirmed live).
+      - due only via the rolling _STALE_CHECK_INTERVAL: a full paginated fetch back to the
+        oldest PO being reconciled this run, so an order that's slipped past page 1 since it was
+        submitted is still found.
+    Both fetches land in the same reference->entries index; every due PO is then matched exactly
+    the same way _refresh_turn14_distributor_order already does, just against pre-fetched data.
+    """
+    adapter = order_registry.get_adapter(company_provider)
+    if adapter is None or not isinstance(adapter, turn_14_adapter.Turn14OrderAdapter):
+        logger.info(
+            "{} No Turn14 order adapter for company_provider_id={}; skipping {} PO(s).".format(
+                _LOG_PREFIX, company_provider.id, len(pos)
+            )
+        )
+        return
+
+    recent_pos, reconcile_pos = [], []
+    for po in pos:
+        is_fresh = po.submitted_at and (now - po.submitted_at) <= _FREQUENT_CHECK_WINDOW
+        is_never_checked = po.distributor_status_checked_at is None
+        (recent_pos if (is_fresh or is_never_checked) else reconcile_pos).append(po)
+
+    index: typing.Dict[str, typing.List[typing.Dict]] = {}
+    end = now.date().isoformat()
+
+    if recent_pos:
+        start = (now - datetime.timedelta(days=_RECENT_ORDERS_LOOKBACK_DAYS)).date().isoformat()
+        data = adapter.get_orders(start_date=start, end_date=end, page=1)
+        _index_turn14_orders_page(data, index)
+        logger.info(
+            "{} company_provider_id={}: recent fetch (page 1, since {}) -> {} order(s) indexed.".format(
+                _LOG_PREFIX, company_provider.id, start, len(data.get("data", []))
+            )
+        )
+
+    if reconcile_pos:
+        earliest = min(
+            (po.submitted_at for po in reconcile_pos if po.submitted_at),
+            default=now - datetime.timedelta(days=_RECONCILE_ORDERS_LOOKBACK_DAYS),
+        )
+        start = earliest.date().isoformat()
+        page, total_seen = 1, 0
+        while page is not None:
+            data = adapter.get_orders(start_date=start, end_date=end, page=page)
+            _index_turn14_orders_page(data, index)
+            total_seen += len(data.get("data", []))
+            total_pages = (data.get("meta") or {}).get("total_pages", 1)
+            page = page + 1 if page < total_pages else None
+        logger.info(
+            "{} company_provider_id={}: reconciliation fetch (since {}, {} page(s)) -> {} order(s) "
+            "indexed.".format(_LOG_PREFIX, company_provider.id, start, total_pages, total_seen)
+        )
+
+    for po in recent_pos + reconcile_pos:
+        for pdo in po.distributor_orders.all():
+            try:
+                _match_and_update_turn14_pdo(pdo, index)
+            except Exception:
+                logger.exception(
+                    "{} Failed matching PurchaseOrderDistributorOrder id={} for "
+                    "purchase_order_id={}.".format(_LOG_PREFIX, pdo.id, po.id)
+                )
 
 
 def _refresh_keystone_distributor_order(
@@ -572,16 +745,42 @@ def refresh_confirmed_purchase_orders() -> typing.Dict[str, int]:
     skipped = 0
     qs = (
         src_models.PurchaseOrder.objects.filter(status=src_enums.PurchaseOrderStatus.CONFIRMED.value)
-        .select_related("company_provider__provider")
+        .select_related("company_provider__provider", "company_provider__company")
         .prefetch_related("distributor_orders")
     )
+
+    # Turn14 POs are pulled out and grouped by company so _refresh_turn14_orders_for_company can
+    # do one bulk GET /v1/orders fetch per company instead of _refresh_purchase_order's one
+    # GET /v1/orders/po/{ref} call per PO. Every other provider is untouched -- same per-PO
+    # _refresh_purchase_order path as before.
+    turn14_pos_by_company: typing.Dict[int, typing.List[src_models.PurchaseOrder]] = {}
+    turn14_company_providers: typing.Dict[int, src_models.CompanyProviders] = {}
+    other_pos: typing.List[src_models.PurchaseOrder] = []
+
     for po in qs:
-        if not _should_check(po, now):
+        is_turn14 = po.company_provider.provider.kind == src_enums.BrandProviderKind.TURN_14.value
+        due = _should_check_turn14(po, now) if is_turn14 else _should_check(po, now)
+        if not due:
             skipped += 1
             continue
+        if is_turn14:
+            turn14_pos_by_company.setdefault(po.company_provider_id, []).append(po)
+            turn14_company_providers[po.company_provider_id] = po.company_provider
+        else:
+            other_pos.append(po)
+
+    for po in other_pos:
         _refresh_purchase_order(po)
         po.distributor_status_checked_at = now
         po.save(update_fields=["distributor_status_checked_at", "updated_at"])
         checked += 1
+
+    for company_provider_id, pos in turn14_pos_by_company.items():
+        _refresh_turn14_orders_for_company(turn14_company_providers[company_provider_id], pos, now)
+        for po in pos:
+            po.distributor_status_checked_at = now
+            po.save(update_fields=["distributor_status_checked_at", "updated_at"])
+            checked += 1
+
     logger.info("{} Checked {} PO(s), skipped {} (not due yet).".format(_LOG_PREFIX, checked, skipped))
     return {"checked": checked, "skipped": skipped}
