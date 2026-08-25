@@ -249,14 +249,14 @@ def _fetch_raw_pricing(cp: src_models.CompanyProviders, use_delta_fetch: bool = 
     kind = cp.provider.kind
 
     if kind == src_enums.BrandProviderKind.TURN_14.value:
-        # Flat /v1/pricing for both paths now. The delta route (pricing/changes -> re-fetch the
-        # affected brands) existed because a full fetch meant paging all 464 brands at 200 rows
-        # a page -- ~4 200 requests, ~50 minutes, impossible to repeat for every customer daily.
-        # The flat endpoint returns the same data 1 000 rows to a page in 776 requests, so a
-        # complete refresh now costs less than the delta's own brand re-fetches did, and every
-        # customer gets genuinely current pricing rather than a diff against unknown state.
-        # fetch_and_save_turn_14_brand_pricing_delta_for_company_provider is kept for now as a
-        # fallback while the flat path proves itself in production.
+        # Flat /v1/pricing for both paths now. The old delta route (pricing/changes -> re-fetch
+        # the affected brands) existed because a full fetch meant paging all 464 brands at 200
+        # rows a page -- ~4 200 requests, ~50 minutes, impossible to repeat for every customer
+        # daily. The flat endpoint returns the same data 1 000 rows to a page in 776 requests, so
+        # a complete refresh now costs less than the delta's own brand re-fetches did, and every
+        # customer gets genuinely current pricing rather than a diff against unknown state. The
+        # old delta function has been removed -- it was unreachable dead code, never called from
+        # anywhere once this branch stopped conditionally falling back to it.
         turn_14_sweeps.sweep_pricing_for_company_provider(cp)
 
     elif kind == src_enums.BrandProviderKind.KEYSTONE.value:

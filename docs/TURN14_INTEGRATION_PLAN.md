@@ -437,20 +437,25 @@ Replaces N per-PO calls with ~2 calls per company per hour — Dan's "less I/O t
 and invoice per customer". Keep `refresh_confirmed_purchase_orders` as the fallback for POs
 older than the sweep window and for the immediate post-submit window.
 
-### Phase 6 — Cadence split (1 day)
+### Phase 6 — Cadence split (done, deployed 2026-08-25)
 
-Cron lives on the host (via `command_runner.sh`), not in the repo — this is a deploy/ops change
-plus new command arguments.
+Cron lives on the host, invoked via `docker exec aftermarketmonkey-be-app-1 python manage.py
+<command>` directly (not `command_runner.sh` -- that file exists but no crontab entry actually
+uses it). Turn 14 no longer runs inside `ingest_all_providers` at all -- it's fully unbundled
+onto the dedicated commands below.
 
 | Cadence | Command | Endpoints |
 |---|---|---|
-| every 10 min | `fetch_turn_14_inventory_updates --minutes 15` | `inventory/updates?minutes=15` |
-| every 4 h | `fetch_turn_14_items_updates --days 1` | `items/updates?days=1` |
+| every 10 min | `fetch_turn_14_inventory_updates --minutes 15` | `inventory/updates?minutes=15`, then a scoped `MasterPart`/`ProviderPartInventory` propagation pass |
+| every 4 h | `fetch_turn_14_items_updates --days 1` | `items/updates?days=1`, then scoped propagation |
 | hourly | `sync_turn14_order_sweeps` | `tracking`, `tracking/package_details`, `invoices` |
-| daily | `ingest_all_providers` + flat global sweeps | `items`, `items/data`, `inventory`, `locations`, `dropship`, `shipping/item_estimation`, `pricing` per company |
-| weekly | `fetch_turn_14_all_brand_fitment` | `items/fitment` |
+| daily | `sync_turn14_global_sweep` | `items`, `items/data`, `inventory`, `locations`, `dropship`, `shipping/item_estimation`, then propagation, then per-company `pricing` jobs enqueued for every active Turn 14 connection |
+| weekly | `sync_turn14_fitment_sweep` | `items/fitment`, decoded straight into `MasterPartFitment` (no `Turn14ItemFitment` intermediate) |
 
-Add `--minutes` / `--days` arguments (currently hardcoded at 30 and 1 inside the services).
+The old `fetch_turn_14_all_brand_fitment` command and its
+`fetch_and_save_turn_14_fitment_for_all_brands` service function (which wrote into
+`Turn14ItemFitment`, the table this redesign moved away from) have been removed entirely --
+`sync_turn14_fitment_sweep` is the only fitment path now.
 
 **Guard rail:** the 10-minute inventory delta and the daily full sweep must not run
 concurrently against the same tables. Use `ScheduledTaskExecution` rows as an advisory lock —
