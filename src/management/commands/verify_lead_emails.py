@@ -74,6 +74,10 @@ class Command(BaseCommand):
     help = "Verify lead emails in bulk using Reoon API (Power mode)"
 
     def add_arguments(self, parser):
+        parser.add_argument("--one-per-lead", action="store_true",
+                            help="Verify only the best-ranked address per lead (credit-efficient)")
+        parser.add_argument("--max-emails", type=int, default=None,
+                            help="Hard cap on addresses submitted — match your credit balance")
         parser.add_argument("--source", default="google", choices=sorted(SOURCES),
                             help="Which lead table's emails to verify")
         parser.add_argument("--state", default=None, help="Filter by state code (e.g. TX)")
@@ -111,13 +115,25 @@ class Command(BaseCommand):
             )
 
         # email -> lead_id mapping for saving results later
+        #
+        # --one-per-lead exists because Reoon credits are finite and outreach needs ONE working
+        # address per business, not every mailbox it owns. With 9,930 leads holding 23,751
+        # addresses, spending a fixed 6,884 credits on every address reaches ~2,900 businesses;
+        # spending one per lead reaches 6,884 -- 2.4x the coverage for the same credits. The
+        # extractor already ranks addresses (own domain first, then role accounts), so index 0
+        # is the best candidate.
         email_to_lead: dict[str, int] = {}
         for lead in leads:
             for email in (lead.emails or []):
                 if (lead.pk, email) not in already_verified:
                     email_to_lead[email] = lead.pk
+                    if options["one_per_lead"]:
+                        break
 
         all_emails = list(email_to_lead.keys())
+        if options["max_emails"]:
+            all_emails = all_emails[:options["max_emails"]]
+            email_to_lead = {e: email_to_lead[e] for e in all_emails}
         total = len(all_emails)
 
         if not total:
