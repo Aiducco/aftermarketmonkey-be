@@ -571,8 +571,17 @@ def _ingest_turn14_items_for_mapped_brands(
     t14_brand_to_brand: typing.Dict[int, src_models.Brands],
     t14_brand_to_aaia: typing.Dict[int, typing.Optional[str]],
     category_by_source: typing.Dict[str, typing.Tuple[typing.Optional[str], typing.Optional[str]]],
+    since: typing.Optional[typing.Any] = None,
 ) -> typing.Tuple[int, int]:
-    """Batch-ingest Turn14Items into MasterPart / ProviderPart for one disjoint set of Turn14 brand PKs."""
+    """
+    Batch-ingest Turn14Items into MasterPart / ProviderPart for one disjoint set of Turn14 brand PKs.
+
+    ``since``, when given, restricts to rows with ``updated_at >= since`` -- Turn14Items.updated_at
+    is reliably bumped only on rows a given items/inventory delta fetch actually touched (see
+    turn_14._transform_items_update_data and _bump_turn14_items_updated_at_for_inventory_batch), so
+    this turns a full ~793k-row walk into a scan of just that delta -- the difference between safe
+    on a 4-hourly cadence and not.
+    """
     if not mapped_catalog_brand_ids:
         return 0, 0
     total_master = 0
@@ -581,11 +590,14 @@ def _ingest_turn14_items_for_mapped_brands(
     last_id = 0
     while True:
         batch_num += 1
+        qs = src_models.Turn14Items.objects.filter(
+            brand_id__in=mapped_catalog_brand_ids,
+            id__gt=last_id,
+        )
+        if since is not None:
+            qs = qs.filter(updated_at__gte=since)
         batch = list(
-            src_models.Turn14Items.objects.filter(
-                brand_id__in=mapped_catalog_brand_ids,
-                id__gt=last_id,
-            )
+            qs
             .order_by("id")
             .values(
                 "id",
@@ -737,13 +749,19 @@ def _ingest_turn14_items_for_mapped_brands(
     return total_master, total_provider
 
 
-def sync_master_parts_from_turn14() -> None:
+def sync_master_parts_from_turn14(since: typing.Optional[typing.Any] = None) -> None:
     """
     Create/update MasterPart and ProviderPart from Turn14Items.
     Only processes items whose Turn14Brand has a BrandTurn14BrandMapping.
     Uses cursor-based pagination (id__gt) and preloaded brand mapping to avoid N+1 and slow OFFSET.
+
+    Pass ``since`` to scope to only rows updated at/after that time (see
+    _ingest_turn14_items_for_mapped_brands) -- a full unscoped run is a genuine ~793k-row walk,
+    fine daily but not on a tight delta cadence.
     """
-    logger.info("{} Syncing master parts from Turn14 (batched, cursor-based).".format(_LOG_PREFIX))
+    logger.info("{} Syncing master parts from Turn14 (batched, cursor-based{}).".format(
+        _LOG_PREFIX, ", since={}".format(since) if since else ""
+    ))
 
     turn14_provider = src_models.Providers.objects.filter(
         kind=src_enums.BrandProviderKind.TURN_14.value,
@@ -772,7 +790,7 @@ def sync_master_parts_from_turn14() -> None:
         mappings,
         "turn14_brand",
         lambda cids: _ingest_turn14_items_for_mapped_brands(
-            cids, turn14_provider, t14_brand_to_brand, t14_brand_to_aaia, category_by_source
+            cids, turn14_provider, t14_brand_to_brand, t14_brand_to_aaia, category_by_source, since=since
         ),
     )
     logger.info("{} Synced {} master parts and {} provider parts from Turn14 total.".format(
@@ -8271,6 +8289,7 @@ def _sync_turn14_provider_inventory_batches(
     catalog_brand_ids: typing.Optional[typing.Set[int]],
     all_mapped_catalog_brand_ids: typing.Optional[typing.Set[int]],
     log_context: str,
+    since: typing.Optional[typing.Any] = None,
 ) -> int:
     """
     Cursor-batched Turn14BrandInventory -> ProviderPartInventory upsert for one brand scope.
@@ -8278,6 +8297,10 @@ def _sync_turn14_provider_inventory_batches(
     If ``catalog_brand_ids`` is set, restrict to those Turn14 brand ids (parallel partition).
     Else if ``all_mapped_catalog_brand_ids`` is set, process rows with no brand or a catalog brand
     not in that set (legacy / unmapped inventory still keyed by ``external_id``).
+
+    ``since``, when given, restricts to rows with ``updated_at >= since`` -- reliably bumped only
+    on rows an inventory delta actually touched (see turn_14._stamp_inventory_batch_updated_at) --
+    turning a full table walk into a scan of just that delta.
     """
     total_upserted = 0
     batch_num = 0
@@ -8285,6 +8308,8 @@ def _sync_turn14_provider_inventory_batches(
     while True:
         batch_num += 1
         qs = src_models.Turn14BrandInventory.objects.filter(id__gt=last_id)
+        if since is not None:
+            qs = qs.filter(updated_at__gte=since)
         if catalog_brand_ids is not None:
             if not catalog_brand_ids:
                 break
@@ -8375,12 +8400,19 @@ def _sync_turn14_provider_inventory_batches(
     return total_upserted
 
 
-def sync_provider_inventory_from_turn14() -> None:
+def sync_provider_inventory_from_turn14(since: typing.Optional[typing.Any] = None) -> None:
     """
     Sync ProviderPartInventory from Turn14BrandInventory.
     Uses bulk upsert with cursor-based batching.
+
+    Pass ``since`` to scope the batch upsert loop to only rows updated at/after that time (see
+    _sync_turn14_provider_inventory_batches). The ProviderPart id/external_id preload below stays
+    unscoped (a single narrow, read-only SELECT -- cheap even at ~793k rows); it's the per-row
+    upsert loop that a full run makes expensive, and that's what since bounds.
     """
-    logger.info("{} Syncing provider inventory from Turn14.".format(_LOG_PREFIX))
+    logger.info("{} Syncing provider inventory from Turn14{}.".format(
+        _LOG_PREFIX, " (since={})".format(since) if since else ""
+    ))
 
     turn14_provider = src_models.Providers.objects.filter(
         kind=src_enums.BrandProviderKind.TURN_14.value,
@@ -8414,6 +8446,7 @@ def sync_provider_inventory_from_turn14() -> None:
             catalog_brand_ids=catalog_ids,
             all_mapped_catalog_brand_ids=None,
             log_context="mapped brand",
+            since=since,
         )
 
     mapped_catalog_brand_ids = {m.turn14_brand_id for m in mappings}
@@ -8425,6 +8458,7 @@ def sync_provider_inventory_from_turn14() -> None:
         catalog_brand_ids=None,
         all_mapped_catalog_brand_ids=mapped_catalog_brand_ids,
         log_context="unmapped or null brand",
+        since=since,
     )
     logger.info("{} Synced {} Turn14 inventory records total.".format(_LOG_PREFIX, total_upserted))
 
@@ -9339,7 +9373,13 @@ def _maybe_reindex_meilisearch_after_master_parts(
     )
 
 
-def sync_derived_from_turn14(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False, skip_pricing: bool = False) -> None:
+def sync_derived_from_turn14(
+    *,
+    reindex_meilisearch: bool = False,
+    skip_master_parts: bool = False,
+    skip_pricing: bool = False,
+    since: typing.Optional[typing.Any] = None,
+) -> None:
     """
     Propagate Turn14 source data into MasterPart, ProviderPart, ProviderPartInventory,
     and ProviderPartCompanyPricing. Call after Turn14 item/catalog fetches so the unified
@@ -9348,17 +9388,24 @@ def sync_derived_from_turn14(*, reindex_meilisearch: bool = False, skip_master_p
     Pass ``skip_master_parts=True`` to run only inventory + pricing (fast incremental path).
     Pass ``skip_pricing=True`` to run only master parts + inventory (global catalog sync path;
     pricing handled separately via IntegrationPricingSyncJob queue).
+
+    Pass ``since`` (a datetime) to scope both the master-parts and inventory passes to rows
+    updated at/after that time instead of a full-catalog walk -- required for the 4-hourly items
+    delta and 10-minute inventory delta commands, since sync_master_parts_from_turn14 /
+    sync_provider_inventory_from_turn14 have no other scoping and a full run of either is a
+    genuine ~793k-row walk (fine once daily via sync_turn14_global_sweep, not on a tight cadence).
     """
-    logger.info("{} Starting Turn14-only derived sync ({}).".format(
+    logger.info("{} Starting Turn14-only derived sync ({}{}).".format(
         _LOG_PREFIX,
         "inventory + pricing only" if skip_master_parts else "parts, inventory" + ("" if skip_pricing else ", pricing"),
+        ", since={}".format(since) if since else "",
     ))
     if not skip_master_parts:
-        sync_master_parts_from_turn14()
+        sync_master_parts_from_turn14(since=since)
         connection.close()
 
     def _cont() -> None:
-        sync_provider_inventory_from_turn14()
+        sync_provider_inventory_from_turn14(since=since)
         connection.close()
         if not skip_pricing:
             sync_provider_pricing_from_turn14()

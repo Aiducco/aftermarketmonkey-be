@@ -16,6 +16,7 @@ from django.utils import timezone
 
 from src.audit import scheduled_tasks as audit_scheduled_tasks
 from src.integrations import rate_limit as rate_limit_base
+from src.integrations.services import integration_pricing_sync_jobs
 from src.integrations.services import master_parts
 from src.integrations.services import turn_14 as turn_14_services
 from src.integrations.services import turn_14_global, turn_14_sweeps
@@ -74,12 +75,18 @@ class Command(BaseCommand):
                 results["shipping_estimates"] = turn_14_sweeps.sweep_shipping_estimates(client)
 
             # Only after every raw sweep above completed -- propagating from a half-swept catalog
-            # would push incomplete data into MasterPart/ProviderPart. Pricing is deliberately
-            # skipped here: it stays on the separate IntegrationPricingSyncJob queue (Phase 3 of
-            # ingest_all_providers, and enqueued immediately per-connection on connect).
+            # would push incomplete data into MasterPart/ProviderPart. Pricing sync itself stays
+            # separate (the per-company IntegrationPricingSyncJob queue), but Turn 14's *recurring*
+            # enqueue happens right here rather than on ingest_all_providers' every-4-hours cycle
+            # -- pricing should be checked against the catalog just swept, not against up to ~20h
+            # stale data (see enqueue_all_active_turn14_pricing_jobs). On-connect enqueue for a
+            # brand new connection is unaffected -- that still fires immediately, unrelated to
+            # this daily cycle.
             self.stdout.write("Propagating swept Turn14 data into MasterPart/ProviderPart...")
             master_parts.sync_derived_from_turn14(skip_pricing=True)
             self.stdout.write("Propagation complete.")
+
+            results["pricing_jobs_enqueued"] = integration_pricing_sync_jobs.enqueue_all_active_turn14_pricing_jobs()
 
             # Only after everything above completed -- a sweep cut short by a spent budget has
             # seen an arbitrary prefix of the catalog, and "deactivate everything unseen" would

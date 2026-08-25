@@ -113,7 +113,12 @@ def should_enqueue_pricing_sync(provider_kind: int) -> bool:
 def enqueue_all_active_company_provider_pricing_jobs() -> int:
     """
     Enqueue a pricing sync job for every active ``CompanyProviders`` row whose provider
-    kind is in ``_PRICING_SYNC_KINDS``.
+    kind is in ``_PRICING_SYNC_KINDS``, EXCEPT Turn 14 -- Turn 14's recurring pricing sync is
+    enqueued separately, once daily, from sync_turn14_global_sweep (see
+    enqueue_all_active_turn14_pricing_jobs), tied to the same cycle as the fresh catalog sweep
+    it should be checked against rather than to this function's every-4-hours cadence. Turn 14
+    stays in _PRICING_SYNC_KINDS itself since should_enqueue_pricing_sync (the on-connect gate)
+    also reads that set and on-connect enqueue for Turn 14 is unchanged.
 
     Called by the nightly ``ingest_all_providers`` pipeline after Phase 2 (global catalog
     sync) completes.  All jobs use ``skip_raw_fetch=False`` so each company-provider
@@ -121,19 +126,15 @@ def enqueue_all_active_company_provider_pricing_jobs() -> int:
     the master pricing layer.  Phase 1 only fetches global catalog data, never per-company
     pricing, so there is nothing to skip here.
 
-    Turn 14 rows are enqueued with ``use_delta_fetch=True``: a full fetch pages through every
-    mapped brand's complete pricing regardless of what changed, which is multi-hour for
-    companies with a large catalog — the recurring cycle only needs what changed since last
-    time. Every other kind is unaffected (use_delta_fetch is a no-op for them).
-
     Idempotent: any existing OPEN job for the same company-provider is removed before
     creating a fresh one (same behaviour as ``enqueue_company_provider_pricing_sync``).
 
     Returns the number of jobs enqueued.
     """
+    recurring_kinds = [k for k in _PRICING_SYNC_KINDS if k != src_enums.BrandProviderKind.TURN_14.value]
     qs = (
         src_models.CompanyProviders.objects.select_related("provider")
-        .filter(provider__kind__in=list(_PRICING_SYNC_KINDS))
+        .filter(provider__kind__in=recurring_kinds)
         .values_list("id", "provider__kind")
     )
     enqueued = 0
@@ -148,8 +149,7 @@ def enqueue_all_active_company_provider_pricing_jobs() -> int:
                 )
             )
             continue
-        use_delta_fetch = kind == src_enums.BrandProviderKind.TURN_14.value
-        enqueue_company_provider_pricing_sync(cp_id, skip_raw_fetch=False, use_delta_fetch=use_delta_fetch)
+        enqueue_company_provider_pricing_sync(cp_id, skip_raw_fetch=False)
         enqueued += 1
     if skipped_not_due:
         logger.info(
@@ -159,6 +159,38 @@ def enqueue_all_active_company_provider_pricing_jobs() -> int:
     logger.info(
         "{} enqueue_all_active_company_provider_pricing_jobs: enqueued {} job(s).".format(
             _LOG_PREFIX, enqueued
+        )
+    )
+    return enqueued
+
+
+def enqueue_all_active_turn14_pricing_jobs() -> int:
+    """
+    Enqueue a pricing sync job for every active Turn 14 ``CompanyProviders`` row.
+
+    Called once daily from sync_turn14_global_sweep, after that command's own catalog sweep +
+    MasterPart/ProviderPart propagation complete -- pricing gets checked against the same-day
+    fresh catalog it was just swept against, rather than against up to ~20h-stale data if this
+    ran on the generic every-4-hours ingest_all_providers cycle instead. Each job still does a
+    full per-company flat /v1/pricing fetch (see _fetch_raw_pricing) -- there is no delta path
+    for Turn 14 pricing.
+
+    Idempotent, same as enqueue_all_active_company_provider_pricing_jobs. Returns the number of
+    jobs enqueued.
+    """
+    turn14_kind = src_enums.BrandProviderKind.TURN_14.value
+    cp_ids = list(
+        src_models.CompanyProviders.objects.filter(provider__kind=turn14_kind).values_list("id", flat=True)
+    )
+    enqueued = 0
+    for cp_id in cp_ids:
+        if not _recurring_pricing_sync_is_due(cp_id, turn14_kind):
+            continue
+        enqueue_company_provider_pricing_sync(cp_id, skip_raw_fetch=False)
+        enqueued += 1
+    logger.info(
+        "{} enqueue_all_active_turn14_pricing_jobs: enqueued {} of {} active connection(s).".format(
+            _LOG_PREFIX, enqueued, len(cp_ids)
         )
     )
     return enqueued
@@ -177,9 +209,11 @@ def enqueue_company_provider_pricing_sync(
     pipeline).  Leave ``False`` (default) for on-demand new-company onboarding/reconnect so the
     full fetch + sync cycle runs.
 
-    Pass ``use_delta_fetch=True`` (Turn 14 only, currently) for the recurring cycle so the raw
-    fetch only re-pulls brands with recent pricing changes instead of the full catalog. Leave
-    ``False`` (default) for connect/reconnect, where there's no prior state to diff against.
+    ``use_delta_fetch`` is currently unused by every dispatch branch in ``_fetch_raw_pricing``
+    (Turn 14's own delta route was retired in favor of a flat full fetch that's cheaper than the
+    delta's brand re-fetches were -- see that function's Turn 14 branch) but is left on the
+    signature/model field rather than removed, since it's still a meaningful concept a future
+    provider's delta endpoint could use.
     """
     src_models.IntegrationPricingSyncJob.objects.filter(
         company_provider_id=company_provider_id,
@@ -206,11 +240,11 @@ def _fetch_raw_pricing(cp: src_models.CompanyProviders, use_delta_fetch: bool = 
     recurring cycle for kinds without a delta option). Each provider uses its own API/SFTP/CSV
     mechanism with company-specific credentials.
 
-    use_delta_fetch is currently only honored for Turn 14: a full fetch pages through every
-    mapped brand's complete pricing regardless of what changed (multi-hour for large catalogs);
-    the delta fetch instead asks Turn 14 what changed and only re-fetches those brands. Ignored
-    for every other kind — set it only from the recurring ingest_all_providers path, never from
-    connect/reconnect, which should always get a full fetch (no prior state to diff against).
+    use_delta_fetch is currently ignored by every branch below -- Turn 14 used to honor it (a
+    delta fetch asking what changed and only re-fetching those brands) but that route was
+    retired once the flat /v1/pricing fetch turned out cheaper than the delta's own brand
+    re-fetches (see the Turn 14 branch just below). Left on the signature rather than removed
+    for the same reason noted on enqueue_company_provider_pricing_sync.
     """
     kind = cp.provider.kind
 

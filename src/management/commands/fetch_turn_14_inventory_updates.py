@@ -1,15 +1,19 @@
 """10-minute Turn 14 inventory delta -- the fastest tier of their proposed model."""
+import datetime
+
 from django.core.management.base import BaseCommand
+from django.utils import timezone
 
 from src.audit import scheduled_tasks as audit_scheduled_tasks
 from src.integrations import rate_limit as rate_limit_base
+from src.integrations.services import master_parts
 from src.integrations.services import turn_14
 
 _TASK_NAME = "fetch_turn_14_inventory_updates"
 
 
 class Command(BaseCommand):
-    help = "Fetch and save Turn 14 inventory updates (GET /v1/inventory/updates)."
+    help = "Fetch and save Turn 14 inventory updates (GET /v1/inventory/updates), then propagate the delta."
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -26,9 +30,14 @@ class Command(BaseCommand):
         audit_scheduled_tasks.cleanup_stale_started_executions(_TASK_NAME, max_age_minutes=30)
         execution = audit_scheduled_tasks.start_scheduled_task_execution(_TASK_NAME)
         meter = rate_limit_base.UsageMeter("t14:get")
+        since = timezone.now() - datetime.timedelta(minutes=options["minutes"])
         meter.__enter__()
         try:
             turn_14.fetch_and_save_turn_14_inventory_updates(minutes=options["minutes"])
+            # Inventory-only (skip_master_parts=True): item metadata doesn't change here, and a
+            # full sync_master_parts_from_turn14 pass has no place on a 10-minute cadence.
+            # Scoped via since -- not a full ~793k-row rescan.
+            master_parts.sync_derived_from_turn14(skip_master_parts=True, skip_pricing=True, since=since)
         except Exception as e:
             meter.__exit__(None, None, None)
             audit_scheduled_tasks.mark_scheduled_task_failed(execution, error_message=str(e))
