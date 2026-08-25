@@ -4726,7 +4726,8 @@ class TireLoadRange(django_db_models.Model):
         ordering = ["sort_order"]
         constraints = [
             django_db_models.CheckConstraint(
-                check=django_db_models.Q(applies_to__in=[APPLIES_TO_LT_ST, APPLIES_TO_PASSENGER]),
+                # Literals, not the class constants above: a nested Meta body cannot see them.
+                check=django_db_models.Q(applies_to__in=["lt_st", "passenger"]),
                 name="load_range_ply_applies_to_valid",
             ),
             django_db_models.CheckConstraint(

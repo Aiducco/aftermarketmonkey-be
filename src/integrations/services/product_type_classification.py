@@ -83,6 +83,19 @@ WITH batch AS MATERIALIZED (
 )
 """
 
+# Same as above plus the master part's own brand, for sources whose provider_external_id is not
+# unique in the raw table and need the brand to disambiguate. See _Source.brand_scope_sql.
+_BARE_BATCH_CTE_WITH_BRAND = """
+WITH batch AS MATERIALIZED (
+    SELECT pp.id, pp.master_part_id, pp.provider_external_id AS raw_key, mp.brand_id
+    FROM provider_parts pp
+    JOIN master_parts mp ON mp.id = pp.master_part_id
+    WHERE pp.provider_id = %(provider_id)s AND pp.id > %(last_id)s
+    ORDER BY pp.id
+    LIMIT %(limit)s
+)
+"""
+
 
 @dataclasses.dataclass(frozen=True)
 class _Source:
@@ -92,6 +105,12 @@ class _Source:
 
     ``composite_key`` is True for the ``"<brand_id>_<key>"`` provider_external_id shape every
     distributor uses except Turn14 (bare ``external_id``) and Meyer (bare ``meyer_part``).
+
+    ``brand_scope_sql`` is an extra predicate for a source whose key is not unique in its own raw
+    table, so the join would otherwise fan out and stage several contradictory candidates for one
+    part. It may reference ``b.brand_id`` (the MasterPart's brand). Only Meyer needs it: 54,881
+    ``meyer_part`` values exist under two MeyerBrands and 15,003 of those pairs disagree on
+    ``sub_category``, and without scoping every one of them would be reported as a fake conflict.
     """
     name: str
     provider_kind: int
@@ -100,13 +119,17 @@ class _Source:
     select_columns: typing.Sequence[str]
     classify: typing.Callable[[typing.Dict, typing.Dict], typing.Optional[pt.Verdict]]
     composite_key: bool = True
+    brand_scope_sql: typing.Optional[str] = None
 
     def batch_sql(self) -> str:
-        cte = _COMPOSITE_BATCH_CTE if self.composite_key else _BARE_BATCH_CTE
         if self.composite_key:
+            cte = _COMPOSITE_BATCH_CTE
             join = "r.brand_id = b.raw_brand_id AND r.{} = b.raw_key".format(self.raw_key_column)
         else:
+            cte = _BARE_BATCH_CTE_WITH_BRAND if self.brand_scope_sql else _BARE_BATCH_CTE
             join = "r.{} = b.raw_key".format(self.raw_key_column)
+        if self.brand_scope_sql:
+            join = "{} AND {}".format(join, self.brand_scope_sql)
         columns = ", ".join("r.{}".format(column) for column in self.select_columns)
         # An explicit join marker rather than "did every selected column come back NULL": a
         # Turn14 item with a NULL category is a real row we simply cannot classify, and must not
@@ -308,6 +331,10 @@ SOURCES = (
         select_columns=("sub_category", "category"),
         classify=_meyer,
         composite_key=False,
+        brand_scope_sql=(
+            "r.brand_id IN (SELECT m.meyer_brand_id FROM brand_meyer_brand_mapping m"
+            " WHERE m.brand_id = b.brand_id)"
+        ),
     ),
 )
 
