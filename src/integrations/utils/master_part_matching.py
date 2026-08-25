@@ -601,7 +601,7 @@ def extend_with_normalized_matches(
             provider_id=provider_id,
         )
         existing_by_key.update(by_sku)
-        matches = dict(matches, **by_sku)
+        matches.update(by_sku)
 
     still_unplaced = [key for key in pairs if existing_by_key.get(key) is None]
     if still_unplaced:
@@ -618,7 +618,7 @@ def extend_with_normalized_matches(
             provider_id=provider_id,
         )
         existing_by_key.update(by_barcode)
-        matches = dict(matches, **by_barcode)
+        matches.update(by_barcode)
     return len(matches)
 
 
