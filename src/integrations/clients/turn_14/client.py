@@ -1,25 +1,27 @@
 import decimal
-import time
 import typing
 import requests
 import logging
 import simplejson
 from django.conf import settings
-from ratelimit import limits, sleep_and_retry  # Add ratelimit imports
 
 from common import enums as common_enums
 from common import utils as common_utils
+from src.integrations import rate_limit as rate_limit_base
 from src.integrations.clients.turn_14 import USER_AGENT, exceptions
+from src.integrations.clients.turn_14 import rate_limit as turn14_rate_limit
 
 logger = logging.getLogger(__name__)
 
-# Define rate limits
-SECOND_LIMIT = 5
-HOUR_LIMIT = 5000
-DAY_LIMIT = 30000
 
-# Token expiration buffer (refresh token 60 seconds before it expires)
-TOKEN_EXPIRATION_BUFFER_SECONDS = 60
+def _retry_after_seconds(response: requests.Response, default: float = 300.0) -> float:
+    """``Retry-After`` in seconds when the response carries a usable one, else ``default``."""
+    raw = (response.headers or {}).get("Retry-After")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
 
 # requests.request() had no timeout at all before, so a stalled Turn 14 response could hang
 # the calling thread indefinitely — this matters now that test_connection() runs synchronously
@@ -39,62 +41,38 @@ class Turn14ApiClient(object):
 
         if not self.client_id or not self.client_secret:
             raise ValueError("Invalid credentials parameter.")
-        
-        # Token caching
-        self._cached_token: typing.Optional[str] = None
-        self._token_expires_at: typing.Optional[float] = None
-
-    def _is_token_valid(self) -> bool:
-        """Check if the cached token is still valid (not expired)."""
-        if self._cached_token is None or self._token_expires_at is None:
-            return False
-        
-        # Check if token expires within the buffer time
-        current_time = time.time()
-        return current_time < (self._token_expires_at - TOKEN_EXPIRATION_BUFFER_SECONDS)
 
     def _get_valid_token(self) -> str:
         """
-        Get a valid access token, using cached token if available and not expired.
-        Creates a new token only when necessary.
+        A live access token, minted only when the cache has none.
+
+        The cache is process-wide and keyed by client_id (see turn_14.rate_limit), not
+        per-instance: several services construct a fresh client inside a per-brand loop, which
+        under the old per-instance cache meant one token request per brand -- 464 per sweep
+        against Turn 14's 10-per-minute-per-IP token limit.
         """
-        if self._is_token_valid():
+        cached = turn14_rate_limit.get_cached_token(self.client_id)
+        if cached is not None:
             logger.debug("{} Using cached authorization token.".format(self.LOG_PREFIX))
-            return self._cached_token
-        
-        # Token is expired or doesn't exist, create a new one
+            return cached
+
         logger.debug("{} Creating new authorization token.".format(self.LOG_PREFIX))
         auth_data = self._create_authorization_token()
-        
+
         access_token = auth_data.get('access_token')
         if not access_token:
             raise exceptions.Turn14APIException("No access_token in authorization response.")
-        
-        # Cache the token
-        self._cached_token = access_token
-        
-        # Calculate expiration time
-        # expires_in is typically in seconds (OAuth2 standard)
+
         expires_in = auth_data.get('expires_in')
-        if expires_in:
-            # Convert to int if it's a Decimal
-            if isinstance(expires_in, decimal.Decimal):
-                expires_in = int(expires_in)
-            self._token_expires_at = time.time() + expires_in
-            logger.debug(
-                "{} Token cached. Expires in {} seconds (at {}).".format(
-                    self.LOG_PREFIX, expires_in, self._token_expires_at
-                )
-            )
-        else:
-            # If expires_in is not provided, assume 1 hour (3600 seconds) as default
-            # This is a common OAuth2 default
+        if isinstance(expires_in, decimal.Decimal):
+            expires_in = int(expires_in)
+        if not expires_in:
             logger.warning(
                 "{} No expires_in in token response. Assuming 1 hour expiration.".format(self.LOG_PREFIX)
             )
-            self._token_expires_at = time.time() + 3600
-        
-        return self._cached_token
+
+        turn14_rate_limit.store_token(self.client_id, access_token, expires_in)
+        return access_token
 
     def _permission_or_reraise(
         self, e: exceptions.Turn14APIBadResponseCodeError, resource: str
@@ -130,13 +108,13 @@ class Turn14ApiClient(object):
         except exceptions.Turn14APIBadResponseCodeError as e:
             raise self._permission_or_reraise(e, "Brands")
 
-    @sleep_and_retry
-    @limits(calls=20, period=60)
     def _create_authorization_token(self) -> typing.Dict:
         """
-        Internal method to create a new authorization token.
-        This method is rate-limited and should only be called when necessary.
+        Mint a new token. Turn 14 meters token issuance at 10/minute **per IP** (not per
+        credential), so the bucket this waits on is shared by every credential set on this
+        host and by the Order API client.
         """
+        rate_limit_base.acquire(turn14_rate_limit.token_buckets(), meter_key="t14:token")
         try:
             response = requests.request(
                 url=f"{self.API_BASE_URL}/token",
@@ -172,62 +150,54 @@ class Turn14ApiClient(object):
 
         return simplejson.loads(response.content, parse_float=decimal.Decimal)
 
-    def get_pricelists(
-            self, brand_id: int, page: int = 1
+    def _paginated(
+        self,
+        endpoint: str,
+        page: int,
+        extra_params: typing.Optional[typing.Dict] = None,
     ) -> typing.Tuple[typing.List[typing.Dict], typing.Optional[int]]:
+        """
+        One page of a JSON:API collection, plus the next page number (None on the last page).
+
+        Every paginated Turn 14 endpoint answers the same shape -- ``{"meta": {"total_pages": N},
+        "data": [...]}`` -- and this was open-coded identically in a dozen methods.
+
+        Note ``total_pages`` defaults to 1, not 0: a response that omits meta entirely is a
+        single page, and treating it as zero would make ``page == total_pages`` false and page
+        forever.
+        """
+        params = {"page": page}
+        if extra_params:
+            params.update(extra_params)
+
         response = simplejson.loads(
             self._request(
-                endpoint="pricing/brand/{}".format(brand_id),
+                endpoint=endpoint,
                 method=common_enums.HttpMethod.GET,
-                params={
-                    "page": page,
-                },
+                params=params,
             ).content
         )
 
         data = response.get("data", [])
-        potential_next_page = page + 1
-        next_page = None if page == response.get("meta", {}).get("total_pages", 1) else potential_next_page
+        total_pages = response.get("meta", {}).get("total_pages", 1)
+        next_page = None if page >= total_pages else page + 1
 
         return data, next_page
+
+    def get_pricelists(
+            self, brand_id: int, page: int = 1
+    ) -> typing.Tuple[typing.List[typing.Dict], typing.Optional[int]]:
+        return self._paginated("pricing/brand/{}".format(brand_id), page)
 
     def get_items_for_brand(
             self, brand_id: int, page: int = 1
     ) -> typing.Tuple[typing.List[typing.Dict], typing.Optional[int]]:
-        response = simplejson.loads(
-            self._request(
-                endpoint="items/brand/{}".format(brand_id),
-                method=common_enums.HttpMethod.GET,
-                params={
-                    "page": page,
-                },
-            ).content
-        )
-
-        data = response.get("data", [])
-        potential_next_page = page + 1
-        next_page = None if page == response.get("meta", {}).get("total_pages", 1) else potential_next_page
-
-        return data, next_page
+        return self._paginated("items/brand/{}".format(brand_id), page)
 
     def get_inventory_items_for_brand(
             self, brand_id: int, page: int = 1
     ) -> typing.Tuple[typing.List[typing.Dict], typing.Optional[int]]:
-        response = simplejson.loads(
-            self._request(
-                endpoint="inventory/brand/{}".format(brand_id),
-                method=common_enums.HttpMethod.GET,
-                params={
-                    "page": page,
-                },
-            ).content
-        )
-
-        data = response.get("data", [])
-        potential_next_page = page + 1
-        next_page = None if page == response.get("meta", {}).get("total_pages", 1) else potential_next_page
-
-        return data, next_page
+        return self._paginated("inventory/brand/{}".format(brand_id), page)
 
     def get_inventory_item(self, item_id: str) -> typing.Optional[typing.Dict]:
         """
@@ -259,40 +229,12 @@ class Turn14ApiClient(object):
     def get_inventory_items_updates(
             self, page: int = 1, minutes: int = 60
     ) -> typing.Tuple[typing.List[typing.Dict], typing.Optional[int]]:
-        response = simplejson.loads(
-            self._request(
-                endpoint="inventory/updates",
-                method=common_enums.HttpMethod.GET,
-                params={
-                    "page": page,
-                    "minutes": str(minutes),
-                },
-            ).content
-        )
+        return self._paginated("inventory/updates", page, extra_params={"minutes": str(minutes)})
 
-        data = response.get("data", [])
-        potential_next_page = page + 1
-        next_page = None if page == response.get("meta", {}).get("total_pages", 1) else potential_next_page
-
-        return data, next_page
-
-    def get_items_updates(self, page: int = 1, days: int = 1) -> typing.Tuple[typing.List[typing.Dict], typing.Optional[int]]:
-        response = simplejson.loads(
-            self._request(
-                endpoint="items/updates",
-                method=common_enums.HttpMethod.GET,
-                params={
-                    "page": page,
-                    "days": str(days),
-                },
-            ).content
-        )
-
-        data = response.get("data", [])
-        potential_next_page = page + 1
-        next_page = None if page == response.get("meta", {}).get("total_pages", 1) else potential_next_page
-
-        return data, next_page
+    def get_items_updates(
+            self, page: int = 1, days: int = 1
+    ) -> typing.Tuple[typing.List[typing.Dict], typing.Optional[int]]:
+        return self._paginated("items/updates", page, extra_params={"days": str(days)})
 
     def get_pricing_changes(
         self,
@@ -301,63 +243,87 @@ class Turn14ApiClient(object):
         page: int = 1,
     ) -> typing.Tuple[typing.List[typing.Dict], typing.Optional[int]]:
         """
-        GET /v1/pricing/changes?start_date=...&end_date=...&page=...
-        Returns (data, next_page). Each item has id, type 'PricingChange', and attributes.itemcode.
+        GET /v1/pricing/changes. Each item has id, type 'PricingChange', and attributes.itemcode.
+
+        Not in Turn 14's published documentation -- it works and the delta pricing path depends
+        on it, but treat it as unsupported until they confirm otherwise (open question for Dan).
         """
-        response = simplejson.loads(
-            self._request(
-                endpoint="pricing/changes",
-                method=common_enums.HttpMethod.GET,
-                params={
-                    "start_date": start_date,
-                    "end_date": end_date,
-                    "page": page,
-                },
-            ).content
+        return self._paginated(
+            "pricing/changes", page, extra_params={"start_date": start_date, "end_date": end_date}
         )
-
-        data = response.get("data", [])
-        potential_next_page = page + 1
-        next_page = None if page == response.get("meta", {}).get("total_pages", 1) else potential_next_page
-
-        return data, next_page
 
     def get_item_fitment_for_brand(
             self, brand_id: int, page: int = 1
     ) -> typing.Tuple[typing.List[typing.Dict], typing.Optional[int]]:
-        response = simplejson.loads(
+        return self._paginated("items/fitment/brand/{}".format(brand_id), page)
+
+    def get_brand_media(
+            self, brand_id: str, page: int = 1
+    ) -> typing.Tuple[typing.List[typing.Dict], typing.Optional[int]]:
+        return self._paginated("items/data/brand/{}".format(brand_id), page)
+
+    # -- Catalog-wide sweeps ---------------------------------------------------------------
+    #
+    # The unscoped collections, as opposed to the /brand/{id} variants above. Measured page
+    # sizes: these return 1 000 rows/page (items/data 450, fitment 200) where the brand-scoped
+    # endpoints return 200 -- so sweeping the catalog flat costs ~776 requests against ~4 200
+    # for the same data brand by brand. Only `items` carries attributes.brand_id; the rest
+    # identify rows by item id alone, so callers resolve the brand through Turn14Items (which
+    # is why the items sweep has to run first).
+
+    def get_items(self, page: int = 1) -> typing.Tuple[typing.List[typing.Dict], typing.Optional[int]]:
+        """GET /v1/items - every item Turn 14 carries."""
+        return self._paginated("items", page)
+
+    def get_items_data(self, page: int = 1) -> typing.Tuple[typing.List[typing.Dict], typing.Optional[int]]:
+        """GET /v1/items/data - media and descriptions for every item."""
+        return self._paginated("items/data", page)
+
+    def get_inventory(self, page: int = 1) -> typing.Tuple[typing.List[typing.Dict], typing.Optional[int]]:
+        """GET /v1/inventory - warehouse availability for every item."""
+        return self._paginated("inventory", page)
+
+    def get_items_fitment(self, page: int = 1) -> typing.Tuple[typing.List[typing.Dict], typing.Optional[int]]:
+        """GET /v1/items/fitment - ACES vehicle ids per item, for every item."""
+        return self._paginated("items/fitment", page)
+
+    def get_pricing(self, page: int = 1) -> typing.Tuple[typing.List[typing.Dict], typing.Optional[int]]:
+        """GET /v1/pricing - this account's pricing for every item. Customer-specific."""
+        return self._paginated("pricing", page)
+
+    def get_dropship_controller(self, dropship_id: int) -> typing.Optional[typing.Dict]:
+        """
+        GET /v1/dropship/{id} - the ruleset and fee schedule governing whether a brand can
+        dropship, keyed by Turn14Items.dropship_controller_id. Returns None when Turn 14 has no
+        such controller (404), which is not an error worth failing a sweep over.
+        """
+        try:
+            response = simplejson.loads(
+                self._request(
+                    endpoint="dropship/{}".format(dropship_id),
+                    method=common_enums.HttpMethod.GET,
+                ).content
+            )
+        except exceptions.Turn14APIBadResponseCodeError as e:
+            if e.code == 404:
+                return None
+            raise
+        return response.get("data")
+
+    def get_item_shipping_estimates_for_brand(
+            self, brand_id: int, page: int = 1
+    ) -> typing.Tuple[typing.List[typing.Dict], typing.Optional[int]]:
+        """GET /v1/shipping/item_estimation/brand/{id} - min/average/max ground rates per item."""
+        return self._paginated("shipping/item_estimation/brand/{}".format(brand_id), page)
+
+    def get_shipping_options(self) -> typing.List[typing.Dict]:
+        """GET /v1/shipping - the service levels available to this account."""
+        return simplejson.loads(
             self._request(
-                endpoint="items/fitment/brand/{}".format(brand_id),
+                endpoint="shipping",
                 method=common_enums.HttpMethod.GET,
-                params={
-                    "page": page,
-                },
             ).content
-        )
-
-        data = response.get("data", [])
-        potential_next_page = page + 1
-        next_page = None if page == response.get("meta", {}).get("total_pages", 1) else potential_next_page
-
-        return data, next_page
-
-    def get_brand_media(self, brand_id: str, page: int = 1) -> typing.Tuple[
-        typing.List[typing.Dict], typing.Optional[int]]:
-        response = simplejson.loads(
-            self._request(
-                endpoint="items/data/brand/{}".format(brand_id),
-                method=common_enums.HttpMethod.GET,
-                params={
-                    "page": page,
-                },
-            ).content
-        )
-
-        data = response.get("data", [])
-        potential_next_page = page + 1
-        next_page = None if page == response.get("meta", {}).get("total_pages", 1) else potential_next_page
-
-        return data, next_page
+        ).get("data", [])
 
     def get_brands(self) -> typing.List[typing.Dict]:
         return simplejson.loads(
@@ -377,16 +343,10 @@ class Turn14ApiClient(object):
         ).get("data", [])
 
     def _clear_token_cache(self) -> None:
-        """Clear the cached token and expiration time."""
-        self._cached_token = None
-        self._token_expires_at = None
+        """Drop this credential's cached token so the next call mints a fresh one."""
+        turn14_rate_limit.clear_token(self.client_id)
         logger.debug("{} Cleared cached authorization token.".format(self.LOG_PREFIX))
 
-    @sleep_and_retry
-    @limits(calls=SECOND_LIMIT, period=1)  # 5 requests per second
-    @limits(calls=20, period=60)  # 5 requests per second
-    @limits(calls=HOUR_LIMIT, period=3600)  # 5000 requests per hour
-    @limits(calls=DAY_LIMIT, period=86400)  # 30000 requests per day
     def _request(
             self,
             endpoint: str,
@@ -396,6 +356,13 @@ class Turn14ApiClient(object):
             include_auth: bool = True,
             retry_on_401: bool = True,
     ) -> requests.Response:
+        # Buckets are keyed on client_id and shared with the Order API client, because Turn 14
+        # meters per credential set, not per client class or per process. Raises
+        # RateBudgetExhausted (NOT a Turn14APIException) when the hour/day budget is spent, so
+        # the per-brand `except Turn14APIException: continue` handlers upstream do not swallow
+        # it and march on through the rest of the catalog.
+        rate_limit_base.acquire(turn14_rate_limit.get_buckets(self.client_id), meter_key="t14:get")
+
         url = f"{self.API_BASE_URL}/{endpoint}"
         headers = {
             "Content-Type": "application/json",
@@ -432,6 +399,28 @@ class Turn14ApiClient(object):
                     payload=payload,
                     include_auth=include_auth,
                     retry_on_401=False,  # Don't retry again to avoid infinite loop
+                )
+
+            # A 429 despite our own accounting means something else is spending these
+            # credentials (Turn 14 customers may share a client_id with third-party
+            # integrators) or their rolling window disagrees with our fixed one. Either way
+            # our local count is an undercount -- shut the hour bucket so concurrent workers
+            # stop immediately instead of each discovering the 429 for themselves, and raise
+            # RateBudgetExhausted so the caller defers rather than skipping this brand and
+            # marching into the next one.
+            if response.status_code == 429:
+                retry_after = _retry_after_seconds(response)
+                rate_limit_base.mark_exhausted(turn14_rate_limit.hourly_bucket(self.client_id))
+                logger.warning(
+                    "{} Upstream 429 (endpoint={}). Deferring for {:.0f}s.".format(
+                        self.LOG_PREFIX, endpoint, retry_after
+                    )
+                )
+                raise rate_limit_base.RateBudgetExhausted(
+                    scope="t14:get:hour (upstream 429)",
+                    limit=turn14_rate_limit.GET_PER_HOUR,
+                    period_seconds=3600,
+                    retry_after_seconds=retry_after,
                 )
 
             if response.status_code not in self.VALID_STATUS_CODES:

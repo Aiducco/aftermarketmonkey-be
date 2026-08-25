@@ -1,5 +1,4 @@
 import logging
-import time
 import typing
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -13,6 +12,7 @@ from src import models as src_models
 from src.integrations import credentials as credentials_helper
 from src.integrations.clients.turn_14 import client as turn_14_client
 from src.integrations.clients.turn_14 import exceptions as turn_14_exceptions
+from src.integrations.services import turn_14_global
 
 logger = logging.getLogger(__name__)
 
@@ -55,27 +55,8 @@ def _bump_turn14_items_updated_at_for_inventory_batch(
 def fetch_and_save_turn_14_brands() -> None:
     logger.info('{} Started fetching and saving turn 14 brands.'.format(_LOG_PREFIX))
     
-    primary_provider = src_models.CompanyProviders.objects.filter(
-        provider__kind=src_enums.BrandProviderKind.TURN_14.value,
-        provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
-        primary=True
-    ).first()
+    api_client = turn_14_global.get_global_client()
 
-    if not primary_provider:
-        logger.info('{} No turn 14 active provider found.'.format(_LOG_PREFIX))
-        return
-
-    credentials = credentials_helper.get_feed_credentials(primary_provider)
-    logger.debug('{} Initializing Turn 14 API client for company: {}'.format(
-        _LOG_PREFIX, primary_provider.company.name
-    ))
-    
-    try:
-        api_client = turn_14_client.Turn14ApiClient(credentials=credentials)
-    except ValueError as e:
-        logger.error('{} Invalid credentials or configuration: {}'.format(_LOG_PREFIX, str(e)))
-        raise
-    
     logger.info('{} Fetching brands from Turn 14 API.'.format(_LOG_PREFIX))
     try:
         brands_data = api_client.get_brands()
@@ -137,7 +118,8 @@ def sync_unmapped_turn_14_brands_to_brands() -> typing.List[src_models.Turn14Bra
     """
     For each Turn14Brand that does not yet have a BrandTurn14BrandMapping:
     find or create a Brand (match by aaia_code then name; create with uppercase name if new),
-    then add BrandTurn14BrandMapping, BrandProviders (Turn 14), and CompanyBrands (TICK_PERFORMANCE).
+    then add BrandTurn14BrandMapping, BrandProviders (Turn 14), and CompanyBrands (the resolved
+    global owner company -- see turn_14_global.get_global_owner_company()).
     Returns the list of Turn14Brand instances that were synced (for use by fetch_and_save_turn_14_items_for_turn14_brands).
     """
     logger.info('{} Syncing unmapped Turn 14 brands to Brands.'.format(_LOG_PREFIX))
@@ -149,9 +131,9 @@ def sync_unmapped_turn_14_brands_to_brands() -> typing.List[src_models.Turn14Bra
         logger.warning('{} Turn 14 provider not found. Skipping sync.'.format(_LOG_PREFIX))
         return []
 
-    tick_company = src_models.Company.objects.filter(name='TICK_PERFORMANCE').first()
-    if not tick_company:
-        logger.warning('{} Company TICK_PERFORMANCE not found. Skipping sync.'.format(_LOG_PREFIX))
+    owner_company = turn_14_global.get_global_owner_company()
+    if not owner_company:
+        logger.warning('{} No global owner company resolved. Skipping sync.'.format(_LOG_PREFIX))
         return []
 
     mapped_turn14_ids = set(
@@ -285,7 +267,7 @@ def sync_unmapped_turn_14_brands_to_brands() -> typing.List[src_models.Turn14Bra
 
     existing_cb_ids = set(
         src_models.CompanyBrands.objects.filter(
-            company=tick_company,
+            company=owner_company,
             brand_id__in=brand_ids,
         ).values_list('brand_id', flat=True)
     )
@@ -293,7 +275,7 @@ def sync_unmapped_turn_14_brands_to_brands() -> typing.List[src_models.Turn14Bra
     active_name = src_enums.CompanyBrandStatus.ACTIVE.name
     cb_to_create = [
         src_models.CompanyBrands(
-            company_id=tick_company.id,
+            company_id=owner_company.id,
             brand_id=bid,
             status=active_val,
             status_name=active_name,
@@ -318,22 +300,7 @@ def fetch_and_save_turn_14_locations() -> None:
     """Fetch Turn14 locations from GET /v1/locations and upsert into Turn14Location."""
     logger.info('{} Started fetching and saving Turn 14 locations.'.format(_LOG_PREFIX))
 
-    primary_provider = src_models.CompanyProviders.objects.filter(
-        provider__kind=src_enums.BrandProviderKind.TURN_14.value,
-        provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
-        primary=True,
-    ).first()
-
-    if not primary_provider:
-        logger.info('{} No Turn 14 active provider found.'.format(_LOG_PREFIX))
-        return
-
-    credentials = credentials_helper.get_feed_credentials(primary_provider)
-    try:
-        api_client = turn_14_client.Turn14ApiClient(credentials=credentials)
-    except ValueError as e:
-        logger.error('{} Invalid credentials: {}'.format(_LOG_PREFIX, str(e)))
-        raise
+    api_client = turn_14_global.get_global_client()
 
     try:
         locations_data = api_client.get_locations()
@@ -438,6 +405,7 @@ def _transform_brands_data(brands_data: typing.List[typing.Dict]) -> typing.List
 
 
 def fetch_and_save_all_turn_14_brand_items() -> None:
+    """Superseded by turn_14_sweeps.sweep_items() (flat, 1000 rows/page vs 200 here)."""
     logger.info('{} Fetching all Turn 14 brand items.'.format(_LOG_PREFIX))
 
     turn_14_provider = src_models.Providers.objects.filter(
@@ -581,9 +549,9 @@ def fetch_and_save_turn_14_items_for_turn14_brands(
 ) -> None:
     """
     Fetch and save Turn 14 items for a given list of Turn14Brand instances (e.g. newly synced brands).
-    Uses the same per-brand logic as fetch_and_save_all_turn_14_brand_items: resolves company via
-    CompanyBrands (brand + TICK_PERFORMANCE), credentials via CompanyProviders, then fetches items
-    and upserts into Turn14Items.
+    Resolves the CompanyBrands owner via turn_14_global.get_global_owner_company() and the API
+    client via turn_14_global.get_global_client() (built once, shared across all brands), then
+    fetches items per brand and upserts into Turn14Items.
     """
     if not turn14_brands:
         logger.info('{} No Turn14 brands provided. Skipping items fetch.'.format(_LOG_PREFIX))
@@ -591,17 +559,12 @@ def fetch_and_save_turn_14_items_for_turn14_brands(
 
     logger.info('{} Fetching items for {} Turn 14 brand(s).'.format(_LOG_PREFIX, len(turn14_brands)))
 
-    turn_14_provider = src_models.Providers.objects.filter(
-        kind=src_enums.BrandProviderKind.TURN_14.value,
-    ).first()
-    if not turn_14_provider:
-        logger.warning('{} No Turn 14 provider found. Skipping.'.format(_LOG_PREFIX))
+    owner_company = turn_14_global.get_global_owner_company()
+    if not owner_company:
+        logger.warning('{} No global owner company resolved. Skipping.'.format(_LOG_PREFIX))
         return
 
-    tick_company = src_models.Company.objects.filter(name='TICK_PERFORMANCE').first()
-    if not tick_company:
-        logger.warning('{} Company TICK_PERFORMANCE not found. Skipping.'.format(_LOG_PREFIX))
-        return
+    api_client = turn_14_global.get_global_client()
 
     for turn_14_brand in turn14_brands:
         brand_mapping = src_models.BrandTurn14BrandMapping.objects.filter(
@@ -619,31 +582,12 @@ def fetch_and_save_turn_14_items_for_turn14_brands(
             continue
 
         company_brand = src_models.CompanyBrands.objects.filter(
-            company=tick_company,
+            company=owner_company,
             brand=brand,
         ).first()
         if not company_brand:
-            logger.warning('{} No CompanyBrands (TICK_PERFORMANCE) for brand: {}. Skipping.'.format(
+            logger.warning('{} No CompanyBrands (owner company) for brand: {}. Skipping.'.format(
                 _LOG_PREFIX, turn_14_brand.name
-            ))
-            continue
-
-        company_provider = src_models.CompanyProviders.objects.filter(
-            company=tick_company,
-            provider=turn_14_provider,
-        ).first()
-        if not company_provider:
-            logger.warning('{} No CompanyProviders for TICK_PERFORMANCE and Turn 14. Skipping brand: {}.'.format(
-                _LOG_PREFIX, turn_14_brand.name
-            ))
-            continue
-
-        credentials = credentials_helper.get_feed_credentials(company_provider)
-        try:
-            api_client = turn_14_client.Turn14ApiClient(credentials=credentials)
-        except ValueError as e:
-            logger.error('{} Invalid credentials for company: {} and brand: {}. Error: {}. Skipping.'.format(
-                _LOG_PREFIX, tick_company.name, turn_14_brand.name, str(e)
             ))
             continue
 
@@ -786,6 +730,7 @@ def _transform_items_data(items_data: typing.List[typing.Dict], turn_14_brand: s
 
 
 def fetch_and_save_all_turn_14_brand_data() -> None:
+    """Superseded by turn_14_sweeps.sweep_items_data() (flat, 450 rows/page vs 200 here)."""
     logger.info('{} Fetching all Turn 14 brand data.'.format(_LOG_PREFIX))
 
     turn_14_provider = src_models.Providers.objects.filter(
@@ -931,17 +876,12 @@ def fetch_and_save_turn_14_brand_data_for_turn14_brands(
 
     logger.info('{} Fetching brand data for {} Turn 14 brand(s).'.format(_LOG_PREFIX, len(turn14_brands)))
 
-    turn_14_provider = src_models.Providers.objects.filter(
-        kind=src_enums.BrandProviderKind.TURN_14.value,
-    ).first()
-    if not turn_14_provider:
-        logger.warning('{} No Turn 14 provider found. Skipping.'.format(_LOG_PREFIX))
+    owner_company = turn_14_global.get_global_owner_company()
+    if not owner_company:
+        logger.warning('{} No global owner company resolved. Skipping.'.format(_LOG_PREFIX))
         return
 
-    tick_company = src_models.Company.objects.filter(name='TICK_PERFORMANCE').first()
-    if not tick_company:
-        logger.warning('{} Company TICK_PERFORMANCE not found. Skipping.'.format(_LOG_PREFIX))
-        return
+    api_client = turn_14_global.get_global_client()
 
     for turn_14_brand in turn14_brands:
         brand_mapping = src_models.BrandTurn14BrandMapping.objects.filter(
@@ -959,31 +899,12 @@ def fetch_and_save_turn_14_brand_data_for_turn14_brands(
             continue
 
         company_brand = src_models.CompanyBrands.objects.filter(
-            company=tick_company,
+            company=owner_company,
             brand=brand,
         ).first()
         if not company_brand:
-            logger.warning('{} No CompanyBrands (TICK_PERFORMANCE) for brand: {}. Skipping.'.format(
+            logger.warning('{} No CompanyBrands (owner company) for brand: {}. Skipping.'.format(
                 _LOG_PREFIX, turn_14_brand.name
-            ))
-            continue
-
-        company_provider = src_models.CompanyProviders.objects.filter(
-            company=tick_company,
-            provider=turn_14_provider,
-        ).first()
-        if not company_provider:
-            logger.warning('{} No CompanyProviders for TICK_PERFORMANCE and Turn 14. Skipping brand: {}.'.format(
-                _LOG_PREFIX, turn_14_brand.name
-            ))
-            continue
-
-        credentials = credentials_helper.get_feed_credentials(company_provider)
-        try:
-            api_client = turn_14_client.Turn14ApiClient(credentials=credentials)
-        except ValueError as e:
-            logger.error('{} Invalid credentials for company: {} and brand: {}. Error: {}. Skipping.'.format(
-                _LOG_PREFIX, tick_company.name, turn_14_brand.name, str(e)
             ))
             continue
 
@@ -1636,6 +1557,7 @@ def _transform_pricing_data(
 
 
 def fetch_and_save_all_turn_14_brand_inventory() -> None:
+    """Superseded by turn_14_sweeps.sweep_inventory() (flat, 1000 rows/page vs 200 here)."""
     logger.info('{} Fetching all Turn 14 brand inventory.'.format(_LOG_PREFIX))
 
     turn_14_provider = src_models.Providers.objects.filter(
@@ -1792,17 +1714,12 @@ def fetch_and_save_turn_14_brand_inventory_for_turn14_brands(
 
     logger.info('{} Fetching brand inventory for {} Turn 14 brand(s).'.format(_LOG_PREFIX, len(turn14_brands)))
 
-    turn_14_provider = src_models.Providers.objects.filter(
-        kind=src_enums.BrandProviderKind.TURN_14.value,
-    ).first()
-    if not turn_14_provider:
-        logger.warning('{} No Turn 14 provider found. Skipping.'.format(_LOG_PREFIX))
+    owner_company = turn_14_global.get_global_owner_company()
+    if not owner_company:
+        logger.warning('{} No global owner company resolved. Skipping.'.format(_LOG_PREFIX))
         return
 
-    tick_company = src_models.Company.objects.filter(name='TICK_PERFORMANCE').first()
-    if not tick_company:
-        logger.warning('{} Company TICK_PERFORMANCE not found. Skipping.'.format(_LOG_PREFIX))
-        return
+    api_client = turn_14_global.get_global_client()
 
     for turn_14_brand in turn14_brands:
         brand_mapping = src_models.BrandTurn14BrandMapping.objects.filter(
@@ -1820,31 +1737,12 @@ def fetch_and_save_turn_14_brand_inventory_for_turn14_brands(
             continue
 
         company_brand = src_models.CompanyBrands.objects.filter(
-            company=tick_company,
+            company=owner_company,
             brand=brand,
         ).first()
         if not company_brand:
-            logger.warning('{} No CompanyBrands (TICK_PERFORMANCE) for brand: {}. Skipping.'.format(
+            logger.warning('{} No CompanyBrands (owner company) for brand: {}. Skipping.'.format(
                 _LOG_PREFIX, turn_14_brand.name
-            ))
-            continue
-
-        company_provider = src_models.CompanyProviders.objects.filter(
-            company=tick_company,
-            provider=turn_14_provider,
-        ).first()
-        if not company_provider:
-            logger.warning('{} No CompanyProviders for TICK_PERFORMANCE and Turn 14. Skipping brand: {}.'.format(
-                _LOG_PREFIX, turn_14_brand.name
-            ))
-            continue
-
-        credentials = credentials_helper.get_feed_credentials(company_provider)
-        try:
-            api_client = turn_14_client.Turn14ApiClient(credentials=credentials)
-        except ValueError as e:
-            logger.error('{} Invalid credentials for company: {} and brand: {}. Error: {}. Skipping.'.format(
-                _LOG_PREFIX, tick_company.name, turn_14_brand.name, str(e)
             ))
             continue
 
@@ -1978,8 +1876,9 @@ def _transform_inventory_data(inventory_data: typing.List[typing.Dict], turn_14_
     return inventory_instances
 
 
-def fetch_and_save_turn_14_items_updates() -> None:
-    logger.info('{} Fetching Turn 14 items updates.'.format(_LOG_PREFIX))
+def fetch_and_save_turn_14_items_updates(days: int = 1) -> None:
+    """GET /v1/items/updates?days=N -- the 4-hourly catalog delta tier of Turn 14's model."""
+    logger.info('{} Fetching Turn 14 items updates (days={}).'.format(_LOG_PREFIX, days))
 
     turn_14_provider = src_models.Providers.objects.filter(
         kind=src_enums.BrandProviderKind.TURN_14.value
@@ -1988,23 +1887,7 @@ def fetch_and_save_turn_14_items_updates() -> None:
         logger.info('{} No Turn 14 provider found.'.format(_LOG_PREFIX))
         return
 
-    primary_provider = src_models.CompanyProviders.objects.filter(
-        provider=turn_14_provider,
-        provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
-        primary=True
-    ).first()
-
-    if not primary_provider:
-        logger.info('{} No turn 14 active primary provider found.'.format(_LOG_PREFIX))
-        return
-
-    credentials = credentials_helper.get_feed_credentials(primary_provider)
-    
-    try:
-        api_client = turn_14_client.Turn14ApiClient(credentials=credentials)
-    except ValueError as e:
-        logger.error('{} Invalid credentials or configuration: {}'.format(_LOG_PREFIX, str(e)))
-        raise
+    api_client = turn_14_global.get_global_client()
 
     items_with_brands = src_models.Turn14Items.objects.filter(
         brand__isnull=False
@@ -2036,71 +1919,26 @@ def fetch_and_save_turn_14_items_updates() -> None:
     }
 
     page = 1
-    days = 1
     total_processed = 0
     total_skipped = 0
     brands_with_updated_items = {}  # id -> Turn14Brand for brands that had items updated this run
-    # Rate limiting is handled at the client level (token caching + rate limit decorators)
-    # Retry logic for 429 errors as a safety measure
-    MAX_RETRIES = 3
-    INITIAL_RETRY_DELAY = 5  # seconds
 
     while page is not None:
-        retry_count = 0
-        items_updates = None
-        next_page = None
-        
-        while retry_count <= MAX_RETRIES:
-            try:
-                items_updates, next_page = api_client.get_items_updates(page=page, days=days)
-                break  # Success, exit retry loop
-            except turn_14_exceptions.Turn14APIBadResponseCodeError as e:
-                # Check if it's a rate limit error (429)
-                if e.code == 429:
-                    if retry_count < MAX_RETRIES:
-                        # Exponential backoff: 5s, 10s, 20s
-                        retry_delay = INITIAL_RETRY_DELAY * (2 ** retry_count)
-                        logger.warning(
-                            '{} Rate limit hit (429) for items updates, page: {}. '
-                            'Retrying in {} seconds (attempt {}/{}).'.format(
-                                _LOG_PREFIX, page, retry_delay, retry_count + 1, MAX_RETRIES
-                            )
-                        )
-                        time.sleep(retry_delay)
-                        retry_count += 1
-                        continue
-                    else:
-                        logger.error(
-                            '{} Rate limit exceeded (429) for items updates, page: {}. '
-                            'Max retries reached. Stopping.'.format(_LOG_PREFIX, page)
-                        )
-                        return
-                else:
-                    # Other bad response code, stop
-                    logger.error(
-                        '{} Turn 14 API error for items updates, page: {}. '
-                        'Status code: {}. Error: {}. Stopping.'.format(
-                            _LOG_PREFIX, page, e.code, str(e)
-                        )
-                    )
-                    return
-            except turn_14_exceptions.Turn14APIException as e:
-                # Other API exceptions, stop
-                logger.error(
-                    '{} Turn 14 API error for items updates, page: {}. Error: {}. Stopping.'.format(
-                        _LOG_PREFIX, page, str(e)
-                    )
-                )
-                return
-        
-        if items_updates is None:
-            # Failed after all retries
+        try:
+            items_updates, next_page = api_client.get_items_updates(page=page, days=days)
+        except turn_14_exceptions.Turn14APIException as e:
+            # Note: a 429 no longer arrives here. The client turns an upstream rate-limit
+            # response into RateBudgetExhausted, which deliberately is not a Turn14APIException
+            # and so propagates past this handler to the caller, which defers the whole task
+            # instead of retrying into a budget that is already spent. The exponential-backoff
+            # retry loop that used to live here was doing exactly the wrong thing: Turn 14
+            # deactivates credentials that repeatedly hit their limits.
             logger.error(
-                '{} Failed to fetch items updates after {} retries, page: {}. Stopping.'.format(
-                    _LOG_PREFIX, MAX_RETRIES, page
+                '{} Turn 14 API error for items updates, page: {}. Error: {}. Stopping.'.format(
+                    _LOG_PREFIX, page, str(e)
                 )
             )
-            break
+            return
 
         if not items_updates:
             logger.warning('{} No items updates returned for page: {}.'.format(
@@ -2358,8 +2196,14 @@ def fetch_and_save_turn_14_pricing_changes(start_date: str, end_date: str) -> No
     logger.info('{} Completed pricing sync for brands with pricing changes.'.format(_LOG_PREFIX))
 
 
-def fetch_and_save_turn_14_inventory_updates() -> None:
-    logger.info('{} Fetching Turn 14 inventory updates.'.format(_LOG_PREFIX))
+def fetch_and_save_turn_14_inventory_updates(minutes: int = 15) -> None:
+    """
+    GET /v1/inventory/updates?minutes=N -- the 10-minute delta tier of Turn 14's model.
+
+    The window should overlap the cron interval rather than match it, so an update landing
+    between two runs cannot fall through the gap. Default 15 for a 10-minute cron.
+    """
+    logger.info('{} Fetching Turn 14 inventory updates (minutes={}).'.format(_LOG_PREFIX, minutes))
 
     turn_14_provider = src_models.Providers.objects.filter(
         kind=src_enums.BrandProviderKind.TURN_14.value
@@ -2368,23 +2212,7 @@ def fetch_and_save_turn_14_inventory_updates() -> None:
         logger.info('{} No Turn 14 provider found.'.format(_LOG_PREFIX))
         return
 
-    primary_provider = src_models.CompanyProviders.objects.filter(
-        provider=turn_14_provider,
-        provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
-        primary=True
-    ).first()
-
-    if not primary_provider:
-        logger.info('{} No turn 14 active primary provider found.'.format(_LOG_PREFIX))
-        return
-
-    credentials = credentials_helper.get_feed_credentials(primary_provider)
-    
-    try:
-        api_client = turn_14_client.Turn14ApiClient(credentials=credentials)
-    except ValueError as e:
-        logger.error('{} Invalid credentials or configuration: {}'.format(_LOG_PREFIX, str(e)))
-        raise
+    api_client = turn_14_global.get_global_client()
 
     existing_item_ids = set(
         src_models.Turn14Items.objects.values_list('external_id', flat=True)
@@ -2399,7 +2227,6 @@ def fetch_and_save_turn_14_inventory_updates() -> None:
     ))
 
     page = 1
-    minutes = 30
     total_processed = 0
     total_skipped = 0
 
@@ -2565,21 +2392,7 @@ def fetch_and_save_turn_14_fitment_for_all_brands(resume: bool = False) -> None:
         logger.info('{} No Turn 14 provider found.'.format(_LOG_PREFIX))
         return
 
-    primary_provider = src_models.CompanyProviders.objects.filter(
-        provider=turn_14_provider,
-        provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
-        primary=True,
-    ).first()
-    if not primary_provider:
-        logger.info('{} No Turn 14 active primary provider found.'.format(_LOG_PREFIX))
-        return
-
-    credentials = credentials_helper.get_feed_credentials(primary_provider)
-    try:
-        api_client = turn_14_client.Turn14ApiClient(credentials=credentials)
-    except ValueError as e:
-        logger.error('{} Invalid credentials or configuration: {}'.format(_LOG_PREFIX, str(e)))
-        raise
+    api_client = turn_14_global.get_global_client()
 
     turn14_brands = list(src_models.Turn14Brand.objects.all().order_by('name'))
     if not turn14_brands:

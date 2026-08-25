@@ -63,6 +63,10 @@ class Command(BaseCommand):
             return
 
         try:
+            reclaimed = integration_pricing_sync_jobs.cleanup_stale_running_jobs()
+            if reclaimed:
+                self.stdout.write("Reclaimed {} stale RUNNING job(s) to OPEN.".format(reclaimed))
+
             self.stdout.write(
                 "Processing up to {} pricing sync job(s) with {} worker(s)…".format(limit, workers)
             )

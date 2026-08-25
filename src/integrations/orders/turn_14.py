@@ -32,6 +32,46 @@ _LOG_PREFIX = "[TURN14-ORDER-ADAPTER]"
 # integrators who don't need manual per-warehouse control.
 _DEFAULT_LOCATION = "default"
 
+# Turn 14's own warehouses plus their two special values. "default" lets Turn 14 pick the
+# best location(s) itself -- prioritising availability, then proximity to the ship-to zip, then
+# restock priorities -- which is the right answer for most orders and why it stays the default.
+# "ds" designates a manufacturer drop-shipment. A numeric code forces one specific warehouse,
+# which a dealer may want in order to consolidate freight or keep inventory in one region even
+# when it is not the closest.
+VALID_LOCATIONS = {"default", "ds", "01", "02", "03", "59"}
+
+
+def resolve_preferred_location(
+    company_provider: src_models.CompanyProviders,
+    order_account: typing.Optional[src_models.CompanyProviderOrderAccount] = None,
+) -> str:
+    """
+    The warehouse this connection wants its Turn 14 orders fulfilled from.
+
+    Read from the order account first and the connection second, so a company running separate
+    accounts for its own shop and for drop-shipping can point them at different warehouses --
+    which is the case the setting mainly exists for. Anything unrecognised falls back to
+    "default" with a warning rather than being sent through: an invalid location code fails the
+    whole quote at Turn 14, and silently degrading to their own (good) warehouse selection beats
+    breaking a customer's checkout over a bad config value.
+    """
+    candidates = []
+    if order_account is not None:
+        candidates.append((order_account.credentials or {}).get("preferred_location"))
+    candidates.append((company_provider.credentials or {}).get("preferred_location"))
+
+    for value in candidates:
+        if not value:
+            continue
+        normalised = str(value).strip().lower()
+        if normalised in VALID_LOCATIONS:
+            return normalised
+        logger.warning(
+            "{} Ignoring unrecognised preferred_location {!r} for company_provider={}; "
+            "falling back to {!r}.".format(_LOG_PREFIX, value, company_provider.id, _DEFAULT_LOCATION)
+        )
+    return _DEFAULT_LOCATION
+
 # "Best Premium Ground" shipping group (UPS Ground / FedEx Ground / OnTrac Ground, cheapest of
 # the group). Used only when a PurchaseOrder has no ship_method set yet — see submit_order().
 _DEFAULT_SHIPPING_GROUP_CODE = "7002"
@@ -277,6 +317,7 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
             credentials=credentials_helper.get_order_credentials(company_provider, order_account),
             environment=environment,
         )
+        self._location = resolve_preferred_location(company_provider, order_account)
 
     # -- Request building -----------------------------------------------------------------
 
@@ -302,8 +343,8 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
             recipient["email_address"] = ship_to.email
         return recipient
 
-    @staticmethod
     def _build_locations(
+        self,
         line_items: typing.List[base.OrderLineItemRequest],
         shipping_code: typing.Optional[str] = None,
     ) -> typing.List[typing.Dict]:
@@ -315,8 +356,11 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
             }
             for li in line_items
         ]
+        # One block per location, and item_ids must be unique within it -- Turn 14 rejects the
+        # order otherwise. Both hold here: a single block, and the cart cannot contain the same
+        # provider part twice.
         location = {
-            "location": _DEFAULT_LOCATION,
+            "location": self._location,
             "combine_in_out_stock": False,
             "items": items,
         }

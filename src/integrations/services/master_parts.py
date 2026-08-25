@@ -2453,44 +2453,37 @@ def sync_master_part_fitments_from_rough_country() -> None:
     logger.info("{} Synced {} Rough Country master part fitment records total.".format(_LOG_PREFIX, total_upserted))
 
 
-def sync_master_part_fitments_from_turn14_vcdb() -> None:
+class Turn14FitmentJoinContext(typing.NamedTuple):
+    """Everything needed to decode a raw Turn14 fitment row straight into MasterPartFitment."""
+    turn14_provider: src_models.Providers
+    item_ext_id_to_master_part_id: typing.Dict[str, int]
+    vcdb_by_vehicle_id: typing.Dict[int, typing.Dict]
+
+
+def build_turn14_fitment_join_context() -> typing.Optional[Turn14FitmentJoinContext]:
     """
-    Sync MasterPartFitment from Turn14ItemFitment, decoding each row's Turn14 vehicle_id via
-    VcdbVehicle (year/make/model/submodel/engine/drive_type) and joining to MasterPart directly
-    via (catalog Brand, part_number) — part_number on MasterPart is Turn14Items.mfr_part_number
-    (see _ingest_turn14_items_for_mapped_brands), not routed through ProviderPart.
+    Preload everything needed to turn a raw Turn14 fitment row (item id + vehicle ids) into
+    MasterPartFitment rows: the Turn14 Providers row, a Turn14Items.external_id -> MasterPart.id
+    lookup (via BrandTurn14BrandMapping + (catalog Brand, part_number) — part_number on
+    MasterPart is Turn14Items.mfr_part_number, not routed through ProviderPart, see
+    _ingest_turn14_items_for_mapped_brands), and a VcdbVehicle.vehicle_id -> attributes lookup.
 
-    On-demand only: not wired into any scheduled pipeline (never called from
-    sync_master_parts_from_turn14, sync_master_parts, or ingest_all_providers). Requires
-    sync_master_parts_from_turn14 (for MasterPart + BrandTurn14BrandMapping) and
-    import_vcdb_vehicles (for the VcdbVehicle lookup) to have already run.
-
-    Parallelized across disjoint Turn14-brand partitions using the same
-    _partition_mapped_brands_for_parallel_ingest / _run_parallel_mapped_brand_int_worker split
-    sync_master_parts_from_turn14 itself uses, so concurrent workers never race on the same
-    MasterPartFitment (master_part, year_start, year_end, make, model, submodel, engine,
-    drive_type) upsert key.
-
-    Turn14 gives one discrete VCdb vehicle per row, not a year range. Batches are built per item
-    (every vehicle_id for an item is loaded together) so all years for a given (master_part, make,
-    model, submodel, engine, drive_type) combination are seen before being collapsed into the
-    minimal set of contiguous (year_start, year_end) ranges via _collapse_years_to_ranges -
-    batching by raw fitment row instead would risk splitting one item's years across batches and
-    under-collapsing.
+    Shared by sync_master_part_fitments_from_turn14_vcdb (backfill, reads Turn14ItemFitment) and
+    turn_14_sweeps.sweep_fitment (live sweep, decodes the API response directly — no
+    intermediate table). Requires sync_master_parts_from_turn14 (for MasterPart +
+    BrandTurn14BrandMapping) and import_vcdb_vehicles (for VcdbVehicle) to have already run.
     """
-    logger.info("{} Syncing master part fitments from Turn14 (via VCdb).".format(_LOG_PREFIX))
-
     turn14_provider = src_models.Providers.objects.filter(
         kind=src_enums.BrandProviderKind.TURN_14.value,
     ).first()
     if not turn14_provider:
         logger.info("{} No Turn14 provider found.".format(_LOG_PREFIX))
-        return
+        return None
 
     mappings = list(src_models.BrandTurn14BrandMapping.objects.select_related("brand", "turn14_brand"))
     if not mappings:
         logger.info("{} No BrandTurn14BrandMapping found.".format(_LOG_PREFIX))
-        return
+        return None
     t14_brand_id_to_catalog_brand_id = {m.turn14_brand_id: m.brand_id for m in mappings}
 
     logger.info("{} Loading MasterPart (brand, part_number) lookup...".format(_LOG_PREFIX))
@@ -2525,8 +2518,48 @@ def sync_master_part_fitments_from_turn14_vcdb() -> None:
     }
     if not vcdb_by_vehicle_id:
         logger.info("{} VcdbVehicle table is empty. Run import_vcdb_vehicles first.".format(_LOG_PREFIX))
-        return
+        return None
     logger.info("{} Loaded {} VcdbVehicle rows.".format(_LOG_PREFIX, len(vcdb_by_vehicle_id)))
+
+    return Turn14FitmentJoinContext(
+        turn14_provider=turn14_provider,
+        item_ext_id_to_master_part_id=item_ext_id_to_master_part_id,
+        vcdb_by_vehicle_id=vcdb_by_vehicle_id,
+    )
+
+
+def sync_master_part_fitments_from_turn14_vcdb() -> None:
+    """
+    Backfill MasterPartFitment from any residual Turn14ItemFitment rows, decoding each row's
+    Turn14 vehicle_id via VcdbVehicle and joining to MasterPart via build_turn14_fitment_join_context().
+
+    On-demand only: not wired into any scheduled pipeline. The live sweep
+    (turn_14_sweeps.sweep_fitment) no longer writes to Turn14ItemFitment at all — it decodes the
+    Turn14 API response straight into MasterPartFitment — so this function now only matters for
+    backfilling from Turn14ItemFitment rows written by some earlier/manual run, if any exist.
+
+    Parallelized across disjoint Turn14-brand partitions using the same
+    _partition_mapped_brands_for_parallel_ingest / _run_parallel_mapped_brand_int_worker split
+    sync_master_parts_from_turn14 itself uses, so concurrent workers never race on the same
+    MasterPartFitment (master_part, year_start, year_end, make, model, submodel, engine,
+    drive_type) upsert key.
+
+    Turn14 gives one discrete VCdb vehicle per row, not a year range. Batches are built per item
+    (every vehicle_id for an item is loaded together) so all years for a given (master_part, make,
+    model, submodel, engine, drive_type) combination are seen before being collapsed into the
+    minimal set of contiguous (year_start, year_end) ranges via _collapse_years_to_ranges -
+    batching by raw fitment row instead would risk splitting one item's years across batches and
+    under-collapsing.
+    """
+    logger.info("{} Syncing master part fitments from Turn14 (via VCdb).".format(_LOG_PREFIX))
+
+    ctx = build_turn14_fitment_join_context()
+    if ctx is None:
+        return
+    turn14_provider = ctx.turn14_provider
+    item_ext_id_to_master_part_id = ctx.item_ext_id_to_master_part_id
+    vcdb_by_vehicle_id = ctx.vcdb_by_vehicle_id
+    mappings = list(src_models.BrandTurn14BrandMapping.objects.select_related("brand", "turn14_brand"))
 
     total_fitment_rows = src_models.Turn14ItemFitment.objects.count()
     num_partitions = min(MASTER_PARTS_SYNC_MAX_WORKERS, len({m.brand_id for m in mappings}))

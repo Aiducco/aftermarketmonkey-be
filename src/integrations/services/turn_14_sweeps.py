@@ -1,0 +1,548 @@
+"""
+Catalog-wide Turn 14 sweeps -- the "daily full sweep" and "weekly fitment" tiers of Turn 14's
+proposed integration model.
+
+Why flat rather than per brand
+------------------------------
+The existing services in ``turn_14.py`` page each of the 464 mapped brands separately
+(``items/brand/{id}``, ``inventory/brand/{id}``, ``pricing/brand/{id}``). Turn 14 serves the
+brand-scoped endpoints 200 rows to a page but the unscoped collections 1 000 (items/data 450,
+fitment 200) -- measured, not assumed. Sweeping the whole catalog flat is therefore ~776
+requests where brand-by-brand is ~4 200, for identical data. Against a 5 000/hour allowance
+that is the difference between a 9-minute sync and one that cannot finish inside its budget.
+
+Ordering constraint
+-------------------
+Only ``/v1/items`` carries ``attributes.brand_id``. The data, inventory, pricing and fitment
+collections identify rows by item id alone, so their brand is resolved through Turn14Items --
+which means :func:`sweep_items` must run before the others on a first-ever sync. On steady-state
+runs the table is already populated and order stops mattering.
+
+Deactivation
+------------
+A flat sweep is also the only way to notice an item Turn 14 has *withdrawn*. The per-brand path
+only ever upserts, so a SKU that disappears from the feed stays ``active=True`` forever. See
+:func:`deactivate_items_missing_from_sweep`.
+"""
+import logging
+import typing
+from decimal import Decimal, InvalidOperation
+
+import pgbulk
+from django.utils import timezone
+
+from src import models as src_models
+from src.integrations.services import master_parts
+from src.integrations.services import turn_14 as turn_14_services
+from src.integrations.services import turn_14_global
+
+logger = logging.getLogger(__name__)
+
+_LOG_PREFIX = "[TURN-14-SWEEPS]"
+
+# Rows buffered before an upsert. Large enough that the round trips disappear next to the
+# ~845ms each API page costs, small enough that a page's worth of JSON plus a batch of model
+# instances stays well clear of the memory ceilings the nightly ingest already works around.
+_BATCH_SIZE = 2000
+
+
+def _to_decimal(value: typing.Any) -> typing.Optional[Decimal]:
+    if value is None:
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _brand_by_external_id() -> typing.Dict[str, src_models.Turn14Brand]:
+    """Turn 14's numeric brand id -> our Turn14Brand. 464 rows; safe to hold for a sweep."""
+    return {
+        str(b.external_id): b
+        for b in src_models.Turn14Brand.objects.all()
+    }
+
+
+def _brand_ids_for_items(item_external_ids: typing.Sequence[str]) -> typing.Dict[str, int]:
+    """
+    item id -> Turn14Brand pk, for the collections that do not carry brand_id themselves.
+
+    Resolved per batch rather than as one 793k-entry dict: the sweeps run inside the same
+    memory envelope as the nightly ingest, and a batch-scoped query is a few milliseconds
+    against a unique index.
+    """
+    if not item_external_ids:
+        return {}
+    return dict(
+        src_models.Turn14Items.objects.filter(external_id__in=list(item_external_ids))
+        .values_list("external_id", "brand_id")
+    )
+
+
+def _sweep(
+    label: str,
+    fetch_page: typing.Callable[[int], typing.Tuple[typing.List[typing.Dict], typing.Optional[int]]],
+    flush: typing.Callable[[typing.List[typing.Dict]], int],
+    max_pages: typing.Optional[int] = None,
+) -> typing.Tuple[int, int]:
+    """
+    Page an endpoint to exhaustion, handing ``flush`` batches of raw rows.
+
+    Returns (rows_seen, rows_written). Deliberately does not catch RateBudgetExhausted: a spent
+    budget must abort the sweep so the caller can defer it, not silently truncate the catalog
+    and report success -- a half-swept catalog that looks complete is worse than a failed run,
+    because the deactivation pass would then mark every unseen item inactive.
+
+    ``max_pages`` stops after that many pages regardless of what the API still has left -- a
+    real, permanent feature (not a test-only hack) for bounded smoke tests of a sweep before
+    trusting it with a full, hours-long catalog run.
+    """
+    page: typing.Optional[int] = 1
+    buffer: typing.List[typing.Dict] = []
+    seen = written = 0
+    pages_fetched = 0
+
+    while page is not None:
+        rows, next_page = fetch_page(page)
+        pages_fetched += 1
+        seen += len(rows)
+        buffer.extend(rows)
+
+        if len(buffer) >= _BATCH_SIZE:
+            written += flush(buffer)
+            buffer = []
+            logger.info("{} {}: {} seen / {} written (page {}).".format(
+                _LOG_PREFIX, label, seen, written, page
+            ))
+
+        page = next_page
+        if max_pages is not None and pages_fetched >= max_pages:
+            if page is not None:
+                logger.info("{} {}: stopping after max_pages={} (more pages remain).".format(
+                    _LOG_PREFIX, label, max_pages
+                ))
+            break
+
+    if buffer:
+        written += flush(buffer)
+
+    logger.info("{} {} complete: {} seen / {} written.".format(_LOG_PREFIX, label, seen, written))
+    return seen, written
+
+
+# ---------------------------------------------------------------------------------------
+# Global (shared) sweeps
+# ---------------------------------------------------------------------------------------
+
+def sweep_items(client=None, max_pages: typing.Optional[int] = None) -> typing.Tuple[int, int]:
+    """GET /v1/items over the whole catalog into Turn14Items."""
+    client = client or turn_14_global.get_global_client()
+    brands = _brand_by_external_id()
+    unknown_brands: typing.Set[str] = set()
+
+    def flush(rows: typing.List[typing.Dict]) -> int:
+        instances = []
+        for row in rows:
+            brand_id = str((row.get("attributes") or {}).get("brand_id") or "")
+            brand = brands.get(brand_id)
+            if brand is None:
+                unknown_brands.add(brand_id)
+                continue
+            instances.extend(turn_14_services._transform_items_data([row], brand))
+        if not instances:
+            return 0
+        pgbulk.upsert(
+            src_models.Turn14Items,
+            instances,
+            unique_fields=["external_id"],
+            update_fields=[
+                "brand", "product_name", "part_number", "mfr_part_number", "part_description",
+                "category", "subcategory", "external_brand_id", "brand_name", "price_group_id",
+                "price_group", "active", "born_on_date", "regular_stock",
+                "powersports_indicator", "dropship_controller_id", "air_freight_prohibited",
+                "not_carb_approved", "carb_acknowledgement_required", "ltl_freight_required",
+                "prop_65", "epa", "units_per_sku", "clearance_item", "thumbnail",
+                "barcode", "dimensions", "warehouse_availability", "updated_at",
+            ],
+        )
+        return len(instances)
+
+    result = _sweep("items", client.get_items, flush, max_pages=max_pages)
+    if unknown_brands:
+        # Turn 14 published items for a brand we have not mapped yet. Not fatal -- the next
+        # brands sync picks it up -- but silence here would hide a growing blind spot.
+        logger.warning(
+            "{} items sweep skipped rows for {} unmapped brand id(s): {}.".format(
+                _LOG_PREFIX, len(unknown_brands), sorted(unknown_brands)[:20]
+            )
+        )
+    return result
+
+
+def sweep_items_data(client=None, max_pages: typing.Optional[int] = None) -> typing.Tuple[int, int]:
+    """GET /v1/items/data over the whole catalog into Turn14BrandData (media + descriptions)."""
+    client = client or turn_14_global.get_global_client()
+
+    def flush(rows: typing.List[typing.Dict]) -> int:
+        brand_ids = _brand_ids_for_items([str(r.get("id", "")) for r in rows])
+        instances = []
+        for row in rows:
+            external_id = str(row.get("id", ""))
+            brand_id = brand_ids.get(external_id)
+            if not external_id or brand_id is None:
+                continue
+            instances.append(src_models.Turn14BrandData(
+                external_id=external_id,
+                brand_id=brand_id,
+                type=row.get("type"),
+                files=row.get("files"),
+                descriptions=row.get("descriptions"),
+                relationships=row.get("relationships"),
+                updated_at=timezone.now(),
+            ))
+        if not instances:
+            return 0
+        pgbulk.upsert(
+            src_models.Turn14BrandData,
+            instances,
+            unique_fields=["external_id"],
+            update_fields=["brand", "type", "files", "descriptions", "relationships", "updated_at"],
+        )
+        return len(instances)
+
+    return _sweep("items/data", client.get_items_data, flush, max_pages=max_pages)
+
+
+def sweep_inventory(client=None, max_pages: typing.Optional[int] = None) -> typing.Tuple[int, int]:
+    """GET /v1/inventory over the whole catalog into Turn14BrandInventory."""
+    client = client or turn_14_global.get_global_client()
+
+    def flush(rows: typing.List[typing.Dict]) -> int:
+        brand_ids = _brand_ids_for_items([str(r.get("id", "")) for r in rows])
+        instances = []
+        for row in rows:
+            external_id = str(row.get("id", ""))
+            if not external_id:
+                continue
+            attributes = row.get("attributes") or {}
+            inventory = attributes.get("inventory") or {}
+            # Warehouse counts are keyed by location code; anything non-numeric is a stray key
+            # rather than a warehouse, so it must not be summed into the total.
+            total = 0
+            for value in inventory.values():
+                try:
+                    total += int(value)
+                except (TypeError, ValueError):
+                    continue
+            instances.append(src_models.Turn14BrandInventory(
+                external_id=external_id,
+                brand_id=brand_ids.get(external_id),
+                type=row.get("type"),
+                inventory=inventory,
+                manufacturer=attributes.get("manufacturer"),
+                eta=attributes.get("eta"),
+                relationships=row.get("relationships"),
+                total_inventory=total,
+                updated_at=timezone.now(),
+            ))
+        if not instances:
+            return 0
+        pgbulk.upsert(
+            src_models.Turn14BrandInventory,
+            instances,
+            unique_fields=["external_id"],
+            update_fields=[
+                "brand", "type", "inventory", "manufacturer", "eta", "relationships",
+                "total_inventory", "updated_at",
+            ],
+        )
+        return len(instances)
+
+    return _sweep("inventory", client.get_inventory, flush, max_pages=max_pages)
+
+
+def sweep_fitment(client=None, max_pages: typing.Optional[int] = None) -> typing.Tuple[int, int]:
+    """
+    GET /v1/items/fitment over the whole catalog, decoded straight into MasterPartFitment.
+
+    Deliberately does NOT persist into Turn14ItemFitment: a 2-page smoke test of the old
+    explode-into-a-row-per-vehicle design wrote 30,591 rows from 400 items (~76 vehicles/item),
+    extrapolating to ~59M rows catalog-wide against a (item_external_id, vehicle_id) unique index
+    -- an unresolved capacity question. Instead every vehicle_id on a row is decoded via VcdbVehicle
+    and collapsed into year ranges immediately, per item, exactly like
+    master_parts.sync_master_part_fitments_from_turn14_vcdb already does for a persisted
+    Turn14ItemFitment table -- just applied inline to the raw API response instead of a DB read.
+    One Turn14 fitment row already carries every vehicle id for that item in a single response,
+    so this collapsing is correct per-row without needing a cross-page accumulator.
+
+    The output table (MasterPartFitment) is sized by real distinct fitment combinations, the same
+    way Rough Country's ~273k and ASAP's ~905k rows already are -- not one row per raw vehicle id
+    -- so the ~59M-row risk that applied to Turn14ItemFitment does not apply here.
+    """
+    client = client or turn_14_global.get_global_client()
+    ctx = master_parts.build_turn14_fitment_join_context()
+    if ctx is None:
+        logger.warning(
+            "{} fitment sweep: join context unavailable (no Turn14 provider, no "
+            "BrandTurn14BrandMapping, or VcdbVehicle is empty -- run import_vcdb_vehicles "
+            "first). Skipping.".format(_LOG_PREFIX)
+        )
+        return 0, 0
+
+    skipped_unknown_item = [0]
+    skipped_unknown_vehicle = [0]
+
+    def flush(rows: typing.List[typing.Dict]) -> int:
+        to_upsert = []
+        for row in rows:
+            external_id = str(row.get("id", ""))
+            master_part_id = ctx.item_ext_id_to_master_part_id.get(external_id)
+            if not external_id or not master_part_id:
+                # An item with no resolvable MasterPart (not yet in Turn14Items, or its brand
+                # isn't mapped) has nowhere to attach fitment to. Counted rather than logged per
+                # row -- on a first run before the items sweep this would be every single row.
+                skipped_unknown_item[0] += 1
+                continue
+            attributes = row.get("attributes") or {}
+            years_by_key: typing.Dict[typing.Tuple, typing.Set[int]] = {}
+            for vehicle_id in (attributes.get("vehicle_ids") or []):
+                try:
+                    vehicle_id = int(vehicle_id)
+                except (TypeError, ValueError):
+                    continue
+                vcdb = ctx.vcdb_by_vehicle_id.get(vehicle_id)
+                if not vcdb:
+                    skipped_unknown_vehicle[0] += 1
+                    continue
+                key = (
+                    vcdb["make"], vcdb["model"], vcdb["submodel"] or "",
+                    vcdb["engine"] or "", vcdb["drive_type"] or "",
+                )
+                years_by_key.setdefault(key, set()).add(vcdb["year"])
+
+            for (make, model, submodel, engine, drive_type), years in years_by_key.items():
+                for year_start, year_end in master_parts._collapse_years_to_ranges(years):
+                    to_upsert.append(src_models.MasterPartFitment(
+                        master_part_id=master_part_id,
+                        year_start=year_start,
+                        year_end=year_end,
+                        make=make,
+                        model=model,
+                        submodel=submodel,
+                        engine=engine,
+                        drive_type=drive_type,
+                        source_provider=ctx.turn14_provider,
+                    ))
+
+        if not to_upsert:
+            return 0
+        to_upsert = master_parts._dedupe_master_part_fitments_for_upsert(
+            to_upsert, context="Turn14 fitment sweep"
+        )
+        pgbulk.upsert(
+            src_models.MasterPartFitment,
+            to_upsert,
+            unique_fields=[
+                "master_part", "year_start", "year_end", "make", "model",
+                "submodel", "engine", "drive_type",
+            ],
+            update_fields=["source_provider"],
+        )
+        return len(to_upsert)
+
+    result = _sweep("items/fitment", client.get_items_fitment, flush, max_pages=max_pages)
+    if skipped_unknown_item[0] or skipped_unknown_vehicle[0]:
+        logger.warning(
+            "{} fitment sweep: skipped {} row(s) for items with no MasterPart, {} vehicle_id(s) "
+            "not in VcdbVehicle.".format(_LOG_PREFIX, skipped_unknown_item[0], skipped_unknown_vehicle[0])
+        )
+    return result
+
+
+def sweep_dropship_controllers(client=None) -> int:
+    """
+    Resolve every distinct Turn14Items.dropship_controller_id through GET /v1/dropship/{id}.
+
+    There is no bulk endpoint for these (an open question for Turn 14), but the set is small --
+    a few hundred at most across the catalog -- so one request each is affordable. Id 0 is
+    Turn 14's sentinel for "no controller" and 404s, so it is filtered out rather than fetched.
+    """
+    client = client or turn_14_global.get_global_client()
+
+    controller_ids = sorted(
+        set(
+            src_models.Turn14Items.objects
+            .filter(dropship_controller_id__isnull=False)
+            .exclude(dropship_controller_id=0)
+            .values_list("dropship_controller_id", flat=True)
+            .distinct()
+        )
+    )
+    logger.info("{} Resolving {} dropship controller(s).".format(_LOG_PREFIX, len(controller_ids)))
+
+    instances = []
+    for controller_id in controller_ids:
+        data = client.get_dropship_controller(int(controller_id))
+        if not data:
+            continue
+        instances.append(src_models.Turn14DropshipController(
+            external_id=str(controller_id),
+            charges=(data.get("attributes") or {}).get("charges"),
+            updated_at=timezone.now(),
+        ))
+
+    if instances:
+        pgbulk.upsert(
+            src_models.Turn14DropshipController,
+            instances,
+            unique_fields=["external_id"],
+            update_fields=["charges", "updated_at"],
+        )
+    logger.info("{} Upserted {} dropship controller(s).".format(_LOG_PREFIX, len(instances)))
+    return len(instances)
+
+
+def sweep_shipping_estimates(client=None) -> typing.Tuple[int, int]:
+    """
+    GET /v1/shipping/item_estimation/brand/{id} for every mapped brand into
+    Turn14ItemShippingEstimate.
+
+    Brand-scoped rather than flat: ``/v1/shipping/item_estimation`` exists unscoped but returns
+    the same 200 rows/page, so there is no page-size advantage, and going brand by brand keeps
+    the brand attribution free instead of costing a Turn14Items lookup per batch.
+    """
+    client = client or turn_14_global.get_global_client()
+    brands = list(src_models.Turn14Brand.objects.all().order_by("id"))
+    total_seen = total_written = 0
+
+    for brand in brands:
+        def flush(rows: typing.List[typing.Dict], _brand=brand) -> int:
+            instances = []
+            for row in rows:
+                external_id = str(row.get("id", ""))
+                if not external_id:
+                    continue
+                attributes = row.get("attributes") or {}
+                rate = attributes.get("ground_continental_us_base_rate") or {}
+                instances.append(src_models.Turn14ItemShippingEstimate(
+                    item_external_id=external_id,
+                    brand=_brand,
+                    can_ship=bool(rate.get("can_ship", False)),
+                    min_rate=_to_decimal(rate.get("min")),
+                    average_rate=_to_decimal(rate.get("average")),
+                    max_rate=_to_decimal(rate.get("max")),
+                    fees=attributes.get("fees"),
+                    updated_at=timezone.now(),
+                ))
+            if not instances:
+                return 0
+            pgbulk.upsert(
+                src_models.Turn14ItemShippingEstimate,
+                instances,
+                unique_fields=["item_external_id"],
+                update_fields=[
+                    "brand", "can_ship", "min_rate", "average_rate", "max_rate", "fees",
+                    "updated_at",
+                ],
+            )
+            return len(instances)
+
+        seen, written = _sweep(
+            "shipping/item_estimation brand={}".format(brand.external_id),
+            lambda page, b=brand: client.get_item_shipping_estimates_for_brand(
+                brand_id=int(b.external_id), page=page
+            ),
+            flush,
+        )
+        total_seen += seen
+        total_written += written
+
+    return total_seen, total_written
+
+
+def deactivate_items_missing_from_sweep(sweep_started_at) -> int:
+    """
+    Mark items untouched by a *completed* full sweep as inactive.
+
+    Turn 14 withdraws SKUs, but every existing path only upserts, so a withdrawn part stays
+    active forever and keeps surfacing in search. A completed flat sweep touches every item
+    Turn 14 still carries, so anything whose updated_at predates the sweep is gone.
+
+    Only ever call this after a sweep that ran to completion. A sweep aborted by a spent rate
+    budget has seen an arbitrary prefix of the catalog, and deactivating "everything unseen"
+    would take out most of it.
+    """
+    stale = src_models.Turn14Items.objects.filter(active=True, updated_at__lt=sweep_started_at)
+    count = stale.count()
+    if count:
+        stale.update(active=False, updated_at=timezone.now())
+        logger.warning(
+            "{} Deactivated {} item(s) absent from the completed sweep.".format(_LOG_PREFIX, count)
+        )
+    return count
+
+
+# ---------------------------------------------------------------------------------------
+# Customer-specific sweep
+# ---------------------------------------------------------------------------------------
+
+def sweep_pricing_for_company_provider(
+    company_provider: src_models.CompanyProviders,
+) -> typing.Tuple[int, int]:
+    """
+    GET /v1/pricing over the whole catalog for one customer, into Turn14BrandPricing.
+
+    The flat replacement for ``_fetch_and_save_turn_14_brand_pricing_for_company_provider``,
+    which walks 464 brands at 200 rows a page (~4 200 requests) to fetch what this does in 776.
+    Against a 5 000/hour allowance that is the difference between finishing inside the budget
+    and not: 776 requests is a ~9 minute floor, 4 200 is ~50 minutes and cannot be repeated for
+    eleven customers inside a day.
+
+    Uses the *customer's* credentials, never the global ones -- pricing is the half of Turn 14's
+    model that is genuinely per-account, and one customer's costs must never be written from
+    another's connection.
+    """
+    from src.integrations import credentials as credentials_helper
+    from src.integrations.clients.turn_14 import client as turn_14_client
+
+    company = company_provider.company
+    client = turn_14_client.Turn14ApiClient(
+        credentials=credentials_helper.get_feed_credentials(company_provider)
+    )
+
+    def flush(rows: typing.List[typing.Dict]) -> int:
+        brand_ids = _brand_ids_for_items([str(r.get("id", "")) for r in rows])
+        instances = []
+        for row in rows:
+            external_id = str(row.get("id", ""))
+            brand_id = brand_ids.get(external_id)
+            if not external_id or brand_id is None:
+                # brand is NOT NULL here. An item we have never catalogued cannot be priced
+                # against a brand, so skip it; the next items sweep will pick it up.
+                continue
+            attributes = row.get("attributes") or {}
+            instances.append(src_models.Turn14BrandPricing(
+                external_id=external_id,
+                brand_id=brand_id,
+                company=company,
+                type=row.get("type"),
+                purchase_cost=_to_decimal(attributes.get("purchase_cost")),
+                has_map=bool(attributes.get("has_map", False)),
+                can_purchase=bool(attributes.get("can_purchase", False)),
+                pricelists=attributes.get("pricelists"),
+                updated_at=timezone.now(),
+            ))
+        if not instances:
+            return 0
+        pgbulk.upsert(
+            src_models.Turn14BrandPricing,
+            instances,
+            unique_fields=["company", "external_id"],
+            update_fields=[
+                "brand", "type", "purchase_cost", "has_map", "can_purchase", "pricelists",
+                "updated_at",
+            ],
+        )
+        return len(instances)
+
+    return _sweep("pricing company={}".format(company.name), client.get_pricing, flush)

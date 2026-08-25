@@ -43,6 +43,7 @@ from django.db import connection
 from django.core.management.base import BaseCommand
 
 from src.audit import scheduled_tasks as audit_scheduled_tasks
+from src.integrations import rate_limit as rate_limit_base
 from src.integrations.services import (
     atech,
     dlg,
@@ -58,7 +59,6 @@ from src.integrations.services import (
     rough_country,
     the_wheel_group,
     tirerack,
-    turn_14,
     vossen,
     wheelpros,
     wps,
@@ -109,6 +109,7 @@ class Command(BaseCommand):
         task_name: str,
         success_message: str,
         continue_on_error: bool = False,
+        meter: typing.Optional[rate_limit_base.UsageMeter] = None,
     ) -> typing.Iterator[None]:
         """
         ``start_scheduled_task_execution`` at entry, ``mark_scheduled_task_completed`` or
@@ -120,7 +121,11 @@ class Command(BaseCommand):
         ex = audit_scheduled_tasks.start_scheduled_task_execution(task_name)
         self._ingest_log("subtask started | task_name={}".format(task_name))
         try:
-            yield
+            if meter is not None:
+                with meter:
+                    yield
+            else:
+                yield
         except Exception as e:
             audit_scheduled_tasks.mark_scheduled_task_failed(ex, error_message=str(e))
             self._ingest_log("subtask failed | task_name={} | error={!s}".format(task_name, e))
@@ -128,13 +133,16 @@ class Command(BaseCommand):
                 raise
             self._ingest_log("subtask failure ignored (continue_on_error=True) | task_name={}".format(task_name))
             return
-        audit_scheduled_tasks.mark_scheduled_task_completed(ex, message=success_message)
+        message = success_message
+        if meter is not None:
+            message = "{} || {}".format(success_message, meter.summary("api_usage"))
+            self._ingest_log("subtask usage | task_name={} | {}".format(task_name, meter.summary("api_usage")))
+        audit_scheduled_tasks.mark_scheduled_task_completed(ex, message=message)
         self._ingest_log("subtask completed | task_name={}".format(task_name))
 
     def handle(self, *args, **options):
         audit_scheduled_tasks.cleanup_stale_started_executions([
             _TASK_NAME,
-            "ingest_all_providers_turn14",
             "ingest_all_providers_keystone",
             "ingest_all_providers_meyer",
             "ingest_all_providers_atech",
@@ -165,8 +173,13 @@ class Command(BaseCommand):
             # is still sequential relative to every other provider.
             # ----------------------------------------------------------------
             self._ingest_log("phase 1 | starting sequential source fetches for all providers")
+            # Turn14 is deliberately not in this list: it now runs entirely through dedicated
+            # scheduled commands (sync_turn14_global_sweep daily, fetch_turn_14_items_updates
+            # 4-hourly, fetch_turn_14_inventory_updates every 10min, sync_turn14_order_sweeps
+            # hourly, sync_turn14_fitment_sweep weekly), per Dan Ziegler's cadence proposal —
+            # see docs/TURN14_HANDOFF.md and docs/TURN14_INTEGRATION_PLAN.md. Running it here too
+            # would duplicate those fetches against the same rate budget.
             phase1_providers: typing.List[typing.Tuple[str, typing.Callable[[], None]]] = [
-                ("turn14",        self._run_turn14),
                 ("keystone",      self._run_keystone),
                 ("meyer",         self._run_meyer),
                 ("atech",         self._run_atech),
@@ -246,31 +259,6 @@ class Command(BaseCommand):
             audit_scheduled_tasks.mark_scheduled_task_failed(execution, error_message=str(e))
             self.stdout.write(self.style.ERROR("Error: {}".format(str(e))))
             raise
-
-    def _run_turn14(self) -> None:
-        with self._audited_step(
-            "ingest_all_providers_turn14",
-            "Turn14 source fetch complete: brands, item updates, inventory updates (derived in sync_all).",
-            continue_on_error=True,
-        ):
-            self._ingest_log("Turn14: brands + items + inventory fetches only; derived in sync_all")
-            turn_14.fetch_and_save_turn_14_brands()
-            synced = turn_14.sync_unmapped_turn_14_brands_to_brands()
-            if synced:
-                n = len(synced)
-                self._ingest_log(
-                    "Turn14: {} new brand(s); fetching items, media, inventory for those "
-                    "(per-company pricing handled by Phase 3 pricing jobs)".format(n)
-                )
-                turn_14.fetch_and_save_turn_14_items_for_turn14_brands(synced)
-                turn_14.fetch_and_save_turn_14_brand_data_for_turn14_brands(synced)
-                turn_14.fetch_and_save_turn_14_brand_inventory_for_turn14_brands(synced)
-            else:
-                self._ingest_log("Turn14: no new brands; skipped brand-scoped fetches")
-            self._ingest_log("Turn14: fetching item updates from API")
-            turn_14.fetch_and_save_turn_14_items_updates()
-            self._ingest_log("Turn14: fetching inventory updates from API")
-            turn_14.fetch_and_save_turn_14_inventory_updates()
 
     def _run_keystone(self) -> None:
         with self._audited_step(

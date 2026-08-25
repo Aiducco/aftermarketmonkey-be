@@ -16,7 +16,7 @@ import datetime
 import logging
 import typing
 
-from django.db import connection, transaction
+from django.db import connection, models as django_db_models, transaction
 from django.utils import timezone
 
 from src import enums as src_enums
@@ -33,10 +33,12 @@ from src.integrations.services import notifications as notifications_services
 from src.integrations.services import premier as premier_services
 from src.integrations.services import quadratec as quadratec_services
 from src.integrations import credentials as credentials_helper
+from src.integrations import rate_limit as rate_limit_base
 from src.integrations.services import rough_country as rough_country_services
 from src.integrations.services import the_wheel_group as the_wheel_group_services
 from src.integrations.services import tirerack as tirerack_services
 from src.integrations.services import turn_14 as turn_14_services
+from src.integrations.services import turn_14_sweeps
 from src.integrations.services import vossen as vossen_services
 from src.integrations.services import wheelpros as wheelpros_services
 from src.integrations.services import wps as wps_services
@@ -213,10 +215,15 @@ def _fetch_raw_pricing(cp: src_models.CompanyProviders, use_delta_fetch: bool = 
     kind = cp.provider.kind
 
     if kind == src_enums.BrandProviderKind.TURN_14.value:
-        if use_delta_fetch:
-            turn_14_services.fetch_and_save_turn_14_brand_pricing_delta_for_company_provider(cp.id)
-        else:
-            turn_14_services.fetch_and_save_turn_14_brand_pricing_for_company_provider(cp.id)
+        # Flat /v1/pricing for both paths now. The delta route (pricing/changes -> re-fetch the
+        # affected brands) existed because a full fetch meant paging all 464 brands at 200 rows
+        # a page -- ~4 200 requests, ~50 minutes, impossible to repeat for every customer daily.
+        # The flat endpoint returns the same data 1 000 rows to a page in 776 requests, so a
+        # complete refresh now costs less than the delta's own brand re-fetches did, and every
+        # customer gets genuinely current pricing rather than a diff against unknown state.
+        # fetch_and_save_turn_14_brand_pricing_delta_for_company_provider is kept for now as a
+        # fallback while the flat path proves itself in production.
+        turn_14_sweeps.sweep_pricing_for_company_provider(cp)
 
     elif kind == src_enums.BrandProviderKind.KEYSTONE.value:
         keystone_services.sync_keystone_catalog_and_company_pricing_for_company_provider(cp.id)
@@ -334,12 +341,71 @@ def _sync_master_pricing(cp: src_models.CompanyProviders) -> None:
         raise ValueError("Unsupported provider kind for master pricing sync: {}".format(kind))
 
 
+def cleanup_stale_running_jobs(max_age_minutes: int = 60) -> int:
+    """
+    Finish IntegrationPricingSyncJob rows stuck RUNNING (worker OOM-killed or container
+    restarted mid-job), then enqueue a fresh OPEN job for the same connection.
+
+    Deliberately does NOT reopen the stale row in place: a row that was killed mid-run may have
+    partial/inconsistent raw_response state, and its identity shouldn't be silently reused as if
+    nothing happened. It's marked FAILED (terminal -- "finished") like any other failed run, and
+    a brand new job is what actually gets retried, via the same enqueue_company_provider_pricing_sync()
+    every other trigger (connect, update, nightly enqueue) already uses.
+    """
+    cutoff = timezone.now() - datetime.timedelta(minutes=max_age_minutes)
+    stale_jobs = list(
+        src_models.IntegrationPricingSyncJob.objects.filter(
+            status=src_enums.IntegrationPricingSyncJobStatus.RUNNING.value,
+            started_at__lt=cutoff,
+        )
+    )
+    if not stale_jobs:
+        return 0
+
+    now = timezone.now()
+    src_models.IntegrationPricingSyncJob.objects.filter(
+        id__in=[j.id for j in stale_jobs]
+    ).update(
+        status=src_enums.IntegrationPricingSyncJobStatus.FAILED.value,
+        status_name=src_enums.IntegrationPricingSyncJobStatus.FAILED.name,
+        error_message=(
+            "Stale RUNNING — worker was killed (OOM or container restart) before it could "
+            "mark itself complete/failed. Finished as FAILED; a fresh job was enqueued for retry."
+        ),
+        completed_at=now,
+        updated_at=now,
+    )
+
+    seen_company_providers: typing.Set[int] = set()
+    requeued = 0
+    for job in stale_jobs:
+        if job.company_provider_id in seen_company_providers:
+            continue
+        seen_company_providers.add(job.company_provider_id)
+        enqueue_company_provider_pricing_sync(
+            job.company_provider_id,
+            skip_raw_fetch=job.skip_raw_fetch,
+            use_delta_fetch=job.use_delta_fetch,
+        )
+        requeued += 1
+
+    logger.warning(
+        "Finished {} stale RUNNING IntegrationPricingSyncJob row(s) as FAILED; "
+        "enqueued {} fresh job(s) for retry.".format(len(stale_jobs), requeued)
+    )
+    return len(stale_jobs)
+
+
 def claim_next_open_job() -> typing.Optional[src_models.IntegrationPricingSyncJob]:
     """Atomically mark one OPEN job as RUNNING. Returns None if none available."""
     with transaction.atomic():
         job = (
             src_models.IntegrationPricingSyncJob.objects.select_for_update(skip_locked=True)
             .filter(status=src_enums.IntegrationPricingSyncJobStatus.OPEN.value)
+            .filter(
+                django_db_models.Q(not_before__isnull=True)
+                | django_db_models.Q(not_before__lte=timezone.now())
+            )
             .order_by("id")
             .first()
         )
@@ -396,6 +462,11 @@ def run_integration_pricing_sync_job(job: src_models.IntegrationPricingSyncJob) 
         )
         return
 
+    # Metered so the job row records what the sync actually cost in requests and wall-clock,
+    # making a run directly comparable against earlier ones. Entered manually rather than as a
+    # `with` block so the existing try/except structure below stays untouched.
+    meter = rate_limit_base.UsageMeter("t14:get")
+    meter.__enter__()
     try:
         if not job.skip_raw_fetch:
             logger.info(
@@ -414,7 +485,35 @@ def run_integration_pricing_sync_job(job: src_models.IntegrationPricingSyncJob) 
         )
         _sync_master_pricing(cp)
 
+    except rate_limit_base.RateBudgetExhausted as e:
+        # Not a failure: the distributor's hourly/daily allowance for this company's credentials
+        # is spent. Turn 14 deactivates credentials that repeatedly hit their limits, so the
+        # right move is to stop, keep whatever was already written, and come back in the next
+        # window -- never to retry into the ceiling. Back to OPEN, deferred until then.
+        meter.__exit__(None, None, None)
+        retry_at = timezone.now() + datetime.timedelta(seconds=e.retry_after_seconds)
+        logger.warning(
+            "{} Job id={} deferred until {}: {}".format(_LOG_PREFIX, job.id, retry_at, e)
+        )
+        job.status = src_enums.IntegrationPricingSyncJobStatus.OPEN.value
+        job.status_name = src_enums.IntegrationPricingSyncJobStatus.OPEN.name
+        job.message = "Deferred: {} || {}".format(e, meter.summary("api_usage"))[:4000]
+        job.not_before = retry_at
+        job.started_at = None
+        job.save(
+            update_fields=[
+                "status",
+                "status_name",
+                "message",
+                "not_before",
+                "started_at",
+                "updated_at",
+            ]
+        )
+        return
+
     except Exception as e:
+        meter.__exit__(None, None, None)
         logger.exception("{} Job id={} failed.".format(_LOG_PREFIX, job.id))
         job.status = src_enums.IntegrationPricingSyncJobStatus.FAILED.value
         job.status_name = src_enums.IntegrationPricingSyncJobStatus.FAILED.name
@@ -431,12 +530,16 @@ def run_integration_pricing_sync_job(job: src_models.IntegrationPricingSyncJob) 
         )
         return
 
+    meter.__exit__(None, None, None)
     job.status = src_enums.IntegrationPricingSyncJobStatus.COMPLETED.value
     job.status_name = src_enums.IntegrationPricingSyncJobStatus.COMPLETED.name
-    job.message = "OK (skip_raw_fetch={}, use_delta_fetch={})".format(job.skip_raw_fetch, job.use_delta_fetch)
+    job.message = "OK (skip_raw_fetch={}, use_delta_fetch={}) || {}".format(
+        job.skip_raw_fetch, job.use_delta_fetch, meter.summary("api_usage")
+    )
     job.completed_at = timezone.now()
+    job.not_before = None
     job.save(
-        update_fields=["status", "status_name", "message", "completed_at", "updated_at"]
+        update_fields=["status", "status_name", "message", "not_before", "completed_at", "updated_at"]
     )
 
     # `cp` was fetched once at the top of this function; a disconnect (credentials.feed cleared

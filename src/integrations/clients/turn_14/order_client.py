@@ -13,7 +13,6 @@ must never invoke these except through an explicit, user-approved submission —
 Purchase Orders plan for the job-queue path this is meant to run behind.
 """
 import decimal
-import time
 import typing
 
 import requests
@@ -22,9 +21,10 @@ from django.conf import settings
 
 from common import enums as common_enums
 from common import utils as common_utils
+from src.integrations import rate_limit as rate_limit_base
 from src.integrations.clients.turn_14 import USER_AGENT, exceptions
+from src.integrations.clients.turn_14 import rate_limit as turn14_rate_limit
 
-TOKEN_EXPIRATION_BUFFER_SECONDS = 60
 REQUEST_TIMEOUT_SECONDS = 30
 
 _ENVIRONMENT_BASE_URLS = {
@@ -54,19 +54,26 @@ class Turn14OrderApiClient(object):
         self.environment = environment
         self.api_base_url = _ENVIRONMENT_BASE_URLS[environment]
 
-        self._cached_token: typing.Optional[str] = None
-        self._token_expires_at: typing.Optional[float] = None
+        # Identity for the shared token cache and the shared rate-limit buckets. On production
+        # this is the bare client_id, so this client and the catalog client (client.py) draw on
+        # the *same* token and the *same* 5 000/hour allowance -- which is what Turn 14 actually
+        # meters, since both authenticate as the same credential set against the same host.
+        # The testing host is a separate system with its own tokens and counters, so it gets a
+        # separate identity rather than spending production's budget.
+        self._identity = (
+            self.client_id if environment == "production" else "{}@testing".format(self.client_id)
+        )
 
     # -- Auth (same client-credentials flow as the read-only client) --------------------
 
-    def _is_token_valid(self) -> bool:
-        if self._cached_token is None or self._token_expires_at is None:
-            return False
-        return time.time() < (self._token_expires_at - TOKEN_EXPIRATION_BUFFER_SECONDS)
-
     def _get_valid_token(self) -> str:
-        if self._is_token_valid():
-            return self._cached_token
+        cached = turn14_rate_limit.get_cached_token(self._identity)
+        if cached is not None:
+            return cached
+
+        # Token issuance is metered per IP (10/minute) across every credential set and both
+        # Turn 14 clients, so this bucket is deliberately not scoped to a client_id.
+        rate_limit_base.acquire(turn14_rate_limit.token_buckets(), meter_key="t14:token")
 
         response = requests.request(
             url="{}/token".format(self.api_base_url),
@@ -90,16 +97,14 @@ class Turn14OrderApiClient(object):
         if not access_token:
             raise exceptions.Turn14APIException("No access_token in authorization response.")
 
-        self._cached_token = access_token
         expires_in = auth_data.get("expires_in")
         if isinstance(expires_in, decimal.Decimal):
             expires_in = int(expires_in)
-        self._token_expires_at = time.time() + (expires_in or 3600)
-        return self._cached_token
+        turn14_rate_limit.store_token(self._identity, access_token, expires_in)
+        return access_token
 
     def _clear_token_cache(self) -> None:
-        self._cached_token = None
-        self._token_expires_at = None
+        turn14_rate_limit.clear_token(self._identity)
 
     def _request(
         self,
@@ -108,7 +113,15 @@ class Turn14OrderApiClient(object):
         payload: typing.Optional[dict] = None,
         params: typing.Optional[dict] = None,
         retry_on_401: bool = True,
+        buckets: typing.Optional[typing.List[rate_limit_base.Bucket]] = None,
     ) -> typing.Dict:
+        # This client had no rate limiting at all, while spending the same per-credential
+        # allowance as the catalog client. ``buckets`` lets create_quote substitute Turn 14's
+        # tighter 2/second quote limit for the ordinary 5/second one.
+        rate_limit_base.acquire(
+            buckets or turn14_rate_limit.get_buckets(self._identity), meter_key="t14:get"
+        )
+
         url = "{}/{}".format(self.api_base_url, endpoint)
         headers = {
             "Content-Type": "application/json",
@@ -133,7 +146,19 @@ class Turn14OrderApiClient(object):
 
         if response.status_code == 401 and retry_on_401:
             self._clear_token_cache()
-            return self._request(endpoint, method, payload=payload, params=params, retry_on_401=False)
+            return self._request(
+                endpoint, method, payload=payload, params=params, retry_on_401=False, buckets=buckets
+            )
+
+        # See client.py's _request for why a 429 shuts the local bucket and defers.
+        if response.status_code == 429:
+            rate_limit_base.mark_exhausted(turn14_rate_limit.hourly_bucket(self._identity))
+            raise rate_limit_base.RateBudgetExhausted(
+                scope="t14:get:hour (upstream 429)",
+                limit=turn14_rate_limit.GET_PER_HOUR,
+                period_seconds=3600,
+                retry_after_seconds=300.0,
+            )
 
         if response.status_code not in self.VALID_STATUS_CODES:
             msg = "Invalid API client response (status_code={}, data={})".format(
@@ -177,6 +202,7 @@ class Turn14OrderApiClient(object):
             endpoint="quote",
             method=common_enums.HttpMethod.POST,
             payload={"data": data},
+            buckets=turn14_rate_limit.quote_buckets(self._identity),
         )
 
     # -- Order (SUBMIT — real order placement, see module docstring) --------------------
@@ -222,6 +248,79 @@ class Turn14OrderApiClient(object):
         return self._request(
             endpoint="invoices/po/{}".format(po_number),
             method=common_enums.HttpMethod.GET,
+        )
+
+    # -- Bulk date-range sweeps ------------------------------------------------------------
+    #
+    # The hourly tier of Turn 14's proposed model. Per-PO polling costs one request per open
+    # order per cycle; these cost one request per company per cycle regardless of how many
+    # orders are open.
+
+    def get_tracking(
+        self,
+        start_date: typing.Optional[str] = None,
+        end_date: typing.Optional[str] = None,
+    ) -> typing.Dict:
+        """
+        GET /v1/tracking. With no dates Turn 14 returns everything shipped today, which is
+        exactly what an hourly sweep wants.
+
+        Turn 14 rejects ranges wider than three days with a 400, so callers backfilling history
+        must chunk -- see ``tracking_date_chunks``.
+        """
+        params = {}
+        if start_date:
+            params["start_date"] = start_date
+        if end_date:
+            params["end_date"] = end_date
+        return self._request(
+            endpoint="tracking",
+            method=common_enums.HttpMethod.GET,
+            params=params or None,
+        )
+
+    def get_package_details(
+        self,
+        start_date: typing.Optional[str] = None,
+        end_date: typing.Optional[str] = None,
+        tracking_number: typing.Optional[str] = None,
+    ) -> typing.Dict:
+        """
+        GET /v1/tracking/package_details -- package-level weights, dimensions and status behind
+        a tracking number. Query by ``tracking_number`` for one shipment, or by date range
+        (again, at most three days apart).
+        """
+        params = {}
+        if tracking_number:
+            params["tracking_number"] = tracking_number
+        else:
+            if start_date:
+                params["start_date"] = start_date
+            if end_date:
+                params["end_date"] = end_date
+        return self._request(
+            endpoint="tracking/package_details",
+            method=common_enums.HttpMethod.GET,
+            params=params or None,
+        )
+
+    def get_invoices(self, start_date: str, end_date: str) -> typing.Dict:
+        """
+        GET /v1/invoices?start_date=&end_date=. Invoices only exist once items ship, so an
+        hourly sweep over today..tomorrow is how an order stops being "uninvoiced".
+        """
+        return self._request(
+            endpoint="invoices",
+            method=common_enums.HttpMethod.GET,
+            params={"start_date": start_date, "end_date": end_date},
+        )
+
+    def get_orders(self, start_date: str, end_date: str) -> typing.Dict:
+        """GET /v1/orders?start_date=&end_date= -- every order placed in the range."""
+        return self._request(
+            endpoint="orders",
+            method=common_enums.HttpMethod.GET,
+            params={"start_date": start_date, "end_date": end_date},
         )
 
     def get_shipping_options(self) -> typing.Dict:

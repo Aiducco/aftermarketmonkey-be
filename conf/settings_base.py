@@ -272,6 +272,18 @@ TURN14_ORDER_TEST_BASE_URL = 'https://apitest.turn14.com/v1'
 TURN14_ORDER_PRODUCTION_BASE_URL = 'https://api.turn14.com/v1'
 TURN14_ORDER_ENVIRONMENT = os.environ.get("TURN14_ORDER_ENVIRONMENT", "production")
 
+# Credentials used to populate the SHARED Turn 14 tables (items, items/data, fitment,
+# inventory, locations, dropship, shipping estimates) -- the "global cache" half of Turn 14's
+# integration model, where one pull serves every customer.
+#
+# Unset by default, in which case the resolver falls back to the primary=True Turn 14
+# connection, preserving exactly today's behaviour. Set these once Turn 14 issues
+# integrator-level credentials and the global sweeps stop borrowing a customer's account (and
+# a customer's 5 000/hour budget) to populate data that is not theirs.
+# See src.integrations.services.turn_14.get_global_company_provider.
+TURN14_GLOBAL_CLIENT_ID = os.environ.get("TURN14_GLOBAL_CLIENT_ID", "")
+TURN14_GLOBAL_CLIENT_SECRET = os.environ.get("TURN14_GLOBAL_CLIENT_SECRET", "")
+
 # How long a PurchaseOrder's quote stays valid before submit is blocked and a re-quote is
 # required. Distributor pricing/availability can shift between quote and submit; this stops
 # a stale quote from being submitted against materially different real-world stock/pricing.
