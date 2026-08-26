@@ -50,6 +50,26 @@ def model_key(name: typing.Optional[str]) -> str:
     return _NON_ALNUM_RE.sub("", (name or "").lower())
 
 
+def brandless_key(name: typing.Optional[str], brand_name: str) -> str:
+    """
+    ``model_key`` with a redundant leading brand name removed.
+
+    The enrichment prompt already says model_name is "the manufacturer's product name with the
+    brand ... removed", and it usually is -- but not always, which leaves "One" and "Nokian One"
+    as two models of the same tire in the brand facet. Collapsing on this key is safe precisely
+    because it is the rule the model was given: it can only merge a name with its own brand
+    prefix, never two different products.
+
+    Only a leading brand is stripped, and only when something is left: a model genuinely named
+    after its brand keeps its name rather than reducing to nothing.
+    """
+    key = model_key(name)
+    brand = model_key(brand_name)
+    if brand and key.startswith(brand) and len(key) > len(brand):
+        return key[len(brand) :]
+    return key
+
+
 @dataclasses.dataclass
 class CategoryVote:
     brand_id: int
@@ -213,19 +233,25 @@ def canonicalize_model_names(
     apply_changes: bool,
 ) -> None:
     """
-    Collapse spellings that differ **only** in case or punctuation onto the most common one.
+    Collapse spellings that differ only in case, punctuation, or a redundant brand prefix.
 
     Deliberately narrow -- see the module docstring for the four real product pairs that a
-    looser rule would have merged. The winner is the most frequent spelling rather than the
-    longest, because frequency is evidence and length is not: "INVO" appearing 8 times against
-    "Invo" 63 times is a minority spelling, not a more complete one.
+    looser rule would have merged. In particular this does NOT merge on a shared prefix: there
+    are 1,005 such pairs in the catalog and they are product families, not duplicates. Merging
+    "P Zero" into "P Zero Winter" would put a summer tire in the winter facet.
+
+    The winner is the most frequent spelling rather than the longest, because frequency is
+    evidence and length is not: "INVO" appearing 8 times against "Invo" 63 times is a minority
+    spelling, not a more complete one. The one exception is a spelling that still carries its
+    brand, which loses regardless of frequency -- see the comment on the sort key.
     """
     sql = """
-        SELECT mp.brand_id, ts.model_name, count(*) AS n
+        SELECT mp.brand_id, b.name AS brand_name, ts.model_name, count(*) AS n
         FROM tire_specs ts
         JOIN master_parts mp ON mp.id = ts.master_part_id
+        JOIN brands b ON b.id = mp.brand_id
         WHERE ts.model_name IS NOT NULL {brand_clause}
-        GROUP BY 1, 2
+        GROUP BY 1, 2, 3
     """
     params: typing.List[typing.Any] = []
     brand_clause = ""
@@ -236,15 +262,25 @@ def canonicalize_model_names(
     spellings: typing.Dict[typing.Tuple[int, str], collections.Counter] = collections.defaultdict(collections.Counter)
     with connection.cursor() as cursor:
         cursor.execute(sql.format(brand_clause=brand_clause), params)
-        for brand_id, name, count in cursor.fetchall():
-            spellings[(brand_id, model_key(name))][name] += count
+        brand_names_by_id = {}
+        for brand_id, brand_name, name, count in cursor.fetchall():
+            brand_names_by_id[brand_id] = brand_name
+            spellings[(brand_id, brandless_key(name, brand_name))][name] += count
 
     for (brand_id, _key), counter in spellings.items():
         if len(counter) < 2:
             continue
-        # Most common wins; ties broken by the longer spelling, then alphabetically, so a rerun
-        # is deterministic.
-        canonical = max(counter, key=lambda name: (counter[name], len(name), name))
+        brand_key = model_key(brand_names_by_id.get(brand_id, ""))
+
+        def _still_has_brand(name: str, brand_key: str = brand_key) -> bool:
+            key = model_key(name)
+            return bool(brand_key) and key.startswith(brand_key) and key != brand_key
+
+        # Most common wins, EXCEPT that a spelling still carrying its brand always loses: "Nokian
+        # One" appears twice against "One" sixty times, but even reversed, the brandless form is
+        # the one the enrichment prompt asks for. Then longer, then alphabetical, so a rerun is
+        # deterministic.
+        canonical = max(counter, key=lambda name: (not _still_has_brand(name), counter[name], len(name), name))
         losers = [name for name in counter if name != canonical]
         with connection.cursor() as cursor:
             cursor.execute(
