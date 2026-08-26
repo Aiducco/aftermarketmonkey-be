@@ -78,12 +78,21 @@ class CategoryVote:
         return self.counts[self.winner] / self.total if self.total else 0.0
 
 
+# Below this share of the vote, the winner is not a majority worth acting on -- it is a coin
+# flip. Measured on TOYO: "Proxes R {TRACK: 6, UHP: 6}" resolved to TRACK on a tiebreaker and
+# would have been written as fact across twelve SKUs. Those go to the review queue instead.
+DEFAULT_MIN_AGREEMENT = 0.60
+
+
 @dataclasses.dataclass
 class ReconciliationReport:
     votes: typing.List[CategoryVote] = dataclasses.field(default_factory=list)
     categories_changed: int = 0
     names_changed: int = 0
     touched_master_part_ids: typing.List[int] = dataclasses.field(default_factory=list)
+    # Split models whose winner did not clear the agreement bar. Left exactly as the model
+    # answered them, per SKU, and surfaced for a human.
+    undecided: typing.List[CategoryVote] = dataclasses.field(default_factory=list)
 
     @property
     def split_votes(self) -> typing.List[CategoryVote]:
@@ -140,10 +149,29 @@ def reconcile_categories(
     report: ReconciliationReport,
     *,
     apply_changes: bool,
+    min_agreement: float = DEFAULT_MIN_AGREEMENT,
 ) -> None:
-    """Overwrite each SKU's category with its model's winning category, where they differ."""
+    """
+    Overwrite each SKU's category with its model's winning category, where they differ.
+
+    A model whose winner falls below ``min_agreement`` is **left alone**. A 50/50 split is not a
+    majority, and resolving it by tiebreaker would stamp a coin flip across every size of that
+    model -- worse than the inconsistency it replaces, because the inconsistency is at least
+    visible. Those land in ``report.undecided`` for review.
+    """
     for vote in votes:
         if not vote.is_split:
+            continue
+        if vote.winner_share < min_agreement:
+            report.undecided.append(vote)
+            logger.info(
+                "%s %s: %s -- winner has only %.0f%%, below the %.0f%% bar; left for review",
+                _LOG_PREFIX,
+                vote.model_name,
+                dict(vote.counts),
+                100 * vote.winner_share,
+                100 * min_agreement,
+            )
             continue
         winner = vote.winner
         with connection.cursor() as cursor:
@@ -243,6 +271,7 @@ def run(
     *,
     brand_ids: typing.Optional[typing.Sequence[int]] = None,
     apply_changes: bool = False,
+    min_agreement: float = DEFAULT_MIN_AGREEMENT,
 ) -> ReconciliationReport:
     """
     Full pass. Names are canonicalised **before** the category vote, so two spellings of one
@@ -251,6 +280,6 @@ def run(
     report = ReconciliationReport()
     canonicalize_model_names(report, brand_ids=brand_ids, apply_changes=apply_changes)
     report.votes = collect_votes(brand_ids)
-    reconcile_categories(report.votes, report, apply_changes=apply_changes)
+    reconcile_categories(report.votes, report, apply_changes=apply_changes, min_agreement=min_agreement)
     report.touched_master_part_ids = sorted(set(report.touched_master_part_ids))
     return report

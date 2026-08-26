@@ -33,6 +33,17 @@ class Command(BaseCommand):
             help="After applying, upsert the changed documents into the tires index. Requires --apply.",
         )
         parser.add_argument(
+            "--min-agreement",
+            type=float,
+            default=tire_reconciliation.DEFAULT_MIN_AGREEMENT,
+            help=(
+                "Minimum share of the vote the winning category must hold before it overwrites a "
+                "model's other sizes. Below it, the model is left exactly as answered and listed "
+                "for review -- a 50/50 split resolved by tiebreaker is a coin flip written as "
+                "fact. Default {:.2f}.".format(tire_reconciliation.DEFAULT_MIN_AGREEMENT)
+            ),
+        )
+        parser.add_argument(
             "--split-threshold",
             type=float,
             default=2.0,
@@ -52,7 +63,9 @@ class Command(BaseCommand):
                 raise CommandError("Unknown brand(s): {}".format(", ".join(unknown)))
             brand_ids = list(resolved.values())
 
-        report = tire_reconciliation.run(brand_ids=brand_ids, apply_changes=options["apply"])
+        report = tire_reconciliation.run(
+            brand_ids=brand_ids, apply_changes=options["apply"], min_agreement=options["min_agreement"]
+        )
 
         self.stdout.write("\nBefore reconciliation")
         self.stdout.write("  models                  {}".format(len(report.votes)))
@@ -70,6 +83,21 @@ class Command(BaseCommand):
                     )
                 )
 
+        if report.undecided:
+            self.stdout.write(
+                self.style.WARNING(
+                    "\nLeft for review -- winner below the {:.0%} agreement bar, NOT overwritten".format(
+                        options["min_agreement"]
+                    )
+                )
+            )
+            for vote in sorted(report.undecided, key=lambda v: -v.total):
+                self.stdout.write(
+                    "  {:<26} {} -> would have been {} ({:.0f}%)".format(
+                        vote.model_name[:26], dict(vote.counts), vote.winner, 100 * vote.winner_share
+                    )
+                )
+
         self.stdout.write("\nChanges")
         self.stdout.write("  tread_category rewritten {}".format(report.categories_changed))
         self.stdout.write("  model_name canonicalised {}".format(report.names_changed))
@@ -81,7 +109,12 @@ class Command(BaseCommand):
         # Re-tally against what is now in the table. This is the acceptance number: under 2%
         # means per-SKU classification plus this pass was the right trade.
         after = tire_reconciliation.collect_votes(brand_ids)
-        split_after = [vote for vote in after if vote.is_split]
+        # Deliberately-undecided models stay split; that is the intended outcome, not a failure
+        # to converge, so they are excluded from the rate the threshold gates on.
+        undecided_keys = {(v.brand_id, v.model_name.lower()) for v in report.undecided}
+        split_after = [
+            vote for vote in after if vote.is_split and (vote.brand_id, vote.model_name.lower()) not in undecided_keys
+        ]
         rate = 100 * len(split_after) / len(after) if after else 0.0
         self.stdout.write("\nAfter reconciliation")
         self.stdout.write("  models with a split vote {} ({:.2f}%)".format(len(split_after), rate))
