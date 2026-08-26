@@ -55,6 +55,26 @@ def _to_decimal(value: typing.Any) -> typing.Optional[Decimal]:
         return None
 
 
+def _dedupe_by_external_id(
+    instances: typing.List[typing.Any], key_attr: str = "external_id"
+) -> typing.List[typing.Any]:
+    """
+    Last-wins dedupe by the model's unique key right before a bulk upsert.
+
+    A flush batch spans several pages (_BATCH_SIZE=2000 against 1000-row pages), and Turn 14's
+    catalog keeps changing while a sweep pages through it -- a real update can shift an item's
+    sort position between two page fetches, landing the same external_id on both pages and
+    inside the same flush batch. Postgres rejects that outright: "ON CONFLICT DO UPDATE command
+    cannot affect row a second time" (confirmed live 2026-08-26, sync_turn14_global_sweep).
+    Keeping the last occurrence is correct either way -- it reflects whichever page fetch
+    happened later, i.e. the freshest read of that item during this sweep.
+    """
+    by_key = {}
+    for instance in instances:
+        by_key[getattr(instance, key_attr)] = instance
+    return list(by_key.values())
+
+
 def _brand_by_external_id() -> typing.Dict[str, src_models.Turn14Brand]:
     """Turn 14's numeric brand id -> our Turn14Brand. 464 rows; safe to hold for a sweep."""
     return {
@@ -151,6 +171,7 @@ def sweep_items(client=None, max_pages: typing.Optional[int] = None) -> typing.T
             instances.extend(turn_14_services._transform_items_data([row], brand))
         if not instances:
             return 0
+        instances = _dedupe_by_external_id(instances)
         pgbulk.upsert(
             src_models.Turn14Items,
             instances,
@@ -202,6 +223,7 @@ def sweep_items_data(client=None, max_pages: typing.Optional[int] = None) -> typ
             ))
         if not instances:
             return 0
+        instances = _dedupe_by_external_id(instances)
         pgbulk.upsert(
             src_models.Turn14BrandData,
             instances,
@@ -247,6 +269,7 @@ def sweep_inventory(client=None, max_pages: typing.Optional[int] = None) -> typi
             ))
         if not instances:
             return 0
+        instances = _dedupe_by_external_id(instances)
         pgbulk.upsert(
             src_models.Turn14BrandInventory,
             instances,
@@ -468,6 +491,7 @@ def sweep_shipping_estimates(client=None, max_pages: typing.Optional[int] = None
             ))
         if not instances:
             return 0
+        instances = _dedupe_by_external_id(instances, key_attr="item_external_id")
         pgbulk.upsert(
             src_models.Turn14ItemShippingEstimate,
             instances,

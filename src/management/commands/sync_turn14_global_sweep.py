@@ -125,7 +125,10 @@ class Command(BaseCommand):
             return
         except Exception as e:
             meter.__exit__(None, None, None)
-            audit_scheduled_tasks.mark_scheduled_task_failed(execution, error_message=str(e))
+            audit_scheduled_tasks.mark_scheduled_task_failed(
+                execution,
+                error_message="{} || partial={} || {}".format(e, results, meter.summary("api_usage")),
+            )
             raise
 
         meter.__exit__(None, None, None)
