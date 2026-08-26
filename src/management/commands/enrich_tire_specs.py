@@ -47,6 +47,15 @@ class Command(BaseCommand):
             help="Comma-separated brand names, matched case-insensitively (e.g. NITTO). Omit for the whole catalog.",
         )
         parser.add_argument(
+            "--exclude-brands",
+            default=None,
+            help=(
+                "Comma-separated brand names to skip. Use this to hold back brands that are "
+                "duplicates of one another until they are merged -- reconciliation votes per "
+                "brand_id, so enriching both halves means the same model is voted on twice."
+            ),
+        )
+        parser.add_argument(
             "--mode",
             default=tire_enrichment.MODE_MISSING,
             choices=list(tire_enrichment.MODES),
@@ -95,6 +104,13 @@ class Command(BaseCommand):
             if unknown:
                 raise CommandError("Unknown brand(s): {}".format(", ".join(unknown)))
 
+        exclude_brand_names = None
+        if options["exclude_brands"]:
+            exclude_brand_names = [n.strip() for n in options["exclude_brands"].split(",") if n.strip()]
+            unknown = sorted(set(exclude_brand_names) - set(tire_enrichment.resolve_brand_ids(exclude_brand_names)))
+            if unknown:
+                raise CommandError("Unknown brand(s) to exclude: {}".format(", ".join(unknown)))
+
         if options["preview"] is not None:
             return self._preview(brand_names=brand_names, options=options)
 
@@ -127,6 +143,7 @@ class Command(BaseCommand):
         try:
             stats = tire_enrichment.run(
                 brand_names=brand_names,
+                exclude_brand_names=exclude_brand_names,
                 mode=options["mode"],
                 limit=options["limit"],
                 max_workers=options["workers"],

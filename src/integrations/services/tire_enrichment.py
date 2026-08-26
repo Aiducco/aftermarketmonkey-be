@@ -692,6 +692,7 @@ def resolve_brand_ids(brand_names: typing.Sequence[str]) -> typing.Dict[str, int
 def iter_candidates(
     *,
     brand_ids: typing.Optional[typing.Sequence[int]] = None,
+    exclude_brand_ids: typing.Optional[typing.Sequence[int]] = None,
     mode: str = MODE_MISSING,
     limit: typing.Optional[int] = None,
     include_rejected: bool = False,
@@ -713,6 +714,12 @@ def iter_candidates(
     if brand_ids:
         where.append("mp.brand_id = ANY(%s)")
         params.append(list(brand_ids))
+    if exclude_brand_ids:
+        # Used to hold back brands that are known duplicates of each other: reconciliation votes
+        # per brand_id, so enriching both halves of a split brand means the same model is voted
+        # on twice and can resolve differently in each. Cheaper to skip them than to re-run.
+        where.append("mp.brand_id <> ALL(%s)")
+        params.append(list(exclude_brand_ids))
     if not include_rejected:
         where.append("mp.product_type_source IS DISTINCT FROM %s")
         params.append(NOT_A_TIRE_SOURCE)
@@ -970,6 +977,7 @@ def _stamp_product_type(master_part_ids: typing.Sequence[int], stats: RunStats) 
 def run(
     *,
     brand_names: typing.Optional[typing.Sequence[str]] = None,
+    exclude_brand_names: typing.Optional[typing.Sequence[str]] = None,
     mode: str = MODE_MISSING,
     limit: typing.Optional[int] = None,
     max_workers: int = 4,
@@ -999,6 +1007,14 @@ def run(
         if missing:
             raise ValueError("Unknown brand(s): {}".format(", ".join(missing)))
         brand_ids = list(resolved.values())
+
+    exclude_brand_ids = None
+    if exclude_brand_names:
+        resolved = resolve_brand_ids(exclude_brand_names)
+        missing = sorted(set(exclude_brand_names) - set(resolved))
+        if missing:
+            raise ValueError("Unknown brand(s) to exclude: {}".format(", ".join(missing)))
+        exclude_brand_ids = list(resolved.values())
 
     lookups = LookupTables()
     system_prompt = build_system_prompt()
@@ -1032,48 +1048,68 @@ def run(
         stats=stats,
     )
 
+    # Bounded submission, NOT ``pool.map``. ``Executor.map`` drains its whole iterable up front
+    # before yielding a single result, which on a full-catalog run means: nothing is written until
+    # the entire 3.17M-row scan finishes, every future and its result is held in memory until
+    # then, and a crash at any point loses the lot. Measured -- 12 minutes into such a run, zero
+    # rows had been written. Keeping only a few batches in flight makes writes incremental again,
+    # so an interrupted run keeps everything it already paid for and ``--mode missing`` resumes.
+    window = max(max_workers * 4, write_batch_size)
+    candidate_iter = iter(candidates)
+    exhausted = False
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-        # map() over the generator keeps the queue bounded by the pool rather than materialising
-        # every candidate up front -- a full-catalog run is 100k of them.
-        for candidate, response, error in pool.map(call, candidates):
-            stats.called += 1
-            if error is not None:
-                stats.llm_errors += 1
-                logger.warning("%s master_part=%s LLM error: %s", _LOG_PREFIX, candidate.master_part_id, error)
-                if on_result:
-                    on_result(candidate, None, "llm-error")
-                continue
+        in_flight: typing.Dict[concurrent.futures.Future, TireCandidate] = {}
+        while True:
+            while not exhausted and len(in_flight) < window:
+                try:
+                    in_flight[pool.submit(call, next(candidate_iter))] = None
+                except StopIteration:
+                    exhausted = True
+            if not in_flight:
+                break
+            done, _pending = concurrent.futures.wait(in_flight, return_when=concurrent.futures.FIRST_COMPLETED)
+            for future in done:
+                in_flight.pop(future)
+                candidate, response, error = future.result()
+                stats.called += 1
+                if error is not None:
+                    stats.llm_errors += 1
+                    logger.warning("%s master_part=%s LLM error: %s", _LOG_PREFIX, candidate.master_part_id, error)
+                    if on_result:
+                        on_result(candidate, None, "llm-error")
+                    continue
 
-            validated, reason = validate(response, candidate, lookups.tread_categories)
-            if validated is None:
-                stats.reject(reason.split(":", 1)[0])
-                logger.warning("%s master_part=%s rejected: %s", _LOG_PREFIX, candidate.master_part_id, reason)
-                if on_result:
-                    on_result(candidate, None, reason)
-                continue
+                validated, reason = validate(response, candidate, lookups.tread_categories)
+                if validated is None:
+                    stats.reject(reason.split(":", 1)[0])
+                    logger.warning("%s master_part=%s rejected: %s", _LOG_PREFIX, candidate.master_part_id, reason)
+                    if on_result:
+                        on_result(candidate, None, reason)
+                    continue
 
-            if not validated.is_tire:
-                stats.not_a_tire += 1
-                pending_not_tire.append(candidate.master_part_id)
-            else:
-                pending_specs.append(
-                    build_tire_spec(
-                        candidate=candidate,
-                        validated=validated,
-                        lookups=lookups,
-                        model_used=model_used,
+                if not validated.is_tire:
+                    stats.not_a_tire += 1
+                    pending_not_tire.append(candidate.master_part_id)
+                else:
+                    pending_specs.append(
+                        build_tire_spec(
+                            candidate=candidate,
+                            validated=validated,
+                            lookups=lookups,
+                            model_used=model_used,
+                        )
                     )
-                )
-                if validated.tread_category:
-                    stats.with_category += 1
-                if validated.model_name:
-                    stats.with_model_name += 1
+                    if validated.tread_category:
+                        stats.with_category += 1
+                    if validated.model_name:
+                        stats.with_model_name += 1
 
-            if on_result:
-                on_result(candidate, validated, None)
+                if on_result:
+                    on_result(candidate, validated, None)
 
-            if len(pending_specs) + len(pending_not_tire) >= write_batch_size:
-                flush()
+                if len(pending_specs) + len(pending_not_tire) >= write_batch_size:
+                    flush()
 
     flush()
     return stats
