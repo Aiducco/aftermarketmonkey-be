@@ -2,6 +2,7 @@ import decimal
 import enum
 
 from django.contrib.auth import models as auth_models
+from django.contrib.postgres import fields as pg_fields
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db import models as django_db_models
 from django.utils import timezone
@@ -4761,3 +4762,325 @@ class TireLoadRange(django_db_models.Model):
 
     def __str__(self):
         return f"{self.load_range} ({self.ply_rating}-ply equivalent, {self.get_applies_to_display()})"
+
+
+class TreadCategory(django_db_models.Model):
+    """
+    Tread category vocabulary -- the closed set a tire's primary category must come from.
+
+    **There is no industry or regulatory standard for this.** Manufacturers label tires however
+    they like, so this is our taxonomy and a product decision: renaming a code re-labels the
+    whole catalogue. Treat the codes as stable identifiers and the labels as the only thing a UI
+    ever renders.
+
+    Three jobs, which is why it is a table and not a Python enum:
+      1. the FK target for ``TireSpec.tread_category``, so a bad code cannot be written at all
+      2. the constraint on the LLM enrichment response -- anything outside this set is rejected
+         rather than repaired (see ``src.integrations.services.tire_enrichment``)
+      3. facet labels and their ordering in search
+
+    **Exactly one primary category per tire.** Season and capability are deliberately NOT
+    modelled here; they live on ``TireSpec`` as independent nullable booleans (``is_3pmsf``,
+    ``is_ms``, ``is_studdable``, ``is_run_flat``) because terrain and season are orthogonal -- an
+    all-terrain tire can also be severe-snow certified, and a single-valued category cannot say
+    both.
+    """
+    AXIS_TERRAIN = "terrain"
+    AXIS_SEASON = "season"
+    AXIS_PERFORMANCE = "performance"
+    AXIS_SPECIAL = "special"
+    # Powersports is its own axis rather than more terrain codes: a motocross tire and a mud-
+    # terrain truck tire are both "aggressive off-road tread" and would collide in one vocabulary,
+    # but nobody cross-shops them. Pairs with vehicle_class motorcycle / atv_utv on TireSpec.
+    AXIS_POWERSPORTS = "powersports"
+    AXIS_CHOICES = [
+        (AXIS_TERRAIN, "Terrain"),
+        (AXIS_SEASON, "Season"),
+        (AXIS_PERFORMANCE, "Performance"),
+        (AXIS_SPECIAL, "Special"),
+        (AXIS_POWERSPORTS, "Powersports"),
+    ]
+
+    code = django_db_models.CharField(max_length=16, primary_key=True)
+    label = django_db_models.CharField(
+        max_length=64,
+        help_text="What a UI renders. Never show the raw code to a customer.",
+    )
+    axis = django_db_models.CharField(max_length=16, choices=AXIS_CHOICES)
+    sort_order = django_db_models.PositiveSmallIntegerField(
+        unique=True,
+        help_text="Facet ordering. Terrain first (10-60) because that is what truck buyers filter on.",
+    )
+    description = django_db_models.TextField(
+        help_text="Shown to the enrichment model as the definition of the code, so edits here change classifications.",
+    )
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "tread_category"
+        ordering = ["sort_order"]
+        constraints = [
+            django_db_models.CheckConstraint(
+                # Literals, not the class constants: a nested Meta body cannot see them.
+                check=django_db_models.Q(axis__in=["terrain", "season", "performance", "special", "powersports"]),
+                name="tread_category_axis_valid",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.code} ({self.label})"
+
+
+class TireSpec(django_db_models.Model):
+    """
+    Everything we know about one tire SKU, keyed to the ``MasterPart`` it describes.
+
+    Three sources feed this table and they are not interchangeable. **Precedence when writing is
+    distributor structured field -> parser -> LLM**; the model only ever fills what the other two
+    cannot, and is explicitly forbidden from returning anything in the size block (see the system
+    prompt in ``src.integrations.services.tire_enrichment``). The column comments below say which
+    tier owns each field, because that is the thing a future writer will get wrong.
+
+    ``master_part`` is a OneToOne rather than the PK itself, per the surrogate-key convention the
+    rest of this module follows -- but the uniqueness is what makes the enrichment job
+    re-runnable, since the upsert conflict target is that column.
+
+    Sizes are the source of truth for search: ``overall_diameter_in`` and ``rim_diameter_in`` are
+    what a fitment query filters on, which is precisely why they come from
+    ``src.domain.tire_size`` and never from a model's recall. Note ``overall_diameter_in`` is
+    nominal when ``notation == 'numeric'`` -- that notation carries no aspect ratio at all.
+
+    Nullable booleans mean **unknown**, never false. ``is_3pmsf`` in particular is a
+    certification with legal weight in some jurisdictions: NULL is written whenever the model was
+    not confident, and any consumer (including the search index) must omit the field rather than
+    coerce it to false.
+    """
+    VEHICLE_CLASS_PASSENGER = "passenger"
+    VEHICLE_CLASS_LIGHT_TRUCK = "light_truck"
+    VEHICLE_CLASS_TRAILER = "trailer"
+    VEHICLE_CLASS_COMMERCIAL = "commercial"
+    VEHICLE_CLASS_MOTORCYCLE = "motorcycle"
+    VEHICLE_CLASS_ATV_UTV = "atv_utv"
+    VEHICLE_CLASS_CHOICES = [
+        (VEHICLE_CLASS_PASSENGER, "Passenger"),
+        (VEHICLE_CLASS_LIGHT_TRUCK, "Light truck"),
+        (VEHICLE_CLASS_TRAILER, "Trailer"),
+        (VEHICLE_CLASS_COMMERCIAL, "Commercial"),
+        (VEHICLE_CLASS_MOTORCYCLE, "Motorcycle"),
+        (VEHICLE_CLASS_ATV_UTV, "ATV / UTV"),
+    ]
+
+    TIER_BUDGET = "budget"
+    TIER_MID = "mid"
+    TIER_PREMIUM = "premium"
+    TIER_FLAGSHIP = "flagship"
+    TIER_CHOICES = [
+        (TIER_BUDGET, "Budget"),
+        (TIER_MID, "Mid"),
+        (TIER_PREMIUM, "Premium"),
+        (TIER_FLAGSHIP, "Flagship"),
+    ]
+
+    NOISE_QUIET = "quiet"
+    NOISE_MODERATE = "moderate"
+    NOISE_LOUD = "loud"
+    NOISE_CHOICES = [
+        (NOISE_QUIET, "Quiet"),
+        (NOISE_MODERATE, "Moderate"),
+        (NOISE_LOUD, "Loud"),
+    ]
+
+    master_part = django_db_models.OneToOneField(
+        MasterPart,
+        on_delete=django_db_models.CASCADE,
+        related_name="tire_spec",
+    )
+
+    # ---- from src.domain.tire_size (source of truth for size) --------------------------------
+    notation = django_db_models.CharField(
+        max_length=16,
+        help_text="metric / flotation / numeric. Read this before treating overall_diameter_in as exact.",
+    )
+    service_type = django_db_models.CharField(max_length=8, null=True, blank=True)
+    section_width_mm = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+    aspect_ratio = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+    section_width_in = django_db_models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
+    overall_diameter_in = django_db_models.DecimalField(
+        max_digits=4,
+        decimal_places=1,
+        help_text="Computed for metric, stated for flotation, NOMINAL for numeric.",
+    )
+    construction = django_db_models.CharField(max_length=4, null=True, blank=True)
+    rim_diameter_in = django_db_models.DecimalField(max_digits=4, decimal_places=1)
+    load_index = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+    load_index_dual = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+    speed_rating = django_db_models.CharField(max_length=8, null=True, blank=True)
+    load_range = django_db_models.CharField(max_length=8, null=True, blank=True)
+    size_display = django_db_models.CharField(max_length=64)
+
+    # ---- resolved from the lookup tables (TireLoadIndex / TireSpeedRating / TireLoadRange) ----
+    # Denormalized so search and PDP reads don't join three tables per tire. Recomputed on every
+    # enrichment run, so a correction to a lookup table propagates on the next pass.
+    max_load_lb = django_db_models.PositiveIntegerField(null=True, blank=True)
+    max_speed_mph = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+    ply_rating = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+
+    # ---- from the LLM -------------------------------------------------------------------------
+    model_name = django_db_models.CharField(max_length=255, null=True, blank=True)
+    sub_model = django_db_models.CharField(max_length=255, null=True, blank=True)
+    tread_category = django_db_models.ForeignKey(
+        TreadCategory,
+        on_delete=django_db_models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="tire_specs",
+        db_column="tread_category",
+        to_field="code",
+    )
+    vehicle_class = django_db_models.CharField(
+        max_length=16, choices=VEHICLE_CLASS_CHOICES, null=True, blank=True
+    )
+    # Arrays rather than JSON (the convention elsewhere in this module) because both are searched
+    # by containment and fed straight into the search index as multi-value facets; a JSON blob
+    # would need casting at every read and cannot take a GIN index usefully.
+    search_aliases = pg_fields.ArrayField(
+        django_db_models.TextField(), default=list, blank=True,
+        help_text="What a customer would type: short forms, misspellings, distributor abbreviations.",
+    )
+    use_case_tags = pg_fields.ArrayField(django_db_models.TextField(), default=list, blank=True)
+    tier = django_db_models.CharField(max_length=16, choices=TIER_CHOICES, null=True, blank=True)
+    noise_level = django_db_models.CharField(max_length=16, choices=NOISE_CHOICES, null=True, blank=True)
+    # NULL means unknown on every flag below -- see the class docstring. is_3pmsf especially.
+    is_3pmsf = django_db_models.BooleanField(null=True, blank=True)
+    is_ms = django_db_models.BooleanField(null=True, blank=True)
+    is_run_flat = django_db_models.BooleanField(null=True, blank=True)
+    is_studdable = django_db_models.BooleanField(null=True, blank=True)
+    has_reinforced_sidewall = django_db_models.BooleanField(null=True, blank=True)
+
+    # ---- from distributor structured fields where available ----------------------------------
+    tread_depth_32nds = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+    max_psi = django_db_models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text="Per tire, from the product's own data. NEVER derived from load range.",
+    )
+    rim_width_min_in = django_db_models.DecimalField(max_digits=4, decimal_places=1, null=True, blank=True)
+    rim_width_max_in = django_db_models.DecimalField(max_digits=4, decimal_places=1, null=True, blank=True)
+    utqg_treadwear = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+    utqg_traction = django_db_models.CharField(max_length=4, null=True, blank=True)
+    utqg_temperature = django_db_models.CharField(max_length=4, null=True, blank=True)
+
+    # ---- provenance ---------------------------------------------------------------------------
+    llm_confidence = django_db_models.DecimalField(max_digits=3, decimal_places=2, null=True, blank=True)
+    llm_reason = django_db_models.TextField(null=True, blank=True)
+    llm_model_used = django_db_models.CharField(max_length=64, null=True, blank=True)
+    size_disputed = django_db_models.BooleanField(
+        default=False,
+        help_text="Parser and model disagree, or two providers describe different sizes. Specs are written anyway; review them.",
+    )
+    category_reconciled = django_db_models.BooleanField(
+        default=False,
+        help_text="tread_category was overwritten by the per-model majority vote rather than this SKU's own answer.",
+    )
+    enriched_at = django_db_models.DateTimeField(default=timezone.now)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "tire_specs"
+        indexes = [
+            # The fitment query: "what fits a 18" rim at 33" tall".
+            django_db_models.Index(fields=["rim_diameter_in", "overall_diameter_in"], name="tire_specs_diameter_idx"),
+            django_db_models.Index(fields=["size_display"], name="tire_specs_size_display_idx"),
+            # Drives the reconciliation pass's per-model vote and the review queue.
+            django_db_models.Index(fields=["model_name"], name="tire_specs_model_name_idx"),
+            django_db_models.Index(fields=["tread_category"], name="tire_specs_tread_category_idx"),
+        ]
+        constraints = [
+            django_db_models.CheckConstraint(
+                check=django_db_models.Q(overall_diameter_in__gt=0),
+                name="tire_specs_overall_diameter_positive",
+            ),
+            django_db_models.CheckConstraint(
+                check=django_db_models.Q(rim_diameter_in__gt=0),
+                name="tire_specs_rim_diameter_positive",
+            ),
+            django_db_models.CheckConstraint(
+                # A tire is always taller than the wheel it mounts on. Cheap tripwire against a
+                # transposed pair reaching the table.
+                check=django_db_models.Q(overall_diameter_in__gt=django_db_models.F("rim_diameter_in")),
+                name="tire_specs_taller_than_rim",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.size_display} {self.model_name or '(unidentified)'}"
+
+
+class FacetConfig(django_db_models.Model):
+    """
+    Which facets a search mode exposes, in what order, with what labels and widgets.
+
+    The server owns this so the FE's facet rail changes without a client deploy: reordering
+    ``tread_category`` above ``rim_diameter_in``, relabelling ``MT`` from "MT" to "Mud terrain",
+    or collapsing a long list after 8 entries are all data edits here, not releases.
+
+    ``field`` **must be a filterable attribute of that mode's index** -- a facet the index cannot
+    facet on returns nothing and looks like empty inventory. For tire mode that means
+    ``src.search.tires_index.FILTERABLE_ATTRIBUTES``; the search service validates it on load
+    rather than trusting the row.
+
+    ``value_labels`` maps raw index values to display text (``{"MT": "Mud terrain"}``). It is
+    deliberately not a FK to ``tread_category``: most facet fields are not categories at all, and
+    a single JSON column beats a per-field lookup table for every one of them.
+    """
+    MODE_TIRE = "tire"
+    MODE_WHEEL = "wheel"
+    MODE_PART = "part"
+    MODE_CHOICES = [(MODE_TIRE, "Tire"), (MODE_WHEEL, "Wheel"), (MODE_PART, "Part")]
+
+    WIDGET_MULTISELECT = "multiselect"
+    WIDGET_RANGE = "range"
+    WIDGET_TOGGLE = "toggle"
+    WIDGET_CHOICES = [
+        (WIDGET_MULTISELECT, "Multi-select"),
+        (WIDGET_RANGE, "Range"),
+        (WIDGET_TOGGLE, "Toggle"),
+    ]
+
+    mode = django_db_models.CharField(max_length=16, choices=MODE_CHOICES)
+    field = django_db_models.CharField(max_length=64)
+    label = django_db_models.CharField(max_length=64)
+    widget = django_db_models.CharField(max_length=16, choices=WIDGET_CHOICES)
+    sort_order = django_db_models.PositiveSmallIntegerField()
+    collapse_after = django_db_models.PositiveSmallIntegerField(
+        default=8,
+        help_text="Show this many values before a 'show more' control.",
+    )
+    unit = django_db_models.CharField(max_length=16, null=True, blank=True)
+    value_labels = django_db_models.JSONField(
+        null=True,
+        blank=True,
+        help_text='Raw index value -> display text, e.g. {"MT": "Mud terrain"}.',
+    )
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "facet_config"
+        unique_together = [["mode", "field"]]
+        ordering = ["mode", "sort_order"]
+        constraints = [
+            django_db_models.CheckConstraint(
+                # Literals, not the class constants: a nested Meta body cannot see them.
+                check=django_db_models.Q(widget__in=["multiselect", "range", "toggle"]),
+                name="facet_config_widget_valid",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.mode}.{self.field} ({self.widget})"

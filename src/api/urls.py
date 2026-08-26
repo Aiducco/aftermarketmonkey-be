@@ -36,6 +36,7 @@ from src.api.views.shop_management import (
     CompanyShopManagementProvidersView,
     CompanyShopManagementProviderDetailView,
 )
+from src.api.views.search import SearchFacetsView, SearchView
 from src.api.views.support import SupportTicketsView
 from src.api.views.billing import (
     CreatePortalSessionView,
@@ -456,5 +457,15 @@ urlpatterns = [
         "support/tickets/",
         SupportTicketsView.as_view(),
         name="support_tickets",
+    ),
+    path(
+        "search/",
+        SearchView.as_view(),
+        name="search",
+    ),
+    path(
+        "search/facets/",
+        SearchFacetsView.as_view(),
+        name="search-facets",
     ),
 ]
