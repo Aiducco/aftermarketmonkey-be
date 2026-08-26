@@ -43,8 +43,15 @@ class Command(BaseCommand):
 
         # 1. Outside evidence first: this is the only check that can prove the parser wrong.
         self.stdout.write(self.style.MIGRATE_HEADING("\n1. Correctness against distributor-stated figures"))
-        cross = tire_validation.overall_diameter_cross_check(brand_ids)
+        cross, nominal = tire_validation.overall_diameter_cross_check(brand_ids)
         self._render(cross, invert=True)
+        if nominal:
+            self.stdout.write(
+                "      {} numeric-notation row(s) excluded -- their diameter is nominal by "
+                "construction, not measured. See tire_size's module docstring.".format(len(nominal))
+            )
+            for line in nominal[:4]:
+                self.stdout.write("        ~ {}".format(line))
 
         # 2. Internal consistency.
         self.stdout.write(self.style.MIGRATE_HEADING("\n2. Internal consistency (every one should be zero)"))
@@ -57,6 +64,14 @@ class Command(BaseCommand):
         for field, populated, total in tire_validation.coverage(brand_ids):
             pct = (100 * populated / total) if total else 0
             self.stdout.write("   {:<26}{:>8,} / {:<8,} {:>6.1f}%".format(field, populated, total, pct))
+
+        advisory = tire_validation.possible_abbreviations(brand_ids)
+        if advisory:
+            self.stdout.write(
+                "\n   advisory: {} model_name value(s) look unexpanded (many are real names): {}".format(
+                    len(advisory), ", ".join(advisory[:8])
+                )
+            )
 
         # 4. Review queue.
         splits = tire_validation.split_votes()

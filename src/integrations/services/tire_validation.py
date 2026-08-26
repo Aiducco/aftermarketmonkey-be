@@ -84,7 +84,9 @@ def _brand_clause(brand_ids: typing.Optional[typing.Sequence[int]]) -> typing.Tu
 # ==========================================================================================
 
 
-def overall_diameter_cross_check(brand_ids=None, tolerance=_DIAMETER_TOLERANCE) -> Check:
+def overall_diameter_cross_check(
+    brand_ids=None, tolerance=_DIAMETER_TOLERANCE
+) -> typing.Tuple[Check, typing.List[str]]:
     """
     Our computed diameter vs the one the distributor wrote at the end of its own title.
 
@@ -94,7 +96,7 @@ def overall_diameter_cross_check(brand_ids=None, tolerance=_DIAMETER_TOLERANCE) 
     clause, params = _brand_clause(brand_ids)
     rows = _rows(
         """
-        SELECT ts.master_part_id, ts.size_display, ts.overall_diameter_in, mp.description
+        SELECT ts.master_part_id, ts.size_display, ts.notation, ts.overall_diameter_in, mp.description
         FROM tire_specs ts JOIN master_parts mp ON mp.id = ts.master_part_id
         WHERE mp.description IS NOT NULL {}
         """.format(
@@ -104,7 +106,8 @@ def overall_diameter_cross_check(brand_ids=None, tolerance=_DIAMETER_TOLERANCE) 
     )
     compared = 0
     failures: typing.List[str] = []
-    for _mpid, size_display, ours, description in rows:
+    nominal: typing.List[str] = []
+    for _mpid, size_display, notation, ours, description in rows:
         text = description.strip()
         match = _TRAILING_DIAMETER_RE.search(text)
         if match is None:
@@ -115,6 +118,13 @@ def overall_diameter_cross_check(brand_ids=None, tolerance=_DIAMETER_TOLERANCE) 
         parsed = tire_size.parse(text)
         if parsed is None or match.start() < parsed.span[1]:
             continue
+        # Only the appended-diameter format is evidence, and it always carries the service
+        # description first: "RECON GRAP 275/60R20 116S XL 32.9". Without that, a trailing number
+        # is part of the model name -- "BS TUR ER33" is a Turanza ER33, "MI SCORCHER 31" is a
+        # Scorcher 31, "PI CINTURATO CN36" is a Cinturato CN36. Comparing against those reported
+        # 5.86% disagreement where the real figure is under 1%.
+        if parsed.load_index is None:
+            continue
         stated = decimal.Decimal(match.group(1))
         # A trailing number that is nowhere near a tire diameter is a part number or a price, not
         # a stated diameter. It also must not simply restate the rim.
@@ -122,15 +132,26 @@ def overall_diameter_cross_check(brand_ids=None, tolerance=_DIAMETER_TOLERANCE) 
             continue
         if stated == parsed.rim_diameter_in:
             continue
-        compared += 1
+        # Numeric notation states no aspect ratio, so its diameter is derived from a convention
+        # and is documented as nominal. Counting it as a parser failure would bury a real
+        # regression under a known limitation -- and the two families in the data disagree with
+        # each other anyway (7.50R16 measures ~97% aspect, 8.75R16.5 ~81%), so no single constant
+        # fits. Reported separately instead.
+        bucket = nominal if notation == tire_size.NOTATION_NUMERIC else None
+        if bucket is None:
+            compared += 1
         if abs(stated - ours) > ours * tolerance:
-            failures.append("{} computed {} vs stated {} -- {}".format(size_display, ours, stated, description[:60]))
-    return Check(
-        name="overall diameter vs distributor-stated",
-        failures=len(failures),
-        total=compared,
-        detail="rows where a distributor stated its own diameter; tolerance {:.0%}".format(float(tolerance)),
-        samples=failures[:8],
+            line = "{} computed {} vs stated {} -- {}".format(size_display, ours, stated, description[:60])
+            (nominal if bucket is not None else failures).append(line)
+    return (
+        Check(
+            name="overall diameter vs distributor-stated",
+            failures=len(failures),
+            total=compared,
+            detail="rows where a distributor stated its own diameter; tolerance {:.0%}".format(float(tolerance)),
+            samples=failures[:8],
+        ),
+        nominal,
     )
 
 
@@ -234,24 +255,27 @@ def consistency_checks(brand_ids=None) -> typing.List[Check]:
         )
     )
 
-    # A model_name that is still a distributor abbreviation means the model was never identified,
-    # only echoed in a shorter form. All-caps with no lowercase and no digits is the tell.
-    abbrev = _rows(
-        "SELECT DISTINCT ts.model_name FROM tire_specs ts JOIN master_parts mp ON mp.id=ts.master_part_id "
-        "WHERE ts.model_name IS NOT NULL AND ts.model_name = upper(ts.model_name) "
-        "  AND ts.model_name !~ '[0-9]' AND length(ts.model_name) <= 12 {} LIMIT 200".format(clause),
-        params,
-    )
-    checks.append(
-        Check(
-            "model_name not left as an abbreviation",
-            len(abbrev),
-            total,
-            detail="all-caps, no digits, short -- likely an unexpanded distributor abbreviation",
-            samples=[row[0] for row in abbrev[:10]],
-        )
-    )
     return checks
+
+
+def possible_abbreviations(brand_ids=None) -> typing.List[str]:
+    """
+    model_name values that *look* unexpanded: all caps, no digits, short.
+
+    Advisory only, never a failure. Plenty of real tire models are exactly this shape -- LTX M/S,
+    G-MAX RS, LO-PRO, HD PRO T/A -- so a non-zero count means "worth a glance", not "a bug".
+    """
+    clause, params = _brand_clause(brand_ids)
+    return [
+        row[0]
+        for row in _rows(
+            "SELECT DISTINCT ts.model_name FROM tire_specs ts JOIN master_parts mp ON mp.id=ts.master_part_id "
+            "WHERE ts.model_name IS NOT NULL AND ts.model_name = upper(ts.model_name) "
+            "  AND ts.model_name !~ '[0-9]' AND length(ts.model_name) <= 12 {} "
+            "ORDER BY 1 LIMIT 200".format(clause),
+            params,
+        )
+    ]
 
 
 # ==========================================================================================
