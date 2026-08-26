@@ -69,18 +69,25 @@ class SearchError(Exception):
 
 
 # Reference data read on every request: the tire brand list, the tread vocabulary and the facet
-# rail. All three change on the timescale of a catalog sync, not a request, and querying them per
-# request cost 1.6s of a 2.2s search -- measured, not assumed.
-#
-# Built into a new object and swapped in by reference rather than mutated in place, so a request
-# reading the cache while another thread refreshes it sees either the old value or the new one,
-# never a half-populated dict. A plain assignment is atomic under the GIL; the lock only stops
-# several threads doing the same expensive query at once after an expiry.
-REFERENCE_CACHE_TTL_SECONDS = 300
+# rail. All three change on the timescale of a catalog sync, not a request. Measured live
+# 2026-08-26: normally ~1.6s of a 2.2s search, but under host memory pressure (concurrent Turn 14
+# sweeps evicting Postgres's buffer cache) the same query took 21s -- long enough to trip
+# gunicorn's worker timeout, kill the worker, and hand the next request to a fresh worker with an
+# empty cache, repeating. Stale-while-revalidate (see _Cached.get) exists specifically so a slow
+# refresh is never on a live request's critical path after the first one.
+REFERENCE_CACHE_TTL_SECONDS = 1800
 
 
 class _Cached:
-    """One lazily-loaded, TTL-expiring reference value."""
+    """
+    One lazily-loaded, TTL-expiring reference value -- stale-while-revalidate.
+
+    Only the very first load (no value yet) blocks the caller; that cost is normally absorbed by
+    warm_reference_caches() firing in the background at process start (see wsgi.py) well before
+    real traffic arrives; a request that beats it there simply pays the cost itself, once. Every
+    later expiry serves the stale value immediately and refreshes on a background thread, so a
+    slow reload -- whatever the reason -- never blocks a request again.
+    """
 
     def __init__(self, loader: typing.Callable[[], typing.Any], ttl: float = REFERENCE_CACHE_TTL_SECONDS):
         self._loader = loader
@@ -88,24 +95,47 @@ class _Cached:
         self._value: typing.Any = None
         self._loaded_at = 0.0
         self._lock = threading.Lock()
+        self._refreshing = False
 
     def get(self) -> typing.Any:
         now = time.monotonic()
         if self._value is not None and now - self._loaded_at < self._ttl:
             return self._value
-        with self._lock:
-            # Re-check: another thread may have refreshed while this one waited.
-            if self._value is not None and time.monotonic() - self._loaded_at < self._ttl:
-                return self._value
-            self._value = self._loader()
-            self._loaded_at = time.monotonic()
+        if self._value is None:
+            with self._lock:
+                # Re-check: another thread may have loaded while this one waited.
+                if self._value is None:
+                    self._value = self._loader()
+                    self._loaded_at = time.monotonic()
             return self._value
+        self._refresh_in_background()
+        return self._value
+
+    def _refresh_in_background(self) -> None:
+        with self._lock:
+            if self._refreshing:
+                return
+            self._refreshing = True
+
+        def _run() -> None:
+            try:
+                value = self._loader()
+                self._value = value
+                self._loaded_at = time.monotonic()
+            except Exception:
+                logger.exception("%s reference cache refresh failed; keeping the stale value.", _LOG_PREFIX)
+            finally:
+                with self._lock:
+                    self._refreshing = False
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def invalidate(self) -> None:
         """Drop the cached value. Call after a reindex or a facet_config edit."""
         with self._lock:
             self._value = None
             self._loaded_at = 0.0
+            self._refreshing = False
 
 
 def allowed_filter_fields() -> typing.AbstractSet[str]:
@@ -185,6 +215,22 @@ def tread_category_codes() -> typing.AbstractSet[str]:
 
 def facets_config() -> typing.List[typing.Dict[str, typing.Any]]:
     return _FACETS_CONFIG.get()
+
+
+def warm_reference_caches() -> None:
+    """
+    Populate all three reference caches now, in the calling thread.
+
+    Called from wsgi.py on a background thread right after each gunicorn worker forks, so the
+    one unavoidable blocking load per process happens before that worker takes real traffic
+    instead of during a user's first request. Safe to call more than once (a concurrent request
+    racing this just does its own first-load under the same lock, see _Cached.get).
+    """
+    for cache in (_BRAND_NAMES, _TREAD_CATEGORY_CODES, _FACETS_CONFIG):
+        try:
+            cache.get()
+        except Exception:
+            logger.exception("%s warm_reference_caches: failed to warm %s.", _LOG_PREFIX, cache._loader.__name__)
 
 
 def invalidate_reference_cache() -> None:

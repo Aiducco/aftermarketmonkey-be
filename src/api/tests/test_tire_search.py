@@ -5,6 +5,8 @@ Meilisearch and Postgres are patched out: what is under test is the *handler ord
 search engine. The first test in this file is the one the handoff document warns a suite will
 miss unless it is written explicitly.
 """
+import threading
+import time
 import typing
 import unittest.mock as mock
 
@@ -215,6 +217,43 @@ class ReferenceCacheTests(SimpleTestCase):
         cached.invalidate()
         cached.get()
         self.assertEqual(len(calls), 2)
+
+    def test_expired_read_returns_stale_value_without_blocking(self):
+        """
+        A request landing right after TTL expiry must never pay the reload cost itself -- that
+        was exactly the production bug (2026-08-26): a slow reload under host pressure blocked
+        the request long enough to trip gunicorn's worker timeout. An expired get() should hand
+        back the stale value immediately and refresh on a background thread instead.
+        """
+        loader_may_return = threading.Event()
+        loader_started = threading.Event()
+        second_call_done = threading.Event()
+        calls = []
+
+        def slow_loader():
+            calls.append(1)
+            if len(calls) == 1:
+                return "value-1"
+            loader_started.set()
+            loader_may_return.wait(timeout=5)
+            second_call_done.set()
+            return "value-2"
+
+        # A long ttl: once expired, this test drives the refresh manually via the events above
+        # rather than by waiting out a real TTL again, so a slow test runner can't make a second
+        # background refresh race the assertions below.
+        cached = tire_search._Cached(slow_loader, ttl=1000)
+        first = cached.get()
+        self.assertEqual(first, "value-1")
+
+        cached._loaded_at -= 2000  # force the next get() to see it as expired
+        second = cached.get()  # must return instantly, not block on the reload
+        self.assertEqual(second, "value-1", "expired get() must return the stale value, not block")
+
+        self.assertTrue(loader_started.wait(timeout=1), "background refresh never started")
+        loader_may_return.set()
+        self.assertTrue(second_call_done.wait(timeout=1), "background refresh never landed")
+        self.assertEqual(cached._value, "value-2")
 
 
 class ModeRoutingTests(SimpleTestCase):
