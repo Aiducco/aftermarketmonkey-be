@@ -148,16 +148,21 @@ class RelaxationTests(SimpleTestCase):
         self.assertIn("rim_diameter_in", result["applied_filters"])
 
     def test_it_retries_only_once(self):
+        # totals: initial parse (0), the one relaxation retry (0), then the zero-result facets
+        # fallback's own extra _multi_search call (0) -- see FacetFallbackTests for that path in
+        # isolation.
         result, seen = self._search_with(
             parsed_filters={"rim_diameter_in": 18.0, "tread_category": "MT", "brand_name": "NITTO"},
-            totals=[0, 0],
+            totals=[0, 0, 0],
         )
-        self.assertEqual(len(seen), 2)
+        self.assertEqual(len(seen), 3)
         self.assertEqual(result["total"], 0)
 
     def test_no_relaxation_when_only_dimensions_remain(self):
-        result, seen = self._search_with(parsed_filters={"rim_diameter_in": 18.0}, totals=[0])
-        self.assertEqual(len(seen), 1)
+        # totals: initial parse (0), then the zero-result facets fallback's own extra call (0) --
+        # no relaxation call in between since only a NEVER_RELAX field remains.
+        result, seen = self._search_with(parsed_filters={"rim_diameter_in": 18.0}, totals=[0, 0])
+        self.assertEqual(len(seen), 2)
         self.assertIsNone(result["interpretation"]["relaxed"])
 
     def test_user_set_filters_are_never_relaxed(self):
@@ -386,3 +391,56 @@ class FacetLabelTests(SimpleTestCase):
             facet_model.objects.filter.return_value.order_by.return_value = rows
             facets = tire_search._load_facets_config()
         self.assertEqual(facets[0]["value_labels"]["AT"], "All-Terrain (custom)")
+
+
+class FacetFallbackTests(SimpleTestCase):
+    """
+    A zero-hit tires search still needs a populated filter panel -- Meilisearch's own
+    facetDistribution is empty whenever a query matches nothing, which is exactly when a user
+    most needs to see what to relax. See tire_search.search, step 5.
+    """
+
+    databases = []
+
+    _FACET_CONFIG = [
+        {"field": "brand_name", "label": "Brand", "widget": "multiselect", "collapse_after": 8,
+         "unit": None, "value_labels": {}},
+    ]
+
+    def test_zero_hits_refetches_facets_with_the_filter_dropped(self):
+        seen = []
+
+        def multi_search(*, text_query, filter_expression, sort_spec, tires_limit, parts_limit, offset):
+            seen.append({"text_query": text_query, "filter_expression": filter_expression})
+            if len(seen) == 1:
+                return _response(total=0), None  # the real, filtered search: nothing matches
+            return _response(total=0, facets={"brand_name": {"NITTO": 42}}), None  # the fallback
+
+        with mock.patch.object(tire_search, "_multi_search", multi_search), mock.patch.object(
+            tire_search, "facets_config", return_value=self._FACET_CONFIG
+        ), mock.patch.object(tire_search.tires_index, "is_configured", return_value=True):
+            result = tire_search.search(q="nitto", filters={"rim_diameter_in": 999}, parse_query_fn=_ExplodingParser())
+
+        self.assertEqual(len(seen), 2)
+        # The fallback call drops the filter but keeps searching the same text.
+        self.assertEqual(seen[1]["filter_expression"], "")
+        self.assertEqual(seen[1]["text_query"], seen[0]["text_query"])
+        # And the response actually carries the fallback's facet values, not an empty panel.
+        self.assertEqual(result["total"], 0)
+        self.assertEqual(result["facets"][0]["field"], "brand_name")
+        self.assertEqual(result["facets"][0]["values"][0]["count"], 42)
+
+    def test_nonzero_hits_do_not_trigger_a_second_call(self):
+        seen = []
+
+        def multi_search(*, text_query, filter_expression, sort_spec, tires_limit, parts_limit, offset):
+            seen.append(1)
+            return _response(hits=[{"id": 1}], total=5, facets={"brand_name": {"NITTO": 5}}), None
+
+        with mock.patch.object(tire_search, "_multi_search", multi_search), mock.patch.object(
+            tire_search, "facets_config", return_value=self._FACET_CONFIG
+        ), mock.patch.object(tire_search.tires_index, "is_configured", return_value=True):
+            result = tire_search.search(q="nitto", filters={"rim_diameter_in": 18}, parse_query_fn=_ExplodingParser())
+
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(result["total"], 5)

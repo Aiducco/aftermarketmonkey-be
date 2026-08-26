@@ -366,7 +366,19 @@ def search(
     if resolved_mode == MODE_TIRES:
         results = [_hit_to_result(hit) for hit in tires_response.get("hits", [])]
         total = tires_total
-        facets = _shape_facets(tires_response.get("facetDistribution") or {})
+        facet_distribution = tires_response.get("facetDistribution") or {}
+        if total == 0:
+            # Meilisearch only computes facet counts from the documents a query actually
+            # matches -- zero hits means an empty facetDistribution, which leaves the filter
+            # panel with nothing to render right when the user most needs it to see what to
+            # relax. Re-fetch facets for the same text query with the filter dropped (not the
+            # whole unfiltered catalog) so counts still reflect "everything this text matches."
+            facet_only, _ = _multi_search(
+                text_query=text_query, filter_expression="", sort_spec=None,
+                tires_limit=0, parts_limit=0, offset=0,
+            )
+            facet_distribution = facet_only.get("facetDistribution") or {}
+        facets = _shape_facets(facet_distribution)
         applied = tire_filters_dict
     else:
         results = [_parts_hit_to_result(hit) for hit in (parts_response or {}).get("hits", [])]
