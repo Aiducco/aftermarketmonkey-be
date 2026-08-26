@@ -255,9 +255,12 @@ def search(
       * an explicit ``mode`` from the client always wins
       * ``filters`` present means the client is refining a tire result set -> tires
       * a query that parsed into structural filters -> tires
-      * otherwise both indexes are searched and the one with hits wins, preferring parts on a
-        tie or when tires is empty. This is what keeps "bed mat tacoma" and "WET40451" behaving
-        exactly as they do today instead of dead-ending on an empty tire page.
+      * otherwise both indexes are searched and tires wins whenever it has any hits at all;
+        parts is the fallback only when tires comes back genuinely empty. This is what keeps
+        "bed mat tacoma" and "WET40451" behaving as parts searches (tires has zero hits for
+        either) while a query like "275/55" -- real tire shape, but missing enough of the size
+        for the parser to build a filter -- surfaces as tires instead of losing to a much larger
+        coincidental digit-substring match count in the parts index.
 
     ``parse_query_fn`` is injected so a test can assert it is **not** called when ``filters`` is
     present -- the refinement bug, which a suite misses unless the assertion is explicit.
@@ -323,9 +326,12 @@ def search(
     parts_total = parts_response.get("estimatedTotalHits", 0) if parts_response is not None else 0
 
     if resolved_mode is None:
-        # Nothing structural parsed. Prefer whichever index actually has something; parts wins
-        # ties and wins outright when tires is empty, which is today's behaviour.
-        resolved_mode = MODE_TIRES if tires_total > parts_total else MODE_PARTS
+        # Nothing structural parsed. Tires wins whenever it has any real hits at all -- a
+        # coincidental digit-substring match in the (much larger) parts index outscoring a real
+        # tire hit is worse than the reverse (confirmed live: "275/55" text-matched 8 tires but
+        # 4381 parts purely by loose substring overlap, and used to lose to parts on count alone).
+        # Parts is the fallback only when tires is genuinely empty.
+        resolved_mode = MODE_TIRES if tires_total > 0 else MODE_PARTS
 
     # ---- 4. relaxation (parsed tire queries only) --------------------------------------------
     if resolved_mode == MODE_TIRES and tires_total == 0 and parsed is not None and parsed.parsed_anything:

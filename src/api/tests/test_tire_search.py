@@ -260,9 +260,19 @@ class ModeRoutingTests(SimpleTestCase):
         result, _ = self._run(parsed_filters={}, tires_total=211, parts_total=3, q="ridge grappler")
         self.assertEqual(result["mode"], tire_search.MODE_TIRES)
 
-    def test_parts_wins_a_tie(self):
+    def test_tires_wins_a_tie(self):
+        # Tires wins whenever it has any real hits at all, ties included -- a coincidental
+        # digit-substring match count in the much larger parts index is not a reason to prefer
+        # it over a genuine tire hit (confirmed live: "275/55" text-matched 8 tires vs 4381
+        # parts purely by substring overlap, and used to lose on count alone).
         result, _ = self._run(parsed_filters={}, tires_total=5, parts_total=5)
-        self.assertEqual(result["mode"], tire_search.MODE_PARTS)
+        self.assertEqual(result["mode"], tire_search.MODE_TIRES)
+
+    def test_parts_wins_when_tires_has_far_fewer_hits(self):
+        # Even a large gap in parts' favor does not flip it back -- tires only loses when it is
+        # genuinely empty.
+        result, _ = self._run(parsed_filters={}, tires_total=8, parts_total=4381, q="275/55")
+        self.assertEqual(result["mode"], tire_search.MODE_TIRES)
 
     def test_explicit_mode_overrides_the_router(self):
         result, _ = self._run(parsed_filters={}, tires_total=0, parts_total=40, mode=tire_search.MODE_TIRES)
