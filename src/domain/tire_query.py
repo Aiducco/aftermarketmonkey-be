@@ -33,12 +33,19 @@ from src.domain import tire_size
 TREAD_CATEGORY_SYNONYMS = {
     "mud terrain": "MT",
     "mud-terrain": "MT",
+    "muddy terrain": "MT",
     "m/t": "MT",
     "mud": "MT",
+    "muddy": "MT",
+    "mudder": "MT",
+    "mudders": "MT",
     "all terrain": "AT",
+    "all terrains": "AT",
     "all-terrain": "AT",
+    "all-terrains": "AT",
     "a/t": "AT",
     "rugged terrain": "RT",
+    "rugged terrains": "RT",
     "rugged": "RT",
     "r/t": "RT",
     "hybrid terrain": "RT",
@@ -47,18 +54,23 @@ TREAD_CATEGORY_SYNONYMS = {
     "highway": "HT",
     "h/t": "HT",
     "all season": "ALL_SEASON",
+    "all seasons": "ALL_SEASON",
     "all-season": "ALL_SEASON",
+    "all-seasons": "ALL_SEASON",
     "all weather": "ALL_WEATHER",
     "all-weather": "ALL_WEATHER",
     "summer": "SUMMER",
     "winter": "WINTER",
     "snow tire": "WINTER",
+    "snow tires": "WINTER",
     "touring": "TOURING",
     "performance": "PERFORMANCE",
     "ultra high performance": "UHP",
     "uhp": "UHP",
     "track": "TRACK",
     "drag": "TRACK",
+    "racing": "TRACK",
+    "competition": "TRACK",
     "trailer": "TRAILER",
     "commercial": "COMMERCIAL",
     "spare": "SPARE",
@@ -204,6 +216,17 @@ def parse_query(
         if size.speed_rating:
             result.matched["speed_rating"] = size.speed_rating
 
+    # Severe-snow intent runs before tread category on purpose: "severe snow tires" shares the
+    # word "snow" with the WINTER synonym "snow tires", and the tread-category loop below would
+    # otherwise consume it first, leaving "severe" stranded with no "snow" left to pair with --
+    # confirmed by a real regression when "snow tires" was added as a WINTER synonym (see below).
+    for phrase in _SEVERE_SNOW_PHRASES:
+        found, remaining = _take_phrase(remaining, phrase)
+        if found:
+            result.filters["is_3pmsf"] = True
+            result.matched["is_3pmsf"] = True
+            break
+
     # Longest phrase first: "all terrain" must win over any shorter substring it contains.
     for phrase in sorted(TREAD_CATEGORY_SYNONYMS, key=len, reverse=True):
         code = TREAD_CATEGORY_SYNONYMS[phrase]
@@ -213,13 +236,6 @@ def parse_query(
         if found:
             result.filters["tread_category"] = code
             result.matched["tread_category"] = code
-            break
-
-    for phrase in _SEVERE_SNOW_PHRASES:
-        found, remaining = _take_phrase(remaining, phrase)
-        if found:
-            result.filters["is_3pmsf"] = True
-            result.matched["is_3pmsf"] = True
             break
 
     for phrase in _RUN_FLAT_PHRASES:
