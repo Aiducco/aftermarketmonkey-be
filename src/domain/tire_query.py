@@ -186,6 +186,36 @@ def _find_size(text: str) -> typing.Optional[tire_size.ParsedSize]:
     return None
 
 
+# A user-typed size missing its rim diameter -- "275/55", "225-45", "205 60". This does not
+# identify one exact wheel size the way a full "275/55R18" does, but section width + aspect
+# ratio alone is still a real, useful filter (cross-shop every rim diameter available at this
+# width/aspect) -- confirmed live: "275/55" previously fell through _find_size entirely and
+# went to Meilisearch as plain text, where coincidental digit-substring matches in the much
+# larger parts index outscored real tire hits. Exactly 3-digit width + 2-digit aspect, the same
+# fixed-digit-count discipline every other loose pattern in this module uses to avoid reading a
+# part number or a wheel bolt pattern as a size. Deliberately does not build a tire_size.ParsedSize
+# (which requires rim_diameter_in and overall_diameter_in) -- this is a query-only, rim-less
+# filter pair, never reused by catalog parsing.
+_PARTIAL_SIZE_RE = re.compile(r"(?<!\w)(\d{3})\s*[/ -]\s*(\d{2})(?!\w)")
+
+
+def _find_partial_size(
+    text: str,
+) -> typing.Optional[typing.Tuple[typing.Dict[str, typing.Any], str, typing.Tuple[int, int]]]:
+    """Last resort, tried only after ``_find_size`` (a full size, with rim) has already failed.
+    Returns (filters, display, span), or ``None``."""
+    match = _PARTIAL_SIZE_RE.search(text)
+    if match is None:
+        return None
+    width_mm = int(match.group(1))
+    aspect = int(match.group(2))
+    if not tire_size._MIN_SECTION_MM <= width_mm <= tire_size._MAX_SECTION_MM:
+        return None
+    if not tire_size._MIN_ASPECT <= aspect <= tire_size._MAX_ASPECT:
+        return None
+    return {"section_width_mm": width_mm, "aspect_ratio": aspect}, "{}/{}".format(width_mm, aspect), match.span()
+
+
 def parse_query(
     text: typing.Optional[str],
     *,
@@ -215,6 +245,14 @@ def parse_query(
             result.matched["load_range"] = size.load_range
         if size.speed_rating:
             result.matched["speed_rating"] = size.speed_rating
+    else:
+        partial = _find_partial_size(remaining)
+        if partial is not None:
+            partial_filters, display, span = partial
+            result.filters.update(partial_filters)
+            result.matched["size"] = display
+            start, end = span
+            remaining = " ".join((remaining[:start] + " " + remaining[end:]).split())
 
     # Severe-snow intent runs before tread category on purpose: "severe snow tires" shares the
     # word "snow" with the WINTER synonym "snow tires", and the tread-category loop below would
