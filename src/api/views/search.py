@@ -44,7 +44,7 @@ class SearchView(views.View):
 
     Body:
         {
-          "mode":    "tire",                 optional, defaults to tire
+          "mode":    "tires" | "parts",      optional -- omit to let the server route
           "q":       "275/70R18 mud terrain",
           "filters": {"tread_category": "MT", "rim_diameter_in": 18},
           "sort":    "diameter_asc",
@@ -52,9 +52,9 @@ class SearchView(views.View):
           "offset":  0
         }
 
-    ``mode`` is optional. Omitted, the server decides: a query that parses into a size or a
-    tread category is a tire query, and anything else falls through to the parts index so a part
-    number behaves exactly as it does today. Sent explicitly, it pins the tab the user clicked.
+    ``mode`` is optional. Omitted, the server routes by what the query parsed into: a size or a
+    tread category means tires, anything else falls through to the parts index so a part number
+    behaves exactly as it does today. Sent explicitly, it pins the tab the user clicked.
 
     **No pricing is returned.** Results are the search index documents, shaped. The client
     hydrates a page by posting the returned ids to ``POST /parts/bulk-pricing/``, which is the
@@ -77,9 +77,13 @@ class SearchView(views.View):
         if not isinstance(body, dict):
             return _json({"message": "Request body must be a JSON object."}, status=400)
 
-        mode = (body.get("mode") or tire_search_services.MODE_TIRES).strip().lower()
-        if mode != tire_search_services.MODE_TIRES:
-            return _json({"message": "Unsupported mode {!r}. Only 'tires' is implemented.".format(mode)}, status=400)
+        # mode is OPTIONAL and must stay optional. Defaulting it to "tires" pins the router shut:
+        # the service can no longer fall through to the parts index, so a query with no tire
+        # structure ("bed mat tacoma", a part number) returns an empty tire page instead of the
+        # parts results it returns today. Send it only to pin the tab the user clicked.
+        mode = body.get("mode")
+        if mode is not None:
+            mode = str(mode).strip().lower() or None
 
         filters = body.get("filters") or {}
         if not isinstance(filters, dict):
