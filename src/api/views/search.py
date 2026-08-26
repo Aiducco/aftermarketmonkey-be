@@ -77,9 +77,9 @@ class SearchView(views.View):
         if not isinstance(body, dict):
             return _json({"message": "Request body must be a JSON object."}, status=400)
 
-        mode = (body.get("mode") or tire_search_services.MODE_TIRE).strip().lower()
-        if mode != tire_search_services.MODE_TIRE:
-            return _json({"message": "Unsupported mode {!r}. Only 'tire' is implemented.".format(mode)}, status=400)
+        mode = (body.get("mode") or tire_search_services.MODE_TIRES).strip().lower()
+        if mode != tire_search_services.MODE_TIRES:
+            return _json({"message": "Unsupported mode {!r}. Only 'tires' is implemented.".format(mode)}, status=400)
 
         filters = body.get("filters") or {}
         if not isinstance(filters, dict):
