@@ -43,6 +43,12 @@ _DIAMETER_TOLERANCE = decimal.Decimal("0.03")
 # should never carry one -- see migration 0183 for why the powersports axis exists.
 _LIGHT_VEHICLE_ONLY = ("HT", "AT", "RT", "MT", "XT", "TOURING", "UHP", "TRAILER", "COMMERCIAL", "SPARE")
 
+# Categories that are seasonally exclusive, where severe-snow certification is a real
+# contradiction. UHP is deliberately NOT here: the taxonomy defines it as "summer OR all-season",
+# and terrain/performance is orthogonal to season by design -- a UHP all-season like the Pilot
+# Sport All Season 4 carrying 3PMSF is correct, not a conflict.
+_NEVER_SEVERE_SNOW = ("SUMMER", "TRACK", "MC_TRACK", "SAND")
+
 
 @dataclasses.dataclass
 class Check:
@@ -235,6 +241,25 @@ def consistency_checks(brand_ids=None) -> typing.List[Check]:
             total,
         ),
     ]
+
+    checks.append(
+        Check(
+            "is_3pmsf only on categories that can carry it",
+            count("ts.is_3pmsf = TRUE AND ts.tread_category = ANY(%s)", [list(_NEVER_SEVERE_SNOW)]),
+            total,
+            detail="a summer or track tire cannot be severe-snow certified",
+        )
+    )
+    checks.append(
+        Check(
+            "vehicle_class agrees with a powersports category",
+            count(
+                "(ts.tread_category LIKE 'MC!_%%' ESCAPE '!' AND ts.vehicle_class IS DISTINCT FROM 'motorcycle') "
+                "OR (ts.tread_category LIKE 'ATV!_%%' ESCAPE '!' AND ts.vehicle_class IS DISTINCT FROM 'atv_utv')"
+            ),
+            total,
+        )
+    )
 
     # Powersports leakage: a motorcycle-shaped size wearing a car category. Motorcycle sizes are
     # the ones with a 2-digit section width or an aspect ratio above 95 -- no car tire has either.
