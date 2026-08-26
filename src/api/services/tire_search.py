@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 _LOG_PREFIX = "[TIRE-SEARCH]"
 
-DEFAULT_LIMIT = 24
+DEFAULT_LIMIT = 50
 MAX_LIMIT = 100
 
 # API-facing mode names. These are what the client switches on, and they match the index each
