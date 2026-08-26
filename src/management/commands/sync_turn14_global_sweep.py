@@ -7,7 +7,21 @@ against ~4 200 for identical data (Turn 14 serves the unscoped endpoints 1 000 r
 the brand-scoped ones 200).
 
 Order is not arbitrary. Only /v1/items carries brand_id, so items must land before the
-collections whose brand has to be resolved through Turn14Items.
+collections whose brand has to be resolved through Turn14Items. That dependency also bounds
+``--phase``: items_data rides along in phase 1 (it only needs items, just above it), leaving
+phase 2 as inventory/dropship/shipping estimates plus propagation. The whole sweep's ~4 200
+requests fit under the 5 000/hour budget in principle, but competing crons (the 10-minute
+inventory-delta job, per-company pricing syncs) share the same budget, and a single run that
+spills past its hour forces long internal rate-limit retries that starve those crons for the
+rest of the day (observed live 2026-08-26). Scheduling phase 1 and phase 2 as separate cron
+entries two hours apart keeps each phase's own request cost comfortably inside one clock hour
+without leaning on retry-and-wait:
+
+    0 1 * * *  manage.py sync_turn14_global_sweep --phase 1 --deactivate-missing
+    0 3 * * *  manage.py sync_turn14_global_sweep --phase 2
+
+Omitting ``--phase`` runs everything in one invocation, as before (useful for ad hoc/manual
+runs where splitting buys nothing).
 """
 import typing
 
@@ -28,10 +42,21 @@ class Command(BaseCommand):
     help = (
         "Daily Turn 14 global sweep: brands, locations, shipping options, items, items/data, "
         "inventory, dropship controllers and shipping estimates, using the flat catalog-wide "
-        "endpoints."
+        "endpoints. --phase 1/2 splits it into two scheduled invocations; omit for one full run."
     )
 
     def add_arguments(self, parser):
+        parser.add_argument(
+            "--phase",
+            type=int,
+            choices=[1, 2],
+            default=None,
+            help=(
+                "Run only phase 1 (brands/locations/shipping options/items) or phase 2 "
+                "(items data/inventory/dropship/shipping estimates/propagation/pricing). Omit "
+                "to run the full sweep in one invocation."
+            ),
+        )
         parser.add_argument(
             "--skip-shipping-estimates",
             action="store_true",
@@ -47,13 +72,19 @@ class Command(BaseCommand):
             action="store_true",
             help=(
                 "After a fully successful items sweep, mark items Turn 14 no longer returns as "
-                "inactive. Off by default: it is only safe when the sweep truly completed."
+                "inactive. Off by default: it is only safe when the items sweep truly "
+                "completed -- this only depends on that sweep, so it belongs with --phase 1."
             ),
         )
 
     def handle(self, *args, **options):
-        audit_scheduled_tasks.cleanup_stale_started_executions(_TASK_NAME)
-        execution = audit_scheduled_tasks.start_scheduled_task_execution(_TASK_NAME)
+        phase = options["phase"]
+        task_name = _TASK_NAME if phase is None else "{}_phase{}".format(_TASK_NAME, phase)
+        run_phase1 = phase in (None, 1)
+        run_phase2 = phase in (None, 2)
+
+        audit_scheduled_tasks.cleanup_stale_started_executions(task_name)
+        execution = audit_scheduled_tasks.start_scheduled_task_execution(task_name)
         meter = rate_limit_base.UsageMeter("t14:get")
         started_at = timezone.now()
         results: typing.Dict[str, typing.Any] = {}
@@ -62,53 +93,66 @@ class Command(BaseCommand):
         try:
             client = turn_14_global.get_global_client()
 
-            rate_limit_base.retry_on_rate_budget("brands", turn_14_services.fetch_and_save_turn_14_brands, self.stdout.write)
-            rate_limit_base.retry_on_rate_budget(
-                "brand_mapping", turn_14_services.sync_unmapped_turn_14_brands_to_brands, self.stdout.write
-            )
-            rate_limit_base.retry_on_rate_budget("locations", turn_14_services.fetch_and_save_turn_14_locations, self.stdout.write)
-            results["shipping_options"] = rate_limit_base.retry_on_rate_budget(
-                "shipping_options", lambda: turn_14_sweeps.sweep_shipping_options(client), self.stdout.write
-            )
-
-            results["items"] = rate_limit_base.retry_on_rate_budget(
-                "items", lambda: turn_14_sweeps.sweep_items(client), self.stdout.write
-            )
-            results["items_data"] = rate_limit_base.retry_on_rate_budget(
-                "items_data", lambda: turn_14_sweeps.sweep_items_data(client), self.stdout.write
-            )
-            results["inventory"] = rate_limit_base.retry_on_rate_budget(
-                "inventory", lambda: turn_14_sweeps.sweep_inventory(client), self.stdout.write
-            )
-
-            if not options["skip_dropship"]:
-                results["dropship"] = rate_limit_base.retry_on_rate_budget(
-                    "dropship", lambda: turn_14_sweeps.sweep_dropship_controllers(client), self.stdout.write
+            if run_phase1:
+                rate_limit_base.retry_on_rate_budget(
+                    "brands", turn_14_services.fetch_and_save_turn_14_brands, self.stdout.write
                 )
-            if not options["skip_shipping_estimates"]:
-                results["shipping_estimates"] = rate_limit_base.retry_on_rate_budget(
-                    "shipping_estimates", lambda: turn_14_sweeps.sweep_shipping_estimates(client), self.stdout.write
+                rate_limit_base.retry_on_rate_budget(
+                    "brand_mapping", turn_14_services.sync_unmapped_turn_14_brands_to_brands, self.stdout.write
+                )
+                rate_limit_base.retry_on_rate_budget(
+                    "locations", turn_14_services.fetch_and_save_turn_14_locations, self.stdout.write
+                )
+                results["shipping_options"] = rate_limit_base.retry_on_rate_budget(
+                    "shipping_options", lambda: turn_14_sweeps.sweep_shipping_options(client), self.stdout.write
+                )
+                results["items"] = rate_limit_base.retry_on_rate_budget(
+                    "items", lambda: turn_14_sweeps.sweep_items(client), self.stdout.write
                 )
 
-            # Only after every raw sweep above completed -- propagating from a half-swept catalog
-            # would push incomplete data into MasterPart/ProviderPart. Pricing sync itself stays
-            # separate (the per-company IntegrationPricingSyncJob queue), but Turn 14's *recurring*
-            # enqueue happens right here rather than on ingest_all_providers' every-4-hours cycle
-            # -- pricing should be checked against the catalog just swept, not against up to ~20h
-            # stale data (see enqueue_all_active_turn14_pricing_jobs). On-connect enqueue for a
-            # brand new connection is unaffected -- that still fires immediately, unrelated to
-            # this daily cycle.
-            self.stdout.write("Propagating swept Turn14 data into MasterPart/ProviderPart...")
-            master_parts.sync_derived_from_turn14(skip_pricing=True)
-            self.stdout.write("Propagation complete.")
+                # Only depends on the items sweep just above -- a completed flat items sweep
+                # touches every item Turn 14 still carries, so anything untouched is gone. Placed
+                # here (not phase 2) because that is its only real dependency.
+                if options["deactivate_missing"]:
+                    results["deactivated"] = turn_14_sweeps.deactivate_items_missing_from_sweep(started_at)
 
-            results["pricing_jobs_enqueued"] = integration_pricing_sync_jobs.enqueue_all_active_turn14_pricing_jobs()
+                # items_data is the heaviest single endpoint (~1724 requests) but only depends on
+                # items (just above) for brand resolution, so it rides along in phase 1 rather
+                # than phase 2 -- phase 2 is then just inventory/dropship/shipping estimates plus
+                # propagation, comfortably lighter.
+                results["items_data"] = rate_limit_base.retry_on_rate_budget(
+                    "items_data", lambda: turn_14_sweeps.sweep_items_data(client), self.stdout.write
+                )
 
-            # Only after everything above completed -- a sweep cut short by a spent budget has
-            # seen an arbitrary prefix of the catalog, and "deactivate everything unseen" would
-            # then take out most of it.
-            if options["deactivate_missing"]:
-                results["deactivated"] = turn_14_sweeps.deactivate_items_missing_from_sweep(started_at)
+            if run_phase2:
+                results["inventory"] = rate_limit_base.retry_on_rate_budget(
+                    "inventory", lambda: turn_14_sweeps.sweep_inventory(client), self.stdout.write
+                )
+
+                if not options["skip_dropship"]:
+                    results["dropship"] = rate_limit_base.retry_on_rate_budget(
+                        "dropship", lambda: turn_14_sweeps.sweep_dropship_controllers(client), self.stdout.write
+                    )
+                if not options["skip_shipping_estimates"]:
+                    results["shipping_estimates"] = rate_limit_base.retry_on_rate_budget(
+                        "shipping_estimates", lambda: turn_14_sweeps.sweep_shipping_estimates(client), self.stdout.write
+                    )
+
+                # Only after every raw sweep above completed -- propagating from a half-swept
+                # catalog would push incomplete data into MasterPart/ProviderPart. Pricing sync
+                # itself stays separate (the per-company IntegrationPricingSyncJob queue), but
+                # Turn 14's *recurring* enqueue happens right here rather than on
+                # ingest_all_providers' every-4-hours cycle -- pricing should be checked against
+                # the catalog just swept, not against up to ~20h stale data (see
+                # enqueue_all_active_turn14_pricing_jobs). On-connect enqueue for a brand new
+                # connection is unaffected -- that still fires immediately, unrelated to this
+                # daily cycle. When run standalone (--phase 2), this assumes phase 1 already ran
+                # -- true on the scheduled 1am/3am split, not guaranteed for an ad hoc run.
+                self.stdout.write("Propagating swept Turn14 data into MasterPart/ProviderPart...")
+                master_parts.sync_derived_from_turn14(skip_pricing=True)
+                self.stdout.write("Propagation complete.")
+
+                results["pricing_jobs_enqueued"] = integration_pricing_sync_jobs.enqueue_all_active_turn14_pricing_jobs()
 
         except rate_limit_base.RateBudgetExhausted as e:
             # Reaches here only after retry_on_rate_budget's own retries were exhausted -- a
