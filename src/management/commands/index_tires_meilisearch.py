@@ -25,8 +25,11 @@ import json
 
 from django.core.management.base import BaseCommand, CommandError
 
+from src.audit import scheduled_tasks as audit_scheduled_tasks
 from src.integrations.services import tire_enrichment
 from src.search import tires_index
+
+_TASK_NAME = "index_tires_meilisearch"
 
 
 class Command(BaseCommand):
@@ -78,40 +81,49 @@ class Command(BaseCommand):
         if not tires_index.is_configured():
             raise CommandError("Meilisearch is not configured (MEILISEARCH_HOST is empty).")
 
-        if options["setup"]:
-            if not tires_index.setup_index():
-                raise CommandError("Index setup failed; see the log.")
-            self.stdout.write(self.style.SUCCESS("Configured index '{}'.".format(tires_index.INDEX_NAME_TIRES)))
-            return
+        audit_scheduled_tasks.cleanup_stale_started_executions(_TASK_NAME, max_age_minutes=180)
+        execution = audit_scheduled_tasks.start_scheduled_task_execution(_TASK_NAME)
+        try:
+            if options["setup"]:
+                if not tires_index.setup_index():
+                    raise CommandError("Index setup failed; see the log.")
+                message = "Configured index '{}'.".format(tires_index.INDEX_NAME_TIRES)
+                self.stdout.write(self.style.SUCCESS(message))
+                audit_scheduled_tasks.mark_scheduled_task_completed(execution, message=message)
+                return
 
-        if options["rebuild"]:
-            if brand_ids:
-                # A brand-scoped staging build contains only that brand, so swapping it in would
-                # delete every other brand's tires from the live index.
-                raise CommandError(
-                    "--rebuild cannot be combined with --brands: the swap would replace the whole "
-                    "index with one brand. Use --brands on its own for an incremental upsert."
-                )
-            indexed, expected = tires_index.reindex(batch_size=options["batch_size"])
-            if indexed != expected:
-                raise CommandError(
-                    "Refused to swap: staged {} documents but expected {}. The live index is "
-                    "unchanged and staging was kept for inspection.".format(indexed, expected)
-                )
-            self.stdout.write(
-                self.style.SUCCESS("Rebuilt '{}': {} documents live.".format(tires_index.INDEX_NAME_TIRES, indexed))
-            )
-            return
+            if options["rebuild"]:
+                if brand_ids:
+                    # A brand-scoped staging build contains only that brand, so swapping it in
+                    # would delete every other brand's tires from the live index.
+                    raise CommandError(
+                        "--rebuild cannot be combined with --brands: the swap would replace the "
+                        "whole index with one brand. Use --brands on its own for an incremental "
+                        "upsert."
+                    )
+                indexed, expected = tires_index.reindex(batch_size=options["batch_size"])
+                if indexed != expected:
+                    raise CommandError(
+                        "Refused to swap: staged {} documents but expected {}. The live index is "
+                        "unchanged and staging was kept for inspection.".format(indexed, expected)
+                    )
+                message = "Rebuilt '{}': {} documents live.".format(tires_index.INDEX_NAME_TIRES, indexed)
+                self.stdout.write(self.style.SUCCESS(message))
+                audit_scheduled_tasks.mark_scheduled_task_completed(execution, message=message)
+                return
 
-        tires_index.setup_index()
-        expected = tires_index.indexable_count(brand_ids)
-        written = 0
-        for batch in tires_index.iter_documents(brand_ids=brand_ids, batch_size=options["batch_size"]):
-            written += tires_index.upsert_documents(batch)
-            self.stdout.write("  upserted {}/{}".format(written, expected))
-        self.stdout.write(
-            self.style.SUCCESS("Upserted {} documents into '{}'.".format(written, tires_index.INDEX_NAME_TIRES))
-        )
+            tires_index.setup_index()
+            expected = tires_index.indexable_count(brand_ids)
+            written = 0
+            for batch in tires_index.iter_documents(brand_ids=brand_ids, batch_size=options["batch_size"]):
+                written += tires_index.upsert_documents(batch)
+                self.stdout.write("  upserted {}/{}".format(written, expected))
+            message = "Upserted {} documents into '{}'.".format(written, tires_index.INDEX_NAME_TIRES)
+            self.stdout.write(self.style.SUCCESS(message))
+            audit_scheduled_tasks.mark_scheduled_task_completed(execution, message=message)
+        except Exception as e:
+            audit_scheduled_tasks.mark_scheduled_task_failed(execution, error_message=str(e))
+            raise
 
     def _dry_run(self, *, brand_ids, limit):
         expected = tires_index.indexable_count(brand_ids)
