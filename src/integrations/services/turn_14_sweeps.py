@@ -580,6 +580,7 @@ def sweep_pricing_for_company_provider(
             ))
         if not instances:
             return 0
+        instances = _dedupe_by_external_id(instances)
         pgbulk.upsert(
             src_models.Turn14BrandPricing,
             instances,
