@@ -72,6 +72,16 @@ _MIN_SECTION_MM = 100
 _MAX_SECTION_MM = 500
 _MIN_ASPECT = 15
 _MAX_ASPECT = 100
+# Minimum aspect ratio for a BIAS metric size. Low-profile tires are always radial -- a bias
+# 19-series does not exist -- so a low aspect with a bare hyphen is a model-year range, not a
+# size: "Westin 15-25 Ford F-150/19-24 RAM 1500" parsed as 150/19-24.
+_MIN_BIAS_ASPECT = 30
+# A tall sidewall only occurs on a narrow tire. Motorcycle sizes reach 100-series but at
+# 100-140mm wide (120/100-18); the widest car and truck sizes stop around 85-series
+# (235/85R16). Nothing is both 250mm wide and 99-series -- "Vertex Pistons 22-24 XX 250/99-24
+# YZ 250" is a motocross model list, and 250/99-24 is not a tire.
+_MAX_ASPECT_FOR_WIDE = 90
+_WIDE_SECTION_MM = 150
 _MIN_OVERALL_IN = decimal.Decimal(15)
 _MAX_OVERALL_IN = decimal.Decimal(60)
 _MIN_SECTION_IN = decimal.Decimal(4)
@@ -96,7 +106,11 @@ _METRIC_RE = re.compile(
     # Unlike the inch notations below, a leading hyphen is allowed: metric carries its own
     # construction character *after* the aspect, so a hyphen in front is a separator rather than
     # part of the size ("MOTIVO 365-275/40R17"), and 3-digit width plus R/ZR keeps it specific.
-    r"(?<![\w./+])" r"(?P<service>{service})?" r"(?P<width>\d{{3}})" r"\s*[/ ]\s*" r"(?P<aspect>\d{{2,3}})"
+    r"(?<![\w./+])" r"(?P<service>{service})?" r"(?P<width>\d{{3}})"
+    # Exactly one separator character, with no whitespace around it. A real size is written
+    # "275/70R18" or, from Premier, "275 45R19" -- never "275 / 45". Allowing spaces on both
+    # sides let the pattern span a sentence: "Ford F-150 / 23-24 F-250" parsed as a 150/23-24.
+    r"(?:/|\ )" r"(?P<aspect>\d{{2,3}})"
     # Wheel Pros and a handful of Premier rows write a second slash before the construction
     # letter ("305/45/r22"); everyone else writes it flush.
     # ``(?<!\s)-`` on the bias alternative: a hyphen with a space in front of it is an
@@ -163,9 +177,14 @@ _MOTORCYCLE_METRIC_RE = re.compile(
 # Numeric / conventional. Requires the decimal point (``7.50-16``): without it, ``750-16`` is
 # indistinguishable from a part number, so it is not accepted.
 _NUMERIC_RE = re.compile(
-    r"(?<![\w./+-])"
-    r"(?P<service>{service})?"
-    r"(?P<width>\d{{1,2}}\.\d{{1,2}})"
+    r"(?<![\w./+-])" r"(?P<service>{service})?"
+    # Exactly two decimals, and no leading zero. Numeric sizes are conventionally written to two
+    # places ("7.50-16", "4.00-18", "4.60-17"), and requiring that is what keeps model-year ranges
+    # out: production rows read "Belltech LOWERING KIT 16.5-17 Chevy Silverado" (MY2016.5-2017)
+    # and "South Bend Clutch 05.5-13 Dodge" (MY2005.5-2013), both of which this notation would
+    # otherwise read as a tire. Costs the one-decimal agricultural sizes ("8.3-24", 9 rows in the
+    # catalog) -- worth it against year ranges appearing across 172 non-tire brands.
+    r"(?P<width>[1-9]\d?\.\d{{2}})"
     r"\s*(?P<construction>R|B|D|(?<!\s)-)\s*"
     r"(?P<rim>\d{{2}}(?:\.5)?)"
     r"(?P<trailing_service>LT|ST|C)?"
@@ -400,10 +419,14 @@ def _parse_metric(text: str) -> typing.Optional[ParsedSize]:
             continue
         if not _plausible_rim(rim):
             continue
+        construction = _construction_from(match.group("construction"))
+        if construction == CONSTRUCTION_BIAS and aspect < _MIN_BIAS_ASPECT:
+            continue
+        if width_mm > _WIDE_SECTION_MM and aspect > _MAX_ASPECT_FOR_WIDE:
+            continue
 
         section_height_in = (decimal.Decimal(width_mm) * aspect / 100) / MM_PER_INCH
         overall = _round(rim + 2 * section_height_in, "0.1")
-        construction = _construction_from(match.group("construction"))
         service_type = _service_type_from(match)
         rim_text = match.group("rim")
         # Bias renders as the bare hyphen the source wrote, not as the letter D. D is the formal

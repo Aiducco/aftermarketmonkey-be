@@ -187,6 +187,25 @@ class ParseNumericTests(SimpleTestCase):
         # Nominal, from section height == section width. See the module docstring.
         self.assertEqual(parsed.overall_diameter_in, decimal.Decimal("31.0"))
 
+    def test_model_year_ranges_are_not_tire_sizes(self):
+        # Real production rows. 16.5-17 is MY2016.5-2017 and 05.5-13 is MY2005.5-2013; both were
+        # being read as numeric tire sizes across 172 non-tire brands.
+        self.assertIsNone(tire_size.parse("Belltech LOWERING KIT 16.5-17 Chevy Silverado All Cabs 4WD 2in"))
+        self.assertIsNone(tire_size.parse("South Bend Clutch 05.5-13 Dodge 5.9/6.7L G56 Org Feramic Clutch"))
+        self.assertIsNone(tire_size.parse("Banks Power 07.5-18 Dodge Ram"))
+
+    def test_real_numeric_motorcycle_sizes_still_parse(self):
+        # Every numeric-notation spec already in the catalog is one of these.
+        for text, expected in [
+            ("Bridgestone Battlax BT46R Tire - 4.00-18 64H", "4.00-18"),
+            ("Bridgestone Trail Wing TW52 Tire - 4.60-18 63S", "4.60-18"),
+            ("TIRE ROAD CLASSIC REAR 4.00B18 64H BIAS TL", "4.00B18"),
+            ("FIRESTONE DELUXE CHAMPION 7.50-16", "7.50-16"),
+        ]:
+            parsed = tire_size.parse(text)
+            self.assertIsNotNone(parsed, text)
+            self.assertEqual(parsed.size_display, expected, text)
+
     def test_numeric_requires_a_decimal_point(self):
         # "750-16" is a part number as often as it is a size, so it is left unparsed.
         self.assertIsNone(tire_size.parse("SOME PART 750-16"))
@@ -219,13 +238,29 @@ class RejectionTests(SimpleTestCase):
     def test_a_spring_rate_is_not_a_tire_size(self):
         # Real production row. 4.5-10.5 is a progressive spring rate; a 10.5" rim does not exist
         # in numeric notation, which is what the half-inch rule encodes.
-        self.assertIsNone(
-            tire_size.parse("Ohlins 06-09 Kawasaki VN 900 Classic Fork Springs - Prog. 4.5-10.5 N/mm")
-        )
+        self.assertIsNone(tire_size.parse("Ohlins 06-09 Kawasaki VN 900 Classic Fork Springs - Prog. 4.5-10.5 N/mm"))
 
     def test_commercial_half_inch_rims_still_parse(self):
         self.assertEqual(tire_size.parse("245/70R19.5 136/134M G").rim_diameter_in, decimal.Decimal("19.5"))
         self.assertEqual(tire_size.parse("225/70R16.5 LRE").rim_diameter_in, decimal.Decimal("16.5"))
+
+    def test_ford_model_names_are_not_tire_sizes(self):
+        # "Ford F-150 / 23-24 F-250" read as a 150/23-24. Two guards: a real size never has
+        # whitespace around the slash, and a bias metric size is never low-profile.
+        for text in (
+            "WeatherTech 21-24 Ford F-150 / 23-24 F-250/F-350 Front & Rear",
+            "Westin 15-25 Ford F-150/19-24 RAM 1500/20-24 RAM 2500/3500",
+            "Ford Racing 18-20 F-150/17-19 Super Duty F-Series Off-Road",
+        ):
+            self.assertIsNone(tire_size.parse(text), text)
+
+    def test_a_wide_tire_is_never_high_aspect(self):
+        # "Vertex Pistons 22-24 XX 250/99-24 YZ 250" is a motocross model list.
+        self.assertIsNone(tire_size.parse("Vertex Pistons 22-24 XX 250/99-24 YZ 250/16-24 YZ 250 X"))
+        # ...but a narrow 100-series motorcycle size is real, and must survive.
+        self.assertEqual(tire_size.parse("Kenda 120/100-18 6PR 68M TT").size_display, "120/100-18")
+        # ...as does the tallest real car/truck sidewall.
+        self.assertEqual(tire_size.parse("235/85R16 120Q").size_display, "235/85R16")
 
     def test_empty_and_none(self):
         self.assertIsNone(tire_size.parse(None))
