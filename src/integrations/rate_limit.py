@@ -211,9 +211,51 @@ def _consume(buckets: typing.Sequence[Bucket], now_epoch: float) -> typing.Set[s
     return {b.scope for b in buckets if _window(b, now_epoch)[0] in granted_keys}
 
 
-def mark_exhausted(bucket: Bucket) -> None:
+def _cooldown_key(bucket: Bucket) -> str:
+    return "{}:cooldown:{}".format(bucket.scope, bucket.identity)
+
+
+def _cooldown_remaining(
+    buckets: typing.Sequence[Bucket], now_epoch: float
+) -> typing.Optional[typing.Tuple[Bucket, float]]:
+    """The first bucket (in the given order) still under an active cooldown, and its remaining seconds."""
+    if not buckets:
+        return None
+    keys = [_cooldown_key(b) for b in buckets]
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT bucket_key, expires_at FROM api_rate_buckets WHERE bucket_key = ANY(%s)", [keys])
+        expires_by_key = dict(cursor.fetchall())
+    now = timezone.now()
+    for bucket, key in zip(buckets, keys):
+        expires_at = expires_by_key.get(key)
+        if expires_at and expires_at > now:
+            return bucket, (expires_at - now).total_seconds()
+    return None
+
+
+# A cooldown longer than this is almost certainly a malformed Retry-After header, not a real
+# instruction -- never lock a shared credential out for longer than its own hourly window.
+MAX_COOLDOWN_SECONDS = 3600.0
+
+# Used only when the distributor's 429 carries no usable Retry-After -- confirmed the common
+# case for Turn 14 live 2026-08-27 (every observed 429 lacked one). A flat guess here would be
+# exactly the kind of made-up number this mechanism replaces the old fixed-window lockout for,
+# so instead: back off a short base, doubling each time another no-signal 429 lands before the
+# previous cooldown's memory expires, capped well short of an hour. One isolated 429 costs
+# almost nothing; a genuinely sustained exhaustion still backs off substantially without ever
+# guessing a single large number up front.
+_NO_SIGNAL_BASE_COOLDOWN_SECONDS = 20.0
+_NO_SIGNAL_MAX_COOLDOWN_SECONDS = 600.0
+# How long after a cooldown ends a fresh no-signal 429 still counts as "the same streak" rather
+# than starting over at the base -- long enough to cover back-to-back retries, short enough that
+# an unrelated 429 an hour later doesn't inherit a stale streak.
+_NO_SIGNAL_STREAK_MEMORY_SECONDS = 120.0
+
+
+def mark_exhausted(bucket: Bucket, retry_after_seconds: typing.Optional[float] = None) -> float:
     """
-    Slam ``bucket`` shut for the remainder of its current window.
+    Block every caller sharing ``bucket``'s (scope, identity) for a cooldown, and return the
+    lockout actually applied, in seconds.
 
     Called when the distributor returns 429 even though our own accounting said there was
     budget left -- which happens whenever something other than this codebase is spending the
@@ -221,26 +263,61 @@ def mark_exhausted(bucket: Bucket) -> None:
     or when their rolling window disagrees with our fixed one. Without this, every concurrent
     worker would have to discover the 429 independently and each would burn another request
     doing so.
+
+    ``retry_after_seconds``: the distributor's own reported cooldown (its 429 response's
+    Retry-After header), when it sent a usable one -- trusted directly, capped at
+    ``MAX_COOLDOWN_SECONDS`` as a guard against a malformed value. Pass ``None`` when there was
+    no usable header; see ``_NO_SIGNAL_*`` above for what happens then.
+
+    This is a separate, time-based lock (bucket_key suffixed ``:cooldown:``) rather than slamming
+    the fixed-window counter itself to its limit. The window counter can only naturally clear at
+    its own clock boundary -- up to an hour away -- and has no way to honor a distributor-reported
+    cooldown shorter than that remaining time. A prior version did exactly that (set count to
+    limit, expiring at the window boundary): observed live 2026-08-27, a single Turn 14 429
+    locked out every unrelated Turn 14 job sharing that credential (order sync, inventory
+    deltas, item updates) for the better part of an hour, regardless of what Turn 14's own
+    Retry-After actually said -- a five-alarm outage caused by our own over-caution, not by
+    Turn 14. If a cooldown turns out to be too short and another 429 follows, this simply sets
+    another cooldown at that point -- self-correcting, never over-blocking.
     """
-    key, remaining_seconds = _window(bucket, time.time())
-    expires_at = timezone.now() + timezone.timedelta(seconds=remaining_seconds)
+    key = _cooldown_key(bucket)
+    now = timezone.now()
+
+    if retry_after_seconds is not None:
+        lockout_seconds = max(0.0, min(retry_after_seconds, MAX_COOLDOWN_SECONDS))
+        stored_streak = 1
+        reason = "distributor-reported"
+    else:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT count, expires_at FROM api_rate_buckets WHERE bucket_key = %s", [key])
+            row = cursor.fetchone()
+        still_fresh = row and row[1] and (now - row[1]).total_seconds() < _NO_SIGNAL_STREAK_MEMORY_SECONDS
+        stored_streak = (row[0] + 1) if still_fresh else 1
+        lockout_seconds = min(
+            _NO_SIGNAL_BASE_COOLDOWN_SECONDS * (2 ** (stored_streak - 1)), _NO_SIGNAL_MAX_COOLDOWN_SECONDS
+        )
+        reason = "no Retry-After given, streak={}".format(stored_streak)
+
+    expires_at = now + timezone.timedelta(seconds=lockout_seconds)
     with connection.cursor() as cursor:
         cursor.execute(
             """
             INSERT INTO api_rate_buckets AS b
                 (bucket_key, count, limit_value, expires_at, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, NOW(), NOW())
+            VALUES (%s, %s, 0, %s, NOW(), NOW())
             ON CONFLICT (bucket_key) DO UPDATE
-                SET count = GREATEST(b.count, EXCLUDED.count),
+                SET count = EXCLUDED.count,
+                    expires_at = GREATEST(b.expires_at, EXCLUDED.expires_at),
                     updated_at = NOW()
             """,
-            [key, bucket.limit, bucket.limit, expires_at],
+            [key, stored_streak, expires_at],
         )
     logger.warning(
-        "{} Marked {} exhausted for the next {:.0f}s after an upstream 429.".format(
-            _LOG_PREFIX, bucket.scope, remaining_seconds
+        "{} Marked {} exhausted for the next {:.0f}s after an upstream 429 ({}).".format(
+            _LOG_PREFIX, bucket.scope, lockout_seconds, reason
         )
     )
+    return lockout_seconds
 
 
 def purge_expired() -> int:
@@ -277,13 +354,26 @@ def acquire(buckets: typing.Sequence[Bucket], meter_key: typing.Optional[str] = 
 
     Raises :class:`RateBudgetExhausted` if a hard bucket is full, or if a soft bucket is still
     full after ``_SOFT_MAX_ATTEMPTS`` window rollovers (which would mean a stuck clock, not
-    ordinary contention).
+    ordinary contention), or if a prior call to :func:`mark_exhausted` set an active cooldown
+    on any of these buckets (checked first, before spending a real round trip on the window
+    counters -- a cooldown means we already know not to call yet).
     """
     hard = [b for b in buckets if not b.is_soft]
     soft = [b for b in buckets if b.is_soft]
 
-    # One round trip for the common case: everything has budget and the call proceeds.
     now = time.time()
+
+    cooldown_hit = _cooldown_remaining(buckets, now)
+    if cooldown_hit is not None:
+        bucket, remaining = cooldown_hit
+        raise RateBudgetExhausted(
+            scope="{} (cooldown)".format(bucket.scope),
+            limit=bucket.limit,
+            period_seconds=bucket.period_seconds,
+            retry_after_seconds=remaining,
+        )
+
+    # One round trip for the common case: everything has budget and the call proceeds.
     granted = _consume(buckets, now)
 
     exhausted_hard = [b for b in hard if b.scope not in granted]

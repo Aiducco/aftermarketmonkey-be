@@ -27,6 +27,8 @@ import threading
 import time
 import typing
 
+import requests
+
 from src.integrations import rate_limit
 
 GET_PER_SECOND = 5
@@ -86,6 +88,25 @@ def hourly_bucket(client_id: str) -> rate_limit.Bucket:
     return rate_limit.Bucket(
         "t14:get:hour", rate_limit.identity_for(client_id), GET_PER_HOUR, 3600
     )
+
+
+def parse_retry_after_seconds(response: requests.Response) -> typing.Optional[float]:
+    """
+    ``Retry-After`` in seconds when a 429 response carries a usable one, else ``None``.
+
+    Shared by both Turn 14 clients so a 429's real, distributor-reported cooldown -- when it
+    sends one -- is what gets passed to :func:`src.integrations.rate_limit.mark_exhausted`,
+    rather than each client guessing its own default. ``None`` (no usable header) is common in
+    practice for Turn 14 -- confirmed live 2026-08-27 -- and is a real, meaningful case
+    ``mark_exhausted`` handles deliberately (backoff, not a flat guess); it is not a placeholder
+    for "assume it's fine."
+    """
+    raw = (response.headers or {}).get("Retry-After")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
 
 
 def get_cached_token(client_id: str) -> typing.Optional[str]:

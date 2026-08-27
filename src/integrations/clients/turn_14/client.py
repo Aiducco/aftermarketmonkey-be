@@ -14,15 +14,6 @@ from src.integrations.clients.turn_14 import rate_limit as turn14_rate_limit
 logger = logging.getLogger(__name__)
 
 
-def _retry_after_seconds(response: requests.Response, default: float = 300.0) -> float:
-    """``Retry-After`` in seconds when the response carries a usable one, else ``default``."""
-    raw = (response.headers or {}).get("Retry-After")
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        return default
-    return value if value > 0 else default
-
 # requests.request() had no timeout at all before, so a stalled Turn 14 response could hang
 # the calling thread indefinitely — this matters now that test_connection() runs synchronously
 # inside the connect/update-connection HTTP request.
@@ -418,20 +409,25 @@ class Turn14ApiClient(object):
             # our local count is an undercount -- shut the hour bucket so concurrent workers
             # stop immediately instead of each discovering the 429 for themselves, and raise
             # RateBudgetExhausted so the caller defers rather than skipping this brand and
-            # marching into the next one.
+            # marching into the next one. mark_exhausted trusts Turn 14's own Retry-After when
+            # it sends one, or backs off a short, doubling cooldown when it doesn't (the common
+            # case in practice) -- never a long guessed lockout. Using its returned value (not
+            # the raw header) for both the log and the exception keeps what we tell this caller
+            # to sleep in sync with what every other caller sharing this credential just got
+            # locked out for.
             if response.status_code == 429:
-                retry_after = _retry_after_seconds(response)
-                rate_limit_base.mark_exhausted(turn14_rate_limit.hourly_bucket(self.client_id))
+                retry_after = turn14_rate_limit.parse_retry_after_seconds(response)
+                applied = rate_limit_base.mark_exhausted(turn14_rate_limit.hourly_bucket(self.client_id), retry_after)
                 logger.warning(
                     "{} Upstream 429 (endpoint={}). Deferring for {:.0f}s.".format(
-                        self.LOG_PREFIX, endpoint, retry_after
+                        self.LOG_PREFIX, endpoint, applied
                     )
                 )
                 raise rate_limit_base.RateBudgetExhausted(
                     scope="t14:get:hour (upstream 429)",
                     limit=turn14_rate_limit.GET_PER_HOUR,
                     period_seconds=3600,
-                    retry_after_seconds=retry_after,
+                    retry_after_seconds=applied,
                 )
 
             if response.status_code not in self.VALID_STATUS_CODES:

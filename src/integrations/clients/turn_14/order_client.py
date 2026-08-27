@@ -150,14 +150,17 @@ class Turn14OrderApiClient(object):
                 endpoint, method, payload=payload, params=params, retry_on_401=False, buckets=buckets
             )
 
-        # See client.py's _request for why a 429 shuts the local bucket and defers.
+        # See client.py's _request for why a 429 shuts the local bucket and defers, and for why
+        # mark_exhausted's returned value (not a hardcoded guess) is what both the exception and
+        # every other caller sharing this credential see.
         if response.status_code == 429:
-            rate_limit_base.mark_exhausted(turn14_rate_limit.hourly_bucket(self._identity))
+            retry_after = turn14_rate_limit.parse_retry_after_seconds(response)
+            applied = rate_limit_base.mark_exhausted(turn14_rate_limit.hourly_bucket(self._identity), retry_after)
             raise rate_limit_base.RateBudgetExhausted(
                 scope="t14:get:hour (upstream 429)",
                 limit=turn14_rate_limit.GET_PER_HOUR,
                 period_seconds=3600,
-                retry_after_seconds=300.0,
+                retry_after_seconds=applied,
             )
 
         if response.status_code not in self.VALID_STATUS_CODES:
