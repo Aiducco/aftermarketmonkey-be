@@ -81,9 +81,22 @@ class RateBudgetExhausted(Exception):
     """
     A hard (hour/day) budget is spent. Callers should checkpoint and retry in a later window --
     never busy-wait, and never fall through to the next item as if this were a transport error.
+
+    ``checkpoint`` is that checkpoint: an opaque, caller-defined resume marker (a page number,
+    a cursor, whatever the failing operation was partway through) that a paginated caller can
+    attach before this propagates, so a retry can pick up where the last attempt actually got
+    to instead of starting over. ``None`` (the default) means "nothing to resume from" -- either
+    the operation isn't paginated, or it failed before making any progress worth remembering.
     """
 
-    def __init__(self, scope: str, limit: int, period_seconds: int, retry_after_seconds: float) -> None:
+    def __init__(
+        self,
+        scope: str,
+        limit: int,
+        period_seconds: int,
+        retry_after_seconds: float,
+        checkpoint: typing.Any = None,
+    ) -> None:
         Exception.__init__(
             self,
             "Rate budget exhausted for {} ({} requests per {}s). Retry in {:.0f}s.".format(
@@ -94,6 +107,7 @@ class RateBudgetExhausted(Exception):
         self.limit = limit
         self.period_seconds = period_seconds
         self.retry_after_seconds = retry_after_seconds
+        self.checkpoint = checkpoint
 
 
 # RateBudgetExhausted's own docstring already says the right response: "checkpoint and retry in
@@ -125,11 +139,39 @@ def retry_on_rate_budget(
                 raise
             wait_s = e.retry_after_seconds + 5
             log_fn(
-                "{}: rate budget exhausted (attempt {}/{}), waiting {:.0f}s then retrying: {}".format(
-                    step_name, attempt, max_retries, wait_s, e
+                "{}: rate budget exhausted (attempt {}/{}), waiting {:.0f}s then retrying{}: {}".format(
+                    step_name, attempt, max_retries, wait_s,
+                    " from checkpoint={}".format(e.checkpoint) if e.checkpoint is not None else "",
+                    e,
                 )
             )
             time.sleep(wait_s)
+
+
+def resumable_sweep(sweep_fn: typing.Callable[..., typing.Any], **fixed_kwargs: typing.Any) -> typing.Callable[[], typing.Any]:
+    """
+    Wrap a paginated sweep function into a zero-arg callable suitable for
+    :func:`retry_on_rate_budget`, so each retry resumes from the previous attempt's checkpoint
+    instead of restarting from page 1.
+
+    ``sweep_fn`` must accept a ``start_page`` keyword (see ``turn_14_sweeps._sweep``) and raise
+    :class:`RateBudgetExhausted` with ``.checkpoint`` set to the page it failed on -- ``_sweep``
+    already does this. Real incident (2026-08-27): without this, a ~1,724-page sweep hit a
+    transient upstream 429 five times over 49 minutes and burned ~4,600 requests -- roughly
+    2.7x the catalog's actual size -- because every retry re-walked pages the previous attempt
+    had already fetched successfully, instead of picking up where it left off.
+    """
+    state: typing.Dict[str, int] = {"start_page": 1}
+
+    def _call() -> typing.Any:
+        try:
+            return sweep_fn(start_page=state["start_page"], **fixed_kwargs)
+        except RateBudgetExhausted as e:
+            if e.checkpoint is not None:
+                state["start_page"] = e.checkpoint
+            raise
+
+    return _call
 
 
 class Bucket(typing.NamedTuple):

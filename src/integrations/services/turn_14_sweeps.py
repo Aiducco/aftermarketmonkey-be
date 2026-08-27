@@ -32,6 +32,7 @@ import pgbulk
 from django.utils import timezone
 
 from src import models as src_models
+from src.integrations import rate_limit as rate_limit_base
 from src.integrations.services import master_parts
 from src.integrations.services import turn_14 as turn_14_services
 from src.integrations.services import turn_14_global
@@ -104,26 +105,40 @@ def _sweep(
     fetch_page: typing.Callable[[int], typing.Tuple[typing.List[typing.Dict], typing.Optional[int]]],
     flush: typing.Callable[[typing.List[typing.Dict]], int],
     max_pages: typing.Optional[int] = None,
+    start_page: int = 1,
 ) -> typing.Tuple[int, int]:
     """
     Page an endpoint to exhaustion, handing ``flush`` batches of raw rows.
 
-    Returns (rows_seen, rows_written). Deliberately does not catch RateBudgetExhausted: a spent
-    budget must abort the sweep so the caller can defer it, not silently truncate the catalog
-    and report success -- a half-swept catalog that looks complete is worse than a failed run,
-    because the deactivation pass would then mark every unseen item inactive.
+    Returns (rows_seen, rows_written). Deliberately does not swallow RateBudgetExhausted: a
+    spent budget must abort the sweep so the caller can defer it, not silently truncate the
+    catalog and report success -- a half-swept catalog that looks complete is worse than a
+    failed run, because the deactivation pass would then mark every unseen item inactive.
+    It is, however, caught just long enough to attach the page it happened on as the
+    exception's ``checkpoint`` before re-raising -- see ``start_page`` below for why.
 
     ``max_pages`` stops after that many pages regardless of what the API still has left -- a
     real, permanent feature (not a test-only hack) for bounded smoke tests of a sweep before
     trusting it with a full, hours-long catalog run.
+
+    ``start_page`` resumes a walk that previously failed partway through, instead of paging
+    from 1 again. Real incident (2026-08-27): a ~1,724-page sweep hit a transient upstream 429
+    five times over 49 minutes; every retry restarted from page 1 because nothing carried the
+    failed page forward, burning ~4,600 requests without the sweep ever actually finishing. A
+    caller that catches ``RateBudgetExhausted`` and passes its ``.checkpoint`` back in as
+    ``start_page`` on the next attempt resumes instead of repeating already-fetched pages.
     """
-    page: typing.Optional[int] = 1
+    page: typing.Optional[int] = start_page
     buffer: typing.List[typing.Dict] = []
     seen = written = 0
     pages_fetched = 0
 
     while page is not None:
-        rows, next_page = fetch_page(page)
+        try:
+            rows, next_page = fetch_page(page)
+        except rate_limit_base.RateBudgetExhausted as e:
+            e.checkpoint = page
+            raise
         pages_fetched += 1
         seen += len(rows)
         buffer.extend(rows)
@@ -154,7 +169,7 @@ def _sweep(
 # Global (shared) sweeps
 # ---------------------------------------------------------------------------------------
 
-def sweep_items(client=None, max_pages: typing.Optional[int] = None) -> typing.Tuple[int, int]:
+def sweep_items(client=None, max_pages: typing.Optional[int] = None, start_page: int = 1) -> typing.Tuple[int, int]:
     """GET /v1/items over the whole catalog into Turn14Items."""
     client = client or turn_14_global.get_global_client()
     brands = _brand_by_external_id()
@@ -188,7 +203,7 @@ def sweep_items(client=None, max_pages: typing.Optional[int] = None) -> typing.T
         )
         return len(instances)
 
-    result = _sweep("items", client.get_items, flush, max_pages=max_pages)
+    result = _sweep("items", client.get_items, flush, max_pages=max_pages, start_page=start_page)
     if unknown_brands:
         # Turn 14 published items for a brand we have not mapped yet. Not fatal -- the next
         # brands sync picks it up -- but silence here would hide a growing blind spot.
@@ -200,7 +215,9 @@ def sweep_items(client=None, max_pages: typing.Optional[int] = None) -> typing.T
     return result
 
 
-def sweep_items_data(client=None, max_pages: typing.Optional[int] = None) -> typing.Tuple[int, int]:
+def sweep_items_data(
+    client=None, max_pages: typing.Optional[int] = None, start_page: int = 1
+) -> typing.Tuple[int, int]:
     """GET /v1/items/data over the whole catalog into Turn14BrandData (media + descriptions)."""
     client = client or turn_14_global.get_global_client()
 
@@ -232,10 +249,12 @@ def sweep_items_data(client=None, max_pages: typing.Optional[int] = None) -> typ
         )
         return len(instances)
 
-    return _sweep("items/data", client.get_items_data, flush, max_pages=max_pages)
+    return _sweep("items/data", client.get_items_data, flush, max_pages=max_pages, start_page=start_page)
 
 
-def sweep_inventory(client=None, max_pages: typing.Optional[int] = None) -> typing.Tuple[int, int]:
+def sweep_inventory(
+    client=None, max_pages: typing.Optional[int] = None, start_page: int = 1
+) -> typing.Tuple[int, int]:
     """GET /v1/inventory over the whole catalog into Turn14BrandInventory."""
     client = client or turn_14_global.get_global_client()
 
@@ -281,10 +300,10 @@ def sweep_inventory(client=None, max_pages: typing.Optional[int] = None) -> typi
         )
         return len(instances)
 
-    return _sweep("inventory", client.get_inventory, flush, max_pages=max_pages)
+    return _sweep("inventory", client.get_inventory, flush, max_pages=max_pages, start_page=start_page)
 
 
-def sweep_fitment(client=None, max_pages: typing.Optional[int] = None) -> typing.Tuple[int, int]:
+def sweep_fitment(client=None, max_pages: typing.Optional[int] = None, start_page: int = 1) -> typing.Tuple[int, int]:
     """
     GET /v1/items/fitment over the whole catalog, decoded straight into MasterPartFitment.
 
@@ -373,7 +392,7 @@ def sweep_fitment(client=None, max_pages: typing.Optional[int] = None) -> typing
         )
         return len(to_upsert)
 
-    result = _sweep("items/fitment", client.get_items_fitment, flush, max_pages=max_pages)
+    result = _sweep("items/fitment", client.get_items_fitment, flush, max_pages=max_pages, start_page=start_page)
     if skipped_unknown_item[0] or skipped_unknown_vehicle[0]:
         logger.warning(
             "{} fitment sweep: skipped {} row(s) for items with no MasterPart, {} vehicle_id(s) "
@@ -456,7 +475,9 @@ def sweep_shipping_options(client=None) -> int:
     return len(instances)
 
 
-def sweep_shipping_estimates(client=None, max_pages: typing.Optional[int] = None) -> typing.Tuple[int, int]:
+def sweep_shipping_estimates(
+    client=None, max_pages: typing.Optional[int] = None, start_page: int = 1
+) -> typing.Tuple[int, int]:
     """
     GET /v1/shipping/item_estimation over the whole catalog into Turn14ItemShippingEstimate.
 
@@ -503,7 +524,10 @@ def sweep_shipping_estimates(client=None, max_pages: typing.Optional[int] = None
         )
         return len(instances)
 
-    return _sweep("shipping/item_estimation", client.get_item_shipping_estimates, flush, max_pages=max_pages)
+    return _sweep(
+        "shipping/item_estimation", client.get_item_shipping_estimates, flush,
+        max_pages=max_pages, start_page=start_page,
+    )
 
 
 def deactivate_items_missing_from_sweep(sweep_started_at) -> int:

@@ -119,7 +119,7 @@ class Command(BaseCommand):
                     "shipping_options", lambda: turn_14_sweeps.sweep_shipping_options(client), self.stdout.write
                 )
                 results["items"] = rate_limit_base.retry_on_rate_budget(
-                    "items", lambda: turn_14_sweeps.sweep_items(client), self.stdout.write
+                    "items", rate_limit_base.resumable_sweep(turn_14_sweeps.sweep_items, client=client), self.stdout.write
                 )
 
                 # Only depends on the items sweep just above -- a completed flat items sweep
@@ -133,12 +133,14 @@ class Command(BaseCommand):
                 # than phase 2 -- phase 2 is then just inventory/dropship/shipping estimates plus
                 # propagation, comfortably lighter.
                 results["items_data"] = rate_limit_base.retry_on_rate_budget(
-                    "items_data", lambda: turn_14_sweeps.sweep_items_data(client), self.stdout.write
+                    "items_data", rate_limit_base.resumable_sweep(turn_14_sweeps.sweep_items_data, client=client),
+                    self.stdout.write,
                 )
 
             if run_phase2:
                 results["inventory"] = rate_limit_base.retry_on_rate_budget(
-                    "inventory", lambda: turn_14_sweeps.sweep_inventory(client), self.stdout.write
+                    "inventory", rate_limit_base.resumable_sweep(turn_14_sweeps.sweep_inventory, client=client),
+                    self.stdout.write,
                 )
 
                 if not options["skip_dropship"]:
@@ -147,7 +149,9 @@ class Command(BaseCommand):
                     )
                 if not options["skip_shipping_estimates"]:
                     results["shipping_estimates"] = rate_limit_base.retry_on_rate_budget(
-                        "shipping_estimates", lambda: turn_14_sweeps.sweep_shipping_estimates(client), self.stdout.write
+                        "shipping_estimates",
+                        rate_limit_base.resumable_sweep(turn_14_sweeps.sweep_shipping_estimates, client=client),
+                        self.stdout.write,
                     )
 
                 # Only after every raw sweep above completed -- propagating from a half-swept
