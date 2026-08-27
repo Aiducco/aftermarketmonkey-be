@@ -61,9 +61,13 @@ SPEED_RATINGS = frozenset(["A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8"] + lis
 # symbols (C, D, E, F, G, H, J, L, M, N are in both), which is why load range is only ever read
 # from a *standalone* token after the service description has already claimed the letter glued
 # to the load index. Position disambiguates; a set lookup alone cannot.
-# Mirrors ``load_range_ply`` plus its aliases. LL is the light-load passenger designation;
-# RD and REINFORCED are two more stampings of XL, alongside RF.
-LOAD_RANGES = frozenset(["SL", "XL", "LL", "RF", "RD", "REINFORCED"] + list("ABCDEFGHJLMN"))
+# Mirrors ``load_range_ply`` plus its aliases, MINUS "RD". RD is a genuine XL stamping and stays
+# in the lookup table for resolution, but as a token in a distributor title it is "Road"
+# abbreviated: all 68 catalog matches were Kumho Road Venture ("KU RD VENTURE RT"), none a load
+# range. LL is kept -- its 39 matches are all competition tires from three different brands
+# ("HO DOT DRAG RAD2 LL", "GY EG F1 GS2 EMT LL"), and that cross-brand consistency is what marks
+# it as a standard designation rather than one vendor's code.
+LOAD_RANGES = frozenset(["SL", "XL", "LL", "RF", "REINFORCED"] + list("ABCDEFGHJLMN"))
 
 # Physically plausible bounds. These are not style checks -- they are what stops a wheel offset
 # or a bolt pattern from being read as a rim diameter. Every one of them fires on real catalog
@@ -219,8 +223,40 @@ _SERVICE_DESCRIPTION_RE = re.compile(
 # "OPEN COUNTRY M/T" were yielding Load Range A and M -- 978 catalog rows, 1,021 persisted specs,
 # and a wrong ply_rating derived from each. A slash followed by a DIGIT is still fine, because
 # that is the real "E/10" ply notation.
+# Two guards, one for each side of an X/Y model designation:
+#   ``(?!/[A-Za-z])``   rejects the A of "GRAND SPORT A/S" and the M of "OPEN COUNTRY M/T"
+#   ``(?<![A-Za-z]/)``  rejects the A of "All Terrain T/A", where the letter follows the slash
+# A slash preceded by a DIGIT is the real thing and must still pass: "LT255/75R17/C" writes its
+# load range exactly that way. Without the second guard, every BFGoodrich T/A -- 173 rows --
+# was about to be given Load Range A, overwriting the C or E the same title actually stated.
+# "/C" or "/E" immediately after the rim -- BFGoodrich writes "LT255/75R17/C 111/108S". Anchored
+# with ``\A`` so only the character right after the size can match.
+# Of the markers that can be glued to a rim, only these are load designations.
+_GLUED_LOAD_DESIGNATIONS = frozenset(["XL", "SL", "RF"])
+
+_LEADING_LOAD_RANGE_RE = re.compile(
+    # A digit may follow with no space -- "LT235/75R15/D110/107S" glues the load index
+    # straight onto the designation. A letter may not, or "/DOT" would read as Load Range D.
+    r"\A/(SL|XL|LL|RF|[A-N])(?![A-Za-z.])",
+    re.IGNORECASE,
+)
+
+# Guards against every way a letter that is not a load range shows up standing alone after a
+# size. All four were found in production:
+#
+#   (?<![A-Za-z]/)   "All Terrain T/A KO3"     -- the A follows the slash
+#   (?!/[A-Za-z])    "GRAND SPORT A/S"         -- the A precedes it
+#   (?<!-) (?!-\w)   "GY EAG RS-A", "M-108+"   -- a hyphenated model suffix or prefix
+#   (?! [TS]\b)      "BAJA BOSS A T"           -- A/T and M/T written with a space
+#   (?! ?&) (?<!& )  "M & H RADIAL DRAG"       -- M&H Racemaster, on both sides of the ampersand
+#
+# The last one is safe because a real designation is never followed by a bare T or S: a load
+# range is the end of the service description, and what follows is a diameter or a part number.
 _LOAD_RANGE_TOKEN_RE = re.compile(
-    r"(?<![\w.])(?:LR)?(REINFORCED|SL|XL|LL|RF|RD|[A-N])(?!/[A-Za-z])(?![\w.])", re.IGNORECASE
+    r"(?<![A-Za-z]/)(?<!-)(?<!& )(?<![\w.])"
+    r"(?:LR)?(REINFORCED|SL|XL|LL|RF|[A-N])"
+    r"(?!/[A-Za-z])(?!-\w)(?! [TS]\b)(?! ?&)(?![\w.])",
+    re.IGNORECASE,
 )
 
 
@@ -351,6 +387,15 @@ def _parse_service_description(tail: str) -> typing.Dict[str, typing.Any]:
         "load_range": None,
     }
 
+    # A load range glued to the rim with a slash comes BEFORE the service description:
+    # "LT255/75R17/C 111/108S" leaves a tail of "/C 111/108S". It has to be taken off the front
+    # first, or the letter blocks the service description's own lookbehind and
+    # "LT235/75R15/D110/107S" reads the dual load 107 as the primary instead of 110.
+    leading = _LEADING_LOAD_RANGE_RE.match(tail)
+    if leading is not None and leading.group(1).upper() in LOAD_RANGES:
+        result["load_range"] = leading.group(1).upper()
+        tail = tail[leading.end() :]
+
     consumed_to = 0
     for match in _SERVICE_DESCRIPTION_RE.finditer(tail):
         speed = match.group("speed").upper()
@@ -369,7 +414,10 @@ def _parse_service_description(tail: str) -> typing.Dict[str, typing.Any]:
         consumed_to = match.end()
         break
 
-    # Load range is a standalone token, and only after the service description has already taken
+    if result["load_range"] is not None:
+        return result
+
+    # Otherwise it is a standalone token, and only after the service description has already taken
     # the letter glued to the load index -- otherwise the E of "115/Q E" and the Q both compete
     # for the same vocabulary.
     for match in _LOAD_RANGE_TOKEN_RE.finditer(tail, consumed_to):
@@ -379,6 +427,33 @@ def _parse_service_description(tail: str) -> typing.Dict[str, typing.Any]:
             break
 
     return result
+
+
+# The letter designations A-N are the LT/ST vocabulary. A passenger tire expresses load through
+# SL/XL/LL and never carries one, so a lone letter after a passenger size is something else --
+# and on premium brands it is almost always an OE homologation marking: Pirelli stamps J for
+# Jaguar, L for Lamborghini, N for Porsche, F for Ferrari. Those were landing as Load Range J,
+# L, N and F on hundreds of rows. Accepting letters only where they can physically apply kills
+# the whole class at once, rather than one brand's code at a time.
+_LETTER_LOAD_RANGES = frozenset("ABCDEFGHJLMN")
+
+
+def _letter_load_range_applies(
+    *,
+    service_type: typing.Optional[str],
+    notation: str,
+    rim: decimal.Decimal,
+    load_index_dual: typing.Optional[int],
+) -> bool:
+    if service_type in ("LT", "ST", "C"):
+        return True
+    if notation == NOTATION_FLOTATION:
+        return True
+    # Commercial rims (17.5 and up in half-inch sizes) and a dual load rating both mean a
+    # truck tire, whether or not the distributor wrote the service type.
+    if rim >= decimal.Decimal("17.5") and rim % 1:
+        return True
+    return load_index_dual is not None
 
 
 def _finish(
@@ -395,10 +470,20 @@ def _finish(
     section_width_in: typing.Optional[decimal.Decimal] = None,
 ) -> ParsedSize:
     service_description = _parse_service_description(tail)
+    # An allowlist, not a denylist: the marker group also carries TL/TT (tube markers) and M/C
+    # (the motorcycle marker), none of which are load designations. Denying only "TL" let M/C
+    # through as a load range on real rows.
     glued_marker = (match.groupdict().get("trailing_marker") or "").upper()
-    if glued_marker and glued_marker != "TL":
-        # TL is "tubeless", a construction marker rather than a load designation.
+    if glued_marker in _GLUED_LOAD_DESIGNATIONS:
         service_description["load_range"] = glued_marker
+
+    if service_description["load_range"] in _LETTER_LOAD_RANGES and not _letter_load_range_applies(
+        service_type=_service_type_from(match),
+        notation=notation,
+        rim=rim_diameter_in,
+        load_index_dual=service_description["load_index_dual"],
+    ):
+        service_description["load_range"] = None
     return ParsedSize(
         notation=notation,
         size_display=size_display,

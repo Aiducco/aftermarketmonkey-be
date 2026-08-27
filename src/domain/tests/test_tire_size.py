@@ -62,6 +62,68 @@ class ParseMetricTests(SimpleTestCase):
         self.assertIsNone(tire_size.parse("265/75R16 OP H/T 2657516").load_range)
         self.assertIsNone(tire_size.parse("LT285/70R17 OPEN COUNTRY M/T").load_range)
 
+    def test_rd_in_a_title_is_road_abbreviated_not_a_load_range(self):
+        # RD is a real XL stamping and stays in load_range_ply, but every one of its 68 catalog
+        # matches was Kumho Road Venture.
+        self.assertIsNone(tire_size.parse("LT295/70R18 KU RD VENTURE RT").load_range)
+        # The C here IS a real load range; only the RD must be ignored.
+        self.assertEqual(tire_size.parse("33X12.5R20~~KU RD VENT MT71 C").load_range, "C")
+
+    def test_every_way_a_designation_letter_is_not_a_load_range(self):
+        """
+        A single letter standing after a size is only sometimes a load range. Each of these was a
+        real false positive, found by sweeping the parsed distribution for implausible values --
+        Load Range M is a 22-ply commercial rating and was landing on ATV and drag tires.
+        """
+        for text in (
+            "215/35R18 GRAND SPORT A/S",  # A/S -- slash after
+            "BFGoodrich All Terrain T/A KO3 LT255/75R17 111S",  # T/A -- slash before
+            "P215/45R17 GY EAG RS-A       #",  # RS-A -- hyphen before
+            "ST225/75R15 117/112M M-108+ 28.3",  # M-108+ -- hyphen after
+            "Mickey Thompson LT295 60R20 126 123Q BAJA BOSS A T",  # A T -- space, not slash
+            "390/40R17 M & H RADIAL DRAG REAR",  # M&H -- the brand
+            "LT295/70R18 KU RD VENTURE RT",  # RD -- "Road" abbreviated
+        ):
+            self.assertIsNone(tire_size.parse(text).load_range, text)
+
+    def test_load_range_written_directly_after_the_rim(self):
+        # BFGoodrich writes it as part of the size, before the service description.
+        parsed = tire_size.parse("BFGoodrich All Terrain T/A KO3 LT255/75R17/C 111/108S")
+        self.assertEqual(parsed.load_range, "C")
+        self.assertEqual(parsed.load_index, 111)
+        # And with the load index glued straight on, which used to make 107 look like the primary.
+        glued = tire_size.parse("LT235/75R15/D110/107S AT T/A KO3")
+        self.assertEqual((glued.load_range, glued.load_index, glued.load_index_dual), ("D", 110, 107))
+
+    def test_oe_homologation_markings_are_not_load_ranges(self):
+        """
+        The letter designations A-N are the LT/ST vocabulary; a passenger tire uses SL/XL/LL. A
+        lone letter after a passenger size is something else, and on premium brands it is an OE
+        marking -- Pirelli stamps J for Jaguar, L for Lamborghini, N for Porsche. Those were
+        landing as load ranges on hundreds of rows.
+        """
+        for text in (
+            "255/35R19  PI P ZERO PZ4 J  #*",
+            "285/40R22 PI SCOR WINTER L   #",
+            "225/55R19  NE N PRIZ RH7     #",
+        ):
+            self.assertIsNone(tire_size.parse(text).load_range, text)
+
+    def test_letter_load_ranges_survive_where_they_can_apply(self):
+        for text, expected in (
+            ("LT225/75R16 115/Q E 29.53", "E"),  # LT service type
+            ("35x12.50R17 128/R F 34.53", "F"),  # flotation
+            ("ST175/80D13 B/4 SPOKEWHITE", "B"),  # ST trailer
+            ("Toyo M1430 Tire - 235/75R17.5 143/141L J/18", "J"),  # commercial rim + dual load
+        ):
+            self.assertEqual(tire_size.parse(text).load_range, expected, text)
+
+    def test_ll_is_a_real_designation(self):
+        # 39 catalog rows, all competition tires, across three brands -- cross-brand consistency
+        # is what separates a standard designation from one vendor's code.
+        self.assertEqual(tire_size.parse("P315/30R18 HO DOT DRAG RAD2 LL").load_range, "LL")
+        self.assertEqual(tire_size.parse("P245/40R18~GY EG F1 GS2 EMT LL").load_range, "LL")
+
     def test_a_ply_suffix_after_the_load_range_still_parses(self):
         # "E/10" is Load Range E with a 10-ply equivalence -- a slash followed by a DIGIT, which
         # must stay allowed even though a slash followed by a letter is now rejected.
