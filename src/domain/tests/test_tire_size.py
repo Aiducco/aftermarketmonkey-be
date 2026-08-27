@@ -55,6 +55,44 @@ class ParseMetricTests(SimpleTestCase):
         self.assertIsNone(parsed.load_index_dual)
         self.assertEqual(parsed.speed_rating, "H")
 
+    def test_a_model_designation_is_not_a_load_range(self):
+        # "GRAND SPORT A/S" and "OPEN COUNTRY M/T" were yielding Load Range A and M on 978
+        # catalog rows, with a ply_rating derived from each.
+        self.assertIsNone(tire_size.parse("215/35R18 GRAND SPORT A/S").load_range)
+        self.assertIsNone(tire_size.parse("265/75R16 OP H/T 2657516").load_range)
+        self.assertIsNone(tire_size.parse("LT285/70R17 OPEN COUNTRY M/T").load_range)
+
+    def test_a_ply_suffix_after_the_load_range_still_parses(self):
+        # "E/10" is Load Range E with a 10-ply equivalence -- a slash followed by a DIGIT, which
+        # must stay allowed even though a slash followed by a letter is now rejected.
+        self.assertEqual(tire_size.parse("Toyo Open Country M/T LT275/70R18 125P E/10").load_range, "E")
+        self.assertEqual(tire_size.parse("295/75R22.5 144/141L G/14").load_range, "G")
+
+    def test_dual_load_separated_by_a_space(self):
+        # Premier writes the whole size with spaces: "LT275 65R20 126 123S". Accepting only the
+        # slash made the regex skip 126 and take 123 -- the dual, and the lower number -- as the
+        # load index on 224 catalog rows, understating max_load_lb on every one.
+        parsed = tire_size.parse("Falken WDPEAK AT4W LT275 65R20 126 123S E 34.1 F28840025")
+        self.assertEqual(parsed.load_index, 126)
+        self.assertEqual(parsed.load_index_dual, 123)
+        self.assertEqual(parsed.speed_rating, "S")
+
+    def test_commercial_c_renders_after_the_rim(self):
+        # 225/75R16C is the industry spelling; C225/75R16 appears nowhere and would not match a
+        # customer's search. LT/ST/P/T still prefix.
+        parsed = tire_size.parse("225/75R16C 121/120R E/10 M165")
+        self.assertEqual(parsed.service_type, "C")
+        self.assertEqual(parsed.size_display, "225/75R16C")
+        self.assertEqual(tire_size.parse("LT275/70R18 116T").size_display, "LT275/70R18")
+
+    def test_decimal_less_commercial_rim(self):
+        # "R225" is R22.5 with the decimal dropped -- 43 catalog rows, all commercial truck.
+        parsed = tire_size.parse("315/80R225 154K L/20 M320Z 55")
+        self.assertEqual(parsed.rim_diameter_in, decimal.Decimal("22.5"))
+        self.assertEqual(parsed.size_display, "315/80R22.5")
+        # A three-digit group that is not a plausible half-inch rim is still rejected.
+        self.assertIsNone(tire_size.parse("225/70R199 something"))
+
     def test_dual_load_index(self):
         parsed = tire_size.parse("LT245/75R16 120/116S E")
         self.assertEqual(parsed.load_index, 120)
@@ -289,6 +327,42 @@ class ParseBestTests(SimpleTestCase):
         self.assertEqual(best.load_index, 116)
         self.assertEqual(best.speed_rating, "Q")
         self.assertEqual(best.load_range, "SL")
+
+    def test_fields_are_merged_from_sibling_titles(self):
+        """
+        The winning title is not the only source. Found by asking an LLM the same question: it
+        read all the titles and reported an XL the parser dropped, because parse_best took every
+        field from the single richest title. 2.6% of enriched tires were losing a field this way.
+        """
+        best = tire_size.parse_best(
+            [
+                "Toyo Extensa A/S II Tire - P255/50R20 109H",
+                "EXTENSA AS2 255/50R20 109H 30.1",
+                "255/50R20~ TO EXTENSA AS II XL",
+            ]
+        )
+        self.assertEqual(best.size_display, "P255/50R20")
+        self.assertEqual(best.load_range, "XL")
+
+    def test_zr_from_a_sibling_title_wins_over_plain_r(self):
+        # ZR is strictly more specific -- it says the size carries the high-speed marker.
+        best = tire_size.parse_best(
+            [
+                "Toyo Proxes Sport Tire - 345/25R20 XL 104Y",
+                "345/25ZR20 (104Y) XL PXSP TL",
+            ]
+        )
+        self.assertEqual(best.construction, tire_size.CONSTRUCTION_ZR)
+        self.assertEqual(best.size_display, "345/25ZR20")
+
+    def test_merging_never_crosses_two_different_tires(self):
+        # The SL belongs to the 285/70R17, not the 275/70R18. Dimensions must match before any
+        # field is borrowed, or the merge is worse than the omission it fixes.
+        best = tire_size.parse_best(["275/70R18 116T", "285/70R17 116Q SL"])
+        self.assertEqual(best.size_display, "285/70R17")
+        best2 = tire_size.parse_best(["275/70R18 116T", "285/70R17 SL"])
+        self.assertEqual(best2.size_display, "275/70R18")
+        self.assertIsNone(best2.load_range)
 
     def test_unparseable_titles_are_skipped(self):
         best = tire_size.parse_best(["NI TRAIL GRAPPLER DISP ON WEB", None, "LT285/70R17 121Q E"])

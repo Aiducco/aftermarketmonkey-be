@@ -83,6 +83,15 @@ class Command(BaseCommand):
             help="Re-offer master parts a previous run's model said were not tires.",
         )
         parser.add_argument(
+            "--llm-size",
+            action="store_true",
+            help=(
+                "Have the model read the size too, instead of src.domain.tire_size. The parser "
+                "still runs on the same titles and any disagreement sets size_disputed, so the "
+                "mode stays measurable. Roughly doubles prompt cost."
+            ),
+        )
+        parser.add_argument(
             "--preview",
             type=int,
             default=None,
@@ -149,6 +158,7 @@ class Command(BaseCommand):
                 max_workers=options["workers"],
                 apply_changes=options["apply"],
                 include_rejected=options["include_rejected"],
+                llm_size=options["llm_size"],
                 on_result=collect if report_path else None,
             )
         except ValueError as exc:
@@ -166,7 +176,7 @@ class Command(BaseCommand):
     def _preview(self, *, brand_names, options):
         """Build prompts without calling anything. The point is checking what the model will see
         -- especially whether the titles we collected actually name the product."""
-        system_prompt = tire_enrichment.build_system_prompt()
+        system_prompt = tire_enrichment.build_system_prompt(llm_size=options["llm_size"])
         self.stdout.write(
             "System prompt: {} chars, ~{} tokens (fixed for the run, cacheable)\n".format(
                 len(system_prompt), azure_llm.estimate_tokens(system_prompt)
@@ -181,7 +191,7 @@ class Command(BaseCommand):
             limit=options["preview"],
             include_rejected=options["include_rejected"],
         ):
-            payload = json.dumps(tire_enrichment.build_user_payload(candidate), indent=2)
+            payload = json.dumps(tire_enrichment.build_user_payload(candidate, llm_size=options["llm_size"]), indent=2)
             input_tokens += azure_llm.estimate_tokens(payload)
             self.stdout.write("\n" + "-" * 78)
             self.stdout.write(payload)

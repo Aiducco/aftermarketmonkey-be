@@ -7,6 +7,7 @@ from django.core.serializers.json import DjangoJSONEncoder
 from django.db import models as django_db_models
 from django.utils import timezone
 
+
 class Company(django_db_models.Model):
     name = django_db_models.CharField(max_length=255)
     slug = django_db_models.CharField(max_length=255)
@@ -14,7 +15,9 @@ class Company(django_db_models.Model):
     status_name = django_db_models.CharField(max_length=255)
 
     # Onboarding / B2B fields (Step 2)
-    business_type = django_db_models.JSONField(default=list, blank=True)  # list[str], e.g. ["retail_store", "dealership"]
+    business_type = django_db_models.JSONField(
+        default=list, blank=True
+    )  # list[str], e.g. ["retail_store", "dealership"]
     country = django_db_models.CharField(max_length=64, null=True, blank=True)
     state_province = django_db_models.CharField(max_length=128, null=True, blank=True)
     city = django_db_models.CharField(max_length=128, null=True, blank=True)
@@ -56,6 +59,7 @@ class CompanyOnboardingPreferences(django_db_models.Model):
     """
     Step 3 personalization: preferred distributors, categories, and optional credentials.
     """
+
     company = django_db_models.OneToOneField(
         Company, on_delete=django_db_models.CASCADE, related_name="onboarding_preferences"
     )
@@ -78,6 +82,7 @@ class CompanyLocation(django_db_models.Model):
     every time; fields mirror PurchaseOrder.ship_to_* so a location can be copied straight
     into a quote's ship_to payload.
     """
+
     company = django_db_models.ForeignKey(Company, on_delete=django_db_models.CASCADE, related_name="locations")
 
     label = django_db_models.CharField(max_length=100)
@@ -136,9 +141,12 @@ class Providers(django_db_models.Model):
         db_table = "providers"
         unique_together = ["kind"]
 
+
 class CompanyProviders(django_db_models.Model):
     company = django_db_models.ForeignKey(Company, on_delete=django_db_models.CASCADE, related_name="company_providers")
-    provider = django_db_models.ForeignKey(Providers, on_delete=django_db_models.CASCADE, related_name="brand_providers")
+    provider = django_db_models.ForeignKey(
+        Providers, on_delete=django_db_models.CASCADE, related_name="brand_providers"
+    )
 
     credentials = django_db_models.JSONField()
 
@@ -202,6 +210,7 @@ class CompanyProviderOrderAccount(django_db_models.Model):
     is: at most one True per company_provider, and clearing/deleting the default promotes the
     next-oldest active account (see integrations_services._promote_next_default_order_account).
     """
+
     company_provider = django_db_models.ForeignKey(
         CompanyProviders, on_delete=django_db_models.CASCADE, related_name="order_accounts"
     )
@@ -242,6 +251,7 @@ class ShopManagementProviders(django_db_models.Model):
     """Global catalog of connectable shop-management systems (ShopMonkey, ...). Deliberately
     separate from Providers/BrandProviderKind — a shop-management system isn't a parts source
     and shouldn't share that model's distributor-oriented flows or kind namespace."""
+
     name = django_db_models.CharField(max_length=255)
     status = django_db_models.PositiveSmallIntegerField()
     status_name = django_db_models.CharField(max_length=255)
@@ -263,6 +273,7 @@ class CompanyShopManagementProviders(django_db_models.Model):
     """Per-tenant connection to a shop-management system. One credentials namespace only
     (e.g. {"api_key": "..."}) — unlike CompanyProviders there's no separate feed/order split,
     since there's a single credential set and (for now) a single capability."""
+
     company = django_db_models.ForeignKey(
         Company, on_delete=django_db_models.CASCADE, related_name="shop_management_providers"
     )
@@ -289,7 +300,9 @@ class CompanyShopManagementProviders(django_db_models.Model):
 
 
 class IntegrationRequest(django_db_models.Model):
-    company = django_db_models.ForeignKey(Company, on_delete=django_db_models.CASCADE, related_name="integration_requests")
+    company = django_db_models.ForeignKey(
+        Company, on_delete=django_db_models.CASCADE, related_name="integration_requests"
+    )
     provider = django_db_models.ForeignKey(Providers, on_delete=django_db_models.CASCADE, related_name="requests")
     created_at = django_db_models.DateTimeField(auto_now_add=True)
 
@@ -299,7 +312,9 @@ class IntegrationRequest(django_db_models.Model):
 
 
 class CustomIntegrationRequest(django_db_models.Model):
-    company = django_db_models.ForeignKey(Company, on_delete=django_db_models.CASCADE, related_name="custom_integration_requests")
+    company = django_db_models.ForeignKey(
+        Company, on_delete=django_db_models.CASCADE, related_name="custom_integration_requests"
+    )
     distributor_name = django_db_models.CharField(max_length=255)
     created_at = django_db_models.DateTimeField(auto_now_add=True)
 
@@ -335,8 +350,11 @@ class BrandProviders(django_db_models.Model):
         db_table = "brand_providers"
         unique_together = ["brand", "provider"]
 
+
 class CompanyDestinationPartsPreferences(django_db_models.Model):
-    company_destination = django_db_models.ForeignKey(CompanyDestinations, on_delete=django_db_models.CASCADE, related_name="parts_preferences")
+    company_destination = django_db_models.ForeignKey(
+        CompanyDestinations, on_delete=django_db_models.CASCADE, related_name="parts_preferences"
+    )
     preferences = django_db_models.JSONField()
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
@@ -348,7 +366,9 @@ class CompanyDestinationPartsPreferences(django_db_models.Model):
 
 
 class CompanyDestinationParts(django_db_models.Model):
-    company_destination = django_db_models.ForeignKey(CompanyDestinations, on_delete=django_db_models.CASCADE, related_name="parts")
+    company_destination = django_db_models.ForeignKey(
+        CompanyDestinations, on_delete=django_db_models.CASCADE, related_name="parts"
+    )
     part_unique_key = django_db_models.CharField(max_length=255)
     source_data = django_db_models.JSONField()
     source_external_id = django_db_models.TextField()
@@ -364,11 +384,8 @@ class CompanyDestinationParts(django_db_models.Model):
         # unique_together = ["company_destination"]
 
 
-
 class UserProfile(django_db_models.Model):
-    user = django_db_models.OneToOneField(
-        auth_models.User, on_delete=django_db_models.CASCADE, related_name="profile"
-    )
+    user = django_db_models.OneToOneField(auth_models.User, on_delete=django_db_models.CASCADE, related_name="profile")
     company = django_db_models.ForeignKey(
         Company,
         on_delete=django_db_models.CASCADE,
@@ -386,6 +403,7 @@ class UserProfile(django_db_models.Model):
 
     class Meta:
         db_table = "auth_user_profile"
+
 
 class Turn14Brand(django_db_models.Model):
     external_id = django_db_models.CharField(max_length=255)
@@ -405,6 +423,7 @@ class Turn14Brand(django_db_models.Model):
 
 class Turn14Location(django_db_models.Model):
     """Turn14 warehouse locations from GET /v1/locations API."""
+
     external_id = django_db_models.CharField(max_length=32)
     name = django_db_models.CharField(max_length=255)
     street = django_db_models.CharField(max_length=255, blank=True)
@@ -427,6 +446,7 @@ class MeyerLocation(django_db_models.Model):
     (e.g. "053") into a human-readable place, the same role Turn14Location plays for Turn14.
     Meyer's Warehouses response is narrower than Turn14's locations (no name/street/zip), just
     LocationCode/City/State/Country."""
+
     external_id = django_db_models.CharField(max_length=32)  # Meyer's "LocationCode"
     city = django_db_models.CharField(max_length=255, blank=True)
     state = django_db_models.CharField(max_length=64, blank=True)
@@ -444,6 +464,7 @@ class WheelProsWarehouse(django_db_models.Model):
     """Wheel Pros warehouses from the Orders API's GET /warehouses/v1 — decodes a tracking/order
     response's bare warehouseCode into a human-readable ship-from location, the same role
     Turn14Location/MeyerLocation play for their distributors."""
+
     external_id = django_db_models.CharField(max_length=32)  # Wheel Pros' "id"
     name = django_db_models.CharField(max_length=255, blank=True)
     city = django_db_models.CharField(max_length=255, blank=True)
@@ -473,8 +494,12 @@ class CompanyBrands(django_db_models.Model):
 
 
 class CompanyBrandDestination(django_db_models.Model):
-    company_brand = django_db_models.ForeignKey(CompanyBrands, on_delete=django_db_models.CASCADE, related_name="destinations")
-    destination = django_db_models.ForeignKey(CompanyDestinations, on_delete=django_db_models.CASCADE, related_name="company_brands")
+    company_brand = django_db_models.ForeignKey(
+        CompanyBrands, on_delete=django_db_models.CASCADE, related_name="destinations"
+    )
+    destination = django_db_models.ForeignKey(
+        CompanyDestinations, on_delete=django_db_models.CASCADE, related_name="company_brands"
+    )
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
@@ -485,7 +510,9 @@ class CompanyBrandDestination(django_db_models.Model):
 
 
 class CompanyDestinationExecutionRun(django_db_models.Model):
-    company_brand_destination = django_db_models.ForeignKey(CompanyBrandDestination, on_delete=django_db_models.CASCADE, related_name="execution_runs")
+    company_brand_destination = django_db_models.ForeignKey(
+        CompanyBrandDestination, on_delete=django_db_models.CASCADE, related_name="execution_runs"
+    )
     status = django_db_models.PositiveSmallIntegerField()
     status_name = django_db_models.CharField(max_length=255)
     products_processed = django_db_models.IntegerField(default=0)
@@ -502,9 +529,14 @@ class CompanyDestinationExecutionRun(django_db_models.Model):
     class Meta:
         db_table = "company_destination_execution_run"
 
+
 class CompanyDestinationPartsHistory(django_db_models.Model):
-    destination_part = django_db_models.ForeignKey(CompanyDestinationParts, on_delete=django_db_models.CASCADE, related_name="history")
-    execution_run = django_db_models.ForeignKey(CompanyDestinationExecutionRun, on_delete=django_db_models.CASCADE, related_name="history_records", null=True)
+    destination_part = django_db_models.ForeignKey(
+        CompanyDestinationParts, on_delete=django_db_models.CASCADE, related_name="history"
+    )
+    execution_run = django_db_models.ForeignKey(
+        CompanyDestinationExecutionRun, on_delete=django_db_models.CASCADE, related_name="history_records", null=True
+    )
     data = django_db_models.JSONField()
     changes = django_db_models.JSONField(null=True)
     synced = django_db_models.BooleanField(default=False)
@@ -516,9 +548,14 @@ class CompanyDestinationPartsHistory(django_db_models.Model):
         db_table = "company_destination_parts_history"
         # unique_together = ["company_destination"]
 
+
 class BrandTurn14BrandMapping(django_db_models.Model):
-    brand = django_db_models.ForeignKey(Brands, on_delete=django_db_models.CASCADE, related_name="turn14_brand_mappings")
-    turn14_brand = django_db_models.ForeignKey(Turn14Brand, on_delete=django_db_models.CASCADE, related_name="brand_mappings")
+    brand = django_db_models.ForeignKey(
+        Brands, on_delete=django_db_models.CASCADE, related_name="turn14_brand_mappings"
+    )
+    turn14_brand = django_db_models.ForeignKey(
+        Turn14Brand, on_delete=django_db_models.CASCADE, related_name="brand_mappings"
+    )
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
@@ -605,7 +642,9 @@ class Turn14BrandPricing(django_db_models.Model):
 
 class Turn14BrandInventory(django_db_models.Model):
     external_id = django_db_models.CharField(max_length=255)
-    brand = django_db_models.ForeignKey(Turn14Brand, on_delete=django_db_models.CASCADE, related_name="brand_inventory", null=True)
+    brand = django_db_models.ForeignKey(
+        Turn14Brand, on_delete=django_db_models.CASCADE, related_name="brand_inventory", null=True
+    )
     type = django_db_models.CharField(max_length=255, null=True)
     inventory = django_db_models.JSONField(null=True)
     manufacturer = django_db_models.JSONField(null=True)
@@ -628,6 +667,7 @@ class Turn14ItemFitment(django_db_models.Model):
     that mapping requires a VCDB dataset we don't have yet. Kept as a flat (item, vehicle_id)
     pair for now; each row is one id pulled out of the response's nested vehicle_ids arrays.
     """
+
     item_external_id = django_db_models.CharField(max_length=255)
     brand = django_db_models.ForeignKey(Turn14Brand, on_delete=django_db_models.CASCADE, related_name="item_fitments")
     vehicle_id = django_db_models.PositiveIntegerField(db_index=True)
@@ -655,6 +695,7 @@ class VcdbVehicle(django_db_models.Model):
     `<App>` row, not the VehicleID alone). Roughly 76% of VCdb vehicles have an unambiguous
     engine and 89% an unambiguous drive type.
     """
+
     vehicle_id = django_db_models.PositiveIntegerField(unique=True)
     base_vehicle_id = django_db_models.PositiveIntegerField(db_index=True)
     year = django_db_models.PositiveSmallIntegerField(db_index=True)
@@ -683,7 +724,9 @@ class BigCommerceParts(django_db_models.Model):
     sku = django_db_models.TextField(max_length=255)
     raw_data = django_db_models.JSONField(null=True)
     external_brand_id = django_db_models.CharField(max_length=255, null=True)
-    company_destination = django_db_models.ForeignKey(CompanyDestinations, on_delete=django_db_models.CASCADE, related_name="bigcommerce_parts")
+    company_destination = django_db_models.ForeignKey(
+        CompanyDestinations, on_delete=django_db_models.CASCADE, related_name="bigcommerce_parts"
+    )
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
@@ -697,7 +740,9 @@ class BigCommerceBrands(django_db_models.Model):
     external_id = django_db_models.CharField(max_length=255)
     name = django_db_models.TextField(max_length=255)
     brand = django_db_models.ForeignKey(Brands, on_delete=django_db_models.CASCADE, related_name="bigcommerce_brands")
-    company_destination = django_db_models.ForeignKey(CompanyDestinations, on_delete=django_db_models.CASCADE, related_name="bigcommerce_brands")
+    company_destination = django_db_models.ForeignKey(
+        CompanyDestinations, on_delete=django_db_models.CASCADE, related_name="bigcommerce_brands"
+    )
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
@@ -712,7 +757,9 @@ class BigCommerceCategories(django_db_models.Model):
     name = django_db_models.CharField(max_length=255)
     parent_id = django_db_models.IntegerField(default=0)
     tree_id = django_db_models.IntegerField(default=1)
-    company_destination = django_db_models.ForeignKey(CompanyDestinations, on_delete=django_db_models.CASCADE, related_name="bigcommerce_categories")
+    company_destination = django_db_models.ForeignKey(
+        CompanyDestinations, on_delete=django_db_models.CASCADE, related_name="bigcommerce_categories"
+    )
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
@@ -720,6 +767,7 @@ class BigCommerceCategories(django_db_models.Model):
     class Meta:
         db_table = "bigcommerce_categories"
         unique_together = ["external_id", "company_destination", "tree_id"]
+
 
 class SDCBrands(django_db_models.Model):
     external_id = django_db_models.CharField(max_length=255)
@@ -753,7 +801,9 @@ class SDCPartFitment(django_db_models.Model):
 
 class BrandSDCBrandMapping(django_db_models.Model):
     brand = django_db_models.ForeignKey(Brands, on_delete=django_db_models.CASCADE, related_name="sdc_brand_mappings")
-    sdc_brand = django_db_models.ForeignKey(SDCBrands, on_delete=django_db_models.CASCADE, related_name="brand_mappings")
+    sdc_brand = django_db_models.ForeignKey(
+        SDCBrands, on_delete=django_db_models.CASCADE, related_name="brand_mappings"
+    )
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
@@ -823,8 +873,12 @@ class KeystoneBrand(django_db_models.Model):
 
 
 class BrandKeystoneBrandMapping(django_db_models.Model):
-    brand = django_db_models.ForeignKey(Brands, on_delete=django_db_models.CASCADE, related_name="keystone_brand_mappings")
-    keystone_brand = django_db_models.ForeignKey(KeystoneBrand, on_delete=django_db_models.CASCADE, related_name="brand_mappings")
+    brand = django_db_models.ForeignKey(
+        Brands, on_delete=django_db_models.CASCADE, related_name="keystone_brand_mappings"
+    )
+    keystone_brand = django_db_models.ForeignKey(
+        KeystoneBrand, on_delete=django_db_models.CASCADE, related_name="brand_mappings"
+    )
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
@@ -884,6 +938,7 @@ class KeystoneCompanyPricing(django_db_models.Model):
     Per-company Keystone FTP pricing for a catalog row (KeystoneParts).
     Catalog fields live on KeystoneParts; cost/jobber/core come from each company's inventory file.
     """
+
     part = django_db_models.ForeignKey(
         KeystoneParts, on_delete=django_db_models.CASCADE, related_name="company_pricing"
     )
@@ -904,6 +959,7 @@ class KeystoneCompanyPricing(django_db_models.Model):
 
 class PremierBrand(django_db_models.Model):
     """Brand / manufacturer from the Premier Performance data feed (Brand column)."""
+
     external_id = django_db_models.CharField(max_length=255)
     name = django_db_models.CharField(max_length=255)
     line_code = django_db_models.CharField(max_length=64, null=True, blank=True)
@@ -934,10 +990,9 @@ class BrandPremierBrandMapping(django_db_models.Model):
 
 class PremierParts(django_db_models.Model):
     """Catalog row from the Premier Performance master data feed."""
+
     premier_part_number = django_db_models.CharField(max_length=255)
-    brand = django_db_models.ForeignKey(
-        PremierBrand, on_delete=django_db_models.CASCADE, related_name="parts"
-    )
+    brand = django_db_models.ForeignKey(PremierBrand, on_delete=django_db_models.CASCADE, related_name="parts")
     mfg_part_number = django_db_models.CharField(max_length=255, null=True)
     long_description = django_db_models.TextField(null=True)
     external_long_description = django_db_models.TextField(null=True)
@@ -989,7 +1044,10 @@ class PremierParts(django_db_models.Model):
     # this row's own long_description, and master_parts._ingest_premier_parts_for_mapped_brands,
     # which prefers it over the feed-brand-level mapping).
     brand_override = django_db_models.ForeignKey(
-        Brands, on_delete=django_db_models.SET_NULL, null=True, blank=True,
+        Brands,
+        on_delete=django_db_models.SET_NULL,
+        null=True,
+        blank=True,
         related_name="premier_brand_overrides",
     )
 
@@ -1006,9 +1064,8 @@ class PremierCompanyPricing(django_db_models.Model):
     Per-company Premier FTP pricing for a catalog row (PremierParts).
     Catalog fields live on PremierParts; cost/jobber/map/core come from each company's feed.
     """
-    part = django_db_models.ForeignKey(
-        PremierParts, on_delete=django_db_models.CASCADE, related_name="company_pricing"
-    )
+
+    part = django_db_models.ForeignKey(PremierParts, on_delete=django_db_models.CASCADE, related_name="company_pricing")
     company = django_db_models.ForeignKey(
         Company, on_delete=django_db_models.CASCADE, related_name="premier_company_pricing"
     )
@@ -1028,6 +1085,7 @@ class PremierCompanyPricing(django_db_models.Model):
 
 class MeyerBrand(django_db_models.Model):
     """Manufacturer / brand label from Meyer pricing feed (MFG column)."""
+
     external_id = django_db_models.CharField(max_length=512)
     name = django_db_models.CharField(max_length=512)
     aaia_code = django_db_models.CharField(max_length=255, null=True, blank=True)
@@ -1041,9 +1099,7 @@ class MeyerBrand(django_db_models.Model):
 
 
 class BrandMeyerBrandMapping(django_db_models.Model):
-    brand = django_db_models.ForeignKey(
-        Brands, on_delete=django_db_models.CASCADE, related_name="meyer_brand_mappings"
-    )
+    brand = django_db_models.ForeignKey(Brands, on_delete=django_db_models.CASCADE, related_name="meyer_brand_mappings")
     meyer_brand = django_db_models.ForeignKey(
         MeyerBrand, on_delete=django_db_models.CASCADE, related_name="brand_mappings"
     )
@@ -1061,9 +1117,8 @@ class MeyerParts(django_db_models.Model):
     Meyer catalog row: pricing from Meyer Pricing file; availability from Meyer Inventory
     (joined on Meyer Part / Item Number per brand).
     """
-    brand = django_db_models.ForeignKey(
-        MeyerBrand, on_delete=django_db_models.CASCADE, related_name="parts"
-    )
+
+    brand = django_db_models.ForeignKey(MeyerBrand, on_delete=django_db_models.CASCADE, related_name="parts")
     meyer_part = django_db_models.CharField(max_length=255)
     mfg_item_number = django_db_models.CharField(max_length=255, null=True, blank=True)
     description = django_db_models.TextField(null=True, blank=True)
@@ -1431,6 +1486,7 @@ class WheelProsCompanyPricing(django_db_models.Model):
     MSRP/MAP come from each company's SFTP feed; ``cost_usd`` is derived from MSRP and optional
     credential fields ``wheel_markup`` / ``tire_markup`` / ``accessories_markup`` (percent off list).
     """
+
     part = django_db_models.ForeignKey(
         WheelProsPart,
         on_delete=django_db_models.CASCADE,
@@ -1461,6 +1517,7 @@ class WheelProsCompanyPricing(django_db_models.Model):
 
 class RoughCountryBrand(django_db_models.Model):
     """Single brand from Rough Country feed (e.g. manufacturer 'Rough Country')."""
+
     external_id = django_db_models.CharField(max_length=255)
     name = django_db_models.CharField(max_length=255)
     aaia_code = django_db_models.CharField(max_length=255, null=True, blank=True)
@@ -1475,6 +1532,7 @@ class RoughCountryBrand(django_db_models.Model):
 
 class RoughCountryPart(django_db_models.Model):
     """Part from Rough Country feed (General tab)."""
+
     brand = django_db_models.ForeignKey(
         RoughCountryBrand,
         on_delete=django_db_models.CASCADE,
@@ -1528,6 +1586,7 @@ class RoughCountryCompanyPricing(django_db_models.Model):
     Catalog/non-price fields live on RoughCountryPart; feed prices are stored per company
     so ProviderPartCompanyPricing sync keys off (part, company) like other providers.
     """
+
     part = django_db_models.ForeignKey(
         RoughCountryPart,
         on_delete=django_db_models.CASCADE,
@@ -1554,6 +1613,7 @@ class RoughCountryCompanyPricing(django_db_models.Model):
 
 class RoughCountryFitment(django_db_models.Model):
     """Vehicle fitment from Rough Country feed (Vehicle Fitment tab)."""
+
     part = django_db_models.ForeignKey(
         RoughCountryPart,
         on_delete=django_db_models.CASCADE,
@@ -1576,6 +1636,7 @@ class RoughCountryFitment(django_db_models.Model):
 
 class BrandRoughCountryBrandMapping(django_db_models.Model):
     """Maps our Brands to RoughCountryBrand (for master parts sync)."""
+
     brand = django_db_models.ForeignKey(
         Brands,
         on_delete=django_db_models.CASCADE,
@@ -1597,6 +1658,7 @@ class BrandRoughCountryBrandMapping(django_db_models.Model):
 
 class QuadratecBrand(django_db_models.Model):
     """Single brand from the Quadratec feed (feed 'Brand' column, stored uppercase)."""
+
     external_id = django_db_models.CharField(max_length=255)
     name = django_db_models.CharField(max_length=255)
     aaia_code = django_db_models.CharField(max_length=255, null=True, blank=True)
@@ -1617,6 +1679,7 @@ class QuadratecPart(django_db_models.Model):
     columns come from the wholesale feed and are Quadratec-wide, like RoughCountryPart's
     nv_stock/tn_stock. Prices live per company on QuadratecCompanyPricing.
     """
+
     brand = django_db_models.ForeignKey(
         QuadratecBrand,
         on_delete=django_db_models.CASCADE,
@@ -1649,6 +1712,7 @@ class QuadratecCompanyPricing(django_db_models.Model):
     keys off (part, company) like other providers. ``cost`` is the dealer cost from the wholesale
     feed; ``retail_price``/``map`` are MSRP/MAP; ``wholesale_price`` is the pricing-sheet wholesale.
     """
+
     part = django_db_models.ForeignKey(
         QuadratecPart,
         on_delete=django_db_models.CASCADE,
@@ -1674,6 +1738,7 @@ class QuadratecCompanyPricing(django_db_models.Model):
 
 class BrandQuadratecBrandMapping(django_db_models.Model):
     """Maps our Brands to QuadratecBrand (for master parts sync)."""
+
     brand = django_db_models.ForeignKey(
         Brands,
         on_delete=django_db_models.CASCADE,
@@ -1695,6 +1760,7 @@ class BrandQuadratecBrandMapping(django_db_models.Model):
 
 class VossenBrand(django_db_models.Model):
     """Single brand from the Vossen feed — always one row, "VOSSEN" (Vossen is brand=distributor)."""
+
     external_id = django_db_models.CharField(max_length=255)
     name = django_db_models.CharField(max_length=255)
 
@@ -1714,6 +1780,7 @@ class VossenPart(django_db_models.Model):
     WheelProsPart's equivalents since raw feed formats vary and non-wheel rows (caps, lug nuts)
     carry "0"/blank placeholders rather than real dimensions.
     """
+
     brand = django_db_models.ForeignKey(
         VossenBrand,
         on_delete=django_db_models.CASCADE,
@@ -1743,6 +1810,7 @@ class VossenCompanyPricing(django_db_models.Model):
     feed_url — mirrors RoughCountryCompanyPricing's split (catalog/stock on the Part, price
     per company) so ProviderPartCompanyPricing sync keys off (part, company) like other providers.
     """
+
     part = django_db_models.ForeignKey(
         VossenPart,
         on_delete=django_db_models.CASCADE,
@@ -1765,6 +1833,7 @@ class VossenCompanyPricing(django_db_models.Model):
 
 class BrandVossenBrandMapping(django_db_models.Model):
     """Maps our Brands to VossenBrand (for master parts sync). Always a single row in practice."""
+
     brand = django_db_models.ForeignKey(
         Brands,
         on_delete=django_db_models.CASCADE,
@@ -1791,6 +1860,7 @@ class TireRackBrand(django_db_models.Model):
     covers many tire manufacturers, one row per distinct name. The feed has no numeric/external
     id for a brand, so ``name`` is the natural key.
     """
+
     name = django_db_models.CharField(max_length=255)
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
@@ -1803,6 +1873,7 @@ class TireRackBrand(django_db_models.Model):
 
 class BrandTireRackBrandMapping(django_db_models.Model):
     """Maps our Brands to TireRackBrand (for master parts sync)."""
+
     brand = django_db_models.ForeignKey(
         Brands,
         on_delete=django_db_models.CASCADE,
@@ -1830,6 +1901,7 @@ class TireRackParts(django_db_models.Model):
     lives on TireRackCompanyPricing, sourced from each company's own SFTP pull (see
     tirerack.sync_tirerack_company_pricing_for_company_provider).
     """
+
     brand = django_db_models.ForeignKey(
         TireRackBrand,
         on_delete=django_db_models.CASCADE,
@@ -1863,6 +1935,7 @@ class TireRackCompanyPricing(django_db_models.Model):
     Catalog/inventory fields stay on TireRackParts (shared, from the primary connection);
     total_price here is the company-specific amount.
     """
+
     part = django_db_models.ForeignKey(
         TireRackParts,
         on_delete=django_db_models.CASCADE,
@@ -1924,7 +1997,9 @@ class MasterPart(django_db_models.Model):
 
 
 class ProviderPart(django_db_models.Model):
-    master_part = django_db_models.ForeignKey(MasterPart, on_delete=django_db_models.CASCADE, related_name="provider_parts")
+    master_part = django_db_models.ForeignKey(
+        MasterPart, on_delete=django_db_models.CASCADE, related_name="provider_parts"
+    )
     provider = django_db_models.ForeignKey(Providers, on_delete=django_db_models.CASCADE, related_name="provider_parts")
     provider_external_id = django_db_models.CharField(max_length=255)
     distributor_refreshed_at = django_db_models.DateTimeField(
@@ -1989,6 +2064,7 @@ class ProviderPartKitComponent(django_db_models.Model):
     unverified and risky by default rather than assumed safe. Expanding into components
     ourselves, before either distributor's order API is ever called, sidesteps both cases.
     """
+
     kit_part = django_db_models.ForeignKey(
         ProviderPart, on_delete=django_db_models.CASCADE, related_name="kit_components"
     )
@@ -2026,7 +2102,9 @@ class ProviderPartCompanyPricing(django_db_models.Model):
     provider_part = django_db_models.ForeignKey(
         ProviderPart, on_delete=django_db_models.CASCADE, related_name="company_pricing"
     )
-    company = django_db_models.ForeignKey(Company, on_delete=django_db_models.CASCADE, related_name="provider_part_pricing")
+    company = django_db_models.ForeignKey(
+        Company, on_delete=django_db_models.CASCADE, related_name="provider_part_pricing"
+    )
     cost = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
     jobber_price = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
     map_price = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
@@ -2048,6 +2126,7 @@ class AsapBrand(django_db_models.Model):
     row (no separate ``Brand<X>BrandMapping`` join table) since ASAP is an enrichment-only data
     catalog, not a distributor a company connects to.
     """
+
     external_id = django_db_models.CharField(max_length=64, unique=True)
     term_name = django_db_models.CharField(max_length=255)
     name = django_db_models.CharField(max_length=255)
@@ -2074,6 +2153,7 @@ class MasterPartData(django_db_models.Model):
     blank, so different sources can enrich different brands (or different fields of the same
     part) without clobbering each other.
     """
+
     master_part = django_db_models.OneToOneField(MasterPart, on_delete=django_db_models.CASCADE, related_name="data")
     images = django_db_models.JSONField(null=True, blank=True)
     description = django_db_models.TextField(null=True, blank=True)
@@ -2103,6 +2183,7 @@ class MasterPartFitment(django_db_models.Model):
     per-year rows) since Postgres isn't the query layer for YMM search; per-year expansion only
     happens when building Meilisearch documents.
     """
+
     master_part = django_db_models.ForeignKey(MasterPart, on_delete=django_db_models.CASCADE, related_name="fitments")
     year_start = django_db_models.IntegerField()
     year_end = django_db_models.IntegerField()
@@ -2122,7 +2203,9 @@ class MasterPartFitment(django_db_models.Model):
 
     class Meta:
         db_table = "master_part_fitments"
-        unique_together = [["master_part", "year_start", "year_end", "make", "model", "submodel", "engine", "drive_type"]]
+        unique_together = [
+            ["master_part", "year_start", "year_end", "make", "model", "submodel", "engine", "drive_type"]
+        ]
 
 
 class CategoryMapping(django_db_models.Model):
@@ -2147,6 +2230,7 @@ class IntegrationPricingSyncJob(django_db_models.Model):
     are saved, enqueue one job per CompanyProviders to pull distributor company
     pricing and fan out ProviderPartCompanyPricing for that company.
     """
+
     company_provider = django_db_models.ForeignKey(
         CompanyProviders,
         on_delete=django_db_models.CASCADE,
@@ -2193,6 +2277,7 @@ class ScheduledTaskExecution(django_db_models.Model):
     Audit table for scheduled task / cron executions (e.g. Turn 14 items updates,
     inventory updates). Reusable for any named task run on a schedule.
     """
+
     name = django_db_models.CharField(max_length=255)
     status = django_db_models.PositiveSmallIntegerField()
     status_name = django_db_models.CharField(max_length=255)
@@ -2213,6 +2298,7 @@ class PartRequestAudit(django_db_models.Model):
     Audit log for part search and part detail API requests.
     Used to track company/user request volume (e.g. how many searches or detail views per company/user).
     """
+
     company = django_db_models.ForeignKey(
         Company,
         on_delete=django_db_models.CASCADE,
@@ -2325,9 +2411,13 @@ class Lead(django_db_models.Model):
     # Contact
     phone = django_db_models.CharField(max_length=64, null=True, blank=True)
     website = django_db_models.URLField(max_length=512, null=True, blank=True)
-    website_not_found = django_db_models.BooleanField(default=False, blank=True)  # True = Tavily+Claude couldn't find one
+    website_not_found = django_db_models.BooleanField(
+        default=False, blank=True
+    )  # True = Tavily+Claude couldn't find one
     website_live = django_db_models.BooleanField(null=True, blank=True)  # None = not checked yet
-    emails_not_found = django_db_models.BooleanField(default=False, blank=True)  # True = enrichment tried, nothing found
+    emails_not_found = django_db_models.BooleanField(
+        default=False, blank=True
+    )  # True = enrichment tried, nothing found
     email = django_db_models.EmailField(max_length=255, null=True, blank=True)
     emails = django_db_models.JSONField(default=list, blank=True)
 
@@ -2382,7 +2472,9 @@ class LeadEmail(django_db_models.Model):
     ai_valid = django_db_models.BooleanField(null=True, blank=True)  # None = not checked yet
 
     # Reoon verification results
-    status = django_db_models.CharField(max_length=32, null=True, blank=True)   # valid, invalid, disposable, unknown, etc.
+    status = django_db_models.CharField(
+        max_length=32, null=True, blank=True
+    )  # valid, invalid, disposable, unknown, etc.
     is_valid = django_db_models.BooleanField(null=True, blank=True)
     is_disposable = django_db_models.BooleanField(null=True, blank=True)
     is_free_email = django_db_models.BooleanField(null=True, blank=True)
@@ -2403,7 +2495,6 @@ class LeadEmail(django_db_models.Model):
 
     def __str__(self):
         return f"{self.email} ({self.status})"
-
 
 
 class RealTruckLead(django_db_models.Model):
@@ -2454,8 +2545,8 @@ class RealTruckLead(django_db_models.Model):
     # (locations, RealTruck dealer tier, brand count); tier is just its A/B/C bucketing.
     outreach_priority = django_db_models.IntegerField(null=True, blank=True)
     priority_tier = django_db_models.CharField(max_length=1, null=True, blank=True)
-    website_quality = django_db_models.IntegerField(null=True, blank=True)   # LLM 0-100
-    location_count = django_db_models.IntegerField(null=True, blank=True)    # sites sharing this domain
+    website_quality = django_db_models.IntegerField(null=True, blank=True)  # LLM 0-100
+    location_count = django_db_models.IntegerField(null=True, blank=True)  # sites sharing this domain
     priority_signals = django_db_models.JSONField(default=dict, blank=True)  # what drove the score
     priority_reasoning = django_db_models.TextField(null=True, blank=True)
     prioritized_at = django_db_models.DateTimeField(null=True, blank=True)
@@ -2588,6 +2679,7 @@ class NotificationEmailLog(django_db_models.Model):
     Audit log of transactional notification emails sent via Resend (e.g. the
     "first sync completed" email). One row per send attempt, success or failure.
     """
+
     email_type = django_db_models.PositiveSmallIntegerField()
     email_type_name = django_db_models.CharField(max_length=64)
 
@@ -2628,6 +2720,7 @@ class PurchaseOrderGroup(django_db_models.Model):
     organisational — distributors never see this, only the internal "review & quote"
     and PO-history screens do.
     """
+
     company = django_db_models.ForeignKey(
         Company, on_delete=django_db_models.CASCADE, related_name="purchase_order_groups"
     )
@@ -2659,9 +2752,8 @@ class PurchaseOrder(django_db_models.Model):
     (company, company_provider) at a time (enforced below); "Add to PO" always finds-or-creates
     this row rather than ever risking a second concurrent draft.
     """
-    company = django_db_models.ForeignKey(
-        Company, on_delete=django_db_models.CASCADE, related_name="purchase_orders"
-    )
+
+    company = django_db_models.ForeignKey(Company, on_delete=django_db_models.CASCADE, related_name="purchase_orders")
     company_provider = django_db_models.ForeignKey(
         CompanyProviders, on_delete=django_db_models.PROTECT, related_name="purchase_orders"
     )
@@ -2900,9 +2992,7 @@ class PurchaseOrderLineItem(django_db_models.Model):
     # whose adapter doesn't return per-item pricing at quote time yet.
     distributor_unit_price = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
     distributor_line_total = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
-    distributor_net_line_total = django_db_models.DecimalField(
-        max_digits=12, decimal_places=2, null=True, blank=True
-    )
+    distributor_net_line_total = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
 
     # Whether the distributor flagged this item as subject to a California Prop 65 warning on
     # the last quote (e.g. Turn14's top-level "prop_65" array) — display-only.
@@ -2936,6 +3026,7 @@ class PurchaseOrderDistributorOrder(django_db_models.Model):
     can map to several of these (Meyer's Orders array of genuinely separate order numbers;
     Keystone/Turn14's multi-warehouse fan-out within one order).
     """
+
     purchase_order = django_db_models.ForeignKey(
         PurchaseOrder, on_delete=django_db_models.CASCADE, related_name="distributor_orders"
     )
@@ -3004,6 +3095,7 @@ class PurchaseOrderInvoice(django_db_models.Model):
     that already polls order status (see purchase_order_jobs._run_status_check), for
     distributors where supports_invoices() is True.
     """
+
     purchase_order = django_db_models.ForeignKey(
         PurchaseOrder, on_delete=django_db_models.CASCADE, related_name="invoices"
     )
@@ -3048,6 +3140,7 @@ class PurchaseOrderSubmissionAttempt(django_db_models.Model):
     since submission is retried and each attempt's raw payload matters for diagnosing
     distributor rejections. Mirrors NotificationEmailLog's one-row-per-event style.
     """
+
     purchase_order = django_db_models.ForeignKey(
         PurchaseOrder, on_delete=django_db_models.CASCADE, related_name="submission_attempts"
     )
@@ -3075,9 +3168,8 @@ class PurchaseOrderJob(django_db_models.Model):
     max_attempts since distributor order APIs can rate-limit (e.g. Meyer's "try again in
     15 minutes" response) and must never be retried unboundedly.
     """
-    purchase_order = django_db_models.ForeignKey(
-        PurchaseOrder, on_delete=django_db_models.CASCADE, related_name="jobs"
-    )
+
+    purchase_order = django_db_models.ForeignKey(PurchaseOrder, on_delete=django_db_models.CASCADE, related_name="jobs")
     operation = django_db_models.PositiveSmallIntegerField()
     operation_name = django_db_models.CharField(max_length=32)
 
@@ -3117,6 +3209,7 @@ class MotorStateBrand(django_db_models.Model):
     """A Motor State brand from GET /api/Brands. Global — brand catalog is not
     account-specific. ``code`` is Motor State's brand code (e.g. "AAA"), used as
     the ``brand`` filter on the availability endpoint."""
+
     code = django_db_models.CharField(max_length=32)
     name = django_db_models.CharField(max_length=255, null=True)
     offered = django_db_models.BooleanField(default=False)
@@ -3148,6 +3241,7 @@ class MotorStateAvailability(django_db_models.Model):
     for incremental polling. ``brand_code`` is the brand the row was fetched under during the
     spine pass (null for rows first seen via an unfiltered incremental poll).
     """
+
     part_number = django_db_models.CharField(max_length=128, unique=True)
     brand_code = django_db_models.CharField(max_length=32, null=True)
     # Motor State StatusType: S=stocking, O=order-as-needed, X=discontinued (raw, as returned).
@@ -3173,6 +3267,7 @@ class MotorStateProduct(django_db_models.Model):
     Per-company because prices are tied to the account behind the API key.
     ``found`` mirrors the API's per-part Found flag; unfound part numbers are
     still recorded so a later pass need not re-query them blindly."""
+
     part_number = django_db_models.CharField(max_length=128, unique=True)
     # Motor State's /api/Product does not return a brand, so this FK is carried over from the
     # MotorStateAvailability spine (the brand the part was fetched under). Null when the part
@@ -3223,6 +3318,7 @@ class MotorStateCompanyPricing(django_db_models.Model):
     ``customer_price`` is this account's actual buy price; ``base_price`` is Motor State's
     undiscounted wholesale; ``list_price`` is MSRP.
     """
+
     product = django_db_models.ForeignKey(
         MotorStateProduct, on_delete=django_db_models.CASCADE, related_name="company_pricing"
     )
@@ -3259,6 +3355,7 @@ class MotorStateCompanyPricing(django_db_models.Model):
 # ---------------------------------------------------------------------------
 class WpsBrand(django_db_models.Model):
     """A brand from GET /brands. Global -- the brand catalog is not account-specific."""
+
     external_id = django_db_models.CharField(max_length=32)
     name = django_db_models.CharField(max_length=255, null=True)
 
@@ -3276,6 +3373,7 @@ class WpsWarehouse(django_db_models.Model):
     matching per-warehouse column on WpsInventory, so this table is what turns a bare
     ``pa2_warehouse`` figure into "Jessup" for display.
     """
+
     external_id = django_db_models.CharField(max_length=32)
     db2_key = django_db_models.CharField(max_length=16, null=True)
     name = django_db_models.CharField(max_length=255, null=True)
@@ -3294,6 +3392,7 @@ class WpsProduct(django_db_models.Model):
     hangs off. This is where the long ``description`` lives; individual items carry only a short
     ``name``, so MasterPart descriptions come from here.
     """
+
     external_id = django_db_models.CharField(max_length=32)
     name = django_db_models.CharField(max_length=255, null=True)
     description = django_db_models.TextField(null=True)
@@ -3317,10 +3416,9 @@ class WpsItem(django_db_models.Model):
     manufacturer's part number (e.g. "TC-M6M8") and is what MasterPart keys on, since the
     WPS SKU would never dedupe against another distributor's catalog.
     """
+
     external_id = django_db_models.CharField(max_length=32)  # WPS item id
-    brand = django_db_models.ForeignKey(
-        WpsBrand, on_delete=django_db_models.SET_NULL, null=True, related_name="items"
-    )
+    brand = django_db_models.ForeignKey(WpsBrand, on_delete=django_db_models.SET_NULL, null=True, related_name="items")
     sku = django_db_models.CharField(max_length=128, null=True)
     name = django_db_models.CharField(max_length=255, null=True)
     supplier_product_id = django_db_models.CharField(max_length=128, null=True)
@@ -3380,19 +3478,18 @@ class WpsInventory(django_db_models.Model):
     just show 25 ... so as to avoid disclosing our actual inventory levels"), so ``total`` is a
     floor, not a true count -- fine for availability, wrong for anything that needs real depth.
     """
-    item = django_db_models.OneToOneField(
-        WpsItem, on_delete=django_db_models.CASCADE, related_name="inventory"
-    )
+
+    item = django_db_models.OneToOneField(WpsItem, on_delete=django_db_models.CASCADE, related_name="inventory")
     external_id = django_db_models.CharField(max_length=32, null=True)  # WPS inventory row id
     sku = django_db_models.CharField(max_length=128, null=True)
 
-    ca_warehouse = django_db_models.IntegerField(default=0)   # Fresno, CA
-    ga_warehouse = django_db_models.IntegerField(default=0)   # Midway, GA
-    id_warehouse = django_db_models.IntegerField(default=0)   # Boise, ID
-    in_warehouse = django_db_models.IntegerField(default=0)   # Ashley, IN
-    pa_warehouse = django_db_models.IntegerField(default=0)   # Elizabethtown, PA
+    ca_warehouse = django_db_models.IntegerField(default=0)  # Fresno, CA
+    ga_warehouse = django_db_models.IntegerField(default=0)  # Midway, GA
+    id_warehouse = django_db_models.IntegerField(default=0)  # Boise, ID
+    in_warehouse = django_db_models.IntegerField(default=0)  # Ashley, IN
+    pa_warehouse = django_db_models.IntegerField(default=0)  # Elizabethtown, PA
     pa2_warehouse = django_db_models.IntegerField(default=0)  # Jessup, PA
-    tx_warehouse = django_db_models.IntegerField(default=0)   # Midlothian, TX
+    tx_warehouse = django_db_models.IntegerField(default=0)  # Midlothian, TX
     total = django_db_models.IntegerField(default=0)
 
     source_updated_at = django_db_models.DateTimeField(null=True)
@@ -3415,9 +3512,8 @@ class WpsCompanyPricing(django_db_models.Model):
     ``map_price`` is mapp_price (meaningful only when has_map_policy is set; WPS returns "0.00"
     for plenty of rows that do carry a policy).
     """
-    item = django_db_models.ForeignKey(
-        WpsItem, on_delete=django_db_models.CASCADE, related_name="company_pricing"
-    )
+
+    item = django_db_models.ForeignKey(WpsItem, on_delete=django_db_models.CASCADE, related_name="company_pricing")
     company = django_db_models.ForeignKey(
         Company, on_delete=django_db_models.CASCADE, related_name="wps_company_pricing"
     )
@@ -3438,12 +3534,9 @@ class WpsCompanyPricing(django_db_models.Model):
 class BrandWpsBrandMapping(django_db_models.Model):
     """Maps our Brands to WpsBrand (for master parts sync). WPS's /brands carries no AAIA code,
     so resolution is name-based only (see wps.sync_unmapped_wps_brands_to_brands)."""
-    brand = django_db_models.ForeignKey(
-        Brands, on_delete=django_db_models.CASCADE, related_name="wps_brand_mappings"
-    )
-    wps_brand = django_db_models.ForeignKey(
-        WpsBrand, on_delete=django_db_models.CASCADE, related_name="brand_mappings"
-    )
+
+    brand = django_db_models.ForeignKey(Brands, on_delete=django_db_models.CASCADE, related_name="wps_brand_mappings")
+    wps_brand = django_db_models.ForeignKey(WpsBrand, on_delete=django_db_models.CASCADE, related_name="brand_mappings")
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
@@ -3457,6 +3550,7 @@ class BrandMotorStateBrandMapping(django_db_models.Model):
     """Maps our Brands to MotorStateBrand (for master parts sync). Motor State's /api/Brands
     carries no AAIA code, so resolution is name-based only (see
     motorstate.sync_unmapped_motorstate_brands_to_brands)."""
+
     brand = django_db_models.ForeignKey(
         Brands, on_delete=django_db_models.CASCADE, related_name="motorstate_brand_mappings"
     )
@@ -3498,6 +3592,7 @@ class HelmetHouseBrand(django_db_models.Model):
     folds the two buckets into a "HELMET HOUSE" house brand rather than creating literal
     MISC/BAGS brands in the catalog.
     """
+
     external_id = django_db_models.CharField(max_length=255)
     name = django_db_models.CharField(max_length=255)
     source_name = django_db_models.CharField(max_length=255, null=True)
@@ -3525,9 +3620,8 @@ class HelmetHousePart(django_db_models.Model):
     it would put a dead link on every master part. Kept so images can be wired up the day a
     working host is available.
     """
-    brand = django_db_models.ForeignKey(
-        HelmetHouseBrand, on_delete=django_db_models.CASCADE, related_name="parts"
-    )
+
+    brand = django_db_models.ForeignKey(HelmetHouseBrand, on_delete=django_db_models.CASCADE, related_name="parts")
     sku = django_db_models.CharField(max_length=255)
     # Helmet House's own part number with the dashes removed ("01-003" -> "01003"). Their
     # "Alt Part#" column; not a separate part, and not a manufacturer number.
@@ -3589,6 +3683,7 @@ class HelmetHouseCompanyPricing(django_db_models.Model):
     a third of rows carry no policy and leave the price blank, and storing that as 0.00 would
     floor the price downstream.
     """
+
     part = django_db_models.ForeignKey(
         HelmetHousePart, on_delete=django_db_models.CASCADE, related_name="company_pricing"
     )
@@ -3613,6 +3708,7 @@ class BrandHelmetHouseBrandMapping(django_db_models.Model):
     """Maps our Brands to HelmetHouseBrand (for master parts sync). The feed carries no AAIA
     code, so resolution is name-based only (see
     helmet_house.sync_unmapped_helmet_house_brands_to_brands)."""
+
     brand = django_db_models.ForeignKey(
         Brands, on_delete=django_db_models.CASCADE, related_name="helmet_house_brand_mappings"
     )
@@ -3638,6 +3734,7 @@ class EliteWheelBrand(django_db_models.Model):
     name: the same manufacturer can legitimately appear on both sides of the catalog, and each
     side needs its own brand row to key its own parts.
     """
+
     PRODUCT_TYPE_WHEEL = "WHEEL"
     PRODUCT_TYPE_TIRE = "TIRE"
 
@@ -3665,6 +3762,7 @@ class EliteWheelPartWheel(django_db_models.Model):
     ``location_availability`` keeps the raw per-location dict verbatim so a warehouse Elite adds
     later is still captured (and counted in ``total_available``) before it gets a column here.
     """
+
     brand = django_db_models.ForeignKey(
         EliteWheelBrand,
         on_delete=django_db_models.CASCADE,
@@ -3707,6 +3805,7 @@ class EliteWheelPartTire(django_db_models.Model):
     packed size code (``"1856514"`` for 185/65R14) kept verbatim rather than expanded, and
     ``tire_diameter`` comes from the ``Inventory for Tire Diameter: <n>`` section the row sat under.
     """
+
     brand = django_db_models.ForeignKey(
         EliteWheelBrand,
         on_delete=django_db_models.CASCADE,
@@ -3748,6 +3847,7 @@ class EliteWheelWheelCompanyPricing(django_db_models.Model):
     a dealer's own feed is connected -- see
     ``src.integrations.services.elite_wheel.sync_elite_wheel_company_pricing_for_company_provider``.
     """
+
     part = django_db_models.ForeignKey(
         EliteWheelPartWheel,
         on_delete=django_db_models.CASCADE,
@@ -3772,6 +3872,7 @@ class EliteWheelWheelCompanyPricing(django_db_models.Model):
 
 class EliteWheelTireCompanyPricing(django_db_models.Model):
     """Per-company Elite pricing for a tire (EliteWheelPartTire) -- see EliteWheelWheelCompanyPricing."""
+
     part = django_db_models.ForeignKey(
         EliteWheelPartTire,
         on_delete=django_db_models.CASCADE,
@@ -3796,6 +3897,7 @@ class EliteWheelTireCompanyPricing(django_db_models.Model):
 
 class BrandEliteWheelBrandMapping(django_db_models.Model):
     """Maps our Brands to EliteWheelBrand (for master parts sync)."""
+
     brand = django_db_models.ForeignKey(
         Brands,
         on_delete=django_db_models.CASCADE,
@@ -3824,6 +3926,7 @@ class TheWheelGroupBrand(django_db_models.Model):
     from the sheet's per-row ``AAIA CODE`` column, used when a matching Brands row has to be
     created (same role as TurnFourteenBrand.aaia_code).
     """
+
     external_id = django_db_models.CharField(max_length=255)
     name = django_db_models.CharField(max_length=255)
     aaia_code = django_db_models.CharField(max_length=255, null=True, blank=True)
@@ -3851,6 +3954,7 @@ class TheWheelGroupPart(django_db_models.Model):
     stock at all, so TWG parts get no ProviderPartInventory row until a real feed is delivered
     (see ``master_parts.sync_provider_details_from_the_wheel_group``).
     """
+
     brand = django_db_models.ForeignKey(
         TheWheelGroupBrand,
         on_delete=django_db_models.CASCADE,
@@ -3944,6 +4048,7 @@ class TheWheelGroupCompanyPricing(django_db_models.Model):
     catalog's MAP/MSRP. See
     ``src.integrations.services.the_wheel_group.sync_the_wheel_group_company_pricing_for_company_provider``.
     """
+
     part = django_db_models.ForeignKey(
         TheWheelGroupPart,
         on_delete=django_db_models.CASCADE,
@@ -3968,6 +4073,7 @@ class TheWheelGroupCompanyPricing(django_db_models.Model):
 
 class BrandTheWheelGroupBrandMapping(django_db_models.Model):
     """Maps our Brands to TheWheelGroupBrand (for master parts sync)."""
+
     brand = django_db_models.ForeignKey(
         Brands,
         on_delete=django_db_models.CASCADE,
@@ -4004,6 +4110,7 @@ class ConnectionAttempt(django_db_models.Model):
     convention), and prefer purging old rows on a retention schedule rather than keeping them
     indefinitely.
     """
+
     company = django_db_models.ForeignKey(
         Company, on_delete=django_db_models.CASCADE, related_name="connection_attempts"
     )
@@ -4013,14 +4120,20 @@ class ConnectionAttempt(django_db_models.Model):
     # Null when the row predates a user (shouldn't happen) or the user was later deleted --
     # SET_NULL rather than CASCADE so the attempt record (and its credentials) survives that.
     user = django_db_models.ForeignKey(
-        auth_models.User, on_delete=django_db_models.SET_NULL, null=True, blank=True,
+        auth_models.User,
+        on_delete=django_db_models.SET_NULL,
+        null=True,
+        blank=True,
         related_name="connection_attempts",
     )
     # Set only for an "update" action against an existing connection (PATCH by id) -- null for a
     # fresh "connect" attempt, and also null (but action stays "connect") if a connect attempt
     # was rejected before any CompanyProviders row could be created.
     company_provider = django_db_models.ForeignKey(
-        CompanyProviders, on_delete=django_db_models.SET_NULL, null=True, blank=True,
+        CompanyProviders,
+        on_delete=django_db_models.SET_NULL,
+        null=True,
+        blank=True,
         related_name="connection_attempts",
     )
 
@@ -4069,6 +4182,7 @@ class ConnectionAttempt(django_db_models.Model):
 # ChangeTableNames.json registry already listing PartCategory/PartPosition as the real table
 # names. PcdbTerminologyFlat does the category join itself; nothing here needs CodeMaster.
 # ---------------------------------------------------------------------------
+
 
 class PcdbVersion(django_db_models.Model):
     database_name = django_db_models.TextField(null=True, blank=True)
@@ -4320,6 +4434,7 @@ class PcdbTerminologyFlat(django_db_models.Model):
     future part-classification pipeline reads from; the raw Pcdb* tables above are provenance,
     not meant to be queried directly by that pipeline.
     """
+
     part_terminology_id = django_db_models.IntegerField(primary_key=True)
     name = django_db_models.TextField()
     category_id = django_db_models.IntegerField(null=True, blank=True)
@@ -4346,6 +4461,7 @@ class PcdbTerminologyFlat(django_db_models.Model):
 # src/domain/title_mask.py and src/integrations/services/product_grouping.py.
 # ---------------------------------------------------------------------------
 
+
 class ProductGroup(django_db_models.Model):
     """
     A terminology-homogeneous grouping of MasterPart rows within one brand, found by an LLM
@@ -4354,6 +4470,7 @@ class ProductGroup(django_db_models.Model):
     group_key is a normalized form of display_name (lowercased), which is the canonical name the
     LLM assigned -- not necessarily the brand's real marketing name for the product line.
     """
+
     brand = django_db_models.ForeignKey(Brands, on_delete=django_db_models.CASCADE, related_name="product_groups")
     group_key = django_db_models.TextField()
     display_name = django_db_models.TextField()
@@ -4371,7 +4488,10 @@ class ProductGroup(django_db_models.Model):
 
 class ProductGroupMember(django_db_models.Model):
     master_part = django_db_models.OneToOneField(
-        MasterPart, on_delete=django_db_models.CASCADE, primary_key=True, related_name="product_group_membership",
+        MasterPart,
+        on_delete=django_db_models.CASCADE,
+        primary_key=True,
+        related_name="product_group_membership",
     )
     group = django_db_models.ForeignKey(ProductGroup, on_delete=django_db_models.CASCADE, related_name="members")
 
@@ -4392,8 +4512,12 @@ class ProductLineTerminologyMap(django_db_models.Model):
     split map is never auto-applied to MasterPart.part_terminology_id, only surfaced for review
     (see propagate_to_master_parts in classification.py).
     """
+
     group = django_db_models.OneToOneField(
-        ProductGroup, on_delete=django_db_models.CASCADE, primary_key=True, related_name="terminology_map",
+        ProductGroup,
+        on_delete=django_db_models.CASCADE,
+        primary_key=True,
+        related_name="terminology_map",
     )
     part_terminology_id = django_db_models.IntegerField(null=True, blank=True)
     confidence = django_db_models.DecimalField(max_digits=3, decimal_places=2, default=0)
@@ -4435,12 +4559,16 @@ class MLPartTerminologyClassification(django_db_models.Model):
     parse-failure text in reasoning) -- both get a row rather than silently having no row at all,
     so a bulk run's failures stay queryable instead of just being absences.
     """
+
     STATUS_CLASSIFIED = "classified"
     STATUS_UNCLASSIFIABLE = "unclassifiable"
     STATUS_ERROR = "error"
 
     master_part = django_db_models.OneToOneField(
-        MasterPart, on_delete=django_db_models.CASCADE, primary_key=True, related_name="ml_terminology_classification",
+        MasterPart,
+        on_delete=django_db_models.CASCADE,
+        primary_key=True,
+        related_name="ml_terminology_classification",
     )
     status = django_db_models.CharField(max_length=16, default=STATUS_CLASSIFIED)
     category = django_db_models.CharField(max_length=255, null=True, blank=True)
@@ -4456,6 +4584,7 @@ class MLPartTerminologyClassification(django_db_models.Model):
 
     class Meta:
         db_table = "ml_part_terminology_classification"
+
 
 class ApiRateBucket(django_db_models.Model):
     """
@@ -4478,6 +4607,7 @@ class ApiRateBucket(django_db_models.Model):
     (it is read back through ``EXCLUDED``); it is a property of the window, never of the row's
     history, so it is safe to overwrite on every hit.
     """
+
     bucket_key = django_db_models.CharField(max_length=255, unique=True)
     count = django_db_models.IntegerField(default=0)
     limit_value = django_db_models.IntegerField()
@@ -4505,6 +4635,7 @@ class Turn14DropshipController(django_db_models.Model):
     Global cache: one row per controller for every company, per Turn 14's model. Item id 0 is a
     sentinel for "no controller" and is never fetched.
     """
+
     external_id = django_db_models.CharField(max_length=32)
     charges = django_db_models.JSONField(null=True)
 
@@ -4532,6 +4663,7 @@ class Turn14ItemShippingEstimate(django_db_models.Model):
     ``fees`` holds the raw surcharge array (residential, additional handling, large package...);
     entries may carry the string "Included" instead of an amount, which is why it stays JSON.
     """
+
     item_external_id = django_db_models.CharField(max_length=255)
     brand = django_db_models.ForeignKey(
         Turn14Brand, on_delete=django_db_models.CASCADE, related_name="item_shipping_estimates", null=True
@@ -4561,6 +4693,7 @@ class Turn14ShippingOption(django_db_models.Model):
     Sweep list; previously fetched live and ad hoc from orders/turn_14.py at quote time only,
     never cached.
     """
+
     external_id = django_db_models.CharField(max_length=32)
     transportation_name = django_db_models.CharField(max_length=255)
     carrier_name = django_db_models.CharField(max_length=255, blank=True)
@@ -4594,6 +4727,7 @@ class TireLoadIndex(django_db_models.Model):
 
     Values verified against 35 published anchors across the range.
     """
+
     load_index = django_db_models.PositiveSmallIntegerField(primary_key=True)
     max_load_kg = django_db_models.PositiveIntegerField(
         help_text="Maximum load per tire in kilograms -- the canonical value from the standard.",
@@ -4650,6 +4784,7 @@ class TireSpeedRating(django_db_models.Model):
     description (W, Y or (Y)), and storing ZR here would let a parser mistake the marker for a
     rating.
     """
+
     code = django_db_models.CharField(max_length=8, primary_key=True)
     max_speed_kmh = django_db_models.PositiveSmallIntegerField(
         null=True,
@@ -4711,12 +4846,17 @@ class TireLoadRange(django_db_models.Model):
     never be computed from this column. It is null above Load Range H, where the Year Book
     stops publishing a single representative figure.
 
-    ``alias`` holds the other stamping for the same designation: XL is also stamped RF
-    ("Reinforced"), so a parser seeing either string should resolve to the XL row.
+    ``aliases`` holds every other stamping for the same designation: XL is stamped RF, RD and
+    REINFORCED, so a parser seeing any of those should resolve to the XL row.
+
+    ``ply_rating`` is NULL for the passenger designations. SL, XL and LL express load capability
+    through the load index, not through a bias-ply equivalence, so there is no number to state --
+    the older seed's "4" for SL and XL was wrong.
 
     I, K and O are intentionally absent from the letter sequence -- the standard skips them
     because they read as 1, and 0 on a sidewall. A gap there is the standard, not missing data.
     """
+
     APPLIES_TO_LT_ST = "lt_st"
     APPLIES_TO_PASSENGER = "passenger"
     APPLIES_TO_CHOICES = [
@@ -4726,7 +4866,13 @@ class TireLoadRange(django_db_models.Model):
 
     load_range = django_db_models.CharField(max_length=8, primary_key=True)
     ply_rating = django_db_models.PositiveSmallIntegerField(
-        help_text="Bias-ply strength equivalence, not a count of physical layers.",
+        null=True,
+        blank=True,
+        help_text=(
+            "Bias-ply strength equivalence, not a count of physical layers. NULL for the "
+            "passenger designations (SL/XL/LL), which express load capability through the load "
+            "index rather than a ply equivalence -- they have no ply rating to state."
+        ),
     )
     applies_to = django_db_models.CharField(max_length=16, choices=APPLIES_TO_CHOICES)
     typical_max_psi = django_db_models.PositiveSmallIntegerField(
@@ -4734,11 +4880,14 @@ class TireLoadRange(django_db_models.Model):
         blank=True,
         help_text="Indicative only -- never derive load capacity from this. Use the product's own max pressure.",
     )
-    alias = django_db_models.CharField(
-        max_length=8,
-        null=True,
+    aliases = pg_fields.ArrayField(
+        django_db_models.TextField(),
+        default=list,
         blank=True,
-        help_text="Alternate sidewall stamping for the same designation (XL is also stamped RF).",
+        help_text=(
+            "Every alternate sidewall stamping for the same designation. XL alone is stamped RF, "
+            "RD and REINFORCED, which is why this is a list rather than one alternate."
+        ),
     )
     sort_order = django_db_models.PositiveSmallIntegerField(unique=True)
 
@@ -4785,6 +4934,7 @@ class TreadCategory(django_db_models.Model):
     all-terrain tire can also be severe-snow certified, and a single-valued category cannot say
     both.
     """
+
     AXIS_TERRAIN = "terrain"
     AXIS_SEASON = "season"
     AXIS_PERFORMANCE = "performance"
@@ -4857,6 +5007,7 @@ class TireSpec(django_db_models.Model):
     not confident, and any consumer (including the search index) must omit the field rather than
     coerce it to false.
     """
+
     VEHICLE_CLASS_PASSENGER = "passenger"
     VEHICLE_CLASS_LIGHT_TRUCK = "light_truck"
     VEHICLE_CLASS_TRAILER = "trailer"
@@ -4939,14 +5090,14 @@ class TireSpec(django_db_models.Model):
         db_column="tread_category",
         to_field="code",
     )
-    vehicle_class = django_db_models.CharField(
-        max_length=16, choices=VEHICLE_CLASS_CHOICES, null=True, blank=True
-    )
+    vehicle_class = django_db_models.CharField(max_length=16, choices=VEHICLE_CLASS_CHOICES, null=True, blank=True)
     # Arrays rather than JSON (the convention elsewhere in this module) because both are searched
     # by containment and fed straight into the search index as multi-value facets; a JSON blob
     # would need casting at every read and cannot take a GIN index usefully.
     search_aliases = pg_fields.ArrayField(
-        django_db_models.TextField(), default=list, blank=True,
+        django_db_models.TextField(),
+        default=list,
+        blank=True,
         help_text="What a customer would type: short forms, misspellings, distributor abbreviations.",
     )
     use_case_tags = pg_fields.ArrayField(django_db_models.TextField(), default=list, blank=True)
@@ -5037,6 +5188,7 @@ class FacetConfig(django_db_models.Model):
     deliberately not a FK to ``tread_category``: most facet fields are not categories at all, and
     a single JSON column beats a per-field lookup table for every one of them.
     """
+
     MODE_TIRE = "tire"
     MODE_WHEEL = "wheel"
     MODE_PART = "part"

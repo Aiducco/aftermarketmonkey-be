@@ -61,7 +61,9 @@ SPEED_RATINGS = frozenset(["A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8"] + lis
 # symbols (C, D, E, F, G, H, J, L, M, N are in both), which is why load range is only ever read
 # from a *standalone* token after the service description has already claimed the letter glued
 # to the load index. Position disambiguates; a set lookup alone cannot.
-LOAD_RANGES = frozenset(["SL", "XL", "RF"] + list("ABCDEFGHJLMN"))
+# Mirrors ``load_range_ply`` plus its aliases. LL is the light-load passenger designation;
+# RD and REINFORCED are two more stampings of XL, alongside RF.
+LOAD_RANGES = frozenset(["SL", "XL", "LL", "RF", "RD", "REINFORCED"] + list("ABCDEFGHJLMN"))
 
 # Physically plausible bounds. These are not style checks -- they are what stops a wheel offset
 # or a bolt pattern from being read as a rim diameter. Every one of them fires on real catalog
@@ -116,7 +118,10 @@ _METRIC_RE = re.compile(
     # ``(?<!\s)-`` on the bias alternative: a hyphen with a space in front of it is an
     # offset ("20X9 -12MM", "4.56 -24"), not a construction marker. Letters may be spaced.
     r"\s*/?\s*(?P<construction>ZR|Z-|Z|R|B|D|(?<!\s)-)\s*"
-    r"(?P<rim>\d{{2}}(?:\.5)?)"
+    # Commercial rims appear both ways: "245/70R19.5" and, on 43 catalog rows, "225/70R195" with
+    # the decimal dropped. Only 14.5 through 24.5 are accepted in the decimal-less form, so a
+    # stray three-digit number cannot be read as a rim.
+    r"(?P<rim>1[4-9]5|2[0-4]5|\d{{2}}(?:\.5)?)"
     r"(?P<trailing_service>LT|ST|C)?"
     r"(?P<trailing_marker>XL|SL|RF|TL)?"
     r"(?![\w.])".format(service=_SERVICE_TYPE_ALT),
@@ -201,16 +206,22 @@ _BOLT_PATTERN_RE = re.compile(r"\b\d(?:\.\d)?\s*[xX]\s*(?:\d{2,3}(?:\.\d+)?|\d\.
 # speed symbol. Wheel Pros writes ``109/T`` where the slash is a separator, not a dual load --
 # the dual form is ``121/118S``, told apart by the second element being numeric.
 _SERVICE_DESCRIPTION_RE = re.compile(
-    r"(?<![\w.])"
-    r"(?P<load_index>\d{2,3})"
-    r"(?:/(?P<load_index_dual>\d{2,3}))?"
-    r"\s*/?\s*"
-    r"(?P<speed>\(Y\)|[A-Z]\d?)"
-    r"(?![\w.])",
+    r"(?<![\w.])" r"(?P<load_index>\d{2,3})"
+    # The dual load separator is a slash for most distributors and a SPACE for Premier, which
+    # writes the whole size that way ("LT275 65R20 126 123S"). Accepting only the slash made the
+    # regex skip 126 and match "123S" as the load index -- the dual, and the lower number -- on
+    # 224 catalog rows, understating max_load_lb on every one of them.
+    r"(?:[/ ](?P<load_index_dual>\d{2,3}))?" r"\s*/?\s*" r"(?P<speed>\(Y\)|[A-Z]\d?)" r"(?![\w.])",
     re.IGNORECASE,
 )
 
-_LOAD_RANGE_TOKEN_RE = re.compile(r"(?<![\w.])(?:LR)?(SL|XL|RF|[A-N])(?![\w.])", re.IGNORECASE)
+# ``(?!/[A-Za-z])`` rejects the letter of an X/Y model designation. "GRAND SPORT A/S" and
+# "OPEN COUNTRY M/T" were yielding Load Range A and M -- 978 catalog rows, 1,021 persisted specs,
+# and a wrong ply_rating derived from each. A slash followed by a DIGIT is still fine, because
+# that is the real "E/10" ply notation.
+_LOAD_RANGE_TOKEN_RE = re.compile(
+    r"(?<![\w.])(?:LR)?(REINFORCED|SL|XL|LL|RF|RD|[A-N])(?!/[A-Za-z])(?![\w.])", re.IGNORECASE
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -283,6 +294,16 @@ def _round(value: decimal.Decimal, places: str) -> decimal.Decimal:
 
 def _normalize(text: str) -> str:
     return text.translate(_UNICODE_X)
+
+
+def _rim_value(raw: str) -> decimal.Decimal:
+    """
+    Rim text -> inches. A bare three-digit group is the decimal-less commercial form: "195" means
+    19.5, not 195 inches. Two-digit and explicit ".5" forms pass through unchanged.
+    """
+    if "." not in raw and len(raw) == 3:
+        return decimal.Decimal("{}.{}".format(raw[:2], raw[2]))
+    return decimal.Decimal(raw)
 
 
 def _plausible_rim(rim: decimal.Decimal) -> bool:
@@ -412,7 +433,7 @@ def _parse_metric(text: str) -> typing.Optional[ParsedSize]:
     for match in _METRIC_RE.finditer(text):
         width_mm = int(match.group("width"))
         aspect = int(match.group("aspect"))
-        rim = decimal.Decimal(match.group("rim"))
+        rim = _rim_value(match.group("rim"))
         if not _MIN_SECTION_MM <= width_mm <= _MAX_SECTION_MM:
             continue
         if not _MIN_ASPECT <= aspect <= _MAX_ASPECT:
@@ -428,18 +449,26 @@ def _parse_metric(text: str) -> typing.Optional[ParsedSize]:
         section_height_in = (decimal.Decimal(width_mm) * aspect / 100) / MM_PER_INCH
         overall = _round(rim + 2 * section_height_in, "0.1")
         service_type = _service_type_from(match)
-        rim_text = match.group("rim")
+        # Always rendered with the decimal, even when the source dropped it, so "225/70R195" and
+        # "225/70R19.5" collapse to one size_display and therefore one search facet value.
+        rim_text = str(rim.normalize()) if rim % 1 else str(int(rim))
         # Bias renders as the bare hyphen the source wrote, not as the letter D. D is the formal
         # metric marker for diagonal construction, but in practice a hyphen in a metric size is
         # either a motorcycle size ("120/100-18", where the hyphen IS the convention) or a
         # distributor writing R sloppily -- and "205/55D16" is a spelling neither of them uses.
         # ``construction`` still carries the semantic "D".
-        display = "{service}{width}/{aspect}{construction}{rim}".format(
-            service=service_type or "",
+        # C is the European commercial marker and is written AFTER the rim ("225/75R16C"), unlike
+        # LT/ST/P/T which prefix. Rendering it leading produced "C225/75R16", a size string that
+        # appears nowhere in the industry and would not match a customer's search.
+        leading = "" if service_type == "C" else (service_type or "")
+        trailing = "C" if service_type == "C" else ""
+        display = "{service}{width}/{aspect}{construction}{rim}{trailing}".format(
+            service=leading,
             width=width_mm,
             aspect=aspect,
             construction="-" if construction == CONSTRUCTION_BIAS else construction,
             rim=rim_text,
+            trailing=trailing,
         )
         return _finish(
             notation=NOTATION_METRIC,
@@ -616,6 +645,7 @@ def parse_best(texts: typing.Iterable[typing.Optional[str]]) -> typing.Optional[
     """
     best: typing.Optional[ParsedSize] = None
     best_score = (-1, -1)
+    candidates: typing.List[ParsedSize] = []
     for text in texts:
         parsed = parse(text)
         if parsed is None:
@@ -641,7 +671,60 @@ def parse_best(texts: typing.Iterable[typing.Optional[str]]) -> typing.Optional[
         score = (_NOTATION_TRUST[parsed.notation], field_count)
         if score > best_score:
             best, best_score = parsed, score
-    return best
+        candidates.append(parsed)
+
+    if best is None:
+        return None
+    return _merge_service_description(best, candidates)
+
+
+# Fields a *different* title may legitimately supply. Dimensions are deliberately absent: they
+# define which tire this is, so taking them from another title would merge two products. These
+# describe the same tire and are simply omitted by some distributors.
+_MERGEABLE_FIELDS = ("service_type", "load_index", "load_index_dual", "speed_rating", "load_range")
+
+
+def _merge_service_description(best: ParsedSize, candidates: typing.Sequence[ParsedSize]) -> ParsedSize:
+    """
+    Fill fields the winning title omitted from other titles describing the same tire.
+
+    ``parse_best`` used to pick one title and take everything from it, which threw away whatever
+    the other titles knew. Measured over 3,000 enriched tires, 2.6% had a field in a non-winning
+    title that the winner lacked -- mostly load range (1.7%) and the ZR marker (0.6%). One real
+    row: the winning title read "Toyo Extensa A/S II P255/50R20 109H" while a sibling read
+    "255/50R20~ TO EXTENSA AS II XL", and the XL was simply lost.
+
+    **Only titles agreeing on the dimensions contribute.** A title describing a different size is
+    a different tire, and merging across those would be worse than the omission it fixes.
+    """
+    same_tire = [
+        other
+        for other in candidates
+        if other is not best
+        and other.notation == best.notation
+        and other.rim_diameter_in == best.rim_diameter_in
+        and other.section_width_mm == best.section_width_mm
+        and other.aspect_ratio == best.aspect_ratio
+        and other.section_width_in == best.section_width_in
+    ]
+    if not same_tire:
+        return best
+
+    updates = {}
+    for field in _MERGEABLE_FIELDS:
+        if getattr(best, field) is None:
+            value = next((getattr(other, field) for other in same_tire if getattr(other, field) is not None), None)
+            if value is not None:
+                updates[field] = value
+
+    # ZR is strictly more specific than R -- it says the size carries the high-speed marker. A
+    # title stating it is more informative than one that does not, so it wins; every other
+    # construction disagreement is left alone, since those are contradictions rather than detail.
+    if best.construction == CONSTRUCTION_RADIAL and any(other.construction == CONSTRUCTION_ZR for other in same_tire):
+        updates["construction"] = CONSTRUCTION_ZR
+        updates["size_display"] = best.size_display.replace("R", "ZR", 1)
+
+    return dataclasses.replace(best, **updates) if updates else best
 
 
 def disagreements(texts: typing.Iterable[typing.Optional[str]]) -> typing.List[str]:

@@ -347,6 +347,139 @@ def _coerce_structured(field: str, value: typing.Any) -> typing.Any:
 # The prompt
 # ==========================================================================================
 
+# Prepended when the model is asked to read the size itself (``--llm-size``), replacing
+# ``src.domain.tire_size`` as the extractor. Measured against the parser over 200 TOYO rows:
+# 99.0% of rows agreed on every field once these format rules were spelled out, up from 94.5%
+# before them -- almost every early miss was the model returning a raw token ("E/10") where the
+# schema wants a normalised value ("E"), not failing to read.
+#
+# The parser is NOT deleted. It stays the reference this mode is scored against, and it is what
+# ``experiment_llm_size`` compares to; a mode with no reference cannot be measured.
+_SIZE_BLOCK = """
+================================================================================
+PART A -- READ THE SIZE
+================================================================================
+
+Read the tire size out of the titles and report exactly what is written.
+
+THE RULE THAT GOVERNS PART A: transcribe, never derive.
+
+Report only what the text states. If the text does not state a field, return null. Do not
+calculate anything. Do not infer a load range from a load index, a speed rating from a model's
+reputation, or an aspect ratio that is simply absent. A null is a correct and expected answer;
+an invented value is not, and is worse than a missing one because nothing downstream can tell
+the difference.
+
+NOTATIONS
+
+metric      205/55R16, LT275/70R18, 275/40ZR20, 245/70R19.5
+            <section width mm>/<aspect %><construction><rim inches>
+flotation   33X12.50R15LT, 31x10.50-15, 35X12.50R20
+            <overall diameter in>X<section width in><construction><rim inches>
+numeric     7.50-16, 8.75R16.5     -- states NO aspect ratio; leave aspect_ratio null
+motorcycle  120/100-18, 90/90-21   -- metric shape with a 2-digit width or an aspect above 95
+
+construction is the mark between aspect and rim: R radial, ZR high-speed radial marker,
+B belted bias, D or a bare hyphen for diagonal/bias ply.
+
+THE SERVICE DESCRIPTION -- where most mistakes happen
+
+  "LT225/75R16 115/Q E"      load_index 115, speed_rating Q, load_range E
+  "275/60R20 116S XL"        load_index 116, speed_rating S, load_range XL
+  "LT265/70R17 121/118S"     load_index 121, load_index_dual 118, speed_rating S
+  "LT275 65R20 126 123S"     same, written with spaces: load 126, dual 123, speed S
+  "LT265/70R17 121/118S LRE" as above, plus load_range E written with an LR prefix
+  "275/35R19XL 100W"         load_range XL glued to the rim, load_index 100, speed W
+
+A slash between load index and speed is a SEPARATOR, not a dual load. "115/Q" is load 115,
+speed Q. A dual load has TWO NUMBERS: "121/118S", or "121 118S" with a space.
+
+Load range letters and speed symbols share letters. POSITION decides: the letter attached to
+the load index is the SPEED RATING; a letter standing alone after it is the LOAD RANGE. In
+"115/Q E", Q is the speed and E is the load range. Never the reverse.
+
+  load range vocabulary: SL, XL, RF, and A B C D E F G H J L M N
+                         (I, K and O are unused -- they read as 1 and 0 on a sidewall)
+  speed vocabulary:      A1-A8, B C D E F G J K L M N P Q R S T U H V W Y, and (Y)
+
+ZR is NOT a speed rating. It is a construction marker; the speed is the letter in the service
+description.
+
+FIELD FORMAT -- each of these is a real answer that was wrong only in its shape
+
+1. load_range is the DESIGNATION ALONE. Distributors append the ply after a slash: "E/10" is
+   Load Range E with a 10-ply equivalence. Report "E", never "E/10". Likewise "G/14" -> "G",
+   "C/6" -> "C", "L/20" -> "L", "(F/12)" -> "F".
+
+2. A letter that is part of a MODEL DESIGNATION is not a load range. "GRAND SPORT A/S" is
+   all-season, not Load Range A. "OPEN COUNTRY M/T" is mud-terrain, not Load Range M. "OP H/T"
+   is highway-terrain, not Load Range H. The tell is a slash followed by a LETTER; a slash
+   followed by a DIGIT ("E/10") is the real ply notation.
+
+3. size_display carries ONLY the size. Strip any ply suffix: "285/70R17/10" -> "285/70R17".
+   Strip the service description and everything after it.
+
+4. A decimal-less commercial rim is normalised WITH the decimal. "285/75R245" is a 24.5 inch
+   rim: rim_diameter_in 24.5, size_display "285/75R24.5". Same for R195 -> 19.5, R225 -> 22.5,
+   R175 -> 17.5. This is the one place you rewrite what is written, because both spellings are
+   the same rim and must produce one size_display.
+
+5. NEVER add a service type that is not in the text. "275/55R20 113H" has no LT, so
+   service_type is null and size_display is "275/55R20". "35X11.50R17 118Q" has no LT either --
+   size_display is "35X11.50R17". Service type changes what a tire fits; inferring one from the
+   model name, the load index or the tread pattern is exactly the guess this forbids.
+
+6. C is the European commercial marker and is written AFTER the rim: "225/75R16C". Report
+   service_type "C" and size_display "225/75R16C". LT, ST, P and T prefix instead.
+
+7. Parentheses around a whole service description do NOT make it the open-ended (Y).
+   "285/35R22 (106Y) XL" is load_index 106, speed_rating "Y" -- report "Y", not "(Y)". Only a
+   bare "(Y)" standing where the speed symbol goes, as in "295/30ZR19 100(Y)", is open-ended.
+
+8. Transcribe the load index digit for digit. "37X12.50R20LT 128Q" is 128. Do not adjust it
+   toward a value that looks more usual for the size.
+
+9. Report the construction character that is WRITTEN, even when it is obviously sloppy.
+   "LT325/50-22 122R" has a bare hyphen, so construction is "D". Many distributors type a hyphen
+   where the tire is really a radial; correcting that is a judgement, and Part A is transcription.
+
+10. Do NOT compute overall diameter. There are exactly two ways to report one, both of them
+    transcription:
+
+    overall_diameter_in -- ONLY for flotation, where the diameter is the first number of the
+      size itself. "33X12.50R15LT" -> 33. For metric, numeric and motorcycle sizes leave it
+      null; it is calculated downstream from the width, aspect and rim you report, and a value
+      you work out yourself would silently replace that calculation.
+
+    stated_overall_diameter_in -- a diameter a distributor printed SEPARATELY, which looks like
+      a trailing decimal after the service description: "116S XL 32.9" -> 32.9. If the trailing
+      text is part of the model name -- "BS TUR ER33", "MI SCORCHER 31", "PI CINTURATO CN36" --
+      it is NOT a diameter. A federal excise tax ("(1.32 FET Inc.)") is not one either. When in
+      doubt, null.
+
+11. Leave section_width_in null for metric sizes. It is millimetres converted to inches and is
+    calculated downstream. Report it only for flotation and numeric, where inches are what the
+    string actually states ("33X12.50R15" -> 12.50).
+
+WHAT IS NOT A TIRE SIZE -- set is_tire false and leave every size field null
+
+  "Belltech LOWERING KIT 16.5-17 Chevy Silverado"   16.5-17 is a model-year range
+  "South Bend Clutch 05.5-13 Dodge"                 05.5-13 is a model-year range
+  "WeatherTech 21-24 Ford F-150 / 23-24 F-250"      F-150 is a vehicle, not a 150mm tire
+  "ARROW 20X10.5 5X112 66.5 RBL +40"                a wheel: 20x10.5 rim, 5x112 bolt pattern
+  "XD811 FINS 20X9 -12MM RED"                       a wheel accessory; -12mm is offset
+  "Fork Springs - Prog. 4.5-10.5 N/mm"              a spring rate
+  "4981910571360"                                   a barcode
+"""
+
+
+_IDENTIFY_HEADING = """
+================================================================================
+PART B -- IDENTIFY THE PRODUCT
+================================================================================
+"""
+
+
 _SYSTEM_PREAMBLE = """You extract tire product information from messy automotive distributor \
 catalogue data.
 
@@ -380,9 +513,9 @@ RULES
    Three-Peak Mountain Snowflake marking. Never infer it from "winter capable" or
    "all weather" marketing language. When unsure, null.
 
-5. NEVER return section width, aspect ratio, rim diameter, load index, speed rating, load
-   range, overall diameter, max PSI, tread depth, UTQG, weight, price, or available sizes.
-   Those come from the parser and the distributor feed.
+5. Do not return max PSI, tread depth, UTQG, treadwear, weight, price, or available sizes.
+   Those come from the distributor feed, not from you. (The size fields in Part A are the
+   exception -- report those exactly as Part A instructs, and nothing beyond them.)
 
 6. If this is not a tire -- a wheel, an accessory, a mounted package -- set is_tire=false and
    leave everything else null.
@@ -397,7 +530,7 @@ RULES
 SCHEMA
 {
   "is_tire": bool,
-  "size_matches_input": bool,
+  "size_matches_input": bool,{size_schema}
   "model_name": string or null,
   "sub_model": string or null,
   "brand_name_corrected": string or null,
@@ -420,15 +553,61 @@ TREAD CATEGORY CODES
 """
 
 
-def build_system_prompt() -> str:
+# Size fields the response may carry in ``--llm-size`` mode. Outside that mode every one of
+# these is a rejection trigger (see FORBIDDEN_RESPONSE_KEYS): the parser owns them and a model
+# returning one means the prompt has drifted.
+LLM_SIZE_FIELDS = (
+    "notation",
+    "service_type",
+    "section_width_mm",
+    "aspect_ratio",
+    "section_width_in",
+    "rim_diameter_in",
+    "construction",
+    "load_index",
+    "load_index_dual",
+    "speed_rating",
+    "load_range",
+    "size_display",
+    "overall_diameter_in",
+    "stated_overall_diameter_in",
+)
+
+_SIZE_SCHEMA = """
+  "notation": "metric" | "flotation" | "numeric" | "motorcycle",
+  "service_type": "LT" | "ST" | "P" | "T" | "C" | null,
+  "section_width_mm": int or null,
+  "aspect_ratio": int or null,
+  "section_width_in": number or null,
+  "rim_diameter_in": number,
+  "construction": "R" | "ZR" | "B" | "D" | null,
+  "load_index": int or null,
+  "load_index_dual": int or null,
+  "speed_rating": string or null,
+  "load_range": string or null,
+  "size_display": string,
+  "overall_diameter_in": number or null,
+  "stated_overall_diameter_in": number or null,"""
+
+
+def build_system_prompt(llm_size: bool = False) -> str:
     """
     The system message, with the tread vocabulary read from ``tread_category`` rather than
     hard-coded -- the table is the constraint the response is validated against, so building the
     prompt from anything else would let the two drift apart silently.
 
+    ``llm_size`` prepends Part A, which asks the model to read the size instead of being handed
+    it. The two halves are separated and headed because a single undivided instruction block had
+    the model applying Part B's "decode the abbreviation using your knowledge" licence to Part A,
+    where the whole point is that it must not.
+
     Fixed for the whole run and identical between runs, which is what makes it cacheable.
     """
-    lines = [_SYSTEM_PREAMBLE]
+    lines = []
+    if llm_size:
+        lines.append(_SIZE_BLOCK)
+        lines.append(_IDENTIFY_HEADING)
+    lines.append(_SYSTEM_PREAMBLE)
     for category in src_models.TreadCategory.objects.all():
         lines.append(
             "  {code:<12} {label} -- {description}".format(
@@ -437,10 +616,10 @@ def build_system_prompt() -> str:
                 description=category.description,
             )
         )
-    return "\n".join(lines)
+    return "\n".join(lines).replace("{size_schema}", _SIZE_SCHEMA if llm_size else "")
 
 
-def build_user_payload(candidate: TireCandidate) -> typing.Dict[str, typing.Any]:
+def build_user_payload(candidate: TireCandidate, llm_size: bool = False) -> typing.Dict[str, typing.Any]:
     """
     What one call sees. The parsed size is included on purpose: it costs about 30 tokens and it
     stops the model guessing at dimensions -- it can see them and spend its attention on
@@ -451,8 +630,12 @@ def build_user_payload(candidate: TireCandidate) -> typing.Dict[str, typing.Any]
         "brand_string": candidate.brand_name,
         "titles": candidate.titles,
         "part_numbers": candidate.part_numbers,
-        "parsed_size": candidate.parsed.as_llm_payload(),
     }
+    if not llm_size:
+        payload["parsed_size"] = candidate.parsed.as_llm_payload()
+    # In llm_size mode the parsed size is deliberately withheld. Showing it would turn Part A
+    # from extraction into ratification -- the model would copy it, agreement would read as
+    # 100%, and the mode would be untestable.
     if candidate.categories:
         payload["distributor_categories"] = candidate.categories
     return payload
@@ -482,6 +665,8 @@ class ValidatedResponse:
     has_reinforced_sidewall: typing.Optional[bool] = None
     confidence: typing.Optional[decimal.Decimal] = None
     reason: typing.Optional[str] = None
+    # Populated only in llm_size mode; None means the parser owns the size for this row.
+    size: typing.Optional["LlmSize"] = None
 
 
 def _check_size_leak(response: typing.Dict[str, typing.Any]) -> typing.Optional[str]:
@@ -513,6 +698,7 @@ def validate(
     response: typing.Any,
     candidate: TireCandidate,
     valid_categories: typing.AbstractSet[str],
+    llm_size: bool = False,
 ) -> typing.Tuple[typing.Optional[ValidatedResponse], typing.Optional[str]]:
     """
     Turn a raw response into a ``ValidatedResponse``, or return the reason it was rejected.
@@ -524,9 +710,18 @@ def validate(
     if not isinstance(response, dict):
         return None, "not-an-object"
 
-    leak = _check_size_leak(response)
-    if leak:
-        return None, "size-leak:{}".format(leak)
+    if llm_size:
+        # The size canary is off by design here: the model was asked for those fields. It is
+        # replaced by validate_llm_size's bounds checks, which are the parser's own, so a value
+        # the parser would have refused cannot get in through this door instead.
+        size, size_error = validate_llm_size(response)
+        if size is None:
+            return None, "bad-size:{}".format(size_error)
+    else:
+        size = None
+        leak = _check_size_leak(response)
+        if leak:
+            return None, "size-leak:{}".format(leak)
 
     is_tire = response.get("is_tire")
     if not isinstance(is_tire, bool):
@@ -610,6 +805,10 @@ def validate(
             has_reinforced_sidewall=_as_bool(response.get("has_reinforced_sidewall")),
             confidence=confidence,
             reason=reason,
+            # None outside llm_size mode, which is what makes build_tire_spec fall back to the
+            # parser. Forgetting to thread this through is silent: every spec still gets written,
+            # just with the parser's size, so the mode looks like it works and measures nothing.
+            size=size,
         ),
         None,
     )
@@ -635,8 +834,12 @@ class LookupTables:
         self.load_range = {
             (row.load_range, row.applies_to): row.ply_rating for row in src_models.TireLoadRange.objects.all()
         }
+        # One entry per alternate stamping, not one per row: XL is stamped RF, RD and REINFORCED,
+        # and a size reading any of those previously had no way back to the XL row.
         self.load_range_alias = {
-            (row.alias, row.applies_to): row.ply_rating for row in src_models.TireLoadRange.objects.all() if row.alias
+            (alias, row.applies_to): row.ply_rating
+            for row in src_models.TireLoadRange.objects.all()
+            for alias in (row.aliases or [])
         }
         self.tread_categories = frozenset(src_models.TreadCategory.objects.values_list("code", flat=True))
 
@@ -801,7 +1004,10 @@ def build_tire_spec(
     verbatim from ``candidate.parsed``, the LLM block from ``validated``, and the distributor
     block is applied last **only over columns neither of the other two owns**.
     """
-    parsed = candidate.parsed
+    # One of the two size sources owns this row. LlmSize deliberately mirrors ParsedSize's field
+    # names so nothing downstream -- the lookups, the spec, the index projection -- has to know
+    # which one it got.
+    parsed = validated.size or candidate.parsed
     spec = src_models.TireSpec(
         master_part_id=candidate.master_part_id,
         notation=parsed.notation,
@@ -835,7 +1041,19 @@ def build_tire_spec(
         llm_model_used=model_used,
         # Either the model contradicted the parser, or two providers on this master part describe
         # different tires. Specs are still written -- the flag is a review queue, not a veto.
-        size_disputed=(not validated.size_matches_input) or len(candidate.size_variants) > 1,
+        # In llm_size mode the parser still ran on the same titles, so comparing the two costs
+        # nothing and is the only free check on the model's reading. A mismatch does not block
+        # the write -- it flags the row.
+        size_disputed=(
+            (not validated.size_matches_input)
+            or len(candidate.size_variants) > 1
+            or (
+                validated.size is not None
+                and candidate.parsed is not None
+                and validated.size.size_display.replace("-", "").upper()
+                != candidate.parsed.size_display.replace("-", "").upper()
+            )
+        ),
         category_reconciled=False,
         enriched_at=timezone.now(),
     )
@@ -983,6 +1201,7 @@ def run(
     max_workers: int = 4,
     apply_changes: bool = False,
     include_rejected: bool = False,
+    llm_size: bool = False,
     write_batch_size: int = 100,
     on_result: typing.Optional[
         typing.Callable[[TireCandidate, typing.Optional[ValidatedResponse], typing.Optional[str]], None]
@@ -1017,7 +1236,7 @@ def run(
         exclude_brand_ids = list(resolved.values())
 
     lookups = LookupTables()
-    system_prompt = build_system_prompt()
+    system_prompt = build_system_prompt(llm_size=llm_size)
     model_used = azure_llm.deployment()
     client = azure_llm.client()
 
@@ -1034,9 +1253,14 @@ def run(
         pending_not_tire.clear()
 
     def call(candidate: TireCandidate):
-        payload = json.dumps(build_user_payload(candidate), separators=(",", ":"))
+        payload = json.dumps(build_user_payload(candidate, llm_size=llm_size), separators=(",", ":"))
         response, error = azure_llm.complete_json(
-            client, system_prompt, payload, max_tokens=LLM_MAX_TOKENS, model=model_used
+            client,
+            system_prompt,
+            payload,
+            # The size block roughly doubles the answer, so the cap has to move with it.
+            max_tokens=LLM_MAX_TOKENS * 2 if llm_size else LLM_MAX_TOKENS,
+            model=model_used,
         )
         return candidate, response, error
 
@@ -1080,7 +1304,7 @@ def run(
                         on_result(candidate, None, "llm-error")
                     continue
 
-                validated, reason = validate(response, candidate, lookups.tread_categories)
+                validated, reason = validate(response, candidate, lookups.tread_categories, llm_size=llm_size)
                 if validated is None:
                     stats.reject(reason.split(":", 1)[0])
                     logger.warning("%s master_part=%s rejected: %s", _LOG_PREFIX, candidate.master_part_id, reason)
@@ -1113,3 +1337,224 @@ def run(
 
     flush()
     return stats
+
+
+# ==========================================================================================
+# LLM-read sizes: validation and the derivations the model must not do
+# ==========================================================================================
+
+# Vocabularies the model's size answer is checked against. Reused from the parser so the two
+# modes cannot disagree about what a valid code is.
+_VALID_NOTATIONS = frozenset(["metric", "flotation", "numeric", "motorcycle"])
+_VALID_CONSTRUCTIONS = frozenset(["R", "ZR", "B", "D"])
+
+# Same physical bounds the parser enforces. A model can transcribe a typo faithfully; these stop
+# the typo reaching the table.
+_LLM_BOUNDS = {
+    "section_width_mm": (60, 500),
+    "aspect_ratio": (15, 130),
+    "rim_diameter_in": (decimal.Decimal(8), decimal.Decimal(30)),
+    "section_width_in": (decimal.Decimal(2), decimal.Decimal(25)),
+    "overall_diameter_in": (decimal.Decimal(10), decimal.Decimal(60)),
+    "load_index": (60, 150),
+    "load_index_dual": (60, 150),
+}
+
+
+@dataclasses.dataclass
+class LlmSize:
+    """A size the model read, after validation and after the derived fields are filled in."""
+
+    notation: str
+    size_display: str
+    rim_diameter_in: decimal.Decimal
+    overall_diameter_in: decimal.Decimal
+    service_type: typing.Optional[str] = None
+    section_width_mm: typing.Optional[int] = None
+    aspect_ratio: typing.Optional[int] = None
+    section_width_in: typing.Optional[decimal.Decimal] = None
+    construction: typing.Optional[str] = None
+    load_index: typing.Optional[int] = None
+    load_index_dual: typing.Optional[int] = None
+    speed_rating: typing.Optional[str] = None
+    load_range: typing.Optional[str] = None
+    diameter_source: str = "computed"
+
+
+def _as_int(value: typing.Any) -> typing.Optional[int]:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_decimal(value: typing.Any) -> typing.Optional[decimal.Decimal]:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return decimal.Decimal(str(value))
+    except (TypeError, ValueError, decimal.InvalidOperation):
+        return None
+
+
+def _in_bounds(field: str, value: typing.Any) -> bool:
+    low, high = _LLM_BOUNDS[field]
+    return value is not None and low <= value <= high
+
+
+def validate_llm_size(
+    response: typing.Mapping[str, typing.Any]
+) -> typing.Tuple[typing.Optional[LlmSize], typing.Optional[str]]:
+    """
+    Turn the model's size answer into an ``LlmSize``, or say why it cannot be trusted.
+
+    **Everything derivable is derived here, not asked for.** The model reads millimetres, an
+    aspect ratio and a rim; the overall diameter that fitment search filters on is arithmetic,
+    and arithmetic is the one thing a language model is worst at and a computer is exact at.
+    Asking for it would also make a wrong answer indistinguishable from a right one, because
+    there would be nothing left to check it against.
+
+    Rejection rather than repair, matching ``validate``: a size that fails a bounds check is a
+    size we do not write. The bounds are the parser's own, so a value the parser would have
+    refused does not get in through this door instead.
+    """
+    notation = (response.get("notation") or "").strip().lower()
+    if notation not in _VALID_NOTATIONS:
+        return None, "bad-notation:{}".format(notation or "missing")
+    # The prompt offers "motorcycle" because that is how a human reads the string; the schema
+    # files those under metric, which is what they are dimensionally.
+    stored_notation = "metric" if notation == "motorcycle" else notation
+
+    rim = _as_decimal(response.get("rim_diameter_in"))
+    if not _in_bounds("rim_diameter_in", rim):
+        return None, "bad-rim:{}".format(response.get("rim_diameter_in"))
+
+    width_mm = _as_int(response.get("section_width_mm"))
+    if width_mm is not None and not _in_bounds("section_width_mm", width_mm):
+        return None, "bad-section-width:{}".format(width_mm)
+    aspect = _as_int(response.get("aspect_ratio"))
+    if aspect is not None and not _in_bounds("aspect_ratio", aspect):
+        return None, "bad-aspect:{}".format(aspect)
+    width_in = _as_decimal(response.get("section_width_in"))
+    if width_in is not None and not _in_bounds("section_width_in", width_in):
+        width_in = None
+
+    load_index = _as_int(response.get("load_index"))
+    if load_index is not None and not _in_bounds("load_index", load_index):
+        load_index = None
+    load_index_dual = _as_int(response.get("load_index_dual"))
+    if load_index_dual is not None and not _in_bounds("load_index_dual", load_index_dual):
+        load_index_dual = None
+
+    speed_rating = _clean(response.get("speed_rating"))
+    if speed_rating is not None:
+        speed_rating = speed_rating.upper().strip("()")
+        if speed_rating not in tire_size.SPEED_RATINGS:
+            speed_rating = None
+
+    load_range = _clean(response.get("load_range"))
+    if load_range is not None:
+        # Belt and braces on prompt rule 1: strip a ply suffix the model kept anyway.
+        load_range = load_range.upper().split("/")[0].strip("() ")
+        if load_range not in tire_size.LOAD_RANGES:
+            load_range = None
+
+    construction = _clean(response.get("construction"))
+    construction = construction.upper() if construction else None
+    if construction == "-":
+        construction = tire_size.CONSTRUCTION_BIAS
+    if construction not in _VALID_CONSTRUCTIONS:
+        construction = None
+
+    size_display = _clean(response.get("size_display"))
+    if not size_display:
+        return None, "missing-size-display"
+
+    overall, diameter_source = _resolve_overall_diameter(
+        notation=stored_notation,
+        response=response,
+        rim=rim,
+        width_mm=width_mm,
+        aspect=aspect,
+        width_in=width_in,
+    )
+    if overall is None:
+        return None, "no-overall-diameter"
+    if overall <= rim:
+        # A tire is always taller than the wheel it mounts on -- the same tripwire the table's
+        # CHECK constraint enforces, applied before the write rather than as a crash.
+        return None, "overall-not-taller-than-rim:{} vs {}".format(overall, rim)
+
+    # Millimetres to inches is exact; never take the model's word for it on a metric size.
+    if stored_notation == "metric" and width_mm is not None:
+        width_in = (decimal.Decimal(width_mm) / tire_size.MM_PER_INCH).quantize(
+            decimal.Decimal("0.01"), rounding=decimal.ROUND_HALF_UP
+        )
+
+    return (
+        LlmSize(
+            notation=stored_notation,
+            size_display=size_display[:64],
+            rim_diameter_in=rim,
+            overall_diameter_in=overall,
+            service_type=(_clean(response.get("service_type")) or "").upper()[:8] or None,
+            section_width_mm=width_mm,
+            aspect_ratio=aspect,
+            section_width_in=width_in,
+            construction=construction,
+            load_index=load_index,
+            load_index_dual=load_index_dual,
+            speed_rating=speed_rating,
+            load_range=load_range,
+            diameter_source=diameter_source,
+        ),
+        None,
+    )
+
+
+def _resolve_overall_diameter(
+    *,
+    notation: str,
+    response: typing.Mapping[str, typing.Any],
+    rim: decimal.Decimal,
+    width_mm: typing.Optional[int],
+    aspect: typing.Optional[int],
+    width_in: typing.Optional[decimal.Decimal],
+) -> typing.Tuple[typing.Optional[decimal.Decimal], str]:
+    """
+    The overall diameter, and where it came from. Preference order is deliberate:
+
+      1. **flotation** states it inside the size ("33X12.50R15" is 33 inches tall), so that is
+         transcription and is trusted outright.
+      2. **metric** is computed: rim plus two section heights. Exact arithmetic on values the
+         model only had to read.
+      3. **numeric** states no aspect ratio at all, so the pre-1965 convention of section height
+         equal to section width applies. Nominal, and flagged as such.
+      4. a distributor's separately-printed figure, only if nothing above worked.
+
+    Anything the model itself calculated is ignored except in case 1, where it did not calculate.
+    """
+    if notation == "flotation":
+        stated = _as_decimal(response.get("overall_diameter_in"))
+        if _in_bounds("overall_diameter_in", stated):
+            return _round_tenth(stated), "stated"
+
+    if width_mm is not None and aspect is not None:
+        section_height = (decimal.Decimal(width_mm) * aspect / 100) / tire_size.MM_PER_INCH
+        return _round_tenth(rim + 2 * section_height), "computed"
+
+    if notation == "numeric" and width_in is not None:
+        return _round_tenth(rim + 2 * width_in), "nominal"
+
+    distributor = _as_decimal(response.get("stated_overall_diameter_in"))
+    if _in_bounds("overall_diameter_in", distributor):
+        return _round_tenth(distributor), "distributor"
+
+    return None, "none"
+
+
+def _round_tenth(value: decimal.Decimal) -> decimal.Decimal:
+    """Half-up, matching the parser and TireLoadIndex.max_load_lb."""
+    return value.quantize(decimal.Decimal("0.1"), rounding=decimal.ROUND_HALF_UP)
