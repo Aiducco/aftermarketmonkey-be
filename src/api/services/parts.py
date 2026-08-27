@@ -12,6 +12,7 @@ from src import constants as src_constants
 from src import enums as src_enums
 from src import models as src_models
 from src.api.services import billing as billing_services
+from src.domain import tire_spec_display
 from src.integrations import credentials as credentials_helper
 from src.integrations.live_inventory import exceptions as live_inventory_exceptions
 from src.integrations.live_inventory import registry as live_inventory_registry
@@ -167,6 +168,32 @@ def _provider_go_to_link(
     return None
 
 
+def _build_tire_specs(
+    tire_spec: typing.Optional["src_models.TireSpec"],
+) -> typing.Optional[typing.Dict[str, typing.Any]]:
+    """
+    The tire specification card for a tire part -- null for anything that is not a tire.
+
+    Only ``product_type == "tire"`` MasterParts ever get a ``tire_specs`` row (the enrichment pass
+    is scoped to them), so the row's existence is the gate; no separate product_type check is
+    needed here, and a tire whose enrichment hasn't run yet correctly returns null rather than a
+    card full of holes.
+
+    Every column is handed to the display builder and it picks what ships -- that whitelist lives
+    in one place (``src.domain.tire_spec_display``) so a new tire_specs column does not silently
+    leak into the API the moment it is added.
+    """
+    if tire_spec is None:
+        return None
+
+    row = {field.attname: getattr(tire_spec, field.attname) for field in tire_spec._meta.concrete_fields}
+    # attname for the FK is ``tread_category_id`` even though it stores the code; the builder
+    # wants the code under its own name, plus the label a UI actually renders.
+    row["tread_category"] = tire_spec.tread_category_id
+    row["tread_category_label"] = tire_spec.tread_category.label if tire_spec.tread_category_id else None
+    return tire_spec_display.build_tire_specs(row)
+
+
 def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None) -> typing.Optional[typing.Dict]:
     """
     Get detailed info for one MasterPart.
@@ -177,7 +204,12 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
     """
     try:
         part = (
-            src_models.MasterPart.objects.select_related("brand", "data")
+            # tire_spec is a reverse OneToOne and tread_category carries the label a UI renders
+            # (never the code -- see the TreadCategory docstring), so both are joined here rather
+            # than costing two extra queries on every tire's detail page.
+            src_models.MasterPart.objects.select_related(
+                "brand", "data", "tire_spec", "tire_spec__tread_category"
+            )
             .prefetch_related(
                 Prefetch(
                     "fitments",
@@ -195,6 +227,11 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
         part_data = part.data
     except src_models.MasterPartData.DoesNotExist:
         part_data = None
+
+    try:
+        tire_spec = part.tire_spec
+    except src_models.TireSpec.DoesNotExist:
+        tire_spec = None
 
     base = {
         "id": part.id,
@@ -241,6 +278,12 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
             if part_data is not None
             else {}
         ),
+        # wheel / tire / part -- null means "not classified yet", never "part" (see
+        # MasterPart.product_type). The client needs it to know which specialised blocks below
+        # are worth rendering.
+        "product_type": part.product_type,
+        # Populated for tires only; null on everything else.
+        "tire_specs": _build_tire_specs(tire_spec),
     }
 
     company_provider_map: typing.Dict[int, typing.Dict[str, typing.Any]] = {}
