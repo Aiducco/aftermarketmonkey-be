@@ -148,27 +148,33 @@ def retry_on_rate_budget(
             time.sleep(wait_s)
 
 
-def resumable_sweep(sweep_fn: typing.Callable[..., typing.Any], **fixed_kwargs: typing.Any) -> typing.Callable[[], typing.Any]:
+def resumable_sweep(
+    sweep_fn: typing.Callable[..., typing.Any],
+    checkpoint_kwarg: str = "start_page",
+    **fixed_kwargs: typing.Any,
+) -> typing.Callable[[], typing.Any]:
     """
-    Wrap a paginated sweep function into a zero-arg callable suitable for
-    :func:`retry_on_rate_budget`, so each retry resumes from the previous attempt's checkpoint
-    instead of restarting from page 1.
+    Wrap a paginated (or otherwise resumable) sweep function into a zero-arg callable suitable
+    for :func:`retry_on_rate_budget`, so each retry resumes from the previous attempt's
+    checkpoint instead of starting over.
 
-    ``sweep_fn`` must accept a ``start_page`` keyword (see ``turn_14_sweeps._sweep``) and raise
-    :class:`RateBudgetExhausted` with ``.checkpoint`` set to the page it failed on -- ``_sweep``
-    already does this. Real incident (2026-08-27): without this, a ~1,724-page sweep hit a
-    transient upstream 429 five times over 49 minutes and burned ~4,600 requests -- roughly
-    2.7x the catalog's actual size -- because every retry re-walked pages the previous attempt
-    had already fetched successfully, instead of picking up where it left off.
+    ``sweep_fn`` must accept ``checkpoint_kwarg`` (default ``start_page``, matching
+    ``turn_14_sweeps._sweep``; pass ``checkpoint_kwarg="start_index"`` for a flat-list sweep
+    like ``sweep_dropship_controllers``) and raise :class:`RateBudgetExhausted` with
+    ``.checkpoint`` set to wherever it failed. Real incident (2026-08-27): without this, a
+    ~1,724-page sweep hit a transient upstream 429 five times over 49 minutes and burned ~4,600
+    requests -- roughly 2.7x the catalog's actual size -- because every retry re-walked
+    everything the previous attempt had already fetched successfully, instead of picking up
+    where it left off.
     """
-    state: typing.Dict[str, int] = {"start_page": 1}
+    state: typing.Dict[str, int] = {"checkpoint": 1 if checkpoint_kwarg == "start_page" else 0}
 
     def _call() -> typing.Any:
         try:
-            return sweep_fn(start_page=state["start_page"], **fixed_kwargs)
+            return sweep_fn(**{checkpoint_kwarg: state["checkpoint"]}, **fixed_kwargs)
         except RateBudgetExhausted as e:
             if e.checkpoint is not None:
-                state["start_page"] = e.checkpoint
+                state["checkpoint"] = e.checkpoint
             raise
 
     return _call

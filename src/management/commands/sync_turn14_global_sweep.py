@@ -154,8 +154,17 @@ class Command(BaseCommand):
                 )
 
                 if not options["skip_dropship"]:
+                    # Real incident (2026-08-27): dropship immediately follows inventory
+                    # (~776 pages) with no gap and hit the same burst-shaped 429 items_data did
+                    # -- resumable + paced for the same reason (see sweep_dropship_controllers
+                    # and this file's items_data comment above).
                     results["dropship"] = rate_limit_base.retry_on_rate_budget(
-                        "dropship", lambda: turn_14_sweeps.sweep_dropship_controllers(client), self.stdout.write
+                        "dropship",
+                        rate_limit_base.resumable_sweep(
+                            turn_14_sweeps.sweep_dropship_controllers,
+                            checkpoint_kwarg="start_index", client=client, pace_seconds=0.3,
+                        ),
+                        self.stdout.write,
                     )
                 if not options["skip_shipping_estimates"]:
                     results["shipping_estimates"] = rate_limit_base.retry_on_rate_budget(

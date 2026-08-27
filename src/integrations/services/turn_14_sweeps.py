@@ -436,13 +436,24 @@ def sweep_fitment(
     return result
 
 
-def sweep_dropship_controllers(client=None) -> int:
+def sweep_dropship_controllers(
+    client=None, start_index: int = 0, pace_seconds: typing.Optional[float] = None
+) -> int:
     """
     Resolve every distinct Turn14Items.dropship_controller_id through GET /v1/dropship/{id}.
 
     There is no bulk endpoint for these (an open question for Turn 14), but the set is small --
     a few hundred at most across the catalog -- so one request each is affordable. Id 0 is
     Turn 14's sentinel for "no controller" and 404s, so it is filtered out rather than fetched.
+
+    ``start_index`` resumes a run that previously failed partway through (see
+    ``rate_limit.resumable_sweep`` -- ``RateBudgetExhausted.checkpoint`` is set to the index of
+    the controller that failed). Real incident (2026-08-27): this used to accumulate every
+    result in memory and upsert only at the very end, so a 429 anywhere in a 298-controller run
+    -- immediately after a heavy inventory sweep with no gap, the same burst-after-burst shape
+    that broke items_data -- discarded every controller successfully resolved so far, on top of
+    restarting from the first one on retry. Now flushes what it has before re-raising, and
+    ``pace_seconds`` (see ``_sweep``) smooths the same burst shape.
     """
     client = client or turn_14_global.get_global_client()
 
@@ -457,26 +468,40 @@ def sweep_dropship_controllers(client=None) -> int:
     )
     logger.info("{} Resolving {} dropship controller(s).".format(_LOG_PREFIX, len(controller_ids)))
 
-    instances = []
-    for controller_id in controller_ids:
-        data = client.get_dropship_controller(int(controller_id))
-        if not data:
-            continue
-        instances.append(src_models.Turn14DropshipController(
-            external_id=str(controller_id),
-            charges=(data.get("attributes") or {}).get("charges"),
-            updated_at=timezone.now(),
-        ))
-
-    if instances:
+    def _flush(instances: typing.List[src_models.Turn14DropshipController]) -> int:
+        if not instances:
+            return 0
         pgbulk.upsert(
             src_models.Turn14DropshipController,
             instances,
             unique_fields=["external_id"],
             update_fields=["charges", "updated_at"],
         )
-    logger.info("{} Upserted {} dropship controller(s).".format(_LOG_PREFIX, len(instances)))
-    return len(instances)
+        return len(instances)
+
+    buffer: typing.List[src_models.Turn14DropshipController] = []
+    written = 0
+    last_index = len(controller_ids) - 1
+    for i in range(start_index, len(controller_ids)):
+        controller_id = controller_ids[i]
+        try:
+            data = client.get_dropship_controller(int(controller_id))
+        except rate_limit_base.RateBudgetExhausted as e:
+            written += _flush(buffer)
+            e.checkpoint = i
+            raise
+        if data:
+            buffer.append(src_models.Turn14DropshipController(
+                external_id=str(controller_id),
+                charges=(data.get("attributes") or {}).get("charges"),
+                updated_at=timezone.now(),
+            ))
+        if pace_seconds and i < last_index:
+            time.sleep(pace_seconds)
+
+    written += _flush(buffer)
+    logger.info("{} Upserted {} dropship controller(s).".format(_LOG_PREFIX, written))
+    return written
 
 
 def sweep_shipping_options(client=None) -> int:
