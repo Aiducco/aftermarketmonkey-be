@@ -13,12 +13,21 @@ phase 2 as inventory/dropship/shipping estimates plus propagation. The whole swe
 requests fit under the 5 000/hour budget in principle, but competing crons (the 10-minute
 inventory-delta job, per-company pricing syncs) share the same budget, and a single run that
 spills past its hour forces long internal rate-limit retries that starve those crons for the
-rest of the day (observed live 2026-08-26). Scheduling phase 1 and phase 2 as separate cron
-entries two hours apart keeps each phase's own request cost comfortably inside one clock hour
-without leaning on retry-and-wait:
+rest of the day (observed live 2026-08-26).
+
+Phase 3 -- enqueuing every active Turn 14 company's own pricing sync -- is split out separately
+rather than tacked onto phase 2, because it is not more API requests against *this* budget, it's
+kicking off up to ~17 minutes of per-company work (a ~9 minute raw fetch plus a ~7 minute
+master-parts sync, measured live 2026-08-26) for every active connection, 4 at a time. Firing
+that immediately after phase 2's own heavy sweep -- rather than after phase 2 has had time to
+fully finish and the host to settle -- is exactly what caused a real production incident
+(2026-08-26): the resulting host memory/CPU pressure evicted Postgres's buffer cache badly
+enough to take /api/search/ down for several minutes. Scheduling all three phases as separate
+cron entries, spaced out, keeps each one's own cost from compounding into the next:
 
     0 1 * * *  manage.py sync_turn14_global_sweep --phase 1 --deactivate-missing
     0 3 * * *  manage.py sync_turn14_global_sweep --phase 2
+    0 5 * * *  manage.py sync_turn14_global_sweep --phase 3
 
 Omitting ``--phase`` runs everything in one invocation, as before (useful for ad hoc/manual
 runs where splitting buys nothing).
@@ -41,20 +50,22 @@ _TASK_NAME = "sync_turn14_global_sweep"
 class Command(BaseCommand):
     help = (
         "Daily Turn 14 global sweep: brands, locations, shipping options, items, items/data, "
-        "inventory, dropship controllers and shipping estimates, using the flat catalog-wide "
-        "endpoints. --phase 1/2 splits it into two scheduled invocations; omit for one full run."
+        "inventory, dropship controllers, shipping estimates and per-company pricing, using the "
+        "flat catalog-wide endpoints. --phase 1/2/3 splits it into scheduled invocations; omit "
+        "for one full run."
     )
 
     def add_arguments(self, parser):
         parser.add_argument(
             "--phase",
             type=int,
-            choices=[1, 2],
+            choices=[1, 2, 3],
             default=None,
             help=(
-                "Run only phase 1 (brands/locations/shipping options/items) or phase 2 "
-                "(items data/inventory/dropship/shipping estimates/propagation/pricing). Omit "
-                "to run the full sweep in one invocation."
+                "Run only phase 1 (brands/locations/shipping options/items/items data), phase 2 "
+                "(inventory/dropship/shipping estimates/propagation), or phase 3 (enqueue every "
+                "active Turn 14 company's pricing sync). Omit to run the full sweep in one "
+                "invocation."
             ),
         )
         parser.add_argument(
@@ -82,6 +93,7 @@ class Command(BaseCommand):
         task_name = _TASK_NAME if phase is None else "{}_phase{}".format(_TASK_NAME, phase)
         run_phase1 = phase in (None, 1)
         run_phase2 = phase in (None, 2)
+        run_phase3 = phase in (None, 3)
 
         audit_scheduled_tasks.cleanup_stale_started_executions(task_name)
         execution = audit_scheduled_tasks.start_scheduled_task_execution(task_name)
@@ -139,19 +151,26 @@ class Command(BaseCommand):
                     )
 
                 # Only after every raw sweep above completed -- propagating from a half-swept
-                # catalog would push incomplete data into MasterPart/ProviderPart. Pricing sync
-                # itself stays separate (the per-company IntegrationPricingSyncJob queue), but
-                # Turn 14's *recurring* enqueue happens right here rather than on
-                # ingest_all_providers' every-4-hours cycle -- pricing should be checked against
-                # the catalog just swept, not against up to ~20h stale data (see
-                # enqueue_all_active_turn14_pricing_jobs). On-connect enqueue for a brand new
-                # connection is unaffected -- that still fires immediately, unrelated to this
-                # daily cycle. When run standalone (--phase 2), this assumes phase 1 already ran
-                # -- true on the scheduled 1am/3am split, not guaranteed for an ad hoc run.
+                # catalog would push incomplete data into MasterPart/ProviderPart.
                 self.stdout.write("Propagating swept Turn14 data into MasterPart/ProviderPart...")
                 master_parts.sync_derived_from_turn14(skip_pricing=True)
                 self.stdout.write("Propagation complete.")
 
+            if run_phase3:
+                # Pricing sync itself stays separate (the per-company IntegrationPricingSyncJob
+                # queue), but Turn 14's *recurring* enqueue happens from this daily cycle rather
+                # than on ingest_all_providers' every-4-hours one -- pricing should be checked
+                # against the catalog just swept, not against up to ~20h stale data (see
+                # enqueue_all_active_turn14_pricing_jobs). On-connect enqueue for a brand new
+                # connection is unaffected -- that still fires immediately, unrelated to this
+                # daily cycle. Split into its own phase, scheduled after phase 2 has had time to
+                # finish and the host to settle, rather than tacked onto phase 2 directly: each
+                # enqueued job is ~17 minutes of real per-company work (see this file's own
+                # docstring), and firing that immediately after phase 2's own heavy sweep is what
+                # caused a real production incident (2026-08-26) -- the combined host pressure
+                # took /api/search/ down. When run standalone (--phase 3), this assumes phases 1
+                # and 2 already ran -- true on the scheduled cron split, not guaranteed for an ad
+                # hoc run.
                 results["pricing_jobs_enqueued"] = integration_pricing_sync_jobs.enqueue_all_active_turn14_pricing_jobs()
 
         except rate_limit_base.RateBudgetExhausted as e:
