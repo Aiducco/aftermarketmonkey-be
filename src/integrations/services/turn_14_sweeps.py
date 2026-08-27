@@ -25,6 +25,7 @@ only ever upserts, so a SKU that disappears from the feed stays ``active=True`` 
 :func:`deactivate_items_missing_from_sweep`.
 """
 import logging
+import time
 import typing
 from decimal import Decimal, InvalidOperation
 
@@ -106,6 +107,7 @@ def _sweep(
     flush: typing.Callable[[typing.List[typing.Dict]], int],
     max_pages: typing.Optional[int] = None,
     start_page: int = 1,
+    pace_seconds: typing.Optional[float] = None,
 ) -> typing.Tuple[int, int]:
     """
     Page an endpoint to exhaustion, handing ``flush`` batches of raw rows.
@@ -127,6 +129,17 @@ def _sweep(
     failed page forward, burning ~4,600 requests without the sweep ever actually finishing. A
     caller that catches ``RateBudgetExhausted`` and passes its ``.checkpoint`` back in as
     ``start_page`` on the next attempt resumes instead of repeating already-fetched pages.
+
+    ``pace_seconds`` sleeps this long after every page, on top of whatever the shared rate
+    buckets already allow. The bucket-based pacing only intervenes once a soft window (5/s,
+    100/min) is already full, so left alone a sweep bursts up to that ceiling, pauses, and
+    bursts again -- a shape, not just a rate. Real incident (2026-08-27): items/data (Turn 14's
+    own smaller, 450-row page for this endpoint, so ~1,724 pages against items' ~778 for the
+    same catalog) hit a real upstream 429 in every one of two independent full-catalog runs,
+    always well under the documented 5,000/hour ceiling by our own accounting -- consistent
+    with Turn 14 reacting to the burst shape on this specific endpoint, not a simple count.
+    Smoothing to an even pace is a direct, cheap way to test that without guessing further from
+    logs alone.
     """
     page: typing.Optional[int] = start_page
     buffer: typing.List[typing.Dict] = []
@@ -158,6 +171,9 @@ def _sweep(
                 ))
             break
 
+        if pace_seconds and page is not None:
+            time.sleep(pace_seconds)
+
     if buffer:
         written += flush(buffer)
 
@@ -169,7 +185,10 @@ def _sweep(
 # Global (shared) sweeps
 # ---------------------------------------------------------------------------------------
 
-def sweep_items(client=None, max_pages: typing.Optional[int] = None, start_page: int = 1) -> typing.Tuple[int, int]:
+def sweep_items(
+    client=None, max_pages: typing.Optional[int] = None, start_page: int = 1,
+    pace_seconds: typing.Optional[float] = None,
+) -> typing.Tuple[int, int]:
     """GET /v1/items over the whole catalog into Turn14Items."""
     client = client or turn_14_global.get_global_client()
     brands = _brand_by_external_id()
@@ -203,7 +222,9 @@ def sweep_items(client=None, max_pages: typing.Optional[int] = None, start_page:
         )
         return len(instances)
 
-    result = _sweep("items", client.get_items, flush, max_pages=max_pages, start_page=start_page)
+    result = _sweep(
+        "items", client.get_items, flush, max_pages=max_pages, start_page=start_page, pace_seconds=pace_seconds,
+    )
     if unknown_brands:
         # Turn 14 published items for a brand we have not mapped yet. Not fatal -- the next
         # brands sync picks it up -- but silence here would hide a growing blind spot.
@@ -216,7 +237,8 @@ def sweep_items(client=None, max_pages: typing.Optional[int] = None, start_page:
 
 
 def sweep_items_data(
-    client=None, max_pages: typing.Optional[int] = None, start_page: int = 1
+    client=None, max_pages: typing.Optional[int] = None, start_page: int = 1,
+    pace_seconds: typing.Optional[float] = None,
 ) -> typing.Tuple[int, int]:
     """GET /v1/items/data over the whole catalog into Turn14BrandData (media + descriptions)."""
     client = client or turn_14_global.get_global_client()
@@ -249,11 +271,15 @@ def sweep_items_data(
         )
         return len(instances)
 
-    return _sweep("items/data", client.get_items_data, flush, max_pages=max_pages, start_page=start_page)
+    return _sweep(
+        "items/data", client.get_items_data, flush,
+        max_pages=max_pages, start_page=start_page, pace_seconds=pace_seconds,
+    )
 
 
 def sweep_inventory(
-    client=None, max_pages: typing.Optional[int] = None, start_page: int = 1
+    client=None, max_pages: typing.Optional[int] = None, start_page: int = 1,
+    pace_seconds: typing.Optional[float] = None,
 ) -> typing.Tuple[int, int]:
     """GET /v1/inventory over the whole catalog into Turn14BrandInventory."""
     client = client or turn_14_global.get_global_client()
@@ -300,10 +326,16 @@ def sweep_inventory(
         )
         return len(instances)
 
-    return _sweep("inventory", client.get_inventory, flush, max_pages=max_pages, start_page=start_page)
+    return _sweep(
+        "inventory", client.get_inventory, flush,
+        max_pages=max_pages, start_page=start_page, pace_seconds=pace_seconds,
+    )
 
 
-def sweep_fitment(client=None, max_pages: typing.Optional[int] = None, start_page: int = 1) -> typing.Tuple[int, int]:
+def sweep_fitment(
+    client=None, max_pages: typing.Optional[int] = None, start_page: int = 1,
+    pace_seconds: typing.Optional[float] = None,
+) -> typing.Tuple[int, int]:
     """
     GET /v1/items/fitment over the whole catalog, decoded straight into MasterPartFitment.
 
@@ -392,7 +424,10 @@ def sweep_fitment(client=None, max_pages: typing.Optional[int] = None, start_pag
         )
         return len(to_upsert)
 
-    result = _sweep("items/fitment", client.get_items_fitment, flush, max_pages=max_pages, start_page=start_page)
+    result = _sweep(
+        "items/fitment", client.get_items_fitment, flush,
+        max_pages=max_pages, start_page=start_page, pace_seconds=pace_seconds,
+    )
     if skipped_unknown_item[0] or skipped_unknown_vehicle[0]:
         logger.warning(
             "{} fitment sweep: skipped {} row(s) for items with no MasterPart, {} vehicle_id(s) "
@@ -476,7 +511,8 @@ def sweep_shipping_options(client=None) -> int:
 
 
 def sweep_shipping_estimates(
-    client=None, max_pages: typing.Optional[int] = None, start_page: int = 1
+    client=None, max_pages: typing.Optional[int] = None, start_page: int = 1,
+    pace_seconds: typing.Optional[float] = None,
 ) -> typing.Tuple[int, int]:
     """
     GET /v1/shipping/item_estimation over the whole catalog into Turn14ItemShippingEstimate.
@@ -526,7 +562,7 @@ def sweep_shipping_estimates(
 
     return _sweep(
         "shipping/item_estimation", client.get_item_shipping_estimates, flush,
-        max_pages=max_pages, start_page=start_page,
+        max_pages=max_pages, start_page=start_page, pace_seconds=pace_seconds,
     )
 
 

@@ -132,8 +132,18 @@ class Command(BaseCommand):
                 # items (just above) for brand resolution, so it rides along in phase 1 rather
                 # than phase 2 -- phase 2 is then just inventory/dropship/shipping estimates plus
                 # propagation, comfortably lighter.
+                #
+                # pace_seconds=0.6: this endpoint alone hit a real upstream 429 in every one of
+                # two independent full-catalog runs (2026-08-27), always well under our own
+                # 5,000/hour accounting -- consistent with Turn 14 reacting to burst shape (our
+                # own soft buckets only intervene once a window is already full, so left alone
+                # this bursts to the ceiling, pauses, bursts again) rather than a simple count.
+                # 0.6s/page evenly spreads requests at the same ~100/min our own governor already
+                # targets, instead of bursting to it. No other sweep has shown this failure, so
+                # only this one is paced for now.
                 results["items_data"] = rate_limit_base.retry_on_rate_budget(
-                    "items_data", rate_limit_base.resumable_sweep(turn_14_sweeps.sweep_items_data, client=client),
+                    "items_data",
+                    rate_limit_base.resumable_sweep(turn_14_sweeps.sweep_items_data, client=client, pace_seconds=0.6),
                     self.stdout.write,
                 )
 
