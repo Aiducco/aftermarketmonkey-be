@@ -5236,3 +5236,280 @@ class FacetConfig(django_db_models.Model):
 
     def __str__(self):
         return f"{self.mode}.{self.field} ({self.widget})"
+
+
+class SimpleTireSku(django_db_models.Model):
+    """
+    One purchasable tire SKU exactly as simpletire.com publishes it -- a competitor-catalog
+    snapshot, deliberately **not** joined to ``MasterPart`` or ``TireSpec``.
+
+    Flat on purpose. Brand and product-line columns repeat on every SKU row because this table is
+    a scrape landing zone, not a catalog: nothing in the app reads it yet, and the one question it
+    has to answer cheaply ("what does SimpleTire list, at what price, in what size") is a single
+    filter over one table. Normalize it later, from this data, if a consumer ever needs to.
+
+    Where the values come from
+    --------------------------
+    SimpleTire renders its PDP from ``GET /api/product-detail``, which returns JSON -- the HTML
+    page merely embeds the same payload in the React flight stream. So this table is populated
+    from the JSON, and "parsing the page" means parsing that object, not the markup. Three blocks
+    of it matter, and ``src.integrations.services.simpletire`` maps them here:
+
+    ``siteProductLine``             brand + model, identical across every SKU of a line
+    ``siteProductLineSizeDetail``   the *selected* SKU: price, stock, scores, fees
+    ``siteProductSpecs``            the *selected* SKU's spec sheet -- load index, UTQG, weight...
+
+    The spec sheet is per-SKU, not per-model: 265/70R18 and 225/65R16 of the same tire report
+    different load indexes, weights and overall diameters. That is why the crawler issues one
+    request per size rather than one per model, and why every ``spec_*`` column below is a
+    property of this row alone.
+
+    Typed columns vs. raw blobs
+    ---------------------------
+    Every typed column is a parse of a display string SimpleTire chose for humans
+    (``'2756 lbs (116)'``, ``'460AA'``, ``'32.6"'``). Those strings are not a contract and will
+    drift, so the untouched source objects are kept in ``raw_specs`` / ``raw_size`` /
+    ``raw_size_detail`` / ``raw_product_line``. **A parser fix must never require a re-crawl** --
+    re-derive the columns from the blobs instead.
+
+    NULL means "SimpleTire did not publish it". Never 0, never False. ``spec_is_3pmsf`` in
+    particular is a certification claim: a missing spec line is unknown, not "not certified".
+
+    Prices are integer cents, as the API sends them. Do not introduce a float here.
+
+    ``item_id`` is SimpleTire's own SKU id and the natural key -- the upsert conflict target,
+    which is what makes a resumed or repeated crawl idempotent.
+    """
+
+    # ---- identity -----------------------------------------------------------------------------
+    item_id = django_db_models.BigIntegerField(
+        unique=True,
+        help_text="SimpleTire's SKU id (siteProductLineSizeDetail.id). Natural key; upsert target.",
+    )
+    part_number = django_db_models.CharField(
+        max_length=255,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Manufacturer part number / MPN as SimpleTire lists it. Not unique: two brands can collide.",
+    )
+    product_line_id = django_db_models.IntegerField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="SimpleTire's model id. Shared by every SKU of the same tire model.",
+    )
+
+    # ---- provenance: exactly what was requested to produce this row ----------------------------
+    brand_slug = django_db_models.CharField(max_length=128, db_index=True)
+    product_line_slug = django_db_models.CharField(max_length=255, db_index=True)
+    page_url = django_db_models.TextField(help_text="Human-facing PDP the row came from.")
+
+    # ---- brand / model (from siteProductLine; identical across the line) ------------------------
+    brand_name = django_db_models.CharField(max_length=255, null=True, blank=True, db_index=True)
+    brand_tier = django_db_models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text="SimpleTire's own 1-3 brand ranking. Their editorial opinion, not a fact about the brand.",
+    )
+    brand_logo_url = django_db_models.TextField(null=True, blank=True)
+    product_line_name = django_db_models.CharField(max_length=255, null=True, blank=True)
+    product_line_overview = django_db_models.TextField(
+        null=True,
+        blank=True,
+        help_text="Marketing copy. Contains HTML (<ul>/<b>) -- escape before rendering.",
+    )
+    product_line_image_url = django_db_models.TextField(null=True, blank=True)
+    starting_price_cents = django_db_models.IntegerField(
+        null=True,
+        blank=True,
+        help_text="Cheapest SKU in the line at scrape time -- a line-level figure, repeated on each row.",
+    )
+
+    # ---- size ----------------------------------------------------------------------------------
+    size_display = django_db_models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="As shown: '265/70R18', 'LT285/75R16', '11R22.5', '18x9.50-8'. Not normalized.",
+    )
+    tire_size_slug = django_db_models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        help_text="SimpleTire's URL form ('265-70rr18'). Required, with item_id, to re-fetch this SKU.",
+    )
+    load_speed_rating = django_db_models.CharField(
+        max_length=16,
+        null=True,
+        blank=True,
+        help_text="Combined as printed: '116S', '106/104T'.",
+    )
+    load_range = django_db_models.CharField(max_length=16, null=True, blank=True)
+    rim_diameter_in = django_db_models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
+    product_type_id = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+    product_sub_type = django_db_models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Passenger / Light Truck / Commercial / Trailer / ATV-UTV / Farm / OTR / ...",
+    )
+
+    # ---- availability & price (cents, as sent) --------------------------------------------------
+    product_status = django_db_models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="ProductStatusAvailable / ProductStatusOutOfStock. Out-of-stock sizes are largely "
+        "absent from the size list, so this is mostly 'Available' plus the fallback SKU of a dead line.",
+    )
+    quantity = django_db_models.IntegerField(null=True, blank=True, help_text="Units SimpleTire showed as on hand.")
+    delivery_days = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+    estimated_retail_price_cents = django_db_models.IntegerField(null=True, blank=True)
+    sale_price_cents = django_db_models.IntegerField(null=True, blank=True, db_index=True)
+    web_price_cents = django_db_models.IntegerField(null=True, blank=True)
+    price_label = django_db_models.CharField(max_length=64, null=True, blank=True, help_text="e.g. '36% off'.")
+    road_hazard_price_cents = django_db_models.IntegerField(null=True, blank=True)
+    road_hazard_duration_label = django_db_models.CharField(max_length=64, null=True, blank=True)
+    oversize_fee_cents = django_db_models.IntegerField(null=True, blank=True)
+    fet_fee_cents = django_db_models.IntegerField(
+        null=True,
+        blank=True,
+        help_text="Federal Excise Tax. Sent as a number whose unit the API does not state; stored verbatim.",
+    )
+
+    # ---- flags (NULL = not published) -----------------------------------------------------------
+    is_run_flat = django_db_models.BooleanField(null=True, blank=True)
+    is_electric_optimized = django_db_models.BooleanField(null=True, blank=True)
+    is_oversized = django_db_models.BooleanField(null=True, blank=True)
+    is_installable = django_db_models.BooleanField(null=True, blank=True)
+
+    # ---- SimpleTire's scores (0-10, their proprietary blend) -------------------------------------
+    simple_score = django_db_models.DecimalField(max_digits=4, decimal_places=2, null=True, blank=True)
+    handling_durability_score = django_db_models.DecimalField(max_digits=4, decimal_places=2, null=True, blank=True)
+    longevity_score = django_db_models.DecimalField(max_digits=4, decimal_places=2, null=True, blank=True)
+    traction_score = django_db_models.DecimalField(max_digits=4, decimal_places=2, null=True, blank=True)
+
+    # ---- spec sheet, parsed (siteProductSpecs) ---------------------------------------------------
+    # Every column here is derived from a display string; the string itself survives in raw_specs.
+    spec_category = django_db_models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="SimpleTire's tread category: All Season / All Terrain / Winter / Mud Terrain / UHP / ...",
+    )
+    spec_vehicle = django_db_models.CharField(max_length=64, null=True, blank=True)
+    spec_sidewall = django_db_models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        help_text="Blackwall / Outlined White Lettering / Tubeless / Tube-Type / Blue Stripe / ...",
+    )
+    spec_tread_design = django_db_models.CharField(
+        max_length=32, null=True, blank=True, help_text="Symmetrical / Asymmetrical / Directional."
+    )
+    spec_load_range = django_db_models.CharField(
+        max_length=32, null=True, blank=True, help_text="Printed form: 'Standard (SL)', 'E (10 Ply)'."
+    )
+    spec_ply_rating = django_db_models.PositiveSmallIntegerField(
+        null=True, blank=True, help_text="Parsed out of 'E (10 Ply)'. NULL for SL/XL, which state no ply count."
+    )
+    spec_load_index = django_db_models.PositiveSmallIntegerField(
+        null=True, blank=True, help_text="Single tire. Dual, when given, goes to spec_load_index_dual."
+    )
+    spec_load_index_dual = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+    spec_max_load_lb = django_db_models.PositiveIntegerField(null=True, blank=True)
+    spec_max_load_dual_lb = django_db_models.PositiveIntegerField(null=True, blank=True)
+    spec_speed_rating = django_db_models.CharField(
+        max_length=8, null=True, blank=True, help_text="Letter symbol from 'Max Speed', e.g. S, H, W, A8."
+    )
+    spec_max_speed_mph = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+    spec_tread_depth_32nds = django_db_models.DecimalField(
+        max_digits=5, decimal_places=2, null=True, blank=True, help_text="In 32nds, as printed ('11/32nds')."
+    )
+    spec_overall_diameter_in = django_db_models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    spec_section_width_in = django_db_models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    spec_max_psi = django_db_models.PositiveSmallIntegerField(
+        null=True, blank=True, help_text="From the 'Inflation Pressure' spec. Never derived from load range."
+    )
+    spec_rim_width_min_in = django_db_models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
+    spec_rim_width_max_in = django_db_models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="Equal to the min when 'Rim Range' names a single width ('8.25\"').",
+    )
+    spec_tire_weight_lb = django_db_models.DecimalField(max_digits=7, decimal_places=2, null=True, blank=True)
+    spec_utqg = django_db_models.CharField(max_length=16, null=True, blank=True, help_text="Verbatim, e.g. '460AA'.")
+    spec_utqg_treadwear = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+    spec_utqg_traction = django_db_models.CharField(max_length=4, null=True, blank=True)
+    spec_utqg_temperature = django_db_models.CharField(max_length=4, null=True, blank=True)
+    spec_wet_traction = django_db_models.CharField(max_length=8, null=True, blank=True)
+    spec_mileage_warranty = django_db_models.CharField(
+        max_length=32, null=True, blank=True, help_text="As printed: 'N/A', '65k'."
+    )
+    spec_mileage_warranty_miles = django_db_models.PositiveIntegerField(
+        null=True, blank=True, help_text="'65k' -> 65000. NULL when the line reads N/A."
+    )
+    spec_is_3pmsf = django_db_models.BooleanField(
+        null=True, blank=True, help_text="Three-Peak Mountain Snowflake. NULL = unpublished, not 'uncertified'."
+    )
+    spec_is_studdable = django_db_models.BooleanField(null=True, blank=True)
+    spec_commercial_position = django_db_models.CharField(
+        max_length=32, null=True, blank=True, help_text="Steer / Drive / Trailer / All Position."
+    )
+    spec_commercial_application = django_db_models.CharField(
+        max_length=32, null=True, blank=True, help_text="Urban / Regional / Long Haul / Mixed Service."
+    )
+    spec_smartway_verified = django_db_models.CharField(max_length=32, null=True, blank=True)
+
+    # ---- untouched source objects ----------------------------------------------------------------
+    raw_specs = django_db_models.JSONField(
+        null=True,
+        blank=True,
+        encoder=DjangoJSONEncoder,
+        help_text="siteProductSpecs verbatim: [{name, values, description, cta, flair}, ...].",
+    )
+    specs_map = django_db_models.JSONField(
+        null=True,
+        blank=True,
+        encoder=DjangoJSONEncoder,
+        help_text="raw_specs flattened to {spec name: joined value} -- the shape to query when a spec has no column.",
+    )
+    raw_size = django_db_models.JSONField(
+        null=True,
+        blank=True,
+        encoder=DjangoJSONEncoder,
+        help_text="This SKU's siteProductLineAvailableSizeList entry, incl. its own thin specList.",
+    )
+    raw_size_detail = django_db_models.JSONField(
+        null=True, blank=True, encoder=DjangoJSONEncoder, help_text="siteProductLineSizeDetail verbatim."
+    )
+    raw_product_line = django_db_models.JSONField(
+        null=True,
+        blank=True,
+        encoder=DjangoJSONEncoder,
+        help_text="siteProductLine verbatim, minus the hero/CMS image fields nothing will ever read.",
+    )
+
+    scraped_at = django_db_models.DateTimeField(
+        default=timezone.now, db_index=True, help_text="When this row was last fetched. Drives --resume."
+    )
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "simpletire_skus"
+        indexes = [
+            django_db_models.Index(fields=["brand_slug", "product_line_slug"], name="simpletire_brand_line_idx"),
+            django_db_models.Index(fields=["size_display", "brand_name"], name="simpletire_size_brand_idx"),
+        ]
+
+    def __str__(self):
+        return f"{self.brand_name} {self.product_line_name} {self.size_display} ({self.part_number})"
+
