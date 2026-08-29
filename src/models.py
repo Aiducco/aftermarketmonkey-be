@@ -5138,14 +5138,20 @@ class TireSpec(django_db_models.Model):
     has_reinforced_sidewall = django_db_models.BooleanField(null=True, blank=True)
 
     # ---- from distributor structured fields where available ----------------------------------
-    tread_depth_32nds = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+    tread_depth_32nds = django_db_models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="Decimal, not whole 32nds: 26% of published tread depths are fractional (7.2, 6.3).",
+    )
     max_psi = django_db_models.PositiveSmallIntegerField(
         null=True,
         blank=True,
         help_text="Per tire, from the product's own data. NEVER derived from load range.",
     )
-    rim_width_min_in = django_db_models.DecimalField(max_digits=4, decimal_places=1, null=True, blank=True)
-    rim_width_max_in = django_db_models.DecimalField(max_digits=4, decimal_places=1, null=True, blank=True)
+    rim_width_min_in = django_db_models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
+    rim_width_max_in = django_db_models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
     utqg_treadwear = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
     utqg_traction = django_db_models.CharField(max_length=4, null=True, blank=True)
     utqg_temperature = django_db_models.CharField(max_length=4, null=True, blank=True)
@@ -5155,7 +5161,7 @@ class TireSpec(django_db_models.Model):
     # a UTQG grade or a rim-width range, and none of them are encoded in the sidewall string, so
     # the parser cannot either. They arrive only from a matched catalog row.
     sidewall_style = django_db_models.CharField(
-        max_length=32,
+        max_length=64,
         null=True,
         blank=True,
         help_text="Blackwall, Whitewall, Outlined White Lettering, Raised White Lettering.",
@@ -5170,14 +5176,14 @@ class TireSpec(django_db_models.Model):
         ),
     )
     tread_design = django_db_models.CharField(
-        max_length=16,
+        max_length=32,
         null=True,
         blank=True,
         help_text="Asymmetrical, Symmetrical or Directional -- affects whether a tire can be rotated freely.",
     )
     mileage_warranty_miles = django_db_models.PositiveIntegerField(null=True, blank=True)
     commercial_position = django_db_models.CharField(
-        max_length=16,
+        max_length=32,
         null=True,
         blank=True,
         help_text="Steer, Drive, Trailer or All Position. Commercial tires only.",
