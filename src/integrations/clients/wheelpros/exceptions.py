@@ -54,3 +54,23 @@ class WheelProsOrderValidationError(WheelProsException):
         WheelProsException.__init__(self, message)
         self.message = message
         self.code = code
+
+
+# -- Vehicle API (REST, Bearer JWT auth) --------------------------------------------------
+# Shares /auth/v1/authorize with the Order API above, but is a separately-entitled API area:
+# a Product Data Portal account can authenticate fine and still be refused by /vehicles.
+
+class WheelProsVehicleAPIException(WheelProsException):
+    """Transport-level or unexpected failure calling the Wheel Pros Vehicle API."""
+
+
+class WheelProsVehiclePermissionError(WheelProsException):
+    """403 from a /vehicles call. The token is valid — the account simply is not entitled to
+    the Vehicle API. Wheel Pros gates it behind a Cognito group the Orders/Pricing/Product
+    grants do not imply, so this is an account provisioning problem, not a code one: it is
+    fixed by Wheel Pros adding the entitlement, never by retrying."""
+
+
+class WheelProsVehicleNotFound(WheelProsException):
+    """404 from a /vehicles call — that year/make/model/submodel has no record. Expected during
+    a crawl (a listing can name a model whose detail endpoint 404s); callers skip, not abort."""

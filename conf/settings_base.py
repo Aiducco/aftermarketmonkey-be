@@ -459,6 +459,13 @@ WHEELPROS_ORDER_TEST_BASE_URL = os.environ.get("WHEELPROS_ORDER_TEST_BASE_URL", 
 WHEELPROS_ORDER_PRODUCTION_BASE_URL = os.environ.get("WHEELPROS_ORDER_PRODUCTION_BASE_URL", "https://api.wheelpros.com")
 WHEELPROS_ORDER_ENVIRONMENT = os.environ.get("WHEELPROS_ORDER_ENVIRONMENT", "production")
 
+# Wheel Pros Vehicle API (year/make/model/submodel + fitment specs). Same host and same
+# /auth/v1/authorize credentials as the Order API above, but a separately-entitled API area —
+# an account can hold the Orders grant and still get 403 from every /vehicles route. Staging
+# needs its own grant. WHEELPROS_VEHICLE_BASE_URL overrides the host for both environments.
+WHEELPROS_VEHICLE_BASE_URL = os.environ.get("WHEELPROS_VEHICLE_BASE_URL", "")
+WHEELPROS_VEHICLE_ENVIRONMENT = os.environ.get("WHEELPROS_VEHICLE_ENVIRONMENT", "production")
+
 # Meyer relay SFTP: AftermarketMonkey-hosted server; per-company sftp_user/sftp_password in CompanyProviders.
 # Env vars (all optional — sensible defaults if unset; use `or` below so empty string does not clear defaults):
 #   MEYER_SFTP_HOST, MEYER_SFTP_PORT, MEYER_SFTP_DIRECTORY,

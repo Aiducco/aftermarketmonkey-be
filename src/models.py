@@ -5513,3 +5513,244 @@ class SimpleTireSku(django_db_models.Model):
     def __str__(self):
         return f"{self.brand_name} {self.product_line_name} {self.size_display} ({self.part_number})"
 
+
+class WheelProsVehicle(django_db_models.Model):
+    """
+    One vehicle as Wheel Pros' Vehicle API describes it -- a year/make/model/submodel row with
+    the wheel-and-tire fitment envelope Wheel Pros publishes for it.
+
+    Populated by the ``fetch_wheelpros_vehicles`` management command; the crawl machinery and
+    the reasoning behind it live in ``src/integrations/services/wheelpros_vehicles.py``.
+
+    Model rows and submodel rows share this table
+    ---------------------------------------------
+    The API exposes two detail endpoints that return the *same* payload shape --
+    ``/v1/years/{y}/makes/{mk}/models/{md}`` and ``.../submodels/{sub}`` -- the second differing
+    only by carrying a ``subModel`` key. So both land here, distinguished by ``submodel``:
+    ``""`` is the model-level record (what the API reports for the model with no submodel
+    chosen), anything else is a specific submodel. That keeps "give me every vehicle Wheel Pros
+    knows" a single unfiltered scan, and "give me the submodels of the 2024 F-150" a single
+    filter -- rather than a join across two near-identical tables.
+
+    Deliberately **not** joined to ``VcdbVehicle``, ``MasterPartFitment`` or any other fitment
+    source. Wheel Pros' year/make/model strings are their own vocabulary and do not reliably
+    match VCdb's; mapping the two is a separate problem from capturing this data faithfully, and
+    doing it at write time would bake today's guess into the stored rows.
+
+    Natural key
+    -----------
+    ``(year, make, model, submodel)`` is the upsert conflict target, not ``external_id``. That is
+    on purpose: ``external_id`` is Wheel Pros' own vehicle id, and a model-level record can carry
+    the same id as one of its submodels, so it is indexed but not unique. The YMM/S tuple is what
+    the crawl actually addresses rows by, which is what makes a resumed or repeated run
+    idempotent.
+
+    ``make``/``model``/``submodel`` are stored exactly as the API returned them in the detail
+    payload -- not as they were spelled in the request path, which is case-insensitive.
+
+    Axles live in ``WheelProsVehicleAxle``
+    --------------------------------------
+    The payload's ``axles.front`` and ``axles.rear`` are the same 30-odd fields twice over. That
+    is a genuine repeating group, so it gets its own table with one row per position rather than
+    sixty ``front_*``/``rear_*`` columns here. On a staggered vehicle the two rows really do
+    differ (that is what ``staggered`` means); on most vehicles they agree.
+
+    Raw payloads
+    ------------
+    Every typed column below is a parse of a value Wheel Pros sends as a *string* -- bolt
+    patterns, offsets, bore diameters, all of it, including the numeric ones. Those strings are
+    not a contract. ``raw_payload`` keeps the untouched response, so **a parser fix must never
+    require a re-crawl**: re-derive the columns from the blob instead.
+
+    NULL means "Wheel Pros did not publish it". Never 0, never False.
+    """
+
+    # ---- identity ------------------------------------------------------------------------
+    external_id = django_db_models.BigIntegerField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Wheel Pros' own vehicle id ('id'). Indexed, but NOT unique -- see the class docstring.",
+    )
+    year = django_db_models.PositiveSmallIntegerField(db_index=True)
+    make = django_db_models.CharField(max_length=128, db_index=True)
+    model = django_db_models.CharField(max_length=255, db_index=True)
+    submodel = django_db_models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        help_text='"" is the model-level record; anything else is a specific submodel.',
+    )
+
+    # ---- properties ----------------------------------------------------------------------
+    staggered = django_db_models.BooleanField(
+        null=True,
+        blank=True,
+        help_text="properties.staggered -- front and rear take different wheel sizes. NULL if unpublished.",
+    )
+
+    # ---- provenance ----------------------------------------------------------------------
+    vehicle_types = django_db_models.JSONField(
+        default=list,
+        blank=True,
+        encoder=DjangoJSONEncoder,
+        help_text=(
+            'Which ?type= listings this vehicle appeared under, e.g. ["wheel", "tire"]. The '
+            "detail payload does not say, so this is recorded from the listing calls that found it."
+        ),
+    )
+    raw_payload = django_db_models.JSONField(
+        null=True,
+        blank=True,
+        encoder=DjangoJSONEncoder,
+        help_text="The detail response verbatim, axles included. Re-parse from here; never re-crawl.",
+    )
+
+    scraped_at = django_db_models.DateTimeField(
+        default=timezone.now, db_index=True, help_text="When this row was last fetched."
+    )
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "wheelpros_vehicles"
+        constraints = [
+            django_db_models.UniqueConstraint(
+                fields=["year", "make", "model", "submodel"], name="wheelpros_vehicle_ymms_uniq"
+            ),
+        ]
+        indexes = [
+            django_db_models.Index(fields=["year", "make", "model"], name="wheelpros_veh_ymm_idx"),
+            django_db_models.Index(fields=["make", "model"], name="wheelpros_veh_mm_idx"),
+        ]
+
+    def __str__(self):
+        return f"{self.year} {self.make} {self.model} {self.submodel}".strip()
+
+
+class WheelProsVehicleAxle(django_db_models.Model):
+    """
+    The front or rear axle spec of a :class:`WheelProsVehicle` -- Wheel Pros' fitment envelope
+    for that end of the car: what wheel bolts on, how wide, how far in or out, and how much
+    brake caliper it has to clear.
+
+    One row per (vehicle, position). Split out of ``WheelProsVehicle`` because ``axles.front``
+    and ``axles.rear`` are the same thirty-odd fields twice over -- see that class's docstring.
+
+    The nested ``diameter``/``caliper``/``offset``/``lug`` sub-objects are flattened into the
+    ``diameter_*``/``caliper_*``/``offset_*``/``lug_*`` columns here; nothing is dropped, and the
+    unflattened original is still on the parent's ``raw_payload``.
+
+    Every value arrives from the API as a string, including the measurements. Columns that are
+    unambiguously numeric are parsed to ``Decimal``; anything that is a code, a size expression
+    or free text (``bolt_pattern_mm`` is "5x114.3", ``oe_tire`` is "275/55R20") stays text. A
+    value Wheel Pros did not publish is NULL -- never 0, never "".
+    """
+
+    class Position(django_db_models.TextChoices):
+        FRONT = "front", "Front"
+        REAR = "rear", "Rear"
+
+    vehicle = django_db_models.ForeignKey(WheelProsVehicle, on_delete=django_db_models.CASCADE, related_name="axles")
+    position = django_db_models.CharField(max_length=8, choices=Position.choices)
+
+    # ---- wheel mounting ------------------------------------------------------------------
+    code = django_db_models.CharField(max_length=64, null=True, blank=True, help_text="Wheel Pros' axle code.")
+    bolt_pattern_mm = django_db_models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text='Lug count x circle diameter as published, e.g. "5x114.3". Text: not a single number.',
+    )
+    center_bore_mm = django_db_models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
+    hub_code = django_db_models.CharField(max_length=64, null=True, blank=True)
+    hub_clearance_mm = django_db_models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
+    nut_bolt = django_db_models.CharField(
+        max_length=64, null=True, blank=True, help_text="Whether the wheel is retained by nuts or bolts."
+    )
+    oe_hex = django_db_models.CharField(max_length=64, null=True, blank=True, help_text="oeHexTx -- OE lug hex size.")
+
+    # ---- lug ------------------------------------------------------------------------------
+    lug_count = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+    lug_nut_size = django_db_models.CharField(
+        max_length=64, null=True, blank=True, help_text='lugNutSizeTx, e.g. "M14x1.5".'
+    )
+    lug_style_am = django_db_models.CharField(
+        max_length=64, null=True, blank=True, help_text="amLugStyle -- the aftermarket lug style that fits."
+    )
+
+    # ---- wheel size envelope ---------------------------------------------------------------
+    oe_width_in = django_db_models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    max_width_in = django_db_models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    oe_diameter_in = django_db_models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    min_diameter_in = django_db_models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    max_diameter_in = django_db_models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    max_bs = django_db_models.DecimalField(
+        max_digits=6, decimal_places=2, null=True, blank=True, help_text="Max backspacing, inches."
+    )
+    max_fs = django_db_models.DecimalField(
+        max_digits=6, decimal_places=2, null=True, blank=True, help_text="Max frontspacing, inches."
+    )
+
+    # ---- offset ----------------------------------------------------------------------------
+    oe_offset_mm = django_db_models.DecimalField(max_digits=7, decimal_places=2, null=True, blank=True)
+    offset_min_mm = django_db_models.DecimalField(max_digits=7, decimal_places=2, null=True, blank=True)
+    offset_max_mm = django_db_models.DecimalField(max_digits=7, decimal_places=2, null=True, blank=True)
+    lift_offset_min_mm = django_db_models.DecimalField(
+        max_digits=7,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="Offset envelope once the vehicle is lifted -- wider than the stock one.",
+    )
+    lift_offset_max_mm = django_db_models.DecimalField(max_digits=7, decimal_places=2, null=True, blank=True)
+
+    # ---- caliper clearance ------------------------------------------------------------------
+    # Wheel Pros publishes clearance as a curve, not a number: the depth available at each of a
+    # fixed set of measuring diameters. A wheel fits if its own profile clears every point.
+    caliper_peak_depth = django_db_models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
+    caliper_depth_90mm = django_db_models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
+    caliper_depth_100mm = django_db_models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
+    caliper_depth_106mm = django_db_models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
+    caliper_depth_119mm = django_db_models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
+    caliper_depth_134mm = django_db_models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
+    caliper_depth_160mm = django_db_models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True)
+
+    # ---- tire / load / TPMS -------------------------------------------------------------------
+    oe_tire = django_db_models.CharField(
+        max_length=64, null=True, blank=True, help_text='oeTireTx, e.g. "275/55R20". A size expression, not a number.'
+    )
+    min_wheel_load = django_db_models.DecimalField(
+        max_digits=10, decimal_places=2, null=True, blank=True, help_text="Minimum wheel load rating, as published."
+    )
+    pressure_sensor = django_db_models.CharField(
+        max_length=128, null=True, blank=True, help_text="vehiclePressureSensor -- TPMS type."
+    )
+    sensor_part_number_oe = django_db_models.CharField(max_length=128, null=True, blank=True)
+
+    # ---- y factor -------------------------------------------------------------------------------
+    # Wheel Pros' own clearance coefficients; kept as published rather than interpreted.
+    y_factor = django_db_models.DecimalField(max_digits=8, decimal_places=3, null=True, blank=True)
+    y_factor_25 = django_db_models.DecimalField(max_digits=8, decimal_places=3, null=True, blank=True)
+    y_factor_50 = django_db_models.DecimalField(max_digits=8, decimal_places=3, null=True, blank=True)
+
+    raw_axle = django_db_models.JSONField(
+        null=True, blank=True, encoder=DjangoJSONEncoder, help_text="This axle object verbatim."
+    )
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "wheelpros_vehicle_axles"
+        constraints = [
+            django_db_models.UniqueConstraint(fields=["vehicle", "position"], name="wheelpros_vehicle_axle_uniq"),
+        ]
+        indexes = [
+            django_db_models.Index(fields=["bolt_pattern_mm", "position"], name="wheelpros_axle_bolt_pos_idx"),
+        ]
+
+    def __str__(self):
+        return f"{self.vehicle_id} {self.position} {self.bolt_pattern_mm or ''}".strip()
+
