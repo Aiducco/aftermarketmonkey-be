@@ -299,7 +299,7 @@ def project_tire(row: typing.Mapping[str, typing.Any]) -> typing.Dict[str, typin
         "tier": row["tier"] or "",
         "noise_level": row["noise_level"] or "",
         # distributor specs
-        "tread_depth_32nds": row["tread_depth_32nds"],
+        "tread_depth_32nds": _decimal_to_float(row["tread_depth_32nds"]),
         "max_psi": row["max_psi"],
         "rim_width_min_in": _decimal_to_float(row["rim_width_min_in"]),
         "rim_width_max_in": _decimal_to_float(row["rim_width_max_in"]),

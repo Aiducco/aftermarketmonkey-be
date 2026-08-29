@@ -67,7 +67,12 @@ SPEED_RATINGS = frozenset(["A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8"] + lis
 # range. LL is kept -- its 39 matches are all competition tires from three different brands
 # ("HO DOT DRAG RAD2 LL", "GY EG F1 GS2 EMT LL"), and that cross-brand consistency is what marks
 # it as a standard designation rather than one vendor's code.
-LOAD_RANGES = frozenset(["SL", "XL", "LL", "RF", "REINFORCED"] + list("ABCDEFGHJLMN"))
+# RF is dropped for the same reason as RD: it is a real XL stamping and stays in load_range_ply
+# for resolution, but in a distributor title it almost always marks a RUN-FLAT. Of 27 specs that
+# had load_range=RF, only 3 were run-flats by the model's reckoning and SimpleTire calls the rest
+# Standard (SL) -- so the token was neither the stamping nor being recorded as the run-flat it
+# actually signalled.
+LOAD_RANGES = frozenset(["SL", "XL", "LL", "REINFORCED"] + list("ABCDEFGHJLMN"))
 
 # Physically plausible bounds. These are not style checks -- they are what stops a wheel offset
 # or a bolt pattern from being read as a rim diameter. Every one of them fires on real catalog
@@ -232,12 +237,12 @@ _SERVICE_DESCRIPTION_RE = re.compile(
 # "/C" or "/E" immediately after the rim -- BFGoodrich writes "LT255/75R17/C 111/108S". Anchored
 # with ``\A`` so only the character right after the size can match.
 # Of the markers that can be glued to a rim, only these are load designations.
-_GLUED_LOAD_DESIGNATIONS = frozenset(["XL", "SL", "RF"])
+_GLUED_LOAD_DESIGNATIONS = frozenset(["XL", "SL"])
 
 _LEADING_LOAD_RANGE_RE = re.compile(
     # A digit may follow with no space -- "LT235/75R15/D110/107S" glues the load index
     # straight onto the designation. A letter may not, or "/DOT" would read as Load Range D.
-    r"\A/(SL|XL|LL|RF|[A-N])(?![A-Za-z.])",
+    r"\A/(SL|XL|LL|[A-N])(?![A-Za-z.])",
     re.IGNORECASE,
 )
 
@@ -247,15 +252,15 @@ _LEADING_LOAD_RANGE_RE = re.compile(
 #   (?<![A-Za-z]/)   "All Terrain T/A KO3"     -- the A follows the slash
 #   (?!/[A-Za-z])    "GRAND SPORT A/S"         -- the A precedes it
 #   (?<!-) (?!-\w)   "GY EAG RS-A", "M-108+"   -- a hyphenated model suffix or prefix
-#   (?! [TS]\b)      "BAJA BOSS A T"           -- A/T and M/T written with a space
+#   (?! [TS](\b|\d)) "BAJA BOSS A T247453"     -- A/T spaced, with a part number glued to the T
 #   (?! ?&) (?<!& )  "M & H RADIAL DRAG"       -- M&H Racemaster, on both sides of the ampersand
 #
 # The last one is safe because a real designation is never followed by a bare T or S: a load
 # range is the end of the service description, and what follows is a diameter or a part number.
 _LOAD_RANGE_TOKEN_RE = re.compile(
     r"(?<![A-Za-z]/)(?<!-)(?<!& )(?<![\w.])"
-    r"(?:LR)?(REINFORCED|SL|XL|LL|RF|[A-N])"
-    r"(?!/[A-Za-z])(?!-\w)(?! [TS]\b)(?! ?&)(?![\w.])",
+    r"(?:LR)?(REINFORCED|SL|XL|LL|[A-N])"
+    r"(?!/[A-Za-z])(?!-\w)(?! [TS](?:\b|\d))(?! ?&)(?![\w.])",
     re.IGNORECASE,
 )
 

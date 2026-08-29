@@ -5034,6 +5034,13 @@ class TireSpec(django_db_models.Model):
         (TIER_FLAGSHIP, "Flagship"),
     ]
 
+    SPEC_SOURCE_PARSER = "parser"
+    SPEC_SOURCE_SIMPLETIRE = "simpletire"
+    SPEC_SOURCE_CHOICES = [
+        (SPEC_SOURCE_PARSER, "Parser"),
+        (SPEC_SOURCE_SIMPLETIRE, "SimpleTire catalog"),
+    ]
+
     NOISE_QUIET = "quiet"
     NOISE_MODERATE = "moderate"
     NOISE_LOUD = "loud"
@@ -5090,6 +5097,26 @@ class TireSpec(django_db_models.Model):
         db_column="tread_category",
         to_field="code",
     )
+    # A second category slot, because one FK cannot hold what the taxonomy actually says. Our
+    # ``tread_category`` rows carry an ``axis`` -- season, terrain, performance, special -- and a
+    # real tire has a value on more than one of them: a summer UHP tire is UHP on the performance
+    # axis and SUMMER on the season axis, and picking one throws the other away. Measured against
+    # 22,155 SimpleTire-matched rows, 4,860 of the apparent category "disagreements" were exactly
+    # this -- both sides right, on different axes -- against 982 genuine contradictions.
+    #
+    # Constrained to the four season codes by ``tire_specs_season_category_valid`` below -- a
+    # CHECK cannot consult ``tread_category.axis``, so the codes are repeated there literally.
+    # ``tread_category`` holds whichever other axis best describes the tire.
+    season_category = django_db_models.ForeignKey(
+        TreadCategory,
+        on_delete=django_db_models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="tire_specs_by_season",
+        db_column="season_category",
+        to_field="code",
+        help_text="ALL_SEASON / ALL_WEATHER / SUMMER / WINTER. Independent of tread_category.",
+    )
     vehicle_class = django_db_models.CharField(max_length=16, choices=VEHICLE_CLASS_CHOICES, null=True, blank=True)
     # Arrays rather than JSON (the convention elsewhere in this module) because both are searched
     # by containment and fed straight into the search index as multi-value facets; a JSON blob
@@ -5123,7 +5150,79 @@ class TireSpec(django_db_models.Model):
     utqg_traction = django_db_models.CharField(max_length=4, null=True, blank=True)
     utqg_temperature = django_db_models.CharField(max_length=4, null=True, blank=True)
 
+    # ---- from a manufacturer-grade catalog (SimpleTire) ---------------------------------------
+    # Nothing above these can supply them: no distributor feed we ingest carries a tread depth,
+    # a UTQG grade or a rim-width range, and none of them are encoded in the sidewall string, so
+    # the parser cannot either. They arrive only from a matched catalog row.
+    sidewall_style = django_db_models.CharField(
+        max_length=32,
+        null=True,
+        blank=True,
+        help_text="Blackwall, Whitewall, Outlined White Lettering, Raised White Lettering.",
+    )
+    is_tubeless = django_db_models.BooleanField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Split out of the same source field as sidewall_style, which conflates appearance "
+            "with construction -- 'Blackwall' and 'Tube-Type' arrive in one column and are two "
+            "different facts about a tire."
+        ),
+    )
+    tread_design = django_db_models.CharField(
+        max_length=16,
+        null=True,
+        blank=True,
+        help_text="Asymmetrical, Symmetrical or Directional -- affects whether a tire can be rotated freely.",
+    )
+    mileage_warranty_miles = django_db_models.PositiveIntegerField(null=True, blank=True)
+    commercial_position = django_db_models.CharField(
+        max_length=16,
+        null=True,
+        blank=True,
+        help_text="Steer, Drive, Trailer or All Position. Commercial tires only.",
+    )
+    tire_weight_lb = django_db_models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+
     # ---- provenance ---------------------------------------------------------------------------
+    # ---- provenance of the catalog block ------------------------------------------------------
+    simpletire_sku = django_db_models.ForeignKey(
+        "SimpleTireSku",
+        on_delete=django_db_models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="tire_specs",
+        help_text=(
+            "The catalog row the spec block came from. SET_NULL rather than PROTECT: the scrape "
+            "table is a landing zone that may be re-crawled or truncated, and losing the pointer "
+            "must not take the specs with it."
+        ),
+    )
+    simpletire_match_tier = django_db_models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "How the row was matched: 1 = brand + part number, 2 = part number + agreeing size, "
+            "3 = brand + model + size. Stored so a tier that later proves unsafe can be retracted "
+            "without re-deriving every match."
+        ),
+    )
+    simpletire_synced_at = django_db_models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When the catalog values were last copied in. Compare against the SKU's updated_at to find rows a re-crawl has moved on from.",
+    )
+    spec_source = django_db_models.CharField(
+        max_length=16,
+        default="parser",
+        choices=[("parser", "Parser"), ("simpletire", "SimpleTire catalog")],
+        db_index=True,
+        help_text=(
+            "Who owns the size block on this row. 'simpletire' means a matched catalog row "
+            "supplied it and reparse_tire_sizes must leave it alone -- without this flag the "
+            "next parser fix would silently overwrite authoritative data with a derived guess."
+        ),
+    )
     llm_confidence = django_db_models.DecimalField(max_digits=3, decimal_places=2, null=True, blank=True)
     llm_reason = django_db_models.TextField(null=True, blank=True)
     llm_model_used = django_db_models.CharField(max_length=64, null=True, blank=True)
@@ -5151,6 +5250,14 @@ class TireSpec(django_db_models.Model):
             django_db_models.Index(fields=["tread_category"], name="tire_specs_tread_category_idx"),
         ]
         constraints = [
+            django_db_models.CheckConstraint(
+                # season_category is a second axis, not a second guess at tread_category: only a
+                # season code belongs in it. The FK guarantees the code exists; this guarantees
+                # it is the right kind.
+                check=django_db_models.Q(season_category__isnull=True)
+                | django_db_models.Q(season_category__in=["ALL_SEASON", "ALL_WEATHER", "SUMMER", "WINTER"]),
+                name="tire_specs_season_category_valid",
+            ),
             django_db_models.CheckConstraint(
                 check=django_db_models.Q(overall_diameter_in__gt=0),
                 name="tire_specs_overall_diameter_positive",

@@ -82,6 +82,30 @@ _LLM_OWNED = frozenset(
 )
 assert not (set(UPDATE_FIELDS) & _LLM_OWNED), "reparse would overwrite an LLM-owned field"
 
+# Fields a matched SimpleTire row owns instead of the parser. On those rows the value was
+# measured and published by the manufacturer's own catalog, so re-deriving it from the sidewall
+# string is a downgrade -- and a silent one, since reparse runs on every parser fix.
+#
+# Note what is *not* here. ``overall_diameter_in`` stays the parser's: ours is the nominal
+# diameter the size prints (35.0 for a 35X12.50R20), theirs is the measured one (33.07), and
+# search for "35 inch" has to keep finding it. ``max_speed_mph`` stays ours too -- both sides
+# derive it from the speed rating, but we floor 160 km/h to 99 and they ceil to 100, and
+# ``speed_sort`` range filters would straddle the boundary if the column mixed conventions.
+CATALOG_OWNED = (
+    "load_range",
+    "load_index",
+    "load_index_dual",
+    "speed_rating",
+    "max_load_lb",
+    "ply_rating",
+)
+assert set(CATALOG_OWNED) <= set(UPDATE_FIELDS), "CATALOG_OWNED names a field reparse never writes"
+
+# What reparse may still recompute on a catalog-backed row: the size block, which is ours either
+# way because a match is only accepted when both sides agree on the dimensions.
+PARSER_FIELDS_CATALOG = tuple(f for f in PARSER_FIELDS if f not in CATALOG_OWNED)
+RESOLVED_FIELDS_CATALOG = tuple(f for f in RESOLVED_FIELDS if f not in CATALOG_OWNED)
+
 
 @dataclasses.dataclass
 class ReparseStats:
@@ -110,7 +134,7 @@ def _iter_specs(brand_ids: typing.Optional[typing.Sequence[int]]) -> typing.Iter
     sql = """
         SELECT mp.id, mp.brand_id, b.name AS brand_name, mp.part_number, mp.sku, mp.description,
                mp.overview_category, mp.category, mp.product_type, mp.product_type_source,
-               ts.size_disputed, {columns}
+               ts.size_disputed, ts.spec_source, {columns}
         FROM master_parts mp
         JOIN brands b ON b.id = mp.brand_id
         JOIN tire_specs ts ON ts.master_part_id = mp.id
@@ -170,6 +194,7 @@ def run(
     for page in _iter_specs(brand_ids):
         provider_rows = tire_enrichment._provider_rows_for([row["id"] for row in page])
         pending: typing.List[src_models.TireSpec] = []
+        pending_catalog: typing.List[src_models.TireSpec] = []
 
         for row in page:
             stats.scanned += 1
@@ -183,8 +208,12 @@ def run(
             resolved = lookups.resolve(parsed)
             disputed = len(candidate.size_variants) > 1
 
-            diff = [f for f in PARSER_FIELDS if _differs(row[f], getattr(parsed, f))]
-            diff += [f for f in RESOLVED_FIELDS if _differs(row[f], resolved[f])]
+            catalog_backed = row["spec_source"] == src_models.TireSpec.SPEC_SOURCE_SIMPLETIRE
+            parser_fields = PARSER_FIELDS_CATALOG if catalog_backed else PARSER_FIELDS
+            resolved_fields = RESOLVED_FIELDS_CATALOG if catalog_backed else RESOLVED_FIELDS
+
+            diff = [f for f in parser_fields if _differs(row[f], getattr(parsed, f))]
+            diff += [f for f in resolved_fields if _differs(row[f], resolved[f])]
             if row["size_disputed"] != disputed:
                 diff.append("size_disputed")
             if not diff:
@@ -206,36 +235,39 @@ def run(
                 )
 
             spec = src_models.TireSpec(master_part_id=row["id"])
-            for field in PARSER_FIELDS:
+            for field in parser_fields:
                 setattr(spec, field, getattr(parsed, field))
-            for field in RESOLVED_FIELDS:
+            for field in resolved_fields:
                 setattr(spec, field, resolved[field])
             spec.size_disputed = disputed
-            pending.append(spec)
+            (pending_catalog if catalog_backed else pending).append(spec)
 
-        if apply_changes and pending:
-            _write(pending)
+        if apply_changes:
+            if pending:
+                _write(pending, PARSER_FIELDS + RESOLVED_FIELDS)
+            if pending_catalog:
+                _write(pending_catalog, PARSER_FIELDS_CATALOG + RESOLVED_FIELDS_CATALOG)
 
     return stats
 
 
 @transaction.atomic
-def _write(specs: typing.Sequence[src_models.TireSpec]) -> None:
+def _write(specs: typing.Sequence[src_models.TireSpec], fields: typing.Sequence[str]) -> None:
     """
-    Update only the size block.
+    Update only the size block, and only the columns ``fields`` names.
 
     The real rows are loaded and mutated rather than constructed, so every field this module does
     not own arrives from the database untouched and goes back unchanged. ``bulk_update`` is then
     given an explicit column list, which is the second guard: even a mistake in the loop cannot
-    write a column that is not named here.
+    write a column that is not named here. Catalog-backed rows are passed a shorter list, which
+    is what keeps a parser fix from reverting measured values to derived ones.
     """
+    assert not (set(fields) & _LLM_OWNED), "reparse would overwrite an LLM-owned field"
     by_master = {spec.master_part_id: spec for spec in specs}
     rows = list(src_models.TireSpec.objects.filter(master_part_id__in=list(by_master)))
     for row in rows:
         source = by_master[row.master_part_id]
-        for field in PARSER_FIELDS + RESOLVED_FIELDS:
+        for field in fields:
             setattr(row, field, getattr(source, field))
         row.size_disputed = source.size_disputed
-    src_models.TireSpec.objects.bulk_update(
-        rows, list(PARSER_FIELDS + RESOLVED_FIELDS + ("size_disputed",)), batch_size=500
-    )
+    src_models.TireSpec.objects.bulk_update(rows, list(tuple(fields) + ("size_disputed",)), batch_size=500)
