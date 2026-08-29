@@ -5861,3 +5861,285 @@ class WheelProsVehicleAxle(django_db_models.Model):
     def __str__(self):
         return f"{self.vehicle_id} {self.position} {self.bolt_pattern_mm or ''}".strip()
 
+
+class TdgProduct(django_db_models.Model):
+    """
+    One product exactly as TDG Access publishes it -- **every type**, not only tires.
+
+    Populated by the ``fetch_tdg_catalog`` command; the transport and the mapping live in
+    ``src/integrations/services/tdg.py``. Like :class:`SimpleTireSku` this is a distributor
+    landing zone, deliberately **not** joined to ``MasterPart`` or ``TireSpec``: nothing in the
+    app reads it yet, and the questions it has to answer cheaply ("what does TDG list, in which
+    brands, with which specs") are single filters over one table. Match it into the catalog from
+    here, later, once the join keys have been audited.
+
+    One table for six product types
+    -------------------------------
+    ``/api/product/all`` returns tires, wheels, lug kits, hub rings, generic products and
+    services in one array, distinguished only by ``type`` -- which lands verbatim in
+    :attr:`product_type`. Their ``specifications`` objects share no keys across types, so the
+    typed columns below are grouped per type and a row only ever fills its own block. Splitting
+    this into six tables would buy nothing: the identity, brand, image and provenance columns are
+    identical for all of them, and "what is item AT-AH4126" should not require knowing its type
+    first. ``specifications`` survives whole in :attr:`raw`, so a column added later can be
+    backfilled without a re-fetch.
+
+    Keys
+    ----
+    ``tdg_id`` (their ``id``) is the natural key and the upsert conflict target -- unique across
+    all 45k rows of a full pull, as is ``item_number``. ``gtin`` is **not** unique and is absent
+    on roughly a third of the catalog, so it can seed a match but cannot key one. Note
+    ``product_line_id`` (their ``productId``) is the *model line*, shared by every size of a
+    tire; their ``id`` is the SKU. The two are easy to transpose and mean very different things.
+
+    Values are stored as published
+    ------------------------------
+    Every ``specifications`` value arrives as a string, including the numbers. The typed columns
+    are a parse of those strings and NULL means "TDG did not publish it" -- never 0, never False.
+    Three specific traps:
+
+    * ``size`` is a composite: ``'2255517, P225/55R17 XL'`` -- a digits-only size code, then the
+      printed size. Split across :attr:`tire_size_code` and :attr:`tire_size_display`, with the
+      original in :attr:`tire_size_raw`.
+    * ``outsideDiameter`` is **not trustworthy**. TDG's own documentation gives ``8.9`` for a
+      225/55R17, which is the section width in inches, not the diameter (~26.8"). It is recorded
+      because it is what they send; derive tire geometry from ``src.domain.tire_size`` instead.
+    * ``tireType`` carries HTML entities from their storefront (``'10 - Off Road Pneumatic
+      1&lt;15kg'``). Kept verbatim -- unescape at render, not on the way in.
+    """
+
+    TYPE_TIRE = "Tire"
+    TYPE_WHEEL = "Wheel"
+    TYPE_LUG_KIT = "Lug Kit"
+    TYPE_HUB_RING = "Hub Ring"
+    TYPE_GENERIC = "Generic Product"
+    TYPE_SERVICE = "Service"
+    TYPE_CHOICES = [
+        (TYPE_TIRE, "Tire"),
+        (TYPE_WHEEL, "Wheel"),
+        (TYPE_LUG_KIT, "Lug kit"),
+        (TYPE_HUB_RING, "Hub ring"),
+        (TYPE_GENERIC, "Generic product"),
+        (TYPE_SERVICE, "Service"),
+    ]
+
+    # ---- identity -------------------------------------------------------------------------------
+    tdg_id = django_db_models.BigIntegerField(
+        unique=True,
+        help_text="TDG's SKU id ('id'). Natural key and upsert target.",
+    )
+    item_number = django_db_models.CharField(
+        max_length=64,
+        db_index=True,
+        help_text="TDG's own SKU code, e.g. 'AT-AH4126'. Unique in practice; what their other endpoints take.",
+    )
+    part_number = django_db_models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Manufacturer part number, e.g. 'AH4126'. Not unique -- two brands can collide.",
+    )
+    gtin = django_db_models.CharField(
+        max_length=32,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Usually the UPC. Absent on ~1/3 of the catalog; leading zeros are significant, so stored as sent.",
+    )
+    product_type = django_db_models.CharField(
+        max_length=32,
+        choices=TYPE_CHOICES,
+        db_index=True,
+        help_text="TDG's 'type', verbatim. Decides which block of spec columns below is populated.",
+    )
+
+    # ---- brand / product line -------------------------------------------------------------------
+    brand_id = django_db_models.IntegerField(null=True, blank=True, db_index=True)
+    brand_name = django_db_models.CharField(max_length=128, null=True, blank=True, db_index=True)
+    product_line_id = django_db_models.IntegerField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="TDG's 'productId' -- the MODEL, shared by every size. Not the SKU id; see tdg_id.",
+    )
+    product_line_name = django_db_models.CharField(
+        max_length=255, null=True, blank=True, help_text="TDG's 'productName', e.g. 'Grip 20'."
+    )
+
+    # ---- availability flags (TDG's, about their own catalog) ------------------------------------
+    is_inactive = django_db_models.BooleanField(
+        default=False,
+        db_index=True,
+        help_text="Discontinued/delisted at TDG. ~20% of tires and over half of wheels. Still returned by the API.",
+    )
+    is_availability_restricted = django_db_models.BooleanField(default=False)
+    product_image_url = django_db_models.TextField(
+        null=True,
+        blank=True,
+        help_text=(
+            "RideStyler render, ~800px transparent PNG. Per PRODUCT LINE, not per SKU -- every size "
+            "of a model repeats one URL, and a URL shared by several lines is a placeholder, not that "
+            "model's photo. Check for reuse before trusting one as a product image."
+        ),
+    )
+
+    # ---- tire specifications --------------------------------------------------------------------
+    tire_size_raw = django_db_models.CharField(
+        max_length=64, null=True, blank=True, help_text="'size' verbatim: '2255517, P225/55R17 XL'."
+    )
+    tire_size_code = django_db_models.CharField(
+        max_length=32, null=True, blank=True, help_text="Digits-only half of 'size': '2255517'."
+    )
+    tire_size_display = django_db_models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Printed half of 'size': 'P225/55R17 XL'. Feed this to src.domain.tire_size, not the raw field.",
+    )
+    tire_size_type = django_db_models.CharField(
+        max_length=16,
+        null=True,
+        blank=True,
+        help_text="Metric / Flotation / Commerial [sic, their spelling] / Slick.",
+    )
+    tire_type = django_db_models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        help_text="Coded category: 'AS - All Season Tire', '4 - Commercial Truck Tires'. Contains HTML entities.",
+    )
+    season = django_db_models.CharField(
+        max_length=32, null=True, blank=True, db_index=True, help_text="All Season / Winter / Summer / All Weather."
+    )
+    service_type = django_db_models.CharField(max_length=32, null=True, blank=True, help_text="'P-Passenger', 'LT'.")
+    service_description = django_db_models.CharField(
+        max_length=16, null=True, blank=True, help_text="Load index + speed symbol as printed: '101T'."
+    )
+    load_index = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+    speed_rating = django_db_models.CharField(max_length=8, null=True, blank=True)
+    load_range = django_db_models.CharField(max_length=8, null=True, blank=True, help_text="SL / XL / C / D / E ...")
+    rim_diameter_in = django_db_models.DecimalField(
+        max_digits=5, decimal_places=2, null=True, blank=True, help_text="Their 'wheelDiameter' -- the tire's rim size."
+    )
+    outside_diameter_in = django_db_models.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="UNRELIABLE -- often the section width, not the diameter. See the class docstring.",
+    )
+    tread_depth_32nds = django_db_models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
+    sidewall = django_db_models.CharField(
+        max_length=32, null=True, blank=True, help_text="'Black Sidewall', 'Outlined White Letters'."
+    )
+    rim_width_min_in = django_db_models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
+    rim_width_max_in = django_db_models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
+    utqg = django_db_models.CharField(
+        max_length=16, null=True, blank=True, help_text="Verbatim, space-separated: '400 A A'."
+    )
+    utqg_treadwear = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+    utqg_traction = django_db_models.CharField(max_length=4, null=True, blank=True)
+    utqg_temperature = django_db_models.CharField(max_length=4, null=True, blank=True)
+    warranty_mileage_miles = django_db_models.PositiveIntegerField(null=True, blank=True)
+    is_run_flat = django_db_models.BooleanField(null=True, blank=True)
+    is_ev_optimized = django_db_models.BooleanField(
+        null=True, blank=True, help_text="Their 'eVOptimized'. Sent on every tire, so rarely NULL."
+    )
+    is_3pmsf = django_db_models.BooleanField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Parsed from 'otherAttributeS', whose only observed value is '3PMS'. Absent means TDG "
+            "made no claim -- NULL, not False. This is a certification with legal weight in some "
+            "jurisdictions; do not coerce."
+        ),
+    )
+    winter_studding = django_db_models.CharField(
+        max_length=16, null=True, blank=True, help_text="'Studdable' or 'Studded' -- factory-studded is not the same."
+    )
+    stud_size = django_db_models.CharField(max_length=16, null=True, blank=True, help_text="'#12', '#12/13'.")
+    oe_marking = django_db_models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="OE homologation as printed: 'MO - Mercedes-Benz', '* - BMW'. May list several, comma-separated.",
+    )
+    additional_model_information = django_db_models.CharField(max_length=128, null=True, blank=True)
+
+    # ---- wheel specifications -------------------------------------------------------------------
+    wheel_diameter_in = django_db_models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
+    wheel_width_in = django_db_models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
+    bolt_pattern = django_db_models.CharField(
+        max_length=32,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text=(
+            "As printed: '5x114.3'. Dual-drilled wheels carry both, comma-separated "
+            "('6x135, 6x139.7') -- ~6% of them -- so match by containment, not equality."
+        ),
+    )
+    offset_mm = django_db_models.SmallIntegerField(null=True, blank=True, help_text="Can be negative.")
+    centerbore_mm = django_db_models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    max_load_lb = django_db_models.PositiveIntegerField(null=True, blank=True)
+    wheel_type = django_db_models.CharField(
+        max_length=32, null=True, blank=True, help_text="Their wheel-only 'type' key: Alloy / Steel / Specialty."
+    )
+    construction = django_db_models.CharField(
+        max_length=32, null=True, blank=True, help_text="Cast / Forged / Stamp & Weld / Alloy ..."
+    )
+    lug_seat = django_db_models.CharField(max_length=16, null=True, blank=True, help_text="Conical / Spherical / Flat.")
+    is_winter_approved = django_db_models.BooleanField(null=True, blank=True)
+
+    # ---- lug kit specifications -----------------------------------------------------------------
+    thread = django_db_models.CharField(max_length=32, null=True, blank=True, help_text="'14mm x 1.50', '9/16\" x 18'.")
+    seat = django_db_models.CharField(max_length=16, null=True, blank=True, help_text="Conical / Radius / Shank.")
+    style = django_db_models.CharField(max_length=16, null=True, blank=True, help_text="Acorn / Spline / Tuner.")
+    end_type = django_db_models.CharField(max_length=16, null=True, blank=True, help_text="Closed / Open / Closed End.")
+
+    # ---- hub ring specifications ----------------------------------------------------------------
+    inside_diameter_mm = django_db_models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    overall_diameter_mm = django_db_models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+
+    # ---- shared across wheel / lug kit / hub ring -------------------------------------------------
+    finish = django_db_models.CharField(max_length=64, null=True, blank=True)
+    material = django_db_models.CharField(
+        max_length=32, null=True, blank=True, help_text="Aluminum / Steel / Alloy / Plastic / 'Unspecified'."
+    )
+
+    # ---- cross-type ------------------------------------------------------------------------------
+    superseded_by_item = django_db_models.CharField(
+        max_length=32,
+        null=True,
+        blank=True,
+        help_text="TDG's replacement for a discontinued SKU. Their id, not ours -- resolve before use.",
+    )
+
+    # ---- provenance -------------------------------------------------------------------------------
+    raw = django_db_models.JSONField(
+        null=True,
+        blank=True,
+        encoder=DjangoJSONEncoder,
+        help_text="The product object verbatim, specifications included. Backfill new columns from here, not a re-pull.",
+    )
+    fetched_at = django_db_models.DateTimeField(default=timezone.now, db_index=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "tdg_products"
+        indexes = [
+            # "what does TDG stock in this brand, of this type" -- the coverage question.
+            django_db_models.Index(fields=["product_type", "brand_name"], name="tdg_type_brand_idx"),
+            # Seeds the match into master_parts: brand + MPN is the fallback when GTIN is absent.
+            django_db_models.Index(fields=["brand_name", "part_number"], name="tdg_brand_part_idx"),
+            django_db_models.Index(fields=["product_line_id"], name="tdg_product_line_idx"),
+        ]
+
+    def __str__(self):
+        bits = [self.brand_name, self.product_line_name, self.tire_size_display or self.bolt_pattern]
+        return f"{' '.join(b for b in bits if b)} ({self.item_number})"

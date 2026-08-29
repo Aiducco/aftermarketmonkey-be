@@ -466,6 +466,14 @@ WHEELPROS_ORDER_ENVIRONMENT = os.environ.get("WHEELPROS_ORDER_ENVIRONMENT", "pro
 WHEELPROS_VEHICLE_BASE_URL = os.environ.get("WHEELPROS_VEHICLE_BASE_URL", "")
 WHEELPROS_VEHICLE_ENVIRONMENT = os.environ.get("WHEELPROS_VEHICLE_ENVIRONMENT", "production")
 
+# TDG Access API (Tire Discounter Group, Canada). Static API key, no token exchange:
+# sent as `Authorization: ApiKey <key>`. Production keys are prefixed `rst`, sandbox `rstsb`,
+# and each only works against its own host -- the client warns on an obvious mismatch.
+# TDG_BASE_URL overrides the host for both environments.
+TDG_API_KEY = os.environ.get("TDG_API_KEY", "")
+TDG_ENVIRONMENT = os.environ.get("TDG_ENVIRONMENT", "production")
+TDG_BASE_URL = os.environ.get("TDG_BASE_URL", "")
+
 # Meyer relay SFTP: AftermarketMonkey-hosted server; per-company sftp_user/sftp_password in CompanyProviders.
 # Env vars (all optional — sensible defaults if unset; use `or` below so empty string does not clear defaults):
 #   MEYER_SFTP_HOST, MEYER_SFTP_PORT, MEYER_SFTP_DIRECTORY,
