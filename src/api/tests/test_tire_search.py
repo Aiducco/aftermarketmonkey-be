@@ -484,6 +484,24 @@ class LoadRangeVocabularyTests(SimpleTestCase):
         self.assertEqual(sequence, ["XL", "E", "ZZ"])
 
 
+class SpeedRatingVocabularyTests(SimpleTestCase):
+    databases = []
+
+    def test_the_code_carries_its_speed_and_the_table_carries_the_order(self):
+        rows = [
+            mock.Mock(code="U", max_speed_mph=124),
+            mock.Mock(code="H", max_speed_mph=130),
+            mock.Mock(code="(Y)", max_speed_mph=None),
+        ]
+        with mock.patch("src.models.TireSpeedRating") as model:
+            model.objects.order_by.return_value = rows
+            labels, sequence = tire_search._speed_rating_vocabulary()
+        self.assertEqual(labels["H"], "H \u2014 130 mph")
+        # H is 130 mph and belongs after U, which is why the table orders this and not the client.
+        self.assertEqual(sequence, ["U", "H", "(Y)"])
+        self.assertEqual(labels["(Y)"], "(Y)")
+
+
 class FacetVisibilityTests(SimpleTestCase):
     """A control that cannot change the result set is worse than an absent one."""
 

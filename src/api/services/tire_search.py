@@ -206,14 +206,22 @@ def _load_range_vocabulary() -> typing.Tuple[typing.Dict[str, str], typing.List[
     return labels, sequence
 
 
-def _speed_rating_sequence() -> typing.List[str]:
+def _speed_rating_vocabulary() -> typing.Tuple[typing.Dict[str, str], typing.List[str]]:
     """
-    Codes in speed order, which is the only order that reads as anything but random: H is 130 mph
-    and belongs between U and V, so alphabetical is a wrong answer rather than a neutral one.
+    ``H`` -> ``H - 130 mph``, in speed order.
+
+    Both halves matter and for the same reason: the code alone is unreadable, and speed order is
+    the only order that reads as anything but random, since H is 130 mph and belongs between U and
+    V. Alphabetical is a wrong answer here, not a neutral one -- and a rail sorted correctly but
+    labelled "H, Q, R" still leaves the user to know that off the top of their head.
     """
     from src import models as src_models
 
-    return list(src_models.TireSpeedRating.objects.order_by("sort_order").values_list("code", flat=True))
+    labels, sequence = {}, []
+    for row in src_models.TireSpeedRating.objects.order_by("sort_order"):
+        sequence.append(row.code)
+        labels[row.code] = "{} \u2014 {} mph".format(row.code, row.max_speed_mph) if row.max_speed_mph else row.code
+    return labels, sequence
 
 
 def _distributor_labels() -> typing.Dict[str, str]:
@@ -238,10 +246,11 @@ def _facet_vocabularies() -> typing.Dict[str, typing.Dict[str, typing.Any]]:
 
     load_range_labels, load_range_sequence = _load_range_vocabulary()
     tread_labels, tread_sequence = _tread_category_vocabulary()
+    speed_labels, speed_sequence = _speed_rating_vocabulary()
     return {
         "tread_category": {"labels": tread_labels, "sequence": tread_sequence},
         "load_range": {"labels": load_range_labels, "sequence": load_range_sequence},
-        "speed_rating": {"labels": {}, "sequence": _speed_rating_sequence()},
+        "speed_rating": {"labels": speed_labels, "sequence": speed_sequence},
         "vehicle_class": {"labels": dict(tire_spec_display.VEHICLE_CLASS_LABELS), "sequence": []},
         "tier": {"labels": dict(src_models.TireSpec.TIER_CHOICES), "sequence": []},
         "distributor_ids": {"labels": _distributor_labels(), "sequence": []},
