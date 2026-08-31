@@ -37,7 +37,16 @@ class Command(BaseCommand):
             # Inventory-only (skip_master_parts=True): item metadata doesn't change here, and a
             # full sync_master_parts_from_turn14 pass has no place on a 10-minute cadence.
             # Scoped via since -- not a full ~793k-row rescan.
-            master_parts.sync_derived_from_turn14(skip_master_parts=True, skip_pricing=True, since=since)
+            #
+            # blocking=False: this and the daily full sweep (sync_turn14_global_sweep) both
+            # upsert into ProviderPart/ProviderPartInventory, which deadlocked when they ran
+            # concurrently (2026-08-31). Skipping this cycle when the full sweep is already
+            # running is safe -- that sweep's own propagation covers the exact same rows this
+            # delta would have written, just with a wider scope -- and cheaper than queuing
+            # behind a run that can take 45-80 minutes.
+            master_parts.sync_derived_from_turn14(
+                skip_master_parts=True, skip_pricing=True, since=since, blocking=False,
+            )
         except Exception as e:
             meter.__exit__(None, None, None)
             audit_scheduled_tasks.mark_scheduled_task_failed(execution, error_message=str(e))

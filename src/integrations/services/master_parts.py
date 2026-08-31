@@ -9373,6 +9373,25 @@ def _maybe_reindex_meilisearch_after_master_parts(
     )
 
 
+# Arbitrary fixed key for this function's Postgres advisory lock -- any 64-bit int works, this
+# one has no other meaning.
+_TURN14_PROPAGATION_LOCK_KEY = 0x54313450524F5031  # "T14PROP1" in hex, just a memorable constant
+
+
+def _acquire_turn14_propagation_lock(blocking: bool) -> bool:
+    with connection.cursor() as cursor:
+        if blocking:
+            cursor.execute("SELECT pg_advisory_lock(%s)", [_TURN14_PROPAGATION_LOCK_KEY])
+            return True
+        cursor.execute("SELECT pg_try_advisory_lock(%s)", [_TURN14_PROPAGATION_LOCK_KEY])
+        return bool(cursor.fetchone()[0])
+
+
+def _release_turn14_propagation_lock() -> None:
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT pg_advisory_unlock(%s)", [_TURN14_PROPAGATION_LOCK_KEY])
+
+
 def sync_derived_from_turn14(
     *,
     reindex_meilisearch: bool = False,
@@ -9380,6 +9399,7 @@ def sync_derived_from_turn14(
     skip_inventory: bool = False,
     skip_pricing: bool = False,
     since: typing.Optional[typing.Any] = None,
+    blocking: bool = True,
 ) -> None:
     """
     Propagate Turn14 source data into MasterPart, ProviderPart, ProviderPartInventory,
@@ -9398,32 +9418,55 @@ def sync_derived_from_turn14(
     delta and 10-minute inventory delta commands, since sync_master_parts_from_turn14 /
     sync_provider_inventory_from_turn14 have no other scoping and a full run of either is a
     genuine ~793k-row walk (fine once daily via sync_turn14_global_sweep, not on a tight cadence).
+
+    Serialized against concurrent callers via a Postgres advisory lock: this function is called
+    both by the daily full sweep (sync_turn14_global_sweep, a 45-80 minute run) and by the
+    10-minute inventory delta, and both upsert into ProviderPart/ProviderPartInventory. Running
+    both concurrently with no coordination produced a real deadlock (2026-08-31) -- two backends
+    inserting overlapping rows in a different order, each waiting on a lock the other held. The
+    lock is re-acquired after every ``connection.close()`` below: a session-scoped advisory lock
+    releases the instant its connection closes (confirmed live), so without re-acquiring, the
+    lock would only actually cover the first of these three phases, not the whole walk.
+
+    ``blocking=True`` (the default -- the daily full sweep) waits for a concurrent run to finish
+    before starting. ``blocking=False`` (the 10-minute delta) skips this call entirely if another
+    propagation is already running rather than queuing behind it -- safe here specifically
+    because whichever full run is holding the lock already covers the exact same rows the
+    skipped delta would have written.
     """
-    logger.info("{} Starting Turn14-only derived sync (parts={} inventory={} pricing={}{}).".format(
-        _LOG_PREFIX, not skip_master_parts, not skip_inventory, not skip_pricing,
-        ", since={}".format(since) if since else "",
-    ))
-    if not skip_master_parts:
-        sync_master_parts_from_turn14(since=since)
-        connection.close()
-
-    def _cont() -> None:
-        if not skip_inventory:
-            sync_provider_inventory_from_turn14(since=since)
+    if not _acquire_turn14_propagation_lock(blocking):
+        logger.info("{} Skipped: another Turn14 propagation is already running.".format(_LOG_PREFIX))
+        return
+    try:
+        logger.info("{} Starting Turn14-only derived sync (parts={} inventory={} pricing={}{}).".format(
+            _LOG_PREFIX, not skip_master_parts, not skip_inventory, not skip_pricing,
+            ", since={}".format(since) if since else "",
+        ))
+        if not skip_master_parts:
+            sync_master_parts_from_turn14(since=since)
             connection.close()
-        if not skip_pricing:
-            sync_provider_pricing_from_turn14()
-            connection.close()
+            _acquire_turn14_propagation_lock(blocking=True)
 
-    if skip_master_parts:
-        _cont()
-    else:
-        _maybe_reindex_meilisearch_after_master_parts(
-            reindex_meilisearch=reindex_meilisearch,
-            provider_label="Turn14",
-            continuation=_cont,
-        )
-    logger.info("{} Completed Turn14-only derived sync.".format(_LOG_PREFIX))
+        def _cont() -> None:
+            if not skip_inventory:
+                sync_provider_inventory_from_turn14(since=since)
+                connection.close()
+                _acquire_turn14_propagation_lock(blocking=True)
+            if not skip_pricing:
+                sync_provider_pricing_from_turn14()
+                connection.close()
+
+        if skip_master_parts:
+            _cont()
+        else:
+            _maybe_reindex_meilisearch_after_master_parts(
+                reindex_meilisearch=reindex_meilisearch,
+                provider_label="Turn14",
+                continuation=_cont,
+            )
+        logger.info("{} Completed Turn14-only derived sync.".format(_LOG_PREFIX))
+    finally:
+        _release_turn14_propagation_lock()
 
 
 def sync_derived_from_keystone(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False, skip_pricing: bool = False) -> None:

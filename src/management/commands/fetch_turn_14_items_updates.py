@@ -38,7 +38,16 @@ class Command(BaseCommand):
             # MasterPart/ProviderPart if this doesn't. skip_inventory=True: items/updates carries
             # no stock-level data, so there is nothing here for ProviderPartInventory to sync --
             # that's fetch_turn_14_inventory_updates' job, on its own 10-minute delta.
-            master_parts.sync_derived_from_turn14(skip_inventory=True, skip_pricing=True, since=since)
+            #
+            # blocking=False: this can land right at the edge of the daily full sweep's window
+            # (this runs every 4h on the hour; that sweep's phase 2 can run 03:00 well past
+            # 04:00), and both upsert into ProviderPart -- the exact concurrent-write deadlock
+            # seen 2026-08-31 on the inventory delta. Skipping here is safe: the raw fetch above
+            # (Turn14Items/Turn14BrandData) already landed regardless, and the next 4-hourly run
+            # -- or tomorrow's full sweep, whichever comes first -- propagates it.
+            master_parts.sync_derived_from_turn14(
+                skip_inventory=True, skip_pricing=True, since=since, blocking=False,
+            )
         except Exception as e:
             meter.__exit__(None, None, None)
             audit_scheduled_tasks.mark_scheduled_task_failed(execution, error_message=str(e))
