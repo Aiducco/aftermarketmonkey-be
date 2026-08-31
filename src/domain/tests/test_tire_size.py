@@ -473,6 +473,49 @@ class ParseBestTests(SimpleTestCase):
         )
 
 
+
+class SingleDecimalFlotationTests(SimpleTestCase):
+    """
+    Flotation sizes written with one decimal place.
+
+    ``33X12.50R15`` and ``32X14R15`` always worked; ``32.0X14.0R15`` did not, and the reason was
+    the wheel guard rather than the flotation pattern. ``_BOLT_PATTERN_RE`` began a match at the
+    single digit after a decimal point -- "0X14" out of "32.0X14.0" -- and a bolt pattern anywhere
+    in the string vetoes the whole parse. 212 tire specs were affected, silently, because a veto
+    is indistinguishable from an unparseable string.
+    """
+
+    def test_one_decimal_place_parses(self):
+        for text in ("32.0X14.0R15", "29.5X11.5R18", "23.0X5.0-15", "31.0X13.0-15"):
+            parsed = tire_size.parse(text)
+            self.assertIsNotNone(parsed, text)
+            self.assertEqual(parsed.notation, tire_size.NOTATION_FLOTATION, text)
+
+    def test_the_dimensions_survive(self):
+        parsed = tire_size.parse("29.5X11.5R18")
+        self.assertEqual(parsed.overall_diameter_in, decimal.Decimal("29.5"))
+        self.assertEqual(parsed.section_width_in, decimal.Decimal("11.5"))
+        self.assertEqual(parsed.rim_diameter_in, decimal.Decimal("18"))
+
+    def test_the_parser_can_reread_its_own_output(self):
+        """The failure surfaced as a round trip: these rows were stored with a flotation notation
+        and a rim diameter, so they had parsed once, yet re-reading size_display returned None."""
+        for text in ("32.0X14.0R15", "29.5X11.5R18", "35X12.50R17LT", "23.0X5.0-15"):
+            first = tire_size.parse(text)
+            second = tire_size.parse(first.size_display)
+            self.assertIsNotNone(second, first.size_display)
+            self.assertEqual(second.size_display, first.size_display)
+
+    def test_real_wheels_are_still_rejected(self):
+        for text in (
+            "20X10 TORSION SE 5X127",
+            "17X8.5 6X139.7",
+            "20X12-44 5X127",
+            "17X9 5X114.3",
+        ):
+            self.assertIsNone(tire_size.parse(text), text)
+
+
 class ParseQueryTests(SimpleTestCase):
     """
     ``parse_query`` is what a search box uses. It accepts everything ``parse`` does plus the

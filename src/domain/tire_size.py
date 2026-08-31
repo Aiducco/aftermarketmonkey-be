@@ -209,7 +209,15 @@ _NUMERIC_RE = re.compile(
 
 # A bolt pattern immediately after an inch pair is the wheel tell: ``20X10 5X127``,
 # ``17X8.5 6X139.7``. Three-digit (mm) or ``4.5``-style (inch) PCDs both appear.
-_BOLT_PATTERN_RE = re.compile(r"\b\d(?:\.\d)?\s*[xX]\s*(?:\d{2,3}(?:\.\d+)?|\d\.\d+)\b")
+#
+# The lookbehind is load-bearing. A bolt count is a whole small number, so a match may not begin
+# in the middle of one -- and ``\b`` alone permits exactly that after a decimal point, because the
+# point is a non-word character. In ``32.0X14.0R15`` it found "0X14" and vetoed the whole string
+# as a wheel; ``29.5X11.5R18`` lost to "5X11" and ``23.0X5.0-15`` to "0X5.0". Those are ordinary
+# drag radials, and 212 of them were rejected outright -- invisibly, because a veto here returns
+# None from ``parse`` exactly as an unparseable string does. Sizes written with two decimals
+# (``33X12.50R15``) were unaffected, which is why the notation looked healthy overall.
+_BOLT_PATTERN_RE = re.compile(r"(?<![\d.])\d(?:\.\d)?\s*[xX]\s*(?:\d{2,3}(?:\.\d+)?|\d\.\d+)\b")
 
 # Service description: load index (optionally a dual-load pair) glued or slash-joined to the
 # speed symbol. Wheel Pros writes ``109/T`` where the slash is a separator, not a dual load --
