@@ -12,7 +12,7 @@ import unittest.mock as mock
 
 from django.test import SimpleTestCase
 
-from src.api.services import tire_search
+from src.api.services import search_tabs, tire_search
 from src.domain import tire_filters
 
 
@@ -20,13 +20,18 @@ def _response(hits=(), total=0, facets=None):
     return {"hits": list(hits), "estimatedTotalHits": total, "facetDistribution": facets or {}}
 
 
-def _fake_multi_search(tires=None, parts=None, calls=None):
-    """Stand in for the one multi-search round trip. ``calls`` records each invocation."""
+def _fake_multi_search(tires=None, parts=None, wheels=None, calls=None):
+    """
+    Stand in for the one multi-search round trip. ``calls`` records each invocation.
+
+    Returns three responses, not two: the same trip now also carries a limit-0 wheels query so the
+    tab strip can show a Wheels count without a second round trip.
+    """
 
     def run(**kwargs):
         if calls is not None:
             calls.append(kwargs)
-        return (tires if tires is not None else _response()), parts
+        return (tires if tires is not None else _response()), parts, wheels
 
     return run
 
@@ -124,7 +129,7 @@ class RelaxationTests(SimpleTestCase):
 
         def multi_search(*, text_query, filter_expression, sort_spec, tires_limit, parts_limit, offset):
             seen_filters.append(filter_expression)
-            return _response(total=sequence.pop(0)), None
+            return _response(total=sequence.pop(0)), None, None
 
         def parser(text, **kwargs):
             return tire_query.ParsedQuery(filters=dict(parsed_filters), residue="", matched={})
@@ -275,6 +280,7 @@ class ModeRoutingTests(SimpleTestCase):
             return (
                 _response(hits=[{"id": 1}] if tires_total else [], total=tires_total),
                 _response(hits=[{"id": 2}] if parts_total else [], total=parts_total),
+                None,
             )
 
         def parser(text, **kwargs):
@@ -345,14 +351,25 @@ class TabsAndChipsTests(SimpleTestCase):
 
     def test_tabs_are_hidden_when_only_one_index_has_hits(self):
         # A part-number search must render no tab strip, so the page looks like it does today.
-        self.assertEqual(tire_search._build_tabs(tires_total=0, parts_total=40, active="parts"), [])
-        self.assertEqual(tire_search._build_tabs(tires_total=12, parts_total=0, active="tires"), [])
+        self.assertEqual(search_tabs.build_tabs({"parts": 40}, active="parts"), [])
+        self.assertEqual(search_tabs.build_tabs({"tires": 12}, active="tires"), [])
 
     def test_tabs_appear_when_both_have_hits_and_mark_the_active_one(self):
-        tabs = tire_search._build_tabs(tires_total=12, parts_total=40, active="tires")
+        tabs = search_tabs.build_tabs({"tires": 12, "parts": 40}, active="tires")
         self.assertEqual([t["mode"] for t in tabs], ["tires", "parts"])
         self.assertEqual([t["count"] for t in tabs], [12, 40])
         self.assertEqual([t["active"] for t in tabs], [True, False])
+
+    def test_wheels_takes_its_place_in_the_strip(self):
+        """The strip is shared by all three modes now, so a wheel search no longer renders
+        "Tires | Parts" and the client no longer has to fake a Wheels tab."""
+        tabs = search_tabs.build_tabs({"tires": 12, "wheels": 43, "parts": 40}, active="wheels")
+        self.assertEqual([t["mode"] for t in tabs], ["tires", "wheels", "parts"])
+        self.assertEqual([t["active"] for t in tabs], [False, True, False])
+
+    def test_a_mode_with_no_hits_is_not_a_tab(self):
+        tabs = search_tabs.build_tabs({"tires": 12, "wheels": 0, "parts": 40}, active="tires")
+        self.assertEqual([t["mode"] for t in tabs], ["tires", "parts"])
 
     def test_chips_are_built_from_applied_filters(self):
         facets = [
@@ -665,8 +682,8 @@ class FacetFallbackTests(SimpleTestCase):
         def multi_search(*, text_query, filter_expression, sort_spec, tires_limit, parts_limit, offset):
             seen.append({"text_query": text_query, "filter_expression": filter_expression})
             if len(seen) == 1:
-                return _response(total=0), None  # the real, filtered search: nothing matches
-            return _response(total=0, facets={"brand_name": {"NITTO": 42}}), None  # the fallback
+                return _response(total=0), None, None  # the real, filtered search: nothing matches
+            return _response(total=0, facets={"brand_name": {"NITTO": 42}}), None, None  # the fallback
 
         with mock.patch.object(tire_search, "_multi_search", multi_search), mock.patch.object(
             tire_search, "facets_config", return_value=self._FACET_CONFIG
@@ -687,7 +704,7 @@ class FacetFallbackTests(SimpleTestCase):
 
         def multi_search(*, text_query, filter_expression, sort_spec, tires_limit, parts_limit, offset):
             seen.append(1)
-            return _response(hits=[{"id": 1}], total=5, facets={"brand_name": {"NITTO": 5}}), None
+            return _response(hits=[{"id": 1}], total=5, facets={"brand_name": {"NITTO": 5}}), None, None
 
         with mock.patch.object(tire_search, "_multi_search", multi_search), mock.patch.object(
             tire_search, "facets_config", return_value=self._FACET_CONFIG
@@ -696,3 +713,83 @@ class FacetFallbackTests(SimpleTestCase):
 
         self.assertEqual(len(seen), 1)
         self.assertEqual(result["total"], 5)
+
+
+class WheelRoutingTests(SimpleTestCase):
+    """A wheel-shaped query resolves to wheels on its own, the way a tire-shaped one resolves to
+    tires. The ordering against ATV tire sizes is the part worth pinning."""
+
+    databases = []
+
+    def _search(self, q, wheel_result=None):
+        from src.api.services import wheel_search
+        from src.domain import tire_query
+
+        called = {}
+
+        def fake_wheel_search(**kwargs):
+            called.update(kwargs)
+            return wheel_result if wheel_result is not None else {"mode": "wheels", "results": []}
+
+        def parser(text, **kwargs):
+            return tire_query.ParsedQuery(filters={}, residue=text, matched={})
+
+        with mock.patch.object(wheel_search, "search", fake_wheel_search), mock.patch.object(
+            tire_search, "_multi_search", _fake_multi_search()
+        ), mock.patch.object(tire_search, "facets_config", return_value=[]), mock.patch.object(
+            tire_search, "brand_names", return_value=frozenset()
+        ), mock.patch.object(
+            tire_search, "tread_category_codes", return_value=frozenset()
+        ), mock.patch.object(
+            tire_search.tires_index, "is_configured", return_value=True
+        ), mock.patch.object(
+            tire_search.wheels_index, "is_configured", return_value=True
+        ):
+            result = tire_search.search(q=q, parse_query_fn=parser)
+        return result, called
+
+    def test_a_wheel_size_routes_to_wheels(self):
+        result, called = self._search("18x8 5x114.3")
+        self.assertEqual(result["mode"], "wheels")
+        self.assertEqual(called.get("q"), "18x8 5x114.3")
+
+    def test_a_tire_size_does_not(self):
+        result, called = self._search("275/70R18")
+        self.assertNotEqual(result.get("mode"), "wheels")
+        self.assertEqual(called, {})
+
+    def test_free_text_does_not(self):
+        result, called = self._search("nitto ridge grappler")
+        self.assertEqual(called, {})
+
+    def test_an_explicit_mode_is_never_overridden(self):
+        from src.api.services import wheel_search
+        from src.domain import tire_query
+
+        def parser(text, **kwargs):
+            return tire_query.ParsedQuery(filters={}, residue=text, matched={})
+
+        with mock.patch.object(wheel_search, "search") as wheel, mock.patch.object(
+            tire_search, "_multi_search", _fake_multi_search()
+        ), mock.patch.object(tire_search, "facets_config", return_value=[]), mock.patch.object(
+            tire_search, "brand_names", return_value=frozenset()
+        ), mock.patch.object(
+            tire_search, "tread_category_codes", return_value=frozenset()
+        ), mock.patch.object(
+            tire_search.tires_index, "is_configured", return_value=True
+        ):
+            tire_search.search(q="18x8 5x114.3", mode="tires", parse_query_fn=parser)
+        wheel.assert_not_called()
+
+    def test_client_supplied_filters_keep_the_request_on_tires(self):
+        """Filters mean the user is refining a tire result set. Re-routing mid-refinement would
+        throw their page away."""
+        from src.api.services import wheel_search
+
+        with mock.patch.object(wheel_search, "search") as wheel, mock.patch.object(
+            tire_search, "_multi_search", _fake_multi_search()
+        ), mock.patch.object(tire_search, "facets_config", return_value=[]), mock.patch.object(
+            tire_search.tires_index, "is_configured", return_value=True
+        ):
+            tire_search.search(q="18x8 5x114.3", filters={"rim_diameter_in": 18}, parse_query_fn=_ExplodingParser())
+        wheel.assert_not_called()

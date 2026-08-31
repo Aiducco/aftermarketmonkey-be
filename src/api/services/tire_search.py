@@ -31,11 +31,11 @@ import typing
 
 from django.db import connection
 
+from src.api.services import search_tabs
 from src.domain import spec_line as spec_line_domain
-from src.domain import tire_filters, tire_query
-from src.domain import tire_spec_display
+from src.domain import tire_filters, tire_query, tire_spec_display, wheel_size
 from src.search import meilisearch_client as parts_index
-from src.search import tires_index
+from src.search import tires_index, wheels_index
 
 logger = logging.getLogger(__name__)
 
@@ -483,13 +483,32 @@ def search(
     # A query that produced structure, or a client that sent filters, is unambiguously about
     # tires; anything else has to be settled by asking both indexes.
     tires_is_certain = bool(filters) or bool(tire_filters_dict) or mode == MODE_TIRES
+
+    # A wheel-shaped query routes itself, the same way a tire-shaped one does: "18x8 5x114.3" is a
+    # wheel and nothing else. Handled by handing the whole request to the wheel service -- the rest
+    # of this function shapes tire documents, so merely setting a mode here would return tire
+    # results under a wheels label.
+    #
+    # Reached only once the tire parser has found nothing, and that order is load-bearing rather
+    # than incidental. ATV tire sizes are written exactly like wheel sizes: "20x10-9" is a tire on
+    # a 9-inch rim, and src.domain.wheel_size reads it as a 20x10 wheel just as readily. Letting
+    # tires answer first keeps those with tires, and only a query tires cannot explain at all
+    # reaches the wheel parser.
+    if not tires_is_certain and mode is None and q and wheel_size.parse(q) is not None:
+        from src.api.services import (
+            wheel_search,  # local: keeps the module import graph acyclic
+        )
+
+        if wheels_index.is_configured():
+            return wheel_search.search(q=q, filters={}, sort=None, limit=limit, offset=offset)
+
     resolved_mode = mode or (MODE_TIRES if tires_is_certain else None)
 
     # ---- 3. one multi-search ----------------------------------------------------------------
     search_t0 = time.monotonic()
     tires_limit = limit if resolved_mode != MODE_PARTS else 1
     parts_limit = 1 if resolved_mode == MODE_TIRES else limit
-    tires_response, parts_response = _multi_search(
+    tires_response, parts_response, wheels_response = _multi_search(
         text_query=text_query,
         filter_expression=filter_expression,
         sort_spec=sort_spec,
@@ -500,6 +519,7 @@ def search(
 
     tires_total = tires_response.get("estimatedTotalHits", 0)
     parts_total = parts_response.get("estimatedTotalHits", 0) if parts_response is not None else 0
+    wheels_total = wheels_response.get("estimatedTotalHits", 0) if wheels_response is not None else 0
 
     if resolved_mode is None:
         # Nothing structural parsed. Tires wins whenever it has any real hits at all -- a
@@ -516,7 +536,7 @@ def search(
             dropped, reduced = relaxation
             tire_filters_dict = reduced
             filter_expression = tire_filters.build_filter(tire_filters_dict, allowed_filter_fields())
-            tires_response, _ = _multi_search(
+            tires_response, _, _ = _multi_search(
                 text_query=text_query,
                 filter_expression=filter_expression,
                 sort_spec=sort_spec,
@@ -551,9 +571,13 @@ def search(
             # panel with nothing to render right when the user most needs it to see what to
             # relax. Re-fetch facets for the same text query with the filter dropped (not the
             # whole unfiltered catalog) so counts still reflect "everything this text matches."
-            facet_only, _ = _multi_search(
-                text_query=text_query, filter_expression="", sort_spec=None,
-                tires_limit=0, parts_limit=0, offset=0,
+            facet_only, _, _ = _multi_search(
+                text_query=text_query,
+                filter_expression="",
+                sort_spec=None,
+                tires_limit=0,
+                parts_limit=0,
+                offset=0,
             )
             facet_distribution = facet_only.get("facetDistribution") or {}
             facet_stats = facet_only.get("facetStats") or {}
@@ -584,7 +608,14 @@ def search(
         "interpretation": interpretation,
         "results": results,
         "facets": facets,
-        "tabs": _build_tabs(tires_total=tires_total, parts_total=parts_total, active=resolved_mode),
+        "tabs": search_tabs.build_tabs(
+            {
+                search_tabs.MODE_TIRES: tires_total,
+                search_tabs.MODE_WHEELS: wheels_total,
+                search_tabs.MODE_PARTS: parts_total,
+            },
+            active=resolved_mode,
+        ),
         "timing": timing,
     }
 
@@ -634,6 +665,14 @@ def _multi_search(
             }
         )
 
+    # Wheels, for the tab badge only: limit 0 fetches a count and no documents. Added to the same
+    # multi-search rather than a second call, so the strip costs nothing in round trips. No filter
+    # is applied -- a tire filter expression names attributes the wheels index does not have, and
+    # Meilisearch rejects the whole multi-search when one query references an unknown field.
+    include_wheels = wheels_index.is_configured()
+    if include_wheels:
+        queries.append({"indexUid": wheels_index.INDEX_NAME_WHEELS, "q": text_query, "limit": 0})
+
     client = tires_index._client()
     try:
         responses = client.multi_search(queries)["results"]
@@ -645,11 +684,13 @@ def _multi_search(
         logger.warning("%s multi-search failed, retrying tires alone: %s", _LOG_PREFIX, exc)
         responses = client.multi_search(queries[:1])["results"]
         include_parts = False
+        include_wheels = False
 
     by_index = {response.get("indexUid"): response for response in responses}
     tires_response = by_index.get(tires_index.INDEX_NAME_TIRES, {"hits": [], "estimatedTotalHits": 0})
     parts_response = by_index.get(parts_index.INDEX_NAME) if include_parts else None
-    return tires_response, parts_response
+    wheels_response = by_index.get(wheels_index.INDEX_NAME_WHEELS) if include_wheels else None
+    return tires_response, parts_response, wheels_response
 
 
 def _parts_hit_to_result(hit: typing.Mapping[str, typing.Any]) -> typing.Dict[str, typing.Any]:
@@ -676,19 +717,6 @@ def _parts_hit_to_result(hit: typing.Mapping[str, typing.Any]) -> typing.Dict[st
         "distributor_count": hit.get("distributor_count", 0),
         "distributor_names": hit.get("distributor_names") or [],
     }
-
-
-def _build_tabs(*, tires_total: int, parts_total: int, active: str) -> typing.List[typing.Dict[str, typing.Any]]:
-    """
-    Tab strip. **Only modes with hits appear**, so a part-number search renders no tab strip at
-    all and the page looks exactly like it does today.
-    """
-    candidates = [
-        {"mode": MODE_TIRES, "label": "Tires", "count": tires_total},
-        {"mode": MODE_PARTS, "label": "Parts", "count": parts_total},
-    ]
-    tabs = [dict(tab, active=tab["mode"] == active) for tab in candidates if tab["count"] > 0]
-    return tabs if len(tabs) > 1 else []
 
 
 def _build_chips(applied: typing.Mapping[str, typing.Any]) -> typing.List[typing.Dict[str, typing.Any]]:
@@ -767,11 +795,7 @@ def _facet_values(distribution_values: typing.Mapping[str, typing.Any]) -> typin
     client. Dropping it here rather than in the projection keeps the filter semantics of the index
     unchanged and needs no reindex.
     """
-    return {
-        str(value): count
-        for value, count in distribution_values.items()
-        if str(value).strip() != "" and count
-    }
+    return {str(value): count for value, count in distribution_values.items() if str(value).strip() != "" and count}
 
 
 def _has_true_value(values: typing.Mapping[str, int]) -> bool:

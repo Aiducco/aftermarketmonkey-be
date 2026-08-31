@@ -5166,6 +5166,65 @@ class WheelSpec(django_db_models.Model):
         max_length=24, null=True, blank=True, help_text="Conical / ball / flat. Wrong seat means the lug will not hold."
     )
 
+    # ---- capability and positioning ------------------------------------------------------------
+    # Mostly NULL against the Wheel Pros feed, which publishes none of it. The columns exist now
+    # because the detail card has a fixed shape -- a client renders the row and blanks a null --
+    # and because The Wheel Group already publishes warranties, lug seat and TPMS for its 2,072
+    # wheels. Adding them later would mean a second migration and a second pass over the card.
+    tier = django_db_models.CharField(
+        max_length=16,
+        choices=[("budget", "Budget"), ("mid", "Mid"), ("premium", "Premium"), ("flagship", "Flagship")],
+        null=True,
+        blank=True,
+    )
+    style_tags = pg_fields.ArrayField(
+        django_db_models.TextField(),
+        default=list,
+        blank=True,
+        help_text='What the wheel is for, as pills: ["Off-road", "Truck"].',
+    )
+    piece_count = django_db_models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text="1-piece cast, or a 2/3-piece bolt-together. Read from the '3PC' marker brands put in the name.",
+    )
+    max_psi = django_db_models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text="Beadlock rings have a torque/pressure limit. Meaningless on a normal wheel -- hide it there.",
+    )
+    is_simulated_beadlock = django_db_models.BooleanField(
+        null=True,
+        blank=True,
+        help_text="Looks like a beadlock, does not clamp the bead. Distinct from is_beadlock and not interchangeable.",
+    )
+    is_hub_centric = django_db_models.BooleanField(null=True, blank=True)
+    is_directional = django_db_models.BooleanField(
+        null=True,
+        blank=True,
+        help_text="Sold as left and right. Ordering four of one hand is a returns problem, so it belongs on the card.",
+    )
+
+    # ---- ownership -------------------------------------------------------------------------------
+    # Two warranties, because wheels warrant the casting and the coating separately and the second
+    # is much the shorter. It is a real differentiator between a $200 and a $400 wheel, so folding
+    # them into one field would throw away the distinction a buyer is paying for.
+    structural_warranty = django_db_models.CharField(max_length=64, null=True, blank=True)
+    finish_warranty = django_db_models.CharField(max_length=64, null=True, blank=True)
+
+    # ---- fitment hardware ------------------------------------------------------------------------
+    lug_thread_size = django_db_models.CharField(
+        max_length=24, null=True, blank=True, help_text="M14 x 1.5, 1/2-20. Wrong thread will not start."
+    )
+    hub_rings = django_db_models.CharField(
+        max_length=24,
+        null=True,
+        blank=True,
+        help_text="included / required / not_needed. 'Required' and absent are very different at fitting time.",
+    )
+    caps_included = django_db_models.BooleanField(null=True, blank=True)
+    lugs_included = django_db_models.BooleanField(null=True, blank=True)
+
     search_aliases = pg_fields.ArrayField(django_db_models.TextField(), default=list, blank=True)
 
     # ---- provenance ----------------------------------------------------------------------------

@@ -13,7 +13,7 @@ from src import constants as src_constants
 from src import enums as src_enums
 from src import models as src_models
 from src.api.services import billing as billing_services
-from src.domain import tire_spec_display
+from src.domain import tire_spec_display, wheel_spec_display
 from src.integrations import credentials as credentials_helper
 from src.integrations.live_inventory import exceptions as live_inventory_exceptions
 from src.integrations.live_inventory import registry as live_inventory_registry
@@ -31,6 +31,7 @@ class PartsServiceError(Exception):
         self.message = message
         self.status = status
 
+
 # Turn14 warehouse keys may be "01", "02" or "wh 01", "wh 02" - normalize to external_id
 _TURN14_WH_KEY_RE = re.compile(r"^(?:wh\s+)?(\d+)$", re.IGNORECASE)
 
@@ -46,8 +47,7 @@ def _map_turn14_warehouse_availability(
         return warehouse_availability
 
     locations = {
-        loc["external_id"]: loc["name"]
-        for loc in src_models.Turn14Location.objects.all().values("external_id", "name")
+        loc["external_id"]: loc["name"] for loc in src_models.Turn14Location.objects.all().values("external_id", "name")
     }
 
     result = {}
@@ -60,6 +60,7 @@ def _map_turn14_warehouse_availability(
         result[display_name] = int(qty) if isinstance(qty, float) and qty == int(qty) else qty
 
     return result if result else None
+
 
 _LOG_PREFIX = "[PARTS-SERVICES]"
 
@@ -96,9 +97,7 @@ def get_parts_search(sku: str, limit: int = 50) -> typing.Dict:
     parts = (
         src_models.MasterPart.objects.filter(part_number__icontains=q)
         .select_related("brand")
-        .prefetch_related(
-            Prefetch("provider_parts", queryset=src_models.ProviderPart.objects.order_by("id"))
-        )
+        .prefetch_related(Prefetch("provider_parts", queryset=src_models.ProviderPart.objects.order_by("id")))
         .order_by("brand__name", "part_number")[:limit]
     )
 
@@ -231,9 +230,27 @@ def _build_tire_specs(
     row["tread_category_label"] = tire_spec.tread_category.label if tire_spec.tread_category_id else None
     row["season_category"] = tire_spec.season_category_id
     row["season_category_label"] = tire_spec.season_category.label if tire_spec.season_category_id else None
-    return tire_spec_display.build_tire_specs(
-        row, equivalent_sizes_count=_equivalent_sizes_count(tire_spec)
-    )
+    return tire_spec_display.build_tire_specs(row, equivalent_sizes_count=_equivalent_sizes_count(tire_spec))
+
+
+def _build_wheel_specs(
+    wheel_spec: typing.Optional["src_models.WheelSpec"],
+) -> typing.Optional[typing.Dict[str, typing.Any]]:
+    """
+    The wheel specification card -- null for anything that is not a wheel.
+
+    Mirrors ``_build_tire_specs``: only wheels get a ``wheel_specs`` row, so the row's existence is
+    the gate and no separate product_type check is needed. A wheel whose enrichment has not run
+    returns null rather than a card full of holes.
+
+    Every column goes to the display builder and it decides what ships. That whitelist lives in one
+    place (``src.domain.wheel_spec_display``) so a new wheel_specs column cannot leak into the API
+    the moment it is added.
+    """
+    if wheel_spec is None:
+        return None
+    row = {field.attname: getattr(wheel_spec, field.attname) for field in wheel_spec._meta.concrete_fields}
+    return wheel_spec_display.build_wheel_specs(row)
 
 
 def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None) -> typing.Optional[typing.Dict]:
@@ -250,7 +267,14 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
             # (never the code -- see the TreadCategory docstring), so all three are joined here
             # rather than costing three extra queries on every tire's detail page.
             src_models.MasterPart.objects.select_related(
-                "brand", "data", "tire_spec", "tire_spec__tread_category", "tire_spec__season_category"
+                "brand",
+                "data",
+                "tire_spec",
+                "tire_spec__tread_category",
+                "tire_spec__season_category",
+                # Also a reverse OneToOne. A part is a wheel or a tire, never both, so exactly one
+                # of these two joins finds a row and the other costs nothing.
+                "wheel_spec",
             )
             .prefetch_related(
                 Prefetch(
@@ -275,6 +299,11 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
     except src_models.TireSpec.DoesNotExist:
         tire_spec = None
 
+    try:
+        wheel_spec = part.wheel_spec
+    except src_models.WheelSpec.DoesNotExist:
+        wheel_spec = None
+
     base = {
         "id": part.id,
         "brand_id": part.brand_id,
@@ -285,9 +314,8 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
         "aaia_code": part.aaia_code,
         # Falls back to MasterPartData's first enrichment image (e.g. from ASAP Network) when
         # the distributor feed that created this MasterPart never supplied a primary image_url.
-        "image_url": part.image_url or (
-            part_data.images[0] if part_data and isinstance(part_data.images, list) and part_data.images else None
-        ),
+        "image_url": part.image_url
+        or (part_data.images[0] if part_data and isinstance(part_data.images, list) and part_data.images else None),
         "gtin": part.gtin,
         "created_at": part.created_at.isoformat() if part.created_at else None,
         "updated_at": part.updated_at.isoformat() if part.updated_at else None,
@@ -326,6 +354,9 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
         "product_type": part.product_type,
         # Populated for tires only; null on everything else.
         "tire_specs": _build_tire_specs(tire_spec),
+        # Populated for wheels only; null on everything else. A part is one or the other, so at
+        # most one of these two is ever non-null.
+        "wheel_specs": _build_wheel_specs(wheel_spec),
     }
 
     company_provider_map: typing.Dict[int, typing.Dict[str, typing.Any]] = {}
@@ -356,9 +387,7 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
     # still configured -- company_provider_objs/company_provider_map above intentionally still
     # include those rows (can_order_in_app below needs them), only this set is feed-specific.
     connected_provider_ids: typing.Set[int] = {
-        provider_id
-        for provider_id, cp in company_provider_objs.items()
-        if (cp.credentials or {}).get("feed")
+        provider_id for provider_id, cp in company_provider_objs.items() if (cp.credentials or {}).get("feed")
     }
 
     # Provider-kind -> catalog entry, precomputed once rather than scanning PROVIDER_CATALOG
@@ -399,9 +428,7 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
     t14_external_ids = [
         pp.provider_external_id
         for pp in provider_parts
-        if pp.provider
-        and pp.provider.kind_name == "TURN_14"
-        and (pp.provider_external_id or "").strip()
+        if pp.provider and pp.provider.kind_name == "TURN_14" and (pp.provider_external_id or "").strip()
     ]
     if t14_external_ids:
         for row in src_models.Turn14Items.objects.filter(external_id__in=t14_external_ids).values(
@@ -427,11 +454,7 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
             inv_obj = None
 
         kind_name = pp.provider.kind_name if pp.provider else None
-        integrated = (
-            company_id is not None
-            and pp.provider_id is not None
-            and pp.provider_id in connected_provider_ids
-        )
+        integrated = company_id is not None and pp.provider_id is not None and pp.provider_id in connected_provider_ids
         turn14_vmm = (
             t14_eid_to_part_number.get(pp.provider_external_id)
             if kind_name == "TURN_14" and pp.provider_external_id
@@ -440,13 +463,16 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
         distributor_logo_image_url = _get_provider_image_url(kind_name)
         default_order_account = (
             credentials_helper.get_default_order_account(company_provider_objs[pp.provider_id])
-            if pp.provider_id in company_provider_objs else None
+            if pp.provider_id in company_provider_objs
+            else None
         )
         provider_info = {
             "provider_id": pp.provider_id,
             "provider_name": pp.provider.name if pp.provider else None,
             "provider_kind_name": kind_name,
-            "provider_display_name": src_constants.PROVIDER_DISPLAY_NAMES.get(kind_name, kind_name) if kind_name else None,
+            "provider_display_name": src_constants.PROVIDER_DISPLAY_NAMES.get(kind_name, kind_name)
+            if kind_name
+            else None,
             "provider_image_url": distributor_logo_image_url,
             "distributor_logo_image_url": distributor_logo_image_url,
             "distributor_refreshed_at": (
@@ -485,9 +511,7 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
             # inferred from can_order_in_app, since a row can be order-connected via email with
             # no API adapter at all. Null when no order account is configured yet.
             "order_method": default_order_account.order_method if default_order_account else None,
-            "order_method_name": (
-                default_order_account.order_method_name if default_order_account else None
-            ),
+            "order_method_name": (default_order_account.order_method_name if default_order_account else None),
             # Whether this DISTRIBUTOR supports in-app ordering at all, independent of any one
             # company's connection — same "does the catalog offer it" question the integrations
             # catalog endpoint answers via its own supports_ordering field. A row can have
@@ -526,11 +550,13 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
                 "status_name": company_provider_map[pp.provider_id]["status_name"] if integrated else None,
                 "order_status": (
                     company_provider_map[pp.provider_id]["order_status"]
-                    if pp.provider_id in company_provider_objs else None
+                    if pp.provider_id in company_provider_objs
+                    else None
                 ),
                 "order_status_name": (
                     company_provider_map[pp.provider_id]["order_status_name"]
-                    if pp.provider_id in company_provider_objs else None
+                    if pp.provider_id in company_provider_objs
+                    else None
                 ),
             },
             "is_discontinued": pp.is_discontinued,
@@ -567,15 +593,9 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
                     "jobber_price": float(pricing_row.jobber_price) if pricing_row.jobber_price else None,
                     "map_price": float(pricing_row.map_price) if pricing_row.map_price else None,
                     "msrp": float(pricing_row.msrp) if pricing_row.msrp else None,
-                    "retail_price": (
-                        float(pricing_row.retail_price) if pricing_row.retail_price else None
-                    ),
-                    "last_synced_at": (
-                        pricing_row.last_synced_at.isoformat() if pricing_row.last_synced_at else None
-                    ),
-                    "cost_tooltip": (
-                        "Cost set by user in Settings" if kind_name == "WHEELPROS" else None
-                    ),
+                    "retail_price": (float(pricing_row.retail_price) if pricing_row.retail_price else None),
+                    "last_synced_at": (pricing_row.last_synced_at.isoformat() if pricing_row.last_synced_at else None),
+                    "cost_tooltip": ("Cost set by user in Settings" if kind_name == "WHEELPROS" else None),
                 }
 
         providers_data.append(provider_info)
@@ -642,9 +662,7 @@ def get_parts_bulk_pricing(
     if not ids:
         raise PartsServiceError("master_part_ids is required.")
     if len(ids) > _BULK_PRICING_MAX_IDS:
-        raise PartsServiceError(
-            "Too many ids: {} given, {} max.".format(len(ids), _BULK_PRICING_MAX_IDS)
-        )
+        raise PartsServiceError("Too many ids: {} given, {} max.".format(len(ids), _BULK_PRICING_MAX_IDS))
 
     result: typing.Dict[int, typing.Dict[str, typing.Any]] = {
         mpid: {
@@ -668,22 +686,25 @@ def get_parts_bulk_pricing(
     connected_provider_ids = set(
         cp.provider_id
         for cp in src_models.CompanyProviders.objects.filter(
-            company_id=company_id, provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
+            company_id=company_id,
+            provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
         ).only("provider_id", "credentials")
         if (cp.credentials or {}).get("feed")
     )
 
     provider_parts = list(
         src_models.ProviderPart.objects.filter(master_part_id__in=ids).values(
-            "id", "master_part_id", "provider_id", "provider__name", "provider__kind_name",
+            "id",
+            "master_part_id",
+            "provider_id",
+            "provider__name",
+            "provider__kind_name",
         )
     )
     if not provider_parts:
         return result
 
-    connected_provider_part_ids = [
-        pp["id"] for pp in provider_parts if pp["provider_id"] in connected_provider_ids
-    ]
+    connected_provider_part_ids = [pp["id"] for pp in provider_parts if pp["provider_id"] in connected_provider_ids]
     cost_by_provider_part_id = {
         row["provider_part_id"]: row["cost"]
         for row in src_models.ProviderPartCompanyPricing.objects.filter(
@@ -707,15 +728,17 @@ def get_parts_bulk_pricing(
         qty = qty_by_provider_part_id.get(pp["id"]) or 0
         in_stock = qty > 0
         entry = result[mpid]
-        entry["providers"].append({
-            "provider_id": pp["provider_id"],
-            "provider_name": pp["provider__name"],
-            "provider_kind_name": pp["provider__kind_name"],
-            "connected": connected,
-            "cost": float(cost) if cost is not None else None,
-            "in_stock": in_stock,
-            "warehouse_total_qty": qty,
-        })
+        entry["providers"].append(
+            {
+                "provider_id": pp["provider_id"],
+                "provider_name": pp["provider__name"],
+                "provider_kind_name": pp["provider__kind_name"],
+                "connected": connected,
+                "cost": float(cost) if cost is not None else None,
+                "in_stock": in_stock,
+                "warehouse_total_qty": qty,
+            }
+        )
         if cost is None:
             continue
         candidate_key = (0 if in_stock else 1, float(cost), -qty)
@@ -767,9 +790,7 @@ def refresh_provider_live_inventory(
     provider = live_inventory_registry.get_provider(company_provider)
     if provider is None:
         kind_name = provider_part.provider.kind_name if provider_part.provider else "This distributor"
-        raise PartsServiceError(
-            "Live inventory refresh isn't available for {} yet.".format(kind_name), status=400
-        )
+        raise PartsServiceError("Live inventory refresh isn't available for {} yet.".format(kind_name), status=400)
 
     try:
         provider.refresh(provider_part)
@@ -777,9 +798,7 @@ def refresh_provider_live_inventory(
         raise PartsServiceError(str(e), status=404)
     except live_inventory_exceptions.LiveInventoryTransportError as e:
         logger.error(
-            "{} Live inventory refresh failed for provider_part_id={}: {}".format(
-                _LOG_PREFIX, provider_part.id, str(e)
-            )
+            "{} Live inventory refresh failed for provider_part_id={}: {}".format(_LOG_PREFIX, provider_part.id, str(e))
         )
         raise PartsServiceError("Error contacting the distributor. Try again shortly.", status=502)
 
@@ -810,8 +829,7 @@ def list_part_detail_audit_history(
         src_models.PartRequestAudit.objects.filter(
             company_id=company_id,
             action="detail",
-        )
-        .exclude(master_part_id__isnull=True)
+        ).exclude(master_part_id__isnull=True)
         # "-id" tiebreaks rows with an identical created_at (real: rapid page views/reloads of the
         # same part land within the same microsecond) -- "-created_at" alone has no guaranteed
         # order for ties, so offset/limit pagination could return a row twice or skip one across
@@ -837,8 +855,10 @@ def list_part_detail_audit_history(
     part_ids = list({r["master_part_id"] for r in rows if r.get("master_part_id")})
     parts_by_id: typing.Dict[int, src_models.MasterPart] = {}
     if part_ids:
-        for mp in src_models.MasterPart.objects.filter(id__in=part_ids).select_related("brand").prefetch_related(
-            Prefetch("provider_parts", queryset=src_models.ProviderPart.objects.order_by("id"))
+        for mp in (
+            src_models.MasterPart.objects.filter(id__in=part_ids)
+            .select_related("brand")
+            .prefetch_related(Prefetch("provider_parts", queryset=src_models.ProviderPart.objects.order_by("id")))
         ):
             parts_by_id[mp.id] = mp
 
