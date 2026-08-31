@@ -1,6 +1,7 @@
 """
 API services for parts search and detail.
 """
+import decimal
 import logging
 import re
 import typing
@@ -168,6 +169,42 @@ def _provider_go_to_link(
     return None
 
 
+# Two tires are "the same size" to a buyer when they stand the same height on the same rim, which
+# is never an exact match across notations -- a 265/70R17 stands 31.6" and the 32x11.50R17 people
+# cross-shop it against stands 32.0". 3% is the industry tolerance for a size swap: inside it
+# the speedometer error stays under the same 3% and the ABS/traction calibration still holds.
+EQUIVALENT_DIAMETER_TOLERANCE = decimal.Decimal("0.03")
+
+
+def _equivalent_sizes_count(tire_spec: "src_models.TireSpec") -> typing.Optional[int]:
+    """
+    How many *other* sizes we carry stand the same height on the same rim diameter.
+
+    A count, not the list: it turns a spec into an action ("14 other sizes fit this wheel") without
+    paying for the sizes themselves on every detail view. Served by the
+    ``tire_specs_diameter_idx`` index on (rim_diameter_in, overall_diameter_in), so it is a range
+    scan rather than a table scan.
+
+    ``0`` is a real answer (nothing else that height on that rim); ``None`` only if the row somehow
+    lacks the dimensions, which the table's own CHECK constraints already forbid.
+    """
+    if tire_spec.overall_diameter_in is None or tire_spec.rim_diameter_in is None:
+        return None
+
+    spread = tire_spec.overall_diameter_in * EQUIVALENT_DIAMETER_TOLERANCE
+    return (
+        src_models.TireSpec.objects.filter(
+            rim_diameter_in=tire_spec.rim_diameter_in,
+            overall_diameter_in__gte=tire_spec.overall_diameter_in - spread,
+            overall_diameter_in__lte=tire_spec.overall_diameter_in + spread,
+        )
+        .exclude(size_display=tire_spec.size_display)
+        .values("size_display")
+        .distinct()
+        .count()
+    )
+
+
 def _build_tire_specs(
     tire_spec: typing.Optional["src_models.TireSpec"],
 ) -> typing.Optional[typing.Dict[str, typing.Any]]:
@@ -187,11 +224,16 @@ def _build_tire_specs(
         return None
 
     row = {field.attname: getattr(tire_spec, field.attname) for field in tire_spec._meta.concrete_fields}
-    # attname for the FK is ``tread_category_id`` even though it stores the code; the builder
-    # wants the code under its own name, plus the label a UI actually renders.
+    # attname for both FKs is ``<field>_id`` even though they store the code; the builder wants
+    # each code under its own name, plus the label a UI actually renders. season_category is a
+    # second axis on the same taxonomy (ALL_SEASON / SUMMER / ...), not a second tread category.
     row["tread_category"] = tire_spec.tread_category_id
     row["tread_category_label"] = tire_spec.tread_category.label if tire_spec.tread_category_id else None
-    return tire_spec_display.build_tire_specs(row)
+    row["season_category"] = tire_spec.season_category_id
+    row["season_category_label"] = tire_spec.season_category.label if tire_spec.season_category_id else None
+    return tire_spec_display.build_tire_specs(
+        row, equivalent_sizes_count=_equivalent_sizes_count(tire_spec)
+    )
 
 
 def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None) -> typing.Optional[typing.Dict]:
@@ -204,11 +246,11 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
     """
     try:
         part = (
-            # tire_spec is a reverse OneToOne and tread_category carries the label a UI renders
-            # (never the code -- see the TreadCategory docstring), so both are joined here rather
-            # than costing two extra queries on every tire's detail page.
+            # tire_spec is a reverse OneToOne and both category FKs carry the label a UI renders
+            # (never the code -- see the TreadCategory docstring), so all three are joined here
+            # rather than costing three extra queries on every tire's detail page.
             src_models.MasterPart.objects.select_related(
-                "brand", "data", "tire_spec", "tire_spec__tread_category"
+                "brand", "data", "tire_spec", "tire_spec__tread_category", "tire_spec__season_category"
             )
             .prefetch_related(
                 Prefetch(

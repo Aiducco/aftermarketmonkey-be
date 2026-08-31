@@ -14,7 +14,7 @@ def _row(**overrides):
         "notation": "metric",
         "size_display": "245/40ZR18",
         "model_name": "Pilot Sport Cup 2",
-        "sub_model": "",
+        "sub_model": None,
         "service_type": "P",
         "section_width_mm": 245,
         "aspect_ratio": 40,
@@ -35,6 +35,15 @@ def _row(**overrides):
         "rim_width_min_in": decimal.Decimal("8.0"),
         "rim_width_max_in": decimal.Decimal("9.5"),
         "is_3pmsf": False,
+        "sidewall_style": "Blackwall",
+        "tread_design": "Directional",
+        "mileage_warranty_miles": 30000,
+        "tire_weight_lb": decimal.Decimal("26.40"),
+        "oe_marking": "N0 - Porsche",
+        "season_category": "SUMMER",
+        "season_category_label": "Summer",
+        "spec_source": "simpletire",
+        "simpletire_match_tier": 1,
         "use_case_tags": ["track"],
         "enriched_at": datetime.datetime(2026, 8, 1, 12, 30),
     }
@@ -106,12 +115,69 @@ class TireSpecDisplayTests(SimpleTestCase):
         payload = tire_spec_display.build_tire_specs(_row())
         self.assertIs(payload["is_3pmsf"], False)
 
-    def test_unknown_flags_are_omitted_never_coerced_to_false(self):
+    def test_unknown_flags_are_null_never_coerced_to_false(self):
         payload = tire_spec_display.build_tire_specs(_row(is_3pmsf=None, is_ms=None))
-        # Absent means unknown. A false here would claim the tire was checked and failed.
-        self.assertNotIn("is_3pmsf", payload)
-        self.assertNotIn("is_ms", payload)
-        self.assertNotIn("is_run_flat", payload)
+        # Present but null means unknown. A false here would claim the tire was checked and failed.
+        for flag in tire_spec_display.TRISTATE_FLAGS:
+            self.assertIn(flag, payload)
+        self.assertIsNone(payload["is_3pmsf"])
+        self.assertIsNone(payload["is_ms"])
+        self.assertIsNone(payload["is_run_flat"])
+        self.assertIsNone(payload["is_tubeless"])
+        self.assertIsNone(payload["has_reinforced_sidewall"])
+
+    def test_unknown_text_is_null_never_an_empty_string(self):
+        """One token for two states is a bug: NULL is "we never learned it"."""
+        payload = tire_spec_display.build_tire_specs(
+            _row(service_type=None, load_range=None, tier=None, model_name=None, oe_marking="")
+        )
+        self.assertIsNone(payload["service_type"])
+        self.assertIsNone(payload["load_range"])
+        self.assertIsNone(payload["tier"])
+        self.assertIsNone(payload["model_name"])
+        self.assertIsNone(payload["sub_model"])
+        self.assertIsNone(payload["oe_marking"])
+
+    def test_the_catalog_block_ships(self):
+        """Fields only a manufacturer-grade catalog supplies -- the ones a buyer filters on."""
+        payload = tire_spec_display.build_tire_specs(_row())
+        self.assertEqual(payload["sidewall_style"], "Blackwall")
+        self.assertEqual(payload["tread_design"], "Directional")
+        self.assertEqual(payload["mileage_warranty_miles"], 30000)
+        self.assertEqual(payload["tire_weight_lb"], 26.4)
+        self.assertEqual(payload["oe_marking"], "N0 - Porsche")
+        self.assertIsNone(payload["commercial_position"])
+
+    def test_season_is_a_second_axis_with_its_own_label(self):
+        payload = tire_spec_display.build_tire_specs(_row())
+        self.assertEqual(payload["season_category"], "SUMMER")
+        self.assertEqual(payload["season_category_label"], "Summer")
+        # ...and does not displace the terrain/performance answer.
+        self.assertEqual(payload["tread_category"], "track")
+
+    def test_provenance_says_who_supplied_the_specs(self):
+        payload = tire_spec_display.build_tire_specs(_row())
+        self.assertEqual(payload["spec_source"], "simpletire")
+        self.assertEqual(payload["spec_source_label"], "SimpleTire catalog")
+        self.assertEqual(payload["simpletire_match_tier"], 1)
+        self.assertIsNone(payload["tdg_match_tier"])
+
+    def test_revolutions_per_mile_comes_off_the_diameter(self):
+        payload = tire_spec_display.build_tire_specs(_row(overall_diameter_in=decimal.Decimal("27.9")))
+        self.assertEqual(payload["revolutions_per_mile"], 722.9)
+
+    def test_revolutions_per_mile_ratio_is_the_speedometer_error(self):
+        """The number exists to answer "how far off will my speedo read" -- that is a ratio."""
+        stock = tire_spec_display.build_tire_specs(_row(overall_diameter_in=decimal.Decimal("30.0")))
+        bigger = tire_spec_display.build_tire_specs(_row(overall_diameter_in=decimal.Decimal("33.0")))
+        self.assertAlmostEqual(
+            stock["revolutions_per_mile"] / bigger["revolutions_per_mile"], 33.0 / 30.0, places=3
+        )
+
+    def test_equivalent_sizes_count_is_the_callers_to_supply(self):
+        self.assertIsNone(tire_spec_display.build_tire_specs(_row())["equivalent_sizes_count"])
+        payload = tire_spec_display.build_tire_specs(_row(), equivalent_sizes_count=14)
+        self.assertEqual(payload["equivalent_sizes_count"], 14)
 
     def test_lt_load_range_letters_have_no_expansion(self):
         payload = tire_spec_display.build_tire_specs(_row(load_range="E", ply_rating=10))
@@ -127,6 +193,10 @@ class TireSpecDisplayTests(SimpleTestCase):
         self.assertIsNone(payload["max_load_lb"])
         self.assertIsNone(payload["service_type_label"])
         self.assertIsNone(payload["section_width_in"])
+        self.assertIsNone(payload["sidewall_style"])
+        self.assertIsNone(payload["season_category_label"])
+        self.assertIsNone(payload["spec_source_label"])
+        self.assertIsNone(payload["is_3pmsf"])
         self.assertEqual(payload["use_case_tags"], [])
         self.assertFalse(payload["size_disputed"])
         self.assertIsNone(payload["enriched_at"])
@@ -149,3 +219,16 @@ class VocabularyParityTests(SimpleTestCase):
             tire_spec_display.VEHICLE_CLASS_LABELS,
             dict(src_models.TireSpec.VEHICLE_CLASS_CHOICES),
         )
+
+    def test_spec_source_labels_cover_every_source_the_model_allows(self):
+        """The wording differs (the card says where a spec came from, in a buyer's words); the
+        set of codes must not."""
+        self.assertEqual(
+            set(tire_spec_display.SPEC_SOURCE_LABELS),
+            {code for code, _ in src_models.TireSpec.SPEC_SOURCE_CHOICES},
+        )
+
+    def test_every_tristate_flag_is_a_nullable_boolean_column(self):
+        for flag in tire_spec_display.TRISTATE_FLAGS:
+            field = src_models.TireSpec._meta.get_field(flag)
+            self.assertTrue(field.null, "{} must stay nullable to mean unknown".format(flag))
