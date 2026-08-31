@@ -619,6 +619,7 @@ def deactivate_items_missing_from_sweep(sweep_started_at) -> int:
 
 def sweep_pricing_for_company_provider(
     company_provider: src_models.CompanyProviders,
+    pace_seconds: typing.Optional[float] = None,
 ) -> typing.Tuple[int, int]:
     """
     GET /v1/pricing over the whole catalog for one customer, into Turn14BrandPricing.
@@ -632,6 +633,13 @@ def sweep_pricing_for_company_provider(
     Uses the *customer's* credentials, never the global ones -- pricing is the half of Turn 14's
     model that is genuinely per-account, and one customer's costs must never be written from
     another's connection.
+
+    Same shape as items_data (~776 pages, one continuous burst) and confirmed live 2026-08-31 to
+    hit the same real upstream 429 items_data did -- see turn_14_sweeps._sweep's pace_seconds
+    docstring. No ``start_page`` here yet, unlike the daily global sweep: the caller
+    (run_integration_pricing_sync_job) defers a 429 as a whole-job retry rather than resuming
+    in-process, and that retry can happen long after this process exits, so a checkpoint would
+    need to live on the job row itself, not an in-memory dict -- a real follow-up, not done here.
     """
     from src.integrations import credentials as credentials_helper
     from src.integrations.clients.turn_14 import client as turn_14_client
@@ -677,4 +685,4 @@ def sweep_pricing_for_company_provider(
         )
         return len(instances)
 
-    return _sweep("pricing company={}".format(company.name), client.get_pricing, flush)
+    return _sweep("pricing company={}".format(company.name), client.get_pricing, flush, pace_seconds=pace_seconds)

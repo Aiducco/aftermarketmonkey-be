@@ -266,7 +266,11 @@ def _fetch_raw_pricing(cp: src_models.CompanyProviders, use_delta_fetch: bool = 
         # customer gets genuinely current pricing rather than a diff against unknown state. The
         # old delta function has been removed -- it was unreachable dead code, never called from
         # anywhere once this branch stopped conditionally falling back to it.
-        turn_14_sweeps.sweep_pricing_for_company_provider(cp)
+        #
+        # pace_seconds=0.6: confirmed live 2026-08-31 this endpoint hits the same burst-shaped
+        # upstream 429 items_data did (see turn_14_sweeps.sweep_items_data), well under any
+        # hourly/daily budget -- same fix, same value.
+        turn_14_sweeps.sweep_pricing_for_company_provider(cp, pace_seconds=0.6)
 
     elif kind == src_enums.BrandProviderKind.KEYSTONE.value:
         keystone_services.sync_keystone_catalog_and_company_pricing_for_company_provider(cp.id)
