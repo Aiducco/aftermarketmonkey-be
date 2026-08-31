@@ -368,7 +368,7 @@ beyond "render what arrives".
 | 10 | `overall_diameter_in` | range | `rim_diameter_in` is already in `filters`. Unscoped it spans 14.7″–37.4″ (lawn tires to 37s) and means nothing. Use `stats` for the slider bounds. |
 | 11 | `service_type` | multiselect | the result set has more than one distinct value. |
 | 12 | `speed_rating` | multiselect | more than one distinct value. Ordered by the speed-rating table, **never alphabetically** — H is 130 mph and sits between U and V. Labels carry the speed (`H — 130 mph`). |
-| 13 | `is_3pmsf` | toggle | at least one row in the result set is actually `true`. Today no tire has a known-true 3PMSF, so **expect this facet to be absent**; it will start appearing on its own when the data lands. |
+| 13 | `is_3pmsf` | toggle | at least one row in the result set is actually `true`. 9,471 tires are rated and 38,179 are unknown, so the facet appears on a winter or all-terrain result set and is absent from most others — that is the rule working, not a bug. |
 | 14 | `tier` | multiselect | the result set has any tier at all. `Budget` / `Mid` / `Premium` / `Flagship`. |
 | 15 | `oe_marking` | multiselect | any row carries an OE approval. ~3,986 tires do. Values are as published (`N0 - Porsche`, `MO - Mercedes-Benz`); a tire with two is indexed as two values, so each is separately selectable. |
 

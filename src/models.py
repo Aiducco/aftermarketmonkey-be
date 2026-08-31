@@ -5406,6 +5406,9 @@ class FacetConfig(django_db_models.Model):
             "is the most useful control on the rail."
         ),
     )
+    # Measured 2026-08-31: 9,471 tires are rated 3PMSF, 5 are known not to be, and 38,179 are
+    # unknown. So the flag is real data, not an empty column -- the facet does appear, on winter
+    # and all-terrain result sets, and is absent from the rest. That is the rule working.
     requires_true_value = django_db_models.BooleanField(
         default=False,
         help_text=(
