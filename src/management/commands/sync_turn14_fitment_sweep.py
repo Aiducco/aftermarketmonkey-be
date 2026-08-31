@@ -44,6 +44,13 @@ class Command(BaseCommand):
                     turn_14_sweeps.sweep_fitment,
                     client=turn_14_global.get_global_client(),
                     max_pages=options["max_pages"],
+                    # Same burst-shaped 429 items_data hit (2026-08-27): a real run gave up
+                    # after only 64 requests, well under any hourly/daily budget -- our own soft
+                    # buckets only intervene once a window is already full, so left alone this
+                    # bursts to that ceiling, pauses, and bursts again. 0.6s/page evenly spreads
+                    # requests at the same ~100/min our own governor already targets, instead of
+                    # bursting to it -- see turn_14_sweeps._sweep's pace_seconds docstring.
+                    pace_seconds=0.6,
                 ),
                 self.stdout.write,
             )
