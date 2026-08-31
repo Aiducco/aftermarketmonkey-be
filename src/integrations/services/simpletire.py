@@ -553,12 +553,20 @@ def parse_load_index(value: object) -> tuple[int | None, int | None, int | None,
 
 
 def parse_max_speed(value: object) -> tuple[int | None, str | None]:
-    """``'112 MPH (S)'`` -> (112, 'S'); ``'25 MPH (A8)'`` -> (25, 'A8')."""
+    r"""
+    ``'112 MPH (S)'`` -> (112, 'S'); ``'25 MPH (A8)'`` -> (25, 'A8').
+
+    The bracket is matched greedily and anchored to the end of the string, because the symbol can
+    itself be parenthesised: a tire rated above Y is published as ``'186 MPH ((Y))'``, and a
+    non-greedy ``\(([^)]*)\)`` stops at the inner bracket and yields the unbalanced ``'(Y'``. That
+    reached 603 SKUs and 733 tire specs before it was noticed, because ``'(Y'`` is not a code any
+    lookup table has, so it failed silently rather than loudly.
+    """
     text = _clean(value)
     if text is None:
         return None, None
     mph = parse_int(text)
-    bracket = re.search(r"\(([^)]*)\)", text)
+    bracket = re.search(r"\((.*)\)\s*$", text)
     symbol = _clean(bracket.group(1)) if bracket else None
     return mph, symbol
 

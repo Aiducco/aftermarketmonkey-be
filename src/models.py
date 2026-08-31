@@ -5036,9 +5036,17 @@ class TireSpec(django_db_models.Model):
 
     SPEC_SOURCE_PARSER = "parser"
     SPEC_SOURCE_SIMPLETIRE = "simpletire"
+    SPEC_SOURCE_TDG = "tdg"
+    # Ordered by precedence, best first. Where two catalogs describe the same tire SimpleTire wins:
+    # measured against 10,740 tires carried by both, it has materially better coverage on every
+    # shared field (tread depth present on 1,703 rows where TDG is silent against 3 the other way,
+    # rim widths 3,508 against 6) and finer precision where both answer -- TDG rounds tread depth
+    # to whole 32nds, SimpleTire does not. TDG is not worse, it is thinner; it earns its place by
+    # reaching 8,656 tires SimpleTire never had, and by carrying fields SimpleTire lacks entirely.
     SPEC_SOURCE_CHOICES = [
         (SPEC_SOURCE_PARSER, "Parser"),
         (SPEC_SOURCE_SIMPLETIRE, "SimpleTire catalog"),
+        (SPEC_SOURCE_TDG, "TDG catalog"),
     ]
 
     NOISE_QUIET = "quiet"
@@ -5189,6 +5197,17 @@ class TireSpec(django_db_models.Model):
         help_text="Steer, Drive, Trailer or All Position. Commercial tires only.",
     )
     tire_weight_lb = django_db_models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    oe_marking = django_db_models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        help_text=(
+            "Original-equipment homologation codes, as published: 'N0 - Porsche', 'MO - "
+            "Mercedes-Benz', 'AO - Audi'. A tire can carry more than one, comma separated. "
+            "Nothing else in the catalog records this, and it is the difference between a tire "
+            "that fits a car and one the manufacturer approved for it."
+        ),
+    )
 
     # ---- provenance ---------------------------------------------------------------------------
     # ---- provenance of the catalog block ------------------------------------------------------
@@ -5218,10 +5237,20 @@ class TireSpec(django_db_models.Model):
         blank=True,
         help_text="When the catalog values were last copied in. Compare against the SKU's updated_at to find rows a re-crawl has moved on from.",
     )
+    tdg_product = django_db_models.ForeignKey(
+        "TdgProduct",
+        on_delete=django_db_models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="tire_specs",
+        help_text="The TDG row merged into this spec. A tire can be described by both catalogs.",
+    )
+    tdg_match_tier = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+    tdg_synced_at = django_db_models.DateTimeField(null=True, blank=True)
     spec_source = django_db_models.CharField(
         max_length=16,
         default="parser",
-        choices=[("parser", "Parser"), ("simpletire", "SimpleTire catalog")],
+        choices=[("parser", "Parser"), ("simpletire", "SimpleTire catalog"), ("tdg", "TDG catalog")],
         db_index=True,
         help_text=(
             "Who owns the size block on this row. 'simpletire' means a matched catalog row "

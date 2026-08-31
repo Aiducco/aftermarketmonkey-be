@@ -132,7 +132,7 @@ class MatchTests(SimpleTestCase):
     databases = []
 
     def _catalog(self, *rows):
-        return sync.Catalog(list(rows))
+        return sync.build_index(list(rows))
 
     def test_tier_1_brand_and_part_number(self):
         found = sync.match(
@@ -247,6 +247,17 @@ class MergeTests(SimpleTestCase):
         spec = TireSpec(search_aliases=[])
         updates = sync.build_updates(spec, _sku(spec_tread_depth_32nds=decimal.Decimal("7.20")))
         self.assertEqual(updates["tread_depth_32nds"], decimal.Decimal("7.20"))
+
+    def test_the_merge_never_erases_a_value_another_source_supplied(self):
+        """_merge_category returns no season for "All Terrain", and writing that None over a
+        season TDG had already set blanked 3,593 rows the first time this sync was re-run."""
+        spec = TireSpec(season_category_id="WINTER", search_aliases=[])
+        updates = sync.build_updates(spec, _sku(spec_category="All Terrain"))
+        self.assertNotIn("season_category_id", updates)
+
+    def test_a_null_is_still_allowed_to_fill_nothing(self):
+        spec = TireSpec(season_category_id=None, search_aliases=[])
+        self.assertNotIn("season_category_id", sync.build_updates(spec, _sku(spec_category="All Terrain")))
 
     def test_unchanged_values_are_not_reported_as_changes(self):
         spec = TireSpec(max_psi=44, model_name="Ridge Grappler", search_aliases=[])

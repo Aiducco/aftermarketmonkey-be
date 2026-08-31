@@ -843,6 +843,26 @@ class LookupTables:
         }
         self.tread_categories = frozenset(src_models.TreadCategory.objects.values_list("code", flat=True))
 
+    def knows(self, derived_field: str, source_value) -> bool:
+        """
+        Does the standards table carry a row for this code at all?
+
+        The distinction matters when reporting what could not be resolved. SL, XL and LL are
+        present in ``load_range_ply`` with a NULL ply rating, because passenger designations have
+        no ply equivalent -- that is an answer, not a gap. ``(Y)`` is likewise present with a NULL
+        speed, because it means *above* Y and has no defined ceiling. A code missing from the table
+        entirely is the only real gap, and there are few enough of those to read.
+        """
+        if derived_field == "max_load_lb":
+            return source_value in self.load_index
+        if derived_field == "max_speed_mph":
+            return source_value in self.speed_rating
+        if derived_field == "ply_rating":
+            return any(key[0] == source_value for key in self.load_range) or any(
+                key[0] == source_value for key in self.load_range_alias
+            )
+        return False
+
     def resolve(self, parsed: tire_size.ParsedSize) -> typing.Dict[str, typing.Any]:
         max_load_lb = self.load_index.get(parsed.load_index) if parsed.load_index else None
         max_speed_mph = self.speed_rating.get(parsed.speed_rating) if parsed.speed_rating else None

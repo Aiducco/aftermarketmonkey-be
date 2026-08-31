@@ -88,21 +88,30 @@ assert not (set(UPDATE_FIELDS) & _LLM_OWNED), "reparse would overwrite an LLM-ow
 #
 # Note what is *not* here. ``overall_diameter_in`` stays the parser's: ours is the nominal
 # diameter the size prints (35.0 for a 35X12.50R20), theirs is the measured one (33.07), and
-# search for "35 inch" has to keep finding it. ``max_speed_mph`` stays ours too -- both sides
-# derive it from the speed rating, but we floor 160 km/h to 99 and they ceil to 100, and
-# ``speed_sort`` range filters would straddle the boundary if the column mixed conventions.
+# search for "35 inch" has to keep finding it.
+#
+# ``max_speed_mph`` *is* here, though it is our own lookup rather than anything a catalog
+# publishes, because it is a function of ``speed_rating`` and that is catalog-owned. Deriving it
+# from the title while the rating beside it came from a catalog lets the two contradict each other
+# -- one row wanted max_speed_mph 130 (H, read off a sibling title) against a stored speed_rating
+# of T, which is 118. ``tire_derived`` resolves it from the rating actually on the row instead.
 CATALOG_OWNED = (
     "load_range",
     "load_index",
     "load_index_dual",
     "speed_rating",
     "max_load_lb",
+    "max_speed_mph",
     "ply_rating",
 )
 assert set(CATALOG_OWNED) <= set(UPDATE_FIELDS), "CATALOG_OWNED names a field reparse never writes"
 
 # What reparse may still recompute on a catalog-backed row: the size block, which is ours either
 # way because a match is only accepted when both sides agree on the dimensions.
+# Any source that is a real catalog rather than our own derivation. Both write the fields in
+# CATALOG_OWNED, so both must be protected from the next parser fix.
+_CATALOG_SOURCES = frozenset([src_models.TireSpec.SPEC_SOURCE_SIMPLETIRE, src_models.TireSpec.SPEC_SOURCE_TDG])
+
 PARSER_FIELDS_CATALOG = tuple(f for f in PARSER_FIELDS if f not in CATALOG_OWNED)
 RESOLVED_FIELDS_CATALOG = tuple(f for f in RESOLVED_FIELDS if f not in CATALOG_OWNED)
 
@@ -208,7 +217,7 @@ def run(
             resolved = lookups.resolve(parsed)
             disputed = len(candidate.size_variants) > 1
 
-            catalog_backed = row["spec_source"] == src_models.TireSpec.SPEC_SOURCE_SIMPLETIRE
+            catalog_backed = row["spec_source"] in _CATALOG_SOURCES
             parser_fields = PARSER_FIELDS_CATALOG if catalog_backed else PARSER_FIELDS
             resolved_fields = RESOLVED_FIELDS_CATALOG if catalog_backed else RESOLVED_FIELDS
 

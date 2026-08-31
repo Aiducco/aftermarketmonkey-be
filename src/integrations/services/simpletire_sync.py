@@ -47,7 +47,8 @@ from django.db import transaction
 from django.utils import timezone
 
 from src import models as src_models
-from src.domain import tire_size
+from src.integrations.services import tire_catalog
+from src.integrations.services.tire_catalog import brand_key, canonical_size, model_key, part_key
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,28 @@ BRAND_ALIASES = {
     "AMPTIRES": "AMP",
     "FURYOFFROAD": "FURY",
     "TESCHETIRE": "TESCHE",
+    # Names that are a manufacturer's, spelled longer than the catalog spells it. Verified against
+    # the catalog's own brand list rather than inferred, because the part-number inference needs 20
+    # hits to fire and these brands are small -- Sedona has 11 SKUs, Shinko 1. Small is not the same
+    # as wrong, and the size gate still checks every row.
+    "SHINKOMOTORCYCLETIRES": "SHINKO",
+    "SEDONATIREANDWHEEL": "SEDONA",
+    "INTERCOTIRECORPORATION": "INTERCO",
+    "SUPERSWAMPER": "INTERCO",  # Super Swamper is Interco's own line, not a separate maker
+    "VITOURUSA": "VITOUR",
+    "COKERTIRE": "COKER",
+    "AVONTYRE": "AVON",
+    "VOGUETYRE": "VOGUE",
+    "SYSTEM3": "SYSTEM3OFFROAD",
+    "PROCOMPTIRE": "PROCOMP",
+    "PROARMORUTVAPEXPRODUCTGROUP": "PROARMOR",
+    # Parents and distributors selling under several marques at once. A single target would strand
+    # most of their stock: Wheel Pros is not a tire maker at all -- its catalogue is Falken's,
+    # Nitto's and Toyo's, and 397 of its rows resolve to Falken on model+size evidence alone.
+    "WHEELPROS": ("FALKEN", "NITTO", "TOYO", "GRITMASTER"),
+    "GREENBALLCORPORATIONKANATI": ("KANATI", "GBC", "GREENBALL", "CENTENNIAL"),
+    "GBCTIRES": ("GBC", "GREENBALL", "KANATI"),
+    "ROUGHCOUNTRY": ("NITTO", "VENOMPOWER", "IRONMAN"),
     # distributor buckets, not manufacturers
     "AMERICANTIREDISTRIBUTORS": "IRONMAN",
     "USAUTOFORCEDIRECT": "ADVANTA",
@@ -95,49 +118,9 @@ BRAND_ALIASES = {
 }
 
 
-def brand_key(name: typing.Optional[str]) -> str:
-    return re.sub(r"[^A-Z0-9]", "", (name or "").upper())
-
-
 def aliased_brand_key(name: typing.Optional[str]) -> str:
     key = brand_key(name)
     return BRAND_ALIASES.get(key, key)
-
-
-def part_key(part_number: typing.Optional[str]) -> str:
-    """The two catalogs punctuate MPNs differently; nothing else about them differs."""
-    return re.sub(r"[^A-Z0-9]", "", (part_number or "").upper())
-
-
-_MODEL_NOISE_RE = re.compile(r"\b(TIRE|TIRES|TYRE)\b")
-
-
-def model_key(name: typing.Optional[str]) -> str:
-    return re.sub(r"[^A-Z0-9]", "", _MODEL_NOISE_RE.sub(" ", (name or "").upper()))
-
-
-# ---------------------------------------------------------------------------------------------
-# Sizes
-# ---------------------------------------------------------------------------------------------
-_size_cache: typing.Dict[str, typing.Optional[tuple]] = {}
-
-
-def canonical_size(display: typing.Optional[str]) -> typing.Optional[tuple]:
-    """
-    Reduce either catalog's size string to comparable dimensions.
-
-    They print '10.00-15' and '265/70R18'; we print '35X12.50R20LT'. Rather than compare
-    typography, both sides go through our own parser -- the same one that is the source of truth
-    for the size block -- and the result is compared on numbers.
-    """
-    if display in _size_cache:
-        return _size_cache[display]
-    parsed = tire_size.parse(display or "")
-    value = None
-    if parsed is not None and parsed.rim_diameter_in is not None:
-        value = (parsed.section_width_mm, parsed.aspect_ratio, str(parsed.rim_diameter_in))
-    _size_cache[display] = value
-    return value
 
 
 # ---------------------------------------------------------------------------------------------
@@ -293,27 +276,17 @@ WRITE_FIELDS = tuple(TAKE_THEIRS) + tuple(FILL_ONLY) + DERIVED_FIELDS + PROVENAN
 
 # The merge must never touch these, and the reasons differ per field -- see the module docstring.
 # Asserted rather than commented so that adding a field to TAKE_THEIRS cannot quietly break it.
-_NEVER_WRITE = frozenset(
+# What no catalog may write is declared once, in tire_catalog. These are the exclusions specific
+# to *this* source -- fields SimpleTire publishes but we must not believe.
+_NEVER_WRITE = tire_catalog.NEVER_WRITE | frozenset(
     [
-        "is_run_flat",  # their column is False on all 58,124 rows: an empty field, not a fact
-        "overall_diameter_in",  # ours is nominal and drives '35 inch' search; theirs is measured
-        "max_speed_mph",  # same quantity, different rounding convention; ours feeds speed_sort
-        "sub_model",  # ours holds OE / Front / Rear, which they have no equivalent for
-        "size_display",
-        "notation",
-        "service_type",
-        "section_width_mm",
-        "section_width_in",
-        "aspect_ratio",
-        "construction",
-        "rim_diameter_in",
-        "size_disputed",
+        # False on all 58,124 scraped rows, including tires whose own model name says "Run Flat".
+        # An empty column, not a fact. TDG publishes a real one; see tdg_sync.
+        "is_run_flat",
+        # SimpleTire has no 3PMSF or M+S field at all, so there is nothing here to take.
         "is_3pmsf",
         "is_ms",
         "has_reinforced_sidewall",
-        "llm_confidence",
-        "llm_reason",
-        "llm_model_used",
     ]
 )
 assert not (set(WRITE_FIELDS) & _NEVER_WRITE), "simpletire sync would write a field it must not"
@@ -337,85 +310,37 @@ CATALOG_COLUMNS = (
 ) + tuple(TAKE_THEIRS.values())
 
 
-class Catalog:
-    """The scraped catalog, indexed three ways -- one per match tier."""
-
-    def __init__(self, rows: typing.Iterable[dict]):
-        self.by_id: typing.Dict[int, dict] = {}
-        self.by_brand_part: typing.Dict[tuple, typing.List[int]] = {}
-        self.by_part: typing.Dict[str, typing.List[int]] = {}
-        self.by_brand_model_size: typing.Dict[tuple, typing.Set[int]] = {}
-        self.brands: typing.Set[str] = set()
-
-        for row in rows:
-            sku_id = row["id"]
-            self.by_id[sku_id] = row
-            bkey, pkey = brand_key(row["brand_name"]), part_key(row["part_number"])
-            self.brands.add(bkey)
-            self.by_brand_part.setdefault((bkey, pkey), []).append(sku_id)
-            self.by_part.setdefault(pkey, []).append(sku_id)
-            size = canonical_size(row["size_display"])
-            if size and row["product_line_name"]:
-                self.by_brand_model_size.setdefault((bkey, model_key(row["product_line_name"]), size), set()).add(
-                    sku_id
-                )
-
-    @classmethod
-    def load(cls) -> "Catalog":
-        rows = src_models.SimpleTireSku.objects.values(*CATALOG_COLUMNS).iterator(chunk_size=5000)
-        catalog = cls(rows)
-        missing = {t for t in BRAND_ALIASES.values() if t not in catalog.brands}
-        if missing:
-            # An alias pointing at a brand the scrape no longer has would silently stop matching.
-            logger.warning("%s alias targets absent from the catalog: %s", _LOG_PREFIX, sorted(missing))
-        return catalog
+Match = tire_catalog.Match
 
 
-class Match(typing.NamedTuple):
-    sku: dict
-    tier: int
+def build_index(rows: typing.Iterable[dict]) -> tire_catalog.CatalogIndex:
+    return tire_catalog.CatalogIndex(
+        rows,
+        brand_field="brand_name",
+        part_field="part_number",
+        size_field="size_display",
+        model_field="product_line_name",
+    )
 
 
-def match(
-    *,
-    brand: typing.Optional[str],
-    part_number: typing.Optional[str],
-    size_display: typing.Optional[str],
-    model_name: typing.Optional[str],
-    catalog: Catalog,
-) -> typing.Optional[Match]:
-    """
-    Find the catalog row for one of our tires, most trustworthy key first.
+def load_catalog() -> tire_catalog.CatalogIndex:
+    rows = src_models.SimpleTireSku.objects.values(*CATALOG_COLUMNS).iterator(chunk_size=5000)
+    index = build_index(rows)
+    missing = {t for t in BRAND_ALIASES.values() if t not in index.brands}
+    if missing:
+        # An alias pointing at a brand the scrape no longer carries would silently stop matching.
+        logger.warning("%s alias targets absent from the catalog: %s", _LOG_PREFIX, sorted(missing))
+    return index
 
-    Every tier is gated on the size agreeing. That gate is what makes tier 2 usable at all: 7,814
-    of our part numbers exist under *some* other-named brand on their side, because short numeric
-    MPNs collide across manufacturers -- Michelin parts colliding with Atturo and Petlas. Requiring
-    the dimensions to match as well cuts that to 297 rows that are actually the same tire.
-    """
-    bkey = aliased_brand_key(brand)
-    pkey = part_key(part_number)
-    ours = canonical_size(size_display)
 
-    for sku_id in catalog.by_brand_part.get((bkey, pkey), ()):
-        sku = catalog.by_id[sku_id]
-        theirs = canonical_size(sku["size_display"])
-        if ours and theirs and ours != theirs:
-            return None  # same brand, same MPN, different tire: trust neither
-        return Match(sku, 1)
-
-    if ours:
-        agreeing = [
-            i for i in catalog.by_part.get(pkey, ()) if canonical_size(catalog.by_id[i]["size_display"]) == ours
-        ]
-        if len(agreeing) == 1:
-            return Match(catalog.by_id[agreeing[0]], 2)
-
-    if ours and model_name and bkey in catalog.brands:
-        candidates = catalog.by_brand_model_size.get((bkey, model_key(model_name), ours))
-        if candidates and len(candidates) == 1:
-            return Match(catalog.by_id[next(iter(candidates))], 3)
-
-    return None
+def match(*, brand, part_number, size_display, model_name, catalog):
+    return catalog.match(
+        brand=brand,
+        part_number=part_number,
+        size_display=size_display,
+        model_name=model_name,
+        aliases=BRAND_ALIASES,
+    )
 
 
 # ---------------------------------------------------------------------------------------------
@@ -503,20 +428,6 @@ class SyncStats:
         target[key] = target.get(key, 0) + 1
 
 
-def _differs(old: typing.Any, new: typing.Any) -> bool:
-    """Compare as the database would, so Decimal('9') and Decimal('9.0') are not a change."""
-    if old is None and new is None:
-        return False
-    if old is None or new is None:
-        return True
-    if isinstance(old, (decimal.Decimal, float, int)) and not isinstance(old, bool):
-        try:
-            return decimal.Decimal(str(old)) != decimal.Decimal(str(new))
-        except (decimal.InvalidOperation, ValueError):
-            pass
-    return old != new
-
-
 def build_updates(spec, sku: dict, *, stats: typing.Optional[SyncStats] = None) -> typing.Dict[str, typing.Any]:
     """
     Work out what one matched row would become. Returns only the fields that actually change.
@@ -570,7 +481,15 @@ def build_updates(spec, sku: dict, *, stats: typing.Optional[SyncStats] = None) 
     if note and stats is not None:
         stats.bump("category_conflicts", note)
 
-    return {f: v for f, v in proposed.items() if _differs(getattr(spec, f), v)}
+    # A merge adds; it never erases. Several rules above legitimately return None -- there is no
+    # season in "All Terrain", so _merge_category yields none -- and without this guard that None
+    # is written over whatever another source already put there. Re-running this sync after the
+    # TDG merge blanked 3,593 season categories exactly that way.
+    return {
+        f: v
+        for f, v in proposed.items()
+        if tire_catalog.differs(getattr(spec, f), v) and not (v is None and getattr(spec, f) is not None)
+    }
 
 
 def _specs(brand_ids: typing.Optional[typing.Sequence[int]]):
@@ -589,7 +508,7 @@ def run(
 ) -> SyncStats:
     """Match every tire spec against the catalog and merge what the catalog is authoritative for."""
     stats = SyncStats()
-    catalog = Catalog.load()
+    catalog = load_catalog()
     logger.info("%s catalog loaded: %s skus, %s brands", _LOG_PREFIX, len(catalog.by_id), len(catalog.brands))
 
     now = timezone.now()
@@ -615,7 +534,7 @@ def run(
 
         stats.matched += 1
         stats.bump("by_tier", found.tier)
-        updates = build_updates(spec, found.sku, stats=stats)
+        updates = build_updates(spec, found.row, stats=stats)
         if on_result:
             on_result(spec, found, updates)
 
@@ -639,7 +558,7 @@ def run(
 
         for field, value in updates.items():
             setattr(spec, field, value)
-        spec.simpletire_sku_id = found.sku["id"]
+        spec.simpletire_sku_id = found.row["id"]
         spec.simpletire_match_tier = found.tier
         spec.simpletire_synced_at = now
         spec.spec_source = src_models.TireSpec.SPEC_SOURCE_SIMPLETIRE

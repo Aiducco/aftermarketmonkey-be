@@ -127,6 +127,13 @@ class ScalarParserTests(SimpleTestCase):
         # ATV/industrial ratings are two characters; truncating to one would corrupt them.
         self.assertEqual(simpletire.parse_max_speed("25 MPH (A8)"), (25, "A8"))
 
+    def test_parse_max_speed_handles_a_parenthesised_symbol(self):
+        """A tire rated above Y is published as '186 MPH ((Y))'. Matching the bracket non-greedily
+        stopped at the inner one and produced the unbalanced '(Y', which is not a code any lookup
+        table has -- so it failed silently across 603 SKUs and 733 tire specs."""
+        self.assertEqual(simpletire.parse_max_speed("186 MPH ((Y))"), (186, "(Y)"))
+        self.assertEqual(simpletire.parse_max_speed("186 MPH (Y)"), (186, "Y"))
+
     def test_parse_ply_rating_only_where_stated(self):
         self.assertEqual(simpletire.parse_ply_rating("E (10 Ply)"), 10)
         self.assertIsNone(simpletire.parse_ply_rating("Standard (SL)"))
