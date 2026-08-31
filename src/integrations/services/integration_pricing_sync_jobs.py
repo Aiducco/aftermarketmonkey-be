@@ -484,11 +484,29 @@ def cleanup_stale_running_jobs(max_age_minutes: typing.Optional[int] = None) -> 
 
 
 def claim_next_open_job() -> typing.Optional[src_models.IntegrationPricingSyncJob]:
-    """Atomically mark one OPEN job as RUNNING. Returns None if none available."""
+    """
+    Atomically mark one OPEN job as RUNNING. Returns None if none available.
+
+    Never claims a job for a company_provider that already has one RUNNING. Nothing previously
+    stopped two jobs for the same connection existing at once -- enqueue_company_provider_pricing_sync
+    only dedupes existing OPEN rows, not a RUNNING one -- and confirmed live 2026-08-31: the
+    recurring daily enqueue ran while cleanup_stale_running_jobs' own reclaim-and-requeue for the
+    same connection was still actually RUNNING, leaving both a RUNNING row and a fresh OPEN row
+    for the same company_provider. Without this exclusion, a second worker would claim the OPEN
+    one and run a duplicate sync concurrently -- wasted duplicate work at best, and for a
+    rate-limited distributor, doubling the request rate for that one credential right when it's
+    most likely to trip a burst-shaped 429.
+    """
+    running_company_provider_ids = (
+        src_models.IntegrationPricingSyncJob.objects
+        .filter(status=src_enums.IntegrationPricingSyncJobStatus.RUNNING.value)
+        .values_list("company_provider_id", flat=True)
+    )
     with transaction.atomic():
         job = (
             src_models.IntegrationPricingSyncJob.objects.select_for_update(skip_locked=True)
             .filter(status=src_enums.IntegrationPricingSyncJobStatus.OPEN.value)
+            .exclude(company_provider_id__in=running_company_provider_ids)
             .filter(
                 django_db_models.Q(not_before__isnull=True)
                 | django_db_models.Q(not_before__lte=timezone.now())
