@@ -20,6 +20,7 @@ import time
 import typing
 
 from src.api.services import search_tabs
+from src.domain import wheel_size
 from src.search import meilisearch_client as parts_index
 from src.search import tires_index, wheels_index
 
@@ -416,6 +417,23 @@ def search(
     q = (q or "").strip()
     filters = filters or {}
 
+    # A wheel size in the search box is structure, not text. The searchable attributes are brand,
+    # model and style number -- none of them contain a size -- so "20x9 6x4.5" passed as ``q``
+    # matches nothing at all. It has to become filters, with any words left over staying as text so
+    # a brand still narrows the result.
+    #
+    # Parsed **only when the client sent no filters**, the same rule tire search follows: once the
+    # client is refining, its filters are used verbatim, or removing a facet chip would not stick
+    # because the server would re-derive it from query text the user never edited.
+    interpretation: typing.Dict[str, typing.Any] = {"parsed": False, "matched": {}, "chips": [], "relaxed": None}
+    if not filters and q:
+        parsed = wheel_size.parse_query(q)
+        if parsed.parsed_anything:
+            filters = parsed.filters
+            q = parsed.residue
+            interpretation["parsed"] = True
+            interpretation["matched"] = parsed.matched
+
     sort_spec = None
     if sort:
         if sort not in SORT_OPTIONS:
@@ -446,7 +464,7 @@ def search(
         "limit": limit,
         "offset": offset,
         "applied_filters": dict(filters),
-        "interpretation": {"parsed": False, "matched": {}, "chips": [], "relaxed": None},
+        "interpretation": dict(interpretation, chips=_build_chips(filters)),
         "results": [_shape_hit(hit) for hit in hits],
         "facets": _shape_facets(response.get("facetDistribution") or {}, stats=response.get("facetStats") or {}),
         "tabs": search_tabs.build_tabs(dict(tab_counts, **{search_tabs.MODE_WHEELS: total}), active=MODE_WHEELS),
@@ -604,3 +622,66 @@ def _search_with_tab_counts(
         search_tabs.MODE_PARTS: (by_index.get(parts_index.INDEX_NAME) or {}).get("estimatedTotalHits", 0),
     }
     return wheels, counts
+
+
+# Filter fields that are not on the rail but can arrive from a parsed query. A bolt pattern
+# reaches the index as a circle plus a lug count, and those two are one idea to a customer.
+_OFF_RAIL_LABELS = {"bolt_circle_mm": "Bolt pattern", "bolt_lug_count": None}
+
+
+def _build_chips(applied: typing.Mapping[str, typing.Any]) -> typing.List[typing.Dict[str, typing.Any]]:
+    """
+    One removable chip per applied filter, labelled the way the rail labels it.
+
+    Built from the applied filters rather than from the query text, so a chip the user removes
+    stays removed: the next request carries the reduced filter set and nothing re-derives it.
+
+    ``bolt_lug_count`` gets no chip of its own. It always travels with ``bolt_circle_mm`` -- the
+    two are how one bolt pattern is filtered -- and showing "Bolt Lug Count 6" beside
+    "Bolt pattern 6x114.3" is the same fact twice.
+    """
+    by_field = {f["field"]: f for f in FACETS_CONFIG}
+    lug_count = applied.get("bolt_lug_count")
+    chips = []
+    for field, value in applied.items():
+        if field in _OFF_RAIL_LABELS and _OFF_RAIL_LABELS[field] is None:
+            continue
+        config = by_field.get(field)
+        label = config["label"] if config else _OFF_RAIL_LABELS.get(field) or field.replace("_", " ").title()
+        unit = (config or {}).get("unit")
+        if field == "bolt_circle_mm" and lug_count:
+            # Render it the way it was typed and the way the card shows it.
+            chips.append(
+                {
+                    "field": field,
+                    "label": label,
+                    "value": value,
+                    "display": "{} {}x{}".format(label, lug_count, _trim_number(value)),
+                }
+            )
+            continue
+        values = value if isinstance(value, (list, tuple)) else [value]
+        for item in values:
+            if isinstance(item, dict):
+                low, high = item.get("gte"), item.get("lte")
+                text = "{}–{}".format(low if low is not None else "", high if high is not None else "")
+            else:
+                text = _trim_number(item) if isinstance(item, (int, float)) else str(item)
+            chips.append(
+                {
+                    "field": field,
+                    "label": label,
+                    "value": item,
+                    "display": "{} {}{}".format(label, text, " " + unit if unit else ""),
+                }
+            )
+    return chips
+
+
+def _trim_number(value: typing.Any) -> str:
+    """114.3 stays 114.3; 20.0 becomes 20."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return str(int(number)) if number.is_integer() else str(number)

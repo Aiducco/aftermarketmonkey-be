@@ -500,7 +500,9 @@ def search(
         )
 
         if wheels_index.is_configured():
-            return wheel_search.search(q=q, filters={}, sort=None, limit=limit, offset=offset)
+            # ``q`` goes through whole: wheel_search parses the size into filters itself, so an
+            # explicit mode="wheels" from the client behaves identically to this auto-route.
+            return wheel_search.search(q=q, filters={}, sort=sort, limit=limit, offset=offset)
 
     resolved_mode = mode or (MODE_TIRES if tires_is_certain else None)
 

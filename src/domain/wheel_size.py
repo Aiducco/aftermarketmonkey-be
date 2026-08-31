@@ -436,3 +436,75 @@ def parse(text: typing.Optional[str]) -> typing.Optional[ParsedWheel]:
         center_bore_mm=None,
         is_blank=is_blank(text),
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# Search queries
+# ---------------------------------------------------------------------------------------------
+@dataclasses.dataclass(frozen=True)
+class ParsedWheelQuery:
+    """
+    A search box turned into filters. ``residue`` is whatever text was left over and becomes
+    Meilisearch's ``q``.
+
+    The split matters. "20x9 6x4.5" carries no words a text index can match -- the searchable
+    attributes are brand, model and style number, and none of them contain a size -- so passing it
+    as text returns nothing at all. It has to become numeric filters. Anything the parser did not
+    claim ("fuel 20x9") stays as text so the brand still narrows the result.
+    """
+
+    filters: typing.Dict[str, typing.Any] = dataclasses.field(default_factory=dict)
+    residue: str = ""
+    matched: typing.Dict[str, typing.Any] = dataclasses.field(default_factory=dict)
+
+    @property
+    def parsed_anything(self) -> bool:
+        return bool(self.filters)
+
+
+def parse_query(text: typing.Optional[str]) -> ParsedWheelQuery:
+    """
+    Read a wheel search box.
+
+    The bolt pattern becomes ``bolt_circle_mm`` plus ``bolt_lug_count``, never the display string.
+    A customer typing "6x4.5" and a feed publishing "6x114.3" mean one circle, and the index stores
+    whichever spelling its source used -- matching on the canonical millimetre value is the only
+    way both find the same wheels.
+    """
+    if not text:
+        return ParsedWheelQuery()
+    parsed = parse(text)
+    if parsed is None:
+        return ParsedWheelQuery(residue=text.strip())
+
+    filters: typing.Dict[str, typing.Any] = {
+        "diameter_in": float(parsed.diameter_in),
+        "width_in": float(parsed.width_in),
+    }
+    matched: typing.Dict[str, typing.Any] = {"size": parsed.size_display}
+
+    if parsed.bolt_pattern is not None:
+        filters["bolt_circle_mm"] = float(parsed.bolt_pattern.circle_mm)
+        filters["bolt_lug_count"] = parsed.bolt_pattern.lug_count
+        matched["bolt_pattern"] = parsed.bolt_pattern.display
+    if parsed.offset_mm is not None:
+        filters["offset_mm"] = parsed.offset_mm
+        matched["offset_mm"] = parsed.offset_mm
+
+    return ParsedWheelQuery(filters=filters, residue=_query_residue(text, parsed), matched=matched)
+
+
+# Everything the filters already account for, removed so it cannot also be text-matched: the size,
+# any bolt pattern, and a signed or mm-suffixed offset.
+_RESIDUE_STRIP_RE = re.compile(
+    r"(?<![\d.])\d{1,2}(?:\.\d+)?\s*[xX]\s*\d{1,2}(?:\.\d+)?(?![\d.])"  # 20x9
+    r"|(?<![\d.])\d\s*[xX/-]\s*\d{1,3}(?:\.\d+)?(?![\d.])"  # 6x4.5, 5-114.3
+    r"|(?<![\w.])[+-]\s*\d{1,3}\s*(?:MM|mm)?(?![\d.])"  # +18, -12
+    r"|(?<![\d.])\d{1,3}\s*(?:MM|mm)(?![\w.])",  # 18mm
+)
+
+
+def _query_residue(text: str, parsed: ParsedWheel) -> str:
+    """What is left of the query once the structured parts are removed."""
+    remaining = _RESIDUE_STRIP_RE.sub(" ", text)
+    return re.sub(r"\s{2,}", " ", remaining).strip(" ,-/")

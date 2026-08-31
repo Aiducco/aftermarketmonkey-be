@@ -214,3 +214,51 @@ class CenterBoreTests(SimpleTestCase):
     def test_implausible_bores_are_rejected(self):
         for text in ("0", "5", "500"):
             self.assertIsNone(wheel_size.parse_center_bore_mm(text), text)
+
+
+class QueryParsingTests(SimpleTestCase):
+    """
+    Turning a search box into filters.
+
+    This is what "20x9 6x4.5" needs to become. Passed to Meilisearch as text it matches nothing at
+    all -- the searchable attributes are brand, model and style number, none of which contain a
+    size -- so a router that detects a wheel query and then forwards the raw string returns an
+    empty page for a query the catalog can answer 130 times over.
+    """
+
+    databases = []
+
+    def test_size_and_pattern_become_filters(self):
+        parsed = wheel_size.parse_query("20x9 6x4.5")
+        self.assertEqual(
+            parsed.filters,
+            {"diameter_in": 20.0, "width_in": 9.0, "bolt_circle_mm": 114.3, "bolt_lug_count": 6},
+        )
+        self.assertEqual(parsed.residue, "")
+
+    def test_the_bolt_pattern_filters_on_the_canonical_circle_not_the_spelling(self):
+        """A customer types 6x4.5 and the feed published 6x114.3. One circle, two spellings, and
+        the index stores whichever its source used -- only the millimetre value finds both."""
+        typed_inches = wheel_size.parse_query("20x9 6x4.5").filters
+        typed_metric = wheel_size.parse_query("20x9 6x114.3").filters
+        self.assertEqual(typed_inches, typed_metric)
+
+    def test_words_the_parser_did_not_claim_stay_as_text(self):
+        parsed = wheel_size.parse_query("fuel 20x9 6x135 -12")
+        self.assertEqual(parsed.residue, "fuel")
+        self.assertEqual(parsed.filters["offset_mm"], -12)
+        self.assertEqual(parsed.filters["bolt_circle_mm"], 135.0)
+
+    def test_a_size_alone_is_enough(self):
+        parsed = wheel_size.parse_query("20x9")
+        self.assertEqual(parsed.filters, {"diameter_in": 20.0, "width_in": 9.0})
+
+    def test_free_text_parses_to_nothing_and_stays_text(self):
+        parsed = wheel_size.parse_query("nitto ridge grappler")
+        self.assertEqual(parsed.filters, {})
+        self.assertEqual(parsed.residue, "nitto ridge grappler")
+        self.assertFalse(parsed.parsed_anything)
+
+    def test_empty_input(self):
+        self.assertEqual(wheel_size.parse_query("").filters, {})
+        self.assertEqual(wheel_size.parse_query(None).residue, "")

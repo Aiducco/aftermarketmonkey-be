@@ -163,3 +163,39 @@ class FacetContractTests(SimpleTestCase):
     def test_coded_values_are_labelled(self):
         shaped = wheel_search._shape_facets({"finish_family": {"gunmetal": 5}})
         self.assertEqual(shaped[0]["values"][0]["label"], "Gunmetal")
+
+
+class QueryToFilterTests(SimpleTestCase):
+    """The bug this fixes: a wheel-shaped query reached Meilisearch as text and matched nothing."""
+
+    databases = []
+
+    def test_a_parsed_query_compiles_to_index_filters(self):
+        from src.domain import wheel_size
+
+        parsed = wheel_size.parse_query("20x9 6x4.5")
+        self.assertEqual(
+            wheel_search.compile_filters(parsed.filters),
+            ["diameter_in = 20", "width_in = 9", "bolt_circles_mm = 114.3", "bolt_lug_counts = 6"],
+        )
+
+    def test_the_pattern_filters_the_array_fields(self):
+        """A multi-fit wheel is drilled twice and either drilling is a real fit; the scalar column
+        would hide wheels from hubs they bolt to."""
+        from src.domain import wheel_size
+
+        compiled = wheel_search.compile_filters(wheel_size.parse_query("20x9 6x4.5").filters)
+        self.assertIn("bolt_circles_mm = 114.3", compiled)
+        self.assertIn("bolt_lug_counts = 6", compiled)
+
+    def test_chips_show_one_bolt_pattern_not_two_numbers(self):
+        from src.domain import wheel_size
+
+        chips = wheel_search._build_chips(wheel_size.parse_query("20x9 6x4.5").filters)
+        displays = [c["display"] for c in chips]
+        self.assertEqual(displays, ["Diameter 20 in", "Width 9 in", "Bolt pattern 6x114.3"])
+        self.assertNotIn("bolt_lug_count", [c["field"] for c in chips])
+
+    def test_a_whole_number_chip_is_not_rendered_with_a_decimal(self):
+        chips = wheel_search._build_chips({"diameter_in": 20.0})
+        self.assertEqual(chips[0]["display"], "Diameter 20 in")
