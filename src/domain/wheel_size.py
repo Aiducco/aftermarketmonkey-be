@@ -475,7 +475,12 @@ def parse_query(text: typing.Optional[str]) -> ParsedWheelQuery:
         return ParsedWheelQuery()
     parsed = parse(text)
     if parsed is None:
-        return ParsedWheelQuery(residue=text.strip())
+        # No diameter and width, so not a wheel -- but a bolt pattern on its own is still a
+        # perfectly good thing to search for, and "6x135" is how a customer with a Silverado in
+        # the driveway starts. ``parse`` rightly refuses it (a pattern with no size describes a
+        # hub or an adapter, not a wheel) which makes identification correct and querying wrong,
+        # so the search box asks a second question that identification never does.
+        return _bolt_pattern_query(text)
 
     filters: typing.Dict[str, typing.Any] = {
         "diameter_in": float(parsed.diameter_in),
@@ -504,7 +509,30 @@ _RESIDUE_STRIP_RE = re.compile(
 )
 
 
-def _query_residue(text: str, parsed: ParsedWheel) -> str:
+def _query_residue(text: str, parsed: typing.Optional[ParsedWheel]) -> str:
     """What is left of the query once the structured parts are removed."""
     remaining = _RESIDUE_STRIP_RE.sub(" ", text)
     return re.sub(r"\s{2,}", " ", remaining).strip(" ,-/")
+
+
+def _bolt_pattern_query(text: str) -> ParsedWheelQuery:
+    """
+    A query that is only a bolt pattern: "6x135", "5x114.3", "6x5.5".
+
+    Size is tried first by the caller and wins on the rare shape both could claim -- "10x8" is a
+    real 10-inch wheel far more often than it is a ten-lug pattern on an 8-inch circle.
+    """
+    found: typing.List[BoltPattern] = []
+    for match in _TEXT_BOLT_RE.finditer(text):
+        pattern = parse_bolt_pattern("{}x{}".format(match.group(1), match.group(2)))
+        if pattern and all((pattern.lug_count, pattern.circle_mm) != (p.lug_count, p.circle_mm) for p in found):
+            found.append(pattern)
+    if not found:
+        return ParsedWheelQuery(residue=text.strip())
+
+    first = found[0]
+    return ParsedWheelQuery(
+        filters={"bolt_circle_mm": float(first.circle_mm), "bolt_lug_count": first.lug_count},
+        residue=_query_residue(text, None),
+        matched={"bolt_pattern": first.display},
+    )

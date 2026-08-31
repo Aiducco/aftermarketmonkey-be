@@ -262,3 +262,48 @@ class QueryParsingTests(SimpleTestCase):
     def test_empty_input(self):
         self.assertEqual(wheel_size.parse_query("").filters, {})
         self.assertEqual(wheel_size.parse_query(None).residue, "")
+
+
+class BoltPatternQueryTests(SimpleTestCase):
+    """
+    A bolt pattern typed on its own.
+
+    ``parse`` refuses it, correctly: a pattern with no size describes a hub or an adapter, not a
+    wheel, and that gate is what keeps tens of thousands of them out of the catalog. But a customer
+    with a Silverado starts by typing "6x135", so the search box has to ask a question that
+    identification never does.
+    """
+
+    databases = []
+
+    def test_a_bare_pattern_becomes_a_filter(self):
+        parsed = wheel_size.parse_query("6x135")
+        self.assertTrue(parsed.parsed_anything)
+        self.assertEqual(parsed.filters, {"bolt_circle_mm": 135.0, "bolt_lug_count": 6})
+        self.assertEqual(parsed.matched, {"bolt_pattern": "6x135"})
+
+    def test_a_truncated_pattern_finds_the_real_one(self):
+        """6x139 is how people type 6x139.7, and the feeds publish that drilling as 6x5.5 as often
+        as not. All three have to reach the same wheels."""
+        for text in ("6x139", "6x139.7", "6x5.5"):
+            self.assertEqual(wheel_size.parse_query(text).filters["bolt_circle_mm"], 139.7, text)
+
+    def test_a_size_still_wins_where_both_could_claim_it(self):
+        """ "10x8" is a real 10-inch wheel far more often than a ten-lug pattern on an 8-inch
+        circle, and "18x9" is not a pattern at all -- 18 lugs do not exist."""
+        self.assertEqual(wheel_size.parse_query("18x9").filters, {"diameter_in": 18.0, "width_in": 9.0})
+        self.assertEqual(wheel_size.parse_query("10x8").filters, {"diameter_in": 10.0, "width_in": 8.0})
+
+    def test_a_brand_beside_a_pattern_survives_as_text(self):
+        parsed = wheel_size.parse_query("fuel 6x135")
+        self.assertEqual(parsed.filters["bolt_circle_mm"], 135.0)
+        self.assertEqual(parsed.residue, "fuel")
+
+    def test_something_that_is_not_a_pattern_stays_text(self):
+        parsed = wheel_size.parse_query("nitto grappler")
+        self.assertFalse(parsed.parsed_anything)
+        self.assertEqual(parsed.residue, "nitto grappler")
+
+    def test_an_implausible_pattern_is_not_one(self):
+        for text in ("2x50", "12x300"):
+            self.assertFalse(wheel_size.parse_query(text).parsed_anything, text)

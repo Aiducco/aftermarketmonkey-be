@@ -159,3 +159,43 @@ class SafetyTests(SimpleTestCase):
     def test_placeholder_image_urls_are_dropped(self):
         """536,041 master parts carry a literal "NA" in image_url, which is truthy in Python."""
         self.assertEqual(wheels_index.project_wheel(_row(image_url="NA"))["image_url"], "")
+
+
+class FitmentTextTests(SimpleTestCase):
+    """
+    The safety net under the query parser.
+
+    A size or a pattern normally becomes a filter and never reaches the text engine. When the
+    parser does not recognise a shape the raw string is still sent as ``q``, and this is what gives
+    it something to hit instead of returning an empty page.
+    """
+
+    databases = []
+
+    def test_it_carries_the_size_and_every_pattern(self):
+        text = wheels_index.project_wheel(_row())["fitment_text"]
+        self.assertIn("20x9", text)
+        self.assertIn("6x135", text)
+        self.assertIn("6x5.5", text)
+
+    def test_both_spellings_of_a_pattern_are_present(self):
+        """The feed published one of "6x5.5" and "6x139.7"; a customer may type either."""
+        text = wheels_index.project_wheel(_row())["fitment_text"]
+        self.assertIn("6x5.5", text)
+        self.assertIn("6x139.7", text)
+
+    def test_no_duplicates(self):
+        text = wheels_index.project_wheel(
+            _row(
+                bolt_pattern_display="6x135", bolt_lug_count_2=None, bolt_circle_mm_2=None, bolt_pattern_2_display=None
+            )
+        )["fitment_text"]
+        self.assertEqual(text.count("6x135"), 1)
+
+    def test_typo_tolerance_is_off_for_it(self):
+        """ "6x135" is five characters, which Meilisearch matches to "6x139" with one typo allowed.
+        Those are different bolt patterns on a part that bolts to a car."""
+        self.assertIn("fitment_text", wheels_index.SPEC.typo_disabled)
+
+    def test_it_is_searchable(self):
+        self.assertIn("fitment_text", wheels_index.SEARCHABLE_ATTRIBUTES)

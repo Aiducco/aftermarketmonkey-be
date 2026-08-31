@@ -35,7 +35,24 @@ _LOG_PREFIX = "[WHEELS-INDEX]"
 INDEX_NAME_WHEELS = getattr(settings, "MEILISEARCH_INDEX_WHEELS", "wheels_v1")
 REINDEX_BATCH_SIZE = getattr(settings, "MEILISEARCH_WHEELS_BATCH_SIZE", 5000)
 
-SEARCHABLE_ATTRIBUTES = ["part_number", "gtin", "brand_name", "model_name", "style_number", "search_text"]
+SEARCHABLE_ATTRIBUTES = [
+    "part_number",
+    "gtin",
+    "brand_name",
+    "model_name",
+    "style_number",
+    "search_text",
+    # The safety net under the query parser. A size or a bolt pattern normally becomes a filter and
+    # never reaches the text engine at all -- but when the parser does not recognise a shape, the
+    # raw string is still sent as ``q``, and without this there is nothing in the document for it
+    # to hit, so the search returns nothing rather than something imperfect.
+    #
+    # Its own attribute rather than folded into ``search_text`` because typo tolerance has to be
+    # off here and on there. "6x135" is five characters, which Meilisearch will happily match to
+    # "6x139" with one typo allowed -- two different bolt patterns that do not interchange, on a
+    # part that bolts to a car.
+    "fitment_text",
+]
 
 FILTERABLE_ATTRIBUTES = [
     # fitment -- the entire reason this index exists
@@ -98,7 +115,7 @@ SPEC = index_builder.IndexSpec(
     searchable=SEARCHABLE_ATTRIBUTES,
     filterable=FILTERABLE_ATTRIBUTES,
     sortable=SORTABLE_ATTRIBUTES,
-    typo_disabled=["part_number", "gtin", "style_number"],
+    typo_disabled=["part_number", "gtin", "style_number", "fitment_text"],
 )
 
 
@@ -229,6 +246,12 @@ def _normalized_gtin(value: typing.Any) -> str:
     return text if text.isdigit() else ""
 
 
+def _trim(value: typing.Any) -> str:
+    """139.70 -> "139.7", 135.00 -> "135". The way a customer types it."""
+    text = format(float(value), "f").rstrip("0").rstrip(".")
+    return text or "0"
+
+
 def _number(value: typing.Any) -> typing.Any:
     """Decimals must reach the index as floats: a filter on ``diameter_in = 20`` matches nothing
     against a string, and Meilisearch will not coerce."""
@@ -243,6 +266,19 @@ def project_wheel(row: typing.Mapping[str, typing.Any]) -> typing.Dict[str, typi
     patterns = [p for p in (row["bolt_pattern_display"], row["bolt_pattern_2_display"]) if p]
 
     aliases = list(row["search_aliases"] or [])
+    # Every way a customer might write this wheel's fitment, so an unparsed query still lands.
+    # Both spellings of each pattern: the feed published one of "6x5.5" and "6x139.7" and a
+    # customer may type either.
+    fitment_parts = [row["size_display"], *patterns]
+    for circle, lugs in (
+        (row["bolt_circle_mm"], row["bolt_lug_count"]),
+        (row["bolt_circle_mm_2"], row["bolt_lug_count_2"]),
+    ):
+        if circle is not None and lugs is not None:
+            fitment_parts.append("{}x{}".format(lugs, _trim(circle)))
+    if row["offset_mm"] is not None:
+        fitment_parts.append("{:+d}mm".format(int(row["offset_mm"])))
+
     search_text = " ".join(
         part for part in [row["brand_name"], row["model_name"], row["style_number"], row["finish"], *aliases] if part
     )
@@ -259,6 +295,7 @@ def project_wheel(row: typing.Mapping[str, typing.Any]) -> typing.Dict[str, typi
         "sub_model": row["sub_model"] or "",
         "style_number": row["style_number"] or "",
         "search_text": search_text,
+        "fitment_text": " ".join(dict.fromkeys(p for p in fitment_parts if p)),
         # fitment
         "size_display": row["size_display"],
         "diameter_in": _number(row["diameter_in"]),
