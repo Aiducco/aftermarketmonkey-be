@@ -131,10 +131,15 @@ def enqueue_all_active_company_provider_pricing_jobs() -> int:
 
     Returns the number of jobs enqueued.
     """
+    # active=True: despite the function's name, this never actually filtered on it until
+    # 2026-08-31 -- every inactive/disconnected CompanyProviders row (dead credentials, a
+    # customer who disconnected) was enqueued and retried every cycle regardless, which was a
+    # real chunk of the noise in a 45%-failure-rate scan of pricing jobs (auth failures, missing
+    # SFTP files -- exactly what a stale disconnected connection produces).
     recurring_kinds = [k for k in _PRICING_SYNC_KINDS if k != src_enums.BrandProviderKind.TURN_14.value]
     qs = (
         src_models.CompanyProviders.objects.select_related("provider")
-        .filter(provider__kind__in=recurring_kinds)
+        .filter(provider__kind__in=recurring_kinds, active=True)
         .values_list("id", "provider__kind")
     )
     enqueued = 0
@@ -178,9 +183,13 @@ def enqueue_all_active_turn14_pricing_jobs() -> int:
     Idempotent, same as enqueue_all_active_company_provider_pricing_jobs. Returns the number of
     jobs enqueued.
     """
+    # active=True fixed 2026-08-31 -- see enqueue_all_active_company_provider_pricing_jobs'
+    # comment on the same fix; this function had the identical gap.
     turn14_kind = src_enums.BrandProviderKind.TURN_14.value
     cp_ids = list(
-        src_models.CompanyProviders.objects.filter(provider__kind=turn14_kind).values_list("id", flat=True)
+        src_models.CompanyProviders.objects.filter(provider__kind=turn14_kind, active=True).values_list(
+            "id", flat=True
+        )
     )
     enqueued = 0
     for cp_id in cp_ids:
