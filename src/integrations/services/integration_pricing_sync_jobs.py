@@ -384,7 +384,23 @@ def _sync_master_pricing(cp: src_models.CompanyProviders) -> None:
         raise ValueError("Unsupported provider kind for master pricing sync: {}".format(kind))
 
 
-def cleanup_stale_running_jobs(max_age_minutes: int = 60) -> int:
+# How long a RUNNING job must sit before cleanup_stale_running_jobs reclaims it, per provider
+# kind. The default (60 min) is comfortably generous for every provider actually measured --
+# real completed-job durations over 7 days topped out at 29.1min (A-Tech), 23.3min (Meyer),
+# under 12min for everything else -- except Turn 14, whose flat full-catalog fetch + master-parts
+# sync genuinely took up to 66.7 minutes in that same window (22 completed runs, 4 of them over
+# 60 minutes). The default threshold was falsely declaring those still-legitimately-running jobs
+# dead and launching a duplicate sync for the same connection every time one ran a bit long --
+# doubling load on exactly the jobs already taking the longest, discovered live 2026-08-31 while
+# investigating why so many Turn 14 pricing jobs were failing. 120 min leaves real margin above
+# the observed max rather than just clearing it.
+_STALE_RUNNING_MAX_AGE_MINUTES_BY_KIND = {
+    src_enums.BrandProviderKind.TURN_14.value: 120,
+}
+_DEFAULT_STALE_RUNNING_MAX_AGE_MINUTES = 60
+
+
+def cleanup_stale_running_jobs(max_age_minutes: typing.Optional[int] = None) -> int:
     """
     Finish IntegrationPricingSyncJob rows stuck RUNNING (worker OOM-killed or container
     restarted mid-job), then enqueue a fresh OPEN job for the same connection.
@@ -394,18 +410,42 @@ def cleanup_stale_running_jobs(max_age_minutes: int = 60) -> int:
     nothing happened. It's marked FAILED (terminal -- "finished") like any other failed run, and
     a brand new job is what actually gets retried, via the same enqueue_company_provider_pricing_sync()
     every other trigger (connect, update, nightly enqueue) already uses.
+
+    Pass ``max_age_minutes`` to apply one fixed threshold to every provider uniformly (kept for
+    callers/tests that want that); leave it ``None`` (the normal case) to use
+    ``_STALE_RUNNING_MAX_AGE_MINUTES_BY_KIND`` per provider kind, falling back to
+    ``_DEFAULT_STALE_RUNNING_MAX_AGE_MINUTES`` for every kind not explicitly listed there.
     """
-    cutoff = timezone.now() - datetime.timedelta(minutes=max_age_minutes)
-    stale_jobs = list(
-        src_models.IntegrationPricingSyncJob.objects.filter(
-            status=src_enums.IntegrationPricingSyncJobStatus.RUNNING.value,
-            started_at__lt=cutoff,
+    now = timezone.now()
+    if max_age_minutes is not None:
+        cutoff = now - datetime.timedelta(minutes=max_age_minutes)
+        stale_jobs = list(
+            src_models.IntegrationPricingSyncJob.objects.filter(
+                status=src_enums.IntegrationPricingSyncJobStatus.RUNNING.value,
+                started_at__lt=cutoff,
+            )
         )
-    )
+    else:
+        overridden_kinds = list(_STALE_RUNNING_MAX_AGE_MINUTES_BY_KIND.keys())
+        default_cutoff = now - datetime.timedelta(minutes=_DEFAULT_STALE_RUNNING_MAX_AGE_MINUTES)
+        stale_jobs = list(
+            src_models.IntegrationPricingSyncJob.objects.filter(
+                status=src_enums.IntegrationPricingSyncJobStatus.RUNNING.value,
+                started_at__lt=default_cutoff,
+            ).exclude(company_provider__provider__kind__in=overridden_kinds)
+        )
+        for kind, kind_minutes in _STALE_RUNNING_MAX_AGE_MINUTES_BY_KIND.items():
+            kind_cutoff = now - datetime.timedelta(minutes=kind_minutes)
+            stale_jobs += list(
+                src_models.IntegrationPricingSyncJob.objects.filter(
+                    status=src_enums.IntegrationPricingSyncJobStatus.RUNNING.value,
+                    started_at__lt=kind_cutoff,
+                    company_provider__provider__kind=kind,
+                )
+            )
     if not stale_jobs:
         return 0
 
-    now = timezone.now()
     src_models.IntegrationPricingSyncJob.objects.filter(
         id__in=[j.id for j in stale_jobs]
     ).update(
