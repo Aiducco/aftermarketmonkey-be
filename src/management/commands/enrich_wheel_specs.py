@@ -7,9 +7,12 @@ See ``src/integrations/services/wheel_enrichment.py`` for the machinery and
 **No LLM is called.** Unlike the tire pipeline, every field here comes from a feed column or a
 rule you can read, so a dry run costs nothing and the whole catalog can be rebuilt in a minute.
 
-    manage.py enrich_wheel_specs                 # report what would be written
-    manage.py enrich_wheel_specs --limit 500     # a small bite
-    manage.py enrich_wheel_specs --apply         # commit
+    manage.py enrich_wheel_specs                              # every feed, report only
+    manage.py enrich_wheel_specs --feeds thewheelgroup        # one feed
+    manage.py enrich_wheel_specs --apply                      # commit
+
+A master part described by two feeds is resolved by ``FEED_ORDER``, not by whichever ran last, and
+every collision is reported. There are none today; the rule exists because catalogs grow.
 """
 from django.core.management.base import BaseCommand, CommandError
 
@@ -20,6 +23,13 @@ class Command(BaseCommand):
     help = "Build wheel_specs from the Wheel Pros structured feed. Read-only unless --apply is given."
 
     def add_arguments(self, parser):
+        parser.add_argument(
+            "--feeds",
+            default=None,
+            help="Comma-separated feeds to read. Default: all, in precedence order ({}).".format(
+                ", ".join(wheel_enrichment.FEED_ORDER)
+            ),
+        )
         parser.add_argument("--brands", default=None, help="Comma-separated brand names. Omit for all.")
         parser.add_argument("--limit", type=int, default=None, help="Max master parts to process.")
         parser.add_argument("--apply", action="store_true", help="Write wheel_specs.")
@@ -34,13 +44,35 @@ class Command(BaseCommand):
                 raise CommandError("Unknown brand(s): {}".format(", ".join(unknown)))
             brand_ids = list(resolved.values())
 
-        stats = wheel_enrichment.run(brand_ids=brand_ids, limit=options["limit"], apply_changes=options["apply"])
+        feeds = None
+        if options["feeds"]:
+            feeds = [f.strip() for f in options["feeds"].split(",") if f.strip()]
+            unknown = sorted(set(feeds) - set(wheel_enrichment.FEEDS))
+            if unknown:
+                raise CommandError(
+                    "Unknown feed(s): {}. Known: {}".format(
+                        ", ".join(unknown), ", ".join(sorted(wheel_enrichment.FEEDS))
+                    )
+                )
+
+        stats = wheel_enrichment.run(
+            feeds=feeds, brand_ids=brand_ids, limit=options["limit"], apply_changes=options["apply"]
+        )
 
         self.stdout.write("\nScanned                   {}".format(stats.scanned))
-        built = stats.scanned - stats.no_size
+        built = stats.built
         self.stdout.write("  specs built             {}".format(built))
+        for name in wheel_enrichment.FEED_ORDER:
+            if name in stats.per_feed:
+                self.stdout.write("    {:<22}{}".format(name, stats.per_feed[name]))
+        if stats.collisions:
+            self.stdout.write(
+                self.style.WARNING("  described by 2 feeds    {}  (resolved by precedence)".format(stats.collisions))
+            )
+            for detail, count in sorted(stats.collision_detail.items(), key=lambda kv: -kv[1])[:6]:
+                self.stdout.write("      {:<40}{}".format(detail, count))
         for reason, count in sorted(stats.skipped.items()):
-            self.stdout.write(self.style.WARNING("  skipped: {:<22}{}".format(reason, count)))
+            self.stdout.write(self.style.WARNING("  skipped: {:<34} {}".format(reason, count)))
 
         if built:
             self.stdout.write("\nCoverage")
