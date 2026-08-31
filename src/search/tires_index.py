@@ -70,6 +70,9 @@ FILTERABLE_ATTRIBUTES = [
     "use_case_tags",
     "tier",
     "noise_level",
+    # Homologation codes, one document value per marking (a tire can carry several). Filterable
+    # because buyers look for them by name -- "Porsche N0" is a search, not a spec line.
+    "oe_marking",
     "is_3pmsf",
     "is_ms",
     "is_run_flat",
@@ -96,6 +99,29 @@ SORTABLE_ATTRIBUTES = [
     "speed_sort",
     "brand_name",
 ]
+
+# Filterable attributes the document holds as numbers / booleans rather than strings (for a list
+# field, the element type). Declared because a facet value has to travel back to the client as the
+# type the index actually stores: Meilisearch's filter grammar reads a quoted ``"18"`` as a string
+# and matches nothing against a numeric ``18``, so a facet that renders correctly can still be
+# unclickable. ``src.search.tests.test_tires_index`` asserts every name here really is that type
+# in a projected document, so the list cannot rot as the projection changes.
+NUMERIC_FILTERABLE = frozenset([
+    "section_width_mm",
+    "aspect_ratio",
+    "rim_diameter_in",
+    "section_width_in",
+    "overall_diameter_in",
+    "load_index",
+    "speed_sort",
+    "ply_rating",
+    "rim_width_min_in",
+    "rim_width_max_in",
+    "brand_id",
+    "distributor_ids",
+    "distributor_count",
+])
+BOOLEAN_FILTERABLE = frozenset(["in_stock", "is_3pmsf", "is_ms", "is_run_flat", "is_studdable"])
 
 MAX_VALUES_PER_FACET = 200
 MAX_TOTAL_HITS = 5000
@@ -179,6 +205,7 @@ SELECT
     ts.search_aliases           AS search_aliases,
     ts.tier                     AS tier,
     ts.noise_level              AS noise_level,
+    ts.oe_marking               AS oe_marking,
     ts.is_3pmsf                 AS is_3pmsf,
     ts.is_ms                    AS is_ms,
     ts.is_run_flat              AS is_run_flat,
@@ -246,6 +273,22 @@ def _normalized_gtin(value: typing.Any) -> str:
     return text
 
 
+def _oe_markings(value: typing.Any) -> typing.List[str]:
+    """
+    ``"* - MINI, MO - Mercedes-Benz"`` -> ``["* - MINI", "MO - Mercedes-Benz"]``.
+
+    A list, not the raw string: 281 tires carry more than one homologation, and as one string
+    they would face as a single bucket nobody can select ("* - MINI, MO - Mercedes-Benz" is not a
+    thing a buyer looks for). Empty stays an empty list, which Meilisearch simply has no value
+    for -- the facet then counts only tires that really are homologated, which is what makes
+    "hide unless some row has one" work.
+    """
+    text = _text_or_empty(value)
+    if not text:
+        return []
+    return [part.strip() for part in text.split(",") if part.strip()]
+
+
 def _decimal_to_float(value: typing.Any) -> typing.Any:
     """Meilisearch cannot filter or sort on a string, and psycopg2 hands back NUMERIC as Decimal,
     which serialises as a string. Every dimensional field goes through here."""
@@ -298,6 +341,7 @@ def project_tire(row: typing.Mapping[str, typing.Any]) -> typing.Dict[str, typin
         "use_case_tags": list(row["use_case_tags"] or []),
         "tier": row["tier"] or "",
         "noise_level": row["noise_level"] or "",
+        "oe_marking": _oe_markings(row.get("oe_marking")),
         # distributor specs
         "tread_depth_32nds": _decimal_to_float(row["tread_depth_32nds"]),
         "max_psi": row["max_psi"],
@@ -391,6 +435,30 @@ def _apply_settings(index) -> None:
     index.update_distinct_attribute("id")
     # A typo in a part number or a GTIN is a different product, not a near miss.
     index.update_typo_tolerance({"disableOnAttributes": ["part_number", "gtin"]})
+
+
+def live_filterable_attributes(index_name: str = INDEX_NAME_TIRES) -> typing.Optional[typing.FrozenSet[str]]:
+    """
+    What the **running** index will actually accept as a filter or a facet, or None if it cannot
+    be read.
+
+    Not the same thing as ``FILTERABLE_ATTRIBUTES``: that is what this code wants, and the index
+    only has it after ``setup_index`` runs. Between a deploy and that command the two disagree,
+    and the disagreement is not survivable -- Meilisearch rejects an entire multi-search when one
+    requested facet is not filterable, so a single new attribute would take tire search down
+    completely rather than hiding one control. ``src.api.services.tire_search`` intersects against
+    this so a not-yet-configured facet is simply absent until the index catches up.
+
+    None (rather than an empty set) on failure, so a caller can tell "the index says nothing is
+    filterable" from "we could not ask".
+    """
+    if not is_configured():
+        return None
+    try:
+        return frozenset(_client().index(index_name).get_filterable_attributes() or [])
+    except Exception as exc:
+        logger.warning("%s could not read filterable attributes from '%s': %s", _LOG_PREFIX, index_name, exc)
+        return None
 
 
 def setup_index(index_name: str = INDEX_NAME_TIRES) -> bool:

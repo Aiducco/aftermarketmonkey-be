@@ -50,6 +50,7 @@ def _row(**overrides):
         "search_aliases": ["Trail Grappler", "TRAIL GRAP"],
         "tier": "premium",
         "noise_level": "loud",
+        "oe_marking": None,
         "is_3pmsf": None,
         "is_ms": True,
         "is_run_flat": None,
@@ -127,6 +128,17 @@ class ProjectTireTests(SimpleTestCase):
             self.assertNotIn("price", key.lower(), key)
             self.assertNotIn("cost", key.lower(), key)
 
+    def test_oe_markings_are_split_so_each_one_is_selectable(self):
+        """281 tires carry two. As one string they would face as a bucket nobody searches for."""
+        document = tires_index.project_tire(_row(oe_marking="* - MINI, MO - Mercedes-Benz"))
+        self.assertEqual(document["oe_marking"], ["* - MINI", "MO - Mercedes-Benz"])
+
+    def test_a_tire_with_no_oe_marking_carries_an_empty_list(self):
+        # Which Meilisearch has no value for -- so the facet counts only homologated tires, which
+        # is what makes "hide the facet unless some row has one" work.
+        self.assertEqual(tires_index.project_tire(_row(oe_marking=None))["oe_marking"], [])
+        self.assertEqual(tires_index.project_tire(_row(oe_marking="  "))["oe_marking"], [])
+
     def test_every_filterable_attribute_exists_on_the_document(self):
         # A filterable attribute the projection never emits is a facet that silently returns
         # nothing. Tri-state flags are the documented exception.
@@ -137,6 +149,26 @@ class ProjectTireTests(SimpleTestCase):
             if field not in document and field not in tires_index._TRISTATE_FLAGS
         ]
         self.assertEqual(missing, [])
+
+    def test_the_declared_numeric_and_boolean_attributes_really_are(self):
+        """
+        A facet value goes back to the client as the type the index holds, so this list decides
+        whether clicking a facet filters anything. It cannot be allowed to drift.
+        """
+        document = tires_index.project_tire(_row(is_3pmsf=True, is_ms=True, is_run_flat=True, is_studdable=True))
+        for field in sorted(tires_index.NUMERIC_FILTERABLE):
+            value = document[field]
+            sample = value[0] if isinstance(value, list) else value
+            if sample is None:
+                continue
+            self.assertIsInstance(sample, (int, float), field)
+            self.assertNotIsInstance(sample, bool, field)
+        for field in sorted(tires_index.BOOLEAN_FILTERABLE):
+            self.assertIsInstance(document[field], bool, field)
+
+    def test_no_declared_type_is_missing_from_the_filterable_list(self):
+        declared = tires_index.NUMERIC_FILTERABLE | tires_index.BOOLEAN_FILTERABLE
+        self.assertEqual(sorted(declared - set(tires_index.FILTERABLE_ATTRIBUTES)), [])
 
     def test_every_sortable_attribute_exists_on_the_document(self):
         document = tires_index.project_tire(_row())

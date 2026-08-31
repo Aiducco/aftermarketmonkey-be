@@ -33,6 +33,7 @@ from django.db import connection
 
 from src.domain import spec_line as spec_line_domain
 from src.domain import tire_filters, tire_query
+from src.domain import tire_spec_display
 from src.search import meilisearch_client as parts_index
 from src.search import tires_index
 
@@ -165,28 +166,105 @@ def _load_tread_category_codes() -> typing.AbstractSet[str]:
     return frozenset(src_models.TreadCategory.objects.values_list("code", flat=True))
 
 
-def _tread_category_labels() -> typing.Dict[str, str]:
-    """Code -> display label, straight from ``tread_category``."""
+def _tread_category_vocabulary() -> typing.Tuple[typing.Dict[str, str], typing.List[str]]:
+    """
+    Code -> display label, plus the codes in ``sort_order`` (terrain first, because that is what
+    truck buyers filter on).
+
+    One query for both: the labels and the order come off the same 27 rows, and this runs on a
+    cache refresh where a second round trip buys nothing.
+    """
     from src import models as src_models
 
-    return {row.code: row.label for row in src_models.TreadCategory.objects.all()}
+    labels, sequence = {}, []
+    for row in src_models.TreadCategory.objects.order_by("sort_order"):
+        labels[row.code] = row.label
+        sequence.append(row.code)
+    return labels, sequence
+
+
+def _load_range_vocabulary() -> typing.Tuple[typing.Dict[str, str], typing.List[str]]:
+    """
+    ``E`` -> ``E - 10 ply``, ``XL`` -> ``XL - Extra load``, in the table's own order.
+
+    Two vocabularies share one column and they are labelled differently on purpose: an LT letter
+    range means a ply equivalence and a passenger range does not have one at all. Writing
+    "XL (4 ply)" would be inventing a number -- see ``TireLoadRange``.
+    """
+    from src import models as src_models
+
+    labels: typing.Dict[str, str] = {}
+    sequence: typing.List[str] = []
+    for row in src_models.TireLoadRange.objects.order_by("sort_order"):
+        code = row.load_range
+        sequence.append(code)
+        if row.ply_rating:
+            labels[code] = "{} \u2014 {} ply".format(code, row.ply_rating)
+        else:
+            passenger = tire_spec_display.LOAD_RANGE_LABELS.get(code)
+            labels[code] = "{} \u2014 {}".format(code, passenger) if passenger else code
+    return labels, sequence
+
+
+def _speed_rating_sequence() -> typing.List[str]:
+    """
+    Codes in speed order, which is the only order that reads as anything but random: H is 130 mph
+    and belongs between U and V, so alphabetical is a wrong answer rather than a neutral one.
+    """
+    from src import models as src_models
+
+    return list(src_models.TireSpeedRating.objects.order_by("sort_order").values_list("code", flat=True))
+
+
+def _distributor_labels() -> typing.Dict[str, str]:
+    """Provider id -> name. The facet filters on ids (stable) and shows names (not)."""
+    from src import models as src_models
+
+    return {str(row.id): row.name for row in src_models.Providers.objects.all() if row.name}
+
+
+def _facet_vocabularies() -> typing.Dict[str, typing.Dict[str, typing.Any]]:
+    """
+    Per-field ``{"labels": ..., "sequence": ...}`` for every facet whose vocabulary already lives
+    somewhere else.
+
+    Read at facet-config load time (cached for 30 minutes with everything else), never per
+    request. The point is single-sourcing: ``tread_category.label`` is the FK target and the LLM's
+    constraint, ``TireLoadRange`` is what resolves ply ratings, ``providers`` is what names a
+    distributor, and ``VEHICLE_CLASS_LABELS`` is what the part detail panel renders. A second copy
+    of any of them inside ``facet_config.value_labels`` would drift the day one is edited.
+    """
+    from src import models as src_models
+
+    load_range_labels, load_range_sequence = _load_range_vocabulary()
+    tread_labels, tread_sequence = _tread_category_vocabulary()
+    return {
+        "tread_category": {"labels": tread_labels, "sequence": tread_sequence},
+        "load_range": {"labels": load_range_labels, "sequence": load_range_sequence},
+        "speed_rating": {"labels": {}, "sequence": _speed_rating_sequence()},
+        "vehicle_class": {"labels": dict(tire_spec_display.VEHICLE_CLASS_LABELS), "sequence": []},
+        "tier": {"labels": dict(src_models.TireSpec.TIER_CHOICES), "sequence": []},
+        "distributor_ids": {"labels": _distributor_labels(), "sequence": []},
+    }
 
 
 def _load_facets_config() -> typing.List[typing.Dict[str, typing.Any]]:
-    """The facet rail definition, server-owned so it changes without a client deploy."""
+    """
+    The facet rail definition, server-owned so it changes without a client deploy.
+
+    Labels and value order are merged in from the reference tables here (see
+    ``_facet_vocabularies``); a ``value_labels`` entry on the row still wins, so a facet can
+    always override. The visibility rules travel with the facet rather than being applied here --
+    they depend on the result set, which this cached function has never seen.
+    """
     from src import models as src_models
 
-    # tread_category labels come from the tread_category table rather than being duplicated into
-    # facet_config.value_labels: the table is already the source of truth for them (it is the FK
-    # target and the LLM's constraint), and a second copy would drift the moment a label is
-    # edited. A value_labels entry on the row still wins, so a facet can override if it needs to.
-    category_labels = _tread_category_labels()
+    vocabularies = _facet_vocabularies()
 
     facets = []
     for row in src_models.FacetConfig.objects.filter(mode=FACET_MODE_BY_SEARCH_MODE[MODE_TIRES]).order_by("sort_order"):
-        value_labels = dict(row.value_labels or {})
-        if row.field == "tread_category":
-            value_labels = {**category_labels, **value_labels}
+        vocabulary = vocabularies.get(row.field) or {}
+        value_labels = {**(vocabulary.get("labels") or {}), **dict(row.value_labels or {})}
         facets.append(
             {
                 "field": row.field,
@@ -195,14 +273,30 @@ def _load_facets_config() -> typing.List[typing.Dict[str, typing.Any]]:
                 "collapse_after": row.collapse_after,
                 "unit": row.unit,
                 "value_labels": value_labels,
+                "value_order": getattr(row, "value_order", None) or "count",
+                "value_sequence": list(vocabulary.get("sequence") or []),
+                "min_distinct_values": getattr(row, "min_distinct_values", None) or 1,
+                "requires_filter_on": getattr(row, "requires_filter_on", None) or None,
+                "requires_true_value": bool(getattr(row, "requires_true_value", False)),
             }
         )
     return facets
 
 
+def _load_index_filterable_fields() -> typing.AbstractSet[str]:
+    """
+    What the live index accepts as a facet. Falls back to this code's own list when the index
+    cannot be asked -- if Meilisearch is unreachable the search is failing on its own merits, and
+    a fallback that hides every facet would just make that harder to diagnose.
+    """
+    live = tires_index.live_filterable_attributes()
+    return live if live is not None else frozenset(tires_index.FILTERABLE_ATTRIBUTES)
+
+
 _BRAND_NAMES = _Cached(_load_brand_names)
 _TREAD_CATEGORY_CODES = _Cached(_load_tread_category_codes)
 _FACETS_CONFIG = _Cached(_load_facets_config)
+_INDEX_FILTERABLE = _Cached(_load_index_filterable_fields)
 
 
 def brand_names() -> typing.AbstractSet[str]:
@@ -217,6 +311,10 @@ def facets_config() -> typing.List[typing.Dict[str, typing.Any]]:
     return _FACETS_CONFIG.get()
 
 
+def index_filterable_fields() -> typing.AbstractSet[str]:
+    return _INDEX_FILTERABLE.get()
+
+
 def warm_reference_caches() -> None:
     """
     Populate all three reference caches now, in the calling thread.
@@ -226,7 +324,7 @@ def warm_reference_caches() -> None:
     instead of during a user's first request. Safe to call more than once (a concurrent request
     racing this just does its own first-load under the same lock, see _Cached.get).
     """
-    for cache in (_BRAND_NAMES, _TREAD_CATEGORY_CODES, _FACETS_CONFIG):
+    for cache in (_BRAND_NAMES, _TREAD_CATEGORY_CODES, _FACETS_CONFIG, _INDEX_FILTERABLE):
         try:
             cache.get()
         except Exception:
@@ -235,12 +333,35 @@ def warm_reference_caches() -> None:
 
 def invalidate_reference_cache() -> None:
     """Drop every cached reference value. Call after a reindex or a facet_config change."""
-    for cache in (_BRAND_NAMES, _TREAD_CATEGORY_CODES, _FACETS_CONFIG):
+    for cache in (_BRAND_NAMES, _TREAD_CATEGORY_CODES, _FACETS_CONFIG, _INDEX_FILTERABLE):
         cache.invalidate()
 
 
 def _facet_fields() -> typing.List[str]:
-    return [facet["field"] for facet in facets_config()]
+    """
+    The fields to ask Meilisearch for counts on.
+
+    Intersected with what the **live** index accepts, not with what this code believes it
+    configured. Meilisearch rejects the *entire* multi-search when one requested facet is not
+    filterable, so the gap between a deploy and ``index_tires_meilisearch --setup`` would take
+    tire search down completely rather than hide one control -- and the same is true of any
+    ``facet_config`` row naming a field the index has never had. Either way the facet is simply
+    absent until the index catches up, which is the behaviour the FE spec promises.
+
+    The live attribute set is cached with the other reference data (30 minutes,
+    stale-while-revalidate), so this costs no HTTP call on the request path.
+    """
+    allowed = index_filterable_fields()
+    fields, skipped = [], []
+    for facet in facets_config():
+        (fields if facet["field"] in allowed else skipped).append(facet["field"])
+    if skipped:
+        logger.warning(
+            "%s not facetable on the live index yet, skipped: %s (run index_tires_meilisearch --setup)",
+            _LOG_PREFIX,
+            skipped,
+        )
+    return fields
 
 
 def _hit_to_result(hit: typing.Mapping[str, typing.Any]) -> typing.Dict[str, typing.Any]:
@@ -412,7 +533,9 @@ def search(
     if resolved_mode == MODE_TIRES:
         results = [_hit_to_result(hit) for hit in tires_response.get("hits", [])]
         total = tires_total
+        applied = tire_filters_dict
         facet_distribution = tires_response.get("facetDistribution") or {}
+        facet_stats = tires_response.get("facetStats") or {}
         if total == 0:
             # Meilisearch only computes facet counts from the documents a query actually
             # matches -- zero hits means an empty facetDistribution, which leaves the filter
@@ -424,8 +547,8 @@ def search(
                 tires_limit=0, parts_limit=0, offset=0,
             )
             facet_distribution = facet_only.get("facetDistribution") or {}
-        facets = _shape_facets(facet_distribution)
-        applied = tire_filters_dict
+            facet_stats = facet_only.get("facetStats") or {}
+        facets = _shape_facets(facet_distribution, applied=applied, stats=facet_stats)
     else:
         results = [_parts_hit_to_result(hit) for hit in (parts_response or {}).get("hits", [])]
         total = parts_total
@@ -624,31 +747,159 @@ def _log_search(
     )
 
 
-def _shape_facets(distribution: typing.Mapping[str, typing.Any]) -> typing.List[typing.Dict[str, typing.Any]]:
+def _facet_values(distribution_values: typing.Mapping[str, typing.Any]) -> typing.Dict[str, int]:
+    """
+    The facet's real values: everything but the empty bucket.
+
+    The index writes ``""`` for a NULL ``service_type`` / ``vehicle_class`` / ``tier`` /
+    ``load_range``, and 38,199 of 47,655 tires have no service type at all -- so the unfiltered
+    counts are dominated by a blank checkbox that means "we do not know", not "none of the above".
+    Selecting it would be meaningless and rendering it looks like a bug, so it never reaches the
+    client. Dropping it here rather than in the projection keeps the filter semantics of the index
+    unchanged and needs no reindex.
+    """
+    return {
+        str(value): count
+        for value, count in distribution_values.items()
+        if str(value).strip() != "" and count
+    }
+
+
+def _has_true_value(values: typing.Mapping[str, int]) -> bool:
+    """A boolean facet's ``true`` bucket, whatever case the engine spelled it in."""
+    return any(str(value).lower() == "true" and count for value, count in values.items())
+
+
+def _typed_facet_value(field: str, value: str) -> typing.Any:
+    """
+    A facet value in the type the index stores, not the string JSON handed us.
+
+    Meilisearch returns every ``facetDistribution`` key as a string, and the client sends the value
+    it was given straight back as a filter. ``rim_diameter_in = "18"`` is a string comparison
+    against a numeric field and matches nothing, so a facet can render perfectly and still be
+    unclickable. The numeric/boolean field lists live on the index module next to the projection
+    that produces them (with a test that they do not drift), because that is the only place that
+    knows what type each attribute really holds -- guessing from the value would type a brand
+    called "911" as a number.
+    """
+    if field in tires_index.BOOLEAN_FILTERABLE:
+        return str(value).lower() == "true"
+    if field not in tires_index.NUMERIC_FILTERABLE:
+        return value
+    number = _as_float(value)
+    if number is None:
+        return value
+    return int(number) if number.is_integer() and "." not in str(value) else number
+
+
+def _as_float(value: typing.Any) -> typing.Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_visible(
+    facet: typing.Mapping[str, typing.Any],
+    values: typing.Mapping[str, int],
+    applied: typing.Mapping[str, typing.Any],
+) -> bool:
+    """
+    Whether this facet earns its place on **this** result set.
+
+    Every rule here is data on the ``facet_config`` row, not a special case in code -- see the
+    FacetConfig docstring. The principle behind all three: a control that cannot change the
+    result set is worse than an absent one, because the user spends attention on it first.
+    """
+    if len(values) < max(1, facet.get("min_distinct_values") or 1):
+        return False
+    required = facet.get("requires_filter_on")
+    if required and required not in applied:
+        return False
+    if facet.get("requires_true_value") and not _has_true_value(values):
+        return False
+    return True
+
+
+def _ordered_values(
+    facet: typing.Mapping[str, typing.Any],
+    values: typing.Mapping[str, int],
+) -> typing.List[typing.Tuple[str, int]]:
+    """Order the values inside one facet -- popularity, numeric, or the reference table's order."""
+    items = list(values.items())
+    order = facet.get("value_order") or "count"
+    if order == "numeric":
+        # Unparseable values sort last rather than exploding: a facet is not worth a 500.
+        return sorted(items, key=lambda item: (_as_float(item[0]) is None, _as_float(item[0]) or 0.0))
+    if order == "vocabulary":
+        sequence = {value: position for position, value in enumerate(facet.get("value_sequence") or [])}
+        return sorted(items, key=lambda item: (sequence.get(item[0], len(sequence)), item[0]))
+    return sorted(items, key=lambda item: (-item[1], item[0]))
+
+
+def _range_stats(
+    field: str,
+    values: typing.Mapping[str, int],
+    stats: typing.Mapping[str, typing.Any],
+) -> typing.Optional[typing.Dict[str, float]]:
+    """
+    ``{"min": .., "max": ..}`` for a range widget -- the only thing a slider actually needs.
+
+    Meilisearch returns ``facetStats`` for numeric facets, so that is used when present; the
+    fallback derives the same two numbers from the distribution's own keys, which keeps the widget
+    working against an engine (or a test double) that does not send stats.
+    """
+    engine_stats = stats.get(field) or {}
+    low, high = engine_stats.get("min"), engine_stats.get("max")
+    if low is None or high is None:
+        numbers = [number for number in (_as_float(value) for value in values) if number is not None]
+        if not numbers:
+            return None
+        low, high = min(numbers), max(numbers)
+    return {"min": float(low), "max": float(high)}
+
+
+def _shape_facets(
+    distribution: typing.Mapping[str, typing.Any],
+    *,
+    applied: typing.Optional[typing.Mapping[str, typing.Any]] = None,
+    stats: typing.Optional[typing.Mapping[str, typing.Any]] = None,
+) -> typing.List[typing.Dict[str, typing.Any]]:
     """
     Join the index's facet counts to the server-owned facet config.
 
-    Order and labels come from ``facet_config``; only fields the index actually returned counts
-    for are included, so a facet that would render empty is omitted rather than shown as a dead
-    control.
+    Order and labels come from ``facet_config``; a facet the index returned nothing for, or one
+    whose visibility rule this result set does not satisfy, is omitted rather than shown as a dead
+    control. ``applied`` is what makes a conditional facet conditional -- "Overall diameter"
+    appears only once a wheel size is chosen.
+
+    A ``range`` facet also carries ``stats`` (min/max), because a slider cannot be built from a
+    list of counts.
     """
+    applied = applied or {}
+    stats = stats or {}
     shaped = []
     for facet in facets_config():
-        values = distribution.get(facet["field"]) or {}
-        if not values:
+        values = _facet_values(distribution.get(facet["field"]) or {})
+        if not values or not _is_visible(facet, values, applied):
             continue
         labels = facet["value_labels"]
-        shaped.append(
-            {
-                "field": facet["field"],
-                "label": facet["label"],
-                "widget": facet["widget"],
-                "unit": facet["unit"],
-                "collapse_after": facet["collapse_after"],
-                "values": [
-                    {"value": value, "label": labels.get(str(value), str(value)), "count": count}
-                    for value, count in sorted(values.items(), key=lambda item: (-item[1], str(item[0])))
-                ],
-            }
-        )
+        entry = {
+            "field": facet["field"],
+            "label": facet["label"],
+            "widget": facet["widget"],
+            "unit": facet["unit"],
+            "collapse_after": facet["collapse_after"],
+            "values": [
+                {
+                    "value": _typed_facet_value(facet["field"], value),
+                    "label": labels.get(str(value), str(value)),
+                    "count": count,
+                }
+                for value, count in _ordered_values(facet, values)
+            ],
+        }
+        if facet["widget"] == "range":
+            entry["stats"] = _range_stats(facet["field"], values, stats)
+        shaped.append(entry)
     return shaped

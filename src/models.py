@@ -5328,7 +5328,16 @@ class FacetConfig(django_db_models.Model):
 
     ``value_labels`` maps raw index values to display text (``{"MT": "Mud terrain"}``). It is
     deliberately not a FK to ``tread_category``: most facet fields are not categories at all, and
-    a single JSON column beats a per-field lookup table for every one of them.
+    a single JSON column beats a per-field lookup table for every one of them. A field whose
+    vocabulary already lives in a table (``tread_category``, ``load_range``, ``speed_rating``,
+    ``providers``) is labelled from that table by the search service and left NULL here, so the
+    two can never drift; an entry here still wins.
+
+    **Visibility is data, not client code.** A facet that cannot discriminate is worse than no
+    facet: "Service type" listing one value, or "Overall diameter" spanning 14.7"-37.4" because
+    nothing has scoped it, both read as a broken control. ``min_distinct_values``,
+    ``requires_filter_on`` and ``requires_true_value`` express those conditions here, so the rail
+    tightens or loosens without a client deploy -- the whole reason this table exists.
     """
 
     MODE_TIRE = "tire"
@@ -5343,6 +5352,20 @@ class FacetConfig(django_db_models.Model):
         (WIDGET_MULTISELECT, "Multi-select"),
         (WIDGET_RANGE, "Range"),
         (WIDGET_TOGGLE, "Toggle"),
+    ]
+
+    # How the values inside one facet are ordered. Popularity is the right default for an
+    # open-ended list (brands), and wrong for anything with an inherent order: wheel sizes read
+    # 15, 16, 17, 18 or they read as noise, and speed ratings are only meaningful in speed order
+    # (H is 130 mph and sits between U and V, so alphabetical is not a neutral choice, it is a
+    # wrong one).
+    VALUE_ORDER_COUNT = "count"
+    VALUE_ORDER_NUMERIC = "numeric"
+    VALUE_ORDER_VOCABULARY = "vocabulary"
+    VALUE_ORDER_CHOICES = [
+        (VALUE_ORDER_COUNT, "Most results first"),
+        (VALUE_ORDER_NUMERIC, "Numeric, ascending"),
+        (VALUE_ORDER_VOCABULARY, "The reference table's own order"),
     ]
 
     mode = django_db_models.CharField(max_length=16, choices=MODE_CHOICES)
@@ -5360,6 +5383,37 @@ class FacetConfig(django_db_models.Model):
         blank=True,
         help_text='Raw index value -> display text, e.g. {"MT": "Mud terrain"}.',
     )
+    value_order = django_db_models.CharField(
+        max_length=16,
+        choices=VALUE_ORDER_CHOICES,
+        default=VALUE_ORDER_COUNT,
+        help_text="How to order the values inside this facet.",
+    )
+    min_distinct_values = django_db_models.PositiveSmallIntegerField(
+        default=1,
+        help_text=(
+            "Hide the facet unless the result set has at least this many distinct values. 2 means "
+            "'only when it can actually split the results' -- a one-value filter is a dead control."
+        ),
+    )
+    requires_filter_on = django_db_models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        help_text=(
+            "Render only once this other field is filtered. Overall diameter is the case: "
+            "unscoped it spans lawn tires to 37s and means nothing; scoped to one wheel size it "
+            "is the most useful control on the rail."
+        ),
+    )
+    requires_true_value = django_db_models.BooleanField(
+        default=False,
+        help_text=(
+            "Toggle facets: render only when some row in the result set is actually true. Keeps "
+            "3PMSF hidden while that certification is unknown catalog-wide, instead of offering a "
+            "filter that empties the page."
+        ),
+    )
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
@@ -5373,6 +5427,10 @@ class FacetConfig(django_db_models.Model):
                 # Literals, not the class constants: a nested Meta body cannot see them.
                 check=django_db_models.Q(widget__in=["multiselect", "range", "toggle"]),
                 name="facet_config_widget_valid",
+            ),
+            django_db_models.CheckConstraint(
+                check=django_db_models.Q(value_order__in=["count", "numeric", "vocabulary"]),
+                name="facet_config_value_order_valid",
             ),
         ]
 
