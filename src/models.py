@@ -1470,13 +1470,50 @@ class WheelProsPart(django_db_models.Model):
     map_usd = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     run_date = django_db_models.DateTimeField(null=True, blank=True)
     warehouse_availability = django_db_models.JSONField(null=True, blank=True)
-    raw_data = django_db_models.JSONField(null=True, blank=True)
+    raw_data = django_db_models.JSONField(
+        null=True,
+        blank=True,
+        help_text=(
+            "The SFTP CSV row verbatim, warehouse-code columns included. Source-specific: API "
+            "data goes to api_data, never here. NULL means this row was never seen in a CSV feed "
+            "-- i.e. it came from the Product API only (see api_data)."
+        ),
+    )
+
+    # -- Product API enrichment ---------------------------------------------------------------
+    # Filled by the `fetch_wheelpros_products` command from GET /products/v1/search/{wheel,tire,
+    # accessory}. Deliberately a separate blob from raw_data: the two sources have different key
+    # spaces and different refresh cadences, so merging them would make it ambiguous which source
+    # a key came from -- and the next CSV sync would clobber the API keys.
+    api_data = django_db_models.JSONField(
+        null=True,
+        blank=True,
+        encoder=DjangoJSONEncoder,
+        help_text=(
+            "The Product API search row verbatim: upc, title, brand, inventory, properties, "
+            "prices (msrp/map/nip) and the full images list with all four size variants. "
+            "Re-derive columns from here; never re-crawl."
+        ),
+    )
+    api_synced_at = django_db_models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="When api_data was last refreshed. NULL means the API has never matched this row.",
+    )
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
 
     class Meta:
         db_table = "wheelpros_parts"
+        indexes = [
+            # Every join into this table is by part number alone -- provider_parts links via
+            # split_part(provider_external_id, '_', 2) with no brand in hand -- and the
+            # UNIQUE(brand_id, part_number) index cannot serve a lookup that does not know
+            # its leading column.
+            django_db_models.Index(fields=["part_number"], name="wheelpros_parts_part_no_idx"),
+        ]
         unique_together = [["brand", "part_number"]]
 
 
@@ -4983,6 +5020,213 @@ class TreadCategory(django_db_models.Model):
         return f"{self.code} ({self.label})"
 
 
+class WheelSpec(django_db_models.Model):
+    """
+    One wheel's dimensions and identity, resolved from every source that describes it.
+
+    The counterpart to :class:`TireSpec`, and deliberately not the same shape, because wheels reach
+    us in a fundamentally better state than tires did. Nothing in the catalog carried a tire's
+    tread depth or load range as a field -- all of it had to be read out of distributor titles by a
+    parser and an LLM. Wheels arrive with the numbers already structured: 51,097 master parts sit
+    behind ``wheelpros_parts``, ``thewheelgroup_parts``, ``vossen_parts`` or
+    ``elitewheels_part_wheels``, each publishing diameter, width, bolt pattern, offset and bore as
+    their own columns, and the feed states outright that the row is a wheel. So the LLM is not the
+    author of this table; it is the fallback for the parts no feed describes, and the normaliser
+    for the few fields that are genuinely prose.
+
+    **Bolt patterns are stored in millimetres and nothing else.** The feeds publish both units in
+    one column -- Wheel Pros writes ``6X5.5`` and ``6X135`` on adjacent rows, meaning a 139.7 mm
+    circle and a 135 mm circle -- and a wheel matched to the wrong circle is a part that will not
+    bolt to the car. ``src.domain.wheel_size`` converts and canonicalises; the display string the
+    source used is kept alongside because that is what a customer searches for.
+
+    ``bolt_circle_mm`` is NULL and ``is_blank_drilled`` True for undrilled wheels. That is a real
+    product sold to be drilled to order, not missing data, and the distinction has to survive into
+    fitment: a blank fits nothing until it is machined, so it must never fall through a
+    "pattern unknown, show it anyway" branch.
+
+    ``master_part`` is a OneToOne rather than the PK itself, per the surrogate-key convention the
+    rest of this module follows.
+    """
+
+    CONSTRUCTION_CAST = "cast"
+    CONSTRUCTION_FLOW_FORMED = "flow_formed"
+    CONSTRUCTION_FORGED = "forged"
+    CONSTRUCTION_STEEL = "steel"
+    CONSTRUCTION_MULTI_PIECE = "multi_piece"
+    CONSTRUCTION_CHOICES = [
+        (CONSTRUCTION_CAST, "Cast"),
+        (CONSTRUCTION_FLOW_FORMED, "Flow formed"),
+        (CONSTRUCTION_FORGED, "Forged"),
+        (CONSTRUCTION_STEEL, "Steel"),
+        (CONSTRUCTION_MULTI_PIECE, "Multi piece"),
+    ]
+
+    # Deliberately the same vocabulary as TireSpec, repeated rather than imported because TireSpec
+    # is declared further down this module. A customer filtering a wheels-and-tires result set by
+    # vehicle should get one list of options, not two that disagree on what a truck is; the
+    # ``test_wheel_and_tire_vehicle_classes_agree`` test fails if these ever drift apart.
+    VEHICLE_CLASS_CHOICES = [
+        ("passenger", "Passenger"),
+        ("light_truck", "Light truck"),
+        ("trailer", "Trailer"),
+        ("commercial", "Commercial"),
+        ("motorcycle", "Motorcycle"),
+        ("atv_utv", "ATV / UTV"),
+    ]
+
+    SPEC_SOURCE_FEED = "feed"
+    SPEC_SOURCE_PARSER = "parser"
+    SPEC_SOURCE_CATALOG = "catalog"
+    SPEC_SOURCE_CHOICES = [
+        (SPEC_SOURCE_FEED, "Distributor feed (structured)"),
+        (SPEC_SOURCE_PARSER, "Parsed from titles"),
+        (SPEC_SOURCE_CATALOG, "External catalog"),
+    ]
+
+    master_part = django_db_models.OneToOneField(
+        MasterPart,
+        on_delete=django_db_models.CASCADE,
+        related_name="wheel_spec",
+    )
+
+    # ---- dimensions, from src.domain.wheel_size ------------------------------------------------
+    diameter_in = django_db_models.DecimalField(max_digits=4, decimal_places=2)
+    width_in = django_db_models.DecimalField(max_digits=4, decimal_places=2)
+    size_display = django_db_models.CharField(max_length=32, db_index=True, help_text='As published: "20x9".')
+
+    bolt_lug_count = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+    bolt_circle_mm = django_db_models.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="Always millimetres. Inch patterns are converted and snapped to the standard they spell.",
+    )
+    bolt_pattern_display = django_db_models.CharField(
+        max_length=24,
+        null=True,
+        blank=True,
+        help_text='The source spelling, kept for search: a Jeep owner types "6x5.5", not "6x139.7".',
+    )
+    # A second pattern means the wheel is drilled twice and fits two vehicles. Two nullable column
+    # pairs rather than a child table: no wheel in ~60,000 SKUs across four feeds has three.
+    bolt_lug_count_2 = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+    bolt_circle_mm_2 = django_db_models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    bolt_pattern_2_display = django_db_models.CharField(max_length=24, null=True, blank=True)
+    is_blank_drilled = django_db_models.BooleanField(
+        default=False,
+        help_text="Undrilled, machined to order. Fits nothing as shipped -- must not be treated as 'pattern unknown'.",
+    )
+
+    offset_mm = django_db_models.SmallIntegerField(
+        null=True,
+        blank=True,
+        help_text="Signed. Zero is a real and common value, not an absence.",
+    )
+    backspacing_in = django_db_models.DecimalField(
+        max_digits=4,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="The off-road way of stating the same thing. Converting needs the width, so both are kept.",
+    )
+    center_bore_mm = django_db_models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
+    load_rating_lb = django_db_models.PositiveIntegerField(null=True, blank=True)
+    weight_lb = django_db_models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+
+    # ---- identity ------------------------------------------------------------------------------
+    model_name = django_db_models.CharField(max_length=255, null=True, blank=True, db_index=True)
+    sub_model = django_db_models.CharField(max_length=255, null=True, blank=True)
+    style_number = django_db_models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="The manufacturer's own style id (Wheel Pros 'display_style_no', TWG 'style_number').",
+    )
+    finish = django_db_models.CharField(
+        max_length=128, null=True, blank=True, help_text='As published: "SATIN BLACK BRIGHT MACH FACE".'
+    )
+    finish_family = django_db_models.CharField(
+        max_length=32,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="The normalised bucket a customer filters on: black, machined, chrome, bronze...",
+    )
+    construction = django_db_models.CharField(max_length=16, choices=CONSTRUCTION_CHOICES, null=True, blank=True)
+    material = django_db_models.CharField(max_length=32, null=True, blank=True)
+    vehicle_class = django_db_models.CharField(max_length=16, choices=VEHICLE_CLASS_CHOICES, null=True, blank=True)
+
+    is_beadlock = django_db_models.BooleanField(null=True, blank=True)
+    is_dually = django_db_models.BooleanField(null=True, blank=True)
+    tpms_compatible = django_db_models.BooleanField(null=True, blank=True)
+    lug_seat = django_db_models.CharField(
+        max_length=24, null=True, blank=True, help_text="Conical / ball / flat. Wrong seat means the lug will not hold."
+    )
+
+    search_aliases = pg_fields.ArrayField(django_db_models.TextField(), default=list, blank=True)
+
+    # ---- provenance ----------------------------------------------------------------------------
+    # A (source, id) pair rather than a foreign key per feed. There are already four wheel feeds
+    # and each is a scrape landing zone that may be truncated and reloaded; four nullable FKs would
+    # be four columns that are NULL 75% of the time and four cascade paths to reason about.
+    spec_source = django_db_models.CharField(
+        max_length=16, choices=SPEC_SOURCE_CHOICES, default=SPEC_SOURCE_PARSER, db_index=True
+    )
+    source_feed = django_db_models.CharField(
+        max_length=32,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Which feed supplied the dimensions: wheelpros, thewheelgroup, vossen, elitewheels, tdg.",
+    )
+    source_external_id = django_db_models.CharField(max_length=128, null=True, blank=True)
+    size_disputed = django_db_models.BooleanField(
+        default=False,
+        help_text="The feed and the title disagree on a dimension. Written anyway; review it.",
+    )
+
+    llm_confidence = django_db_models.DecimalField(max_digits=3, decimal_places=2, null=True, blank=True)
+    llm_reason = django_db_models.TextField(null=True, blank=True)
+    llm_model_used = django_db_models.CharField(max_length=64, null=True, blank=True)
+    enriched_at = django_db_models.DateTimeField(default=timezone.now)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "wheel_specs"
+        indexes = [
+            # The fitment query: "what fits a 5x114.3 hub at 18 inches".
+            django_db_models.Index(fields=["bolt_lug_count", "bolt_circle_mm"], name="wheel_specs_bolt_idx"),
+            django_db_models.Index(fields=["diameter_in", "width_in"], name="wheel_specs_size_idx"),
+            django_db_models.Index(fields=["model_name"], name="wheel_specs_model_name_idx"),
+        ]
+        constraints = [
+            django_db_models.CheckConstraint(
+                check=django_db_models.Q(diameter_in__gt=0) & django_db_models.Q(width_in__gt=0),
+                name="wheel_specs_dimensions_positive",
+            ),
+            django_db_models.CheckConstraint(
+                # A wheel is always at least as tall as it is wide. The reverse pair is a
+                # transposed read, which is the failure mode the tire table has the same guard for.
+                check=django_db_models.Q(width_in__lte=django_db_models.F("diameter_in")),
+                name="wheel_specs_width_not_over_diameter",
+            ),
+            django_db_models.CheckConstraint(
+                # Blanks have no circle, and anything with a circle is not blank. Without this a
+                # half-written row could claim both and reach fitment as a universal fit.
+                check=~django_db_models.Q(is_blank_drilled=True) | django_db_models.Q(bolt_circle_mm__isnull=True),
+                name="wheel_specs_blank_has_no_circle",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return "{} {} {}".format(self.size_display, self.bolt_pattern_display or "blank", self.model_name or "")
+
+
 class TireSpec(django_db_models.Model):
     """
     Everything we know about one tire SKU, keyed to the ``MasterPart`` it describes.
@@ -6239,3 +6483,526 @@ class TdgProduct(django_db_models.Model):
     def __str__(self):
         bits = [self.brand_name, self.product_line_name, self.tire_size_display or self.bolt_pattern]
         return f"{' '.join(b for b in bits if b)} ({self.item_number})"
+
+
+# =================================================================================================
+# Brand tire data
+#
+# The three tables below are one unit and are read together: a registry of where a manufacturer's
+# own tire data comes from (``TireBrandSource``), a log of every attempt to pull it
+# (``TireBrandSourceRun``), and the landing zone the pull writes (``RawTireSpec``).
+#
+# Why a separate department at all, when ``simpletire_skus`` and ``tdg_products`` already land
+# external tire data: those two are *resellers'* catalogs, and their coverage is whatever the
+# reseller chose to stock, spelled the way the reseller spells it. A manufacturer publishes the
+# whole line including the sizes nobody stocks, and publishes it as the authority -- there is no
+# further source to reconcile a Michelin data book against. So the reach and the precedence are
+# both different, and neither is expressible as another row in the existing tables.
+#
+# See ``src/integrations/brand_data/`` for the machinery and
+# ``docs/BRAND_TIRE_DATA_INITIATIVE.md`` for the plan this is phase one of.
+# =================================================================================================
+
+
+class TireBrandSource(django_db_models.Model):
+    """
+    One way of getting one manufacturer's own tire data, and the state of that arrangement.
+
+    This is a registry rather than a config file because most of what it holds is *operational*
+    and changes without a deploy: which brands we have a source for at all, which of them are
+    still delivering, what a human has to do to refresh the ones that are not automated, and when
+    each was last actually pulled. A brand with no source yet is a row here too, with
+    ``status='planned'`` -- the table is the work list, and a brand missing from it is a brand
+    nobody has looked at.
+
+    Method and handler are two different questions and are stored separately:
+
+    ``method``   how the data reaches us in the real world -- a file somebody sends, a person
+                 typing from a PDF, an API we call, a site we crawl. This is what an operator
+                 needs to know, and it is what decides whether the source can be scheduled.
+    ``handler``  which loader in ``src.integrations.brand_data.loaders`` reads it. Several brands
+                 share one handler: every brand that sends a spreadsheet is ``'csv'``, with the
+                 column names in :attr:`config`. Blank means no loader exists yet, which is the
+                 normal state of a ``planned`` row.
+
+    :attr:`config` holds everything the loader needs *except* secrets -- file path, column map,
+    URL, pagination, selectors. Credentials are referenced by the name of the setting that holds
+    them (:attr:`credential_setting`), never by value: this table is dumped into fixtures and read
+    by support, and a key in it would be a key in every one of those places.
+
+    ``slug`` is the natural key and the upsert target, so re-seeding the registry is idempotent.
+    It is per *source*, not per brand: a brand we both crawl and receive a sheet from gets two
+    rows, which is the only way their last-run state and their column maps can differ.
+    """
+
+    METHOD_CSV = "csv"
+    METHOD_MANUAL = "manual"
+    METHOD_API = "api"
+    METHOD_SCRAPE = "scrape"
+    METHOD_CHOICES = [
+        (METHOD_CSV, "File drop (CSV / spreadsheet)"),
+        (METHOD_MANUAL, "Manual entry"),
+        (METHOD_API, "API pull"),
+        (METHOD_SCRAPE, "Scrape"),
+    ]
+
+    STATUS_PLANNED = "planned"
+    STATUS_ACTIVE = "active"
+    STATUS_PAUSED = "paused"
+    STATUS_RETIRED = "retired"
+    STATUS_CHOICES = [
+        (STATUS_PLANNED, "Planned -- no loader or no data yet"),
+        (STATUS_ACTIVE, "Active"),
+        (STATUS_PAUSED, "Paused -- do not schedule"),
+        (STATUS_RETIRED, "Retired -- kept for the rows it left behind"),
+    ]
+
+    slug = django_db_models.SlugField(
+        max_length=128,
+        unique=True,
+        help_text="Stable id, e.g. 'michelin' or 'michelin-databook'. Natural key; seeds upsert on it.",
+    )
+    brand_name = django_db_models.CharField(
+        max_length=128,
+        db_index=True,
+        help_text="The manufacturer, spelled as they spell it. Free text on purpose -- a source can exist for a brand we do not carry yet.",
+    )
+    brand = django_db_models.ForeignKey(
+        Brands,
+        on_delete=django_db_models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="tire_data_sources",
+        help_text=(
+            "Our catalog's brand row, once somebody has confirmed the two are the same "
+            "manufacturer. NULL until then, and deliberately not required: matching rows into "
+            "master_parts is a later step and must not be a precondition for collecting them."
+        ),
+    )
+    method = django_db_models.CharField(
+        max_length=16,
+        choices=METHOD_CHOICES,
+        db_index=True,
+        help_text="How the data reaches us. Decides whether the source can run unattended, not which code runs.",
+    )
+    handler = django_db_models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "Loader key registered in src.integrations.brand_data.registry, e.g. 'csv' or "
+            "'http_json'. Blank means the pull is not built yet -- valid, and the point of a "
+            "'planned' row."
+        ),
+    )
+    status = django_db_models.CharField(
+        max_length=16,
+        choices=STATUS_CHOICES,
+        default=STATUS_PLANNED,
+        db_index=True,
+    )
+    config = django_db_models.JSONField(
+        default=dict,
+        blank=True,
+        encoder=DjangoJSONEncoder,
+        help_text=(
+            "Everything the loader needs and nothing secret: path/url, column or JSON-path map "
+            "under 'field_map', pagination, row filters. Shape is per handler and validated when "
+            "the source runs."
+        ),
+    )
+    credential_setting = django_db_models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text="NAME of the Django setting / env var holding the key. Never the key itself.",
+    )
+    source_url = django_db_models.TextField(
+        blank=True,
+        default="",
+        help_text="Where the data comes from, for a human: the dealer portal, the data-book page, the API docs.",
+    )
+    notes = django_db_models.TextField(
+        blank=True,
+        default="",
+        help_text=(
+            "What a person has to do to refresh this, in enough detail that somebody else can do "
+            "it. The only documentation a 'manual' source has."
+        ),
+    )
+    contact = django_db_models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        help_text="Rep or mailbox the file comes from, where there is one.",
+    )
+    priority = django_db_models.PositiveSmallIntegerField(
+        default=100,
+        help_text=(
+            "Lower runs first, and wins where two sources describe the same tire -- a brand's own "
+            "API outranks a scrape of their marketing site. Only meaningful between sources; "
+            "manufacturer data as a whole outranks the reseller catalogs by being in this table."
+        ),
+    )
+    refresh_interval_days = django_db_models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text="How often this is worth re-pulling. NULL = on demand only; nothing schedules it.",
+    )
+    last_run_at = django_db_models.DateTimeField(null=True, blank=True)
+    last_success_at = django_db_models.DateTimeField(null=True, blank=True)
+    last_row_count = django_db_models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Rows the last successful run saw. A sudden drop is the cheapest signal that a source broke.",
+    )
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "tire_brand_sources"
+        indexes = [
+            django_db_models.Index(fields=["status", "method"], name="tire_brand_src_status_idx"),
+            django_db_models.Index(fields=["priority", "brand_name"], name="tire_brand_src_priority_idx"),
+        ]
+
+    def __str__(self):
+        return f"{self.brand_name} ({self.slug}, {self.method})"
+
+    @property
+    def is_runnable(self) -> bool:
+        """Whether ``ingest_brand_tire_specs`` can execute it at all -- a planned row cannot."""
+        return bool(self.handler) and self.status in (self.STATUS_ACTIVE, self.STATUS_PAUSED)
+
+
+class TireBrandSourceRun(django_db_models.Model):
+    """
+    One attempt to pull one source, successful or not.
+
+    Kept because the failure modes of this department are quiet ones. A CSV whose column headers
+    changed still parses; a crawl that starts returning an empty list still "succeeds"; a portal
+    that logs you out returns a login page with a 200. None of those raise, and all of them show
+    up here as a row count that fell off a cliff next to the run before it -- which is why
+    :attr:`rows_seen` is recorded even for runs that wrote nothing.
+
+    :attr:`input_fingerprint` is the hash of what the loader read (file bytes, or the concatenated
+    response bodies). Identical to the last run's means the source has not moved, and
+    ``--skip-unchanged`` stops there rather than rewriting every row to the same values.
+    """
+
+    STATUS_RUNNING = "running"
+    STATUS_SUCCESS = "success"
+    STATUS_FAILED = "failed"
+    STATUS_SKIPPED = "skipped"
+    STATUS_CHOICES = [
+        (STATUS_RUNNING, "Running"),
+        (STATUS_SUCCESS, "Success"),
+        (STATUS_FAILED, "Failed"),
+        (STATUS_SKIPPED, "Skipped -- input unchanged"),
+    ]
+
+    source = django_db_models.ForeignKey(
+        TireBrandSource,
+        on_delete=django_db_models.CASCADE,
+        related_name="runs",
+    )
+    status = django_db_models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_RUNNING, db_index=True)
+    dry_run = django_db_models.BooleanField(default=False, help_text="Read and map, write no spec rows.")
+    started_at = django_db_models.DateTimeField(default=timezone.now, db_index=True)
+    finished_at = django_db_models.DateTimeField(null=True, blank=True)
+
+    input_label = django_db_models.TextField(
+        blank=True,
+        default="",
+        help_text="What was read: the file path, or the URL and page count.",
+    )
+    input_fingerprint = django_db_models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text="sha256 of the bytes read. Same as last run = the source has not changed.",
+    )
+
+    rows_seen = django_db_models.PositiveIntegerField(default=0, help_text="Records the loader produced.")
+    rows_created = django_db_models.PositiveIntegerField(default=0)
+    rows_updated = django_db_models.PositiveIntegerField(default=0)
+    rows_unchanged = django_db_models.PositiveIntegerField(default=0)
+    rows_skipped = django_db_models.PositiveIntegerField(
+        default=0,
+        help_text="Records dropped before writing: filtered out, or carrying nothing that identifies a tire.",
+    )
+    rows_with_warnings = django_db_models.PositiveIntegerField(
+        default=0,
+        help_text="Written, but something did not parse -- see RawTireSpec.warnings.",
+    )
+    error = django_db_models.TextField(blank=True, default="")
+    stats = django_db_models.JSONField(
+        default=dict,
+        blank=True,
+        encoder=DjangoJSONEncoder,
+        help_text="Per-run detail worth keeping but not worth a column: warning histogram, unmapped source columns.",
+    )
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "tire_brand_source_runs"
+        indexes = [
+            django_db_models.Index(fields=["source", "-started_at"], name="tire_brand_run_source_idx"),
+        ]
+
+    def __str__(self):
+        return f"{self.source_id} {self.started_at:%Y-%m-%d %H:%M} {self.status}"
+
+
+class RawTireSpec(django_db_models.Model):
+    """
+    One tire exactly as its manufacturer publishes it, before anything of ours has an opinion.
+
+    A landing zone, like :class:`SimpleTireSku` and :class:`TdgProduct` and for the same reason:
+    it is deliberately **not** joined to ``MasterPart`` or ``TireSpec``. Collecting a brand's data
+    and matching it into our catalog are separate jobs with separate failure modes, and making the
+    first depend on the second means a brand we cannot match yet is a brand we do not collect.
+    The match happens later, out of this table, through ``src.integrations.services.tire_catalog``.
+
+    **Every typed column holds what the source published, and nothing else.** No column here is
+    ever filled by a parser, a lookup or a model -- if the brand did not state it, it is NULL, and
+    NULL means "not published", never 0 and never False. That rule is what makes the table worth
+    keeping: the moment a derived value can sit in one of these columns, nobody downstream can
+    tell an authority's figure from our guess at it, which is exactly the confusion
+    ``tire_specs.spec_source`` exists to prevent one level up.
+
+    Our own reading of the size lives in :attr:`parsed_size` instead -- a JSON dump of
+    ``src.domain.tire_size.parse(size_display)``, or NULL when the string will not parse, which is
+    also the triage query for a source whose size column is not what we assumed it was.
+
+    :attr:`raw` keeps the source record verbatim and :attr:`attributes` keeps every published
+    label/value pair flattened, including the ones no column covers. Between them, **a mapping fix
+    must never require a re-pull** -- re-map from these instead. That matters more here than in
+    the reseller tables: a manufacturer file often arrives once, by hand, from a rep who has moved
+    on by the time we notice the column we skipped.
+
+    ``(source, external_key)`` is the identity. ``external_key`` is the brand's own article number
+    where they publish one; where they do not, it is a deterministic digest of what does identify
+    the row (see ``brand_data.ingest.derive_external_key``), so a re-run of the same file updates
+    rows instead of doubling them.
+    """
+
+    source = django_db_models.ForeignKey(
+        TireBrandSource,
+        on_delete=django_db_models.CASCADE,
+        related_name="raw_tire_specs",
+        help_text="CASCADE: these rows are that source's output and mean nothing without it.",
+    )
+    external_key = django_db_models.CharField(
+        max_length=255,
+        help_text="The brand's own SKU/article number, or a digest of brand+part+size when they publish none.",
+    )
+
+    # ---- identity -------------------------------------------------------------------------------
+    part_number = django_db_models.CharField(max_length=128, null=True, blank=True)
+    part_number_key = django_db_models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="part_number through tire_catalog.part_key -- punctuation stripped. What a match joins on.",
+    )
+    gtin = django_db_models.CharField(
+        max_length=32,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="UPC/EAN as printed. Leading zeros are significant, so text, not a number.",
+    )
+    brand_name = django_db_models.CharField(max_length=128, null=True, blank=True)
+    brand_key = django_db_models.CharField(max_length=128, null=True, blank=True, db_index=True)
+    model_name = django_db_models.CharField(max_length=255, null=True, blank=True)
+    model_key = django_db_models.CharField(max_length=255, null=True, blank=True)
+    sub_model = django_db_models.CharField(
+        max_length=255,
+        null=True,
+        blank=True,
+        help_text="A line's variant where the brand names one separately: 'Plus', 'ZP', 'OE'.",
+    )
+
+    # ---- size, as published ----------------------------------------------------------------------
+    size_raw = django_db_models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        help_text="The size cell verbatim, whatever else it had glued to it.",
+    )
+    size_display = django_db_models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="The size alone, cleaned of surrounding text but NOT normalized. Fed to src.domain.tire_size.",
+    )
+    service_type = django_db_models.CharField(max_length=16, null=True, blank=True, help_text="P / LT / ST / T.")
+    load_index = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+    load_index_dual = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+    speed_rating = django_db_models.CharField(max_length=8, null=True, blank=True)
+    load_range = django_db_models.CharField(max_length=8, null=True, blank=True)
+    ply_rating = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+    parsed_size = django_db_models.JSONField(
+        null=True,
+        blank=True,
+        encoder=DjangoJSONEncoder,
+        help_text=(
+            "OUR decode of size_display via src.domain.tire_size, kept apart from the published "
+            "columns so the two can never be confused. NULL = the string did not parse; that "
+            "query is how a broken size column is found."
+        ),
+    )
+
+    # ---- the spec sheet, as published --------------------------------------------------------------
+    tread_depth_32nds = django_db_models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
+    max_load_lb = django_db_models.PositiveIntegerField(null=True, blank=True)
+    max_load_dual_lb = django_db_models.PositiveIntegerField(null=True, blank=True)
+    max_psi = django_db_models.PositiveSmallIntegerField(
+        null=True, blank=True, help_text="As published. NEVER derived from load range."
+    )
+    rim_width_min_in = django_db_models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
+    rim_width_max_in = django_db_models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
+    measured_rim_width_in = django_db_models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text=(
+            "The rim the published dimensions were measured on -- a single width inside the "
+            "approved range, not the range. Only a manufacturer publishes this, and without it "
+            "their diameter and section width are figures with no stated conditions."
+        ),
+    )
+    overall_diameter_in = django_db_models.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text=(
+            "MEASURED, on measured_rim_width_in. Not the same quantity as tire_specs."
+            "overall_diameter_in, which is the diameter the size prints and what '35 inch' "
+            "search matches. Do not copy one into the other."
+        ),
+    )
+    section_width_in = django_db_models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    tire_weight_lb = django_db_models.DecimalField(max_digits=7, decimal_places=2, null=True, blank=True)
+    revs_per_mile = django_db_models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Revolutions per mile. Published by manufacturers, by essentially no reseller, and the honest input to a speedometer-error calculation.",
+    )
+    utqg = django_db_models.CharField(max_length=16, null=True, blank=True, help_text="Verbatim, e.g. '500 A A'.")
+    utqg_treadwear = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+    utqg_traction = django_db_models.CharField(max_length=4, null=True, blank=True)
+    utqg_temperature = django_db_models.CharField(max_length=4, null=True, blank=True)
+    sidewall_style = django_db_models.CharField(
+        max_length=64, null=True, blank=True, help_text="Blackwall / Outlined White Letters / Raised White Letters."
+    )
+    tread_design = django_db_models.CharField(
+        max_length=32, null=True, blank=True, help_text="Symmetrical / Asymmetrical / Directional."
+    )
+    mileage_warranty_miles = django_db_models.PositiveIntegerField(null=True, blank=True)
+    commercial_position = django_db_models.CharField(
+        max_length=32, null=True, blank=True, help_text="Steer / Drive / Trailer / All Position."
+    )
+    oe_marking = django_db_models.CharField(
+        max_length=128,
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text=(
+            "Homologation codes as printed ('MO', 'N0', '*'). The manufacturer is the only party "
+            "who actually knows this, which is a large part of why this table exists."
+        ),
+    )
+    season_label = django_db_models.CharField(
+        max_length=64, null=True, blank=True, help_text="The brand's own season word, untranslated."
+    )
+    category_label = django_db_models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        help_text="The brand's own tread/segment word ('Highway All-Season', 'Ultra High Performance'), untranslated. Mapping it to our TreadCategory is a later, reviewable step.",
+    )
+    vehicle_class_label = django_db_models.CharField(max_length=64, null=True, blank=True)
+
+    # ---- flags: NULL = not published, never False ---------------------------------------------------
+    is_3pmsf = django_db_models.BooleanField(
+        null=True,
+        blank=True,
+        help_text="Three-Peak Mountain Snowflake. A certification with legal weight; absence is unknown, not 'no'.",
+    )
+    is_ms = django_db_models.BooleanField(null=True, blank=True)
+    is_run_flat = django_db_models.BooleanField(null=True, blank=True)
+    is_studdable = django_db_models.BooleanField(null=True, blank=True)
+    is_tubeless = django_db_models.BooleanField(null=True, blank=True)
+    has_reinforced_sidewall = django_db_models.BooleanField(null=True, blank=True)
+    is_discontinued = django_db_models.BooleanField(
+        null=True, blank=True, help_text="The brand's own word on it, where they say. Not inferred from absence."
+    )
+
+    # ---- links back to the brand ----------------------------------------------------------------------
+    product_url = django_db_models.TextField(null=True, blank=True)
+    image_url = django_db_models.TextField(null=True, blank=True)
+    spec_sheet_url = django_db_models.TextField(
+        null=True, blank=True, help_text="The PDF/page this row was read off, where there is one to point at."
+    )
+
+    # ---- provenance -------------------------------------------------------------------------------------
+    raw = django_db_models.JSONField(
+        null=True,
+        blank=True,
+        encoder=DjangoJSONEncoder,
+        help_text="The source record verbatim. Re-map from here; never re-pull to fix a mapping.",
+    )
+    attributes = django_db_models.JSONField(
+        default=dict,
+        blank=True,
+        encoder=DjangoJSONEncoder,
+        help_text="Every published label -> value, flattened -- including everything no column covers. Query this before adding a column.",
+    )
+    warnings = pg_fields.ArrayField(
+        django_db_models.TextField(),
+        default=list,
+        blank=True,
+        help_text="What did not parse on this row, e.g. 'size did not parse', 'tread_depth: 11/32nds ea.'. The triage list.",
+    )
+    content_hash = django_db_models.CharField(
+        max_length=64,
+        help_text="sha256 of the mapped values plus raw. Unchanged means the run has nothing to write for this row.",
+    )
+    last_seen_run = django_db_models.ForeignKey(
+        TireBrandSourceRun,
+        on_delete=django_db_models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="rows_seen_here",
+        help_text="Last run that found this row present. Rows the newest run did not see are the source's deletions.",
+    )
+    last_seen_at = django_db_models.DateTimeField(default=timezone.now, db_index=True)
+    last_changed_at = django_db_models.DateTimeField(
+        default=timezone.now, help_text="When a value last actually moved -- not when we last looked."
+    )
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "raw_tire_specs"
+        unique_together = [["source", "external_key"]]
+        indexes = [
+            # The match into our catalog: brand + MPN, the same shape tire_catalog's tier 1 uses.
+            django_db_models.Index(fields=["brand_key", "part_number_key"], name="raw_tire_brand_part_idx"),
+            django_db_models.Index(fields=["brand_key", "size_display"], name="raw_tire_brand_size_idx"),
+            # "what did this source last deliver" -- coverage and staleness reporting.
+            django_db_models.Index(fields=["source", "-last_seen_at"], name="raw_tire_source_seen_idx"),
+        ]
+
+    def __str__(self):
+        bits = [self.brand_name, self.model_name, self.size_display]
+        return f"{' '.join(b for b in bits if b)} ({self.external_key})"

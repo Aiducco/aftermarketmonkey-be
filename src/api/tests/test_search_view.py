@@ -175,8 +175,19 @@ class SearchFacetsViewTests(SimpleTestCase):
     def test_explicit_tires(self):
         self.assertEqual(self._get("?mode=tires").status_code, 200)
 
+    def test_wheels_returns_its_own_rail(self):
+        """Wheels were unsupported here until the wheel index shipped; this asserts the rail is
+        the wheel one, not tires' rail served under a different name."""
+        response = self._get("?mode=wheels")
+        self.assertEqual(response.status_code, 200)
+        body = simplejson.loads(response.content)
+        self.assertEqual(body["mode"], "wheels")
+        fields = [facet["field"] for facet in body["facets"]]
+        self.assertIn("bolt_pattern", fields)
+        self.assertNotIn("tread_category", fields)
+
     def test_unsupported_mode(self):
-        self.assertEqual(self._get("?mode=wheels").status_code, 400)
+        self.assertEqual(self._get("?mode=brake_pads").status_code, 400)
 
     def test_unauthenticated(self):
         self.assertEqual(self._get(authenticated=False).status_code, 401)

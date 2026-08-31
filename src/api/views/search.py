@@ -14,6 +14,7 @@ from django.utils.decorators import method_decorator
 from django.views.decorators.csrf import csrf_exempt
 
 from src.api.services import tire_search as tire_search_services
+from src.api.services import wheel_search as wheel_search_services
 from src.audit import parts as audit_parts
 from src.domain import tire_filters
 
@@ -44,7 +45,7 @@ class SearchView(views.View):
 
     Body:
         {
-          "mode":    "tires" | "parts",      optional -- omit to let the server route
+          "mode":    "tires" | "wheels" | "parts",   optional -- omit to let the server route
           "q":       "275/70R18 mud terrain",
           "filters": {"tread_category": "MT", "rim_diameter_in": 18},
           "sort":    "diameter_asc",
@@ -90,14 +91,28 @@ class SearchView(views.View):
             return _json({"message": "'filters' must be an object."}, status=400)
 
         try:
-            payload = tire_search_services.search(
-                q=body.get("q") or "",
-                filters=filters,
-                mode=mode,
-                sort=body.get("sort"),
-                limit=body.get("limit") or tire_search_services.DEFAULT_LIMIT,
-                offset=body.get("offset") or 0,
-            )
+            if mode == wheel_search_services.MODE_WHEELS:
+                # Wheels are their own service, not a branch inside tire search: the two are
+                # driven by different things (a typed size versus picked fitment) and tire search
+                # is live. They return the same envelope, so the client renders both the same way.
+                payload = wheel_search_services.search(
+                    q=body.get("q") or "",
+                    filters=filters,
+                    sort=body.get("sort"),
+                    limit=body.get("limit") or wheel_search_services.DEFAULT_LIMIT,
+                    offset=body.get("offset") or 0,
+                )
+            else:
+                payload = tire_search_services.search(
+                    q=body.get("q") or "",
+                    filters=filters,
+                    mode=mode,
+                    sort=body.get("sort"),
+                    limit=body.get("limit") or tire_search_services.DEFAULT_LIMIT,
+                    offset=body.get("offset") or 0,
+                )
+        except wheel_search_services.SearchError as exc:
+            return _json({"message": str(exc)}, status=400)
         except (tire_filters.UnknownFilterField, tire_filters.InvalidFilterValue) as exc:
             # An unrecognised filter key is a 400, never a silent drop: quietly ignoring it shows
             # the user more results than they asked for with no way to tell that happened.
@@ -134,6 +149,8 @@ class SearchFacetsView(views.View):
             return err
 
         mode = (request.GET.get("mode") or tire_search_services.MODE_TIRES).strip().lower()
+        if mode == wheel_search_services.MODE_WHEELS:
+            return _json({"mode": mode, "facets": wheel_search_services.facets_config()})
         if mode != tire_search_services.MODE_TIRES:
             return _json({"message": "Unsupported mode {!r}.".format(mode)}, status=400)
         return _json({"mode": mode, "facets": tire_search_services.facets_config()})

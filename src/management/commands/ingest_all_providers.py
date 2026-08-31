@@ -61,6 +61,7 @@ from src.integrations.services import (
     tirerack,
     vossen,
     wheelpros,
+    wheelpros_products,
     wps,
 )
 from src.search.meilisearch_client import is_configured, reindex_all_master_parts_zero_downtime
@@ -421,6 +422,27 @@ class Command(BaseCommand):
                         self._ingest_log("WheelPros: feed={} finished".format(ft))
                     except Exception as exc:  # noqa: BLE001
                         self._ingest_log("WheelPros: feed={} failed: {!s}".format(ft, exc))
+
+            # The Product API pass runs *after* the three CSV feeds so there are rows to enrich,
+            # and *before* the brand sync so any brand it creates gets mapped in the same run.
+            # Deliberately swallowed: the API is a separate entitlement on a separate transport,
+            # and it going down must not cost us the SFTP catalog we just ingested or the brand
+            # sync below. Failures are logged and the next night retries -- the upsert makes a
+            # partial pass harmless.
+            try:
+                self._ingest_log("WheelPros: Product API enrichment (images, UPC, nip, inventory)")
+                api_stats = wheelpros_products.run(
+                    wheelpros_products.get_product_api_client(),
+                    progress=lambda message: None,
+                )
+                self._ingest_log(
+                    "WheelPros: Product API done -- {} enriched, {} inserted, {} slices ({} failed)".format(
+                        api_stats.parts_updated, api_stats.parts_inserted,
+                        api_stats.slices_done, api_stats.slices_skipped,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._ingest_log("WheelPros: Product API enrichment failed: {!s}".format(exc))
 
             wheelpros.sync_unmapped_wheelpros_brands_to_brands()
 

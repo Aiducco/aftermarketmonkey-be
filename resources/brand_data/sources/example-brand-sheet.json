@@ -1,0 +1,50 @@
+[
+  {
+    "slug": "example-brand-sheet",
+    "brand_name": "Example Tire Co",
+    "method": "csv",
+    "handler": "csv",
+    "status": "planned",
+    "priority": 50,
+    "refresh_interval_days": 90,
+    "source_url": "https://dealers.example.com/downloads/tech-data",
+    "contact": "rep@example.com",
+    "notes": "TEMPLATE, not a real source. Copy this file, keep the field_map shape, delete this note. The sheet arrives quarterly by email; save it as resources/brand_data/example/<year>-q<n>.xlsx and update config.path.",
+    "config": {
+      "path": "resources/brand_data/example/2026-q3.xlsx",
+      "sheet": "Passenger",
+      "header_row": 1,
+      "row_filter": {"Product Type": ["Tire"]},
+      "field_map": {
+        "brand_name": {"const": "Example Tire Co"},
+        "external_key": "Article No.",
+        "part_number": "Article No.",
+        "gtin": "UPC",
+        "model_name": ["Pattern", "Tread Pattern"],
+        "size_raw": "Size",
+        "service_description": "Load Index / Speed Symbol",
+        "load_range": "Load Range",
+        "utqg": "UTQG",
+        "tread_depth_32nds": "Tread Depth",
+        "rim_width_range": "Approved Rim Widths",
+        "measured_rim_width_in": "Measuring Rim",
+        "overall_diameter_in": "Overall Diameter",
+        "section_width_in": "Section Width",
+        "max_load_lb": "Max Load",
+        "max_psi": "Max Inflation Pressure",
+        "tire_weight_lb": "Weight",
+        "revs_per_mile": "Revolutions per Mile",
+        "sidewall_style": "Sidewall",
+        "tread_design": "Tread Pattern Type",
+        "mileage_warranty_miles": "Limited Warranty",
+        "oe_marking": "OE Marking",
+        "season_label": "Season",
+        "category_label": "Segment",
+        "is_3pmsf": "3PMSF",
+        "is_run_flat": "Run Flat",
+        "is_studdable": "Studdable",
+        "product_url": "Product Page"
+      }
+    }
+  }
+]

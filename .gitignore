@@ -146,3 +146,10 @@ settings.py
 summit_racing_cookie.local.txt
 .env.bak
 .env.bak2
+
+# Analysis output and scraped data dumps. These are produced by report/enrichment commands
+# (report_tire_catalog_gaps --report, the brand surveys, the SimpleTire and Wheel Pros crawlers)
+# and are working artifacts, not source. They are regenerable and some are large.
+/*.csv
+/result.txt
+logs/*.jsonl

@@ -1,0 +1,13 @@
+# Manufacturer data files are snapshots that arrive by hand and are large; kept locally, not
+# committed. Drop them here in a per-brand, dated folder so a row can be traced to an edition:
+#   resources/brand_data/michelin/2026-q3-us-databook.xlsx
+# The source declarations in sources/ ARE committed -- they are the column maps, and they want
+# review and a history.
+*.csv
+*.tsv
+*.xlsx
+*.xlsm
+*.pdf
+*.json
+!sources/*.json
+!.gitignore

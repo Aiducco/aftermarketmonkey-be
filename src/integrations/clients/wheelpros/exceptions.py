@@ -74,3 +74,13 @@ class WheelProsVehiclePermissionError(WheelProsException):
 class WheelProsVehicleNotFound(WheelProsException):
     """404 from a /vehicles call — that year/make/model/submodel has no record. Expected during
     a crawl (a listing can name a model whose detail endpoint 404s); callers skip, not abort."""
+
+
+# -- Product API (REST, Bearer JWT auth) --------------------------------------------------
+
+class WheelProsProductAPIException(WheelProsException):
+    """Transport-level or unexpected failure calling the Wheel Pros Product API."""
+
+
+class WheelProsProductPermissionError(WheelProsException):
+    """403 from a /products call — the account is not entitled to the Product API."""
