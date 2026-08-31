@@ -131,6 +131,30 @@ class Slice:
 # -- planning -------------------------------------------------------------------------------------
 
 
+def _filterable(value: str, *, param: str, kind: str) -> str:
+    """
+    A facet value trimmed to something the search endpoint will actually accept as a filter.
+
+    Wheel Pros' own catalogue contains brand names with an ampersand ("Teraflex Axles & Shafts"),
+    and passing one back as a filter returns a hard 500 ("Error while searching ACC") no matter
+    how it is encoded -- their bug, not an encoding mistake on our side. Since ``brand`` matches
+    as a *prefix*, truncating at the ampersand addresses the same rows: ``brand=Teraflex Axles``
+    returns exactly the 168 SKUs that ``Teraflex Axles & Shafts`` refuses to.
+
+    The prefix may match sibling brands too. That is harmless -- slices are allowed to overlap,
+    rows are keyed by sku, and the upsert is idempotent -- and the slice's expected count is
+    re-derived from the truncated filter, so the completeness check still holds.
+    """
+    if not isinstance(value, str) or "&" not in value:
+        return value
+    trimmed = value.split("&")[0].strip()
+    logger.info(
+        "%s %s: %s=%r 500s on their side; using the prefix %r instead",
+        _LOG_PREFIX, kind, param, value, trimmed,
+    )
+    return trimmed
+
+
 def plan_slices(
     client,
     kind: str,
@@ -184,6 +208,8 @@ def plan_slices(
                 continue
             # An empty facet value cannot be expressed as a filter, so it can never be fetched
             # as its own slice. Surface it rather than silently dropping those rows.
+            original_value = value
+            value = _filterable(value, param=param, kind=kind)
             if value == "":
                 logger.warning(
                     "%s %s: %s rows have an empty %s and cannot be sliced on it",
@@ -191,7 +217,12 @@ def plan_slices(
                 )
                 out.append(Slice(kind=kind, filters=filters, expected=count))
                 continue
-            out.extend(split(filters + ((param, value),), rest, count))
+            child_filters = filters + ((param, value),)
+            if value != original_value:
+                # The prefix may span more rows than this one bucket; ask for the real figure so
+                # fetch_slice checks against what the filter will actually return.
+                count = client.true_count(kind, **dict(child_filters))
+            out.extend(split(child_filters, rest, count))
         return out
 
     total = client.true_count(kind)
