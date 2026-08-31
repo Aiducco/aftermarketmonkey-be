@@ -197,3 +197,45 @@ class ContractTests(SimpleTestCase):
         """623 wheels have a feed that contradicts its own title. A buyer should not be the one
         who discovers it."""
         self.assertIs(wheel_spec_display.build_wheel_specs(_row(size_disputed=True))["size_disputed"], True)
+
+
+class BlankContradictionTests(SimpleTestCase):
+    """
+    A card showed "5x114.3" and a crossed-out "Blank (undrilled)" pill together, which reads as a
+    contradiction. The data is fine -- a check constraint forbids a blank from carrying a circle
+    and zero rows violate it -- so the fix is to say nothing rather than to say "not blank".
+    """
+
+    databases = []
+
+    def test_a_normal_wheel_says_nothing_about_being_blank(self):
+        self.assertIsNone(wheel_spec_display.build_wheel_specs(_row())["is_blank_drilled"])
+
+    def test_an_undrilled_wheel_still_says_so(self):
+        card = wheel_spec_display.build_wheel_specs(
+            _row(is_blank_drilled=True, bolt_lug_count=None, bolt_circle_mm=None)
+        )
+        self.assertIs(card["is_blank_drilled"], True)
+        self.assertIsNone(card["bolt_pattern"])
+
+
+class DisplayCasingTests(SimpleTestCase):
+    """The feeds shout. Raw casing on a product page reads as unprocessed data."""
+
+    databases = []
+
+    def test_shouted_values_get_a_display_form(self):
+        card = wheel_spec_display.build_wheel_specs(
+            _row(finish="GLOSS BLACK MILLED", lug_seat="CONICAL", finish_family="black")
+        )
+        self.assertEqual(card["finish"], "GLOSS BLACK MILLED")
+        self.assertEqual(card["finish_display"], "Gloss Black Milled")
+        self.assertEqual(card["lug_seat_display"], "Conical")
+        self.assertEqual(card["finish_family_label"], "Black")
+
+    def test_mixed_case_is_left_as_the_source_wrote_it(self):
+        card = wheel_spec_display.build_wheel_specs(_row(finish="Matte Black w/ Milled Accents"))
+        self.assertEqual(card["finish_display"], "Matte Black w/ Milled Accents")
+
+    def test_abbreviations_are_not_capitalised_into_words(self):
+        self.assertEqual(wheel_spec_display._title_case("OE TPMS UTV"), "OE TPMS UTV")

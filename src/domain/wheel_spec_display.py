@@ -89,6 +89,22 @@ def _text(value: typing.Any) -> typing.Optional[str]:
     return text or None
 
 
+# Words a title-caser would otherwise mangle: they are abbreviations, not words.
+_KEEP_UPPER = frozenset(["OE", "OEM", "TPMS", "UTV", "ATV", "RWL", "OWL", "SS", "II", "III", "XL"])
+
+
+def _title_case(value: typing.Any) -> typing.Optional[str]:
+    """ "GLOSS BLACK MILLED" -> "Gloss Black Milled", leaving abbreviations alone."""
+    text = _text(value)
+    if text is None:
+        return None
+    # Genuinely mixed case is the source's own styling and is left alone ("Matte Black w/ Milled
+    # Accents"). All-upper and all-lower are both machine artefacts and both get cased.
+    if text != text.upper() and text != text.lower():
+        return text
+    return " ".join(word if word in _KEEP_UPPER else word.capitalize() for word in text.split())
+
+
 def _isoformat(value: typing.Any) -> typing.Optional[str]:
     return value.isoformat() if value is not None and hasattr(value, "isoformat") else None
 
@@ -166,8 +182,16 @@ def build_wheel_specs(row: typing.Mapping[str, typing.Any]) -> typing.Dict[str, 
         "bolt_pattern_2": _bolt_pattern(
             row.get("bolt_lug_count_2"), row.get("bolt_circle_mm_2"), row.get("bolt_pattern_2_display")
         ),
-        # Undrilled, machined to order. Fits nothing as shipped -- never "pattern unknown".
-        "is_blank_drilled": bool(row.get("is_blank_drilled")),
+        # True on an undrilled wheel, **None otherwise** -- deliberately not False.
+        #
+        # The card renders every key and a false boolean draws as a crossed-out pill, so shipping
+        # False put "Blank (undrilled) ✕" underneath a perfectly good "5x114.3" and read as a
+        # contradiction. There is no contradiction in the data: a check constraint forbids a blank
+        # from having a circle and zero rows violate it. The fix is to say nothing rather than to
+        # say "not blank", which is what the other flags on this card already do.
+        #
+        # The search index keeps the real boolean -- an undrilled wheel has to stay excludable.
+        "is_blank_drilled": True if row.get("is_blank_drilled") else None,
         "offset_mm": offset,
         "backspacing_in": _decimal(backspacing),
         "center_bore_mm": _decimal(row.get("center_bore_mm")),
@@ -190,14 +214,20 @@ def build_wheel_specs(row: typing.Mapping[str, typing.Any]) -> typing.Dict[str, 
         "piece_count": row.get("piece_count"),
         # The manufacturer's own wording, and the bucket the facet rail groups it under. Both, so
         # the card can show "Matte Black w/ Milled Accents" while the filter says "black".
+        # Both, and both ready to render. The feeds shout -- "GLOSS BLACK MILLED", "CONICAL" --
+        # and raw feed casing on a product page reads as unprocessed data, so the card carries a
+        # display form beside the verbatim one rather than making every client title-case it.
         "finish": _text(row.get("finish")),
+        "finish_display": _title_case(row.get("finish")),
         "finish_family": _text(row.get("finish_family")),
+        "finish_family_label": _title_case(row.get("finish_family")),
         # ---- ownership ---------------------------------------------------------------------------
         "weight_lb": _decimal(row.get("weight_lb")),
         "structural_warranty": _text(row.get("structural_warranty")),
         "finish_warranty": _text(row.get("finish_warranty")),
         # ---- fitment -----------------------------------------------------------------------------
         "lug_seat": _text(row.get("lug_seat")),
+        "lug_seat_display": _title_case(row.get("lug_seat")),
         "lug_thread_size": _text(row.get("lug_thread_size")),
         "hub_rings": _text(row.get("hub_rings")),
         "hub_rings_label": HUB_RING_LABELS.get(row.get("hub_rings") or ""),

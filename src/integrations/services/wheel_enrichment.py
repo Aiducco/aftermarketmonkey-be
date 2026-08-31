@@ -62,6 +62,42 @@ _KEYWORDS = {
     "is_dually": (re.compile(r"\bDUALLY\b", re.IGNORECASE), True),
 }
 _UTV_RE = re.compile(r"\bUTV\b", re.IGNORECASE)
+
+# Bolt patterns that belong to exactly one kind of vehicle, so the class follows from the geometry
+# with nothing guessed. Only these two: no passenger car is drilled 8x200 or 10x225, and nothing
+# but an ATV or a side-by-side is drilled 4x137.
+#
+# Deliberately absent are the patterns that look tempting and are not decisive. 5x114.3 and 6x139.7
+# span cars, crossovers and trucks; mapping them would have labelled 11,236 wheels on a guess.
+# Those stay NULL until a feed says otherwise.
+VEHICLE_CLASS_BY_BOLT_PATTERN = {
+    (8, "200"): "commercial",
+    (10, "225"): "commercial",
+    (8, "210"): "commercial",
+    (8, "275"): "commercial",
+    (4, "137"): "atv_utv",
+    (4, "156"): "atv_utv",
+    (4, "110"): "atv_utv",
+    (4, "115"): "atv_utv",
+    (4, "144"): "atv_utv",
+}
+
+
+def _vehicle_class(text: str, patterns) -> typing.Optional[str]:
+    """UTV in the name, or a bolt pattern only one kind of vehicle uses. Otherwise nothing."""
+    if _UTV_RE.search(text):
+        return "atv_utv"
+    for pattern in patterns:
+        # wheel_size._trim, not a bare rstrip: stripping trailing zeros off "200" yields "2", which
+        # silently matched nothing for 8x200 and 8x210 while 10x225 worked, because 225 happens to
+        # end in a non-zero digit.
+        key = (pattern.lug_count, wheel_size._trim(pattern.circle_mm))
+        found = VEHICLE_CLASS_BY_BOLT_PATTERN.get(key)
+        if found:
+            return found
+    return None
+
+
 _FORGED_RE = re.compile(r"\bFORGED\b", re.IGNORECASE)
 
 
@@ -407,7 +443,7 @@ def build_spec(row: dict, *, feed: str, stats: typing.Optional[EnrichStats] = No
         finish=_clean(row.get("finish_raw"), limit=128),
         finish_family=finish_family(row.get("finish_raw")),
         construction=src_models.WheelSpec.CONSTRUCTION_FORGED if _FORGED_RE.search(text) else None,
-        vehicle_class="atv_utv" if _UTV_RE.search(text) else None,
+        vehicle_class=_vehicle_class(text, patterns),
         is_beadlock=True if _KEYWORDS["is_beadlock"][0].search(text) else None,
         is_dually=_boolean(row.get("dually_raw")) or (True if _KEYWORDS["is_dually"][0].search(text) else None),
         tpms_compatible=_boolean(row.get("tpms_raw")),
@@ -440,10 +476,18 @@ def build_spec(row: dict, *, feed: str, stats: typing.Optional[EnrichStats] = No
     return spec
 
 
+# What distributors write in place of a null. The Wheel Group ships a literal "NONE" in its screw
+# column on 820 rows, which reached the detail card as the text "Lug thread size: NONE" -- a row
+# that should not have rendered at all.
+_PLACEHOLDER_VALUES = frozenset(["", "NONE", "N/A", "NA", "NULL", "-", "--", "TBD", "UNKNOWN"])
+
+
 def _clean(value: typing.Optional[str], *, limit: int = 255) -> typing.Optional[str]:
     if value is None:
         return None
     text = str(value).strip()
+    if text.upper() in _PLACEHOLDER_VALUES:
+        return None
     return text[:limit] or None
 
 

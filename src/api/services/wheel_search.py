@@ -501,6 +501,10 @@ def _shape_facets(
         config = by_attribute.get(attribute)
         if config is None or not counts:
             continue
+        # A value nothing in this result set has is a control that cannot narrow anything: click it
+        # and you get an empty page. Meilisearch does not normally return zeros, but a stale or
+        # partially-built index can, and the tire rail already drops them.
+        counts = {value: count for value, count in counts.items() if count > 0}
         if len(counts) < config["min_distinct_values"]:
             continue
         kind = FILTER_FIELDS[config["field"]][1]

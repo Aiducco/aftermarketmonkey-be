@@ -176,3 +176,50 @@ class FeedSqlTests(SimpleTestCase):
         quoted = 'f."offset"'
         for name, feed in wheel_enrichment.FEEDS.items():
             self.assertIn(quoted, feed.sql, "{} selects offset without quoting it".format(name))
+
+
+class PlaceholderTests(SimpleTestCase):
+    databases = []
+
+    def test_a_distributor_placeholder_is_not_a_value(self):
+        """The Wheel Group ships a literal "NONE" in its screw column on 820 rows, which rendered
+        on the detail card as "Lug thread size: NONE"."""
+        spec = wheel_enrichment.build_spec(_row(lug_thread_raw="NONE"), feed="thewheelgroup")
+        self.assertIsNone(spec.lug_thread_size)
+
+    def test_the_usual_suspects(self):
+        for text in ("NONE", "N/A", "NA", "NULL", "-", "", "  ", "TBD", "unknown"):
+            self.assertIsNone(wheel_enrichment._clean(text), repr(text))
+
+    def test_a_real_value_survives(self):
+        self.assertEqual(wheel_enrichment._clean("M14 x 1.5"), "M14 x 1.5")
+
+
+class VehicleClassTests(SimpleTestCase):
+    databases = []
+
+    def _class(self, pattern, title=""):
+        return wheel_enrichment.build_spec(
+            _row(bolt_pattern_1=pattern, title=title, size_raw="20X8.25"), feed="wheelpros"
+        ).vehicle_class
+
+    def test_patterns_only_one_kind_of_vehicle_uses(self):
+        self.assertEqual(self._class("8X200"), "commercial")
+        self.assertEqual(self._class("10X225"), "commercial")
+        self.assertEqual(self._class("4X137"), "atv_utv")
+
+    def test_a_trailing_zero_does_not_break_the_lookup(self):
+        """format(Decimal("200"), "f").rstrip("0") is "2". That silently left 8x200 and 8x210
+        unlabelled while 10x225 worked, because 225 ends in a non-zero digit."""
+        for pattern in ("8X200", "8X210", "10X225"):
+            self.assertIsNotNone(self._class(pattern), pattern)
+
+    def test_an_ambiguous_pattern_is_left_alone(self):
+        """5x114.3 and 6x139.7 span cars, crossovers and trucks. Mapping them would have labelled
+        11,236 wheels on a guess."""
+        self.assertIsNone(self._class("5X114.3"))
+        self.assertIsNone(self._class("6X139.7"))
+        self.assertIsNone(self._class("6X135"))
+
+    def test_the_title_still_wins_for_utv(self):
+        self.assertEqual(self._class("5X114.3", title="SHREDDER SS UTV 22X7"), "atv_utv")

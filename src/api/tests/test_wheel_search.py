@@ -199,3 +199,15 @@ class QueryToFilterTests(SimpleTestCase):
     def test_a_whole_number_chip_is_not_rendered_with_a_decimal(self):
         chips = wheel_search._build_chips({"diameter_in": 20.0})
         self.assertEqual(chips[0]["display"], "Diameter 20 in")
+
+
+class ZeroCountFacetTests(SimpleTestCase):
+    databases = []
+
+    def test_a_value_nothing_has_is_not_a_control(self):
+        """Click it and you get an empty page."""
+        shaped = wheel_search._shape_facets({"finish_family": {"black": 9, "bronze": 0, "gold": 0}})
+        self.assertEqual([v["value"] for v in shaped[0]["values"]], ["black"])
+
+    def test_a_facet_where_nothing_survives_is_dropped(self):
+        self.assertEqual(wheel_search._shape_facets({"brand_name": {"FUEL 1PC": 0, "KMC": 0}}), [])
