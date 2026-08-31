@@ -7096,6 +7096,23 @@ def sync_provider_pricing_from_turn14_for_company(company_id: int) -> None:
 
     now = timezone.now()
 
+    # Watermark -- see sync_provider_pricing_from_meyer_for_company for the full rationale.
+    # turn_14_sweeps._upsert_turn14_brand_pricing_skip_unchanged only bumps
+    # Turn14BrandPricing.updated_at when a row's price actually changed, so filtering on it here
+    # means walking only what changed since the last successful propagation instead of the whole
+    # ~780k-row per-company table every cycle -- confirmed live 2026-08-31 investigating why
+    # Turn14 pricing jobs take 30-65 minutes.
+    sync_started_at = timezone.now()
+    company_provider = src_models.CompanyProviders.objects.filter(
+        company_id=company_id, provider__kind=src_enums.BrandProviderKind.TURN_14.value,
+    ).first()
+    watermark = company_provider.pricing_propagation_watermark if company_provider else None
+    logger.info(
+        "{} Turn14 pricing company={}: propagation watermark={}.".format(
+            _LOG_PREFIX, company_id, watermark or "none (processing everything)",
+        )
+    )
+
     def _worker(catalog_ids: typing.Set[int]) -> int:
         if not catalog_ids:
             return 0
@@ -7104,12 +7121,15 @@ def sync_provider_pricing_from_turn14_for_company(company_id: int) -> None:
         last_id = 0
         while True:
             batch_num += 1
+            qs = src_models.Turn14BrandPricing.objects.filter(
+                id__gt=last_id,
+                company_id=company_id,
+                brand_id__in=catalog_ids,
+            )
+            if watermark:
+                qs = qs.filter(updated_at__gte=watermark)
             batch = list(
-                src_models.Turn14BrandPricing.objects.filter(
-                    id__gt=last_id,
-                    company_id=company_id,
-                    brand_id__in=catalog_ids,
-                )
+                qs
                 .order_by("id")
                 .values("id", "external_id", "purchase_cost", "pricelists", "company_id")[:BATCH_SIZE_PRICING]
             )
@@ -7179,6 +7199,10 @@ def sync_provider_pricing_from_turn14_for_company(company_id: int) -> None:
     logger.info("{} Synced {} Turn14 pricing records for company_id={}.".format(
         _LOG_PREFIX, total_upserted, company_id,
     ))
+
+    if company_provider:
+        company_provider.pricing_propagation_watermark = sync_started_at
+        company_provider.save(update_fields=["pricing_propagation_watermark"])
 
 
 def sync_provider_pricing_from_keystone_for_company(company_id: int) -> None:

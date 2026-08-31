@@ -24,12 +24,14 @@ A flat sweep is also the only way to notice an item Turn 14 has *withdrawn*. The
 only ever upserts, so a SKU that disappears from the feed stays ``active=True`` forever. See
 :func:`deactivate_items_missing_from_sweep`.
 """
+import json
 import logging
 import time
 import typing
 from decimal import Decimal, InvalidOperation
 
 import pgbulk
+from django.db import connection
 from django.utils import timezone
 
 from src import models as src_models
@@ -617,6 +619,68 @@ def deactivate_items_missing_from_sweep(sweep_started_at) -> int:
 # Customer-specific sweep
 # ---------------------------------------------------------------------------------------
 
+def _upsert_turn14_brand_pricing_skip_unchanged(
+    instances: typing.List[src_models.Turn14BrandPricing],
+) -> int:
+    """
+    Hand-written upsert (not pgbulk) so a row whose price genuinely did not change is a true
+    no-op -- no row touched, no index maintenance, ``updated_at`` left alone -- instead of
+    bumping ``updated_at`` on every one of ~780k rows every cycle regardless of whether Turn 14's
+    price actually moved. Mirrors ``meyer.py``'s ``_flush_buf``, built from the same kind of
+    investigation there (company_provider_id=19): comparing on the real columns via
+    ``IS DISTINCT FROM`` and excluding ``updated_at`` from that comparison (it always differs)
+    means it only actually advances when something real changed, so it becomes a genuine "this
+    row's price last changed at" signal -- which is what
+    ``sync_provider_pricing_from_turn14_for_company`` (master_parts.py) filters on downstream to
+    skip walking and re-propagating rows that did not change at all.
+    """
+    if not instances:
+        return 0
+    now = timezone.now()
+    rows = [
+        (
+            inst.external_id,
+            inst.brand_id,
+            inst.company_id,
+            inst.type,
+            inst.purchase_cost,
+            inst.has_map,
+            inst.can_purchase,
+            json.dumps(inst.pricelists) if inst.pricelists is not None else None,
+            now,
+            now,
+        )
+        for inst in instances
+    ]
+    placeholders = ", ".join(["(%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)"] * len(rows))
+    params = [v for row in rows for v in row]
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO turn14_brand_pricing
+                (external_id, brand_id, company_id, type, purchase_cost, has_map, can_purchase,
+                 pricelists, created_at, updated_at)
+            VALUES {}
+            ON CONFLICT (company_id, external_id) DO UPDATE SET
+                brand_id = EXCLUDED.brand_id,
+                type = EXCLUDED.type,
+                purchase_cost = EXCLUDED.purchase_cost,
+                has_map = EXCLUDED.has_map,
+                can_purchase = EXCLUDED.can_purchase,
+                pricelists = EXCLUDED.pricelists,
+                updated_at = EXCLUDED.updated_at
+            WHERE (turn14_brand_pricing.brand_id, turn14_brand_pricing.type,
+                   turn14_brand_pricing.purchase_cost, turn14_brand_pricing.has_map,
+                   turn14_brand_pricing.can_purchase, turn14_brand_pricing.pricelists)
+                IS DISTINCT FROM
+                  (EXCLUDED.brand_id, EXCLUDED.type, EXCLUDED.purchase_cost, EXCLUDED.has_map,
+                   EXCLUDED.can_purchase, EXCLUDED.pricelists)
+            """.format(placeholders),
+            params,
+        )
+    return len(instances)
+
+
 def sweep_pricing_for_company_provider(
     company_provider: src_models.CompanyProviders,
     pace_seconds: typing.Optional[float] = None,
@@ -660,6 +724,8 @@ def sweep_pricing_for_company_provider(
                 # against a brand, so skip it; the next items sweep will pick it up.
                 continue
             attributes = row.get("attributes") or {}
+            # updated_at is deliberately not set here -- _upsert_turn14_brand_pricing_skip_unchanged
+            # computes and applies it itself, only when a row actually changes.
             instances.append(src_models.Turn14BrandPricing(
                 external_id=external_id,
                 brand_id=brand_id,
@@ -669,20 +735,10 @@ def sweep_pricing_for_company_provider(
                 has_map=bool(attributes.get("has_map", False)),
                 can_purchase=bool(attributes.get("can_purchase", False)),
                 pricelists=attributes.get("pricelists"),
-                updated_at=timezone.now(),
             ))
         if not instances:
             return 0
         instances = _dedupe_by_external_id(instances)
-        pgbulk.upsert(
-            src_models.Turn14BrandPricing,
-            instances,
-            unique_fields=["company", "external_id"],
-            update_fields=[
-                "brand", "type", "purchase_cost", "has_map", "can_purchase", "pricelists",
-                "updated_at",
-            ],
-        )
-        return len(instances)
+        return _upsert_turn14_brand_pricing_skip_unchanged(instances)
 
     return _sweep("pricing company={}".format(company.name), client.get_pricing, flush, pace_seconds=pace_seconds)
