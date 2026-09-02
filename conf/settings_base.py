@@ -630,3 +630,15 @@ PREMIER_ORDER_ENVIRONMENT = os.environ.get("PREMIER_ORDER_ENVIRONMENT", "product
 # best-effort default pending confirmation against ShopMonkey's current API docs — override via
 # env if it turns out to differ.
 SHOPMONKEY_API_BASE_URL = os.environ.get("SHOPMONKEY_API_BASE_URL", "https://api.shopmonkey.cloud/v3")
+# Motor State FTP feed: one CSV per dealer account, named after the account number in the
+# login (853809@motorstateftp.com -> 853809.csv), so only ftp_user / ftp_password are stored
+# per company in CompanyProviders.credentials["feed"]. Plain FTP, not FTPS — the server's
+# passive data channel refuses connections after PROT P (see clients/motorstate/ftp_client.py).
+try:
+    _motorstate_ftp_port = int(os.environ.get("MOTORSTATE_FTP_PORT") or "21")
+except ValueError:
+    _motorstate_ftp_port = 21
+MOTORSTATE_FTP_HOST = os.environ.get("MOTORSTATE_FTP_HOST") or "ftp.motorstateftp.com"
+MOTORSTATE_FTP_PORT = _motorstate_ftp_port if 1 <= _motorstate_ftp_port <= 65535 else 21
+MOTORSTATE_FTP_DIRECTORY = os.environ.get("MOTORSTATE_FTP_DIRECTORY") or ""
+MOTORSTATE_FEED_LOCAL_PATH = os.environ.get("MOTORSTATE_FEED_LOCAL_PATH", "/tmp/motorstate_feed.csv")

@@ -54,6 +54,7 @@ from src.integrations.services import (
     master_parts,
     meyer,
     motorstate,
+    motorstate_feed,
     premier,
     quadratec,
     rough_country,
@@ -323,13 +324,13 @@ class Command(BaseCommand):
             "Motor State source fetch + unmapped brand sync complete (derived in sync_all).",
             continue_on_error=True,
         ):
-            # Brands + incremental availability only. The full per-brand spine rebuild and the
-            # ~10.4k-call product hydrate are far too heavy for the nightly window -- the spine
-            # is a one-off (fetch_motorstate_availability) and product detail/pricing refreshes
-            # on the throttled pricing-job cadence (see integration_pricing_sync_jobs).
-            self._ingest_log("Motor State: brands + availability updates + unmapped brand sync")
-            motorstate.fetch_and_save_motorstate_brands()
-            motorstate.fetch_and_save_motorstate_availability_updates()
+            # One FTP file carries the whole catalog, so the nightly pass reads it end to end --
+            # no availability spine, no per-part hydrate. Brands come from the feed too (the
+            # API's brand list runs behind it). Per-company pricing is not pulled here; that
+            # belongs to the pricing-job queue (see integration_pricing_sync_jobs).
+            self._ingest_log("Motor State: FTP catalog feed + unmapped brand sync")
+            motorstate_feed.fetch_and_save_motorstate_catalog_from_feed(force_download=True)
+            motorstate_feed.sync_motorstate_content_from_feed(force_download=True)
             motorstate.sync_unmapped_motorstate_brands_to_brands()
 
     def _run_wps(self) -> None:

@@ -69,14 +69,14 @@ _PRICING_SYNC_KINDS = frozenset(
 )
 
 # Kinds whose *recurring* pricing refresh is deliberately slower than the nightly cycle,
-# mapped to their minimum interval. Motor State has no bulk pricing endpoint -- a refresh is
-# ~10.4k sequential /api/Product calls (15 part numbers each), far too heavy to repeat nightly,
-# and its dealer prices move slowly. The first sync for a connection is never throttled: it is
+# mapped to their minimum interval. The first sync for a connection is never throttled: it is
 # enqueued directly by connect/reconnect (enqueue_company_provider_pricing_sync), which does not
 # consult this map, so a newly connected company still gets a full pricing sync immediately.
-_RECURRING_PRICING_MIN_INTERVAL = {
-    src_enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING.value: datetime.timedelta(days=7),
-}
+#
+# Motor State was throttled to 7 days while its pricing came from the API, where a refresh
+# meant ~10.4k sequential /api/Product calls. Its prices now come from the FTP feed -- one
+# file download per connection -- so it runs on the normal nightly cadence like everyone else.
+_RECURRING_PRICING_MIN_INTERVAL = {}
 
 
 def _recurring_pricing_sync_is_due(company_provider_id: int, kind: int) -> bool:

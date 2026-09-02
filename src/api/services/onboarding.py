@@ -408,6 +408,32 @@ def get_distributor_credentials_info() -> dict:
             "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("TIRERACK", "TireRack"),
             "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("TIRERACK") or None,
         },
+        "motor_state_distributing": {
+            "required": [
+                src_constants.MOTOR_STATE_CREDENTIALS_FTP_USER,
+                src_constants.MOTOR_STATE_CREDENTIALS_FTP_PASSWORD,
+            ],
+            "optional": [
+                src_constants.MOTOR_STATE_CREDENTIALS_CONTENT_FTP_USER,
+                src_constants.MOTOR_STATE_CREDENTIALS_CONTENT_FTP_PASSWORD,
+                src_constants.MOTOR_STATE_CREDENTIALS_API_KEY,
+            ],
+            "description": (
+                "Motor State FTP username and password for your dealer account (host "
+                "ftp.motorstateftp.com, port 21, is fixed, and your feed file is named after the "
+                "account number in the login \u2014 there is nothing else to enter). Ask your Motor "
+                "State account manager to enable FTP feed access for your account number. "
+                "Catalog, stock and your own dealer pricing all come from that one file. "
+                "Optionally, if Motor State issued you a second account whose file carries "
+                "product images, category levels and long descriptions, enter it as "
+                "content_ftp_user / content_ftp_password and those fields will be overlaid on "
+                "the catalog. The API key is only needed for order placement, not for the feed."
+            ),
+            "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get(
+                "MOTOR_STATE_DISTRIBUTING", "Motor State Distributing"
+            ),
+            "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("MOTOR_STATE_DISTRIBUTING") or None,
+        },
         "helmhouse": {
             "required": [
                 src_constants.HELMET_HOUSE_CREDENTIALS_FTP_USER,

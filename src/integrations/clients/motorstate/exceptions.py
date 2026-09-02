@@ -16,3 +16,15 @@ class MotorStatePermissionError(MotorStateAPIBadResponseCodeError):
     lacks access to an endpoint (e.g. the undocumented ProductSearch/ProductQuery
     routes), so the two cannot be told apart from the response alone.
     """
+
+
+class MotorStateFTPException(Exception):
+    """Base for the FTP feed client (separate from the ordering API's exception tree)."""
+
+
+class MotorStateFTPConnectionError(MotorStateFTPException):
+    pass
+
+
+class MotorStateFeedNotFoundError(MotorStateFTPException):
+    pass

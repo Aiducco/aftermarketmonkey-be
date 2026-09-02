@@ -26,7 +26,7 @@ from src.integrations.clients.keystone import order_client as keystone_order_cli
 from src.integrations.clients.meyer import client as meyer_client
 from src.integrations.clients.meyer import exceptions as meyer_exceptions
 from src.integrations.clients.meyer import order_client as meyer_order_client
-from src.integrations.clients.motorstate import client as motorstate_client
+from src.integrations.clients.motorstate import ftp_client as motorstate_ftp_client
 from src.integrations.clients.motorstate import exceptions as motorstate_exceptions
 from src.integrations.clients.premier import client as premier_client
 from src.integrations.clients.premier import exceptions as premier_exceptions
@@ -574,25 +574,33 @@ def _validate_elite_wheel_connection(credentials: typing.Dict[str, typing.Any]) 
 
 def _validate_motorstate_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
     """
-    Validates the dealer's Motor State API key against GET /api/Brands — the cheapest real
-    endpoint (single unpaginated call, no account state needed).
+    Validates the dealer's Motor State FTP login by logging in and stat-ing their feed file.
 
-    Motor State answers 403 with an empty body both for an unknown/expired key and for a valid
-    key that lacks access to an endpoint, so the two are indistinguishable from the response
-    alone; the client raises MotorStatePermissionError for either and it is reported as bad
-    credentials, which is the actionable case for someone pasting a key into this form.
+    The feed, not the API, is what "Feed Connected" now means for Motor State: catalog, stock
+    and this account's pricing all come from ``<account>.csv`` on ftp.motorstateftp.com. A key
+    that authenticates but whose account has no feed file provisioned is the interesting
+    failure here, and it is reported as not-found rather than bad credentials so the dealer is
+    told to ask Motor State to enable feed access rather than to re-paste a working password.
+
+    The API key is validated separately when order credentials are entered -- it plays no part
+    in the feed connection.
     """
     try:
-        client = motorstate_client.MotorStateApiClient(credentials=credentials)
+        client = motorstate_ftp_client.MotorStateFTPClient(credentials=credentials)
     except ValueError as e:
         return str(e), CONNECTION_ERROR_INVALID_INPUT
     try:
-        client.test_connection()
-    except motorstate_exceptions.MotorStatePermissionError as e:
-        return e.message, CONNECTION_ERROR_INVALID_CREDENTIALS
-    except motorstate_exceptions.MotorStateAPIBadResponseCodeError as e:
-        return e.message, CONNECTION_ERROR_CONNECTION_FAILED
-    except motorstate_exceptions.MotorStateAPIException as e:
+        if not client.feed_present():
+            return (
+                "Logged in, but no feed file named {} exists for this account. Ask your Motor "
+                "State account manager to enable FTP feed access for account {}.".format(
+                    client.ftp_remote_file, client.ftp_remote_file.rsplit(".", 1)[0]
+                ),
+                CONNECTION_ERROR_NOT_FOUND,
+            )
+    except motorstate_exceptions.MotorStateFTPConnectionError as e:
+        return str(e), CONNECTION_ERROR_INVALID_CREDENTIALS
+    except motorstate_exceptions.MotorStateFTPException as e:
         return str(e), CONNECTION_ERROR_CONNECTION_FAILED
     return None, None
 

@@ -3239,8 +3239,11 @@ class PurchaseOrderJob(django_db_models.Model):
 #       with fromDateTime=epoch is the only way to enumerate every part number)
 #   * GET /api/Product (<=15 part numbers) -> MotorStateProduct (per-company
 #       detail + account pricing)
-# These are deliberately thin raw mirrors; nothing here is wired into the
-# master-parts layer yet.
+# The catalog, stock and pricing tables are now filled from the FTP feed instead
+# (src/integrations/services/motorstate_feed.py) — one CSV per dealer account.
+# MotorStateAvailability is the one table the feed does not write: it belonged to
+# the retired ProductAvailabilityChange poll, and stock now rides on
+# MotorStateProduct.quantity / status_type. The API client stays for ordering.
 # ---------------------------------------------------------------------------
 class MotorStateBrand(django_db_models.Model):
     """A Motor State brand from GET /api/Brands. Global — brand catalog is not
@@ -3299,26 +3302,40 @@ class MotorStateAvailability(django_db_models.Model):
 
 
 class MotorStateProduct(django_db_models.Model):
-    """One row per (company, part number) from GET /api/Product — catalog detail
-    plus account-specific pricing (Motor State returns both in one payload).
-    Per-company because prices are tied to the account behind the API key.
-    ``found`` mirrors the API's per-part Found flag; unfound part numbers are
-    still recorded so a later pass need not re-query them blindly."""
+    """
+    The distributor-wide Motor State catalog row, one per part number. Prices are never here —
+    they are per account, on MotorStateCompanyPricing.
+
+    Populated from the FTP feed (``<account>.csv``, see clients/motorstate/feed_spec.py), which
+    is the catalog source of record. The columns above ``--- feed catalog ---`` predate the feed
+    and came from ``GET /api/Product``; that hydrate is retired for ingest (the API is kept for
+    ordering) but the columns stay because the feed fills every one of them and 155k rows
+    already carry API-sourced values.
+
+    Everything below ``--- feed catalog ---`` is nullable on purpose. Motor State provisions
+    each dealer's file with the columns that dealer is entitled to, so image, categories and
+    long description arrive only on enriched accounts — a null here means "this account's feed
+    does not carry that column", not "the part has no image". Only the primary connection
+    writes these; see ``motorstate.fetch_and_save_motorstate_catalog_from_feed``.
+    """
 
     part_number = django_db_models.CharField(max_length=128, unique=True)
-    # Motor State's /api/Product does not return a brand, so this FK is carried over from the
-    # MotorStateAvailability spine (the brand the part was fetched under). Null when the part
-    # has no matching availability row. brand_code mirrors brand.code for join-free filtering.
+    # The first three characters of part_number are Motor State's brand code (``AAA00004`` ->
+    # ``AAA`` -> "A-1 PRODUCTS"), which resolves ~98.5% of feed rows against MotorStateBrand.
+    # brand_code mirrors brand.code for join-free filtering.
     brand = django_db_models.ForeignKey(
         MotorStateBrand, on_delete=django_db_models.SET_NULL, null=True, related_name="products"
     )
     brand_code = django_db_models.CharField(max_length=32, null=True)
     found = django_db_models.BooleanField(default=False)
 
+    # Manufacturer part number: the feed's ``ManufacturerPart``. Motor State's own part number
+    # is brand-code-prefixed, so this is what MasterPart keys on across distributors.
     vendor_part_number = django_db_models.CharField(max_length=128, null=True)
     supersede_part_number = django_db_models.CharField(max_length=128, null=True)
+    # The feed's short ``Description`` (~40 chars, often truncated mid-word).
     short_description = django_db_models.TextField(null=True)
-    # Motor State numeric Status code (raw).
+    # Motor State numeric Status code (API-era; the feed's letter code is status_type).
     status = django_db_models.IntegerField(null=True)
     is_stocking = django_db_models.BooleanField(default=False)
     quantity = django_db_models.IntegerField(null=True)
@@ -3328,6 +3345,42 @@ class MotorStateProduct(django_db_models.Model):
     can_special_order = django_db_models.BooleanField(default=False)
     can_drop_ship = django_db_models.BooleanField(default=False)
     can_regular_back_order = django_db_models.BooleanField(default=False)
+
+    # --- feed catalog -----------------------------------------------------
+    # Feed ``Status``: S=stocking, O=order-as-needed, X=discontinued.
+    status_type = django_db_models.CharField(max_length=8, null=True, blank=True)
+    # The API carries no UPC at all; the feed does for ~67% of rows, which is what lets
+    # MasterPart.gtin be populated and cross-distributor dedupe work.
+    upc = django_db_models.CharField(max_length=64, null=True, blank=True)
+    aaia_code = django_db_models.CharField(max_length=64, null=True, blank=True)
+
+    # Enriched-account-only columns (null on plain accounts).
+    long_description = django_db_models.TextField(null=True, blank=True)
+    image_url = django_db_models.TextField(null=True, blank=True)
+    category_level_1 = django_db_models.CharField(max_length=255, null=True, blank=True)
+    category_level_2 = django_db_models.CharField(max_length=255, null=True, blank=True)
+    category_level_3 = django_db_models.CharField(max_length=255, null=True, blank=True)
+
+    # Shipping dimensions, in the feed's own units (inches / pounds).
+    length = django_db_models.DecimalField(max_digits=12, decimal_places=5, null=True, blank=True)
+    width = django_db_models.DecimalField(max_digits=12, decimal_places=5, null=True, blank=True)
+    height = django_db_models.DecimalField(max_digits=12, decimal_places=5, null=True, blank=True)
+    weight = django_db_models.DecimalField(max_digits=12, decimal_places=5, null=True, blank=True)
+
+    # Shipping / compliance flags. Null (not False) when the account's feed omits the column,
+    # so "not restricted" stays distinguishable from "not told".
+    air_restricted = django_db_models.BooleanField(null=True, blank=True)
+    state_restricted = django_db_models.CharField(max_length=255, null=True, blank=True)
+    truck_freight_only = django_db_models.BooleanField(null=True, blank=True)
+    ship_alone = django_db_models.BooleanField(null=True, blank=True)
+    canada_restricted = django_db_models.BooleanField(null=True, blank=True)
+    emissions_warning = django_db_models.BooleanField(null=True, blank=True)
+    oversized = django_db_models.BooleanField(null=True, blank=True)
+    notes = django_db_models.TextField(null=True, blank=True)
+    acquired_date = django_db_models.DateField(null=True, blank=True)
+
+    # When the feed last supplied this row. Null on rows that only ever came from the API.
+    feed_updated_at = django_db_models.DateTimeField(null=True, blank=True)
 
     # Full raw Product object kept verbatim (notes, duty/tariff, any fields not columned above).
     data = django_db_models.JSONField(null=True)
@@ -3339,6 +3392,8 @@ class MotorStateProduct(django_db_models.Model):
         db_table = "motorstate_products"
         indexes = [
             django_db_models.Index(fields=["brand"], name="ms_products_brand_idx"),
+            django_db_models.Index(fields=["upc"], name="ms_products_upc_idx"),
+            django_db_models.Index(fields=["feed_updated_at"], name="ms_products_feed_upd_idx"),
         ]
 
 
@@ -3348,12 +3403,13 @@ class MotorStateCompanyPricing(django_db_models.Model):
     fields live on MotorStateProduct; prices are stored per company so
     ProviderPartCompanyPricing sync keys off (part, company) like every other provider.
 
-    Motor State returns catalog and account pricing in the same /api/Product payload (there is
-    no price-only endpoint), so both tables are written by the same hydrate pass —
-    unlike distributors whose catalog and pricing arrive on separate feeds.
+    Every account's FTP feed file carries that account's own prices for the whole catalog, so
+    each connection pulls its own file and writes only its own rows here — the catalog columns
+    on MotorStateProduct are written once, from the primary connection's file.
 
-    ``customer_price`` is this account's actual buy price; ``base_price`` is Motor State's
-    undiscounted wholesale; ``list_price`` is MSRP.
+    Feed column -> field: ``Cost`` -> customer_price (this account's actual buy price),
+    ``Jobber`` -> base_price, ``SuggestedRetail`` -> list_price, ``MapPrice`` -> map_price,
+    ``VendorMSRP`` -> vendor_msrp.
     """
 
     product = django_db_models.ForeignKey(
@@ -3369,9 +3425,15 @@ class MotorStateCompanyPricing(django_db_models.Model):
     list_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True)
     map_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True)
     is_map_restricted = django_db_models.BooleanField(default=False)
+    # The feed's ``VendorMSRP`` — the manufacturer's own list, which Motor State reports
+    # separately from its ``SuggestedRetail`` and does not always populate.
+    vendor_msrp = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
 
     special_order_charge = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True)
     drop_ship_charge = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True)
+
+    # When this company's feed file last supplied the row.
+    feed_updated_at = django_db_models.DateTimeField(null=True, blank=True)
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)

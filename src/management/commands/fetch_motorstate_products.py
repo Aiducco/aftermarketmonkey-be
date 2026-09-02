@@ -6,6 +6,9 @@ from src.integrations.services import motorstate
 
 class Command(BaseCommand):
     help = (
+        "[Superseded by fetch_motorstate_feed -- the FTP feed is the catalog/pricing "
+        "source of record. This API path is kept for one-off backfills; running it "
+        "overwrites feed-sourced stock and description on MotorStateProduct.] "
         "Hydrate Motor State product detail + account pricing via parallel "
         "/api/Product calls (<=15 part numbers each) over the stored spine."
     )

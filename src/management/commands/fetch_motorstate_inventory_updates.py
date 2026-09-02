@@ -6,6 +6,9 @@ from src.integrations.services import motorstate
 
 class Command(BaseCommand):
     help = (
+        "[Superseded by fetch_motorstate_feed -- the FTP feed is the catalog/pricing "
+        "source of record. This API path is kept for one-off backfills; running it "
+        "overwrites feed-sourced stock and description on MotorStateProduct.] "
         "Poll Motor State ProductAvailabilityChange for stock/status changes since "
         "the last-seen high-water mark and upsert them into MotorStateAvailability. "
         "The Turn14 inventory-updates analog."

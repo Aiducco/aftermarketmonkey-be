@@ -32,6 +32,15 @@ _LOG_PREFIX = "[MASTER-PARTS]"
 
 # ProviderPart upsert from sync_master_parts_from_* (distributor_refreshed_at from source row updated_at)
 _PROVIDER_PART_SYNC_UPDATE_FIELDS = ["provider_external_id", "distributor_refreshed_at"]
+# Motor State's feed carries its own readable three-level taxonomy, so its ProviderPart rows
+# refresh the category columns too (enriched accounts only -- null on a plain-account feed).
+_MOTORSTATE_PROVIDER_PART_SYNC_UPDATE_FIELDS = [
+    "provider_external_id",
+    "distributor_refreshed_at",
+    "overview_category",
+    "category",
+    "subcategory",
+]
 # Turn14 / Meyer / Rough Country: map ``CategoryMapping`` -> ``ProviderPart.category`` /
 # ``ProviderPart.overview_category`` (Meyer: first ``category`` segment split on ``;``).
 # If source is empty or not in ``category_mappings``, those two fields are null on upsert.
@@ -4378,8 +4387,30 @@ def _motorstate_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
         {"key": "motorstate_pn", "label": "Motor State Part No", "value": row.get("part_number") or None},
         {"key": "mpn", "label": "MPN", "value": row.get("vendor_part_number") or None},
         {"key": "description", "label": "Description", "value": row.get("short_description") or None},
+        {"key": "long_description", "label": "Long Description", "value": row.get("long_description") or None},
+        {"key": "upc", "label": "UPC", "value": row.get("upc") or None},
         {"key": "supersede", "label": "Superseded By", "value": row.get("supersede_part_number") or None},
     ]
+
+
+# Columns the Motor State ingest reads off MotorStateProduct. The feed-only ones are null on
+# rows that predate the feed, and on any row whose account file lacks the enriched columns.
+_MOTORSTATE_PRODUCT_VALUES = (
+    "id", "brand_id", "part_number", "vendor_part_number", "short_description",
+    "supersede_part_number", "updated_at",
+    "long_description", "upc", "aaia_code", "image_url",
+    "category_level_1", "category_level_2", "category_level_3",
+)
+
+
+def _motorstate_master_description(row: typing.Dict) -> typing.Optional[str]:
+    """The feed's full-length description when the account receives it, else the short one.
+
+    ``short_description`` is Motor State's ~40-character field and is routinely truncated
+    mid-word ("Wheel Adp.5x4.5 > Wide 5"); ``long_description`` is the readable version
+    ("Wheel Adapter - 5 x 4.50 in to Wide 5 - Aluminum - Each").
+    """
+    return (row.get("long_description") or "").strip() or row.get("short_description")
 
 
 def _ingest_motorstate_parts_for_mapped_brands(
@@ -4405,10 +4436,7 @@ def _ingest_motorstate_parts_for_mapped_brands(
                 id__gt=last_id,
             )
             .order_by("id")
-            .values(
-                "id", "brand_id", "part_number", "vendor_part_number", "short_description",
-                "supersede_part_number", "updated_at",
-            )[:BATCH_SIZE_MASTER_PARTS]
+            .values(*_MOTORSTATE_PRODUCT_VALUES)[:BATCH_SIZE_MASTER_PARTS]
         )
         if not batch:
             break
@@ -4437,11 +4465,13 @@ def _ingest_motorstate_parts_for_mapped_brands(
                         brand=brand,
                         part_number=part_number,
                         sku=part_number,
-                        description=row.get("short_description"),
-                        # Motor State's /api/Product carries no UPC/GTIN (confirmed against the
-                        # live payload), so normalized cross-distributor matching has no
-                        # corroborating identifier here -- left null rather than faked.
-                        gtin=None,
+                        description=_motorstate_master_description(row),
+                        # The FTP feed carries a UPC for ~2/3 of the catalog (the API carried
+                        # none at all), which is what lets normalized cross-distributor
+                        # matching corroborate a Motor State part against another feed's row.
+                        gtin=row.get("upc") or None,
+                        aaia_code=row.get("aaia_code") or None,
+                        image_url=row.get("image_url") or None,
                     )
                 )
             external_id_to_brand_part[
@@ -4476,6 +4506,7 @@ def _ingest_motorstate_parts_for_mapped_brands(
         )
 
         new_parts = [mp for mp in master_parts if (mp.brand_id, mp.part_number) not in existing_by_key]
+        existing_keys = [k for k in pairs if k in existing_by_key]
 
         if new_parts:
             new_parts = _dedupe_master_parts_for_upsert(
@@ -4488,6 +4519,38 @@ def _ingest_motorstate_parts_for_mapped_brands(
                 update_fields=[],
             )
             total_master += len(new_parts)
+
+        # Phase 2 -- fill gaps on master parts another distributor already created. Motor State
+        # is not the primary source for description (see MASTER_PART_FULL_UPDATE_FIELDS), so
+        # this only writes an image where there is none and a gtin where there is none; it
+        # never overwrites content a primary source supplied. Same shape as the Premier pass.
+        if existing_keys:
+            key_to_mp = {(mp.brand_id, mp.part_number): mp for mp in master_parts}
+            values = [
+                (existing_by_key[k], key_to_mp[k].aaia_code, key_to_mp[k].image_url, key_to_mp[k].gtin)
+                for k in existing_keys
+                if k in key_to_mp
+            ]
+            if values:
+                placeholders = ", ".join(["(%s::bigint, %s, %s, %s)"] * len(values))
+                params = [x for t in values for x in t]
+                with connection.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE master_parts mp SET
+                            aaia_code = COALESCE(mp.aaia_code, v.aaia_code),
+                            image_url = CASE
+                                WHEN (mp.image_url IS NULL OR mp.image_url = '')
+                                     AND v.image_url IS NOT NULL AND v.image_url != ''
+                                THEN v.image_url
+                                ELSE mp.image_url
+                            END,
+                            gtin = COALESCE(mp.gtin, v.gtin)
+                        FROM (VALUES {}) AS v(id, aaia_code, image_url, gtin)
+                        WHERE mp.id = v.id::bigint
+                        """.format(placeholders),
+                        params,
+                    )
 
         brand_part_to_master = mp_matching.master_part_stubs_for(existing_by_key)
         unresolved_pairs = [k for k in pairs if k not in brand_part_to_master]
@@ -4520,6 +4583,12 @@ def _ingest_motorstate_parts_for_mapped_brands(
                 provider=motorstate_provider,
                 provider_external_id=ext_id,
                 distributor_refreshed_at=row.get("updated_at"),
+                # The feed's three-level taxonomy maps straight onto the three ProviderPart
+                # category fields -- no CategoryMapping lookup, because Motor State ships
+                # readable names ("Wheels and Tires" / "Wheels" / "Wheels") rather than codes.
+                overview_category=row.get("category_level_1") or None,
+                category=row.get("category_level_2") or None,
+                subcategory=row.get("category_level_3") or None,
             )
 
         provider_parts = list(provider_parts_by_key.values())
@@ -4528,7 +4597,7 @@ def _ingest_motorstate_parts_for_mapped_brands(
                 src_models.ProviderPart,
                 provider_parts,
                 unique_fields=["master_part", "provider"],
-                update_fields=_PROVIDER_PART_SYNC_UPDATE_FIELDS,
+                update_fields=_MOTORSTATE_PROVIDER_PART_SYNC_UPDATE_FIELDS,
             )
             total_provider += len(provider_parts)
 
@@ -4584,10 +4653,14 @@ def sync_master_parts_from_motorstate() -> None:
 
 def sync_provider_inventory_from_motorstate() -> None:
     """
-    Sync ProviderPartInventory from MotorStateAvailability (quantity + StatusType), which is
-    distributor-wide. Motor State exposes no per-warehouse breakdown -- QuantityAvailable is a
-    single distributor-wide number -- so warehouse_availability carries the status instead.
-    Also refreshes ProviderPart.product_details from the matching MotorStateProduct row.
+    Sync ProviderPartInventory from MotorStateProduct (quantity + status type), which is
+    distributor-wide. Motor State exposes no per-warehouse breakdown -- QtyAvail is a single
+    distributor-wide number -- so warehouse_availability carries the status instead.
+    Also refreshes ProviderPart.product_details from the same row.
+
+    Stock comes from the daily FTP feed. The incremental ProductAvailabilityChange poll that
+    used to supply a fresher number is retired along with the rest of the API ingest, so
+    MotorStateAvailability is no longer read here.
     """
     logger.info("{} Syncing provider inventory from Motor State.".format(_LOG_PREFIX))
 
@@ -4631,7 +4704,8 @@ def sync_provider_inventory_from_motorstate() -> None:
                 .order_by("id")
                 .values(
                     "id", "brand_id", "part_number", "vendor_part_number", "short_description",
-                    "supersede_part_number", "quantity", "is_stocking",
+                    "supersede_part_number", "quantity", "is_stocking", "status_type",
+                    "long_description", "upc",
                 )[:BATCH_SIZE_INVENTORY]
             )
             if not batch:
@@ -4639,27 +4713,14 @@ def sync_provider_inventory_from_motorstate() -> None:
 
             last_id = batch[-1]["id"]
 
-            # Availability is the fresher stock signal (polled incrementally between full
-            # product hydrates), so prefer its quantity over the product row's snapshot.
-            part_numbers = [r["part_number"] for r in batch]
-            availability = {
-                a["part_number"]: a
-                for a in src_models.MotorStateAvailability.objects.filter(
-                    part_number__in=part_numbers
-                ).values("part_number", "quantity_available", "status_type")
-            }
-
             to_upsert = []
             for row in batch:
                 ext_id = _motorstate_provider_external_id(row["brand_id"], row["part_number"])
                 provider_part = provider_parts.get(ext_id)
                 if not provider_part:
                     continue
-                avail = availability.get(row["part_number"]) or {}
-                qty = avail.get("quantity_available")
-                if qty is None:
-                    qty = row.get("quantity")
-                status_type = (avail.get("status_type") or "").upper() or None
+                qty = row.get("quantity")
+                status_type = (row.get("status_type") or "").upper() or None
                 to_upsert.append(
                     src_models.ProviderPartInventory(
                         provider_part=provider_part,
@@ -4790,6 +4851,27 @@ def _sync_motorstate_pricing(company_id: typing.Optional[int] = None) -> None:
         logger.info("{} No BrandMotorStateBrandMapping found. Nothing to price.".format(_LOG_PREFIX))
         return
 
+    # Only companies whose Motor State connection is active get priced. Prices are per account
+    # and come from that account's own feed file, so a deactivated connection has no live price
+    # source -- whatever is still sitting in MotorStateCompanyPricing for it is the last thing
+    # some earlier sync wrote and nothing refreshes it. Propagating that would quote a customer
+    # from a frozen price sheet.
+    active_company_ids = set(
+        src_models.CompanyProviders.objects.filter(
+            provider_id=motorstate_provider.id, active=True
+        ).values_list("company_id", flat=True)
+    )
+    if not active_company_ids:
+        logger.info("{} No active Motor State connections. Nothing to price.".format(_LOG_PREFIX))
+        return
+    if company_id and company_id not in active_company_ids:
+        logger.info(
+            "{} Motor State connection for company_id={} is not active. Skipping pricing.".format(
+                _LOG_PREFIX, company_id
+            )
+        )
+        return
+
     company_provider = None
     watermark = None
     sync_started_at = timezone.now()
@@ -4816,7 +4898,8 @@ def _sync_motorstate_pricing(company_id: typing.Optional[int] = None) -> None:
         while True:
             batch_num += 1
             qs = src_models.MotorStateCompanyPricing.objects.filter(
-                id__gt=last_id, product__brand_id__in=catalog_ids, product__found=True
+                id__gt=last_id, product__brand_id__in=catalog_ids, product__found=True,
+                company_id__in=active_company_ids,
             )
             if company_id:
                 qs = qs.filter(company_id=company_id)

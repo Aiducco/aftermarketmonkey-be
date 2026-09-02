@@ -1,9 +1,22 @@
 """
-Motor State Distributing raw-feed ingest.
+Motor State Distributing API ingest — retired for catalog/pricing, kept for brand mapping.
 
-Populates three raw mirror tables (MotorStateBrand, MotorStateAvailability,
-MotorStateProduct) from the Motor State API. Nothing here touches the
-master-parts layer — this is the raw first stage only.
+The catalog, stock and per-company pricing now come from the FTP feed; see
+``src.integrations.services.motorstate_feed``. One CSV per dealer account carries the whole
+catalog plus fields the API has none of (UPC, dimensions, weight, MAP, MSRP, manufacturer part
+number, shipping flags, and on enriched accounts an image URL, a three-level category taxonomy
+and a full-length description).
+
+Still live here:
+  * ``sync_unmapped_motorstate_brands_to_brands`` — maps MotorStateBrand to Brands; called by
+    the nightly ingest after the feed pass.
+  * ``sync_motorstate_company_pricing_for_company_provider`` — the name the pricing-job queue
+    dispatches on, now a thin delegate to the feed.
+  * ``MotorStateApiClient`` itself, which the ordering work will use.
+
+Everything below is the API ingest path. It is no longer wired into ``ingest_all_providers``
+and is kept for one-off backfills and for reference while ordering is built out; running it
+will still write MotorStateAvailability / MotorStateProduct rows.
 
 Flow:
   * ``fetch_and_save_motorstate_brands`` — GET /api/Brands -> MotorStateBrand.
@@ -762,40 +775,13 @@ def sync_unmapped_motorstate_brands_to_brands() -> typing.List[src_models.MotorS
 # ---------------------------------------------------------------------------
 def sync_motorstate_company_pricing_for_company_provider(company_provider_id: int) -> None:
     """
-    Refresh this connection's own MotorStateCompanyPricing rows using its API key. Motor State
-    returns catalog and price in the same /api/Product payload and has no price-only endpoint,
-    so this runs the product hydrate with write_catalog=False: the shared catalog and inventory
-    are left to the primary connection, and only this company's prices are written.
+    Refresh this connection's own MotorStateCompanyPricing rows from its own FTP feed file.
 
-    Called by the IntegrationPricingSyncJob queue: on connect/reconnect (full first sync) and
-    on the recurring cadence (see integration_pricing_sync_jobs, throttled to 7 days for Motor
-    State because a refresh is ~10.4k API calls).
+    Kept as the entrypoint name the IntegrationPricingSyncJob queue dispatches on; the work
+    itself lives in ``motorstate_feed``. Each dealer's file carries the whole catalog priced
+    for that account, so this is one download per connection -- not the ~10.4k /api/Product
+    calls the API path needed.
     """
-    cp = (
-        src_models.CompanyProviders.objects.filter(
-            id=company_provider_id,
-            provider__kind=src_enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING.value,
-            provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
-        )
-        .select_related("company", "provider")
-        .first()
-    )
-    if not cp:
-        logger.warning(
-            "{} No active Motor State CompanyProviders id={}. Skipping.".format(
-                _LOG_PREFIX, company_provider_id
-            )
-        )
-        return
+    from src.integrations.services import motorstate_feed
 
-    # Brands, the availability spine and the product catalog are distributor-wide and are
-    # maintained once from the primary connection (nightly ingest / fetch_motorstate_*). This
-    # job only prices what that shared catalog already carries -- it never rebuilds the spine.
-    if not src_models.MotorStateAvailability.objects.exists():
-        logger.warning(
-            "{} No shared Motor State availability spine yet; run fetch_motorstate_availability "
-            "before pricing company_provider_id={}.".format(_LOG_PREFIX, cp.id)
-        )
-        return
-
-    fetch_and_save_motorstate_products(company_provider_id=cp.id, write_catalog=False)
+    motorstate_feed.sync_motorstate_company_pricing_from_feed(company_provider_id)

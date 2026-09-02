@@ -204,6 +204,22 @@ HELMET_HOUSE_CREDENTIALS_FTP_PASSWORD = "ftp_password"
 # the default preference order).
 HELMET_HOUSE_CREDENTIALS_CATALOG_FILENAME = "catalog_filename"
 
+# Motor State Distributing: catalog, stock and pricing all come from the dealer's own FTP feed
+# file, so a connection needs the FTP login rather than the API key it used to ask for. The
+# file is named after the account number carried in the login itself
+# (853809@motorstateftp.com -> 853809.csv), and host/port are fixed, so those two fields are
+# the whole form.
+MOTOR_STATE_CREDENTIALS_FTP_USER = "ftp_user"
+MOTOR_STATE_CREDENTIALS_FTP_PASSWORD = "ftp_password"
+# Optional second account used for content only (image URL, category levels, long description).
+# Motor State enables those columns per account, and the account that has them is not
+# necessarily the one with the freshest stock -- when they differ, the main login above drives
+# catalog/stock/price and this one supplies content.
+MOTOR_STATE_CREDENTIALS_CONTENT_FTP_USER = "content_ftp_user"
+MOTOR_STATE_CREDENTIALS_CONTENT_FTP_PASSWORD = "content_ftp_password"
+# The API key is no longer used for ingest. It stays because order placement will need it.
+MOTOR_STATE_CREDENTIALS_API_KEY = "api_key"
+
 # Helmet House brand column -> the name we resolve against Brands. Their Brand column carries a few
 # in-house abbreviations that would otherwise never match ("T/M" is Tourmaster, whose own parts also
 # appear spelled out in the descriptions), plus two buckets that are not brands at all ("MISC",
@@ -2062,42 +2078,66 @@ PROVIDER_CATALOG = [
     {
         "kind": enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING,
         "name": "Motor State Distributing",
-        "description": "Access Motor State Distributing inventory and pricing via their API.",
+        "description": "Access Motor State Distributing inventory and pricing via their FTP feed.",
         "icon_url": "https://api.aftermarketscout.com/uploads/motor_state_logo.png",
         "category": "Distributors",
-        "connection_required_fields": ["api_key"],
+        "connection_required_fields": [
+            MOTOR_STATE_CREDENTIALS_FTP_USER,
+            MOTOR_STATE_CREDENTIALS_FTP_PASSWORD,
+        ],
+        "connection_optional_fields": [
+            MOTOR_STATE_CREDENTIALS_CONTENT_FTP_USER,
+            MOTOR_STATE_CREDENTIALS_CONTENT_FTP_PASSWORD,
+        ],
         # Email-channel ordering — see the matching note on Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
         "email_order_connection_optional_fields": ["cc_email", "reply_to"],
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
-            "<p><strong>Motor State Distributing</strong> provides inventory and pricing through their API. "
-            "AfterMarketScout handles the connection &mdash; you only need to enter an API key.</p>"
+            "<p><strong>Motor State Distributing</strong> publishes your inventory, pricing and product "
+            "data as a daily file on their FTP server. AfterMarketScout handles the connection &mdash; "
+            "you only need your FTP username and password.</p>"
 
-            "<p><strong>1. Request your API key</strong></p>"
-            "<p>Contact your Motor State account manager and request API access:</p>"
+            "<p><strong>1. Request FTP feed access</strong></p>"
+            "<p>Contact your Motor State account manager and ask for it:</p>"
             + _CALLOUT_OPEN +
-            "<p>Could you please issue an API key for our account so we can access inventory and pricing data? "
-            "We're connecting it to our inventory system.</p>"
+            "<p>Could you please set up FTP feed access for our account so we can pull inventory and "
+            "pricing? We\u2019re connecting it to our inventory system. If a product data feed with "
+            "images, categories and long descriptions is available for our account, please enable that "
+            "too.</p>"
             "</div>"
-            "<p>Include your Motor State account number so they can match the request to your account.</p>"
+            "<p>Include your Motor State account number so they can match the request to your account. "
+            "Your prices are specific to your account, so this has to be your own login rather than one "
+            "shared with another dealer.</p>"
 
-            "<p><strong>2. Enter your API key</strong></p>"
+            "<p><strong>2. Enter your FTP credentials</strong></p>"
             "<ol>"
-            "<li>Paste the <strong>API key</strong> into the field below.</li>"
+            "<li>Paste the <strong>FTP username</strong> (it looks like "
+            "<code>123456@motorstateftp.com</code>) and <strong>FTP password</strong> into the fields "
+            "below.</li>"
             "<li>Click <strong>Save</strong>.</li>"
             "</ol>"
-            "<p>Paste the key rather than retyping it &mdash; these are long strings, and a single wrong "
-            "character or trailing space will fail validation.</p>"
+            "<p>There is nothing else to enter &mdash; the server address and your file name are both "
+            "worked out from the username.</p>"
             "<p>Once validated, this integration shows <strong>Feed Connected</strong>.</p>"
+
+            "<p><strong>Product images and categories (optional)</strong></p>"
+            "<p>Motor State enables images, category levels and long descriptions per account, and the "
+            "account that has them is not always the one with the freshest stock. If they issued you a "
+            "second account for that data, enter it in the optional <strong>content FTP</strong> fields "
+            "and we will overlay images, categories and descriptions onto your catalog while your main "
+            "account continues to drive stock and pricing.</p>"
 
             "<p><strong>Notes</strong></p>"
             "<ul>"
-            "<li><strong>Connection fails.</strong> Re-paste the key to rule out a stray space or a truncated "
-            "copy. If it still fails, ask your Motor State account manager to confirm the key is active for your "
-            "account.</li>"
-            "<li><strong>Key stopped working.</strong> API keys can be rotated or revoked. Request a new one and "
-            "paste it here &mdash; nothing else needs changing.</li>"
+            "<li><strong>Connection fails.</strong> Re-paste the password to rule out a stray space or a "
+            "truncated copy, and check the username includes the "
+            "<code>@motorstateftp.com</code> part. If it still fails, ask your account manager to "
+            "confirm FTP access is active.</li>"
+            "<li><strong>Logged in, but no feed file.</strong> The login works but Motor State has not "
+            "provisioned a feed file for the account yet &mdash; ask them to enable it.</li>"
+            "<li><strong>Ordering.</strong> Placing orders through Motor State uses a separate API key, "
+            "entered with your order credentials. It is not needed for the feed.</li>"
             "<li><strong>Need help?</strong> Contact "
             "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a>.</li>"
             "</ul>"
