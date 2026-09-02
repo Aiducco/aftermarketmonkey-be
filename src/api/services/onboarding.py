@@ -413,10 +413,12 @@ def get_distributor_credentials_info() -> dict:
                 src_constants.MOTOR_STATE_CREDENTIALS_FTP_USER,
                 src_constants.MOTOR_STATE_CREDENTIALS_FTP_PASSWORD,
             ],
+            # api_key is deliberately absent: order-placement credentials live in
+            # CompanyProviderOrderAccount, not credentials["feed"] (see
+            # src/integrations/credentials.py), and the feed itself has no use for it.
             "optional": [
                 src_constants.MOTOR_STATE_CREDENTIALS_CONTENT_FTP_USER,
                 src_constants.MOTOR_STATE_CREDENTIALS_CONTENT_FTP_PASSWORD,
-                src_constants.MOTOR_STATE_CREDENTIALS_API_KEY,
             ],
             "description": (
                 "Motor State FTP username and password for your dealer account (host "
