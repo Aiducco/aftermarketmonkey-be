@@ -131,8 +131,16 @@ def get_global_client() -> turn_14_client.Turn14ApiClient:
     Callers must build this once and pass it down rather than constructing per brand: the
     rate limiter and token cache are keyed by client_id so a per-brand client is no longer
     expensive, but it is still 464 objects and 464 chances to resolve credentials differently.
+
+    Base URL is set on this instance only (settings.TURN14_GLOBAL_BASE_URL, defaults to
+    production) -- never on the Turn14ApiClient class -- so redirecting the shared catalog
+    sweep to Turn 14's sandbox host never affects a client built elsewhere (per-company pricing,
+    order placement), both of which always use that customer's own credentials against
+    production regardless of this setting.
     """
     try:
-        return turn_14_client.Turn14ApiClient(credentials=get_global_credentials())
+        client = turn_14_client.Turn14ApiClient(credentials=get_global_credentials())
+        client.API_BASE_URL = settings.TURN14_GLOBAL_BASE_URL
+        return client
     except ValueError as e:
         raise GlobalCredentialsUnavailable(str(e)) from e

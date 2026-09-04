@@ -209,6 +209,14 @@ FRONTEND_BASE_URL = os.environ.get("FRONTEND_BASE_URL", "https://app.aftermarket
 
 TURN14_BASE_URL = 'https://api.turn14.com/v1'
 
+# Base URL for the shared/global Turn 14 client only (get_global_client() -- brands, items,
+# items/data, inventory, dropship, shipping estimates). Independent of TURN14_BASE_URL and of
+# the Order API's own TURN14_ORDER_TEST_BASE_URL/_PRODUCTION_BASE_URL below: per-company pricing
+# and order placement always use that customer's own credentials against production regardless
+# of this setting. Defaults to production; set to Turn 14's sandbox host
+# (https://apitest.turn14.com/v1) temporarily while validating integrator credentials.
+TURN14_GLOBAL_BASE_URL = os.environ.get("TURN14_GLOBAL_BASE_URL", TURN14_BASE_URL)
+
 # Western Power Sports Data Depot API (see src.integrations.clients.wps).
 WPS_BASE_URL = os.environ.get("WPS_BASE_URL", "https://api.wps-inc.com")
 
@@ -642,3 +650,28 @@ MOTORSTATE_FTP_HOST = os.environ.get("MOTORSTATE_FTP_HOST") or "ftp.motorstateft
 MOTORSTATE_FTP_PORT = _motorstate_ftp_port if 1 <= _motorstate_ftp_port <= 65535 else 21
 MOTORSTATE_FTP_DIRECTORY = os.environ.get("MOTORSTATE_FTP_DIRECTORY") or ""
 MOTORSTATE_FEED_LOCAL_PATH = os.environ.get("MOTORSTATE_FEED_LOCAL_PATH", "/tmp/motorstate_feed.csv")
+
+# Rough Country EDI (X12 005010) mailbox, hosted by Alluvia. Documents we SEND go to their
+# /Inbound/<doctype>; documents we RECEIVE are collected from /Outbound/<doctype> and, per
+# Alluvia's request, moved to /Archive/<doctype> once downloaded.
+#
+# Plain FTP is what Alluvia gave us (ftp://alluviaftp.alluviaplatform.com). The payloads carry
+# end-customer names and street addresses, so flip ROUGH_COUNTRY_EDI_FTP_USE_TLS to true the
+# moment they confirm FTPS is available — the transport already supports it.
+#
+# NOTE: Alluvia filters this host by source IP. Both the production host and any machine running
+# this by hand must be allowlisted by them first, or every connection simply times out.
+ROUGH_COUNTRY_EDI_FTP_HOST = os.environ.get("ROUGH_COUNTRY_EDI_FTP_HOST") or "alluviaftp.alluviaplatform.com"
+try:
+    _rough_country_edi_ftp_port = int(os.environ.get("ROUGH_COUNTRY_EDI_FTP_PORT") or "21")
+except ValueError:
+    _rough_country_edi_ftp_port = 21
+ROUGH_COUNTRY_EDI_FTP_PORT = _rough_country_edi_ftp_port if 1 <= _rough_country_edi_ftp_port <= 65535 else 21
+ROUGH_COUNTRY_EDI_FTP_USER = os.environ.get("ROUGH_COUNTRY_EDI_FTP_USER", "")
+ROUGH_COUNTRY_EDI_FTP_PASSWORD = os.environ.get("ROUGH_COUNTRY_EDI_FTP_PASSWORD", "")
+ROUGH_COUNTRY_EDI_FTP_USE_TLS = os.environ.get("ROUGH_COUNTRY_EDI_FTP_USE_TLS", "false").strip().lower() in (
+    "true",
+    "1",
+    "yes",
+)
+ROUGH_COUNTRY_EDI_LOCAL_DIR = os.environ.get("ROUGH_COUNTRY_EDI_LOCAL_DIR", "/tmp/rough_country_edi")
