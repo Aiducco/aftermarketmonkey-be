@@ -209,12 +209,14 @@ FRONTEND_BASE_URL = os.environ.get("FRONTEND_BASE_URL", "https://app.aftermarket
 
 TURN14_BASE_URL = 'https://api.turn14.com/v1'
 
-# Base URL for the shared/global Turn 14 client only (get_global_client() -- brands, items,
-# items/data, inventory, dropship, shipping estimates). Independent of TURN14_BASE_URL and of
-# the Order API's own TURN14_ORDER_TEST_BASE_URL/_PRODUCTION_BASE_URL below: per-company pricing
-# and order placement always use that customer's own credentials against production regardless
-# of this setting. Defaults to production; set to Turn 14's sandbox host
-# (https://apitest.turn14.com/v1) temporarily while validating integrator credentials.
+# Base URL for the shared/global Turn 14 client (get_global_client() -- brands, items,
+# items/data, inventory, dropship, shipping estimates) AND every per-company pricing sweep
+# (sweep_pricing_for_company_provider -- still that customer's own credentials, just against
+# this host). Independent of TURN14_BASE_URL and of the Order API's own
+# TURN14_ORDER_TEST_BASE_URL/_PRODUCTION_BASE_URL below -- order placement always uses that
+# customer's own credentials against production regardless of this setting. Defaults to
+# production; set to Turn 14's sandbox host (https://apitest.turn14.com/v1) temporarily while
+# validating integrator credentials.
 TURN14_GLOBAL_BASE_URL = os.environ.get("TURN14_GLOBAL_BASE_URL", TURN14_BASE_URL)
 
 # Western Power Sports Data Depot API (see src.integrations.clients.wps).

@@ -31,6 +31,7 @@ import typing
 from decimal import Decimal, InvalidOperation
 
 import pgbulk
+from django.conf import settings
 from django.db import connection
 from django.utils import timezone
 
@@ -712,6 +713,11 @@ def sweep_pricing_for_company_provider(
     client = turn_14_client.Turn14ApiClient(
         credentials=credentials_helper.get_feed_credentials(company_provider)
     )
+    # Instance-level override, same mechanism as turn_14_global.get_global_client() -- lets
+    # TURN14_GLOBAL_BASE_URL redirect pricing to Turn 14's sandbox during the temporary
+    # integrator-credential validation window without touching the Turn14ApiClient class
+    # default (order placement builds its own client and is never affected by this).
+    client.API_BASE_URL = settings.TURN14_GLOBAL_BASE_URL
 
     def flush(rows: typing.List[typing.Dict]) -> int:
         brand_ids = _brand_ids_for_items([str(r.get("id", "")) for r in rows])
