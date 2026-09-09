@@ -20,6 +20,13 @@ and only once the order's subtotal clears that address's own "Route Minimum Orde
 CreateOrder additionally requires AddressCode whenever ShipMethod is Meyer Truck (see
 submit_order); omitting it either falls back to default order logic or gets rejected, per the
 docs.
+
+Meyer Logistics ("THIRD PARTY ML"): the opposite problem from Meyer Truck -- ShippingRateMassQuote
+always offers it as a normal, real-cost carrier regardless of destination, but CreateOrder rejects
+it unconditionally outside a shop address (ErrorCode 60051, "not a valid ship method" -- confirmed
+live against three real customer-address orders, see _MEYER_LOGISTICS_SHIP_METHOD_CODE). Filtered
+out of get_shipping_quote's options whenever ship_to.is_shop_address is False, with a matching
+guard in submit_order in case a stale quote or direct ship_method override reaches it anyway.
 """
 import datetime
 import decimal
@@ -57,6 +64,14 @@ _ITEM_INFORMATION_CHUNK_SIZE = 100
 # GET /ShipMethods' canonical code for a Meyer Truck route order -- confirmed live, distinct
 # from the "Meyer Truck" (Title Case) shown in CreateOrder's own docs example.
 _MEYER_TRUCK_SHIP_METHOD_CODE = "MEYER TRUCK"
+
+# ShippingRateMassQuote always offers this ("ServiceType": "Meyer Logistics") as a normal,
+# real-cost carrier option alongside FedEx/UPS/etc, regardless of destination -- but CreateOrder
+# rejects it unconditionally: confirmed live against three separate customer-address orders
+# (ErrorCode 60051, "Ship Method is invalid. The value (THIRD PARTY ML) is not a valid ship
+# method"), one of them on four separate submit attempts. Filtered out of the options offered
+# whenever ship_to.is_shop_address is False, same gate as Meyer Truck above.
+_MEYER_LOGISTICS_SHIP_METHOD_CODE = "THIRD PARTY ML"
 
 # Meyer's own docs: DeliveryDate on a quote line is either a literal date ("9/28/2017") or a
 # business-day estimate string ("3-5 Business Days" / "5 Business Days") — same field, two
@@ -455,6 +470,12 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
                             quote_option_id=(q.get("ShipMethod") or "").strip(),
                         )
                     )
+                if not ship_to.is_shop_address:
+                    # See _MEYER_LOGISTICS_SHIP_METHOD_CODE -- Meyer quotes it for any address
+                    # but CreateOrder rejects it outside a shop destination.
+                    raw_options = [
+                        o for o in raw_options if o.service_level_code != _MEYER_LOGISTICS_SHIP_METHOD_CODE
+                    ]
                 if meyer_truck_option is not None:
                     # Listed first, not appended -- it's Meyer's own preferred/free route, not
                     # just another carrier option buried among everything else.
@@ -570,6 +591,15 @@ class MeyerOrderAdapter(base.DistributorOrderAdapter):
                     )
                 )
             data["AddressCode"] = route["address_code"]
+        elif purchase_order.ship_method.strip().upper() == _MEYER_LOGISTICS_SHIP_METHOD_CODE and not ship_to.is_shop_address:
+            # Belt-and-suspenders: get_shipping_quote already excludes this option outside a
+            # shop destination, but a stale quote or a direct ship_method override could still
+            # reach here. CreateOrder rejects it unconditionally in that case (ErrorCode 60051)
+            # -- fail loudly before spending a real API call on a guaranteed rejection.
+            raise order_exceptions.OrderValidationError(
+                "Meyer Logistics can only be used when shipping to one of this shop's own "
+                "addresses."
+            )
 
         try:
             response = self._client.create_order(customer_number=self._client.customer_number, data=data)
