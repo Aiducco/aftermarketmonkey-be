@@ -764,9 +764,16 @@ def sync_the_wheel_group_company_pricing_for_company_provider(company_provider_i
 
     creds = credentials_helper.get_feed_credentials(cp)
     client = _the_wheel_group_client_for_credentials(creds)
-    source_mode = client.source_mode()
+    # A separate instance forced onto sftp for just this check: THE_WHEEL_GROUP_FORCE_PUBLIC_SHARE
+    # defaults True and would otherwise make client.source_mode() report public_share even when
+    # this connection has real relay credentials. Deliberately not applied to `client` above --
+    # this company's relay directory holds only the inventory CSV, no mastersheet, so forcing sftp
+    # on the client used for the get_feed_data() fallback below would make a mastersheet-less
+    # relay directory raise TheWheelGroupFileNotFoundError instead of falling back to the public
+    # share.
+    relay_client = _the_wheel_group_client_for_credentials(creds, force_public_share=False)
     try:
-        relay_data = client.get_relay_inventory_data()
+        relay_data = relay_client.get_relay_inventory_data()
     except the_wheel_group_exceptions.TheWheelGroupException as e:
         logger.error(
             "{} Relay inventory CSV error for company_id={}: {}.".format(
@@ -778,6 +785,7 @@ def sync_the_wheel_group_company_pricing_for_company_provider(company_provider_i
     if relay_data is not None:
         rows = relay_data.get("parts") or []
         brand_key_fn = _inventory_brand_external_id
+        source_mode = "relay_inventory_csv"
         logger.info(
             "{} company_id={} pricing from relay inventory CSV {!r} ({} rows).".format(
                 _LOG_PREFIX, cp.company_id, relay_data.get("source_filename"), len(rows)
@@ -793,6 +801,7 @@ def sync_the_wheel_group_company_pricing_for_company_provider(company_provider_i
             raise
         rows = data.get("parts") or []
         brand_key_fn = brand_external_id
+        source_mode = client.source_mode()
 
     if not rows:
         logger.warning(
@@ -889,7 +898,11 @@ def sync_the_wheel_group_relay_inventory() -> int:
         return 0
 
     creds = credentials_helper.get_feed_credentials(cp)
-    client = _the_wheel_group_client_for_credentials(creds)
+    # force_public_share=False: THE_WHEEL_GROUP_FORCE_PUBLIC_SHARE defaults True (see the client's
+    # own module docstring) and would otherwise make source_mode() report public_share even when
+    # this connection has real relay credentials -- there's no mastersheet fallback in this
+    # function to worry about breaking, unlike the per-company pricing sync.
+    client = _the_wheel_group_client_for_credentials(creds, force_public_share=False)
     try:
         relay_data = client.get_relay_inventory_data()
     except the_wheel_group_exceptions.TheWheelGroupException as e:
