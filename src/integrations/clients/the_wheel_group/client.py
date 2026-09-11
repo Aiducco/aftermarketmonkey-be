@@ -27,6 +27,7 @@ Two transports, same workbook parser:
 Both transports accept either a bare ``.xlsx`` or a ``.zip`` containing one, so the Dropbox zip
 and a future direct workbook drop go through the same path.
 """
+import csv
 import io
 import logging
 import os
@@ -168,6 +169,26 @@ _FIELD_BY_HEADER_KEY: typing.Dict[str, str] = {
 # The header row is found by scanning for the row that carries these -- the mastersheet opens with
 # a free-text price-change banner and a blank spacer row before it.
 _REQUIRED_HEADER_KEYS = ("SKU", "BRAND")
+
+# TWG's real per-dealer relay drop -- "TWG_Inventory_USA.csv" seen live, matched loosely in case
+# the name drifts. Distinct from WORKBOOK_FILENAME_PATTERN: this is a flat CSV with real
+# DealerCost and per-warehouse on-hand columns, not the mastersheet's list-price-only xlsx. Only
+# ever arrives over the sftp transport -- the public share has no dealer-specific data to serve.
+INVENTORY_FILENAME_PATTERN = re.compile(r"inventory.*\.csv$", re.IGNORECASE)
+
+# Named columns on the relay inventory CSV. Every other column is a warehouse code holding that
+# SKU's on-hand quantity there (see _parse_inventory_csv) -- not hardcoded here since TWG could
+# add or rename a warehouse without any code change needed on our side.
+_INVENTORY_FIELD_BY_HEADER_KEY: typing.Dict[str, str] = {
+    "ITEM": "sku",
+    "ITEMDESCRIPTION": "description",
+    "PLINID": "brand",
+    "DEALERCOST": "cost",
+    "MSRP": "msrp",
+    "MAP": "map_price",
+    "OLDMSRP": "old_msrp",
+    "TOTALONHAND": "total_onhand",
+}
 
 
 def _header_key(value: typing.Any) -> str:
@@ -552,3 +573,112 @@ class TheWheelGroupFeedClient(object):
         data["source_filename"] = filename
         data["source_mode"] = "local_file" if self.local_file_path else self.source_mode()
         return data
+
+    # ----------------------------------------------------------------------------------
+    # Relay inventory CSV (real per-dealer cost + per-warehouse stock; sftp only)
+    # ----------------------------------------------------------------------------------
+    @staticmethod
+    def _latest_inventory_csv_filename(
+        entries: typing.Iterable[typing.Tuple[str, float]]
+    ) -> typing.Optional[str]:
+        candidates = [
+            (mtime, name)
+            for name, mtime in entries
+            if INVENTORY_FILENAME_PATTERN.search((name or "").strip())
+        ]
+        if not candidates:
+            return None
+        candidates.sort()
+        return candidates[-1][1]
+
+    def _download_latest_inventory_csv(self) -> typing.Optional[typing.Tuple[str, bytes]]:
+        """(filename, content) for the newest relay inventory CSV, or None if this connection
+        isn't on the sftp transport or has no such file -- both are normal, expected states."""
+        if self.local_file_path or self.source_mode() != SOURCE_MODE_SFTP:
+            return None
+        transport, sftp = self._sftp_session()
+        try:
+            filename = self._latest_inventory_csv_filename(self._relay_entries(sftp))
+            if not filename:
+                return None
+            remote_path = (
+                filename
+                if self.sftp_directory in ("", ".")
+                else "{}/{}".format(self.sftp_directory.rstrip("/"), filename)
+            )
+            buffer = io.BytesIO()
+            sftp.getfo(remote_path, buffer)
+            content = buffer.getvalue()
+        except exceptions.TheWheelGroupException:
+            raise
+        except Exception as e:
+            raise exceptions.TheWheelGroupDownloadError(
+                "Failed to download The Wheel Group inventory CSV over SFTP: {}.".format(str(e))
+            )
+        finally:
+            self._close_sftp_session(transport, sftp)
+        if not content:
+            raise exceptions.TheWheelGroupDownloadError(
+                "The Wheel Group inventory CSV {} was empty.".format(filename)
+            )
+        logger.info(
+            "{} Downloaded inventory CSV {} ({} bytes) via sftp.".format(
+                _LOG_PREFIX, filename, len(content)
+            )
+        )
+        return filename, content
+
+    @staticmethod
+    def _decode_csv_bytes(content: bytes) -> str:
+        """TWG's relay CSV has shown up clean UTF-8 so far; fall back through latin-1 (never
+        raises, matching every other relay CSV client in this codebase) rather than failing the
+        whole sync over one mis-encoded byte."""
+        for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+            try:
+                return content.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+        return content.decode("latin-1", errors="replace")
+
+    @classmethod
+    def _parse_inventory_csv(cls, content: bytes) -> typing.List[typing.Dict]:
+        """
+        One dict per row: known columns mapped via _INVENTORY_FIELD_BY_HEADER_KEY (sku, brand,
+        cost, msrp, map_price, ...); every other non-blank column is treated as a warehouse code
+        and collected into "warehouse_qty" -- {code: qty}. Blank warehouse cells (no stock there)
+        are simply omitted rather than written as 0, matching Turn14's own "absent = no data"
+        inventory-dict convention.
+        """
+        text = cls._decode_csv_bytes(content)
+        reader = csv.DictReader(io.StringIO(text))
+        rows: typing.List[typing.Dict] = []
+        for raw_row in reader:
+            row: typing.Dict[str, typing.Any] = {}
+            warehouse_qty: typing.Dict[str, typing.Any] = {}
+            for header, value in raw_row.items():
+                key = _header_key(header)
+                text_value = _text(value)
+                if key in _INVENTORY_FIELD_BY_HEADER_KEY:
+                    row[_INVENTORY_FIELD_BY_HEADER_KEY[key]] = text_value
+                elif key and text_value is not None:
+                    warehouse_qty[header.strip()] = text_value
+            row["warehouse_qty"] = warehouse_qty
+            if row.get("sku"):
+                rows.append(row)
+        return rows
+
+    def get_relay_inventory_data(self) -> typing.Optional[typing.Dict[str, typing.Any]]:
+        """
+        ``{"parts": [...], "source_filename": ...}`` from the newest relay inventory CSV, or
+        None when this connection has no such file yet (still on the public share, or the relay
+        drop hasn't landed) -- callers should treat that as "nothing to do," not an error.
+        """
+        downloaded = self._download_latest_inventory_csv()
+        if downloaded is None:
+            return None
+        filename, content = downloaded
+        rows = self._parse_inventory_csv(content)
+        logger.info(
+            "{} Parsed {} rows from inventory CSV {!r}.".format(_LOG_PREFIX, len(rows), filename)
+        )
+        return {"parts": rows, "source_filename": filename}

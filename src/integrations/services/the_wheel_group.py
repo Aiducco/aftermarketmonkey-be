@@ -67,6 +67,28 @@ _THE_WHEEL_GROUP_BRAND_NAME_OVERRIDE: typing.Dict[str, str] = {
 # targets, but never acceptable *fuzzy* targets -- see the same guard in the Elite Wheel service.
 _INACTIVE_BRAND_NAME_MARKER = "INACTIVE"
 
+# The relay inventory CSV's PlinId column -> TheWheelGroupBrand.external_id. Different problem
+# from _THE_WHEEL_GROUP_BRAND_NAME_OVERRIDE above (that one retargets which Brands row a TWG
+# brand maps to; this one bridges the CSV's own brand spelling to the TheWheelGroupBrand row the
+# mastersheet already created), so kept separate even though two of the three entries are the
+# same brands. Confirmed live 2026-09-12 against a real relay drop (Recon Overland):
+#   * CSV writes "ION" for what the mastersheet's external_id stores as "ION ALLOY".
+#   * CSV writes "TRAILER" for "ION TRAILER".
+#   * CSV writes "TUFF STUFF OVERLAND" (spelled out) for the mastersheet's raw "TUFFSTUFF".
+# Every other PlinId seen so far (AMERICAN TRUXX, CALI OFF-ROAD, DIRTY LIFE, KRAZE, MAYHEM, MAZZI,
+# RIDLER, TOUREN) already matches its TheWheelGroupBrand.external_id exactly.
+_INVENTORY_PLINID_TO_BRAND_EXTERNAL_ID: typing.Dict[str, str] = {
+    "ION": "ION ALLOY",
+    "TRAILER": "ION TRAILER",
+    "TUFF STUFF OVERLAND": "TUFFSTUFF",
+}
+
+def _inventory_brand_external_id(plinid: typing.Optional[str]) -> str:
+    """TheWheelGroupBrand.external_id for a relay inventory CSV row's PlinId column."""
+    name = (plinid or "").strip().upper()
+    return _INVENTORY_PLINID_TO_BRAND_EXTERNAL_ID.get(name, name)
+
+
 _PART_UPDATE_FIELDS = [
     "aaia_code",
     "name",
@@ -710,14 +732,18 @@ def _part_id_by_brand_and_sku() -> typing.Dict[typing.Tuple[str, str], int]:
 
 def sync_the_wheel_group_company_pricing_for_company_provider(company_provider_id: int) -> None:
     """
-    Read this company's own TWG feed and upsert TheWheelGroupCompanyPricing. Keyed to existing part
-    rows by (brand external_id, sku); parts missing from the catalog table are skipped (run
-    fetch_and_save_the_wheel_group first).
+    Upsert TheWheelGroupCompanyPricing for this company. Keyed to existing part rows by (brand
+    external_id, sku); parts missing from the catalog table are skipped (run
+    fetch_and_save_the_wheel_group first) -- this never creates a TheWheelGroupPart, only prices
+    ones the mastersheet already put there.
 
-    A connection still on the public share has no dealer cost to read, so its rows carry MAP and
-    MSRP with a null cost -- that is the expected state until TWG delivers to our relay, and it
-    still gives the company real list pricing to work from. Rows with no price at all are never
-    written, so an empty feed cannot blank out prices a real dealer feed previously set.
+    Prefers this connection's own relay inventory CSV when one exists (real per-dealer
+    DealerCost -- see TheWheelGroupFeedClient.get_relay_inventory_data), falling back to the
+    public mastersheet's list-price-only rows otherwise. A connection still on the public share
+    has no dealer cost to read, so its rows carry MAP and MSRP with a null cost -- that is the
+    expected state until TWG delivers to this company's relay, and it still gives the company
+    real list pricing to work from. Rows with no price at all are never written, so an empty feed
+    cannot blank out prices a real dealer feed previously set.
     """
     cp = (
         src_models.CompanyProviders.objects.filter(
@@ -740,14 +766,34 @@ def sync_the_wheel_group_company_pricing_for_company_provider(company_provider_i
     client = _the_wheel_group_client_for_credentials(creds)
     source_mode = client.source_mode()
     try:
-        data = client.get_feed_data()
+        relay_data = client.get_relay_inventory_data()
     except the_wheel_group_exceptions.TheWheelGroupException as e:
         logger.error(
-            "{} Feed error for company_id={}: {}.".format(_LOG_PREFIX, cp.company_id, str(e))
+            "{} Relay inventory CSV error for company_id={}: {}.".format(
+                _LOG_PREFIX, cp.company_id, str(e)
+            )
         )
         raise
 
-    rows = data.get("parts") or []
+    if relay_data is not None:
+        rows = relay_data.get("parts") or []
+        brand_key_fn = _inventory_brand_external_id
+        logger.info(
+            "{} company_id={} pricing from relay inventory CSV {!r} ({} rows).".format(
+                _LOG_PREFIX, cp.company_id, relay_data.get("source_filename"), len(rows)
+            )
+        )
+    else:
+        try:
+            data = client.get_feed_data()
+        except the_wheel_group_exceptions.TheWheelGroupException as e:
+            logger.error(
+                "{} Feed error for company_id={}: {}.".format(_LOG_PREFIX, cp.company_id, str(e))
+            )
+            raise
+        rows = data.get("parts") or []
+        brand_key_fn = brand_external_id
+
     if not rows:
         logger.warning(
             "{} No TWG rows for company_id={}. Nothing to price.".format(
@@ -766,7 +812,7 @@ def sync_the_wheel_group_company_pricing_for_company_provider(company_provider_i
         sku = _safe_str(row.get("sku"), 255)
         if not sku:
             continue
-        part_id = part_id_by_key.get((brand_external_id(row.get("brand")), sku))
+        part_id = part_id_by_key.get((brand_key_fn(row.get("brand")), sku))
         if not part_id:
             continue
         pricing_rows.append(
@@ -807,3 +853,110 @@ def sync_the_wheel_group_company_pricing_for_company_provider(company_provider_i
             _LOG_PREFIX, cp.company_id, written, priced_with_cost, source_mode,
         )
     )
+
+
+def _safe_int(value: typing.Any) -> typing.Optional[int]:
+    if value is None:
+        return None
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return None
+    try:
+        return int(Decimal(text))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def sync_the_wheel_group_relay_inventory() -> int:
+    """
+    Pull the primary TWG connection's relay inventory CSV (real per-warehouse on-hand) and upsert
+    TheWheelGroupInventory. No-op, not an error, when that connection is still on the public
+    share -- there's nothing to read until TWG delivers a real feed (see
+    TheWheelGroupFeedClient.get_relay_inventory_data).
+
+    Stock is shared across every company (TWG's own warehouse network, not a per-customer
+    allocation) -- one connection's relay drop is read regardless of how many companies are
+    connected, same as fetch_and_save_the_wheel_group reads one connection's mastersheet for the
+    whole shared catalog. Only matches SKUs that already exist as TheWheelGroupPart; the relay
+    file's rows for brands/categories outside the mastersheet (center caps, lug nuts, tires,
+    third-party brands) have nothing to attach to and are skipped, not created.
+
+    Returns the number of TheWheelGroupInventory rows upserted.
+    """
+    cp = _catalog_company_provider()
+    if not cp:
+        logger.info("{} No TWG CompanyProviders yet; nothing to read inventory from.".format(_LOG_PREFIX))
+        return 0
+
+    creds = credentials_helper.get_feed_credentials(cp)
+    client = _the_wheel_group_client_for_credentials(creds)
+    try:
+        relay_data = client.get_relay_inventory_data()
+    except the_wheel_group_exceptions.TheWheelGroupException as e:
+        logger.error(
+            "{} Relay inventory CSV error for company_id={}: {}.".format(
+                _LOG_PREFIX, cp.company_id, str(e)
+            )
+        )
+        raise
+
+    if relay_data is None:
+        logger.info(
+            "{} company_id={} (catalog connection) has no relay inventory CSV yet -- still on "
+            "the public share.".format(_LOG_PREFIX, cp.company_id)
+        )
+        return 0
+
+    rows = relay_data.get("parts") or []
+    source_filename = relay_data.get("source_filename")
+    if not rows:
+        logger.warning("{} Relay inventory CSV {!r} had no rows.".format(_LOG_PREFIX, source_filename))
+        return 0
+
+    part_id_by_key = _part_id_by_brand_and_sku()
+    now = timezone.now()
+    instances = []
+    skipped_unknown_sku = 0
+    for row in rows:
+        sku = _safe_str(row.get("sku"), 255)
+        if not sku:
+            continue
+        part_id = part_id_by_key.get((_inventory_brand_external_id(row.get("brand")), sku))
+        if not part_id:
+            skipped_unknown_sku += 1
+            continue
+        warehouse_qty = {
+            code: qty
+            for code, qty in ((c, _safe_int(v)) for c, v in (row.get("warehouse_qty") or {}).items())
+            if qty is not None
+        }
+        total_onhand = _safe_int(row.get("total_onhand"))
+        if total_onhand is None:
+            total_onhand = sum(warehouse_qty.values())
+        instances.append(
+            src_models.TheWheelGroupInventory(
+                part_id=part_id,
+                warehouse_qty=warehouse_qty or None,
+                total_onhand=total_onhand,
+                source_filename=source_filename,
+                updated_at=now,
+            )
+        )
+
+    written = 0
+    for start in range(0, len(instances), THE_WHEEL_GROUP_UPSERT_BATCH):
+        batch = instances[start:start + THE_WHEEL_GROUP_UPSERT_BATCH]
+        pgbulk.upsert(
+            src_models.TheWheelGroupInventory,
+            batch,
+            unique_fields=["part"],
+            update_fields=["warehouse_qty", "total_onhand", "source_filename", "updated_at"],
+            returning=False,
+        )
+        written += len(batch)
+
+    logger.info(
+        "{} Upserted {} TWG inventory rows from {!r} ({} rows skipped -- no matching mastersheet "
+        "SKU).".format(_LOG_PREFIX, written, source_filename, skipped_unknown_sku)
+    )
+    return written

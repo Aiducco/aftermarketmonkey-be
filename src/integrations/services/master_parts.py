@@ -12099,10 +12099,12 @@ def sync_derived_from_elite_wheel(
 # THE WHEEL GROUP
 # ============================================================
 # TWG's mastersheet is a catalog and list-price sheet: wheel specs, images, marketing copy, MSRP
-# and MAP, with no quantity column anywhere. So this provider has no ProviderPartInventory step --
-# the product_details refresh that normally rides along with inventory is its own pass below
-# (sync_provider_details_from_the_wheel_group). Everything else is the standard single-source-table
-# shape, closest to Rough Country (aaia + gtin + image on MasterPart) and Vossen.
+# and MAP, with no quantity column anywhere. Real per-warehouse stock (and real per-dealer cost)
+# arrives separately over the relay as a CSV -- see TheWheelGroupInventory and
+# sync_provider_inventory_from_the_wheel_group below, and
+# the_wheel_group.sync_the_wheel_group_relay_inventory for how it lands there. Everything else is
+# the standard single-source-table shape, closest to Rough Country (aaia + gtin + image on
+# MasterPart) and Vossen.
 
 
 def _the_wheel_group_provider_external_id(twg_brand_id: int, sku: str) -> str:
@@ -12406,10 +12408,12 @@ def sync_provider_details_from_the_wheel_group() -> None:
     """
     Refresh ProviderPart.product_details with TWG's wheel-spec attributes.
 
-    Deliberately no ProviderPartInventory: the mastersheet carries no stock at all, and writing
-    rows with a zero total would present every TWG part as out of stock rather than as
-    "availability unknown" (which is what a missing inventory row already means to the parts API).
-    When TWG starts delivering a feed with quantities, this is where the inventory upsert goes.
+    No inventory here -- see sync_provider_inventory_from_the_wheel_group, sourced from the relay
+    CSV rather than the mastersheet this function reads. Before that relay feed existed, writing a
+    zero-total row here from a stockless mastersheet would have presented every TWG part as out of
+    stock rather than as "availability unknown" (a missing inventory row); now that a real feed
+    exists, that concern applies only to connections still on the public share, which simply never
+    produce a TheWheelGroupInventory row to propagate.
     """
     logger.info("{} Syncing provider product details from The Wheel Group.".format(_LOG_PREFIX))
 
@@ -12472,6 +12476,120 @@ def sync_provider_details_from_the_wheel_group() -> None:
     logger.info("{} Refreshed {} The Wheel Group product_details records.".format(
         _LOG_PREFIX, grand_total
     ))
+
+
+# TWG's relay inventory CSV warehouse columns -> a human-readable name. TWG publishes no location
+# reference API (unlike Turn14Location/MeyerLocation, fetched from GET /locations or /Warehouses)
+# -- this is a flat CSV with no accompanying facility directory, so the mapping is hand-built from
+# TWG's own published facility list. ATL/CHAR/DEN/COL/JACKFL/HOUS/DAL/SANT/KSCITY/NASH/LA/SEAWA
+# are confirmed against that list; CHI/IND/NJ/NORL/PHXAZ have no confirmed street address but are
+# unambiguous from the code itself. A code seen in a feed but absent here falls back to the raw
+# code (see _the_wheel_group_warehouse_availability) rather than failing the sync.
+_THE_WHEEL_GROUP_WAREHOUSE_NAMES: typing.Dict[str, str] = {
+    "ATL": "Atlanta, GA",
+    "CHAR": "Charlotte, NC",
+    "CHI": "Chicago, IL",
+    "COL": "Columbus, OH",
+    "DAL": "Dallas, TX",
+    "DEN": "Denver, CO",
+    "HOUS": "Houston, TX",
+    "IND": "Indianapolis, IN",
+    "JACKFL": "Jacksonville, FL",
+    "KSCITY": "Kansas City, MO",
+    "LA": "Los Angeles, CA",
+    "NASH": "Nashville, TN",
+    "NJ": "New Jersey",
+    "NORL": "New Orleans, LA",
+    "PHXAZ": "Phoenix, AZ",
+    "SANT": "San Antonio, TX",
+    "SEAWA": "Seattle, WA",
+}
+
+
+def _the_wheel_group_warehouse_availability(
+    warehouse_qty: typing.Optional[typing.Dict],
+) -> typing.Optional[typing.Dict[str, typing.Union[int, float]]]:
+    """TheWheelGroupInventory.warehouse_qty's raw codes -> display names, same role
+    _map_turn14_inventory_to_location_names plays for Turn14's inventory."""
+    if not warehouse_qty or not isinstance(warehouse_qty, dict):
+        return None
+    result = {}
+    for code, qty in warehouse_qty.items():
+        if not isinstance(qty, (int, float)):
+            continue
+        display_name = _THE_WHEEL_GROUP_WAREHOUSE_NAMES.get((code or "").strip().upper(), code)
+        result[display_name] = qty
+    return result or None
+
+
+def sync_provider_inventory_from_the_wheel_group() -> int:
+    """
+    Sync ProviderPartInventory from TheWheelGroupInventory (real per-warehouse on-hand from TWG's
+    relay CSV -- see the_wheel_group.sync_the_wheel_group_relay_inventory, which must run first).
+    Global, not per-company: TWG's stock is the same regardless of which dealer's relay account
+    delivered the file, same as Turn14's. No-op when no TheWheelGroupInventory rows exist yet
+    (still on the public share) -- not an error, matching sync_provider_details_from_the_wheel_group's
+    own "deliberately no inventory yet" note above.
+    """
+    logger.info("{} Syncing provider inventory from The Wheel Group.".format(_LOG_PREFIX))
+
+    twg_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.THE_WHEEL_GROUP.value,
+    ).first()
+    if not twg_provider:
+        logger.info("{} No The Wheel Group provider found.".format(_LOG_PREFIX))
+        return 0
+
+    provider_parts = {
+        row["provider_external_id"]: src_models.ProviderPart(id=row["id"])
+        for row in src_models.ProviderPart.objects.filter(provider=twg_provider).values(
+            "id", "provider_external_id"
+        )
+    }
+    if not provider_parts:
+        logger.info("{} No The Wheel Group ProviderPart rows yet. Nothing to inventory.".format(_LOG_PREFIX))
+        return 0
+
+    now = timezone.now()
+    to_upsert = []
+    for row in src_models.TheWheelGroupInventory.objects.values(
+        "part__brand_id", "part__sku", "warehouse_qty", "total_onhand"
+    ).iterator(chunk_size=2000):
+        brand_id = row.get("part__brand_id")
+        sku = (row.get("part__sku") or "").strip()
+        if not brand_id or not sku:
+            continue
+        ext_id = _the_wheel_group_provider_external_id(brand_id, sku)
+        provider_part = provider_parts.get(ext_id)
+        if not provider_part:
+            continue
+        to_upsert.append(
+            src_models.ProviderPartInventory(
+                provider_part=provider_part,
+                warehouse_total_qty=row.get("total_onhand") or 0,
+                warehouse_availability=_the_wheel_group_warehouse_availability(row.get("warehouse_qty")),
+                last_synced_at=now,
+                updated_at=now,
+            )
+        )
+
+    written = 0
+    for start in range(0, len(to_upsert), BATCH_SIZE_INVENTORY):
+        batch = _dedupe_provider_part_inventory_for_upsert(
+            to_upsert[start:start + BATCH_SIZE_INVENTORY],
+            context="The Wheel Group inventory batch starting at {}".format(start),
+        )
+        pgbulk.upsert(
+            src_models.ProviderPartInventory,
+            batch,
+            unique_fields=["provider_part"],
+            update_fields=["warehouse_total_qty", "warehouse_availability", "last_synced_at", "updated_at"],
+        )
+        written += len(batch)
+        connection.close()
+
+    logger.info("{} Synced {} The Wheel Group inventory records.".format(_LOG_PREFIX, written))
+    return written
 
 
 _THE_WHEEL_GROUP_PRICING_UPSERT_FIELDS = [
@@ -12676,13 +12794,18 @@ def sync_derived_from_the_wheel_group(
     *, reindex_meilisearch: bool = False, skip_master_parts: bool = False, skip_pricing: bool = False
 ) -> None:
     """
-    Propagate The Wheel Group source data into MasterPart, ProviderPart, ProviderPart.product_details
-    and ProviderPartCompanyPricing. Call after the TWG feed ingest. No fitment sync -- the sheet
-    carries wheel-spec attributes, not vehicle fitment; and no inventory sync -- it carries no
-    stock (see sync_provider_details_from_the_wheel_group).
+    Propagate The Wheel Group source data into MasterPart, ProviderPart, ProviderPart.product_details,
+    ProviderPartInventory and ProviderPartCompanyPricing. Call after the TWG feed ingest. No
+    fitment sync -- the sheet carries wheel-spec attributes, not vehicle fitment.
 
-    Pass ``skip_master_parts=True`` to run only details + pricing (fast incremental path).
-    Pass ``skip_pricing=True`` to run only master parts + details (global catalog sync path).
+    Inventory (sync_provider_inventory_from_the_wheel_group) runs whenever a TheWheelGroupInventory
+    row exists (i.e. the catalog connection's relay feed has landed -- see
+    the_wheel_group.sync_the_wheel_group_relay_inventory, which must run first); it is a genuine
+    no-op, not an error, while every connection is still on the public share, since the mastersheet
+    itself carries no stock at all.
+
+    Pass ``skip_master_parts=True`` to run only details + inventory + pricing (fast incremental path).
+    Pass ``skip_pricing=True`` to run only master parts + details + inventory (global catalog sync path).
     """
     logger.info("{} Starting The Wheel Group-only derived sync ({}).".format(
         _LOG_PREFIX,
@@ -12694,6 +12817,8 @@ def sync_derived_from_the_wheel_group(
 
     def _cont() -> None:
         sync_provider_details_from_the_wheel_group()
+        connection.close()
+        sync_provider_inventory_from_the_wheel_group()
         connection.close()
         if not skip_pricing:
             sync_provider_pricing_from_the_wheel_group()

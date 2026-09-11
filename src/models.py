@@ -2455,6 +2455,10 @@ class Lead(django_db_models.Model):
     emails_not_found = django_db_models.BooleanField(
         default=False, blank=True
     )  # True = enrichment tried, nothing found
+    # When the web-search hunt (search_lead_emails) last ran. Distinct from emails_not_found,
+    # which the site scrape sets: a scraped-and-empty row and a searched-and-empty row look
+    # identical without this, and re-searching costs metered Tavily credits.
+    email_search_at = django_db_models.DateTimeField(null=True, blank=True)
     email = django_db_models.EmailField(max_length=255, null=True, blank=True)
     emails = django_db_models.JSONField(default=list, blank=True)
 
@@ -2554,6 +2558,8 @@ class RealTruckLead(django_db_models.Model):
     email = django_db_models.EmailField(max_length=255, null=True, blank=True)
     emails = django_db_models.JSONField(default=list, blank=True)
     emails_not_found = django_db_models.BooleanField(default=False, blank=True)  # scraped, nothing there
+    # When search_lead_emails last searched the web for this shop's address. See Lead.email_search_at.
+    email_search_at = django_db_models.DateTimeField(null=True, blank=True)
 
     address = django_db_models.TextField(null=True, blank=True)
     city = django_db_models.TextField(null=True, blank=True)
@@ -4168,6 +4174,40 @@ class TheWheelGroupCompanyPricing(django_db_models.Model):
     class Meta:
         db_table = "thewheelgroup_company_pricing"
         unique_together = [["part", "company"]]
+
+
+class TheWheelGroupInventory(django_db_models.Model):
+    """
+    Raw per-SKU rows from TWG's real relay inventory CSV (real DealerCost + per-warehouse
+    on-hand) -- see src.integrations.clients.the_wheel_group.client.INVENTORY_FILENAME_PATTERN.
+    Only matched against SKUs that already exist as TheWheelGroupPart from the mastersheet; a CSV
+    row for a brand/category the mastersheet doesn't carry (TWG's file spans a wider catalog than
+    just their own house wheel brands) has nothing to attach to and is skipped.
+
+    Stock is the same regardless of which dealer's relay account happened to deliver the file
+    (TWG's shared warehouse network, not a per-customer allocation), so this carries no company
+    FK and feeds the GLOBAL ProviderPartInventory, same role Turn14BrandInventory plays for
+    Turn14. warehouse_qty keeps TWG's raw codes (e.g. "ATL", "DEN") -- decoding to human-readable
+    names happens at propagation time in master_parts.sync_provider_inventory_from_the_wheel_group,
+    mirroring Turn14Location's split between raw storage and display-name decode.
+
+    Per-dealer DealerCost from the same CSV is used separately, per company, by
+    TheWheelGroupCompanyPricing -- see
+    the_wheel_group.sync_the_wheel_group_company_pricing_for_company_provider.
+    """
+
+    part = django_db_models.OneToOneField(
+        TheWheelGroupPart, on_delete=django_db_models.CASCADE, related_name="relay_inventory"
+    )
+    warehouse_qty = django_db_models.JSONField(null=True, blank=True)
+    total_onhand = django_db_models.IntegerField(default=0)
+    source_filename = django_db_models.CharField(max_length=255, null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "thewheelgroup_inventory"
 
 
 class BrandTheWheelGroupBrandMapping(django_db_models.Model):

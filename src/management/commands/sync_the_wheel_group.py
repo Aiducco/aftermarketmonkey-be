@@ -1,9 +1,14 @@
 """
-Sync The Wheel Group's US Wheel Data Mastersheet.
-Downloads the newest workbook, upserts brands and parts from the ``US Data Mastersheet``
-worksheet, maps brands into Brands, then propagates into the master parts layer. Per-company
+Sync The Wheel Group's US Wheel Data Mastersheet, plus the catalog connection's real relay
+inventory CSV when one has landed.
+
+Downloads the newest mastersheet workbook (product definitions, images, MSRP/MAP -- always the
+public Dropbox share's source of truth), upserts brands and parts from the ``US Data Mastersheet``
+worksheet, maps brands into Brands, reads the real per-warehouse stock CSV over SFTP if the
+catalog connection has one, then propagates everything into the master parts layer. Per-company
 pricing (TheWheelGroupCompanyPricing -> ProviderPartCompanyPricing) is handled per company by the
-IntegrationPricingSyncJob queue.
+IntegrationPricingSyncJob queue, which also prefers that company's own relay CSV for real dealer
+cost when one exists.
 """
 from django.core.management.base import BaseCommand
 
@@ -15,7 +20,8 @@ class Command(BaseCommand):
     help = (
         "Sync The Wheel Group mastersheet: download the newest US Wheel Data Mastersheet.xlsx, "
         "upsert TheWheelGroupBrand and TheWheelGroupPart (catalog + MSRP/MAP); sync unmapped TWG "
-        "brands into Brands; then propagate into master parts and provider parts."
+        "brands into Brands; read the catalog connection's relay inventory CSV if one exists; "
+        "then propagate into master parts and provider parts."
     )
 
     def add_arguments(self, parser):
@@ -54,7 +60,18 @@ class Command(BaseCommand):
             self.stdout.write(self.style.SUCCESS("Unmapped TWG brands synced."))
 
             self.stdout.write(
-                "Step 3: Propagating TWG catalog into master parts and provider parts..."
+                "Step 3: Reading the catalog connection's relay inventory CSV (real per-warehouse "
+                "stock), if one has landed..."
+            )
+            inventory_rows = the_wheel_group.sync_the_wheel_group_relay_inventory()
+            self.stdout.write(self.style.SUCCESS(
+                "TWG relay inventory synced ({} rows).".format(inventory_rows)
+                if inventory_rows
+                else "No TWG relay inventory CSV yet (still on the public share) -- skipped."
+            ))
+
+            self.stdout.write(
+                "Step 4: Propagating TWG catalog into master parts and provider parts..."
             )
             master_parts.sync_derived_from_the_wheel_group(
                 reindex_meilisearch=False, skip_pricing=True
