@@ -333,6 +333,36 @@ def remove_company_user(
     return None
 
 
+def reset_company_user_password(
+    company_id: int,
+    target_user_id: int,
+    admin_user,
+    new_password: str,
+) -> str | None:
+    """
+    Reset a team member's password. Admin only. Target user must belong to the same
+    company as the admin — scoped the same way as update_company_user_role/
+    remove_company_user, so an admin can't reach a user in another company.
+    Returns error message on failure, None on success.
+    """
+    ok, err = _is_company_admin(admin_user, company_id)
+    if not ok:
+        return err
+
+    try:
+        profile = src_models.UserProfile.objects.select_related("user").get(
+            user_id=target_user_id,
+            company_id=company_id,
+        )
+    except src_models.UserProfile.DoesNotExist:
+        return "User not found in company"
+
+    profile.user.set_password(new_password)
+    profile.user.save(update_fields=["password"])
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Account deletion
 # ---------------------------------------------------------------------------

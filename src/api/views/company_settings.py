@@ -286,6 +286,52 @@ class CompanyTeamMemberView(views.View):
 
 
 @method_decorator(csrf_exempt, name="dispatch")
+class CompanyTeamMemberResetPasswordView(views.View):
+    """POST /api/settings/company/team/<user_id>/reset-password/ - Reset a team member's password (admin only)."""
+
+    def post(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
+        company_id, err = _auth_and_company(request)
+        if err:
+            return _json_response({"message": err}, status=401 if "authenticated" in err else 400)
+
+        ok, admin_err = company_settings_services._is_company_admin(request.user, company_id)
+        if not ok:
+            return _json_response({"message": admin_err or "Admin access required"}, status=403)
+
+        user_id = kwargs.get("user_id")
+        if not user_id:
+            return _json_response({"message": "User ID required"}, status=400)
+        try:
+            user_id = int(user_id)
+        except (ValueError, TypeError):
+            return _json_response({"message": "Invalid user ID"}, status=400)
+
+        try:
+            body = json.loads(request.body) if request.body else {}
+            validated = common_utils.validate_data_schema(
+                data=body,
+                schema=company_settings_schema.ResetCompanyUserPasswordSchema(),
+            )
+        except common_exceptions.ValidationSchemaException as e:
+            return _json_response(
+                {"message": "Invalid payload", "data": common_utils.get_exception_message(exception=e)},
+                status=400,
+            )
+        except json.JSONDecodeError:
+            return _json_response({"message": "Invalid JSON body"}, status=400)
+
+        err = company_settings_services.reset_company_user_password(
+            company_id=company_id,
+            target_user_id=user_id,
+            admin_user=request.user,
+            new_password=validated["new_password"],
+        )
+        if err:
+            return _json_response({"message": err}, status=400)
+        return _json_response({"message": "Password reset successfully"})
+
+
+@method_decorator(csrf_exempt, name="dispatch")
 class DeleteAccountView(views.View):
     """DELETE /settings/account/ — delete the authenticated user's own account."""
 

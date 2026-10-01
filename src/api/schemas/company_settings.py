@@ -27,3 +27,7 @@ class AddCompanyUserSchema(Schema):
 
 class UpdateCompanyUserRoleSchema(Schema):
     is_company_admin = fields.Boolean(required=True)
+
+
+class ResetCompanyUserPasswordSchema(Schema):
+    new_password = fields.String(required=True, validate=validate.Length(min=8))
