@@ -147,15 +147,30 @@ def suggest_addresses(
     results = []
     for suggestion in suggestions[:limit]:
         suggestion_id = uuid.uuid4().hex
-        cache.set(
-            _suggestion_cache_key(session=session, suggestion_id=suggestion_id),
-            {
-                "provider": getattr(provider, "name", ""),
-                "provider_ref": suggestion.provider_ref,
-                "address": suggestion.address.as_dict() if suggestion.address else None,
-            },
-            ttl,
-        )
+        try:
+            cache.set(
+                _suggestion_cache_key(session=session, suggestion_id=suggestion_id),
+                {
+                    "provider": getattr(provider, "name", ""),
+                    "provider_ref": suggestion.provider_ref,
+                    "address": suggestion.address.as_dict() if suggestion.address else None,
+                },
+                ttl,
+            )
+        except Exception:
+            # The cache is load-bearing here, not an optimization: an id nobody can resolve
+            # would give the user a dropdown that does nothing when clicked. So this still
+            # degrades to "no suggestions" -- but it is logged at ERROR and named for what it
+            # is, because an unreachable cache and a genuinely unmatched address are
+            # indistinguishable in the response and chasing the wrong one costs hours.
+            # Run `manage.py check_address_lookup` to confirm which it is.
+            logger.exception(
+                "%s CACHE WRITE FAILED -- /suggest will return an empty list for every query "
+                "until the cache is reachable. The address provider itself is fine; check "
+                "CACHE_HOST/CACHE_PORT and that the cache is up.",
+                _LOG_PREFIX,
+            )
+            return []
         results.append({"id": suggestion_id, "label": suggestion.label})
     return results
 

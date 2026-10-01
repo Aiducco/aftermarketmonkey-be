@@ -176,6 +176,46 @@ class SuggestAndResolveTest(SimpleTestCase):
         self.assertEqual(resolved, _US_ADDRESS.as_dict())
         self.assertEqual(provider.resolve_calls, [{"provider_ref": "place-abc", "session": _SESSION}])
 
+    def test_cache_write_failure_yields_an_empty_list_and_never_escapes(self):
+        """
+        The exact production failure this guards: an unreachable Redis made
+        /api/address/suggest/ answer 200 {"suggestions": []} for every query while
+        /api/address/validate/ kept working, because validate touches no cache. The empty list
+        is still the right response -- an id nobody can resolve would give the user a dropdown
+        that does nothing -- but the error must not propagate, and it must be logged.
+        """
+        provider = _StubProvider(
+            suggestions=[base.Suggestion(label="a", provider_ref="p1", address=_US_ADDRESS)]
+        )
+
+        with _patch_provider(provider):
+            with mock.patch.object(
+                address_services.cache, "set", side_effect=RuntimeError("redis down")
+            ):
+                with self.assertLogs(address_services.logger, level="ERROR") as captured:
+                    result = address_services.suggest_addresses(
+                        q="1600 Amph", country="US", session=_SESSION
+                    )
+
+        self.assertEqual(result, [])
+        self.assertIn("CACHE WRITE FAILED", "\n".join(captured.output))
+
+    def test_cache_write_failure_does_not_log_the_address_text(self):
+        provider = _StubProvider(
+            suggestions=[base.Suggestion(label="1600 Amphitheatre Parkway", provider_ref="p1", address=_US_ADDRESS)]
+        )
+
+        with _patch_provider(provider):
+            with mock.patch.object(
+                address_services.cache, "set", side_effect=RuntimeError("redis down")
+            ):
+                with self.assertLogs(address_services.logger, level="ERROR") as captured:
+                    address_services.suggest_addresses(q="1600 Amph", country="US", session=_SESSION)
+
+        logged = "\n".join(captured.output)
+        self.assertNotIn("Amphitheatre", logged)
+        self.assertNotIn("94043", logged)
+
     def test_provider_timeout_yields_an_empty_list_not_an_error(self):
         provider = _StubProvider(raises=address_exceptions.AddressProviderTimeout("too slow"))
 
