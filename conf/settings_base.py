@@ -696,31 +696,40 @@ GEOAPIFY_BASE_URL = os.environ.get("GEOAPIFY_BASE_URL", "https://api.geoapify.co
 # never feel slower than typing, so on timeout /suggest returns [] and /validate returns
 # "unverified" rather than surfacing an error (see the failure rule in the spec).
 #
-# 5s, not the 2s the spec asked for, and not the 3s this first shipped with. Measured over 24
-# live autocomplete calls: median 0.84s, min 0.56s -- but a long tail. "13000 Research Blvd"
-# ran 1.75-3.04s across four samples, straddling a 3s ceiling, and 5 of 24 calls exceeded 3s
-# altogether. A timeout here is indistinguishable to the user from "no such address", so a
-# ceiling that clips real queries makes the feature look broken rather than slow.
+# 8s, not the 2s the spec asked for. Walked up through 3s and 5s as measurements came in, the
+# last of them from production itself (0.375s baseline RTT subtracted):
 #
-# Costing little: the frontend debounces 250ms and aborts the superseded request, so a long
-# ceiling is only ever waited on for the one query the user actually stopped typing on. The
-# queries that still exceed 5s in testing were sparse ones ("742 Evergreen", consistently
-# ~6.5s) where an empty dropdown is the correct final answer anyway.
+#   most queries ("1600 Amph", "123 Main St", "350 5th Ave")   0.65-1.5s
+#   "13000 Research Blvd"                                      2.8-3.8s, spiking past 5s
+#   "742 Evergreen"                                            ~6.5s, consistently
+#
+# Slowness is per-query, not per-host: Geoapify spends real time on some inputs and the same
+# ones are slow from everywhere. Crucially the slow ones still return RESULTS -- "13000
+# Research Blvd" comes back with three hits -- so a tight ceiling silently discards good data,
+# and a timeout is indistinguishable to the user from "no such address". That makes the feature
+# look broken rather than slow, which is the worse failure.
+#
+# The ceiling costs little: the frontend debounces 250ms and aborts the superseded request, so
+# it is only ever waited out on the one query the user actually stopped typing on, and the
+# typical case stays ~1s.
 try:
-    ADDRESS_PROVIDER_TIMEOUT_SECONDS = float(os.environ.get("ADDRESS_PROVIDER_TIMEOUT_SECONDS") or "5")
+    ADDRESS_PROVIDER_TIMEOUT_SECONDS = float(os.environ.get("ADDRESS_PROVIDER_TIMEOUT_SECONDS") or "8")
 except ValueError:
-    ADDRESS_PROVIDER_TIMEOUT_SECONDS = 5.0
+    ADDRESS_PROVIDER_TIMEOUT_SECONDS = 8.0
 
-# Separate, longer ceiling for /validate. Geoapify's geocoding search is measurably slower
-# than its autocomplete -- 3.9s observed for "350 5th Ave, New York" against 0.4-0.9s for most
-# lookups -- so a shared 2s budget would turn a correct address into a spurious "we could not
-# check this address" warning for a noticeable share of users. Validation also runs once on a
-# button click rather than on every keystroke, so the "never slower than typing" reasoning
-# behind the 2s figure does not apply to it.
+# Its own knob, same 8s default, because the two endpoints fail differently and will want
+# tuning apart: a clipped /suggest shows an empty dropdown, a clipped /validate shows "We could
+# not check this address right now" on an address that is in fact fine.
+#
+# Measured on production: validating "13000 Research Boulevard" with a wrong postcode took
+# 4.2-4.7s across five samples and 5.4s on a sixth, which the previous 5s ceiling turned into
+# exactly that false warning -- the correct answer is "corrected", with the right postcode.
+# Geocoding runs once on a button click behind a loading state, so waiting is the cheaper error
+# here than crying wolf on a good address.
 try:
-    ADDRESS_VALIDATE_TIMEOUT_SECONDS = float(os.environ.get("ADDRESS_VALIDATE_TIMEOUT_SECONDS") or "5")
+    ADDRESS_VALIDATE_TIMEOUT_SECONDS = float(os.environ.get("ADDRESS_VALIDATE_TIMEOUT_SECONDS") or "8")
 except ValueError:
-    ADDRESS_VALIDATE_TIMEOUT_SECONDS = 5.0
+    ADDRESS_VALIDATE_TIMEOUT_SECONDS = 8.0
 
 try:
     ADDRESS_SUGGEST_LIMIT = int(os.environ.get("ADDRESS_SUGGEST_LIMIT") or "5")
