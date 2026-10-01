@@ -100,6 +100,24 @@ def get_admin_company_detail(company_id: int) -> typing.Optional[typing.Dict]:
             }
         )
 
+    # Same shape list_company_users (settings/company/team/) returns for a company's own members —
+    # here for any company, since this is the staff view. No password/credential fields.
+    profiles = src_models.UserProfile.objects.filter(company_id=company_id).select_related("user")
+    users = [
+        {
+            "id": p.user_id,
+            "email": p.user.email,
+            "first_name": p.user.first_name,
+            "last_name": p.user.last_name,
+            "is_company_admin": p.is_company_admin,
+            "is_staff": p.user.is_staff,
+            "is_active": p.user.is_active,
+            "last_login": p.user.last_login.isoformat() if p.user.last_login else None,
+            "created_at": p.created_at.isoformat() if p.created_at else None,
+        }
+        for p in profiles
+    ]
+
     return {
         "id": company.id,
         "name": company.name,
@@ -116,4 +134,5 @@ def get_admin_company_detail(company_id: int) -> typing.Optional[typing.Dict]:
         "connected_providers_count": company.connected_providers_count,
         "total_providers_count": company.total_providers_count,
         "providers": providers,
+        "users": users,
     }
