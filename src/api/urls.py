@@ -1,5 +1,10 @@
 from django.contrib import admin
 from django.urls import path, include
+from src.api.views.address import (
+    AddressResolveView,
+    AddressSuggestView,
+    AddressValidateView,
+)
 from src.api.views.authentication import LoginView, ChangePasswordView
 from src.api.views.company import CompanyDestinationsView
 from src.api.views.company_locations import CompanyLocationsView, CompanyLocationDetailView
@@ -457,6 +462,21 @@ urlpatterns = [
         "support/tickets/",
         SupportTicketsView.as_view(),
         name="support_tickets",
+    ),
+    path(
+        "address/suggest/",
+        AddressSuggestView.as_view(),
+        name="address_suggest",
+    ),
+    path(
+        "address/resolve/",
+        AddressResolveView.as_view(),
+        name="address_resolve",
+    ),
+    path(
+        "address/validate/",
+        AddressValidateView.as_view(),
+        name="address_validate",
     ),
     path(
         "search/",

@@ -22,6 +22,7 @@ from django.utils import timezone as django_timezone
 
 from src import enums as src_enums
 from src import models as src_models
+from src.api.services import address as address_services
 from src.api.services import billing as billing_services
 from src.integrations import credentials as credentials_helper
 from src.integrations.orders import base as order_base
@@ -305,6 +306,12 @@ def _serialize_purchase_order(po: src_models.PurchaseOrder, include_line_items: 
             "country": po.ship_to_country,
             "phone": po.ship_to_phone,
             "ship_to_my_shop": po.ship_to_is_shop_address,
+            # "valid" | "corrected" | "unverified", or None when the address never went
+            # through POST /api/address/validate/ (saved location, ship-to-my-shop, or an
+            # older client) -- see src.enums.AddressValidationStatus.
+            "validation_status": address_services.status_to_api_from_value(
+                po.ship_to_validation_status
+            ),
         }
         if po.ship_to_address1
         else None,
@@ -840,6 +847,12 @@ def review_cart(
     ``shipping_method_id`` (singular) for a one-entry ``ship_methods`` map — the last one only
     applies when exactly one PO is being reviewed, since a single method id can't sensibly
     apply across distributors with different method-code namespaces.
+
+    ``ship_to.validation_status`` ("valid" / "corrected" / "unverified") is the answer from
+    POST /api/address/validate/ that the user chose to proceed with. Optional and never
+    enforced — an unrecognized or absent value simply stores NULL, which is why a client that
+    doesn't call /validate at all (or a ship-to taken from a saved location) keeps working
+    unchanged.
     """
     ship_to = dict(ship_to or {})
     if not ship_to.get("address1") and ship_to.get("address"):
@@ -848,6 +861,10 @@ def review_cart(
     missing = [f for f in _REQUIRED_SHIP_TO_FIELDS if not ship_to.get(f)]
     if missing:
         raise PurchaseOrderServiceError("Missing required ship-to field(s): {}.".format(", ".join(missing)))
+
+    # Recorded, not enforced: address validation is advisory and the user is always allowed
+    # through, so an unknown/missing value is stored as NULL rather than rejected.
+    validation_status = address_services.status_from_api(ship_to.get("validation_status"))
 
     if not purchase_order_ids and purchase_order_id:
         purchase_order_ids = [purchase_order_id]
@@ -896,6 +913,7 @@ def review_cart(
         # _ship_to_from_purchase_order / turn_14.py) — distinguishes "ship to the shop's own
         # address" from "drop-ship to an end customer". Defaults False when the FE omits it.
         po.ship_to_is_shop_address = bool(ship_to.get("ship_to_my_shop"))
+        po.ship_to_validation_status = validation_status.value if validation_status else None
         po.ship_method = ship_methods.get(str(po.id))
         po.save(
             update_fields=[
@@ -910,6 +928,7 @@ def review_cart(
                 "ship_to_country",
                 "ship_to_phone",
                 "ship_to_is_shop_address",
+                "ship_to_validation_status",
                 "ship_method",
                 "updated_at",
             ]

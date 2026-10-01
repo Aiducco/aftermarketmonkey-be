@@ -2862,6 +2862,14 @@ class PurchaseOrder(django_db_models.Model):
     # _build_recipient). Defaults False (drop-ship) to match the field's prior hardcoded value
     # before this flag existed, so an FE that doesn't send it yet sees no behavior change.
     ship_to_is_shop_address = django_db_models.BooleanField(default=False)
+    # Which answer from POST /api/address/validate/ the user chose to proceed with -- see
+    # src.enums.AddressValidationStatus. NULL is not a fourth status: it means validation
+    # never ran for this PO (ship-to came from a saved location or "ship to my shop", or the
+    # request came from a client that predates the validation step), which is deliberately
+    # distinguishable from UNVERIFIED ("we asked the provider and it could not confirm it").
+    # Recorded rather than enforced -- a user is always allowed through -- so that a delivery
+    # dispute can be traced back to what we knew about the address at quote time.
+    ship_to_validation_status = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
     ship_method = django_db_models.CharField(max_length=64, null=True, blank=True)
 
     # Quote snapshot from the distributor adapter's get_shipping_quote(), before submit.

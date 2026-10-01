@@ -255,3 +255,21 @@ class DistributorOrderRawStatus(enum.Enum):
     strings (see turn_14.translate_order_status)."""
     OPEN = 1
     CLOSED = 2
+
+class AddressValidationStatus(enum.Enum):
+    """
+    Outcome of checking a ship-to address against the address provider (see
+    src/integrations/address/). Deliberately soft: the user is always allowed to proceed, so
+    this records which answer they proceeded with rather than gating anything.
+
+    VALID       provider matched the address at building level with high confidence.
+    CORRECTED   provider matched it, but differs in postal code, city or street spelling.
+                The user either accepted the suggestion (and the stored address is the
+                suggested one) or kept their own — both end up stored as CORRECTED, since
+                either way the provider disagreed with what was first typed.
+    UNVERIFIED  provider could not confirm the address, was unreachable, or is not
+                configured at all. Carries no judgement that the address is wrong.
+    """
+    VALID = 1
+    CORRECTED = 2
+    UNVERIFIED = 3

@@ -181,7 +181,11 @@ class CartReviewView(views.View):
     per-request) since method codes are distributor-specific — see GET
     .../shipping-methods/?company_provider_id=. Also accepts purchase_order_id (singular) and
     shipping_method_id (singular) as shorthand when reviewing just one PO — see
-    review_cart's docstring for the exact aliasing rules."""
+    review_cart's docstring for the exact aliasing rules.
+
+    ship_to may also carry validation_status ("valid"/"corrected"/"unverified") — the answer
+    from POST /api/address/validate/ that the user proceeded with. Optional: omitting it (a
+    saved location, "ship to my shop") stores NULL and changes nothing else."""
 
     def post(self, request: http.HttpRequest, *args, **kwargs) -> http.HttpResponse:
         company_id, user_id, err = _require_auth(request)
