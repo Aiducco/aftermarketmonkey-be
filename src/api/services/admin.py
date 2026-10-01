@@ -136,3 +136,91 @@ def get_admin_company_detail(company_id: int) -> typing.Optional[typing.Dict]:
         "providers": providers,
         "users": users,
     }
+
+
+def list_all_providers_for_admin() -> typing.List[typing.Dict]:
+    """Every distributor/provider with a count of companies connected to it (CONNECTED status) vs. total companies that have ever set it up — the inverse of list_all_companies_for_admin."""
+    logger.info("{} Fetching all providers for admin panel.".format(_LOG_PREFIX))
+
+    providers = src_models.Providers.objects.annotate(
+        total_companies_count=Count("brand_providers"),
+        connected_companies_count=Count(
+            "brand_providers", filter=Q(brand_providers__status_name="CONNECTED")
+        ),
+    ).order_by("name")
+
+    data = []
+    for provider in providers:
+        data.append(
+            {
+                "id": provider.id,
+                "name": provider.name,
+                "status": provider.status,
+                "status_name": provider.status_name,
+                "kind_name": provider.kind_name,
+                "coming_soon": provider.coming_soon,
+                "connected_companies_count": provider.connected_companies_count,
+                "total_companies_count": provider.total_companies_count,
+            }
+        )
+
+    logger.info("{} Found {} providers.".format(_LOG_PREFIX, len(data)))
+    return data
+
+
+def get_admin_provider_detail(provider_id: int) -> typing.Optional[typing.Dict]:
+    """Single provider's summary plus every company connected to it (company name/slug/subscription + the CompanyProviders connection status) — the inverse of get_admin_company_detail. No credentials."""
+    logger.info("{} Fetching provider detail for provider_id: {}.".format(_LOG_PREFIX, provider_id))
+
+    provider = (
+        src_models.Providers.objects.filter(id=provider_id)
+        .annotate(
+            total_companies_count=Count("brand_providers"),
+            connected_companies_count=Count(
+                "brand_providers", filter=Q(brand_providers__status_name="CONNECTED")
+            ),
+        )
+        .first()
+    )
+    if not provider:
+        return None
+
+    company_providers = (
+        src_models.CompanyProviders.objects.filter(provider_id=provider_id)
+        .exclude(company__slug=ADMIN_COMPANY_SLUG)
+        .select_related("company")
+        .order_by("company__name")
+    )
+
+    companies = []
+    for cp in company_providers:
+        companies.append(
+            {
+                "id": cp.id,
+                "company_id": cp.company_id,
+                "company_name": cp.company.name if cp.company else None,
+                "company_slug": cp.company.slug if cp.company else None,
+                "subscription_plan": cp.company.subscription_plan if cp.company else None,
+                "status": cp.status,
+                "status_name": cp.status_name,
+                "status_reason": cp.status_reason,
+                "status_checked_at": cp.status_checked_at.isoformat() if cp.status_checked_at else None,
+                "order_status": cp.order_status,
+                "order_status_name": cp.order_status_name,
+                "active": cp.active,
+                "initial_sync_completed": cp.initial_sync_completed,
+                "created_at": cp.created_at.isoformat() if cp.created_at else None,
+            }
+        )
+
+    return {
+        "id": provider.id,
+        "name": provider.name,
+        "status": provider.status,
+        "status_name": provider.status_name,
+        "kind_name": provider.kind_name,
+        "coming_soon": provider.coming_soon,
+        "connected_companies_count": provider.connected_companies_count,
+        "total_companies_count": provider.total_companies_count,
+        "companies": companies,
+    }

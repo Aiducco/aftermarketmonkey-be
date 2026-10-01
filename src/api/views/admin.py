@@ -93,3 +93,62 @@ class AdminCompanyDetailView(views.View):
             content=simplejson.dumps({"data": data}),
             status=200,
         )
+
+
+class AdminProvidersView(views.View):
+    """GET /admin/providers/ - Every provider with a count of companies connected to it. Staff only."""
+
+    def get(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
+        denied = _require_staff(request)
+        if denied:
+            return denied
+
+        try:
+            data = admin_services.list_all_providers_for_admin()
+        except Exception as e:
+            logger.error("{} Error fetching providers for admin panel. Error: {}".format(_LOG_PREFIX, str(e)))
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Error fetching providers"}),
+                status=500,
+            )
+
+        return http.HttpResponse(
+            headers={"Content-Type": "application/json"},
+            content=simplejson.dumps({"data": data}),
+            status=200,
+        )
+
+
+class AdminProviderDetailView(views.View):
+    """GET /admin/providers/<id>/ - One provider's summary plus every company connected to it. Staff only."""
+
+    def get(self, request: http.HttpRequest, id: int, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
+        denied = _require_staff(request)
+        if denied:
+            return denied
+
+        try:
+            data = admin_services.get_admin_provider_detail(provider_id=id)
+        except Exception as e:
+            logger.error(
+                "{} Error fetching provider detail for provider_id: {}. Error: {}".format(_LOG_PREFIX, id, str(e))
+            )
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Error fetching provider"}),
+                status=500,
+            )
+
+        if not data:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Provider not found"}),
+                status=404,
+            )
+
+        return http.HttpResponse(
+            headers={"Content-Type": "application/json"},
+            content=simplejson.dumps({"data": data}),
+            status=200,
+        )

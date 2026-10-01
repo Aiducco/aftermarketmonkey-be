@@ -6,7 +6,12 @@ from src.api.views.address import (
     AddressValidateView,
 )
 from src.api.views.authentication import LoginView, ChangePasswordView
-from src.api.views.admin import AdminCompaniesView, AdminCompanyDetailView
+from src.api.views.admin import (
+    AdminCompaniesView,
+    AdminCompanyDetailView,
+    AdminProvidersView,
+    AdminProviderDetailView,
+)
 from src.api.views.company import CompanyDestinationsView
 from src.api.views.company_locations import CompanyLocationsView, CompanyLocationDetailView
 from src.api.views.integrations import (
@@ -504,5 +509,15 @@ urlpatterns = [
         "admin/companies/<int:id>/",
         AdminCompanyDetailView.as_view(),
         name="admin_company_detail",
+    ),
+    path(
+        "admin/providers/",
+        AdminProvidersView.as_view(),
+        name="admin_providers",
+    ),
+    path(
+        "admin/providers/<int:id>/",
+        AdminProviderDetailView.as_view(),
+        name="admin_provider_detail",
     ),
 ]
