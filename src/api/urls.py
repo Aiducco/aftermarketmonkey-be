@@ -6,6 +6,7 @@ from src.api.views.address import (
     AddressValidateView,
 )
 from src.api.views.authentication import LoginView, ChangePasswordView
+from src.api.views.admin import AdminCompaniesView, AdminCompanyDetailView
 from src.api.views.company import CompanyDestinationsView
 from src.api.views.company_locations import CompanyLocationsView, CompanyLocationDetailView
 from src.api.views.integrations import (
@@ -30,6 +31,7 @@ from src.api.views.company_settings import (
     CompanySettingsView,
     CompanyTeamView,
     CompanyTeamMemberView,
+    CompanyTeamMemberResetPasswordView,
     DeleteAccountView,
     DeleteCompanyDataView,
 )
@@ -424,6 +426,11 @@ urlpatterns = [
         name="company_team_member",
     ),
     path(
+        "settings/company/team/<int:user_id>/reset-password/",
+        CompanyTeamMemberResetPasswordView.as_view(),
+        name="company_team_member_reset_password",
+    ),
+    path(
         "settings/account/",
         DeleteAccountView.as_view(),
         name="delete_account",
@@ -487,5 +494,15 @@ urlpatterns = [
         "search/facets/",
         SearchFacetsView.as_view(),
         name="search-facets",
+    ),
+    path(
+        "admin/companies/",
+        AdminCompaniesView.as_view(),
+        name="admin_companies",
+    ),
+    path(
+        "admin/companies/<int:id>/",
+        AdminCompanyDetailView.as_view(),
+        name="admin_company_detail",
     ),
 ]

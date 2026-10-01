@@ -51,6 +51,9 @@ def create_jwt_token(user: auth_models.User) -> str:
             "last_name": user.last_name,
             "company_id": company_id,
             "is_company_admin": is_company_admin,
+            # Django's own platform-wide staff flag -- gates the staff-only admin panel on the
+            # frontend. Independent of is_company_admin (per-company role) above.
+            "is_staff": user.is_staff,
             "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=12),
         },
         key=settings.JWT_SECRET,
@@ -79,6 +82,7 @@ def login_user(email: str, password: str) -> dict:
         "user_id": user.id,
         "access_token": create_jwt_token(user=user),
         "is_company_admin": is_company_admin,
+        "is_staff": user.is_staff,
     }
 
 
