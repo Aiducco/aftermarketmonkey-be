@@ -46,6 +46,12 @@
         <div class="meta-label">Date</div>
         <div class="meta-value">{{ order_date }}</div>
       </td>
+      {% if account_number %}
+      <td>
+        <div class="meta-label">Account #</div>
+        <div class="meta-value">{{ account_number }}</div>
+      </td>
+      {% endif %}
     </tr>
   </table>
 

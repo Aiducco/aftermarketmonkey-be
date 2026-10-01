@@ -147,6 +147,15 @@ def send_purchase_order_email(
     error_message — silently swallowing a failed send here would leave the PO looking SUBMITTED
     when no email actually went out.
     """
+    if not (to_email or "").strip():
+        # Belt-and-suspenders: EmailOrderAdapter.__init__ already refuses to construct without a
+        # rep_email, but that guard lives one layer up and a future caller (or a bug in that
+        # guard) must never reach Resend with an empty "to" -- that's a PO silently marked
+        # SUBMITTED/EMAILED with no email actually sent to anyone.
+        raise order_exceptions.OrderValidationError(
+            "Refusing to send the purchase order email: no recipient (rep) email address."
+        )
+
     company = company_provider.company
     provider = company_provider.provider
     from_email = settings.NOTIFICATIONS_FROM_EMAIL

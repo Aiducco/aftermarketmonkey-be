@@ -822,11 +822,12 @@ def _validate_email_order_connection(credentials: typing.Dict[str, typing.Any]) 
     Validator for the Email order channel (src.enums.OrderMethod.EMAIL) — checked whenever an
     order account's order_method is EMAIL, regardless of provider kind. Unlike
     _ORDER_CONNECTION_VALIDATORS above (one live-API-testing validator per distributor kind),
-    there's no live endpoint to test against here — just that rep_email/cc_email/reply_to, when
-    present, are actually well-formed addresses. No network call, so this always runs
-    synchronously and cheaply, same as the format-only feed validators elsewhere in this module.
+    there's no live endpoint to test against here — just that rep_email/cc_email/reply_to_email,
+    when present, are actually well-formed addresses (account_number is free text, not an email,
+    and is deliberately not checked here). No network call, so this always runs synchronously and
+    cheaply, same as the format-only feed validators elsewhere in this module.
     """
-    for field in ("rep_email", "cc_email", "reply_to"):
+    for field in ("rep_email", "cc_email", "reply_to_email"):
         value = (credentials.get(field) or "").strip()
         if not value:
             continue
@@ -1967,25 +1968,33 @@ def update_order_account(
         switching_method = new_method_value != method_value
         method_value = new_method_value
 
+    # Required-field completeness is checked unconditionally, even for a save that only touches
+    # label/active/is_default and never mentions credentials or order_method: an account can
+    # reach this function already missing a required field (created through the legacy
+    # connect_provider/update_connection path, which has no concept of order_method/email fields
+    # at all -- see that path's own docstring), and a bare rename/reactivate must not be able to
+    # leave it (or keep it) in that state silently. Confirmed live 2026-10-01: a PO was "sent" by
+    # email from an A-Tech account with no rep_email on file at all.
+    order_required, order_optional = _order_credential_fields_for_method(catalog_entry, method_value)
+    if not order_required and not order_optional:
+        return (
+            None,
+            "{} doesn't support {} ordering.".format(
+                cp.provider.name, "email" if method_value == src_enums.OrderMethod.EMAIL.value else "API"
+            ),
+            CONNECTION_ERROR_INVALID_INPUT,
+        )
+    creds = dict(account.credentials or {})
+    if credentials:
+        err, err_code = _merge_namespace_credentials(creds, order_required, order_optional, credentials)
+        if err:
+            return None, err, err_code
+    missing = [f for f in order_required if not _normalize_credential_value(creds.get(f))]
+    if missing:
+        return None, "Missing required fields: {}".format(", ".join(missing)), CONNECTION_ERROR_MISSING_FIELDS
+
     validated = None
     if credentials or switching_method:
-        order_required, order_optional = _order_credential_fields_for_method(catalog_entry, method_value)
-        if not order_required and not order_optional:
-            return (
-                None,
-                "{} doesn't support {} ordering.".format(
-                    cp.provider.name, "email" if method_value == src_enums.OrderMethod.EMAIL.value else "API"
-                ),
-                CONNECTION_ERROR_INVALID_INPUT,
-            )
-        creds = dict(account.credentials or {})
-        if credentials:
-            err, err_code = _merge_namespace_credentials(creds, order_required, order_optional, credentials)
-            if err:
-                return None, err, err_code
-        missing = [f for f in order_required if not _normalize_credential_value(creds.get(f))]
-        if missing:
-            return None, "Missing required fields: {}".format(", ".join(missing)), CONNECTION_ERROR_MISSING_FIELDS
         validated, val_error, val_error_code = _validate_order_connection_for_method(cp.provider.kind, method_value, creds)
         if val_error:
             return None, val_error, val_error_code

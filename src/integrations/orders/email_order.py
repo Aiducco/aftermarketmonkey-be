@@ -16,6 +16,17 @@ resolve_po_number instead).
 SAFETY: submit_order() sends a REAL email to a REAL distributor rep. It must only ever be
 invoked from an explicit, user-approved submission — never from exploratory/dev code, automated
 tests, or ad-hoc scripts. See src/integrations/orders/keystone.py's matching note.
+
+Credential fields (PROVIDER_CATALOG's email_order_connection_required_fields /
+..._optional_fields, same list for every provider): ``rep_email`` (required — the one thing that
+blocks construction, see __init__), ``cc_email``, ``reply_to_email`` and ``account_number``
+(all optional). ``account_number`` is shown on the PO PDF so the distributor knows which of the
+company's accounts to bill — it has nothing to do with which email account places the order.
+``cc_email`` defaults to the submitting user's own email when left blank; ``reply_to_email`` then
+defaults to whichever CC address results (explicit or defaulted) when it's also left blank — see
+_effective_cc_and_reply_to, computed at submit time since both can depend on the PurchaseOrder's
+creator. ``reply_to_email`` was renamed from ``reply_to`` (old key still read for backward
+compatibility) to match the "_email" suffix every other field here uses.
 """
 import datetime
 import decimal
@@ -48,13 +59,41 @@ class EmailOrderAdapter(base.DistributorOrderAdapter):
         base.DistributorOrderAdapter.__init__(self, company_provider, order_account)
         creds = credentials_helper.get_order_credentials(company_provider, order_account)
         self.rep_email = (creds.get("rep_email") or "").strip()
-        self.cc_email = (creds.get("cc_email") or "").strip() or None
-        # Optional -- when set, the rep's reply goes here instead of defaulting to whatever
-        # NOTIFICATIONS_FROM_EMAIL is (a generic platform address nobody monitors for
-        # order-specific replies). See notifications.send_purchase_order_email.
-        self.reply_to = (creds.get("reply_to") or "").strip() or None
+        # Raw, un-defaulted values from the stored credentials -- CC/reply-to defaulting (CC to
+        # the submitting user's own email, reply-to to the resolved CC) depends on the
+        # PurchaseOrder being submitted, which isn't known yet at construction time, so it's
+        # computed in submit_order() instead. See _effective_cc_and_reply_to.
+        self._cc_email_raw = (creds.get("cc_email") or "").strip() or None
+        # reply_to_email is the current field name (renamed from "reply_to" so it matches the
+        # "_email" suffix every other email-channel field uses -- the FE's field-type inference
+        # keyed off that suffix, and "reply_to" alone was rendering as a password input). Still
+        # read the old key for any account saved before the rename.
+        self._reply_to_raw = (
+            (creds.get("reply_to_email") or creds.get("reply_to") or "").strip() or None
+        )
+        # Optional -- shown on the PO PDF/email so the distributor knows which of the company's
+        # accounts to bill, independent of which email account placed the order.
+        self.account_number = (creds.get("account_number") or "").strip() or None
         if not self.rep_email:
             raise ValueError("rep_email is required for email-based ordering.")
+
+    @staticmethod
+    def _effective_cc_and_reply_to(
+        cc_email_raw: typing.Optional[str],
+        reply_to_raw: typing.Optional[str],
+        purchase_order: src_models.PurchaseOrder,
+    ) -> typing.Tuple[typing.Optional[str], typing.Optional[str]]:
+        """
+        CC defaults to the submitting user's own email when left blank; reply-to then defaults to
+        whichever CC address results (explicit or defaulted) when IT is left blank -- matching
+        the Integrations page's documented field behavior for these two fields. Both stay
+        user-overridable: an explicit value in credentials always wins over the default.
+        """
+        cc_email = cc_email_raw
+        if not cc_email and purchase_order.created_by_id and purchase_order.created_by.user_id:
+            cc_email = (purchase_order.created_by.user.email or "").strip() or None
+        reply_to = reply_to_raw or cc_email
+        return cc_email, reply_to
 
     # -- Quote ------------------------------------------------------------------------------
 
@@ -101,6 +140,7 @@ class EmailOrderAdapter(base.DistributorOrderAdapter):
         purchase_order: src_models.PurchaseOrder,
         line_items: typing.List[base.OrderLineItemRequest],
         ship_to: base.ShipToAddress,
+        cc_email: typing.Optional[str],
     ) -> typing.Dict:
         po_reference = base.resolve_po_number(purchase_order)
         pdf_line_items = []
@@ -135,6 +175,7 @@ class EmailOrderAdapter(base.DistributorOrderAdapter):
             "po_reference": po_reference,
             "company_name": self.company_provider.company.name,
             "provider_name": self.company_provider.provider.name,
+            "account_number": self.account_number,
             "order_date": datetime.date.today().isoformat(),
             "ship_to": {
                 "name": ship_to.name,
@@ -151,7 +192,7 @@ class EmailOrderAdapter(base.DistributorOrderAdapter):
             "subtotal": _decimal_to_str(subtotal) if by_line_item_id else None,
             "notes": purchase_order.notes,
             "rep_email": self.rep_email,
-            "cc_email": self.cc_email,
+            "cc_email": cc_email,
         }
 
     def submit_order(
@@ -161,7 +202,10 @@ class EmailOrderAdapter(base.DistributorOrderAdapter):
         ship_to: base.ShipToAddress,
     ) -> base.DistributorOrderResult:
         po_reference = base.resolve_po_number(purchase_order)
-        pdf_context = self._build_pdf_context(purchase_order, line_items, ship_to)
+        cc_email, reply_to = self._effective_cc_and_reply_to(
+            self._cc_email_raw, self._reply_to_raw, purchase_order
+        )
+        pdf_context = self._build_pdf_context(purchase_order, line_items, ship_to, cc_email)
 
         try:
             pdf_bytes = purchase_order_pdf.render_purchase_order_pdf(pdf_context)
@@ -177,8 +221,8 @@ class EmailOrderAdapter(base.DistributorOrderAdapter):
                 company_provider=self.company_provider,
                 purchase_order=purchase_order,
                 to_email=self.rep_email,
-                cc_email=self.cc_email,
-                reply_to=self.reply_to,
+                cc_email=cc_email,
+                reply_to=reply_to,
                 pdf_bytes=pdf_bytes,
                 pdf_filename="PO-{}.pdf".format(po_reference),
             )
@@ -207,7 +251,9 @@ class EmailOrderAdapter(base.DistributorOrderAdapter):
             raw_response={
                 "channel": "email",
                 "to": self.rep_email,
-                "cc": self.cc_email,
+                "cc": cc_email,
+                "reply_to": reply_to,
+                "account_number": self.account_number,
                 "sent_at": sent_at,
             },
             request_payload=pdf_context,
