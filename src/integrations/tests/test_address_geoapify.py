@@ -111,8 +111,10 @@ class _StubClient:
         self.raises = raises
         self.calls: typing.List[dict] = []
 
-    def autocomplete(self, text, country_code=None, limit=5):
-        self.calls.append({"endpoint": "autocomplete", "text": text, "country_code": country_code, "limit": limit})
+    def autocomplete(self, text, country_codes=None, limit=5):
+        self.calls.append(
+            {"endpoint": "autocomplete", "text": text, "country_codes": country_codes, "limit": limit}
+        )
         if self.raises:
             raise self.raises
         return self.autocomplete_result
@@ -243,7 +245,17 @@ class SuggestTest(SimpleTestCase):
 
         provider.suggest(q="Jovana", country="ME", session="s-1")
 
-        self.assertEqual(client.calls[0]["country_code"], "ME")
+        self.assertEqual(client.calls[0]["country_codes"], ["ME"])
+
+    @override_settings(ADDRESS_SUGGEST_LIMIT=5)
+    def test_sends_no_filter_when_the_caller_resolved_no_country(self):
+        # The service layer is what guarantees a country is present (see
+        # _effective_suggest_country); the provider just forwards what it is given.
+        client = _StubClient(autocomplete_result=[])
+
+        geoapify.GeoapifyAddressProvider(client=client).suggest(q="Jovana", country=None, session="s-1")
+
+        self.assertIsNone(client.calls[0]["country_codes"])
 
     @override_settings(ADDRESS_SUGGEST_LIMIT=5)
     def test_skips_hits_with_nothing_to_put_in_the_address_field(self):

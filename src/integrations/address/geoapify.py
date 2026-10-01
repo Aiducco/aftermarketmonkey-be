@@ -168,7 +168,9 @@ class GeoapifyAddressProvider(base.AddressProvider):
 
         try:
             features = self.client.autocomplete(
-                text=q, country_code=country, limit=settings.ADDRESS_SUGGEST_LIMIT
+                text=q,
+                country_codes=[country] if country else None,
+                limit=settings.ADDRESS_SUGGEST_LIMIT,
             )
         except geoapify_exceptions.GeoapifyTimeout as e:
             raise exceptions.AddressProviderTimeout(str(e))

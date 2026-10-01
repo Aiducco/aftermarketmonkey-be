@@ -76,6 +76,20 @@ def _suggestion_cache_key(session: str, suggestion_id: str) -> str:
     return "{}:{}:{}".format(_SUGGESTION_CACHE_PREFIX, session, suggestion_id)
 
 
+def effective_suggest_country(country: typing.Optional[str]) -> typing.Optional[str]:
+    """
+    What we actually filter the provider lookup by. Falls back to
+    ``settings.ADDRESS_SUGGEST_DEFAULT_COUNTRY`` when the request omits one, because an
+    unfiltered lookup is up to 13x slower at the provider and can exceed the request timeout
+    outright -- reaching the user as an empty dropdown rather than as slowness. The frontend
+    is expected to send the form's COUNTRY value; this only covers a client that doesn't.
+    """
+    requested = (country or "").strip().upper()
+    if requested:
+        return requested
+    return (getattr(settings, "ADDRESS_SUGGEST_DEFAULT_COUNTRY", "") or "").strip().upper() or None
+
+
 def _country_is_shippable(country: typing.Optional[str]) -> bool:
     allowed = getattr(settings, "ADDRESS_ALLOWED_COUNTRIES", None) or []
     if not allowed or not country:
@@ -125,6 +139,7 @@ def suggest_addresses(
 ) -> typing.List[typing.Dict[str, str]]:
     """Returns at most ``settings.ADDRESS_SUGGEST_LIMIT`` ``{id, label}`` entries, or [] for
     any reason at all (no provider, provider down, nothing matched, country we don't ship to)."""
+    country = effective_suggest_country(country)
     if not _country_is_shippable(country):
         return []
 

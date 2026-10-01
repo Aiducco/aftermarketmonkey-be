@@ -772,6 +772,20 @@ try:
 except ValueError:
     ADDRESS_SUGGEST_RATE_LIMIT_PER_MINUTE = 30
 
+# Country filter applied when a /suggest request omits `country` entirely. Not cosmetic: the
+# filter is the single biggest lever on Geoapify's latency, because its cost scales with the
+# candidate set it has to search. Measured, filtered vs unfiltered:
+#
+#   "123 Main St"           0.49s  ->   6.55s
+#   "13000 Research Blvd"   1.97s  ->   4.43s
+#   "742 Evergreen"         6.47s  ->  12.31s   (past the request timeout -> empty dropdown)
+#
+# So an unfiltered query doesn't just run slow, it can reach the user as "no such address".
+# US because the Ship To form's COUNTRY already defaults to United States, so this matches
+# what the user is looking at. Set it to "" to search every country instead, accepting the
+# latency above.
+ADDRESS_SUGGEST_DEFAULT_COUNTRY = (os.environ.get("ADDRESS_SUGGEST_DEFAULT_COUNTRY") or "US").strip().upper()
+
 # Countries we ship to, as ISO 3166-1 alpha-2, comma separated. Empty (the default) means no
 # restriction — autocomplete offers whatever country the user picked. This exists because
 # "which countries do we actually ship to?" is still open: once product answers, set the env

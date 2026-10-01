@@ -44,7 +44,10 @@ class Command(BaseCommand):
 
     def handle(self, *args: typing.Any, **options: typing.Any) -> None:
         query = options["query"]
-        country = (options["country"] or "").strip().upper() or None
+        # Resolved exactly as a real /suggest request resolves it, default country included --
+        # otherwise passing --country "" would exercise an unfiltered lookup that the API
+        # itself never performs, and report a timeout the request path would not hit.
+        country = address_services.effective_suggest_country(options["country"])
         failures: typing.List[str] = []
 
         self._config()
@@ -83,6 +86,11 @@ class Command(BaseCommand):
         self.stdout.write(
             "   ADDRESS_ALLOWED_COUNTRIES    = {}".format(
                 settings.ADDRESS_ALLOWED_COUNTRIES or "(none -- every country allowed)"
+            )
+        )
+        self.stdout.write(
+            "   default country when omitted = {}".format(
+                settings.ADDRESS_SUGGEST_DEFAULT_COUNTRY or "(none -- unfiltered, and SLOW)"
             )
         )
         self.stdout.write(

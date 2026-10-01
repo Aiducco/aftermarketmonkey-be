@@ -230,7 +230,45 @@ class SuggestAndResolveTest(SimpleTestCase):
                 address_services.suggest_addresses(q="1600 Amph", country="US", session=_SESSION), []
             )
 
-    @override_settings(ADDRESS_ALLOWED_COUNTRIES=["US", "CA"])
+    @override_settings(ADDRESS_SUGGEST_DEFAULT_COUNTRY="US")
+    def test_omitted_country_falls_back_to_the_configured_default(self):
+        """
+        An unfiltered Geoapify lookup is up to 13x slower and can exceed the request timeout
+        outright, surfacing as an empty dropdown. The form always has a COUNTRY value, so a
+        request without one gets the configured default rather than a planet-wide search.
+        """
+        provider = _StubProvider(
+            suggestions=[base.Suggestion(label="a", provider_ref="p1", address=_US_ADDRESS)]
+        )
+
+        with _patch_provider(provider):
+            address_services.suggest_addresses(q="1600 Amph", country=None, session=_SESSION)
+
+        self.assertEqual(provider.suggest_calls[0]["country"], "US")
+
+    @override_settings(ADDRESS_SUGGEST_DEFAULT_COUNTRY="US")
+    def test_an_explicit_country_always_wins_over_the_default(self):
+        provider = _StubProvider(
+            suggestions=[base.Suggestion(label="a", provider_ref="p1", address=_US_ADDRESS)]
+        )
+
+        with _patch_provider(provider):
+            address_services.suggest_addresses(q="Jovana", country="me", session=_SESSION)
+
+        self.assertEqual(provider.suggest_calls[0]["country"], "ME")
+
+    @override_settings(ADDRESS_SUGGEST_DEFAULT_COUNTRY="")
+    def test_blank_default_means_no_country_filter(self):
+        provider = _StubProvider(
+            suggestions=[base.Suggestion(label="a", provider_ref="p1", address=_US_ADDRESS)]
+        )
+
+        with _patch_provider(provider):
+            address_services.suggest_addresses(q="1600 Amph", country=None, session=_SESSION)
+
+        self.assertIsNone(provider.suggest_calls[0]["country"])
+
+    @override_settings(ADDRESS_ALLOWED_COUNTRIES=["US", "CA"], ADDRESS_SUGGEST_DEFAULT_COUNTRY="US")
     def test_country_we_do_not_ship_to_is_not_looked_up_at_all(self):
         provider = _StubProvider(
             suggestions=[base.Suggestion(label="a", provider_ref="p1", address=_US_ADDRESS)]

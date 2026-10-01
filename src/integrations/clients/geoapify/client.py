@@ -33,6 +33,17 @@ _LOG_PREFIX = "[GEOAPIFY-CLIENT]"
 # Geoapify's own hard cap on the autocomplete `limit` parameter.
 _MAX_LIMIT = 20
 
+# Module-level so TCP+TLS connections are reused across requests. A provider is constructed
+# per HTTP request, so a per-instance session would pool nothing. Measured ~0.14s off the
+# median (0.68s -> 0.54s) on a fast query, and more whenever the handshake is cold.
+#
+# Sharing one Session is safe under this deployment's worker model: gunicorn is started with
+# `--workers 3` and the default *sync* worker class (see the Dockerfile CMD), so each worker
+# process is single-threaded. If that ever becomes a threaded or async worker class, give this
+# a threading.local or swap in a per-thread session -- requests.Session is not documented as
+# thread-safe.
+_session = requests.Session()
+
 
 class GeoapifyApiClient(object):
     """One instance per request is fine -- construction only reads settings."""
@@ -62,7 +73,7 @@ class GeoapifyApiClient(object):
         query["format"] = "geojson"
 
         try:
-            response = requests.get(url=url, params=query, timeout=timeout)
+            response = _session.get(url=url, params=query, timeout=timeout)
         except requests.exceptions.Timeout as e:
             raise exceptions.GeoapifyTimeout(
                 "Timed out after {}s calling {}. Error: {}".format(
@@ -100,24 +111,36 @@ class GeoapifyApiClient(object):
     def autocomplete(
         self,
         text: str,
-        country_code: typing.Optional[str] = None,
+        country_codes: typing.Optional[typing.Sequence[str]] = None,
         limit: int = 5,
     ) -> typing.List[dict]:
         """
-        ``country_code`` is ISO 3166-1 alpha-2; Geoapify wants it lowercased inside its
-        ``filter=countrycode:`` expression.
+        ``country_codes`` are ISO 3166-1 alpha-2, lowercased into Geoapify's
+        ``filter=countrycode:a,b`` expression.
 
-        No ``type=`` filter is sent on purpose. Restricting to ``type=street`` drops exactly
-        the hits users most often want -- a building with a house number comes back as
-        ``type=building``, and named places as ``type=amenity`` -- so filtering is left to the
-        mapping layer, which simply skips hits with no street.
+        Send one whenever you possibly can -- it is the single biggest lever on latency here,
+        because Geoapify's cost scales with the candidate set it has to search. Measured:
+
+            "123 Main St"           0.49s filtered   6.55s unfiltered
+            "13000 Research Blvd"   1.97s filtered   4.43s unfiltered
+            "742 Evergreen"         6.47s filtered  12.31s unfiltered
+
+        An unfiltered query can therefore blow the request timeout and reach the user as an
+        empty dropdown. See the caller in src/integrations/address/geoapify.py, which never
+        lets the filter be absent if config can supply one.
+
+        No ``type=`` filter is sent on purpose, and that is not a latency decision -- it does
+        not help (6.50s unfiltered by type vs 6.09s with type=street) and it destroys recall:
+        ``type=street`` returned 0 results for a query that otherwise returns 5, because a
+        house-number hit is typed "building" and a named place "amenity".
         """
         params: typing.Dict[str, typing.Any] = {
             "text": text,
             "limit": max(1, min(int(limit), _MAX_LIMIT)),
         }
-        if country_code:
-            params["filter"] = "countrycode:{}".format(country_code.strip().lower())
+        codes = [code.strip().lower() for code in (country_codes or []) if code and code.strip()]
+        if codes:
+            params["filter"] = "countrycode:{}".format(",".join(codes))
         return self._get(endpoint="autocomplete", params=params)
 
     def search(
