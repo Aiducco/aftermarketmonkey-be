@@ -120,6 +120,19 @@ class Command(BaseCommand):
         self.stdout.write(self.style.SUCCESS("Instantly -> FreshSales sync finished."))
 
     def _dry_run(self, since, campaign_id):
+        from django.conf import settings
+
+        if since is None:
+            # Preview what a real run would do, which means starting where a real run would start.
+            # Without this the dry run ignores the watermark and walks the whole account, so it
+            # reports work that a real run would not attempt -- and on a busy account it would also
+            # spend a page of GET /emails per 100 replies to say nothing. Pass --since to widen.
+            since = instantly_freshsales_sync.watermark(
+                overlap_minutes=settings.INSTANTLY_SYNC_OVERLAP_MINUTES,
+                initial_days=settings.INSTANTLY_SYNC_INITIAL_DAYS,
+            )
+            self.stdout.write("Previewing from the watermark ({}). Pass --since to widen.".format(since))
+
         client = instantly_client.InstantlyApiClient()
         try:
             campaign_names = client.list_campaigns()

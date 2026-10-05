@@ -713,3 +713,62 @@ class FreshsalesTransportTests(SimpleTestCase):
         with self.assertRaises(ValueError) as caught:
             freshsales_client.FreshsalesApiClient()
         self.assertIn("myfreshworks.com", str(caught.exception))
+
+
+class PreviewSubtractsCompletedWorkTests(SimpleTestCase):
+    """
+    The dry run answers "what happens if I run this". After the backfill the honest answer is
+    "nothing", so the preview has to subtract replies already pushed rather than re-propose them.
+    """
+
+    databases = []
+
+    @staticmethod
+    def _preview(emails, synced_ids=(), contact_addresses=(), deal_addresses=()):
+        client = mock.Mock()
+        client.iter_received_emails.return_value = iter(emails)
+
+        def fake_filter(**kwargs):
+            result = mock.MagicMock()
+            if "contact_synced_at__isnull" in kwargs:
+                result.values_list.return_value = list(synced_ids)
+            elif "freshsales_contact_id__isnull" in kwargs:
+                result.values_list.return_value.distinct.return_value = list(contact_addresses)
+            elif "freshsales_deal_id__isnull" in kwargs:
+                result.values_list.return_value.distinct.return_value = list(deal_addresses)
+            return result
+
+        with mock.patch.object(src_models.InstantlyReply, "objects") as objects:
+            objects.values_list.return_value = list(synced_ids)
+            objects.filter.side_effect = fake_filter
+            return sync.preview(client=client)
+
+    def test_an_already_synced_reply_proposes_nothing(self):
+        rows, counts = self._preview(
+            [_email(id="done", lead="andrew@rhinoutah.com", i_status=1)],
+            synced_ids=["done"],
+            contact_addresses=["andrew@rhinoutah.com"],
+            deal_addresses=["andrew@rhinoutah.com"],
+        )
+        self.assertEqual(counts["already_synced"], 1)
+        self.assertEqual(counts["would_create_contacts"], 0)
+        self.assertEqual(counts["would_create_deals"], 0)
+        self.assertEqual(rows[0]["action"], "already synced")
+
+    def test_a_new_reply_from_a_shop_already_in_the_crm_is_a_note_not_a_second_deal(self):
+        _, counts = self._preview(
+            [_email(id="fresh", lead="andrew@rhinoutah.com", i_status=1)],
+            synced_ids=[],
+            contact_addresses=["andrew@rhinoutah.com"],
+            deal_addresses=["andrew@rhinoutah.com"],
+        )
+        self.assertEqual(counts["would_create_contacts"], 0)
+        self.assertEqual(counts["would_create_deals"], 0)
+
+    def test_a_genuinely_new_reply_is_still_proposed(self):
+        _, counts = self._preview(
+            [_email(id="fresh", lead="someone@newshop.com", i_status=1)],
+            synced_ids=["other"],
+        )
+        self.assertEqual(counts["would_create_contacts"], 1)
+        self.assertEqual(counts["would_create_deals"], 1)

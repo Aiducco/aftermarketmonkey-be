@@ -813,12 +813,32 @@ def preview(
         "would_create_deals": 0,
         "no_email": 0,
     }
+    counts["already_synced"] = 0
     known = set(src_models.InstantlyReply.objects.values_list("instantly_email_id", flat=True))
+
+    # What has already reached the CRM. A preview that ignores this reports work a real run would
+    # not do -- after the backfill, "would create 1 contact" for a reply that was pushed last week.
+    # The whole point of the flag is to answer "what happens if I run this", so it has to subtract
+    # what is already done.
+    synced_email_ids = set(
+        src_models.InstantlyReply.objects.filter(contact_synced_at__isnull=False).values_list(
+            "instantly_email_id", flat=True
+        )
+    )
     # Both counted per address, not per reply: contacts are upserted on the address and a shop that
     # replies three times is one contact and one opportunity. Counting rows here would promise 20
-    # contacts for 13 people, which is exactly the number someone checks the CRM against.
-    contact_addresses = set()
-    deal_addresses = set()
+    # contacts for 13 people, which is exactly the number someone checks the CRM against. Seeded
+    # with the addresses already in the CRM so a new reply from a known shop reads as a note.
+    contact_addresses = set(
+        src_models.InstantlyReply.objects.filter(freshsales_contact_id__isnull=False)
+        .values_list("lead_email", flat=True)
+        .distinct()
+    )
+    deal_addresses = set(
+        src_models.InstantlyReply.objects.filter(freshsales_deal_id__isnull=False)
+        .values_list("lead_email", flat=True)
+        .distinct()
+    )
 
     for email_payload in client.iter_received_emails(min_timestamp_created=_iso(since), campaign_id=campaign_id):
         fields = row_fields_from_email(email_payload, campaign_names)
@@ -827,7 +847,10 @@ def preview(
         counts["new" if is_new else "already_stored"] += 1
 
         action = []
-        if not fields["lead_email"]:
+        if fields["instantly_email_id"] in synced_email_ids:
+            counts["already_synced"] += 1
+            action.append("already synced")
+        elif not fields["lead_email"]:
             counts["no_email"] += 1
             action.append("skip (no address)")
         elif fields["is_auto_reply"]:
@@ -844,6 +867,7 @@ def preview(
             fields["is_positive"]
             and not fields["is_auto_reply"]
             and fields["lead_email"]
+            and fields["instantly_email_id"] not in synced_email_ids
             and fields["lead_email"] not in deal_addresses
         ):
             action.append("deal")
