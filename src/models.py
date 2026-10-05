@@ -2717,6 +2717,97 @@ class LeerLead(django_db_models.Model):
         return f"{self.name} ({self.city}, {self.state})"
 
 
+class InstantlyReply(django_db_models.Model):
+    """
+    One row per reply received in Instantly, plus what we pushed to FreshSales for it.
+
+    The row is the whole idempotency story. ``instantly_email_id`` is Instantly's own UUID, so
+    re-reading the overlap window on the next run cannot create a second row, and each
+    ``freshsales_*_id`` is written the moment the vendor returns it -- a run killed between the
+    contact upsert and the note resumes instead of creating the contact twice.
+
+    There is no watermark table: the next run reads from ``max(instantly_created_at)`` minus an
+    overlap (see ``instantly_freshsales_sync.watermark``). A half-committed run therefore heals
+    itself on the next tick rather than leaving a stored cursor ahead of the rows it describes.
+
+    ``lead_payload`` is Instantly's custom-variable bag for the lead, which is the same City /
+    State / Zip / Tier / Typology / Locations we uploaded from ``scripts/export_instantly_list.py``.
+    It is stored rather than re-fetched so the FreshSales push never depends on a second live call,
+    and so what the CRM record was built from stays visible after the fact.
+    """
+
+    class Interest(django_db_models.IntegerChoices):
+        """
+        Instantly's own scale, used unchanged -- ``i_status`` on an email and
+        ``lt_interest_status`` on a lead are the same numbers. Verified equal on every address in
+        the live account, so the email's value is trusted on ingest and only refreshed later.
+        """
+
+        LOST = -3, "Lost"
+        WRONG_PERSON = -2, "Wrong Person"
+        NOT_INTERESTED = -1, "Not Interested"
+        OUT_OF_OFFICE = 0, "Out of Office"
+        INTERESTED = 1, "Interested"
+        MEETING_BOOKED = 2, "Meeting Booked"
+        MEETING_COMPLETED = 3, "Meeting Completed"
+        CLOSED = 4, "Closed"
+
+    # NO_SHOW is documented as -4 but is absent from IntegerChoices above because Instantly's own
+    # docs disagree with themselves on it; POSITIVE_INTEREST below is what actually gates a deal,
+    # and any unrecognised value is stored as-is and treated as non-positive.
+    POSITIVE_INTEREST = (1, 2, 3, 4)
+
+    instantly_email_id = django_db_models.TextField(unique=True)
+    thread_id = django_db_models.TextField(null=True, blank=True)
+    campaign_id = django_db_models.TextField(null=True, blank=True, db_index=True)
+    campaign_name = django_db_models.TextField(null=True, blank=True)
+
+    lead_email = django_db_models.EmailField(max_length=255, db_index=True)
+    from_name = django_db_models.TextField(null=True, blank=True)  # from_address_json[0].name
+    eaccount = django_db_models.TextField(null=True, blank=True)  # which of our mailboxes answered
+    subject = django_db_models.TextField(null=True, blank=True)
+    body_text = django_db_models.TextField(null=True, blank=True)
+
+    email_timestamp = django_db_models.DateTimeField(null=True, blank=True, db_index=True)
+    instantly_created_at = django_db_models.DateTimeField(null=True, blank=True, db_index=True)
+
+    interest_status = django_db_models.IntegerField(
+        choices=Interest.choices, null=True, blank=True
+    )  # None = Instantly has not labelled the thread yet
+    interest_checked_at = django_db_models.DateTimeField(null=True, blank=True)
+    is_positive = django_db_models.BooleanField(default=False)
+    # Instantly's documented is_auto_reply field is never actually returned, so this is derived
+    # from interest_status == OUT_OF_OFFICE plus an "Out of office" subject. See
+    # instantly_freshsales_sync.derive_is_auto_reply.
+    is_auto_reply = django_db_models.BooleanField(default=False)
+    lead_payload = django_db_models.JSONField(default=dict, blank=True)
+
+    freshsales_account_id = django_db_models.TextField(null=True, blank=True)
+    freshsales_contact_id = django_db_models.TextField(null=True, blank=True)
+    freshsales_note_id = django_db_models.TextField(null=True, blank=True)
+    freshsales_deal_id = django_db_models.TextField(null=True, blank=True)
+    contact_synced_at = django_db_models.DateTimeField(null=True, blank=True)
+    deal_created_at = django_db_models.DateTimeField(null=True, blank=True)
+
+    sync_attempts = django_db_models.IntegerField(default=0)
+    last_error = django_db_models.TextField(null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "instantly_reply"
+        ordering = ["-email_timestamp"]
+        indexes = [
+            # The two queue scans: "needs a contact" and "needs an interest re-check".
+            django_db_models.Index(fields=["contact_synced_at"], name="instantly_reply_synced_idx"),
+            django_db_models.Index(fields=["is_positive", "deal_created_at"], name="instantly_reply_deal_idx"),
+        ]
+
+    def __str__(self):
+        return "{} ({})".format(self.lead_email, self.get_interest_status_display() or "unlabelled")
+
+
 class NotificationEmailLog(django_db_models.Model):
     """
     Audit log of transactional notification emails sent via Resend (e.g. the

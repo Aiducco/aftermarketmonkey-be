@@ -795,3 +795,53 @@ ADDRESS_ALLOWED_COUNTRIES = [
     for code in (os.environ.get("ADDRESS_ALLOWED_COUNTRIES") or "").split(",")
     if code.strip()
 ]
+
+
+# ---------------------------------------------------------------------------------------------
+# Instantly -> FreshSales reply sync (src/integrations/services/instantly_freshsales_sync.py,
+# manage.py sync_instantly_replies, 15-minute cron).
+#
+# Both API keys must be real environment variables in .env.app.<env>, not only in a .env file:
+# this module reads os.environ at import time, which happens before settings.py calls
+# load_dotenv(), so a key present only in .env reads as empty here. A missing key makes the
+# command exit instead of issuing an unauthenticated request.
+#
+# See docs/INSTANTLY_FRESHSALES_SYNC_PLAN.md for where each default came from.
+# ---------------------------------------------------------------------------------------------
+INSTANTLY_API_KEY = os.environ.get("INSTANTLY_API_KEY", "")
+INSTANTLY_BASE_URL = os.environ.get("INSTANTLY_BASE_URL", "https://api.instantly.ai/api/v2")
+INSTANTLY_TIMEOUT_SECONDS = float(os.environ.get("INSTANTLY_TIMEOUT_SECONDS") or 20)
+
+# How far back of already-seen replies to re-read each run. The ingest watermark is derived from
+# the newest stored reply rather than kept in a cursor table, so this overlap is what absorbs a
+# run that half-committed; duplicates are dropped by the unique constraint on instantly_email_id.
+INSTANTLY_SYNC_OVERLAP_MINUTES = int(os.environ.get("INSTANTLY_SYNC_OVERLAP_MINUTES") or 60)
+
+# Only used when instantly_reply is empty, so a first run does not pull an entire account's
+# history unasked. Pass --since for a deliberate backfill.
+INSTANTLY_SYNC_INITIAL_DAYS = int(os.environ.get("INSTANTLY_SYNC_INITIAL_DAYS") or 7)
+
+# How long after a reply arrives we keep re-asking Instantly for its interest label.
+#
+# 60 days, not a week. Instantly's AI labels most threads within minutes, but 4 of the 22 replies
+# in the live account are still unlabelled and two of those are a month old -- those only ever
+# become deals if someone labels them in Unibox, which can happen long after the reply. At ~22
+# replies a month a re-check costs one API call per address per 6 hours, so a wide window is
+# nearly free and a narrow one silently loses deals.
+INSTANTLY_INTEREST_RECHECK_DAYS = int(os.environ.get("INSTANTLY_INTEREST_RECHECK_DAYS") or 60)
+INSTANTLY_INTEREST_RECHECK_HOURS = int(os.environ.get("INSTANTLY_INTEREST_RECHECK_HOURS") or 6)
+
+FRESHSALES_API_KEY = os.environ.get("FRESHSALES_API_KEY", "")
+# The <name> in https://<name>.myfreshworks.com -- the URL the CRM is logged into.
+FRESHSALES_BUNDLE_ALIAS = os.environ.get("FRESHSALES_BUNDLE_ALIAS", "")
+FRESHSALES_TIMEOUT_SECONDS = float(os.environ.get("FRESHSALES_TIMEOUT_SECONDS") or 20)
+
+# FreshSales requires an amount on every deal, so there is no "leave it unset" option. 0 means the
+# pipeline's forecast reads as zero; set this once there is a figure worth forecasting per shop.
+FRESHSALES_DEFAULT_DEAL_AMOUNT = float(os.environ.get("FRESHSALES_DEFAULT_DEAL_AMOUNT") or 0)
+
+# FreshSales meters 1000 requests/hour per *account*, shared with anything else touching that CRM.
+# A reply costs ~3 calls, so this caps one run's spend and leaves the rest of the hour alone; what
+# does not fit resumes on the next tick. Never binds at current volume -- it exists so a backfill
+# cannot lock us out of our own CRM.
+FRESHSALES_MAX_CALLS_PER_RUN = int(os.environ.get("FRESHSALES_MAX_CALLS_PER_RUN") or 600)
