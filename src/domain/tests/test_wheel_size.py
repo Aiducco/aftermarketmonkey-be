@@ -307,3 +307,95 @@ class BoltPatternQueryTests(SimpleTestCase):
     def test_an_implausible_pattern_is_not_one(self):
         for text in ("2x50", "12x300"):
             self.assertFalse(wheel_size.parse_query(text).parsed_anything, text)
+
+
+class TitleNotationTests(SimpleTestCase):
+    """
+    Notations that only appear in free-text titles, never in a feed's attribute columns.
+
+    113,000 wheels reach us as prose from Premier, Turn 14, Meyer, A-Tech and TireRack, plus 20,000
+    Wheel Pros rows that carry a description and nothing else. Between them, ET accounts for 21% of
+    those titles, backspacing 10% and hub bore 8% -- data we would otherwise store as NULL while it
+    sat in plain sight.
+    """
+
+    databases = []
+
+    def test_et_is_offset(self):
+        parsed = wheel_size.parse("TSW VALENCIA 18x9.5 5/114.3 ET20 CB76.1 SILVER")
+        self.assertEqual(parsed.offset_mm, 20)
+
+    def test_negative_et(self):
+        self.assertEqual(wheel_size.parse("BBS LM 19x12 5x130 ET-12 Gold").offset_mm, -12)
+
+    def test_hub_bore_both_spellings(self):
+        self.assertEqual(
+            wheel_size.parse("TSW VALENCIA 18x9.5 5/114.3 ET20 CB76.1").center_bore_mm,
+            decimal.Decimal("76.1"),
+        )
+        self.assertEqual(
+            wheel_size.parse("Kansei K12G 17x9.5in / 5x114.3 BP / 12mm Offset / 73.1mm Bore").center_bore_mm,
+            decimal.Decimal("73.1"),
+        )
+        self.assertEqual(
+            wheel_size.parse("BBS LM 19x12 5x130 ET44 CB 71.6 Gold").center_bore_mm, decimal.Decimal("71.6")
+        )
+
+    def test_backspacing_becomes_an_offset(self):
+        """A 17x10 with 5.4" backspacing: centreline is 5.5", so the offset is -0.1" = -3 mm."""
+        parsed = wheel_size.parse("Weld S71 17x10 / 5x4.5 BP / 5.4in. BS Black Wheel")
+        self.assertEqual(parsed.backspacing_in, decimal.Decimal("5.4"))
+        self.assertEqual(parsed.offset_mm, -3)
+
+    def test_the_published_backspacing_is_kept_as_written(self):
+        parsed = wheel_size.parse("VNC450 HOPSTER 16X7 5X4.75 CHR/POL 4.0BS")
+        self.assertEqual(parsed.backspacing_in, decimal.Decimal("4.0"))
+        self.assertEqual(parsed.offset_mm, 0)
+
+    def test_a_bolt_pattern_ending_in_mm_is_not_an_offset(self):
+        """ "5x115mm BP" ends in digits followed by mm, which the offset fallback read as a 115 mm
+        offset -- a plausible-looking number for a wheel that does not exist."""
+        parsed = wheel_size.parse("Weld S71 18x7 / 5x115mm BP / 2.1in. BS Black Wheel")
+        self.assertEqual(parsed.bolt_pattern.display, "5x115")
+        self.assertEqual(parsed.offset_mm, -48)
+
+    def test_a_stated_offset_beats_a_derived_one(self):
+        """Both notations present: the seller's own figure wins over our arithmetic."""
+        parsed = wheel_size.parse("Some Wheel 17x9 5x127 ET35 4.5BS")
+        self.assertEqual(parsed.offset_mm, 35)
+        self.assertEqual(parsed.backspacing_in, decimal.Decimal("4.5"))
+
+    def test_plain_signed_offsets_still_work(self):
+        self.assertEqual(wheel_size.parse("AFW EVADE FP 26X12 BLACK -40").offset_mm, -40)
+        self.assertEqual(wheel_size.parse("MR138 19X8.5 5X4.5 GOLD MACH-LIP 35MM").offset_mm, 35)
+
+
+class FractionTests(SimpleTestCase):
+    """
+    Engineering copy is full of fractions, and the whole catalog is now in scope.
+
+    The four vendor feeds had ``feed_type='wheel'`` deciding what was a wheel. Reading
+    master_parts.description has no such gate -- every piston ring and cap screw in 3.1M parts is a
+    candidate -- so the parser is the only thing standing between a ring set and the wheel index.
+    """
+
+    databases = []
+
+    def test_a_fraction_is_not_a_wheel_size(self):
+        for text in (
+            "Wiseco 3.840inch 1/16 x 1/16 x 3/16inch Single Set Ring Shelf Stock",
+            "Wiseco Ring Set-3.940inch Bore 1/16 x 1/16 x 3/16inch Ring Shelf Stock",
+            "AMP Research 1/4-20 x 7/8 S439 Black Socket Cap Screw",
+        ):
+            self.assertIsNone(wheel_size.parse(text), text)
+
+    def test_a_dual_pattern_after_a_slash_still_reads(self):
+        """The slash guard belongs on the size only. A dual-drilled wheel is written
+        "5-112/5-120" and the second pattern legitimately follows a slash."""
+        parsed = wheel_size.parse("TOUREN TR60 17X7.5 5-112/5-120 42MM 72.62MM")
+        self.assertEqual(parsed.bolt_pattern.display, "5x112")
+        self.assertEqual(parsed.bolt_pattern_2.display, "5x120")
+
+    def test_a_slash_separated_bolt_pattern_still_reads(self):
+        parsed = wheel_size.parse("TSW VALENCIA 18x9.5 5/114.3 ET20")
+        self.assertEqual(parsed.bolt_pattern.display, "5x114.3")

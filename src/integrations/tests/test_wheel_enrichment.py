@@ -163,19 +163,61 @@ class FeedSqlTests(SimpleTestCase):
             for column in ("master_part_id", "size_raw", "bolt_pattern_1", "offset_raw", "part_number"):
                 self.assertIn(column, feed.sql, "{} is missing {}".format(name, column))
 
-    def test_every_feed_deduplicates_by_master_part(self):
+    #: The title source selects straight from master_parts and joins no vendor table, so the two
+    #: assertions below -- about join fan-out and about a vendor column name -- do not apply to it.
+    VENDOR_FEEDS = {name: feed for name, feed in wheel_enrichment.FEEDS.items() if name != wheel_enrichment.FEED_TITLE}
+
+    def test_every_vendor_feed_deduplicates_by_master_part(self):
         """Without DISTINCT ON, a batch can hold one master_part_id twice and Postgres rejects the
         whole write: 'ON CONFLICT DO UPDATE command cannot affect row a second time'."""
-        for name, feed in wheel_enrichment.FEEDS.items():
+        for name, feed in self.VENDOR_FEEDS.items():
             self.assertIn("DISTINCT ON (mp.id)", feed.sql, name)
             self.assertIn("ORDER BY mp.id", feed.sql, name)
 
+    def test_the_title_source_cannot_fan_out(self):
+        """It needs no DISTINCT ON because it reads master_parts directly -- one row per part by
+        construction, with nothing to join against."""
+        sql = wheel_enrichment.FEEDS[wheel_enrichment.FEED_TITLE].sql
+        self.assertNotIn("JOIN", sql.upper().replace("NOT EXISTS", ""))
+        self.assertIn("ORDER BY mp.id", sql)
+
     def test_offset_is_quoted_where_it_is_a_column(self):
         """``offset`` is a reserved word in Postgres; selected unquoted it is a syntax error, and
-        every one of these four feeds happens to have a column by that name."""
+        every vendor feed happens to have a column by that name."""
         quoted = 'f."offset"'
-        for name, feed in wheel_enrichment.FEEDS.items():
+        for name, feed in self.VENDOR_FEEDS.items():
             self.assertIn(quoted, feed.sql, "{} selects offset without quoting it".format(name))
+
+    def test_the_title_source_is_last_in_precedence(self):
+        """A figure read out of a sentence must never outrank one a manufacturer put in a column."""
+        self.assertEqual(wheel_enrichment.FEED_ORDER[-1], wheel_enrichment.FEED_TITLE)
+
+    def test_a_title_row_is_marked_as_parsed_not_fed(self):
+        spec = wheel_enrichment.build_spec(
+            _row(
+                size_raw=None,
+                bolt_pattern_1=None,
+                offset_raw=None,
+                finish_raw=None,
+                model_raw=None,
+                center_bore_raw=None,
+                load_rating_raw=None,
+                style_number_raw=None,
+                title="TSW VALENCIA 18x9.5 5/114.3 ET20 CB76.1 SILVER",
+            ),
+            feed=wheel_enrichment.FEED_TITLE,
+        )
+        self.assertEqual(spec.spec_source, "parser")
+        self.assertEqual(spec.size_display, "18x9.5")
+        self.assertEqual(spec.bolt_pattern_display, "5x114.3")
+        self.assertEqual(spec.offset_mm, 20)
+        self.assertEqual(str(spec.center_bore_mm), "76.1")
+        self.assertEqual(spec.model_name, "TSW VALENCIA")
+        self.assertEqual(spec.finish_family, "silver")
+
+    def test_a_vendor_row_is_still_marked_as_fed(self):
+        spec = wheel_enrichment.build_spec(_row(), feed=wheel_enrichment.FEED_WHEELPROS)
+        self.assertEqual(spec.spec_source, "feed")
 
 
 class PlaceholderTests(SimpleTestCase):

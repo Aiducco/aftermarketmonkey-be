@@ -153,3 +153,13 @@ summit_racing_cookie.local.txt
 /*.csv
 /result.txt
 logs/*.jsonl
+
+# Timestamped .env backups (.env.bak.reoon.1788352112, .env.bak.tavily3.1788420328, ...).
+# The bare `.env.bak` and `.env.bak2` below were already ignored, but the suffixed ones were not,
+# so `git add -A` would have published every production credential in them. Each holds 40+ live
+# values: DATABASE_PASSWORD, STRIPE_WEBHOOK_SECRET, ANTHROPIC_API_KEY, RESEND_API_KEY and more.
+.env.bak.*
+
+# curl/libcurl cookie jars -- live session cookies for distributor portals.
+cookies.txt
+*_cookie.local.txt

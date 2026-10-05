@@ -154,6 +154,9 @@ class ParsedWheel:
     bolt_pattern_2: typing.Optional[BoltPattern] = None
     offset_mm: typing.Optional[int] = None
     center_bore_mm: typing.Optional[decimal.Decimal] = None
+    #: Stated in the title, not derived. Where a seller gives backspacing instead of offset, the
+    #: offset above is computed from it -- but the published figure is kept as it was written.
+    backspacing_in: typing.Optional[decimal.Decimal] = None
     is_blank: bool = False
 
     @property
@@ -279,7 +282,11 @@ def _split_multi(value: str) -> typing.List[str]:
 # Diameter x width
 # ---------------------------------------------------------------------------------------------
 # '20X9', '17X8.5', '20x8.25'. Both figures are inches; nobody publishes a metric wheel size.
-_SIZE_RE = re.compile(r"(?<![\d.])(?P<diameter>\d{1,2}(?:\.\d+)?)\s*[xX]\s*(?P<width>\d{1,2}(?:\.\d+)?)(?![\d.])")
+# The slash in the lookarounds is load-bearing. Engineering copy is full of fractions --
+# "Wiseco 1/16 x 1/16 x 3/16inch Ring Set", "AMP Research 1/4-20 x 7/8 Socket Cap Screw" -- and
+# without it the parser reads "16 x 3" and "20 x 7" out of them and calls a piston ring set a
+# 16x3 wheel. A dimension that begins or ends against a slash is part of a fraction, not a size.
+_SIZE_RE = re.compile(r"(?<![\d./])(?P<diameter>\d{1,2}(?:\.\d+)?)\s*[xX]\s*(?P<width>\d{1,2}(?:\.\d+)?)(?![\d./])")
 
 
 def parse_size(text: typing.Optional[str]) -> typing.Optional[typing.Tuple[decimal.Decimal, decimal.Decimal]]:
@@ -365,6 +372,9 @@ _BACKSPACE_RE = re.compile(r"(?<![\d.])(?P<whole>\d)\s*\+\s*(?P<frac>\d)(?![\d.]
 # 127 mm Jeep pattern. The noise this lets through is caught by the millimetre bounds rather than
 # by the pattern -- ``3-3.5`` from a shock-kit title is 88.9 mm, under the 90 mm floor, so it
 # fails on physics instead of on punctuation.
+# No slash guard here, unlike the size pattern: a dual-drilled wheel is written "5-112/5-120" and
+# the second pattern legitimately follows a slash. Fractions cannot survive this anyway -- "1/16"
+# is 1 lug on a 16-inch circle, 406 mm, far outside the bounds, and "6 x 3" is 76 mm, below them.
 _TEXT_BOLT_RE = re.compile(r"(?<![\d.])(\d)\s*[xX/-]\s*(\d{1,3}(?:\.\d+)?)(?![\d.])")
 
 
@@ -389,6 +399,21 @@ def backspacing_to_offset_mm(backspacing_in: decimal.Decimal, width_in: decimal.
     return int(((backspacing_in - centreline) * MM_PER_INCH).quantize(decimal.Decimal("1")))
 
 
+# Offset written the European way. 23,561 of the title-only wheels use it and nothing else, so
+# without this they have no offset at all -- "TSW VALENCIA 18x9.5 5/114.3 ET20 CB76.1".
+_ET_RE = re.compile(r"\bET\s*([+-]?\d{1,3})\b", re.IGNORECASE)
+
+# Hub bore, either spelled out or as the "CB" abbreviation. 9,339 rows.
+_BORE_IN_TEXT_RE = re.compile(
+    r"(?:\bCB\s*(?P<cb>\d{2,3}(?:\.\d+)?)|(?P<mm>\d{2,3}(?:\.\d+)?)\s*mm\s*(?:hub\s*)?bore)",
+    re.IGNORECASE,
+)
+
+# Backspacing, the American off-road way of stating the same thing as offset: "4.5BS", "2.1in. BS".
+# 11,814 rows, and on most of them it is the *only* statement of where the mounting face sits.
+_BS_IN_TEXT_RE = re.compile(r"(?<![\d.])(\d{1,2}(?:\.\d+)?)\s*(?:in\.?\s*)?BS\b", re.IGNORECASE)
+
+
 def parse(text: typing.Optional[str]) -> typing.Optional[ParsedWheel]:
     """
     Decode a whole distributor title.
@@ -411,21 +436,48 @@ def parse(text: typing.Optional[str]) -> typing.Optional[ParsedWheel]:
     scannable = text[: size_span[0]] + " " * (size_span[1] - size_span[0]) + text[size_span[1] :]
 
     patterns: typing.List[BoltPattern] = []
+    consumed = list(scannable)
     for match in _TEXT_BOLT_RE.finditer(scannable):
         candidate = parse_bolt_pattern("{}x{}".format(match.group(1), match.group(2)))
         if candidate is None:
             continue
+        # Blank the pattern too, for the same reason the size was blanked: "5x115mm BP" ends in
+        # digits followed by "mm", which the offset fallback below reads as a 115 mm offset.
+        for index in range(match.start(), match.end()):
+            consumed[index] = " "
         if all((candidate.lug_count, candidate.circle_mm) != (p.lug_count, p.circle_mm) for p in patterns):
             patterns.append(candidate)
+    offset_text = "".join(consumed)
 
+    # Offset, in whichever of the three notations the seller used. ET first: it is unambiguous,
+    # where a bare "+18" competes with every other signed number in a description.
     offset = None
-    signed = re.search(r"(?<![\w.])([+-]\s*\d{1,3})\s*(?:MM|mm)?(?![\d.])", text)
-    if signed:
-        offset = parse_offset_mm(signed.group(1))
+    et = _ET_RE.search(text)
+    if et:
+        offset = parse_offset_mm(et.group(1))
     if offset is None:
-        explicit = re.search(r"(?<![\d.])(\d{1,3})\s*(?:MM|mm)(?![\w.])", text)
+        signed = re.search(r"(?<![\w.])([+-]\s*\d{1,3})\s*(?:MM|mm)?(?![\d.])", offset_text)
+        if signed:
+            offset = parse_offset_mm(signed.group(1))
+    if offset is None:
+        explicit = re.search(r"(?<![\d.])(\d{1,3})\s*(?:MM|mm)(?![\w.])", offset_text)
         if explicit:
             offset = parse_offset_mm(explicit.group(1))
+
+    # Backspacing is the same fact in another vocabulary, and converting needs the width -- which
+    # is why a seller states one or the other, never both. Derive the offset from it only when no
+    # offset was stated, so a published figure always wins over arithmetic.
+    backspacing = None
+    bs_match = _BS_IN_TEXT_RE.search(text)
+    if bs_match:
+        backspacing = _decimal(bs_match.group(1))
+        if backspacing is not None and offset is None:
+            offset = backspacing_to_offset_mm(backspacing, width)
+
+    bore = None
+    bore_match = _BORE_IN_TEXT_RE.search(text)
+    if bore_match:
+        bore = parse_center_bore_mm(bore_match.group("cb") or bore_match.group("mm"))
 
     return ParsedWheel(
         diameter_in=diameter,
@@ -433,7 +485,8 @@ def parse(text: typing.Optional[str]) -> typing.Optional[ParsedWheel]:
         bolt_pattern=patterns[0] if patterns else None,
         bolt_pattern_2=patterns[1] if len(patterns) > 1 else None,
         offset_mm=offset,
-        center_bore_mm=None,
+        center_bore_mm=bore,
+        backspacing_in=backspacing,
         is_blank=is_blank(text),
     )
 

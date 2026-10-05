@@ -1,9 +1,22 @@
 # Rough Country EDI (X12 005010) — sample review & implementation plan
 
-Status: **review / pre-implementation.** Nothing is built yet. This document records (a) what the
+Status: **collection built and verified against the live mailbox.** This document records (a) what the
 four Alluvia sample files actually contain, (b) the defects and ambiguities we must resolve with
-Rough Country / Alluvia before writing code, and (c) how the integration would fit onto the
-existing purchase-order stack.
+Rough Country / Alluvia, and (c) how the integration fits onto the existing purchase-order stack.
+
+What exists today:
+
+| Piece | State |
+|---|---|
+| `src/integrations/edi/x12.py` — X12 envelope reader/writer | done, tested against all four samples |
+| `src/integrations/edi/transport.py` — FTP/FTPS transport | done |
+| `src/integrations/clients/rough_country/edi.py` — folder layout, download + archive | done |
+| `manage.py fetch_rough_country_edi` | done; verified live against the Alluvia FTP |
+| 850 generation, order adapter, 997s, applying documents to POs | not started — see §5 |
+
+Nothing writes to a `PurchaseOrder` yet, and nothing sends anything to Rough Country. The
+command downloads what they have published, verifies each file is a complete interchange, and
+moves it to Archive.
 
 Source: Michael McBride email, Wed 26 Aug 2026, with four `.X12` samples (810, 850, 855, 856).
 
@@ -16,7 +29,52 @@ Source: Michael McBride email, Wed 26 Aug 2026, with four `.X12` samples (810, 8
 
 Trading partner IDs (both `ZZ` qualifier): RC production `64ROUGHC`, RC test `64ROUGHCT`.
 Our ID appears in the samples as `TRIDENT` — **not yet confirmed by Alluvia** (see Q1).
-Transport: **plain FTP**, hosted by Alluvia; credentials not yet provided.
+
+## Transport (received 3 Sep 2026)
+
+Plain FTP, hosted by Alluvia. Credentials live in the deployment environment as
+`ROUGH_COUNTRY_EDI_FTP_USER` / `ROUGH_COUNTRY_EDI_FTP_PASSWORD` — never in the repo.
+
+    host  ftp://alluviaftp.alluviaplatform.com   (23.96.235.55)
+    user  TridentRC
+
+Folder names are from *Alluvia's* point of view, so their Inbound is our outbound:
+
+| Folder | Direction | Contents |
+|---|---|---|
+| `/Inbound/850` | we write | Purchase orders |
+| `/Inbound/997` | we write | Functional acknowledgments |
+| `/Outbound/855` | we read | PO acknowledgments |
+| `/Outbound/856` | we read | Advance ship notices |
+| `/Outbound/810` | we read | Invoices |
+| `/Archive/{850,855,856,810}` | we move | Where each collected document goes |
+
+Alluvia asked us to move 855/856/810 into Archive once downloaded, which is what
+`manage.py fetch_rough_country_edi` does.
+
+The folder layout settles part of one open question on its own: `/Inbound/997` means **they
+expect functional acknowledgments from us**, and the absence of any `/Outbound/997` means **we
+will not get one back for our own 850s**.
+
+**Access confirmed 4 Sep 2026.** Alluvia allowlists this host by source IP; `5.161.121.143`
+(production) and the dev machine are both through, and login and directory listing succeed from
+each. Any new machine that needs to reach this mailbox has to be allowlisted by Alluvia first —
+from an unlisted address every port silently times out, which is what this looked like on 3 Sep
+before the allowlist landed.
+
+Server is **FileZilla Server 0.9.60 beta**. Two things confirmed live against it:
+
+* **FTPS is not available.** `AUTH TLS` and `AUTH SSL` both return
+  `502 Explicit TLS authentication not allowed`, and `FEAT` advertises no TLS capability at all.
+  So our password and every end-customer name and street address cross the wire in cleartext.
+  `ROUGH_COUNTRY_EDI_FTP_USE_TLS` stays `false` until Alluvia enables TLS or gives us SFTP —
+  the transport already supports FTPS, so it is a one-setting change when they do. Worth
+  pushing on: this is the kind of thing that is trivial for them to turn on and awkward to
+  explain after a breach.
+* **Passive mode works; `EPSV` is advertised.** No special handling needed.
+
+All nine folders exist and are currently empty — expected, since Rough Country publishes
+855/856/810 only in response to an 850, and we have not sent one yet.
 
 ---
 
@@ -196,26 +254,28 @@ Maps to `PurchaseOrderInvoice` (`invoice_number` ← `BIG02`, PO match ← `BIG0
 1. **Our trading-partner ID.** Is `TRIDENT` our real assigned ISA/GS ID, and is it the same for
    test and production, or does Alluvia assign a separate test ID (as RC has `64ROUGHC` vs
    `64ROUGHCT`)?
-2. **Functional acknowledgments.** None appear in the sample set. Does RC/Alluvia send a **997 or
-   999** for our 850s? Do they expect 997s back from us for their 810/855/856? Over plain FTP with
-   no acknowledgment at all, a syntactically bad 850 is silently discarded and the order simply
-   never happens — we would have no way to detect it. This is the single biggest operational risk.
-3. **`ACK01` and `BAK02` code lists** for the 855 (§2.2) — the accepted / backordered / rejected /
-   quantity-changed vocabulary, so we can map to line-item statuses.
-4. **RC's own order number.** Does the production 855 carry RC's sales-order number (`BAK08`/`BAK09`
-   /`REF*ON`)? If not, we key everything on our own PO number.
+2. **Acknowledgments for our 850s.** `/Inbound/997` confirms they want 997s from us for their
+   810/855/856. But with no `/Outbound/997`, a syntactically bad 850 of ours is discarded
+   silently and the order simply never happens, with no signal on our side. Can they publish
+   997s for our 850s? If not, the only safety net is treating "no 855 within N hours" as a
+   failure and alerting — which is worth building either way.
+3. **`ACK01` and `BAK02` code lists** for the 855 (§2.2) — the accepted / backordered / rejected
+   / quantity-changed vocabulary, so we can map to line-item statuses.
+4. **RC's own order number.** Does the production 855 carry RC's sales-order number
+   (`BAK08`/`BAK09`/`REF*ON`)? If not, we key everything on our own PO number.
 5. **Ship-method code list.** The full set of mutually-defined `TD5-05` / `CAD04` codes (`FG`,
-   `FEDEX_GROUND`, …), including expedited air and LTL/freight for heavy items (bumpers, long-arm
-   kits). This becomes our `list_shipping_methods()`.
-6. **FTP details and security.** Host, port, credentials, inbound/outbound directory names, file
-   naming convention. Is the file written to a temp name and renamed on completion (otherwise we
-   will eventually read a half-written file)? Who deletes files after pickup? And: **can we get
-   FTPS or SFTP instead of plain FTP?** Plain FTP puts our credentials and end-customer names and
-   addresses on the wire in cleartext. We already run SFTP elsewhere (`relay_sftp_provisioning`,
-   the DLG feed client) so this is no extra work on our side.
-7. **Test environment loop.** We need a test mailbox against `64ROUGHCT` where an 850 we submit
-   produces a real 855, 856 and 810 back. Without a round-trip we are writing parsers against four
-   hand-edited files.
+   `FEDEX_GROUND`, …), including expedited air and LTL/freight for heavy items (bumpers,
+   long-arm kits). This becomes our `list_shipping_methods()`.
+6. **FTP write convention.** Does Alluvia write each file to a temp name and rename it on
+   completion? Without that we will eventually read a half-written document. (Our reader rejects
+   any payload with no `IEA` trailer and leaves it in Outbound to retry, so this is contained
+   rather than dangerous — but worth knowing.) And what filename convention should our 850s use?
+7. **FTPS or SFTP.** Confirmed unavailable today (`502 Explicit TLS authentication not
+   allowed`). Ask them to enable TLS on the FileZilla server, or give us SFTP. One setting on
+   our side once they do.
+8. **Test environment loop.** We need a test mailbox against `64ROUGHCT` where an 850 we submit
+   produces a real 855, 856 and 810 back. Without a round-trip we are writing parsers against
+   four hand-edited files.
 
 **Important — affects design, not blocking**
 

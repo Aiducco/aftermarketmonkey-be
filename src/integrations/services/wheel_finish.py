@@ -44,6 +44,41 @@ _TREATMENT_FAMILIES: typing.Tuple[typing.Tuple[str, typing.Tuple[str, ...]], ...
     ("raw", ("RAW", "BARE", "AS CAST", "CLEAR")),
 )
 
+# Abbreviations the trade writes in free-text titles but never in a feed's finish column. A title
+# says "M-BLK", "S-BLK MILL", "CHR/POL", "SLV MIR"; the attribute columns spell the same finishes
+# out in full. Without these the mapper reaches only 40% of title-parsed wheels.
+#
+# Only unambiguous ones. "BD", "NBL" and "CUSTOM" appear often and are left out: CUSTOM is not a
+# colour at all, and the other two could not be pinned to one from the descriptions alone.
+_ABBREVIATIONS = {
+    "BLK": "BLACK",
+    "BLKOUT": "BLACK",
+    "BLAK": "BLACK",
+    "SLV": "SILVER",
+    "SIL": "SILVER",
+    "GNMTL": "GUNMETAL",
+    "GMTL": "GUNMETAL",
+    "GUNMTL": "GUNMETAL",
+    "BRNZ": "BRONZE",
+    "BRZ": "BRONZE",
+    "ANTH": "ANTHRACITE",
+    "CHR": "CHROME",
+    "POL": "POLISHED",
+    "POLISHD": "POLISHED",
+    "PLSH": "POLISHED",
+    "MCH": "MACHINED",
+    "MACH": "MACHINED",
+    "MILL": "MACHINED",
+    "BRSH": "MACHINED",
+    "BRUSH": "MACHINED",
+    "GRY": "GRAY",
+    "GRPH": "GRAPHITE",
+    "WHT": "WHITE",
+    "GLD": "GOLD",
+    "GRN": "GREEN",
+    "BLU": "BLUE",
+}
+
 _WORD_SPLIT = re.compile(r"[^A-Z0-9]+")
 
 
@@ -52,7 +87,8 @@ def finish_family(finish: typing.Optional[str]) -> typing.Optional[str]:
     if not finish:
         return None
     text = finish.upper()
-    words = set(_WORD_SPLIT.split(text))
+    words = {_ABBREVIATIONS.get(word, word) for word in _WORD_SPLIT.split(text)}
+    text = " ".join(words) if words else text
     for family, needles in _COLOUR_FAMILIES:
         for needle in needles:
             if needle in words or (" " in needle and needle in text):

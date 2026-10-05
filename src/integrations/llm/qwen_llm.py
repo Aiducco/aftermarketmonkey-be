@@ -38,31 +38,38 @@ def model_name() -> str:
     return _env("QWEN_MODEL_NAME", "qwen2.5")
 
 
-def client(timeout: float = 300.0, max_retries: int = 3):
+def client(timeout: float = 300.0, max_retries: int = 3,
+           base_url: str | None = None, api_key: str | None = None):
     """
     OpenAI SDK pointed at the self-hosted endpoint. timeout is much higher than azure_llm's
     120s default -- a single-GPU/CPU-served model doing a 24,000-token-budget Stage D call is
     realistically slower than a hosted multi-tenant API, so a tight timeout would abort real
     in-flight generations rather than catch actually-hung connections. Tune down once real
     per-call latency on the host machine is known.
+
+    base_url/api_key default to the QWEN_* environment. They are arguments as well so a single
+    run can be pointed at a different host -- a laptop's Ollama, a rented GPU box, ollama.com --
+    without editing .env, which matters when the endpoint changes more often than the code does.
     """
     from openai import OpenAI
 
-    base_url = _env("QWEN_API_BASE_URL")
+    base_url = base_url or _env("QWEN_API_BASE_URL")
     if not base_url:
         raise RuntimeError("QWEN_API_BASE_URL is not set -- point it at the host machine's OpenAI-compatible endpoint")
     return OpenAI(
         base_url=base_url,
         # Most self-hosted servers don't check the key at all, but the SDK requires a non-empty
-        # string -- QWEN_API_KEY lets you set a real one if the host machine is locked down.
-        api_key=_env("QWEN_API_KEY", "not-needed"),
+        # string -- QWEN_API_KEY lets you set a real one if the host machine is locked down, or
+        # when the endpoint is a hosted one (ollama.com) that does authenticate.
+        api_key=api_key or _env("QWEN_API_KEY", "not-needed"),
         max_retries=max_retries,
         timeout=timeout,
     )
 
 
 def complete_json(cli, system: str, user: str, max_tokens: int = 1024,
-                   model: str | None = None) -> tuple[dict | None, str | None]:
+                   model: str | None = None,
+                   reasoning_effort: str | None = None) -> tuple[dict | None, str | None]:
     """
     Same contract as azure_llm.complete_json: (parsed, error), never raises. Also logs REAL
     prompt/completion token usage from the response -- the thing azure_llm.py never captured,
@@ -72,6 +79,11 @@ def complete_json(cli, system: str, user: str, max_tokens: int = 1024,
     """
     import logging
     logger = logging.getLogger(__name__)
+    kwargs = {}
+    if reasoning_effort:
+        # Only sent when asked for: a non-reasoning model served by vLLM will reject an unknown
+        # parameter outright, and most of the models this points at are not reasoning models.
+        kwargs["reasoning_effort"] = reasoning_effort
     try:
         resp = cli.chat.completions.create(
             model=model or model_name(),
@@ -80,6 +92,7 @@ def complete_json(cli, system: str, user: str, max_tokens: int = 1024,
             max_tokens=max_tokens,
             temperature=0,
             response_format={"type": "json_object"},
+            **kwargs,
         )
         if resp.usage:
             logger.info("qwen_llm real usage: prompt_tokens=%s completion_tokens=%s (max_tokens budget was %s)",

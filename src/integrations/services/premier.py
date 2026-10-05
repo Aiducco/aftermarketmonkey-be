@@ -44,15 +44,48 @@ def _premier_setting_int(name: str, default: int) -> int:
 PREMIER_COMPANY_PRICING_SYNC_MAX_WORKERS = _premier_setting_int("PREMIER_COMPANY_PRICING_SYNC_MAX_WORKERS", 4)
 
 PREMIER_PARTS_UPDATE_FIELDS = [
-    "mfg_part_number", "long_description", "external_long_description",
-    "length", "width", "height", "weight", "upc_code", "usa_item_availability",
-    "core_charge", "jobber_price", "map_price", "retail_price", "inventory_status",
-    "nv_qty", "ky_qty", "mfg_qty", "wa_qty", "image_url",
-    "ships_ltl", "item_with_cores", "prop65_carcinogen", "prop65_reproductive_harm",
-    "approved_line", "california_legal", "line_code", "pies_ems_code", "drop_ship_fee",
-    "canada_map", "canada_msrp", "canada_jobber", "part_category", "part_subcategory",
-    "part_terminology", "freight_cost", "minimum_order_qty", "drop_shippable_from_mfg",
-    "vendor_enhanced_emissions_code", "is_kit", "kit_component_list", "raw_data", "updated_at",
+    "mfg_part_number",
+    "long_description",
+    "external_long_description",
+    "length",
+    "width",
+    "height",
+    "weight",
+    "upc_code",
+    "usa_item_availability",
+    "core_charge",
+    "jobber_price",
+    "map_price",
+    "retail_price",
+    "inventory_status",
+    "nv_qty",
+    "ky_qty",
+    "mfg_qty",
+    "wa_qty",
+    "image_url",
+    "ships_ltl",
+    "item_with_cores",
+    "prop65_carcinogen",
+    "prop65_reproductive_harm",
+    "approved_line",
+    "california_legal",
+    "line_code",
+    "pies_ems_code",
+    "drop_ship_fee",
+    "canada_map",
+    "canada_msrp",
+    "canada_jobber",
+    "part_category",
+    "part_subcategory",
+    "part_terminology",
+    "freight_cost",
+    "minimum_order_qty",
+    "drop_shippable_from_mfg",
+    "vendor_enhanced_emissions_code",
+    "is_kit",
+    "kit_component_list",
+    "raw_data",
+    "updated_at",
 ]
 
 
@@ -183,9 +216,7 @@ def sync_unmapped_premier_brands_to_brands() -> typing.List[src_models.PremierBr
         logger.warning("{} Premier provider not found.".format(_LOG_PREFIX))
         return []
 
-    mapped_ids = set(
-        src_models.BrandPremierBrandMapping.objects.values_list("premier_brand_id", flat=True).distinct()
-    )
+    mapped_ids = set(src_models.BrandPremierBrandMapping.objects.values_list("premier_brand_id", flat=True).distinct())
     unmapped = list(src_models.PremierBrand.objects.exclude(id__in=mapped_ids).order_by("id"))
 
     if not unmapped:
@@ -198,9 +229,7 @@ def sync_unmapped_premier_brands_to_brands() -> typing.List[src_models.PremierBr
     brands_by_upper_name: typing.Dict[str, src_models.Brands] = {}
     if name_upper_keys:
         for b in (
-            src_models.Brands.objects.annotate(_name_u=Upper("name"))
-            .filter(_name_u__in=name_upper_keys)
-            .order_by("id")
+            src_models.Brands.objects.annotate(_name_u=Upper("name")).filter(_name_u__in=name_upper_keys).order_by("id")
         ):
             key = (b.name or "").strip().upper()
             if key not in brands_by_upper_name:
@@ -232,9 +261,7 @@ def sync_unmapped_premier_brands_to_brands() -> typing.List[src_models.PremierBr
             candidates = list(brands_first_index.get(parts[0], ()))
         if not candidates:
             if all_brands_fallback is None:
-                all_brands_fallback = list(
-                    src_models.Brands.objects.only("id", "name", "aaia_code").order_by("id")
-                )
+                all_brands_fallback = list(src_models.Brands.objects.only("id", "name", "aaia_code").order_by("id"))
             candidates = all_brands_fallback
         brand = best_fuzzy_brand_match(pb.name or "", candidates)
         if brand:
@@ -251,9 +278,7 @@ def sync_unmapped_premier_brands_to_brands() -> typing.List[src_models.PremierBr
 
     created_brands = 0
     if new_brand_names:
-        existing = set(
-            src_models.Brands.objects.filter(name__in=list(new_brand_names)).values_list("name", flat=True)
-        )
+        existing = set(src_models.Brands.objects.filter(name__in=list(new_brand_names)).values_list("name", flat=True))
         new_rows = [
             src_models.Brands(
                 name=name,
@@ -266,10 +291,7 @@ def sync_unmapped_premier_brands_to_brands() -> typing.List[src_models.PremierBr
         if new_rows:
             src_models.Brands.objects.bulk_create(new_rows, ignore_conflicts=True)
             created_brands = len(new_rows)
-        by_name = {
-            b.name: b
-            for b in src_models.Brands.objects.filter(name__in=list(new_brand_names))
-        }
+        by_name = {b.name: b for b in src_models.Brands.objects.filter(name__in=list(new_brand_names))}
         for pb in unmapped:
             if pb.id not in resolved:
                 nu = (pb.name or "").strip().upper()
@@ -295,7 +317,8 @@ def sync_unmapped_premier_brands_to_brands() -> typing.List[src_models.PremierBr
     brand_ids = {resolved[pb.id].id for pb in unmapped if pb.id in resolved}
     existing_bp = set(
         src_models.BrandProviders.objects.filter(
-            provider=premier_provider, brand_id__in=brand_ids,
+            provider=premier_provider,
+            brand_id__in=brand_ids,
         ).values_list("brand_id", flat=True)
     )
     bp_to_create = [
@@ -308,13 +331,24 @@ def sync_unmapped_premier_brands_to_brands() -> typing.List[src_models.PremierBr
 
     logger.info(
         "{} Sync complete: brands_created={} fuzzy_matches={} mappings={} brand_providers={}.".format(
-            _LOG_PREFIX, created_brands, fuzzy_matches, len(mapping_models), len(bp_to_create),
+            _LOG_PREFIX,
+            created_brands,
+            fuzzy_matches,
+            len(mapping_models),
+            len(bp_to_create),
         )
     )
     return unmapped
 
 
 _LEADING_BRAND_PHRASE_RE = re.compile(r"^([A-Za-z][A-Za-z.'&]*(?:\s+[A-Za-z][A-Za-z.'&]*)*)")
+
+
+# 63% of the bucket's descriptions lead with the distributor's own name -- "Wheel Pros Niche 1PC
+# 17X8 TURIN..." -- and the marque is the phrase immediately after it. Without stripping this, the
+# leading phrase is "Wheel Pros", which resolves back to the bucket brand and is discarded as a
+# no-op: the resolver matched 2 rows out of 6,754 for exactly this reason.
+_WHEELPROS_PREFIX_RE = re.compile(r"^wheel\s*pros\b[\s\-:]*", re.IGNORECASE)
 
 
 def _leading_brand_phrase(description: typing.Optional[str]) -> typing.Optional[str]:
@@ -330,14 +364,70 @@ def _leading_brand_phrase(description: typing.Optional[str]) -> typing.Optional[
     """
     if not description:
         return None
-    m = _LEADING_BRAND_PHRASE_RE.match(description.strip())
+    text = _WHEELPROS_PREFIX_RE.sub("", description.strip(), count=1).strip()
+    m = _LEADING_BRAND_PHRASE_RE.match(text)
     if not m:
         return None
     phrase = m.group(1).strip()
     return phrase or None
 
 
-def resolve_wheelpros_bucket_brands(dry_run: bool = True) -> typing.Dict[str, int]:
+# Marques inside Premier's "Wheel Pros" bucket that the generic cascade cannot reach, and why it
+# cannot: ``_LEADING_BRAND_PHRASE_RE`` stops at the first token containing a digit, so "VN405
+# TT-II" yields the phrase "VN" and "R159" yields "R" -- fragments no brand name matches. The
+# marque lives in the model code itself, which is a closed vocabulary per manufacturer.
+#
+# Every entry below was read off the bucket's own rows, and the target is the specific Brands row
+# the product belongs to rather than the nearest-looking name -- the catalog carries NICHE 1PC and
+# NICHE WHEELS, AMERICAN RACING and AMERICAN RACING VINTAGE, PRO COMP ALLOYS and PRO COMP TIRE, and
+# picking the wrong half would move the problem rather than fix it.
+#
+# Ordered: the first pattern that matches wins, so a longer prefix precedes a shorter one.
+WHEELPROS_BUCKET_MARQUES: typing.Tuple[typing.Tuple[str, str], ...] = (
+    # Wheels, identified by the manufacturer's own style-code prefix.
+    (r"^VNCL\d", "AMERICAN RACING VINTAGE"),  # VNCL205 ... TT-GRY
+    (r"^VN\d", "AMERICAN RACING VINTAGE"),  # VN215 TT-II, VN405 TORQ THRUST II
+    (r"^MO\d", "MOTO METAL"),  # MO992, MO970
+    (r"^PR\d", "PERFORMANCE REPLICAS"),  # PR104C, PR106A
+    (r"^R\d{3}\b", "ROTIFORM"),  # R159, R161
+    (r"^NICHE\b", "NICHE 1PC"),
+    (r"^DUB\b", "DUB 1PC"),
+    (r"^PRO\s*COMP\s+ALLOYS\b", "PRO COMP ALLOYS"),
+    (r"^BR\s", "BLACK RHINO WHEELS"),  # BR ALAMO, BR BATONA
+    # Tires. Premier writes the size first on most of these, so the marque has to come from the
+    # model code: FK/AZENIS is Azenis, ZE/ZIEX is Ziex, SN/SINCERA is Sincera, PT and S/TZ are
+    # Sincera and Ziex S/TZ, AT3W and WDPEAK are Wildpeak, AKLIMATE and RUBITREK are Falken lines.
+    (r"^FALKEN\b", "FALKEN TIRE"),
+    (r"\b(?:AZENIS|ZIEX|SINCERA|WDPEAK|WILDPEAK|AKLIMATE|RUBITREK|EUROWINTER)\b", "FALKEN TIRE"),
+    # \d+ not \d: a trailing \b after a single digit fails on "SN-211", because the boundary is
+    # tested between "2" and "1" and there is none.
+    (r"\b(?:FK-?\d+|ZE-?\d+|SN-?\d+|PT-?\d+|S/TZ\d+|AT[34]W|RT01|MT01)\b", "FALKEN TIRE"),
+    (r"\bNITTO\b", "NITTO"),
+)
+
+_WHEELPROS_BUCKET_MARQUES_COMPILED = tuple(
+    (re.compile(pattern, re.IGNORECASE), name) for pattern, name in WHEELPROS_BUCKET_MARQUES
+)
+
+
+def marque_from_bucket_description(description: typing.Optional[str]) -> typing.Optional[str]:
+    """
+    The real manufacturer for one row of Premier's "Wheel Pros" bucket, or None.
+
+    Matched against the description with the distributor prefix removed, so "Wheel Pros Niche 1PC
+    17X8 TURIN" is read as "Niche 1PC 17X8 TURIN". Returns a Brands **name**; the caller resolves
+    it and skips the row if the catalog has no such brand, so a rename cannot silently drop rows.
+    """
+    if not description:
+        return None
+    text = _WHEELPROS_PREFIX_RE.sub("", description.strip(), count=1).strip()
+    for pattern, name in _WHEELPROS_BUCKET_MARQUES_COMPILED:
+        if pattern.search(text):
+            return name
+    return None
+
+
+def resolve_wheelpros_bucket_brands(dry_run: bool = True, use_leading_phrase: bool = False) -> typing.Dict[str, int]:
     """
     Premier's own feed lumps many distinct real manufacturers (Nitto, Falken, Moto Metal, Niche,
     American Racing, Toyo, Performance Replicas, Motegi, MSA, Ohtsu, DUB, Asanti, XD, TSW, ...)
@@ -360,13 +450,14 @@ def resolve_wheelpros_bucket_brands(dry_run: bool = True) -> typing.Dict[str, in
     """
     logger.info(
         "{} Resolving per-part brands for the Wheel Pros bucket{}.".format(
-            _LOG_PREFIX, " (dry run)" if dry_run else "",
+            _LOG_PREFIX,
+            " (dry run)" if dry_run else "",
         )
     )
 
     wheelpros_premier_brand = src_models.PremierBrand.objects.filter(name__iexact="Wheel Pros").first()
     if not wheelpros_premier_brand:
-        logger.info("{} No \"Wheel Pros\" PremierBrand found.".format(_LOG_PREFIX))
+        logger.info('{} No "Wheel Pros" PremierBrand found.'.format(_LOG_PREFIX))
         return {}
 
     # Today's feed-brand-level mapping target -- some Wheel Pros rows' own descriptions
@@ -379,7 +470,8 @@ def resolve_wheelpros_bucket_brands(dry_run: bool = True) -> typing.Dict[str, in
 
     rows = list(
         src_models.PremierParts.objects.filter(
-            brand_id=wheelpros_premier_brand.id, brand_override__isnull=True,
+            brand_id=wheelpros_premier_brand.id,
+            brand_override__isnull=True,
         )
         .exclude(long_description__isnull=True)
         .exclude(long_description="")
@@ -387,22 +479,63 @@ def resolve_wheelpros_bucket_brands(dry_run: bool = True) -> typing.Dict[str, in
         .iterator(chunk_size=2000)
     )
 
-    phrase_by_row_id: typing.Dict[int, str] = {}
+    # ---- pass 1: a resolved sibling on the same manufacturer part number --------------------
+    # Premier lists the same wheel twice, once under its own "WPR" SKU and once under a marque SKU
+    # ("WPRVN2155461" and "AMRVN2155461"). The marque row resolves on its description and the WPR
+    # row does not, so the answer is already sitting next to it. Highest-confidence pass and it
+    # invents nothing: measured across the bucket, 1,553 rows have such a sibling and **zero** of
+    # them have siblings that disagree, so a conflict is treated as no answer rather than a vote.
+    sibling_brand_by_row_id: typing.Dict[int, int] = {}
+    resolved_siblings: typing.Dict[str, typing.Set[int]] = {}
+    for mfg_pn, override_id in (
+        src_models.PremierParts.objects.filter(brand_override__isnull=False)
+        .exclude(mfg_part_number__isnull=True)
+        .exclude(mfg_part_number="")
+        .values_list("mfg_part_number", "brand_override_id")
+    ):
+        resolved_siblings.setdefault(mfg_pn, set()).add(override_id)
+
+    unresolved_mfg_pn = dict(
+        src_models.PremierParts.objects.filter(
+            brand_id=wheelpros_premier_brand.id, brand_override__isnull=True
+        ).values_list("id", "mfg_part_number")
+    )
+    for row_id, mfg_pn in unresolved_mfg_pn.items():
+        found = resolved_siblings.get(mfg_pn or "")
+        if found and len(found) == 1:
+            sibling_brand_by_row_id[row_id] = next(iter(found))
+
+    # ---- pass 2: the marque named by the row's own model code -------------------------------
+    marque_by_row_id: typing.Dict[int, str] = {}
     for row in rows:
+        if row["id"] in sibling_brand_by_row_id:
+            continue
+        marque = marque_from_bucket_description(row["long_description"])
+        if marque:
+            marque_by_row_id[row["id"]] = marque
+
+    # ---- pass 3: the original leading-phrase cascade -----------------------------------------
+    # Off by default. It is the weakest signal of the three -- a free-text phrase, matched fuzzily
+    # against the whole Brands catalog -- and it is where a style name can collide with an
+    # unrelated brand (the "DAGGER" / "DAGGER KAYAKS" case the code below already guards against).
+    # Passes 1 and 2 reach 5,792 rows on evidence that cannot be coincidence; this adds 188 more
+    # on evidence that can.
+    phrase_by_row_id: typing.Dict[int, str] = {}
+    for row in rows if use_leading_phrase else ():
+        if row["id"] in sibling_brand_by_row_id or row["id"] in marque_by_row_id:
+            continue
         phrase = _leading_brand_phrase(row["long_description"])
         if phrase:
             phrase_by_row_id[row["id"]] = phrase
 
-    if not phrase_by_row_id:
-        logger.info("{} No Wheel Pros rows with a leading brand phrase to resolve.".format(_LOG_PREFIX))
+    if not (phrase_by_row_id or marque_by_row_id or sibling_brand_by_row_id):
+        logger.info("{} No Wheel Pros rows to resolve.".format(_LOG_PREFIX))
         return {}
 
     phrase_upper_keys = {phrase.strip().upper() for phrase in phrase_by_row_id.values()}
     brands_by_upper_name: typing.Dict[str, src_models.Brands] = {}
     for b in (
-        src_models.Brands.objects.annotate(_name_u=Upper("name"))
-        .filter(_name_u__in=phrase_upper_keys)
-        .order_by("id")
+        src_models.Brands.objects.annotate(_name_u=Upper("name")).filter(_name_u__in=phrase_upper_keys).order_by("id")
     ):
         key = (b.name or "").strip().upper()
         if key not in brands_by_upper_name:
@@ -416,7 +549,34 @@ def resolve_wheelpros_bucket_brands(dry_run: bool = True) -> typing.Dict[str, in
     exact_matches = 0
     compact_matches = 0
     fuzzy_matches = 0
+    sibling_matches = 0
+    marque_matches = 0
     samples: typing.List[typing.Tuple[str, str, str, str]] = []
+
+    # Pass 1 and 2 resolve to a Brands row before the phrase cascade runs. Both look the brand up
+    # by id or name rather than trusting the mapping blindly, so a renamed or deleted Brand drops
+    # the row instead of writing a dangling override.
+    needed_ids = set(sibling_brand_by_row_id.values())
+    needed_names = set(marque_by_row_id.values())
+    brands_by_id = {b.id: b for b in src_models.Brands.objects.filter(id__in=needed_ids)}
+    brands_by_name = {
+        (b.name or "").strip().upper(): b
+        for b in src_models.Brands.objects.annotate(_n=Upper("name")).filter(_n__in=needed_names)
+    }
+    for row_id, brand_id in sibling_brand_by_row_id.items():
+        brand = brands_by_id.get(brand_id)
+        if brand and brand.id != wheelpros_catalog_brand_id:
+            resolved_by_row_id[row_id] = brand
+            sibling_matches += 1
+            if len(samples) < 40:
+                samples.append(("sibling", row_id, "same mfg part number", brand.name))
+    for row_id, marque in marque_by_row_id.items():
+        brand = brands_by_name.get(marque.upper())
+        if brand and brand.id != wheelpros_catalog_brand_id:
+            resolved_by_row_id[row_id] = brand
+            marque_matches += 1
+            if len(samples) < 40:
+                samples.append(("marque", row_id, marque, brand.name))
 
     for row_id, phrase in phrase_by_row_id.items():
         nm = phrase.strip().upper()
@@ -464,18 +624,25 @@ def resolve_wheelpros_bucket_brands(dry_run: bool = True) -> typing.Dict[str, in
     for how, row_id, phrase, brand_name in samples:
         logger.info(
             "{} [{}{}] row_id={} phrase={!r} -> Brand {!r}".format(
-                _LOG_PREFIX, how, " dry-run" if dry_run else "", row_id, phrase, brand_name,
+                _LOG_PREFIX,
+                how,
+                " dry-run" if dry_run else "",
+                row_id,
+                phrase,
+                brand_name,
             )
         )
 
     unresolved = len(phrase_by_row_id) - len(resolved_by_row_id)
     summary = {
-        "candidates": len(phrase_by_row_id),
+        "candidates": len(rows),
+        "sibling_matches": sibling_matches,
+        "marque_matches": marque_matches,
         "exact_matches": exact_matches,
         "compact_matches": compact_matches,
         "fuzzy_matches": fuzzy_matches,
         "resolved": len(resolved_by_row_id),
-        "unresolved": unresolved,
+        "unresolved": len(rows) - len(resolved_by_row_id),
     }
     logger.info("{} Summary: {}".format(_LOG_PREFIX, summary))
 
@@ -494,7 +661,9 @@ def resolve_wheelpros_bucket_brands(dry_run: bool = True) -> typing.Dict[str, in
                 UPDATE premier_parts pp SET brand_override_id = v.brand_override_id
                 FROM (VALUES {}) AS v(id, brand_override_id)
                 WHERE pp.id = v.id::bigint
-                """.format(placeholders),
+                """.format(
+                    placeholders
+                ),
                 params,
             )
         connection.close()
@@ -530,18 +699,19 @@ def _link_override_brands_to_premier(brand_ids: typing.Set[int]) -> int:
 
     existing = set(
         src_models.BrandProviders.objects.filter(
-            provider_id=premier_provider.id, brand_id__in=brand_ids,
+            provider_id=premier_provider.id,
+            brand_id__in=brand_ids,
         ).values_list("brand_id", flat=True)
     )
     to_create = [
-        src_models.BrandProviders(brand_id=bid, provider_id=premier_provider.id)
-        for bid in sorted(brand_ids - existing)
+        src_models.BrandProviders(brand_id=bid, provider_id=premier_provider.id) for bid in sorted(brand_ids - existing)
     ]
     if to_create:
         src_models.BrandProviders.objects.bulk_create(to_create, ignore_conflicts=True)
         logger.info(
             "{} Linked {} override-derived brand(s) to Premier in BrandProviders.".format(
-                _LOG_PREFIX, len(to_create),
+                _LOG_PREFIX,
+                len(to_create),
             )
         )
     return len(to_create)
@@ -596,8 +766,11 @@ def cleanup_premier_brand_override_orphans() -> typing.Dict[str, int]:
         chunk = dupe_ext_ids[i : i + batch_size]
         pps = list(
             src_models.ProviderPart.objects.filter(
-                provider=premier_provider, provider_external_id__in=chunk,
-            ).values("id", "provider_external_id", "master_part_id").order_by("provider_external_id", "id")
+                provider=premier_provider,
+                provider_external_id__in=chunk,
+            )
+            .values("id", "provider_external_id", "master_part_id")
+            .order_by("provider_external_id", "id")
         )
         by_ext_id: typing.Dict[str, typing.List[typing.Dict]] = {}
         for pp in pps:
@@ -621,7 +794,8 @@ def cleanup_premier_brand_override_orphans() -> typing.Dict[str, int]:
             protected_provider_parts += 1
             logger.warning(
                 "{} ProviderPart id={} has protected order history -- left in place.".format(
-                    _LOG_PREFIX, pp_id,
+                    _LOG_PREFIX,
+                    pp_id,
                 )
             )
 
@@ -629,7 +803,8 @@ def cleanup_premier_brand_override_orphans() -> typing.Dict[str, int]:
     if candidate_master_part_ids:
         orphaned_master_part_ids = list(
             src_models.MasterPart.objects.filter(
-                id__in=candidate_master_part_ids, provider_parts__isnull=True,
+                id__in=candidate_master_part_ids,
+                provider_parts__isnull=True,
             ).values_list("id", flat=True)
         )
         if orphaned_master_part_ids:
@@ -662,7 +837,7 @@ def _pgbulk_upsert_premier_parts_batches(
     num_batches = (len(part_instances) + batch_size - 1) // batch_size
     total = 0
     for i in range(0, len(part_instances), batch_size):
-        batch = part_instances[i: i + batch_size]
+        batch = part_instances[i : i + batch_size]
         batch_num = (i // batch_size) + 1
         now = timezone.now()
         for p in batch:
@@ -675,9 +850,14 @@ def _pgbulk_upsert_premier_parts_batches(
             returning=False,
         )
         total += len(batch)
-        logger.info("{} Upserted PremierParts batch {}/{} ({} rows).".format(
-            _LOG_PREFIX, batch_num, num_batches, len(batch),
-        ))
+        logger.info(
+            "{} Upserted PremierParts batch {}/{} ({} rows).".format(
+                _LOG_PREFIX,
+                batch_num,
+                num_batches,
+                len(batch),
+            )
+        )
         connection.close()
         if batch_num < num_batches:
             time.sleep(batch_delay_seconds)
@@ -704,7 +884,7 @@ def _pgbulk_upsert_premier_company_pricing_batches(
     num_batches = (len(pricing_instances) + batch_size - 1) // batch_size
     total_written = 0
     for i in range(0, len(pricing_instances), batch_size):
-        batch = pricing_instances[i: i + batch_size]
+        batch = pricing_instances[i : i + batch_size]
         batch_num = (i // batch_size) + 1
         now = timezone.now()
         rows = [
@@ -743,7 +923,9 @@ def _pgbulk_upsert_premier_company_pricing_batches(
                     IS DISTINCT FROM
                       (EXCLUDED.customer_price, EXCLUDED.jobber_price, EXCLUDED.map_price,
                        EXCLUDED.core_charge, EXCLUDED.customer_cad_price)
-                """.format(placeholders),
+                """.format(
+                    placeholders
+                ),
                 params,
             )
             n_written = cur.rowcount
@@ -751,7 +933,11 @@ def _pgbulk_upsert_premier_company_pricing_batches(
         logger.info(
             "{} PremierCompanyPricing batch {}/{}: {} considered, {} actually written "
             "(unchanged skipped).".format(
-                _LOG_PREFIX, batch_num, num_batches, len(batch), n_written,
+                _LOG_PREFIX,
+                batch_num,
+                num_batches,
+                len(batch),
+                n_written,
             )
         )
         connection.close()
@@ -821,10 +1007,7 @@ def _transform_single_premier_row(
             vendor_enhanced_emissions_code=_clean(row.get("Vendor Enhanced Emissions Code")),
             is_kit=_safe_bool(row.get("Kit")),
             kit_component_list=_clean(row.get("Kit Component List")),
-            raw_data={
-                k: (None if (v is None or (isinstance(v, float) and pd.isna(v))) else v)
-                for k, v in row.items()
-            },
+            raw_data={k: (None if (v is None or (isinstance(v, float) and pd.isna(v))) else v) for k, v in row.items()},
         )
     except Exception as e:
         logger.warning("{} Error transforming row: {}. Skipping.".format(_LOG_PREFIX, str(e)))
@@ -866,9 +1049,7 @@ def _part_number_brand_id_lookup(
         return {}
     lookup: typing.Dict[typing.Tuple[str, int], int] = {}
     for p in (
-        src_models.PremierParts.objects.filter(
-            premier_part_number__in=part_numbers, brand_id__in=brand_ids
-        )
+        src_models.PremierParts.objects.filter(premier_part_number__in=part_numbers, brand_id__in=brand_ids)
         .only("id", "premier_part_number", "brand_id")
         .iterator(chunk_size=5000)
     ):
@@ -965,9 +1146,7 @@ def fetch_and_save_premier_company_pricing_for_company_provider(company_provider
         return
 
     brand_names = {_clean(row.get("Brand")) for row in records if _clean(row.get("Brand"))}
-    brand_name_to_premier_brand = {
-        b.name: b for b in src_models.PremierBrand.objects.filter(name__in=brand_names)
-    }
+    brand_name_to_premier_brand = {b.name: b for b in src_models.PremierBrand.objects.filter(name__in=brand_names)}
     if not brand_name_to_premier_brand:
         logger.warning(
             "{} None of this feed's brands exist in PremierBrand yet (catalog sync hasn't run "
@@ -983,15 +1162,11 @@ def fetch_and_save_premier_company_pricing_for_company_provider(company_provider
         )
         return
 
-    pricing_instances = _build_company_pricing_instances(
-        records, brand_name_to_premier_brand, company, part_lookup
-    )
+    pricing_instances = _build_company_pricing_instances(records, brand_name_to_premier_brand, company, part_lookup)
     total = _pgbulk_upsert_premier_company_pricing_batches(
         pricing_instances, PREMIER_PGBULK_BATCH_SIZE, PREMIER_PGBULK_BATCH_DELAY_SECONDS
     )
-    logger.info(
-        "{} Synced {} PremierCompanyPricing rows for company={}.".format(_LOG_PREFIX, total, company.name)
-    )
+    logger.info("{} Synced {} PremierCompanyPricing rows for company={}.".format(_LOG_PREFIX, total, company.name))
 
 
 def fetch_and_save_all_premier_brand_parts() -> None:
@@ -1078,14 +1253,9 @@ def fetch_and_save_all_premier_brand_parts() -> None:
                 update_fields=["name", "line_code", "updated_at"],
                 returning=False,
             )
-        logger.info("{} Upserted {} Premier brands company={}.".format(
-            _LOG_PREFIX, len(brand_data), company.name
-        ))
+        logger.info("{} Upserted {} Premier brands company={}.".format(_LOG_PREFIX, len(brand_data), company.name))
 
-        premier_brands = {
-            b.name: b
-            for b in src_models.PremierBrand.objects.filter(external_id__in=brand_data.keys())
-        }
+        premier_brands = {b.name: b for b in src_models.PremierBrand.objects.filter(external_id__in=brand_data.keys())}
 
         # ── Pass 2: stream parts in batches of PREMIER_PGBULK_BATCH_SIZE ───────────────────
         # Buffer dict keyed by (premier_part_number, brand_id) provides within-batch dedup
@@ -1112,9 +1282,11 @@ def fetch_and_save_all_premier_brand_parts() -> None:
             )
             batch_num += 1
             company_parts += len(batch_list)
-            logger.info("{} Upserted PremierParts batch {} ({} rows, {} total) company={}.".format(
-                _LOG_PREFIX, batch_num, len(batch_list), company_parts, company.name
-            ))
+            logger.info(
+                "{} Upserted PremierParts batch {} ({} rows, {} total) company={}.".format(
+                    _LOG_PREFIX, batch_num, len(batch_list), company_parts, company.name
+                )
+            )
             connection.close()
             time.sleep(PREMIER_PGBULK_BATCH_DELAY_SECONDS)
             parts_buf.clear()
@@ -1137,12 +1309,17 @@ def fetch_and_save_all_premier_brand_parts() -> None:
 
         _flush_premier_catalog_batch()
 
-        logger.info("{} Premier catalog pass 2 done: {} rows scanned, {} parts upserted company={}.".format(
-            _LOG_PREFIX, row_count, company_parts, company.name
-        ))
+        logger.info(
+            "{} Premier catalog pass 2 done: {} rows scanned, {} parts upserted company={}.".format(
+                _LOG_PREFIX, row_count, company_parts, company.name
+            )
+        )
         total_parts += company_parts
 
-    logger.info("{} Finished Premier catalog sync: parts_upserted={}. "
-                "Per-company pricing handled by Phase 3 pricing jobs.".format(
-        _LOG_PREFIX, total_parts,
-    ))
+    logger.info(
+        "{} Finished Premier catalog sync: parts_upserted={}. "
+        "Per-company pricing handled by Phase 3 pricing jobs.".format(
+            _LOG_PREFIX,
+            total_parts,
+        )
+    )

@@ -53,8 +53,6 @@ _LOG_PREFIX = "[WHEEL-ENRICH]"
 PAGE_SIZE = 2000
 WRITE_BATCH = 500
 
-FEED_WHEELPROS = "wheelpros"
-
 # What a match on the description or the style column means. Only unambiguous markers: see the
 # module docstring for the two that look useful and are not.
 _KEYWORDS = {
@@ -222,6 +220,47 @@ def _feed(name, provider_id, table, key, freshest, feed_where="", **columns) -> 
     )
 
 
+# Wheels that reach us as prose. 112,984 master parts from Premier, Turn 14, Meyer, A-Tech and
+# TireRack carry no structured attributes anywhere -- TireRack's table has a description column and
+# nothing else -- and a further 20,000 Wheel Pros rows have a description with every attribute
+# column null. Their dimensions are in the title and only the parser can reach them.
+#
+# Unlike the four feed adapters this one joins no vendor table: master_parts.description is the
+# record. It is also the only source written with spec_source='parser', because a figure read out
+# of a sentence is not the same claim as one a manufacturer put in a column.
+_TITLE_SELECT = """
+    SELECT mp.id            AS master_part_id,
+           mp.description   AS master_description,
+           mp.part_number   AS part_number,
+           mp.description   AS title,
+           NULL AS size_raw, NULL AS diameter_raw, NULL AS width_raw,
+           NULL AS bolt_pattern_1, NULL AS bolt_pattern_2, NULL AS offset_raw,
+           NULL AS center_bore_raw, NULL AS load_rating_raw, NULL AS backspace_raw,
+           NULL AS weight_raw, NULL AS finish_raw, NULL AS model_raw, NULL AS style_number_raw,
+           NULL AS lug_seat_raw, NULL AS lug_thread_raw, NULL AS structural_warranty_raw,
+           NULL AS finish_warranty_raw, NULL AS tpms_raw, NULL AS dually_raw, NULL AS image_url
+    FROM master_parts mp
+    -- The gate is MasterPart.product_type, decided by src.integrations.utils.product_type from
+    -- distributor signals. Nothing here classifies anything itself.
+    --
+    -- That module refuses to guess -- it returns NULL when its inputs do not decide the question --
+    -- which is exactly the property this source needs. Reading descriptions puts all 3.1M parts in
+    -- scope, and a size alone cannot tell a wheel from a component: "Wiseco Valve Shim 10x3.05"
+    -- and "Piston Pin 20x10" are millimetre dimensions that land squarely inside wheel bounds.
+    --
+    -- Two gates of our own were tried and both were wrong. Requiring the WHEELS & TIRES category
+    -- looked right on a sample of 20,000 rows and turned out to cover only 23% of candidates once
+    -- measured across the catalog -- the sample was the first block by id and not representative.
+    -- Requiring a bolt pattern would have been a second guess of the same kind. A part is a wheel
+    -- when a distributor says so, not when a regex finds two numbers.
+    WHERE mp.product_type = 'wheel'
+      AND NOT EXISTS (SELECT 1 FROM tire_specs t WHERE t.master_part_id = mp.id)
+      AND mp.description ~ '[0-9]{{1,2}}(\\.[0-9]+)?[[:space:]]*[xX][[:space:]]*[0-9]'
+      {brand_filter}
+    ORDER BY mp.id
+"""
+
+FEED_TITLE = "title"
 FEED_WHEELPROS = "wheelpros"
 FEED_THEWHEELGROUP = "thewheelgroup"
 FEED_VOSSEN = "vossen"
@@ -235,7 +274,9 @@ FEED_ELITEWHEELS = "elitewheels"
 # The Wheel Group leads on completeness: it is the only feed publishing lug seat, both warranties,
 # TPMS and a real product weight, on 2,072 of 2,072 rows. Wheel Pros is next on volume. Vossen and
 # Elite carry dimensions only.
-FEED_ORDER = (FEED_THEWHEELGROUP, FEED_WHEELPROS, FEED_VOSSEN, FEED_ELITEWHEELS)
+# ``title`` is deliberately last: any vendor that publishes an attribute column outranks a figure
+# read out of a sentence, so a wheel that later appears in a real feed is upgraded automatically.
+FEED_ORDER = (FEED_THEWHEELGROUP, FEED_WHEELPROS, FEED_VOSSEN, FEED_ELITEWHEELS, FEED_TITLE)
 
 FEEDS = {
     FEED_WHEELPROS: _feed(
@@ -302,6 +343,7 @@ FEEDS = {
         offset='f."offset"',
         center_bore="f.center_bore",
     ),
+    FEED_TITLE: Feed(name=FEED_TITLE, provider_id=0, sql=_TITLE_SELECT),
     FEED_ELITEWHEELS: _feed(
         FEED_ELITEWHEELS,
         17,
@@ -324,7 +366,26 @@ FEEDS = {
 def iter_feed(
     feed: Feed, *, brand_ids: typing.Optional[typing.Sequence[int]] = None
 ) -> typing.Iterator[typing.List[dict]]:
-    """Pages of one feed's wheel rows, joined to the master part they belong to."""
+    """
+    Pages of one feed's wheel rows, joined to the master part they belong to.
+
+    The title source is read in a single pass rather than keyset-paginated. Its filter is a regex
+    over ``master_parts.description`` with no index to help it, so ``WHERE mp.id > last_id ... LIMIT
+    2000`` makes every page re-scan forward through millions of non-matching rows -- the full run
+    took 83 minutes before the connection dropped. One scan returns ~110k rows in about a minute
+    and chunking happens in memory.
+    """
+    if feed.name == FEED_TITLE:
+        sql = feed.sql.format(brand_filter="AND mp.brand_id = ANY(%s)" if brand_ids else "")
+        with connection.cursor() as cursor:
+            cursor.execute(sql, [list(brand_ids)] if brand_ids else [])
+            names = [c[0] for c in cursor.description]
+            rows = [dict(zip(names, row)) for row in cursor.fetchall()]
+        logger.info("%s title source: %s candidate rows", _LOG_PREFIX, len(rows))
+        for start in range(0, len(rows), PAGE_SIZE):
+            yield rows[start : start + PAGE_SIZE]
+        return
+
     brand_filter = "AND mp.brand_id = ANY(%s)" if brand_ids else ""
     sql = feed.sql.format(brand_filter=brand_filter)
 
@@ -420,6 +481,12 @@ def build_spec(row: dict, *, feed: str, stats: typing.Optional[EnrichStats] = No
         backspacing = wheel_size.parse_backspacing_in(str(row["backspace_raw"])) or _positive_decimal(
             row["backspace_raw"]
         )
+    if backspacing is None and from_title is not None:
+        backspacing = from_title.backspacing_in
+
+    center_bore = wheel_size.parse_center_bore_mm(row.get("center_bore_raw"))
+    if center_bore is None and from_title is not None:
+        center_bore = from_title.center_bore_mm
 
     spec = src_models.WheelSpec(
         master_part_id=row["master_part_id"],
@@ -435,13 +502,13 @@ def build_spec(row: dict, *, feed: str, stats: typing.Optional[EnrichStats] = No
         is_blank_drilled=blank,
         offset_mm=offset,
         backspacing_in=backspacing,
-        center_bore_mm=wheel_size.parse_center_bore_mm(row.get("center_bore_raw")),
+        center_bore_mm=center_bore,
         load_rating_lb=_positive_int(row.get("load_rating_raw")),
         weight_lb=_positive_decimal(row.get("weight_raw")),
-        model_name=_clean(row.get("model_raw")),
+        model_name=_clean(row.get("model_raw")) or model_from_title(row.get("title"), row.get("brand_name")),
         style_number=_clean(row.get("style_number_raw"), limit=64),
         finish=_clean(row.get("finish_raw"), limit=128),
-        finish_family=finish_family(row.get("finish_raw")),
+        finish_family=finish_family(row.get("finish_raw")) or finish_family(_finish_words(row.get("title"))),
         construction=src_models.WheelSpec.CONSTRUCTION_FORGED if _FORGED_RE.search(text) else None,
         vehicle_class=_vehicle_class(text, patterns),
         is_beadlock=True if _KEYWORDS["is_beadlock"][0].search(text) else None,
@@ -451,7 +518,9 @@ def build_spec(row: dict, *, feed: str, stats: typing.Optional[EnrichStats] = No
         lug_thread_size=_clean(row.get("lug_thread_raw"), limit=24),
         structural_warranty=_warranty(row.get("structural_warranty_raw")),
         finish_warranty=_warranty(row.get("finish_warranty_raw")),
-        spec_source=src_models.WheelSpec.SPEC_SOURCE_FEED,
+        spec_source=(
+            src_models.WheelSpec.SPEC_SOURCE_PARSER if feed == FEED_TITLE else src_models.WheelSpec.SPEC_SOURCE_FEED
+        ),
         source_feed=feed,
         source_external_id=_clean(row.get("part_number"), limit=128),
         size_disputed=disputed,
@@ -480,6 +549,47 @@ def build_spec(row: dict, *, feed: str, stats: typing.Optional[EnrichStats] = No
 # column on 820 rows, which reached the detail card as the text "Lug thread size: NONE" -- a row
 # that should not have rendered at all.
 _PLACEHOLDER_VALUES = frozenset(["", "NONE", "N/A", "NA", "NULL", "-", "--", "TBD", "UNKNOWN"])
+
+
+# The size is where the model name stops. "SERENE 22X10 BLANK 72 +20 TNM-BRSH" is the Serene;
+# "TSW VALENCIA 18x9.5 5/114.3 ET20" is the Valencia, with the brand in front of it.
+_MODEL_BEFORE_SIZE_RE = re.compile(r"^(.*?)(?=(?<![\d.])\d{1,2}(?:\.\d+)?\s*[xX]\s*\d)")
+
+# Words after the size that describe the finish rather than the fitment. Passed to the same mapper
+# the feeds use, so a title-parsed wheel lands in the same facet bucket as a feed one.
+_FITMENT_NOISE_RE = re.compile(r"\b(?:ET[+-]?\d+|CB\s*\d[\d.]*|BP|BS|MM|LT|\d[\d.]*(?:MM|mm)?|[+-]\d+)\b|[\d./+-]+")
+
+
+def model_from_title(title: typing.Optional[str], brand: typing.Optional[str] = None) -> typing.Optional[str]:
+    """
+    The model name, taken as whatever precedes the size.
+
+    Sellers write the wheel's name first and its dimensions after, without exception across the
+    five sources sampled. A leading brand is dropped so the field holds "Valencia", not
+    "TSW Valencia" -- the brand is already its own column and repeating it makes every facet value
+    start with the same word.
+    """
+    if not title:
+        return None
+    match = _MODEL_BEFORE_SIZE_RE.match(title.strip())
+    if not match:
+        return None
+    text = " ".join(match.group(1).split())
+    if brand:
+        for token in re.split(r"[^A-Za-z0-9]+", brand):
+            if len(token) > 2:
+                text = re.sub(r"^\s*" + re.escape(token) + r"\b\s*", "", text, flags=re.IGNORECASE)
+    text = text.strip(" -/,")
+    return text[:255] or None
+
+
+def _finish_words(title: typing.Optional[str]) -> typing.Optional[str]:
+    """Everything after the size, with the fitment tokens stripped out, for the finish mapper."""
+    if not title:
+        return None
+    match = _MODEL_BEFORE_SIZE_RE.match(title.strip())
+    tail = title[match.end() :] if match else title
+    return " ".join(_FITMENT_NOISE_RE.sub(" ", tail).split()) or None
 
 
 def _clean(value: typing.Optional[str], *, limit: int = 255) -> typing.Optional[str]:
