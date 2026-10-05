@@ -106,6 +106,32 @@ class _Unparseable(object):
     pass
 
 
+def _preview_with(emails, synced_ids=(), contact_addresses=(), deal_addresses=()):
+    """
+    Run ``sync.preview`` over ``emails`` against a stubbed ``InstantlyReply`` manager.
+
+    One helper rather than per-class mocks: ``preview`` makes four distinct queries, and three
+    hand-rolled copies of that shape is three things to get subtly wrong.
+    """
+    client = mock.Mock()
+    client.iter_received_emails.return_value = iter(emails)
+
+    def fake_filter(**kwargs):
+        result = mock.MagicMock()
+        if "contact_synced_at__isnull" in kwargs:
+            result.values_list.return_value = list(synced_ids)
+        elif "freshsales_contact_id__isnull" in kwargs:
+            result.values_list.return_value.distinct.return_value = list(contact_addresses)
+        elif "freshsales_deal_id__isnull" in kwargs:
+            result.values_list.return_value.distinct.return_value = list(deal_addresses)
+        return result
+
+    with mock.patch.object(src_models.InstantlyReply, "objects") as objects:
+        objects.values_list.return_value = list(synced_ids)
+        objects.filter.side_effect = fake_filter
+        return sync.preview(client=client)
+
+
 # -------------------------------------------------------------------------------------------
 # Regression tests for the four documentation defects
 # -------------------------------------------------------------------------------------------
@@ -329,21 +355,22 @@ class DisplayNameTests(SimpleTestCase):
         self.assertEqual(sync.display_name_of({}), "")
 
 
+@override_settings(FRESHSALES_CREATE_DEALS=True)
 class PreviewTests(SimpleTestCase):
     """
     The dry run's counts are what someone checks the CRM against after the first real run, so they
     have to mean "people and opportunities", not "rows processed".
+
+    Deals are enabled here: these assertions are about one-deal-per-address dedupe, which only
+    means anything when deals are being created at all. The default-off behaviour is pinned in
+    DealsAreManualByDefaultTests.
     """
 
     databases = []
 
     @staticmethod
     def _preview(emails):
-        client = mock.Mock()
-        client.iter_received_emails.return_value = iter(emails)
-        with mock.patch.object(src_models.InstantlyReply, "objects") as objects:
-            objects.values_list.return_value = []
-            return sync.preview(client=client)
+        return _preview_with(emails)
 
     def test_repeat_replies_from_one_address_are_one_contact_and_one_deal(self):
         """Three of the live account's addresses replied more than once; 22 replies are 13 people."""
@@ -715,33 +742,20 @@ class FreshsalesTransportTests(SimpleTestCase):
         self.assertIn("myfreshworks.com", str(caught.exception))
 
 
+@override_settings(FRESHSALES_CREATE_DEALS=True)
 class PreviewSubtractsCompletedWorkTests(SimpleTestCase):
     """
     The dry run answers "what happens if I run this". After the backfill the honest answer is
     "nothing", so the preview has to subtract replies already pushed rather than re-propose them.
+
+    Deals enabled, so that "already has a deal" is actually exercised.
     """
 
     databases = []
 
     @staticmethod
     def _preview(emails, synced_ids=(), contact_addresses=(), deal_addresses=()):
-        client = mock.Mock()
-        client.iter_received_emails.return_value = iter(emails)
-
-        def fake_filter(**kwargs):
-            result = mock.MagicMock()
-            if "contact_synced_at__isnull" in kwargs:
-                result.values_list.return_value = list(synced_ids)
-            elif "freshsales_contact_id__isnull" in kwargs:
-                result.values_list.return_value.distinct.return_value = list(contact_addresses)
-            elif "freshsales_deal_id__isnull" in kwargs:
-                result.values_list.return_value.distinct.return_value = list(deal_addresses)
-            return result
-
-        with mock.patch.object(src_models.InstantlyReply, "objects") as objects:
-            objects.values_list.return_value = list(synced_ids)
-            objects.filter.side_effect = fake_filter
-            return sync.preview(client=client)
+        return _preview_with(emails, synced_ids, contact_addresses, deal_addresses)
 
     def test_an_already_synced_reply_proposes_nothing(self):
         rows, counts = self._preview(
@@ -772,3 +786,39 @@ class PreviewSubtractsCompletedWorkTests(SimpleTestCase):
         )
         self.assertEqual(counts["would_create_contacts"], 1)
         self.assertEqual(counts["would_create_deals"], 1)
+
+
+class DealsAreManualByDefaultTests(SimpleTestCase):
+    """
+    Deals are opened by hand. The sync records Instantly's verdict and sets the contact's FreshSales
+    status from it, so "Interested" is the queue to work from -- but it does not open the
+    opportunity, because an auto-created deal in a shared pipeline is somebody else's forecast.
+    """
+
+    databases = []
+
+    def test_the_default_is_off(self):
+        from django.conf import settings
+
+        self.assertFalse(settings.FRESHSALES_CREATE_DEALS)
+
+    @override_settings(FRESHSALES_CREATE_DEALS=False)
+    def test_the_preview_does_not_promise_a_deal_when_disabled(self):
+        rows, counts = _preview_with([_email(id="a", lead="andrew@rhinoutah.com", i_status=1)])
+
+        self.assertEqual(counts["would_create_deals"], 0)
+        self.assertNotIn("deal", rows[0]["action"])
+        # The contact is still created, and still labelled Interested.
+        self.assertEqual(counts["would_create_contacts"], 1)
+        self.assertEqual(rows[0]["status"], "Interested")
+
+    @override_settings(FRESHSALES_CREATE_DEALS=True)
+    def test_the_preview_promises_a_deal_when_explicitly_enabled(self):
+        _, counts = _preview_with([_email(id="a", lead="andrew@rhinoutah.com", i_status=1)])
+
+        self.assertEqual(counts["would_create_deals"], 1)
+
+    def test_a_positive_reply_still_maps_to_the_interested_contact_status(self):
+        """The signal a human needs in order to create the deal by hand."""
+        self.assertEqual(sync.contact_status_name(1), "Interested")
+        self.assertEqual(sync.contact_status_name(2), "Interested")

@@ -1,5 +1,11 @@
 # Deploy handoff — Instantly → FreshSales reply sync
 
+> **Superseded 2026-10-05: this deploy is done.** Code is on `main`, the keys are in
+> `.env.app.production`, migration `0205` is applied and the cron is installed. Kept as a record of
+> the steps, and as the runbook if the box is ever rebuilt. Note that deal creation is now off by
+> default (`FRESHSALES_CREATE_DEALS`), so the "6 deals" figures below describe the original
+> backfill, not what a fresh run would do.
+
 For whoever (or whatever) has SSH to production. Self-contained: you do not need the session that
 wrote this. Design notes are in [INSTANTLY_FRESHSALES_SYNC_PLAN.md](INSTANTLY_FRESHSALES_SYNC_PLAN.md);
 this file is only the deploy.

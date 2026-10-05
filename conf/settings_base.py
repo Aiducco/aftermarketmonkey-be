@@ -836,8 +836,21 @@ FRESHSALES_API_KEY = os.environ.get("FRESHSALES_API_KEY", "")
 FRESHSALES_BUNDLE_ALIAS = os.environ.get("FRESHSALES_BUNDLE_ALIAS", "")
 FRESHSALES_TIMEOUT_SECONDS = float(os.environ.get("FRESHSALES_TIMEOUT_SECONDS") or 20)
 
-# FreshSales requires an amount on every deal, so there is no "leave it unset" option. 0 means the
-# pipeline's forecast reads as zero; set this once there is a figure worth forecasting per shop.
+# Whether a positive reply also opens a deal. **Off**: deals are created by hand.
+#
+# The sync still records Instantly's label and still sets the FreshSales contact status, so an
+# interested shop shows up as "Interested" in the CRM -- that is the queue to work from. It just
+# does not open the opportunity for you. Turning this on is a deliberate choice, not a default,
+# because an auto-created deal in a shared pipeline is somebody else's forecast.
+FRESHSALES_CREATE_DEALS = (os.environ.get("FRESHSALES_CREATE_DEALS") or "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+# Only read when FRESHSALES_CREATE_DEALS is on. FreshSales requires an amount on every deal, so
+# there is no "leave it unset" option; 0 means the pipeline's forecast reads as zero.
 FRESHSALES_DEFAULT_DEAL_AMOUNT = float(os.environ.get("FRESHSALES_DEFAULT_DEAL_AMOUNT") or 0)
 
 # FreshSales meters 1000 requests/hour per *account*, shared with anything else touching that CRM.

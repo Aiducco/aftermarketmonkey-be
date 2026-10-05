@@ -7,8 +7,11 @@ re-runnable, because the useful failure mode is "stopped halfway and resumed", n
 1. :func:`ingest_replies`  -- read inbound emails from Instantly into ``InstantlyReply``. Writes
    nothing to the CRM, so a FreshSales outage cannot lose a reply.
 2. :func:`push_contacts`   -- sales account, contact, note for every human reply not yet pushed.
-3. :func:`refresh_interest` then :func:`create_deals` -- re-read the interest label, then create a
-   deal for whatever is positive and has no deal yet.
+3. :func:`refresh_interest` -- re-read the interest label and keep the CRM contact status honest.
+
+:func:`create_deals` exists and is tested but is **not called unless ``FRESHSALES_CREATE_DEALS``
+is on**, which it is not by default: deals are opened by hand. A positive reply still lands as a
+contact whose FreshSales status reads "Interested", which is the queue to work from.
 
 **Why pass 3 exists.** Instantly's label is not always set when the reply arrives: their AI applies
 it shortly after, and a human relabelling in Unibox can change it much later. In the live account 4
@@ -814,6 +817,11 @@ def preview(
         "no_email": 0,
     }
     counts["already_synced"] = 0
+    # A preview that promises deals while the sync is configured not to create them is the same
+    # class of lie as one that ignores the watermark.
+    from django.conf import settings as django_settings
+
+    create_deals_enabled = getattr(django_settings, "FRESHSALES_CREATE_DEALS", False)
     known = set(src_models.InstantlyReply.objects.values_list("instantly_email_id", flat=True))
 
     # What has already reached the CRM. A preview that ignores this reports work a real run would
@@ -864,7 +872,8 @@ def preview(
             counts["would_create_contacts"] += 1
 
         if (
-            fields["is_positive"]
+            create_deals_enabled
+            and fields["is_positive"]
             and not fields["is_auto_reply"]
             and fields["lead_email"]
             and fields["instantly_email_id"] not in synced_email_ids
@@ -953,15 +962,28 @@ def run(
             status_ids=status_ids,
         )
     )
-    summary.update(
-        create_deals(
-            crm=crm,
-            default_amount=conf.FRESHSALES_DEFAULT_DEAL_AMOUNT,
-            limit=limit,
-            max_calls=conf.FRESHSALES_MAX_CALLS_PER_RUN,
-            max_attempts=max_attempts,
+    # Deals are created by hand. The contact still carries Instantly's verdict as its FreshSales
+    # status, so "Interested" is the queue to work from; the sync does not open the opportunity.
+    if getattr(conf, "FRESHSALES_CREATE_DEALS", False):
+        summary.update(
+            create_deals(
+                crm=crm,
+                default_amount=conf.FRESHSALES_DEFAULT_DEAL_AMOUNT,
+                limit=limit,
+                max_calls=conf.FRESHSALES_MAX_CALLS_PER_RUN,
+                max_attempts=max_attempts,
+            )
         )
-    )
+    else:
+        summary["deals_created"] = "disabled"
+        summary["awaiting_manual_deal"] = (
+            src_models.InstantlyReply.objects.filter(
+                is_positive=True, is_auto_reply=False, freshsales_deal_id__isnull=True
+            )
+            .values("lead_email")
+            .distinct()
+            .count()
+        )
 
     summary["freshsales_calls"] = crm.calls_made
     stuck = src_models.InstantlyReply.objects.filter(

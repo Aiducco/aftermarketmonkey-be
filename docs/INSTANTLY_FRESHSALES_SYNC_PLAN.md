@@ -1,9 +1,16 @@
 # Instantly → FreshSales reply sync — implementation plan
 
-Status: **live and working end to end.** As of 2026-10-04 the full backfill has run against the
-real FreshSales account: **13 contacts, 6 deals, 20 notes, 0 failures**, and a re-run creates
-nothing. 62 tests pass, migration `0205` is applied. The only thing left is installing the cron
-line (§9) and deciding the deal amount (§11 Q2).
+Status: **live in production.** Deployed 2026-10-05, cron installed, 73 tests pass, migration
+`0205` applied. The backfill created **13 contacts, 13 sales accounts, 20 notes** and a re-run
+creates nothing.
+
+**Deals are created by hand** (changed 2026-10-05 at Gojko's request). `FRESHSALES_CREATE_DEALS`
+gates the deal pass and is **off by default**; the sync still records Instantly's label and still
+sets each contact's FreshSales status from it, so `Interested` is the queue to work from. The 6
+deals the original backfill created are still in the pipeline — §11 Q2.
+
+An auto-created deal in a shared pipeline is somebody else's forecast, which is why the flag
+defaults off rather than on.
 
 Both vendors verified live, writes included. The question of whether that FreshSales key could
 write — open through the whole design phase because `GET /selector/owners` answers 403 — is
@@ -517,12 +524,15 @@ number, contact status `Contacted` (correct — that reply is unlabelled), linke
 Repeat replies behaved as designed on real data: Andrew Ortega's three replies and Carl Tucker's
 three each produced **one** contact and **one** deal, with the extra replies landing as notes.
 
-**Q2 — Deal amount.** `amount` is required and defaults to `0`. Your Default Pipeline highlights
-`amount` as its headline field and aggregates on `expected_deal_value`, so every deal landing at
-zero makes the pipeline view read as worthless — the 6 deals from the backfill would total $0. A
-nominal per-shop figure would make it useful; name one and it becomes the default. Deal naming is
-`"<Company> — <campaign name>"` (e.g. *Rhino Utah — Realtruck - 1/3 locations*) unless you want
-something that reads better in your pipeline.
+**Q2 — The 6 deals the backfill already created.** Deal creation is now off, but those 6 are still
+in `Default Pipeline` at stage `New`, each worth $0: Bucks 4x4, Frontline Outfitters, Tuckers
+Trucks, Garman Accessories, Rhino Linings of Utah, Aftermath Custom Auto. They are real interested
+shops, so they may be worth keeping and re-pricing by hand — or deleting so the pipeline starts
+clean. **Needs a decision**; nothing will touch them either way.
+
+If deal creation is ever turned back on, `amount` is required by the API and defaults to `0`, which
+reads as a worthless pipeline on a view that headlines `amount`. Set
+`FRESHSALES_DEFAULT_DEAL_AMOUNT` at the same time.
 
 **Q3 — The 4 unlabelled replies.** Two are a month old and still blank, so Instantly's AI is not
 going to label them. They will land as contacts with no deal. Either label them in Unibox and the
