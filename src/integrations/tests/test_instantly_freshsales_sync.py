@@ -14,6 +14,7 @@ with the docs open would otherwise "fix" the code back to the broken behaviour.
   * the ``lt_interest_status`` filter is ignored -> leads are looked up one address at a time
   * only ``lead`` (an address) is returned, never ``lead_id`` -> the address is the join key
 """
+import collections
 import datetime
 import unittest.mock as mock
 
@@ -822,3 +823,39 @@ class DealsAreManualByDefaultTests(SimpleTestCase):
         """The signal a human needs in order to create the deal by hand."""
         self.assertEqual(sync.contact_status_name(1), "Interested")
         self.assertEqual(sync.contact_status_name(2), "Interested")
+
+
+@override_settings(**dict(INSTANTLY_SETTINGS, **FRESHSALES_SETTINGS))
+class PlatformStatusWinsTests(SimpleTestCase):
+    """
+    Somebody can be both a cold reply and a platform signup -- frontlineoutfitter@gmail.com is
+    exactly that on production. A signup sits at "Qualified" in the Sales Qualified Lead stage; an
+    Instantly label writes Lead-stage statuses. The weaker signal must not drag the contact back
+    down, or a customer would read as a lead every time their thread is relabelled in Unibox.
+    """
+
+    databases = []
+
+    def _push(self, reply, is_platform):
+        crm = mock.Mock()
+        crm.resolve_contact_status_id.return_value = 127004315050
+        crm.upsert_sales_account.return_value = ("1", True)
+        crm.upsert_contact.return_value = ("2", True)
+        crm.create_note.return_value = "3"
+        with mock.patch.object(sync.platform_crm_sync, "is_platform_contact", return_value=is_platform):
+            sync._push_one_contact(crm, reply, {"Interested": 127004315050}, collections.defaultdict(int))
+        return crm.upsert_contact.call_args.kwargs["fields"]
+
+    def test_a_signups_status_is_left_alone(self):
+        reply = _reply(freshsales_account_id="1", freshsales_note_id=None)
+        reply.save = mock.Mock()
+        fields = self._push(reply, is_platform=True)
+        self.assertNotIn("contact_status_id", fields)
+        # Everything else about the contact is still written -- only the status is withheld.
+        self.assertEqual(fields["first_name"], "Andrew")
+
+    def test_an_ordinary_reply_still_gets_its_status(self):
+        reply = _reply(freshsales_account_id="1", freshsales_note_id=None)
+        reply.save = mock.Mock()
+        fields = self._push(reply, is_platform=False)
+        self.assertEqual(fields["contact_status_id"], 127004315050)

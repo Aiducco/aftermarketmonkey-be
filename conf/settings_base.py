@@ -858,3 +858,52 @@ FRESHSALES_DEFAULT_DEAL_AMOUNT = float(os.environ.get("FRESHSALES_DEFAULT_DEAL_A
 # does not fit resumes on the next tick. Never binds at current volume -- it exists so a backfill
 # cannot lock us out of our own CRM.
 FRESHSALES_MAX_CALLS_PER_RUN = int(os.environ.get("FRESHSALES_MAX_CALLS_PER_RUN") or 600)
+
+
+# ---------------------------------------------------------------------------------------------
+# Platform signups -> FreshSales (src/integrations/services/platform_crm_sync.py,
+# manage.py sync_platform_signups). Reuses FRESHSALES_API_KEY / FRESHSALES_BUNDLE_ALIAS above.
+#
+# A company that finished onboarding becomes a sales account and each of its users a contact, so
+# somebody who signed up through any channel is in the CRM alongside the Instantly repliers.
+# ---------------------------------------------------------------------------------------------
+FRESHSALES_SYNC_PLATFORM_SIGNUPS = (
+    os.environ.get("FRESHSALES_SYNC_PLATFORM_SIGNUPS") or "true"
+).strip().lower() in ("1", "true", "yes", "on")
+
+# Only companies at this onboarding step are mirrored. 4 = complete. A company that stopped at
+# step 2 has an account but never finished setup, and most such rows are test signups.
+FRESHSALES_SIGNUP_MIN_ONBOARDING_STEP = int(os.environ.get("FRESHSALES_SIGNUP_MIN_ONBOARDING_STEP") or 4)
+
+# What a signup's contact status is. "Qualified" sits in the Sales Qualified Lead lifecycle stage,
+# a step above the Lead-stage statuses the Instantly sync writes -- signing up is a stronger signal
+# than replying to a cold email, and platform status therefore wins where both apply (see
+# platform_crm_sync.is_platform_contact). Resolved by name at runtime, never as a numeric id.
+FRESHSALES_SIGNUP_CONTACT_STATUS = os.environ.get("FRESHSALES_SIGNUP_CONTACT_STATUS") or "Qualified"
+
+# Domains that are only ever ours -- staff, demo, support, smoke tests, pentest accounts. A company
+# whose every user sits on one of these is skipped, which keeps new internal signups out without
+# anyone remembering to set Company.is_internal. Individual users on these domains are skipped even
+# when the company itself is a real customer (e.g. a support account added to a customer's company).
+#
+# Comma-separated override replaces the list rather than extending it.
+FRESHSALES_INTERNAL_EMAIL_DOMAINS = frozenset(
+    domain.strip().lower()
+    for domain in (
+        os.environ.get("FRESHSALES_INTERNAL_EMAIL_DOMAINS")
+        or "aftermarketscout.com,test.com,example.com,pentest.local,m.com,dmzapps.com,tridentatx.com"
+    ).split(",")
+    if domain.strip()
+)
+
+# Deep link from a FreshSales note back to the Instantly thread, so a reply can be opened in one
+# click instead of hunted for in Unibox.
+#
+# Instantly only returns a real ``unibox_url`` on *webhook* payloads; GET /emails -- what this sync
+# polls -- carries no URL field at all. So the link is constructed, and this template is a best
+# guess at the app's own URL shape until somebody pastes a real Unibox thread URL. Placeholders:
+# {thread_id} and {lead_email}. Set to "" to emit no link; the note always carries the thread id
+# and the lead's address as search hints, which work regardless.
+INSTANTLY_UNIBOX_URL_TEMPLATE = os.environ.get(
+    "INSTANTLY_UNIBOX_URL_TEMPLATE", "https://app.instantly.ai/app/unibox?search=thread:{thread_id}"
+)

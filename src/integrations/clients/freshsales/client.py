@@ -216,6 +216,22 @@ class FreshsalesApiClient(object):
             )
         return str(note_id)
 
+    def update_note(self, note_id: str, description: str) -> None:
+        """
+        Replace a note's body.
+
+        ``PUT /notes/{id}`` works even though ``GET /notes/{id}`` answers 404 -- a single note is
+        only readable through ``GET /contacts/{id}/notes``. Verified against the live account.
+        Used to backfill the Unibox link into notes written before that link existed, rather than
+        posting a second note per contact saying the same thing.
+        """
+        self._request("PUT", "notes/{}".format(note_id), json_body={"note": {"description": description}})
+
+    def contact_notes(self, contact_id: str) -> typing.List[dict]:
+        """Every note on a contact. The only way to read a note back; see :meth:`update_note`."""
+        _, payload = self._request("GET", "contacts/{}/notes".format(contact_id))
+        return [n for n in (payload.get("notes") or []) if isinstance(n, dict)]
+
     def create_deal(
         self,
         name: str,

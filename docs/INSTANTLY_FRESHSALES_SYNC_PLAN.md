@@ -624,3 +624,109 @@ Doc sources:
 [webhook events](https://developer.instantly.ai/guides/webhook-events) ·
 [API keys](https://developer.instantly.ai/quickstart) ·
 [Freshworks CRM API](https://developers.freshworks.com/crm/api/)
+
+---
+
+# Part 2 — Platform signups → FreshSales
+
+Added 2026-10-08. `manage.py sync_platform_signups`, service
+`src/integrations/services/platform_crm_sync.py`, migration `0206`.
+
+A company that finishes onboarding becomes a FreshSales **sales account** and each of its users a
+**contact** at status `Qualified`, so the CRM holds everybody however they arrived — not just the
+people who answered a cold email.
+
+## Why this is worth having: the Frontline case
+
+`frontlineoutfitter@gmail.com` replied to the Instantly campaign, was labelled **Interested**, and
+then **signed up** as *Frontline Off-Road*. Before this, the CRM could not show you that. It now
+reads as one contact — Michael Ponder, status `Qualified`, one sales account, three notes: two
+Instantly replies followed by the signup. The entire journey from cold email to customer in one
+record. That case is also what every rule below is calibrated against.
+
+## What is excluded, and why two mechanisms
+
+Of the 27 companies on production, **10 are ours** and must never reach the CRM.
+
+| Mechanism | Catches |
+|---|---|
+| `Company.is_internal` — set by hand; migration `0206` set the 10 that existed then | Cases no rule can see. *Trident Motorsports* is our own entity (our EDI partner id is `TRIDENT`) but one of its three users signed up with a gmail address, so the domain rule alone leaves it looking like a customer |
+| `FRESHSALES_INTERNAL_EMAIL_DOMAINS` | A company whose **every** user is on one of our domains — so a new staff or pentest signup is excluded without anyone remembering the flag. Applied per user too, so a support address added to a real customer's company is not a contact |
+
+Current domain list: `aftermarketscout.com`, `test.com`, `example.com`, `pentest.local`, `m.com`,
+`dmzapps.com`, `tridentatx.com`. A company left with no contactable users is dropped rather than
+becoming an empty account.
+
+Scope is `onboarding_step >= 4` (complete). That filter does double duty: a company that stopped at
+step 2 never finished setup, and 4 of the 5 such rows are test accounts anyway.
+
+## Collisions with the Instantly sync
+
+Both syncs write contacts, and the same person can appear in both.
+
+- **Contacts** upsert on email, so the person merges to one record for free.
+- **Accounts** would not: Instantly knew the shop as *Frontline Outfitters*, the platform calls it
+  *Frontline Off-Road*. So before creating an account, the platform sync looks for one the Instantly
+  sync already made for any of that company's users and **reuses it**. The existing account keeps
+  its name — renaming would rewrite a record a human may have edited — and the platform company
+  name is in the contact's note either way.
+- **Status**: a signup is `Qualified` (Sales Qualified Lead); Instantly writes Lead-stage statuses.
+  **Platform wins.** `platform_crm_sync.is_platform_contact` is consulted by the Instantly sync
+  before it sets or changes a status, so a relabel in Unibox cannot drag a customer back to a lead.
+
+## Why a cron and not a signal
+
+A `post_save` on `Company`/`User` would be immediate, and would also put a third-party HTTP call in
+the signup path, where its failure is either silent or user-facing. Neither is acceptable for a CRM
+nicety. Nothing in the product reads the `freshsales_*` columns; this is a mirror, not a dependency.
+
+## Thread links back to Instantly
+
+Each reply note carries a link straight to the Unibox thread, plus the thread id and the lead's
+address as search hints.
+
+> **The URL format is a guess until confirmed.** Instantly only returns a real `unibox_url` on
+> *webhook* payloads; `GET /emails` — what we poll — has no URL field at all. So the link is built
+> from `INSTANTLY_UNIBOX_URL_TEMPLATE` (default
+> `https://app.instantly.ai/app/unibox?search=thread:{thread_id}`). **Paste one real Unibox thread
+> URL and the template can be set correctly.** The search hints in the note work regardless, and
+> setting the template to `""` drops the link.
+
+`manage.py sync_instantly_replies --rewrite-notes` rebuilds every existing note from stored data —
+how the link was backfilled into the 28 notes written before it existed. `PUT /notes/{id}` is
+supported (though `GET /notes/{id}` answers 404; a note is only readable via
+`GET /contacts/{id}/notes`), so notes are updated in place rather than duplicated.
+
+## Live result (2026-10-08)
+
+| | |
+|---|---|
+| Companies in scope | **17** of 27 (10 internal) |
+| Sales accounts | 16 created, **1 reused** from Instantly |
+| Contacts | **18**, all at `Qualified` |
+| Notes | 18 |
+| Failures | **0** |
+| Re-run | no-op, 1 FreshSales call |
+
+## Settings
+
+```
+FRESHSALES_SYNC_PLATFORM_SIGNUPS       = true        # master switch
+FRESHSALES_SIGNUP_MIN_ONBOARDING_STEP  = 4           # 4 = finished onboarding
+FRESHSALES_SIGNUP_CONTACT_STATUS       = Qualified   # resolved by name at runtime
+FRESHSALES_INTERNAL_EMAIL_DOMAINS      = <see above> # REPLACES the built-in list, does not extend
+INSTANTLY_UNIBOX_URL_TEMPLATE          = https://app.instantly.ai/app/unibox?search=thread:{thread_id}
+```
+
+Reuses `FRESHSALES_API_KEY` / `FRESHSALES_BUNDLE_ALIAS`. A missing key exits 0 with a `SKIPPED`
+audit row, same as the Instantly command.
+
+## Cron
+
+```cron
+5,35 * * * * docker exec aftermarketmonkey-be-app-1 python manage.py sync_platform_signups >> /root/logs/platform_crm_sync.log 2>&1
+```
+
+Every 30 minutes, offset off the quarter-hour so it does not contend with `sync_instantly_replies`
+for the shared 1000/hour FreshSales budget. Signups arrive far slower than replies, so latency is
+immaterial.

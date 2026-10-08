@@ -57,6 +57,13 @@ class Command(BaseCommand):
             help="Widen the interest re-check window for this run (default " "INSTANTLY_INTEREST_RECHECK_DAYS).",
         )
         parser.add_argument(
+            "--rewrite-notes",
+            action="store_true",
+            help="Rebuild every already-pushed note from stored data and stop. Use after changing "
+            "what a note contains -- e.g. to backfill the Instantly thread link into older notes. "
+            "Idempotent; creates nothing.",
+        )
+        parser.add_argument(
             "--max-attempts",
             type=int,
             default=5,
@@ -76,6 +83,17 @@ class Command(BaseCommand):
             )
             audit_scheduled_tasks.mark_scheduled_task_skipped(execution, message=message)
             self.stdout.write(self.style.WARNING(message))
+            return
+
+        if options.get("rewrite_notes"):
+            from src.integrations.clients.freshsales import client as freshsales_client
+
+            counts = instantly_freshsales_sync.rewrite_notes(
+                crm=freshsales_client.FreshsalesApiClient(), limit=options.get("limit")
+            )
+            for key in sorted(counts):
+                self.stdout.write("  {:<26} {}".format(key, counts[key]))
+            self.stdout.write(self.style.SUCCESS("Notes rewritten."))
             return
 
         since = self._parse_since(options.get("since"))

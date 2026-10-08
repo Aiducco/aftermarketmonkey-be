@@ -47,6 +47,19 @@ class Company(django_db_models.Model):
     relay_sftp_password = django_db_models.CharField(max_length=128, null=True, blank=True)
     relay_sftp_provisioned_at = django_db_models.DateTimeField(null=True, blank=True)
 
+    # CRM mirror (FreshSales). A company becomes a sales account and each of its users a contact --
+    # see src/integrations/services/platform_crm_sync.py. Nullable because the sync is a mirror,
+    # not a dependency: nothing in the product reads these, and a CRM outage must not touch signup.
+    #
+    # is_internal keeps our own staff, demo, pentest and support accounts out of the CRM. It is set
+    # by hand (or by migration 0206 for the rows that existed then); the sync additionally skips any
+    # company whose every user sits on a FRESHSALES_INTERNAL_EMAIL_DOMAINS domain, so a new test
+    # account on a known-internal domain is excluded without anyone remembering to tick this.
+    is_internal = django_db_models.BooleanField(default=False, db_index=True)
+    freshsales_account_id = django_db_models.TextField(null=True, blank=True)
+    freshsales_synced_at = django_db_models.DateTimeField(null=True, blank=True)
+    freshsales_last_error = django_db_models.TextField(null=True, blank=True)
+
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
 
@@ -397,6 +410,12 @@ class UserProfile(django_db_models.Model):
     # Job function within the company (owner, parts_manager, service_advisor, technician, other).
     # Free CharField; allowed values enforced at the schema layer (see onboarding.USER_ROLES).
     role = django_db_models.CharField(max_length=32, null=True, blank=True)
+
+    # CRM mirror (FreshSales) -- one contact per user, attached to the company's sales account.
+    # See Company.freshsales_account_id for why these are nullable and nothing reads them.
+    freshsales_contact_id = django_db_models.TextField(null=True, blank=True)
+    freshsales_synced_at = django_db_models.DateTimeField(null=True, blank=True)
+    freshsales_last_error = django_db_models.TextField(null=True, blank=True)
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)

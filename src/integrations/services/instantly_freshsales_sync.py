@@ -43,6 +43,7 @@ from src.integrations.clients.freshsales import client as freshsales_client
 from src.integrations.clients.freshsales import exceptions as freshsales_exceptions
 from src.integrations.clients.instantly import client as instantly_client
 from src.integrations.clients.instantly import exceptions as instantly_exceptions
+from src.integrations.services import platform_crm_sync
 
 logger = logging.getLogger(__name__)
 
@@ -327,6 +328,33 @@ def contact_fields(reply: "src_models.InstantlyReply", contact_status_id: int) -
     return {k: v for k, v in fields.items() if v not in (None, "")}
 
 
+def unibox_url(reply: "src_models.InstantlyReply") -> typing.Optional[str]:
+    """
+    A link straight to this thread in Instantly's Unibox, or None.
+
+    **The format is configured, not discovered.** Instantly only hands out a real ``unibox_url`` on
+    *webhook* payloads, and this sync polls ``GET /emails``, which returns no URL field at all --
+    checked against every field the live API returns. So the link is built from
+    ``INSTANTLY_UNIBOX_URL_TEMPLATE`` and the thread id.
+
+    Because the template is a best guess until somebody pastes a real Unibox URL, the note also
+    carries the raw thread id and the lead's address (see :func:`note_description`): those are both
+    searchable in Unibox, so the thread stays findable even if this link is wrong. Set the template
+    to "" to drop the link entirely and rely on the search hints.
+    """
+    from django.conf import settings as django_settings
+
+    template = getattr(django_settings, "INSTANTLY_UNIBOX_URL_TEMPLATE", "") or ""
+    if not template or not reply.thread_id:
+        return None
+    try:
+        return template.format(thread_id=reply.thread_id, lead_email=reply.lead_email or "")
+    except (KeyError, IndexError):
+        # A malformed template must not take a whole sync pass down over a convenience link.
+        logger.warning("{} INSTANTLY_UNIBOX_URL_TEMPLATE is malformed: {!r}".format(_LOG_PREFIX, template))
+        return None
+
+
 def note_description(reply: "src_models.InstantlyReply") -> str:
     """
     The reply, with the context needed to read it a month later.
@@ -346,6 +374,17 @@ def note_description(reply: "src_models.InstantlyReply") -> str:
         "Campaign:  {}".format(reply.campaign_name or reply.campaign_id or "unknown"),
         "Mailbox:   {}".format(reply.eaccount or "unknown"),
         "Instantly label: {}".format(label),
+    ]
+
+    link = unibox_url(reply)
+    if link:
+        lines += ["", "Open the thread: {}".format(link)]
+    # Always present, and independent of whether the link format is right: both of these paste
+    # straight into Unibox's own search box.
+    lines += [
+        "",
+        "Find it in Unibox by searching for:  {}".format(reply.lead_email or "(no address)"),
+        "            or by thread:            thread:{}".format(reply.thread_id or "(unknown)"),
     ]
 
     shop_bits = [
@@ -563,6 +602,14 @@ def _push_one_contact(
     if not reply.freshsales_contact_id:
         status_id = crm.resolve_contact_status_id(contact_status_name(reply.interest_status), status_ids)
         fields = contact_fields(reply, status_id)
+        if platform_crm_sync.is_platform_contact(reply.lead_email):
+            # They have signed up, which puts them at "Qualified" in the Sales Qualified Lead
+            # stage. A cold-reply label is a weaker signal, so it must not drag them back to a
+            # Lead-stage status; everything else about the contact is still written.
+            fields.pop("contact_status_id", None)
+            logger.info(
+                "{} {} is a platform signup -- leaving its CRM status alone.".format(_LOG_PREFIX, reply.lead_email)
+            )
         # FreshSales ids are integers; we store them as text (they are opaque to us), so the
         # association is cast back rather than sent as a string the API may not match.
         fields["sales_accounts"] = [{"id": _as_id(reply.freshsales_account_id), "is_primary": True}]
@@ -690,7 +737,12 @@ def refresh_interest(
                 ]
             )
 
-            if changed and crm is not None and reply.freshsales_contact_id:
+            if (
+                changed
+                and crm is not None
+                and reply.freshsales_contact_id
+                and not platform_crm_sync.is_platform_contact(reply.lead_email)
+            ):
                 try:
                     ids = status_ids if status_ids is not None else crm.contact_status_ids_by_name()
                     status_id = crm.resolve_contact_status_id(contact_status_name(new_status), ids)
@@ -993,3 +1045,51 @@ def run(
         # Named in the summary so the audit row shows it without anyone reading logs.
         summary["stuck_over_max_attempts"] = stuck
     return summary
+
+
+def rewrite_notes(
+    crm: "freshsales_client.FreshsalesApiClient",
+    limit: typing.Optional[int] = None,
+    max_calls: typing.Optional[int] = None,
+) -> typing.Dict[str, int]:
+    """
+    Rebuild the note body for replies already pushed, so older notes gain whatever the note now
+    carries -- in practice the Unibox thread link, added after the first 20 notes were written.
+
+    An update rather than a second note: the alternative is every contact carrying two notes that
+    say the same thing, one of which has a link. ``PUT /notes/{id}`` is supported (see
+    ``FreshsalesApiClient.update_note``), so the existing note is simply rewritten from the reply
+    row we already store. Idempotent -- the description is regenerated from stored data, so running
+    it twice writes the same bytes.
+    """
+    counts = {"rewritten": 0, "failed": 0}
+
+    queryset = src_models.InstantlyReply.objects.exclude(freshsales_note_id=None).order_by("email_timestamp")
+    if limit:
+        queryset = queryset[:limit]
+
+    for reply in queryset:
+        if max_calls is not None and crm.calls_made >= max_calls:
+            logger.warning("{} Stopping note rewrite: FreshSales call budget reached.".format(_LOG_PREFIX))
+            break
+        try:
+            crm.update_note(note_id=reply.freshsales_note_id, description=note_description(reply))
+        except (
+            freshsales_exceptions.FreshsalesRateLimited,
+            freshsales_exceptions.FreshsalesAuthError,
+        ):
+            raise
+        except Exception as e:
+            counts["failed"] += 1
+            logger.warning(
+                "{} Could not rewrite note {} for {}: {}".format(
+                    _LOG_PREFIX,
+                    reply.freshsales_note_id,
+                    reply.lead_email,
+                    common_utils.get_exception_message(exception=e),
+                )
+            )
+            continue
+        counts["rewritten"] += 1
+
+    return counts
