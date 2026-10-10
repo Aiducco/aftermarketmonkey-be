@@ -23,13 +23,16 @@ They therefore share the buckets here rather than each keeping their own.
 Token issuance is the exception: it is metered per *IP*, so every credential set on this server
 shares one 10/minute bucket -- hence ``identity="ip"`` rather than a client_id hash.
 """
-import threading
-import time
+import logging
 import typing
 
 import requests
+from django.core.cache import cache
 
 from src.integrations import rate_limit
+
+logger = logging.getLogger(__name__)
+_LOG_PREFIX = "[TURN14-RATE-LIMIT]"
 
 GET_PER_SECOND = 5
 GET_PER_HOUR = 5000
@@ -49,8 +52,7 @@ TOKEN_PER_MINUTE_PER_IP = 10
 # Refresh a token this long before it actually expires, so a request never races the boundary.
 TOKEN_EXPIRATION_BUFFER_SECONDS = 60
 
-_token_cache: typing.Dict[str, typing.Tuple[str, float]] = {}
-_token_cache_lock = threading.Lock()
+_TOKEN_CACHE_KEY_PREFIX = "turn14_token"
 
 
 def get_buckets(client_id: str) -> typing.List[rate_limit.Bucket]:
@@ -109,33 +111,53 @@ def parse_retry_after_seconds(response: requests.Response) -> typing.Optional[fl
     return value if value > 0 else None
 
 
+def _token_cache_key(client_id: str) -> str:
+    return "{}:{}".format(_TOKEN_CACHE_KEY_PREFIX, client_id)
+
+
 def get_cached_token(client_id: str) -> typing.Optional[str]:
     """
     A live token for ``client_id``, or None.
 
-    Cached per client_id at module level rather than per client instance: several call sites
-    construct a fresh ``Turn14ApiClient`` inside a per-brand loop, and with a per-instance
-    cache that meant one token request per brand -- 464 per sweep, from a single IP, against a
-    10/minute ceiling. Keyed by credential, so two companies never share a token.
+    Cached per client_id in the shared Django cache (Redis) rather than a process-local dict --
+    confirmed live 2026-10-10 that an in-memory cache here was the root cause of Turn 14 flagging
+    our token-request volume (Dan Ziegler, ~50/hour against an expected <300/day): every Turn 14
+    cron (check_company_provider_connections, inventory/items deltas, pricing jobs, ...) runs as
+    its own fresh ``docker exec`` process, so a cache that doesn't outlive one process meant a
+    brand new token on every single invocation, independent of whether the previous one was
+    still valid. A shared cache fixes that for every call site at once, the same way several
+    call sites already share this cache by client_id to avoid 464 token requests in one sweep
+    (per-brand client construction) -- this is that same problem one layer up, across processes
+    instead of across one process's loop iterations.
+
+    Cache is an optimization, never a dependency: per this codebase's standing rule (a cache
+    outage once silently broke /address/suggest), any read/write failure here just means "mint a
+    new token," not a propagated error.
     """
-    with _token_cache_lock:
-        entry = _token_cache.get(client_id)
-        if not entry:
-            return None
-        token, expires_at = entry
-        if time.time() >= (expires_at - TOKEN_EXPIRATION_BUFFER_SECONDS):
-            return None
-        return token
+    try:
+        return cache.get(_token_cache_key(client_id))
+    except Exception as e:
+        logger.warning("{} Cache read failed, minting a new token: {}.".format(_LOG_PREFIX, e))
+        return None
 
 
 def store_token(client_id: str, token: str, expires_in: typing.Optional[float]) -> None:
     """Cache ``token``. Falls back to the OAuth2-conventional hour when expires_in is absent."""
     ttl = float(expires_in) if expires_in else 3600.0
-    with _token_cache_lock:
-        _token_cache[client_id] = (token, time.time() + ttl)
+    # Still refresh this long before real expiry (TOKEN_EXPIRATION_BUFFER_SECONDS) so a request
+    # already in flight never races the cache's own expiry boundary.
+    cache_ttl = max(ttl - TOKEN_EXPIRATION_BUFFER_SECONDS, 1.0)
+    try:
+        cache.set(_token_cache_key(client_id), token, timeout=cache_ttl)
+    except Exception as e:
+        # Token is still returned to this caller for immediate use (see client.py) -- only the
+        # reuse-across-requests benefit is lost, not this request.
+        logger.warning("{} Cache write failed, token won't be reused: {}.".format(_LOG_PREFIX, e))
 
 
 def clear_token(client_id: str) -> None:
     """Drop a cached token — called after a 401 so the retry fetches a fresh one."""
-    with _token_cache_lock:
-        _token_cache.pop(client_id, None)
+    try:
+        cache.delete(_token_cache_key(client_id))
+    except Exception as e:
+        logger.warning("{} Cache delete failed: {}.".format(_LOG_PREFIX, e))
