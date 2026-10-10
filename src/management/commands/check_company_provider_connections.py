@@ -29,8 +29,12 @@ each account is its own source of truth for its own order_status/... fields, see
 docstring) belonging to an active row whose provider kind has a registered order validator (see
 integrations_services._ORDER_CONNECTION_VALIDATORS), regardless of initial_sync_completed: order
 credentials can go stale on their own (a rotated API key, a revoked security key) independently
-of feed sync state, so they're re-checked continuously rather than only while the feed is still
-mid-sync.
+of feed sync state, so they're re-checked on a schedule of their own rather than only while the
+feed is still mid-sync -- but at most once per _ORDER_RECHECK_INTERVAL (2 hours), not every time
+this command runs. A revoked credential still surfaces immediately through the normal path (the
+next real order attempt fails loudly); this check only catches it a little sooner, in the
+background, and doesn't need 5-minute resolution to do that usefully. Confirmed live 2026-10-10
+that rechecking every cycle regardless of staleness was most of Turn 14's own API call volume.
   passes and feed status is CONNECTED -> CONNECTED
   passes but feed status isn't CONNECTED yet -> WAITING
   fails -> ERROR, reason = the validator's message
@@ -38,6 +42,7 @@ CompanyProviders.order_status/... is refreshed afterward to mirror whichever acc
 currently the connection's default (see integrations_services._refresh_default_order_status) —
 that stays a read-only summary for consumers that only know the single-value legacy shape.
 """
+import datetime
 import logging
 import typing
 
@@ -53,12 +58,26 @@ logger = logging.getLogger(__name__)
 
 _LOG_PREFIX = "[CHECK-COMPANY-PROVIDER-CONNECTIONS]"
 
+# Order credentials go stale on their own (a rotated API key, a revoked security key) rarely and
+# slowly -- and a real revocation surfaces immediately anyway the next time someone actually
+# tries to place an order (submit_order's own live call fails loudly then). This cron's job is
+# only to catch it a little sooner than that in the background, which doesn't need 5-minute
+# resolution: re-checking every cycle regardless of how recently an account was already confirmed
+# good was Turn 14's own token-request volume complaint (Dan Ziegler, 2026-10-10) -- each
+# recheck here constructs a fresh client and authenticates, independent of the token-cache fix in
+# src/integrations/clients/turn_14/rate_limit.py (that fix stops a recheck from costing a *new*
+# token; this stops the recheck itself from happening needlessly often). Applies to every
+# provider's order accounts, not just Turn14 -- no reason the other three registered validators
+# (Keystone, Meyer, Premier, WheelPros) need 5-minute resolution either.
+_ORDER_RECHECK_INTERVAL = datetime.timedelta(hours=2)
+
 
 class Command(BaseCommand):
     help = (
         "Check connectivity for CompanyProviders whose initial sync hasn't completed yet, and "
-        "re-check order credentials for any active row that has them configured; updates "
-        "status/status_name/status_reason/status_checked_at and their order_ counterparts."
+        "re-check order credentials for any active account not checked within the last "
+        "_ORDER_RECHECK_INTERVAL; updates status/status_name/status_reason/status_checked_at "
+        "and their order_ counterparts."
     )
 
     def handle(self, *args: typing.Any, **options: typing.Any) -> None:
@@ -100,7 +119,14 @@ class Command(BaseCommand):
                         )
 
                 if kind in integrations_services._ORDER_CONNECTION_VALIDATORS:
-                    accounts = [a for a in cp.order_accounts.filter(active=True) if a.credentials]
+                    now = timezone.now()
+                    accounts = [
+                        a for a in cp.order_accounts.filter(active=True)
+                        if a.credentials and (
+                            a.order_status_checked_at is None
+                            or now - a.order_status_checked_at >= _ORDER_RECHECK_INTERVAL
+                        )
+                    ]
                     if accounts:
                         try:
                             self._check_order_validated(cp, kind, accounts)
