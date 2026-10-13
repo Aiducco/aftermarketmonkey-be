@@ -730,6 +730,135 @@ def _part_id_by_brand_and_sku() -> typing.Dict[typing.Tuple[str, str], int]:
     }
 
 
+def _the_wheel_group_brands_by_external_id(
+    external_ids: typing.Iterable[str],
+) -> typing.Dict[str, src_models.TheWheelGroupBrand]:
+    ids = {e for e in external_ids if e}
+    if not ids:
+        return {}
+    return {
+        b.external_id: b
+        for b in src_models.TheWheelGroupBrand.objects.filter(external_id__in=list(ids))
+    }
+
+
+# A relay row is only ever used to overwrite these on an *existing* TheWheelGroupPart (see
+# _ensure_the_wheel_group_relay_parts) -- the relay CSV carries no wheel-spec attributes at all
+# (diameter, bolt pattern, images, ...), so touching anything else here would blank out real
+# mastersheet data with nothing to replace it with. A brand-new row (the SKU doesn't exist yet)
+# is unaffected by this list -- pgbulk's INSERT side writes every field the constructed instance
+# actually carries, this only restricts the UPDATE side of the upsert.
+_RELAY_PART_OVERLAY_FIELDS = ["msrp", "map_price", "source_filename", "updated_at"]
+
+
+def _ensure_the_wheel_group_relay_parts(
+    rows: typing.List[typing.Dict],
+    source_filename: typing.Optional[str],
+) -> typing.Tuple[int, int]:
+    """
+    Make sure every wheel SKU in a relay inventory CSV has a TheWheelGroupPart row, and that its
+    msrp/map_price reflect the relay feed rather than the public mastersheet.
+
+    Two things prompted this:
+
+      * The relay is a real per-dealer drop TWG actually delivers (see TheWheelGroupFeedClient's
+        own docstring); the public mastersheet is updated on its own schedule and can lag behind
+        it. So for msrp/map_price specifically, the relay is the more current source once one
+        exists -- confirmed live 2026-10-13 against Recon Overland's real relay CSV.
+      * The relay carries real SKUs the mastersheet doesn't have at all -- confirmed live the same
+        day: of 3,374 wheel-brand rows in Recon's relay CSV, only 2,056 matched an existing
+        TheWheelGroupPart. The other ~1,318 are not a brand- or SKU-formatting mismatch (every
+        PlinId resolves to a known brand, and no near-miss SKU exists under a different brand) --
+        they are simply SKUs TWG has never listed on the public sheet. Without this, every sync
+        that keys off TheWheelGroupPart (pricing, inventory, master parts) silently drops them.
+
+    Two outcomes from the same upsert, by (brand, sku):
+
+      * Already exists (from the mastersheet) -- only msrp/map_price/source_filename are
+        overwritten (_RELAY_PART_OVERLAY_FIELDS), so the relay feed -- which has no wheel-spec
+        columns at all -- never blanks out real spec data (diameter, bolt pattern, images, ...)
+        it has nothing to replace it with.
+      * Doesn't exist yet -- a minimal part is created from what the relay actually has (sku,
+        brand, its own Item Description doubling as name, msrp, map). It carries no spec
+        attributes until the mastersheet catches up, but it is not silently dropped from
+        inventory/pricing/master parts in the meantime.
+
+    Only rows whose PlinId resolves to a brand this catalog already has (TWG's wheel house
+    brands) are touched. A PlinId outside that set -- CAPS, MR LUGNUT, BODY ARMOR, tires, and the
+    other non-wheel categories the relay file also carries -- is a different product line
+    entirely, with no TheWheelGroupPart spec shape to create a row for, and is left untouched
+    exactly as before (see the module docstring and sync_the_wheel_group_relay_inventory).
+
+    Returns (new_parts_created, existing_parts_overlaid).
+    """
+    brand_ext_ids = {_inventory_brand_external_id(row.get("brand")) for row in rows}
+    brands_by_external_id = _the_wheel_group_brands_by_external_id(brand_ext_ids)
+    if not brands_by_external_id:
+        return 0, 0
+
+    existing_keys = set(
+        src_models.TheWheelGroupPart.objects.filter(
+            brand__external_id__in=list(brands_by_external_id.keys())
+        ).values_list("brand__external_id", "sku")
+    )
+
+    instances_by_key: typing.Dict[typing.Tuple[str, str], src_models.TheWheelGroupPart] = {}
+    new_count = 0
+    overlay_count = 0
+    for row in rows:
+        brand_ext_id = _inventory_brand_external_id(row.get("brand"))
+        brand = brands_by_external_id.get(brand_ext_id)
+        if not brand:
+            continue
+        sku = _safe_str(row.get("sku"), 255)
+        if not sku:
+            continue
+        key = (brand_ext_id, sku)
+        if key in instances_by_key:
+            continue
+        is_new = key not in existing_keys
+        description = _safe_str(row.get("description"))
+        instances_by_key[key] = src_models.TheWheelGroupPart(
+            brand=brand,
+            sku=sku,
+            name=description[:255] if description else None,
+            description=description,
+            msrp=_safe_price(row.get("msrp")),
+            map_price=_safe_price(row.get("map_price")),
+            source_filename=_safe_str(source_filename, 255),
+            raw_data=row,
+        )
+        if is_new:
+            new_count += 1
+        else:
+            overlay_count += 1
+
+    if not instances_by_key:
+        return 0, 0
+
+    now = timezone.now()
+    instances = list(instances_by_key.values())
+    for part in instances:
+        part.updated_at = now
+    for start in range(0, len(instances), THE_WHEEL_GROUP_UPSERT_BATCH):
+        batch = instances[start:start + THE_WHEEL_GROUP_UPSERT_BATCH]
+        pgbulk.upsert(
+            src_models.TheWheelGroupPart,
+            batch,
+            unique_fields=["brand", "sku"],
+            update_fields=_RELAY_PART_OVERLAY_FIELDS,
+            returning=False,
+        )
+
+    logger.info(
+        "{} Relay inventory CSV {!r}: {} new TheWheelGroupPart row(s) created, {} existing "
+        "row(s) overlaid with relay msrp/map.".format(
+            _LOG_PREFIX, source_filename, new_count, overlay_count
+        )
+    )
+    return new_count, overlay_count
+
+
 def sync_the_wheel_group_company_pricing_for_company_provider(company_provider_id: int) -> None:
     """
     Upsert TheWheelGroupCompanyPricing for this company. Keyed to existing part rows by (brand
@@ -791,6 +920,10 @@ def sync_the_wheel_group_company_pricing_for_company_provider(company_provider_i
                 _LOG_PREFIX, cp.company_id, relay_data.get("source_filename"), len(rows)
             )
         )
+        # The relay often carries real SKUs the public mastersheet has never listed -- without
+        # this, those rows would just silently fail the part_id_by_key lookup below and never
+        # get priced at all. See _ensure_the_wheel_group_relay_parts's own docstring.
+        _ensure_the_wheel_group_relay_parts(rows, relay_data.get("source_filename"))
     else:
         try:
             data = client.get_feed_data()
@@ -886,9 +1019,11 @@ def sync_the_wheel_group_relay_inventory() -> int:
     Stock is shared across every company (TWG's own warehouse network, not a per-customer
     allocation) -- one connection's relay drop is read regardless of how many companies are
     connected, same as fetch_and_save_the_wheel_group reads one connection's mastersheet for the
-    whole shared catalog. Only matches SKUs that already exist as TheWheelGroupPart; the relay
-    file's rows for brands/categories outside the mastersheet (center caps, lug nuts, tires,
-    third-party brands) have nothing to attach to and are skipped, not created.
+    whole shared catalog. A wheel SKU the mastersheet hasn't listed yet gets a minimal
+    TheWheelGroupPart row created for it first (see _ensure_the_wheel_group_relay_parts), so real
+    stock is never silently dropped just because the public sheet lags the relay. Rows for
+    brands/categories outside the mastersheet entirely (center caps, lug nuts, tires, third-party
+    brands) still have no spec shape to create a row for, and are skipped exactly as before.
 
     Returns the number of TheWheelGroupInventory rows upserted.
     """
@@ -926,6 +1061,7 @@ def sync_the_wheel_group_relay_inventory() -> int:
         logger.warning("{} Relay inventory CSV {!r} had no rows.".format(_LOG_PREFIX, source_filename))
         return 0
 
+    _ensure_the_wheel_group_relay_parts(rows, source_filename)
     part_id_by_key = _part_id_by_brand_and_sku()
     now = timezone.now()
     instances = []
