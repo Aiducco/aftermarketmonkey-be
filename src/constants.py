@@ -2,6 +2,7 @@ import typing
 
 # Provider kind_name -> display name (used by parts API)
 PROVIDER_DISPLAY_NAMES = {
+    "ALLPRO_DISTRIBUTING": "AllPro Distributing",
     "TURN_14": "Turn 14",
     "KEYSTONE": "Keystone",
     "MEYER": "Meyer",
@@ -40,6 +41,7 @@ PROVIDER_DISPLAY_NAMES = {
 
 # Provider kind_name -> image URL (used by parts API)
 PROVIDER_IMAGE_URLS = {
+    "ALLPRO_DISTRIBUTING": "https://api.aftermarketscout.com/uploads/allpro_logo.png",
     "TURN_14": "https://api.aftermarketscout.com/uploads/t14_logo.png",
     "KEYSTONE": "https://api.aftermarketscout.com/uploads/keystone.png",
     "MEYER": "https://api.aftermarketscout.com/uploads/meyer_logo.png",
@@ -2130,6 +2132,50 @@ PROVIDER_CATALOG = [
             "</ul>"
         ),
     },
+    {
+        "kind": enums.BrandProviderKind.ALLPRO_DISTRIBUTING,
+        "name": "AllPro Distributing",
+        "description": "Access AllPro Distributing inventory and pricing via their FTP feed.",
+        "icon_url": "https://api.aftermarketscout.com/uploads/allpro_logo.png",
+        "category": "Distributors",
+        "connection_required_fields": ["username", "password"],
+        # Email-channel ordering — see the matching note on Turn 14 above.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["account_number", "cc_email", "reply_to_email"],
+        "integration_time": "Data available within 1-2 days",
+        "installation_instructions_html": (
+            "<p><strong>AllPro Distributing</strong> publishes your inventory and pricing on their FTP "
+            "server. AfterMarketScout handles the connection &mdash; you only need your FTP username and "
+            "password.</p>"
+
+            "<p><strong>1. Request FTP credentials</strong></p>"
+            "<p>AllPro issues a username and password per customer rather than one shared login. Contact "
+            "your AllPro representative to request them:</p>"
+            + _CALLOUT_OPEN +
+            "<p>Could you please send us FTP username and password to pull our inventory and pricing? "
+            "We're connecting it to our inventory system.</p>"
+            "</div>"
+            "<p>Email <a href=\"mailto:Andrew.Avello@allprob2b.com\">Andrew.Avello@allprob2b.com</a> and "
+            "include your <strong>AllPro customer number</strong> so the request can be matched to your "
+            "account.</p>"
+
+            "<p><strong>2. Enter your FTP credentials</strong></p>"
+            "<ol>"
+            "<li>Paste the <strong>username</strong> and <strong>password</strong> AllPro sent you into "
+            "the fields below.</li>"
+            "<li>Click <strong>Save</strong>.</li>"
+            "</ol>"
+
+            "<p><strong>Notes</strong></p>"
+            "<ul>"
+            "<li><strong>Connection fails.</strong> Re-paste the password to rule out a stray space or a "
+            "truncated copy. If it still fails, ask Andrew to confirm the username/password and that FTP "
+            "access is active for your account.</li>"
+            "<li><strong>Need help?</strong> Contact "
+            "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a>.</li>"
+            "</ul>"
+        ),
+    },
 ]
 
 
@@ -2146,7 +2192,6 @@ def visible_provider_catalog() -> typing.List[typing.Dict[str, typing.Any]]:
 _UPLOADS = "https://api.aftermarketscout.com/uploads"
 
 COMING_SOON_PROVIDERS = [
-    {"kind": enums.BrandProviderKind.ALLPRO_DISTRIBUTING,     "name": "AllPro Distributing",        "category": "Distributors", "icon_url": f"{_UPLOADS}/allpro_logo.png"},
     {"kind": enums.BrandProviderKind.HOLLEY_PERFORMANCE,      "name": "Holley Performance",         "category": "Distributors", "icon_url": f"{_UPLOADS}/holley_logo.png"},
 ]
 

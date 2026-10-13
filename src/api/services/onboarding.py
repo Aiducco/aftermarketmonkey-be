@@ -452,4 +452,17 @@ def get_distributor_credentials_info() -> dict:
             "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("HELMHOUSE", "HelmHouse"),
             "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("HELMHOUSE") or None,
         },
+        "allpro_distributing": {
+            "required": ["username", "password"],
+            "description": (
+                "AllPro Distributing FTP username and password, issued per customer number by "
+                "AllPro's rep (Andrew.Avello@allprob2b.com) on request — there is no shared or "
+                "self-service login. Only a connection check exists so far; catalog/pricing ingest "
+                "is separate work for once a real feed file has been seen."
+            ),
+            "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get(
+                "ALLPRO_DISTRIBUTING", "AllPro Distributing"
+            ),
+            "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("ALLPRO_DISTRIBUTING") or None,
+        },
     }

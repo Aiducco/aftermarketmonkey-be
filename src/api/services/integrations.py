@@ -14,6 +14,8 @@ from src import enums as src_enums
 from src import models as src_models
 from src.api.services import billing as billing_services
 from src.integrations import credentials as credentials_helper
+from src.integrations.clients.allpro import client as allpro_client
+from src.integrations.clients.allpro import exceptions as allpro_exceptions
 from src.integrations.clients.atech import client as atech_client
 from src.integrations.clients.atech import exceptions as atech_exceptions
 from src.integrations.clients.crown import client as crown_client
@@ -657,6 +659,28 @@ def _validate_helmet_house_connection(credentials: typing.Dict[str, typing.Any])
     return None, None
 
 
+def _validate_allpro_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
+    """
+    Validates a dealer's AllPro Distributing FTP login by connecting and logging in. No feed file
+    check here (unlike Motor State's) -- AllPro has never delivered a sample file, so no filename
+    or format is known yet to check for; a real client that reads one is separate work for once
+    that's confirmed. See clients/allpro/client.py's own docstring.
+    """
+    try:
+        client = allpro_client.AllProFTPClient(credentials=credentials)
+    except ValueError as e:
+        return str(e), CONNECTION_ERROR_INVALID_INPUT
+    try:
+        client.test_connection()
+    except allpro_exceptions.AllProAuthError as e:
+        return str(e), CONNECTION_ERROR_INVALID_CREDENTIALS
+    except allpro_exceptions.AllProFTPConnectionError as e:
+        return str(e), CONNECTION_ERROR_CONNECTION_FAILED
+    except (allpro_exceptions.AllProException, ValueError) as e:
+        return str(e), CONNECTION_ERROR_CONNECTION_FAILED
+    return None, None
+
+
 def _validate_tirerack_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
     try:
         client = tirerack_client.TireRackSFTPClient(credentials=credentials)
@@ -687,6 +711,7 @@ _CONNECTION_VALIDATORS: typing.Dict[int, typing.Callable[[typing.Dict[str, typin
     src_enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING.value: _validate_motorstate_connection,
     src_enums.BrandProviderKind.WESTERN_POWER_SPORTS.value: _validate_wps_connection,
     src_enums.BrandProviderKind.HELMHOUSE.value: _validate_helmet_house_connection,
+    src_enums.BrandProviderKind.ALLPRO_DISTRIBUTING.value: _validate_allpro_connection,
 }
 
 
