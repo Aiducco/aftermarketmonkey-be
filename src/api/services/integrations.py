@@ -931,8 +931,9 @@ def _relay_feed_connection_status(
             )
         return (
             src_enums.CompanyProviderConnectionStatus.WAITING,
-            "Reading The Wheel Group's shared catalog for list pricing — your own cost and stock "
-            "arrive once they deliver your feed to our relay.",
+            "Reading The Wheel Group's shared catalog for list pricing. Please read the setup "
+            "instructions and ask your rep to push your feed file to our relay for your own cost "
+            "and stock.",
         )
 
     client_cls, exception_cls = _RELAY_FEED_PRESENT_CLIENTS[kind]
@@ -951,7 +952,7 @@ def _relay_feed_connection_status(
         )
     return (
         src_enums.CompanyProviderConnectionStatus.WAITING,
-        "Waiting for your first file to arrive on our relay.",
+        "Please read the setup instructions and ask your rep to push your feed file to our relay.",
     )
 
 
