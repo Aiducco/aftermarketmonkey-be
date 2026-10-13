@@ -14,8 +14,15 @@ one question ``_relay_feed_connection_status`` actually needs right now: has Cro
 anything at all, so the connection can move off WAITING. Parsing/ingestion (a real client/
 provider-part sync, the way Meyer and A-Tech have) is a separate piece of work for once a real
 file -- and its format -- actually exists to build against.
+
+Every relay-provisioned provider (Meyer, A-Tech, DLG, TWG, Crown) shares one ``uploads/`` folder
+per company, so "any file" has to exclude the other providers' own known filenames -- otherwise a
+file one of THEM dropped reads as Crown's. Confirmed live 2026-10-13: SunCoast's Crown connection
+read DLG's freshly-dropped ``dlg_inventory.csv`` as its own and reported INGESTING with nothing
+from Crown ever delivered.
 """
 import logging
+import re
 import socket
 import typing
 from urllib.parse import urlparse
@@ -36,6 +43,25 @@ _DEFAULT_CROWN_RELAY_PORT = 22
 _DEFAULT_CROWN_RELAY_DIRECTORY = "uploads"
 
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 15
+
+# Other relay-provisioned providers' own known filenames (exact, case-insensitive) or patterns,
+# sharing this same per-company uploads/ folder -- excluded from the "any file" check below so one
+# of THEIR files never reads as a Crown delivery. See the module docstring for the real incident
+# this guards against. Add to this set/list if another provider's filename becomes known.
+_OTHER_PROVIDER_EXACT_FILENAMES = frozenset({
+    "dlg_inventory.csv",
+    "meyer pricing.csv",
+    "meyer inventory.csv",
+    "atechfile.txt",
+})
+_OTHER_PROVIDER_FILENAME_PATTERNS = (re.compile(r"^twg.*inventory.*\.csv$", re.IGNORECASE),)
+
+
+def _is_another_providers_file(filename: str) -> bool:
+    name = (filename or "").strip()
+    if name.lower() in _OTHER_PROVIDER_EXACT_FILENAMES:
+        return True
+    return any(p.search(name) for p in _OTHER_PROVIDER_FILENAME_PATTERNS)
 
 
 def _setting_str(name: str, fallback: str) -> str:
@@ -170,7 +196,8 @@ class CrownSFTPClient:
 
     def feed_present(self) -> bool:
         """
-        True if this company's relay uploads folder holds at least one file. Connection failures
+        True if this company's relay uploads folder holds at least one file that isn't a dotfile
+        or a known other-provider filename (see _is_another_providers_file). Connection failures
         propagate as CrownSFTPConnectionError rather than returning False, so callers can tell
         "not there yet" apart from "couldn't check" — same contract as Meyer/A-Tech's
         feed_present().
@@ -181,6 +208,9 @@ class CrownSFTPClient:
                 entries = self._sftp.listdir_attr(self.sftp_directory)
             except FileNotFoundError:
                 return False
-            return any(not entry.filename.startswith(".") for entry in entries)
+            return any(
+                not entry.filename.startswith(".") and not _is_another_providers_file(entry.filename)
+                for entry in entries
+            )
         finally:
             self._disconnect()

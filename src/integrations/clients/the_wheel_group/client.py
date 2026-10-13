@@ -174,7 +174,13 @@ _REQUIRED_HEADER_KEYS = ("SKU", "BRAND")
 # the name drifts. Distinct from WORKBOOK_FILENAME_PATTERN: this is a flat CSV with real
 # DealerCost and per-warehouse on-hand columns, not the mastersheet's list-price-only xlsx. Only
 # ever arrives over the sftp transport -- the public share has no dealer-specific data to serve.
-INVENTORY_FILENAME_PATTERN = re.compile(r"inventory.*\.csv$", re.IGNORECASE)
+#
+# Anchored on a "twg" prefix, not just "inventory...csv" -- every relay-provisioned provider
+# (Meyer, A-Tech, Crown, DLG, TWG) shares one uploads/ folder per company, and a bare
+# "inventory.*\.csv$" matches DLG's own fixed filename "dlg_inventory.csv" too. Confirmed live
+# 2026-10-13: SunCoast's TWG connection read DLG's freshly-dropped file as its own and reported
+# INGESTING with nothing from TWG ever delivered.
+INVENTORY_FILENAME_PATTERN = re.compile(r"^twg.*inventory.*\.csv$", re.IGNORECASE)
 
 # Named columns on the relay inventory CSV. Every other column is a warehouse code holding that
 # SKU's on-hand quantity there (see _parse_inventory_csv) -- not hardcoded here since TWG could
