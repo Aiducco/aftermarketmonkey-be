@@ -1856,25 +1856,12 @@ PROVIDER_CATALOG = [
             "</ul>"
         ),
     },
-    {
-        "kind": enums.BrandProviderKind.XDP,
-        "name": "XDP",
-        "description": "Access XDP (Xtreme Diesel Performance) public inventory and pricing — no account required.",
-        "icon_url": "https://api.aftermarketscout.com/uploads/xdp_logo.png",
-        "category": "Distributors",
-        "connection_required_fields": [],
-        # Email-channel ordering — see the matching note on Turn 14 above.
-        "email_order_connection_required_fields": ["rep_email"],
-        "email_order_connection_optional_fields": ["account_number", "cc_email", "reply_to_email"],
-        "integration_time": "Data available within 1-2 days",
-        "installation_instructions_html": (
-            "<p><strong>XDP (Xtreme Diesel Performance)</strong> provides a public price and stock data feed — "
-            "an account is not required. Simply save the connection to activate it.</p>"
-            "<p>For assistance visit the "
-            "<a href=\"https://www.xdp.com/help\" target=\"_blank\" rel=\"noopener noreferrer\">"
-            "XDP Help Desk</a>.</p>"
-        ),
-    },
+    # XDP removed from the connectable catalog 2026-10-13: it was listed as "no account required"
+    # with no backend ever built -- no client, no fetch command, no data source confirmed. Two
+    # companies (Trident Motorsports, Recon Overland & Off Road) had already connected to it with
+    # nothing behind it. PROVIDER_NAMES/PROVIDER_IMAGE_URLS above still carry an "XDP" entry so
+    # those two existing (non-functional) CompanyProviders rows keep a name/icon to display rather
+    # than rendering blank -- only the catalog entry that offers it for a *new* connection is gone.
     {
         "kind": enums.BrandProviderKind.ATD,
         "name": "ATD",

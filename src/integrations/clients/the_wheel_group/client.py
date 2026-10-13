@@ -591,6 +591,23 @@ class TheWheelGroupFeedClient(object):
         candidates.sort()
         return candidates[-1][1]
 
+    def inventory_feed_present(self) -> bool:
+        """
+        True if this connection's relay directory holds a real inventory CSV (the thing that
+        actually carries per-dealer cost and per-warehouse stock — see the module docstring).
+        False while still on the public share (nothing dealer-specific to find there) or when the
+        relay directory is reachable but empty. Same stat-only, no-download contract as Meyer/
+        A-Tech/DLG's own feed_present() — connection failures propagate rather than reading as
+        "not there yet".
+        """
+        if self.local_file_path or self.source_mode() != SOURCE_MODE_SFTP:
+            return False
+        transport, sftp = self._sftp_session()
+        try:
+            return self._latest_inventory_csv_filename(self._relay_entries(sftp)) is not None
+        finally:
+            self._close_sftp_session(transport, sftp)
+
     def _download_latest_inventory_csv(self) -> typing.Optional[typing.Tuple[str, bytes]]:
         """(filename, content) for the newest relay inventory CSV, or None if this connection
         isn't on the sftp transport or has no such file -- both are normal, expected states."""

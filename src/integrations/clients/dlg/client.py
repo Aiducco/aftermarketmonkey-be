@@ -200,3 +200,21 @@ class DlgSFTPClient:
 
     def download_inventory_file(self, force_download: bool = False) -> str:
         return self._download(self.inventory_remote_file, self.local_inventory_path, force_download)
+
+    def feed_present(self) -> bool:
+        """
+        True if this company's own copy of ``DLG_INVENTORY_CSV_FILENAME`` exists on the relay.
+        Single connection, stat() only — doesn't download anything. Connection failures propagate
+        as DlgSFTPConnectionError rather than returning False, so callers can tell "not there yet"
+        apart from "couldn't check" — same contract as Meyer/A-Tech's feed_present().
+        """
+        self._connect()
+        try:
+            remote_path = _remote_join(self.sftp_directory, self.inventory_remote_file)
+            try:
+                self._sftp.stat(remote_path)
+                return True
+            except FileNotFoundError:
+                return False
+        finally:
+            self._disconnect()

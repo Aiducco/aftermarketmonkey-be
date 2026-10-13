@@ -12,13 +12,15 @@ resurrected from a stale relay file:
     stored credentials.
       passes -> INGESTING (connectivity fine, sync just hasn't finished yet)
       fails  -> FAILING, reason = the validator's message
-  - Relay-provisioned kinds with an ingest client (Meyer, A-Tech, The Wheel Group): via
-    integrations_services._relay_feed_connection_status — same helper connect_provider/
+  - Relay-provisioned kinds with an ingest client (Meyer, A-Tech, Crown, DLG, The Wheel Group):
+    via integrations_services._relay_feed_connection_status — same helper connect_provider/
     update_connection use to set the initial status, so there's one source of truth for
-    what "file arrived" means. (The Wheel Group is checked against the public mastersheet it
-    is actually read from today rather than the relay folder — see that helper.)
-  - Everything else (no ingest client built yet — CTP, Crown, DIX, and the rest of the
-    catalog-only distributors): left untouched, nothing to check against.
+    what "file arrived" means. The Wheel Group's own shared public mastersheet (catalog + list
+    price, readable with no relay file at all) does not count as "arrived" here — this still
+    checks for that company's own relay drop, same as every other kind (see that helper's own
+    docstring for why, added 2026-10-13).
+  - Everything else (no ingest client built yet — CTP, DIX, and the rest of the catalog-only
+    distributors): left untouched, nothing to check against.
 
   Rows where initial_sync_completed is already True are out of scope for this part — those
   are set to CONNECTED once, directly, in integration_pricing_sync_jobs when the first sync

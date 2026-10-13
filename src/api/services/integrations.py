@@ -16,6 +16,10 @@ from src.api.services import billing as billing_services
 from src.integrations import credentials as credentials_helper
 from src.integrations.clients.atech import client as atech_client
 from src.integrations.clients.atech import exceptions as atech_exceptions
+from src.integrations.clients.crown import client as crown_client
+from src.integrations.clients.crown import exceptions as crown_exceptions
+from src.integrations.clients.dlg import client as dlg_client
+from src.integrations.clients.dlg import exceptions as dlg_exceptions
 from src.integrations.clients.elite_wheel import client as elite_wheel_client
 from src.integrations.clients.elite_wheel import exceptions as elite_wheel_exceptions
 from src.integrations.clients.helmet_house import client as helmet_house_client
@@ -856,12 +860,27 @@ def _validate_order_connection_for_method(
 
 
 # Relay-provisioned kinds we can actually check something for — see
-# _relay_feed_connection_status. Other relay-provisioned kinds (CTP, Crown, DIX) have no ingest
-# client built yet, so there's nothing to check against.
+# _relay_feed_connection_status. Other relay-provisioned kinds (CTP, DIX) have no ingest client
+# built yet, so there's nothing to check against.
 _RELAY_FEED_CHECK_KINDS = {
     src_enums.BrandProviderKind.MEYER.value,
     src_enums.BrandProviderKind.ATECH.value,
+    src_enums.BrandProviderKind.CROWN_AUTOMOTIVE.value,
+    src_enums.BrandProviderKind.DLG.value,
     src_enums.BrandProviderKind.THE_WHEEL_GROUP.value,
+}
+
+# kind -> (client class, exception base) for every relay kind whose check is a plain
+# feed_present() -> bool, same contract Meyer/A-Tech originated (True = a real file for *this*
+# company exists on the relay). Crown (built 2026-10-13, presence-only — see its client's own
+# docstring) and DLG now follow the same shape. The Wheel Group is handled separately below: its
+# presence check is inventory_feed_present() with a different constructor (force_public_share)
+# and a different FAILING/WAITING message.
+_RELAY_FEED_PRESENT_CLIENTS: typing.Dict[int, typing.Tuple[typing.Any, typing.Any]] = {
+    src_enums.BrandProviderKind.MEYER.value: (meyer_client.MeyerSFTPClient, meyer_exceptions.MeyerException),
+    src_enums.BrandProviderKind.ATECH.value: (atech_client.AtechSFTPClient, atech_exceptions.AtechException),
+    src_enums.BrandProviderKind.CROWN_AUTOMOTIVE.value: (crown_client.CrownSFTPClient, crown_exceptions.CrownException),
+    src_enums.BrandProviderKind.DLG.value: (dlg_client.DlgSFTPClient, dlg_exceptions.DlgException),
 }
 
 
@@ -875,11 +894,15 @@ def _relay_feed_connection_status(
     logic — used both here (to set an initial status at connect time) and by the
     check_company_provider_connections cron (to keep it fresh afterwards).
 
-    The Wheel Group is the one exception to "check the relay folder": their catalog and list
-    pricing come from the public mastersheet they publish, not from a relay drop, so a TWG
-    connection is already receiving data on the day it's made. It's checked against whichever
-    source it will actually read — the client decides, so this switches to the dealer's own relay
-    drop by itself once THE_WHEEL_GROUP_FORCE_PUBLIC_SHARE is turned off.
+    Every kind here answers the same underlying question — has a real file for *this* company
+    actually arrived — with WAITING until it has. The Wheel Group used to be treated as an
+    exception (shown as already "ingesting" the day a connection was made, since their shared
+    public mastersheet is immediately readable with no relay file at all), but that left a company
+    with no per-company cost/stock looking indistinguishable from one that actually has real data
+    — confirmed live 2026-10-13 on two real connections (SunCoast, Trident) sitting on the public
+    share with nothing from TWG ever delivered to their own relay folder. It's now checked the
+    same way as every other kind: WAITING until inventory_feed_present() is true, regardless of
+    the shared catalog's own state.
     """
     if kind not in _RELAY_FEED_CHECK_KINDS:
         return None, None
@@ -893,25 +916,29 @@ def _relay_feed_connection_status(
 
     if kind == src_enums.BrandProviderKind.THE_WHEEL_GROUP.value:
         try:
-            the_wheel_group_client.TheWheelGroupFeedClient(credentials=creds).test_connection()
+            present = the_wheel_group_client.TheWheelGroupFeedClient(
+                credentials=creds, force_public_share=False
+            ).inventory_feed_present()
         except (the_wheel_group_exceptions.TheWheelGroupException, ValueError) as e:
             return (
                 src_enums.CompanyProviderConnectionStatus.FAILING,
                 "Could not reach The Wheel Group's feed: {}".format(e),
             )
+        if present:
+            return (
+                src_enums.CompanyProviderConnectionStatus.INGESTING,
+                "File received — waiting for it to be processed.",
+            )
         return (
-            src_enums.CompanyProviderConnectionStatus.INGESTING,
-            "Reading The Wheel Group's catalog — your own cost and stock follow once they deliver "
-            "your feed.",
+            src_enums.CompanyProviderConnectionStatus.WAITING,
+            "Reading The Wheel Group's shared catalog for list pricing — your own cost and stock "
+            "arrive once they deliver your feed to our relay.",
         )
 
+    client_cls, exception_cls = _RELAY_FEED_PRESENT_CLIENTS[kind]
     try:
-        if kind == src_enums.BrandProviderKind.MEYER.value:
-            client = meyer_client.MeyerSFTPClient(credentials=creds)
-        else:
-            client = atech_client.AtechSFTPClient(credentials=creds)
-        present = client.feed_present()
-    except (meyer_exceptions.MeyerException, atech_exceptions.AtechException, ValueError) as e:
+        present = client_cls(credentials=creds).feed_present()
+    except (exception_cls, ValueError) as e:
         return (
             src_enums.CompanyProviderConnectionStatus.FAILING,
             "Could not reach our relay to check for your file: {}".format(e),
