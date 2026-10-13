@@ -35,6 +35,7 @@ from src.integrations.services import quadratec as quadratec_services
 from src.integrations import credentials as credentials_helper
 from src.integrations import rate_limit as rate_limit_base
 from src.integrations.services import rough_country as rough_country_services
+from src.integrations.clients.the_wheel_group import exceptions as the_wheel_group_exceptions
 from src.integrations.services import the_wheel_group as the_wheel_group_services
 from src.integrations.services import tirerack as tirerack_services
 from src.integrations.services import turn_14 as turn_14_services
@@ -601,6 +602,36 @@ def run_integration_pricing_sync_job(job: src_models.IntegrationPricingSyncJob) 
         retry_at = timezone.now() + datetime.timedelta(seconds=e.retry_after_seconds)
         logger.warning(
             "{} Job id={} deferred until {}: {}".format(_LOG_PREFIX, job.id, retry_at, e)
+        )
+        job.status = src_enums.IntegrationPricingSyncJobStatus.OPEN.value
+        job.status_name = src_enums.IntegrationPricingSyncJobStatus.OPEN.name
+        job.message = "Deferred: {} || {}".format(e, meter.summary("api_usage"))[:4000]
+        job.not_before = retry_at
+        job.started_at = None
+        job.save(
+            update_fields=[
+                "status",
+                "status_name",
+                "message",
+                "not_before",
+                "started_at",
+                "updated_at",
+            ]
+        )
+        return
+
+    except the_wheel_group_exceptions.TheWheelGroupFeedNotYetDeliveredException as e:
+        # Not a failure, and the rows this run already wrote (public mastersheet list pricing)
+        # stay written -- see that exception's own docstring. Deferred an hour rather than
+        # retried next cycle: nothing about this company's relay folder changes faster than that,
+        # and check_company_provider_connections (every 5 min) is the thing actually watching for
+        # the file to arrive, not this job.
+        meter.__exit__(None, None, None)
+        retry_at = timezone.now() + datetime.timedelta(hours=1)
+        logger.info(
+            "{} Job id={} company_provider={}: no relay file yet, deferred until {}: {}".format(
+                _LOG_PREFIX, job.id, cp.id, retry_at, e
+            )
         )
         job.status = src_enums.IntegrationPricingSyncJobStatus.OPEN.value
         job.status_name = src_enums.IntegrationPricingSyncJobStatus.OPEN.name

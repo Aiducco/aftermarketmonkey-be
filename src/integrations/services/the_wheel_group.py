@@ -996,6 +996,18 @@ def sync_the_wheel_group_company_pricing_for_company_provider(company_provider_i
                 _LOG_PREFIX, cp.company_id, source_mode, written,
             )
         )
+        if relay_data is None:
+            # The rows above are still worth having (list pricing immediately, same as always) --
+            # this only tells the job queue not to treat writing them as "the connection is fully
+            # synced." Caught specifically in integration_pricing_sync_jobs so the job is deferred,
+            # not FAILED, and initial_sync_completed/CONNECTED stay exactly where they were -- see
+            # the exception's own docstring for why this matters (confirmed live 2026-10-13 on two
+            # real connections marked CONNECTED despite never having delivered a relay file).
+            raise the_wheel_group_exceptions.TheWheelGroupFeedNotYetDeliveredException(
+                "No relay file yet for company_id={} — still on the public mastersheet.".format(
+                    cp.company_id
+                )
+            )
         return
 
     logger.info(
