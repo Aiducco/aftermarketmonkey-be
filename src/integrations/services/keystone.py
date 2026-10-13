@@ -50,6 +50,34 @@ def _clean_csv_value(value: typing.Any) -> typing.Optional[str]:
     return s
 
 
+_IMPLAUSIBLE_BRAND_NAME_BOOLEAN_PATTERN = re.compile(r",\s*(?:TRUE|FALSE)\b", re.IGNORECASE)
+_IMPLAUSIBLE_BRAND_NAME_DIGIT_RUN_PATTERN = re.compile(r"\d{4,}")
+_MAX_PLAUSIBLE_BRAND_NAME_LENGTH = 60
+
+
+def _is_plausible_brand_name(name: typing.Optional[str]) -> bool:
+    """
+    Reject VendorName values that look like several merged CSV columns rather
+    than a real vendor name. A stray quote elsewhere in Keystone's upstream feed
+    can throw off csv.DictReader's quote state, collapsing pricing/boolean/
+    quantity columns into VendorName, e.g.
+    "CURT 05.5.50,TRUE,0.00, BRAKE CONTROLLER HARNES9=5E8I87,=64.87".
+    """
+    if not name:
+        return False
+    if len(name) > _MAX_PLAUSIBLE_BRAND_NAME_LENGTH:
+        return False
+    if "\n" in name or "\r" in name:
+        return False
+    if name.count(",") > 1:
+        return False
+    if _IMPLAUSIBLE_BRAND_NAME_BOOLEAN_PATTERN.search(name):
+        return False
+    if _IMPLAUSIBLE_BRAND_NAME_DIGIT_RUN_PATTERN.search(name):
+        return False
+    return True
+
+
 def _safe_decimal(value: typing.Any) -> typing.Optional[Decimal]:
     """Convert value to Decimal, return None if invalid."""
     if value is None or (isinstance(value, float) and pd.isna(value)):
@@ -121,7 +149,7 @@ def fetch_and_save_keystone_brands() -> None:
     brand_names = set()
     for row in records:
         name = _clean_csv_value(row.get("VendorName"))
-        if name:
+        if name and _is_plausible_brand_name(name):
             brand_names.add(name)
 
     brand_instances = []
@@ -792,7 +820,7 @@ def fetch_and_save_all_keystone_brands_and_parts() -> None:
         brand_data = {}
         for row in records:
             name = _clean_csv_value(row.get("VendorName"))
-            if name and name not in brand_data:
+            if name and name not in brand_data and _is_plausible_brand_name(name):
                 brand_data[name] = _clean_csv_value(row.get("AAIACode"))
 
         if not brands_synced_once and brand_data:
@@ -1075,7 +1103,7 @@ def sync_keystone_catalog_and_company_pricing_for_company_provider(company_provi
     brand_data = {}
     for row in records:
         name = _clean_csv_value(row.get("VendorName"))
-        if name and name not in brand_data:
+        if name and name not in brand_data and _is_plausible_brand_name(name):
             brand_data[name] = _clean_csv_value(row.get("AAIACode"))
 
     if brand_data:
