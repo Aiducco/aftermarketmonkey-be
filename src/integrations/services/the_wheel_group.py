@@ -821,7 +821,15 @@ def _ensure_the_wheel_group_relay_parts(
         instances_by_key[key] = src_models.TheWheelGroupPart(
             brand=brand,
             sku=sku,
-            name=description[:255] if description else None,
+            # Left unset deliberately: the relay has no separate short "model name" column the way
+            # the mastersheet's own NAME does (see _build_part) -- only this one descriptive
+            # sentence. Stuffing the whole sentence in here would feed wheel_enrichment's "model"
+            # column directly (build_spec's model_name = _clean(model_raw) or model_from_title(...)
+            # -- the _clean(...) branch wins first), which skips its own title parser entirely and
+            # produces a worse result than letting that parser strip the size/brand/finish words
+            # out of `description` the same way it already does for every part with no vendor
+            # model column at all (see FEED_TITLE).
+            name=None,
             description=description,
             msrp=_safe_price(row.get("msrp")),
             map_price=_safe_price(row.get("map_price")),
