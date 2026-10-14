@@ -546,6 +546,17 @@ class BrandProviders(django_db_models.Model):
     brand = django_db_models.ForeignKey(Brands, on_delete=django_db_models.CASCADE, related_name="providers")
     provider = django_db_models.ForeignKey(Providers, on_delete=django_db_models.CASCADE, related_name="providers")
 
+    # Precomputed count of ProviderPart rows for this (provider, brand) pair -- refreshed
+    # periodically by refresh_brand_provider_part_counts, not computed live. NULL until that
+    # command has run at least once for this row. Added specifically so
+    # src.integrations.services.shopmonkey_sync.available_brands_for_company (ShopMonkey's
+    # brand picker) doesn't GROUP BY the multi-million-row ProviderPart table on every request --
+    # confirmed live 2026-10-14 that doing so times out at Trident's real scale (4.59M rows
+    # across their 15 connected providers). This table was already the right size to answer
+    # "which brands does this provider carry" (7,567 rows platform-wide at the time, one row per
+    # pair that has ever existed, not per part) -- this field is the only piece it was missing.
+    part_count = django_db_models.IntegerField(null=True, blank=True)
+
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
 

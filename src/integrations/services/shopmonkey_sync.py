@@ -26,7 +26,7 @@ Status model, mapped from signals we already have instead of the old tool's prov
 import logging
 import typing
 
-from django.db import models as django_db_models
+from django.core.cache import cache
 from django.utils import timezone
 
 from src import enums as src_enums
@@ -37,6 +37,17 @@ from src.integrations.clients.shopmonkey import exceptions as shopmonkey_excepti
 
 logger = logging.getLogger(__name__)
 _LOG_PREFIX = "[SHOPMONKEY-SYNC]"
+
+# available_brands_for_company's brand/provider/part_count aggregation is a GROUP BY over every
+# ProviderPart row for the company's connected providers -- for Trident (connected to most
+# providers) that's 4.6M+ rows, confirmed live to take 30s+ and 502 at the web server's timeout.
+# That data only changes when a distributor's catalog re-syncs (hours, not seconds), so it's
+# cached here rather than recomputed per request. Warmed proactively by the
+# warm_shopmonkey_available_brands_cache management command (same cadence as
+# sync_shopmonkey_inventory) so a live request should always hit a warm cache; the TTL below is
+# just a safety net in case warming ever falls behind.
+_AVAILABLE_BRANDS_CACHE_KEY_FMT = "shopmonkey:available_brands_base:{company_id}"
+_AVAILABLE_BRANDS_CACHE_TTL_SECONDS = 6 * 60 * 60
 
 _OBSOLETE_PREFIX = "[OBSOLETE] "
 _ERROR_PREFIX = "[ERROR UPDATING PART] "
@@ -58,68 +69,99 @@ def company_connected_provider_ids(company_id: int) -> typing.Set[int]:
     }
 
 
-def available_brands_for_company(company_id: int) -> typing.List[typing.Dict[str, typing.Any]]:
+def _compute_available_brands_base(company_id: int) -> typing.List[typing.Dict[str, typing.Any]]:
     """
-    Brands this company could sync to ShopMonkey, and which of its own connected providers carry
-    each one -- the choice set the brand-picker UI needs. Computed live from ProviderPart, not a
-    fixed allowlist the way the old tool hardcoded one enum per distributor -- a company only
-    ever sees brands its own connected distributors actually have.
+    The expensive(-ish) part of available_brands_for_company: brand/provider/part_count, with
+    none of this company's own sync-configuration state overlaid (that part is cheap and always
+    recomputed fresh -- see available_brands_for_company). Never call this directly from a
+    request path; go through the cached wrapper below.
+
+    Reads BrandProviders (one row per (provider, brand) pair that has ever existed, 7,567 rows
+    platform-wide at the time this was written) rather than GROUP BY-ing ProviderPart itself (a
+    live aggregation over 4.6M+ rows for a company connected to most providers -- confirmed live
+    to take 30s+ and 502 at the web server's timeout on its own, i.e. the cache above isn't
+    enough by itself if what it's caching is still this expensive to *compute* on every warm
+    cycle). part_count on BrandProviders is precomputed by refresh_brand_provider_part_counts,
+    not live here -- see that field's own docstring in src/models.py.
     """
     connected_provider_ids = company_connected_provider_ids(company_id)
     if not connected_provider_ids:
         return []
 
     rows = (
-        src_models.ProviderPart.objects.filter(provider_id__in=connected_provider_ids)
-        .values("master_part__brand_id", "provider_id")
-        .annotate(part_count=django_db_models.Count("id"))
+        src_models.BrandProviders.objects.filter(provider_id__in=connected_provider_ids)
+        .select_related("brand", "provider")
     )
 
-    by_brand: typing.Dict[int, typing.List[typing.Dict[str, typing.Any]]] = {}
+    by_brand: typing.Dict[int, typing.Dict[str, typing.Any]] = {}
     for row in rows:
-        brand_id = row["master_part__brand_id"]
-        if not brand_id:
+        if not row.brand_id:
             continue
-        by_brand.setdefault(brand_id, []).append(
-            {"provider_id": row["provider_id"], "part_count": row["part_count"]}
-        )
-    if not by_brand:
+        entry = by_brand.setdefault(row.brand_id, {"brand_name": row.brand.name, "providers": []})
+        entry["providers"].append({
+            "provider_id": row.provider_id,
+            "provider_kind_name": row.provider.kind_name if row.provider_id else None,
+            # None until refresh_brand_provider_part_counts has run at least once for this pair --
+            # treated as 0 for sort purposes only, not shown as a confirmed zero to the FE.
+            "part_count": row.part_count,
+        })
+
+    result = []
+    for brand_id, entry in by_brand.items():
+        entry["providers"].sort(key=lambda p: -(p["part_count"] or 0))
+        result.append({"brand_id": brand_id, "brand_name": entry["brand_name"], "providers": entry["providers"]})
+    return sorted(result, key=lambda r: r["brand_name"] or "")
+
+
+def refresh_available_brands_cache(company_id: int) -> int:
+    """Forces recomputation of the slow base list and overwrites the cache. Returns the brand count. Called by warm_shopmonkey_available_brands_cache; also safe to call ad hoc after a distributor catalog re-sync."""
+    base = _compute_available_brands_base(company_id)
+    cache.set(_AVAILABLE_BRANDS_CACHE_KEY_FMT.format(company_id=company_id), base, _AVAILABLE_BRANDS_CACHE_TTL_SECONDS)
+    return len(base)
+
+
+def available_brands_for_company(company_id: int) -> typing.List[typing.Dict[str, typing.Any]]:
+    """
+    Brands this company could sync to ShopMonkey, and which of its own connected providers carry
+    each one -- the choice set the brand-picker UI needs. A fixed allowlist the way the old tool
+    hardcoded one enum per distributor wouldn't work here -- a company only ever sees brands its
+    own connected distributors actually have, which differs per company.
+
+    The brand/provider/part_count portion comes from cache (see refresh_available_brands_cache) --
+    confirmed live that computing it per-request times out at Trident's real data volume (4.6M+
+    ProviderPart rows). This company's own sync-configuration (sync_brand_id/enabled/
+    current_provider_id) is NOT part of that cache -- it's a small, fast, per-company query,
+    always run fresh here so toggling a brand on/off is reflected immediately rather than waiting
+    on the cache TTL.
+    """
+    cache_key = _AVAILABLE_BRANDS_CACHE_KEY_FMT.format(company_id=company_id)
+    base = cache.get(cache_key)
+    if base is None:
+        # Cache miss (not yet warmed, or TTL lapsed with warming behind) -- falls back to the slow
+        # live path rather than returning nothing, and populates the cache for next time.
+        base = _compute_available_brands_base(company_id)
+        cache.set(cache_key, base, _AVAILABLE_BRANDS_CACHE_TTL_SECONDS)
+    if not base:
         return []
 
-    brands_by_id = {b.id: b for b in src_models.Brands.objects.filter(id__in=by_brand.keys())}
-    providers_by_id = {p.id: p for p in src_models.Providers.objects.filter(id__in=connected_provider_ids)}
+    brand_ids = [row["brand_id"] for row in base]
     existing_sync_brands = {
         sb.brand_id: sb
         for sb in src_models.ShopMonkeySyncBrand.objects.filter(
-            company_id=company_id, brand_id__in=by_brand.keys()
+            company_id=company_id, brand_id__in=brand_ids
         ).select_related("vendor")
     }
 
     result = []
-    for brand_id, providers in by_brand.items():
-        brand = brands_by_id.get(brand_id)
-        if not brand:
-            continue
-        sync_brand = existing_sync_brands.get(brand_id)
+    for row in base:
+        sync_brand = existing_sync_brands.get(row["brand_id"])
         result.append({
-            "brand_id": brand_id,
-            "brand_name": brand.name,
-            "providers": [
-                {
-                    "provider_id": p["provider_id"],
-                    "provider_kind_name": (
-                        providers_by_id[p["provider_id"]].kind_name
-                        if p["provider_id"] in providers_by_id else None
-                    ),
-                    "part_count": p["part_count"],
-                }
-                for p in sorted(providers, key=lambda x: -x["part_count"])
-            ],
+            **row,
             "sync_brand_id": sync_brand.id if sync_brand else None,
             "enabled": sync_brand.enabled if sync_brand else False,
             "current_provider_id": sync_brand.vendor.provider_id if sync_brand else None,
         })
-    return sorted(result, key=lambda r: r["brand_name"] or "")
+    return result
 
 
 # --------------------------------------------------------------------------------------
