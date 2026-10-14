@@ -413,7 +413,7 @@ class ShopMonkeySyncBrand(django_db_models.Model):
         Company, on_delete=django_db_models.CASCADE, related_name="shopmonkey_sync_brands"
     )
     brand = django_db_models.ForeignKey(
-        Brands, on_delete=django_db_models.CASCADE, related_name="shopmonkey_sync_brands"
+        "Brands", on_delete=django_db_models.CASCADE, related_name="shopmonkey_sync_brands"
     )
     vendor = django_db_models.ForeignKey(
         ShopMonkeySyncVendor, on_delete=django_db_models.CASCADE, related_name="sync_brands"
@@ -453,7 +453,7 @@ class ShopMonkeySyncPart(django_db_models.Model):
         ShopMonkeySyncBrand, on_delete=django_db_models.CASCADE, related_name="sync_parts"
     )
     provider_part = django_db_models.ForeignKey(
-        ProviderPart, on_delete=django_db_models.CASCADE, related_name="shopmonkey_sync_parts"
+        "ProviderPart", on_delete=django_db_models.CASCADE, related_name="shopmonkey_sync_parts"
     )
     shopmonkey_external_id = django_db_models.CharField(max_length=255, null=True, blank=True)
 
