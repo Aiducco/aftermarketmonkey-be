@@ -654,17 +654,18 @@ MOTORSTATE_FTP_DIRECTORY = os.environ.get("MOTORSTATE_FTP_DIRECTORY") or ""
 MOTORSTATE_FEED_LOCAL_PATH = os.environ.get("MOTORSTATE_FEED_LOCAL_PATH", "/tmp/motorstate_feed.csv")
 
 # AllPro Distributing FTP: plain FTP, per-dealer username/password issued by AllPro's own rep
-# (Andrew.Avello@allprob2b.com) on request -- no relay, no shared account. Host/port are the
-# values AllPro sent 2026-10-12 for Trident Motorsports; confirmed live 2026-10-13 that
-# adftp.hhenterprises.com does not resolve yet (NXDOMAIN against AllPro's own nameservers) --
-# kept as the default anyway since it's what their own rep gave us, with no reason yet to think
-# it's wrong rather than not-live-yet. Only a connection/login test exists so far (see
-# clients/allpro/client.py) -- no feed filename is known, so there's nothing to download yet.
+# (Andrew.Avello@allprob2b.com) on request -- no relay, no shared account. AllPro's email
+# 2026-10-12 for Trident Motorsports had a typo -- "adftp.hhenterprises.com" doesn't resolve
+# (confirmed NXDOMAIN 2026-10-13). The real host is "apdftp" (matching the "apd-" account prefix
+# in the username itself) -- confirmed live 2026-10-13: resolves, logs in, and lists three real,
+# actively-updated files (APDInventory.txt, APDLineCodes.txt, MASTER_PRICEFILE.CSV). Only a
+# connection/login test exists so far (see clients/allpro/client.py) -- a real feed client that
+# reads these is separate work.
 try:
     _allpro_ftp_port = int(os.environ.get("ALLPRO_FTP_PORT") or "21")
 except ValueError:
     _allpro_ftp_port = 21
-ALLPRO_FTP_HOST = os.environ.get("ALLPRO_FTP_HOST") or "adftp.hhenterprises.com"
+ALLPRO_FTP_HOST = os.environ.get("ALLPRO_FTP_HOST") or "apdftp.hhenterprises.com"
 ALLPRO_FTP_PORT = _allpro_ftp_port if 1 <= _allpro_ftp_port <= 65535 else 21
 
 # Rough Country EDI (X12 005010) mailbox, hosted by Alluvia. Documents we SEND go to their

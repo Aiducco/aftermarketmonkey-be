@@ -6,10 +6,10 @@ our own relay -- each dealer logs into AllPro's own FTP server directly with a u
 AllPro's rep issues per customer number (see PROVIDER_CATALOG's ALLPRO_DISTRIBUTING entry for the
 request instructions shown to the user).
 
-Only a connection/login test exists here so far -- no feed filename or format is known yet (no
-sample file has ever been read; the one real attempt so far couldn't even resolve the host -- see
-ALLPRO_FTP_HOST's own settings comment). Downloading and parsing a real feed is separate work for
-once that's confirmed; building it now would mean guessing at a file we've never seen.
+Only a connection/login test exists here so far. The connection itself is confirmed live
+2026-10-13 (host, port, and Trident's own apd-9010066 login all work -- three real files sit on
+the account: APDInventory.txt, APDLineCodes.txt, MASTER_PRICEFILE.CSV), but no sample has been
+read yet, so downloading and parsing a real feed from those is separate work.
 """
 import ftplib
 import logging
@@ -68,7 +68,7 @@ class AllProFTPClient:
         self.ftp_host = (
             _normalize_host(raw_host)
             if str(raw_host or "").strip()
-            else _normalize_host(_setting_str("ALLPRO_FTP_HOST", "adftp.hhenterprises.com"))
+            else _normalize_host(_setting_str("ALLPRO_FTP_HOST", "apdftp.hhenterprises.com"))
         )
 
         port_raw = creds.get("ftp_port")
