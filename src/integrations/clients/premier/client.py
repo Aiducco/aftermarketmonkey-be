@@ -20,6 +20,14 @@ DEFAULT_INVENTORY_ZIP_FILENAME = "premier_data_feed_master.zip"
 DEFAULT_INVENTORY_CSV_FILENAME = "premier_data_feed_master.csv"
 DEFAULT_FILE_MAX_AGE_SECONDS = 6 * 60 * 60  # 6 hours
 
+# Premier issues a per-customer filename, not the generic "premier_data_feed_master.zip" its own
+# docs imply -- confirmed live 2026-10-14 for Suncoast Off-Road: their FTP root only has
+# "premier_data_feed Sunco.zip" (plus an unrelated old ItemExport.zip). So the inventory zip is
+# resolved by listing the FTP root and matching this prefix/suffix instead of assuming the fixed
+# name; the CSV inside is still located by extension the same way as before.
+_INVENTORY_ZIP_PREFIX = "premier_data_feed"
+_INVENTORY_ZIP_SUFFIX = ".zip"
+
 # ftp.connect() had no timeout before, so a bad host/firewall could hang the calling thread
 # indefinitely — matters now that test_connection() runs synchronously inside an HTTP request.
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 15
@@ -90,6 +98,35 @@ class PremierFTPClient:
         ftp = self._connect()
         self._disconnect(ftp)
 
+    def _resolve_inventory_filename(self, ftp: ftplib.FTP) -> str:
+        """
+        Find this customer's inventory zip on the FTP root. Falls back to the documented
+        DEFAULT_INVENTORY_ZIP_FILENAME if present (older/other accounts may still use it);
+        otherwise matches "premier_data_feed*.zip" case-insensitively and picks the first hit.
+        """
+        try:
+            names = ftp.nlst()
+        except ftplib.all_errors as e:
+            raise exceptions.PremierFTPConnectionError(
+                "Could not list FTP root to find the inventory file: {}".format(str(e))
+            )
+
+        names_by_lower = {n.lower(): n for n in names}
+        if DEFAULT_INVENTORY_ZIP_FILENAME.lower() in names_by_lower:
+            return names_by_lower[DEFAULT_INVENTORY_ZIP_FILENAME.lower()]
+
+        matches = [
+            n for n in names
+            if n.lower().startswith(_INVENTORY_ZIP_PREFIX) and n.lower().endswith(_INVENTORY_ZIP_SUFFIX)
+        ]
+        if not matches:
+            raise exceptions.PremierFileNotFoundError(
+                "No inventory zip found on FTP (looked for \"{}\" or \"{}*{}\"). Root contents: {}".format(
+                    DEFAULT_INVENTORY_ZIP_FILENAME, _INVENTORY_ZIP_PREFIX, _INVENTORY_ZIP_SUFFIX, names
+                )
+            )
+        return matches[0]
+
     def is_file_outdated(self) -> bool:
         if not os.path.exists(self.local_file_path):
             return True
@@ -111,15 +148,16 @@ class PremierFTPClient:
         ftp = None
         try:
             ftp = self._connect()
+            zip_filename = self._resolve_inventory_filename(ftp)
 
             expected_size = None
             try:
-                expected_size = ftp.size(DEFAULT_INVENTORY_ZIP_FILENAME)
+                expected_size = ftp.size(zip_filename)
             except (ftplib.error_perm, AttributeError):
                 pass
 
             with open(zip_path, "wb") as zip_file:
-                ftp.retrbinary("RETR {}".format(DEFAULT_INVENTORY_ZIP_FILENAME), zip_file.write)
+                ftp.retrbinary("RETR {}".format(zip_filename), zip_file.write)
 
             zip_size = os.path.getsize(zip_path)
             if expected_size is not None and zip_size != expected_size:
@@ -165,7 +203,7 @@ class PremierFTPClient:
         except ftplib.error_perm as e:
             if "550" in str(e):
                 raise exceptions.PremierFileNotFoundError(
-                    "File not found on FTP: {}".format(DEFAULT_INVENTORY_ZIP_FILENAME)
+                    "File not found on FTP: {}".format(zip_filename)
                 )
             raise exceptions.PremierFTPConnectionError("Failed to download: {}".format(str(e)))
         except (exceptions.PremierFileNotFoundError, exceptions.PremierFTPConnectionError):
