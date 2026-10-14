@@ -32,6 +32,30 @@ class ShopManagementConnectionStatus(enum.Enum):
     FAILING = 2
 
 
+class ShopMonkeySyncStatus(enum.Enum):
+    """Status for ShopMonkeySyncVendor/ShopMonkeySyncBrand -- mirrors the old standalone tool's
+    InventoryVendorStatus/InventoryBrandStatus one-for-one. INACTIVE until the vendor/brand is
+    actually created on ShopMonkey (shopmonkey_external_id set), ACTIVE after."""
+    ACTIVE = 1
+    INACTIVE = 2
+
+
+class ShopMonkeySyncPartStatus(enum.Enum):
+    """Mirrors the old tool's InventoryPartStatus one-for-one, including the ERROR state for a
+    part whose last push to ShopMonkey failed."""
+    ACTIVE = 1
+    INACTIVE = 2
+    ERROR = 3
+
+
+class ShopMonkeySyncExecutionStatus(enum.Enum):
+    """Mirrors the old tool's ExecutionStatus (string-valued there too, not int) for
+    ShopMonkeySyncExecution."""
+    RUNNING = "RUNNING"
+    FINISHED = "FINISHED"
+    FAILURE = "FAILURE"
+
+
 class BrandProvider(enum.Enum):
     CATALOG = 1
     DISTRIBUTOR = 2

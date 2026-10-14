@@ -48,6 +48,14 @@ from src.api.views.shop_management import (
     CompanyShopManagementProvidersView,
     CompanyShopManagementProviderDetailView,
 )
+from src.api.views.shopmonkey_inventory import (
+    ShopMonkeyAvailableBrandsView,
+    ShopMonkeySyncBrandsView,
+    ShopMonkeySyncBrandDetailView,
+    ShopMonkeySyncBrandRunView,
+    ShopMonkeySyncBrandPartsView,
+    ShopMonkeySyncExecutionsView,
+)
 from src.api.views.search import SearchFacetsView, SearchView
 from src.api.views.support import SupportTicketsView
 from src.api.views.billing import (
@@ -219,6 +227,36 @@ urlpatterns = [
         "company-shop-management-providers/<int:id>/",
         CompanyShopManagementProviderDetailView.as_view(),
         name="company_shop_management_provider_detail",
+    ),
+    path(
+        "shopmonkey/inventory/available-brands/",
+        ShopMonkeyAvailableBrandsView.as_view(),
+        name="shopmonkey_inventory_available_brands",
+    ),
+    path(
+        "shopmonkey/inventory/sync-brands/",
+        ShopMonkeySyncBrandsView.as_view(),
+        name="shopmonkey_inventory_sync_brands",
+    ),
+    path(
+        "shopmonkey/inventory/sync-brands/<int:id>/",
+        ShopMonkeySyncBrandDetailView.as_view(),
+        name="shopmonkey_inventory_sync_brand_detail",
+    ),
+    path(
+        "shopmonkey/inventory/sync-brands/<int:id>/run/",
+        ShopMonkeySyncBrandRunView.as_view(),
+        name="shopmonkey_inventory_sync_brand_run",
+    ),
+    path(
+        "shopmonkey/inventory/sync-brands/<int:id>/parts/",
+        ShopMonkeySyncBrandPartsView.as_view(),
+        name="shopmonkey_inventory_sync_brand_parts",
+    ),
+    path(
+        "shopmonkey/inventory/executions/",
+        ShopMonkeySyncExecutionsView.as_view(),
+        name="shopmonkey_inventory_executions",
     ),
     path(
         "brands/",

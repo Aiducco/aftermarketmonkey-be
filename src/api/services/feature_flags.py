@@ -16,6 +16,11 @@ from src import models as src_models
 # a migration).
 FEATURE_SHOP_MANAGEMENT = "shop_management"
 
+# Separate from FEATURE_SHOP_MANAGEMENT on purpose -- a company could have ShopMonkey connected
+# without the inventory-sync module being turned on for them yet. Trident Motorsports only while
+# this is being proven out; other companies later.
+FEATURE_SHOPMONKEY_INVENTORY_SYNC = "shopmonkey_inventory_sync"
+
 
 def company_has_feature(company_id: typing.Optional[int], feature: str) -> bool:
     if not company_id:

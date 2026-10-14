@@ -350,6 +350,170 @@ class CompanyFeatureFlags(django_db_models.Model):
         unique_together = ["company", "feature"]
 
 
+# ============================================================
+# SHOPMONKEY INVENTORY SYNC
+# ============================================================
+# Pushes a company's own already-ingested distributor data (MasterPart/ProviderPart/
+# ProviderPartInventory/ProviderPartCompanyPricing -- all already multi-tenant) into that
+# company's ShopMonkey account as inventory parts. Ported from the standalone single-tenant tool
+# at ~/Documents/code/shopmonkey (built for Trident specifically, still live there) -- same
+# vendor -> brand -> part hierarchy and the same create-once/diff-and-update/mark-missing-as-error
+# sync behavior, just reading from data we already have instead of re-fetching from each
+# distributor directly, which is what makes this safe to offer per-company instead of bespoke
+# per-client tooling. See src.integrations.services.shopmonkey_sync for the sync logic itself.
+#
+# Gated behind CompanyFeatureFlags (FEATURE_SHOPMONKEY_INVENTORY_SYNC in
+# src.api.services.feature_flags) -- Trident Motorsports only while this is being proven out.
+
+
+class ShopMonkeySyncVendor(django_db_models.Model):
+    """
+    One row per (company, distributor) the company has chosen to sync into ShopMonkey --
+    mirrors the old tool's InventoryVendor, except scoped per company instead of being the one
+    tool's single global vendor list. ``shopmonkey_external_id`` is created once (POST vendor)
+    the first time any brand under this vendor is synced, then reused for every part pushed
+    under it.
+    """
+
+    company = django_db_models.ForeignKey(
+        Company, on_delete=django_db_models.CASCADE, related_name="shopmonkey_sync_vendors"
+    )
+    provider = django_db_models.ForeignKey(
+        Providers, on_delete=django_db_models.CASCADE, related_name="shopmonkey_sync_vendors"
+    )
+    shopmonkey_external_id = django_db_models.CharField(max_length=255, null=True, blank=True)
+
+    # See src.enums.ShopMonkeySyncStatus -- ACTIVE once created on ShopMonkey, INACTIVE until then.
+    status = django_db_models.PositiveSmallIntegerField()
+    status_name = django_db_models.CharField(max_length=32)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "shopmonkey_sync_vendor"
+        unique_together = ["company", "provider"]
+
+
+class ShopMonkeySyncBrand(django_db_models.Model):
+    """
+    One row per (company, brand) the company has enabled for ShopMonkey sync -- mirrors the old
+    tool's InventoryBrand. ``vendor`` picks which of the company's connected providers sources
+    this brand's parts when more than one of them carries it (see
+    src.integrations.services.shopmonkey_sync.available_brands_for_company for how that choice
+    set is computed). ``shopmonkey_external_id`` is this brand's id on ShopMonkey, created once
+    (POST brand) and reused on every subsequent update.
+
+    ``entity`` is always "Tire" on creation, matching the old tool's own create_brand call exactly
+    (preserved deliberately, not derived from our own product_type classification -- see the
+    shopmonkey_sync module docstring for why).
+    """
+
+    company = django_db_models.ForeignKey(
+        Company, on_delete=django_db_models.CASCADE, related_name="shopmonkey_sync_brands"
+    )
+    brand = django_db_models.ForeignKey(
+        Brands, on_delete=django_db_models.CASCADE, related_name="shopmonkey_sync_brands"
+    )
+    vendor = django_db_models.ForeignKey(
+        ShopMonkeySyncVendor, on_delete=django_db_models.CASCADE, related_name="sync_brands"
+    )
+    shopmonkey_external_id = django_db_models.CharField(max_length=255, null=True, blank=True)
+    entity = django_db_models.CharField(max_length=32, default="Tire")
+
+    enabled = django_db_models.BooleanField(default=True)
+
+    # See src.enums.ShopMonkeySyncStatus.
+    status = django_db_models.PositiveSmallIntegerField()
+    status_name = django_db_models.CharField(max_length=32)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "shopmonkey_sync_brand"
+        unique_together = ["company", "brand"]
+
+
+class ShopMonkeySyncPart(django_db_models.Model):
+    """
+    One row per part actually pushed to ShopMonkey under a ShopMonkeySyncBrand -- mirrors the old
+    tool's InventoryPart. Points straight at the ``ProviderPart`` this came from (no re-fetch, no
+    separate raw-data cache the way the old tool needed one per distributor) and carries what was
+    last pushed so a sync run only calls ShopMonkey again when something actually changed, exactly
+    like the old tool's own diff.
+
+    ``status`` ACTIVE/INACTIVE/ERROR mirrors the old tool's InventoryPartStatus one-for-one,
+    including the same "[OBSOLETE] " / "[ERROR UPDATING PART] " name-prefix convention when a
+    part disappears from our own data or fails to push -- see
+    src.integrations.services.shopmonkey_sync for where those are applied.
+    """
+
+    sync_brand = django_db_models.ForeignKey(
+        ShopMonkeySyncBrand, on_delete=django_db_models.CASCADE, related_name="sync_parts"
+    )
+    provider_part = django_db_models.ForeignKey(
+        ProviderPart, on_delete=django_db_models.CASCADE, related_name="shopmonkey_sync_parts"
+    )
+    shopmonkey_external_id = django_db_models.CharField(max_length=255, null=True, blank=True)
+
+    last_pushed_name = django_db_models.CharField(max_length=255, null=True, blank=True)
+    last_pushed_retail_cost_cents = django_db_models.DecimalField(
+        max_digits=28, decimal_places=8, null=True, blank=True
+    )
+    last_pushed_wholesale_cost_cents = django_db_models.DecimalField(
+        max_digits=28, decimal_places=8, null=True, blank=True
+    )
+
+    # See src.enums.ShopMonkeySyncPartStatus.
+    status = django_db_models.PositiveSmallIntegerField()
+    status_name = django_db_models.CharField(max_length=32)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "shopmonkey_sync_part"
+        unique_together = ["sync_brand", "provider_part"]
+        indexes = [
+            django_db_models.Index(fields=["sync_brand", "status"], name="smsp_sync_brand_status_idx"),
+        ]
+
+
+class ShopMonkeySyncExecution(django_db_models.Model):
+    """
+    One row per sync run -- mirrors the old tool's CommandExecutionLog, which is exactly what a
+    monitoring page reads there today (confirmed live: 200K+ rows, actively queried for recent
+    runs and failure rates). ``sync_brand`` is null for a company-wide run that covers every
+    enabled brand in one pass; set for a single manual "sync now" on one brand.
+    """
+
+    company = django_db_models.ForeignKey(
+        Company, on_delete=django_db_models.CASCADE, related_name="shopmonkey_sync_executions"
+    )
+    sync_brand = django_db_models.ForeignKey(
+        ShopMonkeySyncBrand,
+        on_delete=django_db_models.CASCADE,
+        related_name="sync_executions",
+        null=True,
+        blank=True,
+    )
+
+    # See src.enums.ShopMonkeySyncExecutionStatus.
+    status = django_db_models.CharField(max_length=16)
+    message = django_db_models.TextField(null=True, blank=True)
+    metadata = django_db_models.JSONField(default=dict)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "shopmonkey_sync_execution"
+        indexes = [
+            django_db_models.Index(fields=["company", "-created_at"], name="smse_company_created_idx"),
+        ]
+
+
 class CustomIntegrationRequest(django_db_models.Model):
     company = django_db_models.ForeignKey(
         Company, on_delete=django_db_models.CASCADE, related_name="custom_integration_requests"
