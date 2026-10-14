@@ -18,6 +18,7 @@ from django.utils import timezone
 from src import constants as src_constants
 from src import enums as src_enums
 from src import models as src_models
+from src.api.services import feature_flags as feature_flags_services
 from src.integrations.clients.shopmonkey import client as shopmonkey_client
 from src.integrations.clients.shopmonkey import exceptions as shopmonkey_exceptions
 
@@ -32,6 +33,7 @@ CONNECTION_ERROR_INVALID_INPUT = "invalid_input"
 CONNECTION_ERROR_INVALID_CREDENTIALS = "invalid_credentials"
 CONNECTION_ERROR_CONNECTION_FAILED = "connection_failed"
 CONNECTION_ERROR_NOT_FOUND = "not_found"
+CONNECTION_ERROR_FEATURE_NOT_AVAILABLE = "feature_not_available"
 
 _SENSITIVE_CREDENTIAL_KEY_SUBSTRINGS = ("password", "secret", "key", "token")
 
@@ -192,8 +194,20 @@ def _redacted_credentials(
 
 
 def get_shop_management_catalog(company_id: int) -> typing.Dict:
-    """Catalog of connectable shop-management systems with per-company connection status."""
+    """
+    Catalog of connectable shop-management systems with per-company connection status.
+
+    The whole category is staged behind FEATURE_SHOP_MANAGEMENT (see
+    src.api.services.feature_flags) -- a company without the flag gets an empty catalog, same
+    shape as "no shop-management systems exist yet", so the frontend needs no special case for
+    "not available to you" vs "nothing to show".
+    """
     logger.info("{} Fetching shop management catalog for company_id: {}.".format(_LOG_PREFIX, company_id))
+
+    if not feature_flags_services.company_has_feature(
+        company_id, feature_flags_services.FEATURE_SHOP_MANAGEMENT
+    ):
+        return {"data": [], "categories": []}
 
     company_connections_by_provider_id = {
         c.provider_id: c
@@ -273,7 +287,15 @@ def connect_provider(
     Create, or idempotently update, a ``CompanyShopManagementProviders`` row (keyed by
     company + provider). Validates credentials with a live ``test_connection()`` call before
     persisting anything. Returns (data, error_message, error_code).
+
+    Gated behind FEATURE_SHOP_MANAGEMENT independently of the catalog endpoint -- the catalog
+    hides the option, but a direct API call must not be able to connect around that.
     """
+    if not feature_flags_services.company_has_feature(
+        company_id, feature_flags_services.FEATURE_SHOP_MANAGEMENT
+    ):
+        return None, "Shop management integrations are not available for this company yet.", CONNECTION_ERROR_FEATURE_NOT_AVAILABLE
+
     provider = src_models.ShopManagementProviders.objects.filter(id=provider_id).first()
     if not provider:
         return None, "Provider not found", CONNECTION_ERROR_NOT_FOUND

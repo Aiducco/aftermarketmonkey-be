@@ -324,6 +324,32 @@ class IntegrationRequest(django_db_models.Model):
         unique_together = ["company", "provider"]
 
 
+class CompanyFeatureFlags(django_db_models.Model):
+    """
+    Per-company feature gate, independent of plan tier -- for staged rollouts where a feature
+    needs to reach one company (or a short allowlist) before it's ready for everyone. ``feature``
+    is a plain string, not an FK or enum, so adding a new gated feature never needs a migration --
+    see FEATURE_* constants in src.api.services.feature_flags for the names actually checked.
+
+    First use: the ShopMonkey shop-management integration (see ShopManagementProviders /
+    CompanyShopManagementProviders), enabled only for Trident Motorsports (company_id=16, our own
+    internal account) while it's being built out.
+    """
+
+    company = django_db_models.ForeignKey(
+        Company, on_delete=django_db_models.CASCADE, related_name="feature_flags"
+    )
+    feature = django_db_models.CharField(max_length=64)
+    enabled = django_db_models.BooleanField(default=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "company_feature_flags"
+        unique_together = ["company", "feature"]
+
+
 class CustomIntegrationRequest(django_db_models.Model):
     company = django_db_models.ForeignKey(
         Company, on_delete=django_db_models.CASCADE, related_name="custom_integration_requests"

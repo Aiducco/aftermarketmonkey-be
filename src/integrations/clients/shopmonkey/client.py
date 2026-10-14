@@ -4,11 +4,12 @@ token on every request — no token exchange, unlike Premier's apiKey->session-t
 ``src/integrations/clients/premier/order_client.py``, the closest existing template this
 mirrors).
 
-KNOWN GAP: the exact base URL, auth header name, and which endpoint is cheapest/safest to use
-for ``test_connection()`` have not been confirmed against ShopMonkey's current API docs — treat
-``settings.SHOPMONKEY_API_BASE_URL`` and the endpoint below as best-effort until verified. Auth
-and request handling are centralized in ``_request()`` specifically so that confirmation only
-requires changing this one file.
+Confirmed 2026-10-14 against shopmonkey.dev: a bearer token (an API key generated in the
+ShopMonkey app at Settings > Integration > API Keys, not an OAuth2 client_id/client_secret flow —
+no app-registration or authorization-code flow exists in their public docs), base URL
+``https://api.shopmonkey.cloud/v3`` (``settings.SHOPMONKEY_API_BASE_URL``'s own default), and
+their own purpose-built key-validation endpoint (``GET auth/api_key/status``) for
+``test_connection()`` rather than a guessed general-purpose one.
 
 Write operations (e.g. pushing parts onto a repair order) are intentionally not implemented yet
 — this client currently only supports validating that an api_key works.
@@ -91,5 +92,6 @@ class ShopMonkeyApiClient(object):
 
     def test_connection(self) -> None:
         """Cheap connectivity/auth probe — confirms the api_key is accepted without touching
-        any customer/repair-order data."""
-        self._request(endpoint="shop", method=common_enums.HttpMethod.GET)
+        any customer/repair-order data. ShopMonkey's own documented example:
+        ``curl https://api.shopmonkey.cloud/v3/auth/api_key/status -H 'Authorization: Bearer ...'``"""
+        self._request(endpoint="auth/api_key/status", method=common_enums.HttpMethod.GET)

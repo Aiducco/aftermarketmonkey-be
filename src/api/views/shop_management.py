@@ -92,7 +92,12 @@ class ShopManagementProviderConnectView(views.View):
             credentials=credentials,
         )
         if err:
-            status = 404 if error_code == shop_management_services.CONNECTION_ERROR_NOT_FOUND else 400
+            if error_code == shop_management_services.CONNECTION_ERROR_NOT_FOUND:
+                status = 404
+            elif error_code == shop_management_services.CONNECTION_ERROR_FEATURE_NOT_AVAILABLE:
+                status = 403
+            else:
+                status = 400
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
                 content=simplejson.dumps({"message": err, "error_code": error_code}),
@@ -200,7 +205,12 @@ class ShopManagementConnectionView(views.View):
             credentials=patch,
         )
         if err:
-            status = 404 if error_code == shop_management_services.CONNECTION_ERROR_NOT_FOUND else 400
+            if error_code == shop_management_services.CONNECTION_ERROR_NOT_FOUND:
+                status = 404
+            elif error_code == shop_management_services.CONNECTION_ERROR_FEATURE_NOT_AVAILABLE:
+                status = 403
+            else:
+                status = 400
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
                 content=simplejson.dumps({"message": err, "error_code": error_code}),
