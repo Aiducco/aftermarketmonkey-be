@@ -280,14 +280,28 @@ def _report_sync_progress(cp: src_models.CompanyProviders, message: str) -> None
     cp.save(update_fields=["status_reason", "status_checked_at"])
 
 
-def fetch_tristate_inventory_and_pricing_for_company(company_provider_id: int) -> int:
+# A full-catalog run takes well over an hour, so a run can get killed partway through by
+# anything that restarts the app process (a deploy, a server restart) -- defaulting to "skip
+# whatever already has fresh pricing" means a relaunch picks up roughly where the last one left
+# off instead of redoing completed work from zero. Pass 0 to force a full re-fetch of everything.
+DEFAULT_RESUME_SKIP_HOURS = 6
+
+
+def fetch_tristate_inventory_and_pricing_for_company(
+    company_provider_id: int, resume_skip_hours: float = DEFAULT_RESUME_SKIP_HOURS
+) -> int:
     """
     For one company's Tri-State connection: call get_inventory_and_pricing (aliasing=True) for
     every TSEParts row, sending each brand's warehouse_code when known or its aaia_code
     otherwise. Writes quantity/orderable/per-warehouse breakdown to TSEParts (shared -- see its
     docstring), backfills TSEBrand.warehouse_code from whatever aliasing resolves, and upserts
     cost/list_price into TSECompanyPricing for this company. Returns the number of
-    TSECompanyPricing rows upserted.
+    TSECompanyPricing rows upserted (this run only -- rows skipped as already-fresh don't count).
+
+    Resumable: parts with a TSECompanyPricing row for this company updated within the last
+    ``resume_skip_hours`` are skipped entirely (see DEFAULT_RESUME_SKIP_HOURS above) -- a
+    relaunch after an interruption continues roughly where the previous run stopped rather than
+    re-fetching everything. Pass ``resume_skip_hours=0`` to force a full re-fetch.
 
     Progress (batches done/total, items fetched, rows written) is written to
     CompanyProviders.status_reason as it runs -- see _report_sync_progress.
@@ -312,13 +326,35 @@ def fetch_tristate_inventory_and_pricing_for_company(company_provider_id: int) -
         )
         return 0
 
-    parts = list(
-        src_models.TSEParts.objects.select_related("brand").values(
-            "id", "part_number", "brand_id", "brand__warehouse_code", "brand__aaia_code"
+    parts_qs = src_models.TSEParts.objects.select_related("brand")
+    already_fresh_count = 0
+    if resume_skip_hours:
+        cutoff = timezone.now() - timezone.timedelta(hours=resume_skip_hours)
+        already_fresh_ids = set(
+            src_models.TSECompanyPricing.objects.filter(
+                company_id=cp.company_id, updated_at__gte=cutoff
+            ).values_list("part_id", flat=True)
         )
+        if already_fresh_ids:
+            already_fresh_count = len(already_fresh_ids)
+            parts_qs = parts_qs.exclude(id__in=already_fresh_ids)
+
+    parts = list(
+        parts_qs.values("id", "part_number", "brand_id", "brand__warehouse_code", "brand__aaia_code")
     )
+    if already_fresh_count:
+        logger.info(
+            "{} company_provider_id={}: skipping {} part(s) already synced in the last {}h "
+            "(resuming from an earlier run).".format(
+                _LOG_PREFIX, company_provider_id, already_fresh_count, resume_skip_hours
+            )
+        )
     if not parts:
-        logger.info("{} company_provider_id={}: no TSEParts yet.".format(_LOG_PREFIX, company_provider_id))
+        logger.info(
+            "{} company_provider_id={}: nothing left to sync ({} already fresh).".format(
+                _LOG_PREFIX, company_provider_id, already_fresh_count
+            )
+        )
         return 0
 
     # The token actually sent per item -- warehouse_code when known, else aaia_code (aliasing
@@ -378,8 +414,11 @@ def fetch_tristate_inventory_and_pricing_for_company(company_provider_id: int) -
             total_pricing_written += len(pricing_upserts)
             pricing_upserts = []
 
+    skip_note = (
+        " ({} part(s) already fresh, skipped)".format(already_fresh_count) if already_fresh_count else ""
+    )
     _report_sync_progress(
-        cp, "Tri-State sync starting: 0/{} batches ({} parts).".format(total_chunks, len(parts))
+        cp, "Tri-State sync starting: 0/{} batches ({} parts){}.".format(total_chunks, len(parts), skip_note)
     )
 
     with ThreadPoolExecutor(max_workers=PRICING_FETCH_WORKERS) as executor:
