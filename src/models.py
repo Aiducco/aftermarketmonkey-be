@@ -1520,10 +1520,12 @@ class TSEBrand(django_db_models.Model):
     their own public catalog/Algolia data -- see src.management.commands.seed_tse_brands), not
     fetched live. ``warehouse_code`` is the real PACE API's own brand code (e.g. "AIR" for Air
     Lift) needed to call get_inventory_and_pricing -- distinct from aaia_code, and NOT present
-    anywhere in the public Algolia catalog data (confirmed by exhaustive grep); only resolved one
-    brand at a time via an authenticated catalog-page fetch, so most rows start out null here and
-    get filled in as each brand is confirmed. A brand with no warehouse_code yet is simply
-    skipped by the pricing sync rather than failing (see master_parts.sync_provider_pricing_from_tristate_for_company).
+    anywhere in the public Algolia catalog data (confirmed by exhaustive grep). Self-heals rather
+    than needing manual scraping: get_inventory_and_pricing's ``aliasing=true`` option resolves
+    an AAIA code against the real warehouse code directly (confirmed live), so
+    src.integrations.services.tristate.fetch_tristate_inventory_and_pricing_for_company always
+    passes aliasing and backfills this field from the resolved ``brand_code`` the first time a
+    brand's items come back matched -- most rows just start out null until that happens.
     """
 
     aaia_code = django_db_models.CharField(max_length=16, unique=True)
@@ -1555,10 +1557,20 @@ class TSEParts(django_db_models.Model):
     from part_number (same single-key shape as DlgParts), since the source is TriStatePart's own
     Algolia-derived catalog slice (see sync_master_parts_from_tristate, which populates this
     table from ``tristate_parts`` rather than a live distributor feed -- Tri-State's real PACE
-    API has no bulk catalog dump, only a per-(warehouse_code, part_number) pricing/inventory
-    lookup). ``description``/``image_url`` are carried here for display; live cost/jobber/core
-    and quantity for a specific company come from TSECompanyPricing, fetched through the real
-    API one batch of known parts at a time.
+    API has no bulk catalog dump, only a per-(brand_code, part_number) pricing/inventory lookup).
+    ``description``/``image_url`` are carried here for display.
+
+    ``quantity_available``/``orderable``/``warehouse_availability`` live HERE, not on
+    TSECompanyPricing -- confirmed live that ``inventory``/``inventory_locations`` from
+    get_inventory_and_pricing are Tri-State's actual physical warehouse stock, the same
+    regardless of which account's credentials ask (only ``account_price`` is genuinely
+    account-specific) -- same split as every other distributor's shared catalog table carrying
+    quantity (KeystoneParts.total_qty, MeyerParts.available_qty) while *CompanyPricing carries
+    price only. Refreshed from whichever company's connection happens to call the API (right
+    now, only Trident/the primary connection has real credentials) via
+    src.integrations.services.tristate.fetch_tristate_inventory_and_pricing_for_company.
+    ``warehouse_availability`` mirrors ProviderPartInventory's own field: a dict of
+    ``{location_name: quantity}`` built from the response's ``inventory_locations`` list.
     """
 
     brand = django_db_models.ForeignKey(TSEBrand, on_delete=django_db_models.CASCADE, related_name="parts")
@@ -1567,6 +1579,11 @@ class TSEParts(django_db_models.Model):
     image_url = django_db_models.TextField(null=True, blank=True)
     category = django_db_models.CharField(max_length=255, null=True, blank=True)
     subcategory = django_db_models.CharField(max_length=255, null=True, blank=True)
+
+    quantity_available = django_db_models.IntegerField(null=True, blank=True)
+    orderable = django_db_models.BooleanField(default=True)
+    warehouse_availability = django_db_models.JSONField(null=True, blank=True)
+    inventory_synced_at = django_db_models.DateTimeField(null=True, blank=True)
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
@@ -1578,13 +1595,12 @@ class TSEParts(django_db_models.Model):
 
 class TSECompanyPricing(django_db_models.Model):
     """
-    Per-company Tri-State pricing AND inventory for a catalog row (TSEParts), fetched live from
-    the real PACE Customer API's get_inventory_and_pricing (not a feed file) -- unlike every
-    other distributor's *CompanyPricing table, a row here is only ever as fresh as its last
-    on-demand API call, since Tri-State's API returns account-specific pricing directly rather
-    than publishing a dealer-wide feed. ``quantity_available``/``orderable`` are kept here
-    (rather than only in ProviderPartInventory) so the raw API response is preserved per
-    company, the same role every other distributor's raw *Parts/*CompanyPricing split plays.
+    Per-company Tri-State PRICING for a catalog row (TSEParts), fetched live from the real PACE
+    Customer API's get_inventory_and_pricing (not a feed file) -- unlike every other
+    distributor's *CompanyPricing table, a row here is only ever as fresh as its last on-demand
+    API call, since Tri-State's API returns account-specific pricing directly rather than
+    publishing a dealer-wide feed. Quantity/availability is NOT here -- see TSEParts' own
+    docstring for why that's shared/catalog-level instead.
     """
 
     part = django_db_models.ForeignKey(TSEParts, on_delete=django_db_models.CASCADE, related_name="company_pricing")
@@ -1594,8 +1610,6 @@ class TSECompanyPricing(django_db_models.Model):
     # list_price from the same response -- Tri-State's own MSRP/list, not a separate dealer tier
     # (the real API has no distinct "jobber" price -- account_price IS the dealer price).
     list_price = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
-    quantity_available = django_db_models.IntegerField(null=True)
-    orderable = django_db_models.BooleanField(default=True)
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)

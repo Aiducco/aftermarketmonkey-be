@@ -37,6 +37,7 @@ PROVIDER_DISPLAY_NAMES = {
     "TIRERACK": "TireRack",
     "MOTOR_STATE_DISTRIBUTING": "Motor State Distributing",
     "QUADRATEC": "Quadratec",
+    "TRI_STATE": "Tri-State",
 }
 
 # Provider kind_name -> image URL (used by parts API)
@@ -76,6 +77,7 @@ PROVIDER_IMAGE_URLS = {
     "TIRERACK": "https://api.aftermarketscout.com/uploads/tirerack_logo.png",
     "MOTOR_STATE_DISTRIBUTING": "https://api.aftermarketscout.com/uploads/motor_state_logo.png",
     "QUADRATEC": "https://api.aftermarketscout.com/uploads/quadratec_logo.png",
+    "TRI_STATE": "https://api.aftermarketscout.com/uploads/tristate.png",
 }
 
 # Public "open in distributor" links (parts API ``provider_go_to_link``); ``urllib.parse.quote`` at call sites.

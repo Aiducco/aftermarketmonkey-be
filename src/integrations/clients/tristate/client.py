@@ -131,22 +131,37 @@ class TriStateApiClient:
         return data if isinstance(data, list) else []
 
     def get_inventory_and_pricing(
-        self, items: typing.Sequence[typing.Tuple[str, str]]
+        self, items: typing.Sequence[typing.Tuple[str, str]], aliasing: bool = True
     ) -> typing.List[typing.Dict]:
         """
-        ``items``: a sequence of (warehouse_brand_code, part_number) pairs, e.g.
-        ``[("AIR", "25980EZ"), ("WIX", "51515")]`` -- ``warehouse_brand_code`` is Tri-State's own
-        internal brand code (TSEBrand.warehouse_code), NOT the generic AAIA code -- confirmed
-        live these are different namespaces (Air Lift is AAIA "BBCG" but warehouse code "AIR").
+        ``items``: a sequence of (brand_code, part_number) pairs, e.g.
+        ``[("AIR", "25980EZ"), ("WIX", "51515")]``. ``brand_code`` can be either Tri-State's own
+        internal warehouse brand code (TSEBrand.warehouse_code, e.g. "AIR" for Air Lift) OR the
+        generic AAIA code (e.g. "BBCG") when ``aliasing=True`` -- confirmed live: with
+        aliasing, PACE matches the supplied code against both namespaces and against normalized
+        part numbers, and echoes back the resolved pair as ``brand_code``/``aaia_brand_code`` on
+        each result row. A result with no ``aaia_brand_code`` key means aliasing found no match
+        at all for that item (not merely zero stock) -- see
+        src.integrations.services.tristate._resolve_response_identity.
+
+        ``aliasing`` defaults True: confirmed live it resolves already-correct warehouse codes
+        just as well as unresolved AAIA codes (both come back with the same enriched shape), so
+        there's no real downside to always leaving it on other than PACE's documented extra
+        per-item DB lookup cost -- and it's what lets TSEBrand.warehouse_code get filled in over
+        time without a separate manual-scraping step.
 
         Returns the raw ``data`` list verbatim (one dict per item, each carrying brand_code,
         part_number, description, orderable, account_number, account_price, list_price,
-        inventory, inventory_locations) -- confirmed real shape, see this module's docstring.
-        Callers needing more than DEFAULT_ITEMS_BATCH_SIZE items must batch themselves (see
-        src.integrations.services.tristate.fetch_tristate_inventory_and_pricing).
+        inventory, inventory_locations, and -- when aliasing resolved it -- aaia_brand_code) --
+        confirmed real shape, see this module's docstring. Callers needing more than
+        DEFAULT_ITEMS_BATCH_SIZE items must batch themselves (see
+        src.integrations.services.tristate.fetch_tristate_inventory_and_pricing_for_company).
         """
         items_param = ",".join("{}|{}".format(brand_code, part_number) for brand_code, part_number in items)
         if not items_param:
             return []
-        data = self._call("get_inventory_and_pricing", params={"items": items_param})
+        params = {"items": items_param}
+        if aliasing:
+            params["aliasing"] = "true"
+        data = self._call("get_inventory_and_pricing", params=params)
         return data if isinstance(data, list) else []

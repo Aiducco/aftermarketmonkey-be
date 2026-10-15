@@ -16,10 +16,14 @@ is built around two separate, narrower jobs instead of one feed-ingest job:
      TSEBrand just stays unmapped (logged), and is skipped everywhere downstream.
 
   2. ``fetch_tristate_inventory_and_pricing_for_company`` -- the actual live sync: for a given
-     company's connection, batch-call get_inventory_and_pricing for every TSEParts row under a
-     TSEBrand that has a confirmed ``warehouse_code`` (see TSEBrand's own docstring for why most
-     rows don't have one yet), and upsert the results into TSECompanyPricing. This is the
-     function wired into integration_pricing_sync_jobs._fetch_raw_pricing.
+     company's connection, batch-call get_inventory_and_pricing (always with ``aliasing=True``)
+     for every TSEParts row, sending the brand's ``warehouse_code`` when known or its
+     ``aaia_code`` otherwise -- aliasing resolves either against PACE's real brand_code and
+     echoes back the match (confirmed live, see TSEBrand's own docstring), so this also
+     self-heals ``TSEBrand.warehouse_code`` over time rather than needing it pre-populated.
+     Quantity/availability (shared, account-agnostic -- confirmed live) is written to TSEParts;
+     cost/list_price (genuinely account-specific) is upserted into TSECompanyPricing for this
+     company. This is the function wired into integration_pricing_sync_jobs._fetch_raw_pricing.
 
 TSEParts itself is NOT populated here -- see
 src.management.commands.sync_tse_parts_catalog, which copies from the already-imported
@@ -171,15 +175,27 @@ def _active_tse_company_providers_queryset():
     ).select_related("company", "provider")
 
 
+def _warehouse_availability(locations: typing.Any) -> typing.Optional[typing.Dict[str, int]]:
+    """``inventory_locations`` ([{location_name, location_inventory}, ...]) -> {name: qty}."""
+    if not isinstance(locations, list):
+        return None
+    out: typing.Dict[str, int] = {}
+    for loc in locations:
+        name = (loc or {}).get("location_name")
+        qty = (loc or {}).get("location_inventory")
+        if name is not None and qty is not None:
+            out[name] = qty
+    return out or None
+
+
 def fetch_tristate_inventory_and_pricing_for_company(company_provider_id: int) -> int:
     """
-    For one company's Tri-State connection: call get_inventory_and_pricing for every TSEParts
-    row whose brand has a known warehouse_code, batched DEFAULT_ITEMS_BATCH_SIZE items at a
-    time, and upsert the results into TSECompanyPricing. Returns the number of rows upserted.
-
-    Brands with no warehouse_code yet (most of them -- see TSEBrand's docstring) are skipped
-    entirely rather than failing the whole sync; this simply widens in coverage as more
-    warehouse codes get confirmed, no code change required.
+    For one company's Tri-State connection: call get_inventory_and_pricing (aliasing=True) for
+    every TSEParts row, sending each brand's warehouse_code when known or its aaia_code
+    otherwise. Writes quantity/orderable/per-warehouse breakdown to TSEParts (shared -- see its
+    docstring), backfills TSEBrand.warehouse_code from whatever aliasing resolves, and upserts
+    cost/list_price into TSECompanyPricing for this company. Returns the number of
+    TSECompanyPricing rows upserted.
     """
     cp = (
         src_models.CompanyProviders.objects.filter(id=company_provider_id)
@@ -202,25 +218,29 @@ def fetch_tristate_inventory_and_pricing_for_company(company_provider_id: int) -
         return 0
 
     parts = list(
-        src_models.TSEParts.objects.filter(brand__warehouse_code__isnull=False)
-        .exclude(brand__warehouse_code="")
-        .select_related("brand")
-        .values("id", "part_number", "brand__warehouse_code")
+        src_models.TSEParts.objects.select_related("brand").values(
+            "id", "part_number", "brand_id", "brand__warehouse_code", "brand__aaia_code"
+        )
     )
     if not parts:
-        logger.info(
-            "{} company_provider_id={}: no TSEParts with a known warehouse_code yet. "
-            "Nothing to price.".format(_LOG_PREFIX, company_provider_id)
-        )
+        logger.info("{} company_provider_id={}: no TSEParts yet.".format(_LOG_PREFIX, company_provider_id))
         return 0
+
+    # The token actually sent per item -- warehouse_code when known, else aaia_code (aliasing
+    # resolves either, see this module's and the client's docstrings).
+    for row in parts:
+        row["_sent_token"] = (row.get("brand__warehouse_code") or row["brand__aaia_code"]).upper()
+
+    by_sent_token = {(row["_sent_token"], row["part_number"].upper()): row for row in parts}
+    by_aaia = {(row["brand__aaia_code"].upper(), row["part_number"].upper()): row for row in parts}
 
     batch_size = tristate_client.DEFAULT_ITEMS_BATCH_SIZE
     chunks = [parts[i : i + batch_size] for i in range(0, len(parts), batch_size)]
 
     def _fetch_chunk(chunk: typing.List[typing.Dict]) -> typing.List[typing.Dict]:
-        items = [(row["brand__warehouse_code"], row["part_number"]) for row in chunk]
+        items = [(row["_sent_token"], row["part_number"]) for row in chunk]
         try:
-            return client.get_inventory_and_pricing(items)
+            return client.get_inventory_and_pricing(items, aliasing=True)
         except tristate_exceptions.TriStateException as e:
             logger.error(
                 "{} company_provider_id={}: get_inventory_and_pricing failed for a batch of {}: {}".format(
@@ -239,43 +259,87 @@ def fetch_tristate_inventory_and_pricing_for_company(company_provider_id: int) -
         logger.info("{} company_provider_id={}: no results from the API.".format(_LOG_PREFIX, company_provider_id))
         return 0
 
-    part_by_key = {
-        (row["brand__warehouse_code"].upper(), row["part_number"].upper()): row["id"] for row in parts
-    }
     now = timezone.now()
-    to_upsert = []
+    pricing_upserts = []
+    part_updates = []
+    brand_warehouse_code_updates: typing.Dict[int, str] = {}
+
     for item in results:
-        key = ((item.get("brand_code") or "").upper(), (item.get("part_number") or "").upper())
-        part_id = part_by_key.get(key)
-        if not part_id:
+        part_number_u = (item.get("part_number") or "").upper()
+        brand_code_u = (item.get("brand_code") or "").upper()
+        aaia_brand_code = item.get("aaia_brand_code")
+
+        row = by_sent_token.get((brand_code_u, part_number_u))
+        if row is None and aaia_brand_code:
+            row = by_aaia.get((aaia_brand_code.upper(), part_number_u))
+        if row is None:
             continue
-        to_upsert.append(
+
+        part_updates.append(
+            src_models.TSEParts(
+                id=row["id"],
+                quantity_available=item.get("inventory"),
+                orderable=bool(item.get("orderable", 1)),
+                warehouse_availability=_warehouse_availability(item.get("inventory_locations")),
+                inventory_synced_at=now,
+            )
+        )
+        pricing_upserts.append(
             src_models.TSECompanyPricing(
-                part_id=part_id,
+                part_id=row["id"],
                 company_id=cp.company_id,
                 cost=item.get("account_price"),
                 list_price=item.get("list_price"),
-                quantity_available=item.get("inventory"),
-                orderable=bool(item.get("orderable", 1)),
                 updated_at=now,
             )
         )
+        # Resolved via aliasing against a real warehouse brand_code -- backfill so future runs
+        # for this brand skip straight to the cheaper non-aliased path. aaia_brand_code is only
+        # present when aliasing actually matched the item (see the client's docstring).
+        if aaia_brand_code and item.get("brand_code"):
+            brand_warehouse_code_updates[row["brand_id"]] = item["brand_code"]
+
+    if part_updates:
+        src_models.TSEParts.objects.bulk_update(
+            part_updates,
+            ["quantity_available", "orderable", "warehouse_availability", "inventory_synced_at"],
+            batch_size=2000,
+        )
 
     written = 0
-    for start in range(0, len(to_upsert), PRICING_UPSERT_BATCH):
-        batch = to_upsert[start : start + PRICING_UPSERT_BATCH]
+    for start in range(0, len(pricing_upserts), PRICING_UPSERT_BATCH):
+        batch = pricing_upserts[start : start + PRICING_UPSERT_BATCH]
         pgbulk.upsert(
             src_models.TSECompanyPricing,
             batch,
             unique_fields=["part", "company"],
-            update_fields=["cost", "list_price", "quantity_available", "orderable", "updated_at"],
+            update_fields=["cost", "list_price", "updated_at"],
             returning=False,
         )
         written += len(batch)
 
+    if brand_warehouse_code_updates:
+        brands_to_update = []
+        existing = {
+            b.id: b for b in src_models.TSEBrand.objects.filter(id__in=brand_warehouse_code_updates.keys())
+        }
+        for brand_id, resolved_code in brand_warehouse_code_updates.items():
+            brand = existing.get(brand_id)
+            if brand and brand.warehouse_code != resolved_code:
+                brand.warehouse_code = resolved_code
+                brands_to_update.append(brand)
+        if brands_to_update:
+            src_models.TSEBrand.objects.bulk_update(brands_to_update, ["warehouse_code"], batch_size=500)
+            logger.info(
+                "{} Backfilled warehouse_code for {} TSE brand(s) via aliasing.".format(
+                    _LOG_PREFIX, len(brands_to_update)
+                )
+            )
+
     logger.info(
-        "{} company_provider_id={}: fetched {} items, upserted {} TSECompanyPricing rows.".format(
-            _LOG_PREFIX, company_provider_id, len(results), written
+        "{} company_provider_id={}: fetched {} items, updated {} TSEParts, upserted {} "
+        "TSECompanyPricing rows.".format(
+            _LOG_PREFIX, company_provider_id, len(results), len(part_updates), written
         )
     )
     return written

@@ -2379,11 +2379,11 @@ def sync_master_parts_from_tristate() -> None:
 
 def sync_provider_inventory_from_tristate() -> None:
     """
-    Sync ProviderPartInventory from TSECompanyPricing -- sourced from whichever company has the
-    real Tri-State API connection (see CompanyProviders.primary), mirroring how every other
-    on-demand-only provider's "global" inventory snapshot is just its primary company's own data
-    rather than a true distributor-wide figure. Skipped entirely if no primary connection has
-    priced anything yet.
+    Sync ProviderPartInventory from TSEParts -- quantity/availability lives on the shared
+    catalog table, not per company (confirmed live: Tri-State's physical warehouse stock is the
+    same regardless of which account's credentials asked -- see TSEParts' own docstring),
+    mirroring exactly how Keystone/Meyer's inventory sync reads their own *Parts table directly
+    rather than *CompanyPricing.
     """
     logger.info("{} Syncing provider inventory from TSE.".format(_LOG_PREFIX))
 
@@ -2392,16 +2392,6 @@ def sync_provider_inventory_from_tristate() -> None:
     ).first()
     if not tse_provider:
         logger.info("{} No TSE provider found.".format(_LOG_PREFIX))
-        return
-
-    primary_cp = (
-        src_models.CompanyProviders.objects.filter(
-            provider=tse_provider, primary=True, active=True,
-        ).first()
-        or src_models.CompanyProviders.objects.filter(provider=tse_provider, active=True).first()
-    )
-    if not primary_cp:
-        logger.info("{} No active TSE CompanyProviders row. Nothing to sync.".format(_LOG_PREFIX))
         return
 
     provider_parts_by_key = {
@@ -2418,11 +2408,13 @@ def sync_provider_inventory_from_tristate() -> None:
     while True:
         batch_num += 1
         batch = list(
-            src_models.TSECompanyPricing.objects.filter(
-                id__gt=last_id, company_id=primary_cp.company_id,
+            src_models.TSEParts.objects.filter(
+                id__gt=last_id, inventory_synced_at__isnull=False,
             )
             .order_by("id")
-            .values("id", "quantity_available", "part__brand_id", "part__part_number")[:BATCH_SIZE_INVENTORY]
+            .values(
+                "id", "brand_id", "part_number", "quantity_available", "warehouse_availability",
+            )[:BATCH_SIZE_INVENTORY]
         )
         if not batch:
             break
@@ -2430,7 +2422,7 @@ def sync_provider_inventory_from_tristate() -> None:
 
         to_upsert = []
         for row in batch:
-            ext_id = "{}_{}".format(row["part__brand_id"], row["part__part_number"])
+            ext_id = "{}_{}".format(row["brand_id"], row["part_number"])
             provider_part = provider_parts_by_key.get(ext_id)
             if not provider_part:
                 continue
@@ -2440,7 +2432,7 @@ def sync_provider_inventory_from_tristate() -> None:
                     warehouse_total_qty=row.get("quantity_available") or 0,
                     manufacturer_inventory=None,
                     manufacturer_esd=None,
-                    warehouse_availability=None,
+                    warehouse_availability=row.get("warehouse_availability"),
                     last_synced_at=now,
                     updated_at=now,
                 )
