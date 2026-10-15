@@ -568,6 +568,61 @@ class PaceCatalogPart(django_db_models.Model):
         db_table = "pace_catalog"
 
 
+class TriStatePart(django_db_models.Model):
+    """
+    Tri-State Enterprises' own catalog, scoped from AAM/PACE's shared Algolia "parts" index by
+    reading only the "TSE" (Tri-State's member code) sub-object each record carries alongside the
+    shared catalog fields -- unlike ``PaceCatalogPart``, which deliberately never requests ANY
+    per-distributor sub-object, this model exists specifically to hold Tri-State's own slice
+    (their own inventory count, category placement, product_id), still via an explicit
+    ``attributesToRetrieve`` allowlist so no OTHER distributor's data is ever requested either.
+
+    Seeded via ``import_tristate_parts_from_algolia`` (one-off, not scheduled -- same reasoning
+    as PaceCatalogPart's own import command). This is the catalog-discovery half of the Tri-State
+    integration; live pricing/stock for ordering still goes through the real PACE Customer API
+    (ShopMonkeySync-style sync service), never this table.
+    """
+
+    object_id = django_db_models.CharField(max_length=64, unique=True)  # Algolia objectID, e.g. "BBCG-57589"
+    aaia_brand_code = django_db_models.CharField(max_length=8, db_index=True)
+    part_number = django_db_models.CharField(max_length=64, db_index=True)
+
+    name = django_db_models.TextField(null=True, blank=True)
+    description = django_db_models.TextField(null=True, blank=True)
+    price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    part_search = django_db_models.JSONField(default=list, blank=True)
+
+    pace_brand = django_db_models.CharField(max_length=255, null=True, blank=True)
+    pace_name = django_db_models.TextField(null=True, blank=True)
+    pace_image = django_db_models.TextField(null=True, blank=True)
+    pace_slug = django_db_models.TextField(null=True, blank=True)
+    aw_brand = django_db_models.CharField(max_length=255, null=True, blank=True)
+    aw_name = django_db_models.TextField(null=True, blank=True)
+    aw_image = django_db_models.TextField(null=True, blank=True)
+    aw_slug = django_db_models.TextField(null=True, blank=True)
+
+    # Tri-State's own catalog placement/stock -- the "TSE" sub-object, not the generic top-level
+    # category/subcategory/series (confirmed those can differ per distributor for the same part).
+    tse_inventory = django_db_models.IntegerField(null=True, blank=True)
+    tse_category = django_db_models.CharField(max_length=255, null=True, blank=True)
+    tse_subcategory = django_db_models.CharField(max_length=255, null=True, blank=True)
+    tse_series = django_db_models.CharField(max_length=255, null=True, blank=True)
+    tse_product_id = django_db_models.BigIntegerField(null=True, blank=True)
+    tse_slug = django_db_models.TextField(null=True, blank=True)
+
+    # Raw ACES-style vehicle-fitment IDs -- see PaceCatalogPart.fitment's own docstring.
+    fitment = django_db_models.JSONField(default=dict, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "tristate_parts"
+        indexes = [
+            django_db_models.Index(fields=["aaia_brand_code", "part_number"], name="tsp_brand_part_idx"),
+        ]
+
+
 class CustomIntegrationRequest(django_db_models.Model):
     company = django_db_models.ForeignKey(
         Company, on_delete=django_db_models.CASCADE, related_name="custom_integration_requests"

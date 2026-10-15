@@ -1,0 +1,732 @@
+[
+  {
+    "code": "BGNX",
+    "name": "303 Products - Gold Eagle",
+    "slug": "goldeagle"
+  },
+  {
+    "code": "FMCP",
+    "name": "3D MAXpider",
+    "slug": "3d-maxpider"
+  },
+  {
+    "code": "FBCN",
+    "name": "AAMP of America",
+    "slug": "aamp-of-america"
+  },
+  {
+    "code": "BGPC",
+    "name": "ACI",
+    "slug": "access-cover"
+  },
+  {
+    "code": "JYYD",
+    "name": "ACIW",
+    "slug": "aciw"
+  },
+  {
+    "code": "FDNP",
+    "name": "Advance Manufacturing Limited",
+    "slug": "advance-manufacturing-limited"
+  },
+  {
+    "code": "JDDS",
+    "name": "AIMS Power",
+    "slug": "aims-power"
+  },
+  {
+    "code": "BBCG",
+    "name": "Air Lift",
+    "slug": "air-lift"
+  },
+  {
+    "code": "HWWK",
+    "name": "AlphaRex",
+    "slug": "alpharex"
+  },
+  {
+    "code": "A6LG",
+    "name": "American Grease Stick",
+    "slug": "ags"
+  },
+  {
+    "code": "BGQD",
+    "name": "AMP Research",
+    "slug": "amp-research"
+  },
+  {
+    "code": "HWXP",
+    "name": "ARC Lighting",
+    "slug": "arc-lighting"
+  },
+  {
+    "code": "BGNZ",
+    "name": "A.R.E.",
+    "slug": "are-accessories"
+  },
+  {
+    "code": "BBDR",
+    "name": "ARIES",
+    "slug": "aries"
+  },
+  {
+    "code": "A70O",
+    "name": "ARK",
+    "slug": "ark"
+  },
+  {
+    "code": "DSKF",
+    "name": "ATrend",
+    "slug": "atrend"
+  },
+  {
+    "code": "FSMF",
+    "name": "ATS Diesel Performance",
+    "slug": "ats-diesel-performance"
+  },
+  {
+    "code": "DLRX",
+    "name": "Autel",
+    "slug": "aul"
+  },
+  {
+    "code": "BDHZ",
+    "name": "AutoMeter Products",
+    "slug": "autometer"
+  },
+  {
+    "code": "BBFF",
+    "name": "Auto Ventshade AVS",
+    "slug": "avs-auto-ventshade"
+  },
+  {
+    "code": "HWNX",
+    "name": "Axxess Integrate",
+    "slug": "axxess-integrate"
+  },
+  {
+    "code": "BKHJ",
+    "name": "BACKRACK",
+    "slug": "backrack"
+  },
+  {
+    "code": "FGXX",
+    "name": "Baja Designs",
+    "slug": "baja-designs"
+  },
+  {
+    "code": "BKDA",
+    "name": "BAK Industries",
+    "slug": "bak-industries"
+  },
+  {
+    "code": "BKJX",
+    "name": "BD Diesel Performance",
+    "slug": "bd-diesel-performance"
+  },
+  {
+    "code": "BRLQ",
+    "name": "BedRug",
+    "slug": "bedrug"
+  },
+  {
+    "code": "FLJC",
+    "name": "BEDSLIDE",
+    "slug": "bedslide"
+  },
+  {
+    "code": "CNNX",
+    "name": "Big Country Truck Accessories",
+    "slug": "big-country-truck-accessories"
+  },
+  {
+    "code": "FDRW",
+    "name": "Blue OX",
+    "slug": "blue-ox"
+  },
+  {
+    "code": "FHBL",
+    "name": "BOLT",
+    "slug": "bolt"
+  },
+  {
+    "code": "HHML",
+    "name": "Boomerang Rubber Company",
+    "slug": "boomerang-rubber-company"
+  },
+  {
+    "code": "GTXB",
+    "name": "Brandit\u00ae",
+    "slug": "brandit-products"
+  },
+  {
+    "code": "DKSF",
+    "name": "Brandmotion",
+    "slug": "brandmotion"
+  },
+  {
+    "code": "GNVR",
+    "name": "Buckeye Fire Equiptment",
+    "slug": "buckeye-fire-equiptment"
+  },
+  {
+    "code": "JZZM",
+    "name": "BUILTBRIGHT",
+    "slug": "builtbright"
+  },
+  {
+    "code": "FMJR",
+    "name": "Bulldog Winch Co LLC",
+    "slug": "bulldog-winch"
+  },
+  {
+    "code": "BTQP",
+    "name": "Bully Dog",
+    "slug": "bully-dog"
+  },
+  {
+    "code": "BDMQ",
+    "name": "Bushwacker",
+    "slug": "bushwacker"
+  },
+  {
+    "code": "BBHT",
+    "name": "Buyers Products Company",
+    "slug": "buyers-products-company"
+  },
+  {
+    "code": "BQVL",
+    "name": "B&W Towing",
+    "slug": "bw-towing"
+  },
+  {
+    "code": "XXCL",
+    "name": "Cab Locker",
+    "slug": "cab-locker"
+  },
+  {
+    "code": "FSWC",
+    "name": "CargoGlide",
+    "slug": "cargoglide"
+  },
+  {
+    "code": "JVHP",
+    "name": "Carli Suspension",
+    "slug": "carli-suspension"
+  },
+  {
+    "code": "BDPH",
+    "name": "Carr",
+    "slug": "carr"
+  },
+  {
+    "code": "JFPT",
+    "name": "Cloyes High Performance",
+    "slug": "cloyes"
+  },
+  {
+    "code": "BBLQ",
+    "name": "Covercraft",
+    "slug": "covercraft"
+  },
+  {
+    "code": "BGVL",
+    "name": "Coverlay",
+    "slug": "coverlay"
+  },
+  {
+    "code": "BKDK",
+    "name": "CURT",
+    "slug": "curt"
+  },
+  {
+    "code": "BKCG",
+    "name": "Daystar",
+    "slug": "daystar"
+  },
+  {
+    "code": "FXWQ",
+    "name": "DECKED",
+    "slug": "decked"
+  },
+  {
+    "code": "BDSN",
+    "name": "Dee Zee",
+    "slug": "dee-zee"
+  },
+  {
+    "code": "CFVL",
+    "name": "ECCO",
+    "slug": "ecco"
+  },
+  {
+    "code": "BDVQ",
+    "name": "Energy Suspension",
+    "slug": "energy-suspension"
+  },
+  {
+    "code": "BBQL",
+    "name": "Extang",
+    "slug": "extang"
+  },
+  {
+    "code": "DKSN",
+    "name": "Fab Fours",
+    "slug": "fab-fours-inc"
+  },
+  {
+    "code": "FKRH",
+    "name": "FASS Diesel Fuel Systems",
+    "slug": "fass-diesel-fuel-systems"
+  },
+  {
+    "code": "FBJH",
+    "name": "Fill-Rite",
+    "slug": "fill-rite"
+  },
+  {
+    "code": "BBQZ",
+    "name": "Firestone Ride-Rite",
+    "slug": "firestone-ride-rite"
+  },
+  {
+    "code": "FQWW",
+    "name": "Fleece Performance Engineering Inc.",
+    "slug": "fleece-performance-engineering-inc"
+  },
+  {
+    "code": "BKTK",
+    "name": "Fox Factory Inc",
+    "slug": "fox-factory-inc"
+  },
+  {
+    "code": "FTQN",
+    "name": "Frontier Truck Gear",
+    "slug": "frontier-truck-gear"
+  },
+  {
+    "code": "KRYV",
+    "name": "Gage",
+    "slug": "gage"
+  },
+  {
+    "code": "BDZW",
+    "name": "Garrett",
+    "slug": "gar"
+  },
+  {
+    "code": "FNGL",
+    "name": "Gator",
+    "slug": "gator"
+  },
+  {
+    "code": "JDZH",
+    "name": "Gator Fasteners",
+    "slug": "gator-fasteners"
+  },
+  {
+    "code": "HHKM",
+    "name": "GEN-Y Hitch",
+    "slug": "gen-y-hitch"
+  },
+  {
+    "code": "BHBN",
+    "name": "Go Industries",
+    "slug": "go-industries"
+  },
+  {
+    "code": "GJWD",
+    "name": "Golight",
+    "slug": "golight"
+  },
+  {
+    "code": "KBLV",
+    "name": "Go Power",
+    "slug": "go-power"
+  },
+  {
+    "code": "BBSP",
+    "name": "Go Rhino",
+    "slug": "go-rhino"
+  },
+  {
+    "code": "JCQF",
+    "name": "GPI Great Plains Industries",
+    "slug": "gpi-great-plains-industries"
+  },
+  {
+    "code": "HKSK",
+    "name": "Havoc Offroad",
+    "slug": "havoc-offroad"
+  },
+  {
+    "code": "HXGL",
+    "name": "Heise LED Lighting Systems",
+    "slug": "heise-led-lighting-systems"
+  },
+  {
+    "code": "BFDP",
+    "name": "Hella Inc",
+    "slug": "hella"
+  },
+  {
+    "code": "BFDQ",
+    "name": "Hellwig",
+    "slug": "hellwig"
+  },
+  {
+    "code": "JRMJ",
+    "name": "HexCore Lighting",
+    "slug": "hexcore-lighting"
+  },
+  {
+    "code": "KKNS",
+    "name": "Holman",
+    "slug": "holman-formerly-kargo-master"
+  },
+  {
+    "code": "BBVR",
+    "name": "Husky Liners",
+    "slug": "husky-liners"
+  },
+  {
+    "code": "HKPR",
+    "name": "Iconic Accessories",
+    "slug": "iconic-xd"
+  },
+  {
+    "code": "HXPX",
+    "name": "Iconic Accessories ST Lighting and Suspension",
+    "slug": "iconic-accessories-by-southern-truck"
+  },
+  {
+    "code": "FRDK",
+    "name": "ICON Vehicle Dynamics",
+    "slug": "icon-vehicle-dynamics"
+  },
+  {
+    "code": "GHJV",
+    "name": "Industrial Injection",
+    "slug": "industrial-injection"
+  },
+  {
+    "code": "DSWQ",
+    "name": "JVC",
+    "slug": "jvc"
+  },
+  {
+    "code": "DFVM",
+    "name": "Kargomaster",
+    "slug": "kargomaster"
+  },
+  {
+    "code": "KBQV",
+    "name": "Legend Fleet Solutions",
+    "slug": "legend-fleet-solutions"
+  },
+  {
+    "code": "XXLP",
+    "name": "Lively Power Batteries",
+    "slug": "lively-power"
+  },
+  {
+    "code": "BFKJ",
+    "name": "LUND",
+    "slug": "lund"
+  },
+  {
+    "code": "FTNF",
+    "name": "LUVERNE",
+    "slug": "luverne-truck-equipment"
+  },
+  {
+    "code": "FLHQ",
+    "name": "MAHLE",
+    "slug": "mahle"
+  },
+  {
+    "code": "FRFC",
+    "name": "MaxTrac Suspension",
+    "slug": "maxtrac-suspension"
+  },
+  {
+    "code": "BKSJ",
+    "name": "MBRP Exhaust",
+    "slug": "mbrp-exhaust"
+  },
+  {
+    "code": "DGLX",
+    "name": "Metra Electronics",
+    "slug": "metra-electronics"
+  },
+  {
+    "code": "DRRQ",
+    "name": "Milwaukee Tool",
+    "slug": "milwaukee-tool"
+  },
+  {
+    "code": "FLDS",
+    "name": "Mishimoto",
+    "slug": "mishimoto-automotive"
+  },
+  {
+    "code": "HGKD",
+    "name": "Mob Armor",
+    "slug": "mob-armor"
+  },
+  {
+    "code": "A6R4",
+    "name": "MOOG",
+    "slug": "moo"
+  },
+  {
+    "code": "BKES",
+    "name": "N-FAB",
+    "slug": "n-fab"
+  },
+  {
+    "code": "FQCV",
+    "name": "Oracle Lighting",
+    "slug": "oracle-lighting"
+  },
+  {
+    "code": "BHJH",
+    "name": "Pace Edwards",
+    "slug": "pace-edwards-company"
+  },
+  {
+    "code": "HFTD",
+    "name": "Pacific Performance Engineering",
+    "slug": "pacific-performance-engineering"
+  },
+  {
+    "code": "BKEV",
+    "name": "Phoenix USA",
+    "slug": "phoenix-usa"
+  },
+  {
+    "code": "DTKD",
+    "name": "Polk Audio",
+    "slug": "polk-audio"
+  },
+  {
+    "code": "DHKF",
+    "name": "Power Acoustik",
+    "slug": "power-acoustik"
+  },
+  {
+    "code": "DTKL",
+    "name": "Powerbass",
+    "slug": "powerbass"
+  },
+  {
+    "code": "BHKQ",
+    "name": "Power Stop LLC",
+    "slug": "power-stop-llc"
+  },
+  {
+    "code": "BCJH",
+    "name": "Putco",
+    "slug": "putco"
+  },
+  {
+    "code": "FVGN",
+    "name": "Ram Mounts",
+    "slug": "ram-mounts"
+  },
+  {
+    "code": "FLDQ",
+    "name": "Ranch Hand",
+    "slug": "ranch-hand"
+  },
+  {
+    "code": "BCKM",
+    "name": "Rancho",
+    "slug": "rancho"
+  },
+  {
+    "code": "FGGF",
+    "name": "RDS Manufacturing",
+    "slug": "rds-manufacturing"
+  },
+  {
+    "code": "BKMQ",
+    "name": "ReadyLIFT",
+    "slug": "readylift"
+  },
+  {
+    "code": "FQKL",
+    "name": "Retrax",
+    "slug": "retrax"
+  },
+  {
+    "code": "FCVT",
+    "name": "Rhino-Rack",
+    "slug": "rhino-rack"
+  },
+  {
+    "code": "FLWB",
+    "name": "RIGID Industries",
+    "slug": "rigid-industries"
+  },
+  {
+    "code": "JDCF",
+    "name": "RKI Truck Equipment",
+    "slug": "rki-truck-equiptment"
+  },
+  {
+    "code": "CLRJ",
+    "name": "Roll-N-Lock",
+    "slug": "roll-n-lock"
+  },
+  {
+    "code": "DHTP",
+    "name": "Rough Country",
+    "slug": "rough-country"
+  },
+  {
+    "code": "BHMR",
+    "name": "Rugged Liner",
+    "slug": "rugged-liner"
+  },
+  {
+    "code": "BKMS",
+    "name": "Rugged Ridge",
+    "slug": "rugged-ridge"
+  },
+  {
+    "code": "JGKZ",
+    "name": "Samlex America",
+    "slug": "samlex-america"
+  },
+  {
+    "code": "FKTM",
+    "name": "SCT",
+    "slug": "sct"
+  },
+  {
+    "code": "FQMJ",
+    "name": "Seat Saver",
+    "slug": "seat-saver"
+  },
+  {
+    "code": "GNQL",
+    "name": "Southern Truck",
+    "slug": "southern-truck"
+  },
+  {
+    "code": "GNJV",
+    "name": "sPOD",
+    "slug": "spod"
+  },
+  {
+    "code": "GVTP",
+    "name": "S&S Diesel Motorsports",
+    "slug": "s-s-diesel-motorsports"
+  },
+  {
+    "code": "FDMV",
+    "name": "Steelcraft",
+    "slug": "steelcraft-automotive"
+  },
+  {
+    "code": "KKTW",
+    "name": "Stout Manufacturing",
+    "slug": "stout-manufacturing"
+  },
+  {
+    "code": "BKWS",
+    "name": "SuperSprings",
+    "slug": "supersprings"
+  },
+  {
+    "code": "BGFJ",
+    "name": "Superwinch",
+    "slug": "superwinch"
+  },
+  {
+    "code": "FDCP",
+    "name": "Timbren",
+    "slug": "timbren"
+  },
+  {
+    "code": "FKFW",
+    "name": "TITAN Fuel Tanks",
+    "slug": "titan-fuel-tanks"
+  },
+  {
+    "code": "BKCF",
+    "name": "TRIMAX",
+    "slug": "trimax"
+  },
+  {
+    "code": "BKHI",
+    "name": "TruXedo",
+    "slug": "truxedo"
+  },
+  {
+    "code": "BKFX",
+    "name": "UnderCover",
+    "slug": "undercover"
+  },
+  {
+    "code": "BHSG",
+    "name": "UWS",
+    "slug": "uws"
+  },
+  {
+    "code": "JDFJ",
+    "name": "VAIS Technology",
+    "slug": "vais-technology"
+  },
+  {
+    "code": "DXTT",
+    "name": "VOXX Int.",
+    "slug": "voxx-int"
+  },
+  {
+    "code": "BCSQ",
+    "name": "WARN",
+    "slug": "warn"
+  },
+  {
+    "code": "HWZD",
+    "name": "Weather Guard",
+    "slug": "weather-guard"
+  },
+  {
+    "code": "BHTJ",
+    "name": "WeatherTech",
+    "slug": "weathertech"
+  },
+  {
+    "code": "A6W0",
+    "name": "Weboost",
+    "slug": "web"
+  },
+  {
+    "code": "BCTC",
+    "name": "Westin Automotive",
+    "slug": "westin-automotive"
+  },
+  {
+    "code": "DKKV",
+    "name": "Wilton",
+    "slug": "wilton"
+  },
+  {
+    "code": "JCRS",
+    "name": "Worksport",
+    "slug": "worksport"
+  },
+  {
+    "code": "FQMS",
+    "name": "Zone Offroad Products",
+    "slug": "zone-offroad-products"
+  },
+  {
+    "code": "KJBV",
+    "name": "ZZ2 Audio",
+    "slug": "zz2-audio"
+  }
+]
