@@ -236,6 +236,7 @@ def fetch_tristate_inventory_and_pricing_for_company(company_provider_id: int) -
 
     batch_size = tristate_client.DEFAULT_ITEMS_BATCH_SIZE
     chunks = [parts[i : i + batch_size] for i in range(0, len(parts), batch_size)]
+    total_chunks = len(chunks)
 
     def _fetch_chunk(chunk: typing.List[typing.Dict]) -> typing.List[typing.Dict]:
         items = [(row["_sent_token"], row["part_number"]) for row in chunk]
@@ -249,74 +250,91 @@ def fetch_tristate_inventory_and_pricing_for_company(company_provider_id: int) -
             )
             return []
 
-    results: typing.List[typing.Dict] = []
+    # Written incrementally as results come back (flushed every FLUSH_EVERY_ITEMS, not held in
+    # memory until every one of the (potentially thousands of) API calls finishes) -- a run over
+    # the full catalog takes long enough in wall-clock time that an all-at-the-end write loses
+    # everything on a crash/timeout and shows zero progress for its whole duration.
+    part_updates: typing.List[src_models.TSEParts] = []
+    pricing_upserts: typing.List[src_models.TSECompanyPricing] = []
+    brand_warehouse_code_updates: typing.Dict[int, str] = {}
+    total_fetched = 0
+    total_parts_written = 0
+    total_pricing_written = 0
+    chunks_done = 0
+
+    def _flush() -> None:
+        nonlocal part_updates, pricing_upserts, total_parts_written, total_pricing_written
+        if part_updates:
+            src_models.TSEParts.objects.bulk_update(
+                part_updates,
+                ["quantity_available", "orderable", "warehouse_availability", "inventory_synced_at"],
+                batch_size=2000,
+            )
+            total_parts_written += len(part_updates)
+            part_updates = []
+        if pricing_upserts:
+            pgbulk.upsert(
+                src_models.TSECompanyPricing,
+                pricing_upserts,
+                unique_fields=["part", "company"],
+                update_fields=["cost", "list_price", "updated_at"],
+                returning=False,
+            )
+            total_pricing_written += len(pricing_upserts)
+            pricing_upserts = []
+
     with ThreadPoolExecutor(max_workers=PRICING_FETCH_WORKERS) as executor:
         futures = [executor.submit(_fetch_chunk, chunk) for chunk in chunks]
         for future in as_completed(futures):
-            results.extend(future.result())
+            chunks_done += 1
+            now = timezone.now()
+            for item in future.result():
+                total_fetched += 1
+                part_number_u = (item.get("part_number") or "").upper()
+                brand_code_u = (item.get("brand_code") or "").upper()
+                aaia_brand_code = item.get("aaia_brand_code")
 
-    if not results:
-        logger.info("{} company_provider_id={}: no results from the API.".format(_LOG_PREFIX, company_provider_id))
-        return 0
+                row = by_sent_token.get((brand_code_u, part_number_u))
+                if row is None and aaia_brand_code:
+                    row = by_aaia.get((aaia_brand_code.upper(), part_number_u))
+                if row is None:
+                    continue
 
-    now = timezone.now()
-    pricing_upserts = []
-    part_updates = []
-    brand_warehouse_code_updates: typing.Dict[int, str] = {}
+                part_updates.append(
+                    src_models.TSEParts(
+                        id=row["id"],
+                        quantity_available=item.get("inventory"),
+                        orderable=bool(item.get("orderable", 1)),
+                        warehouse_availability=_warehouse_availability(item.get("inventory_locations")),
+                        inventory_synced_at=now,
+                    )
+                )
+                pricing_upserts.append(
+                    src_models.TSECompanyPricing(
+                        part_id=row["id"],
+                        company_id=cp.company_id,
+                        cost=item.get("account_price"),
+                        list_price=item.get("list_price"),
+                        updated_at=now,
+                    )
+                )
+                # Resolved via aliasing against a real warehouse brand_code -- backfill so future
+                # runs for this brand skip straight to the cheaper non-aliased path.
+                # aaia_brand_code is only present when aliasing actually matched the item.
+                if aaia_brand_code and item.get("brand_code"):
+                    brand_warehouse_code_updates[row["brand_id"]] = item["brand_code"]
 
-    for item in results:
-        part_number_u = (item.get("part_number") or "").upper()
-        brand_code_u = (item.get("brand_code") or "").upper()
-        aaia_brand_code = item.get("aaia_brand_code")
+            if len(pricing_upserts) >= PRICING_UPSERT_BATCH or len(part_updates) >= PRICING_UPSERT_BATCH:
+                _flush()
+                logger.info(
+                    "{} company_provider_id={}: {}/{} batches done, {} items fetched so far, "
+                    "{} TSEParts + {} TSECompanyPricing written so far.".format(
+                        _LOG_PREFIX, company_provider_id, chunks_done, total_chunks,
+                        total_fetched, total_parts_written, total_pricing_written,
+                    )
+                )
 
-        row = by_sent_token.get((brand_code_u, part_number_u))
-        if row is None and aaia_brand_code:
-            row = by_aaia.get((aaia_brand_code.upper(), part_number_u))
-        if row is None:
-            continue
-
-        part_updates.append(
-            src_models.TSEParts(
-                id=row["id"],
-                quantity_available=item.get("inventory"),
-                orderable=bool(item.get("orderable", 1)),
-                warehouse_availability=_warehouse_availability(item.get("inventory_locations")),
-                inventory_synced_at=now,
-            )
-        )
-        pricing_upserts.append(
-            src_models.TSECompanyPricing(
-                part_id=row["id"],
-                company_id=cp.company_id,
-                cost=item.get("account_price"),
-                list_price=item.get("list_price"),
-                updated_at=now,
-            )
-        )
-        # Resolved via aliasing against a real warehouse brand_code -- backfill so future runs
-        # for this brand skip straight to the cheaper non-aliased path. aaia_brand_code is only
-        # present when aliasing actually matched the item (see the client's docstring).
-        if aaia_brand_code and item.get("brand_code"):
-            brand_warehouse_code_updates[row["brand_id"]] = item["brand_code"]
-
-    if part_updates:
-        src_models.TSEParts.objects.bulk_update(
-            part_updates,
-            ["quantity_available", "orderable", "warehouse_availability", "inventory_synced_at"],
-            batch_size=2000,
-        )
-
-    written = 0
-    for start in range(0, len(pricing_upserts), PRICING_UPSERT_BATCH):
-        batch = pricing_upserts[start : start + PRICING_UPSERT_BATCH]
-        pgbulk.upsert(
-            src_models.TSECompanyPricing,
-            batch,
-            unique_fields=["part", "company"],
-            update_fields=["cost", "list_price", "updated_at"],
-            returning=False,
-        )
-        written += len(batch)
+    _flush()
 
     if brand_warehouse_code_updates:
         brands_to_update = []
@@ -339,10 +357,10 @@ def fetch_tristate_inventory_and_pricing_for_company(company_provider_id: int) -
     logger.info(
         "{} company_provider_id={}: fetched {} items, updated {} TSEParts, upserted {} "
         "TSECompanyPricing rows.".format(
-            _LOG_PREFIX, company_provider_id, len(results), len(part_updates), written
+            _LOG_PREFIX, company_provider_id, total_fetched, total_parts_written, total_pricing_written
         )
     )
-    return written
+    return total_pricing_written
 
 
 def sync_tristate_company_pricing_for_company_provider(company_provider_id: int) -> None:
