@@ -791,8 +791,6 @@ PROVIDER_CATALOG = [
             "Password: <code>{{SFTP_PASSWORD}}</code><br />"
             "Folder: <code>uploads</code>"
             "</p>"
-            "<p>The two files should be named <code>Meyer Pricing.csv</code> and "
-            "<code>Meyer Inventory.csv</code>.</p>"
             "<p><strong>2. API access.</strong> Please issue an API key for our account and confirm our Meyer "
             "customer number.</p>"
             "<p>Thanks!</p>"
