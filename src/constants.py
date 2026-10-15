@@ -633,9 +633,6 @@ PROVIDER_CATALOG = [
             "<p>We've registered for an account on data.wheelpros.com. Could you please grant us access to "
             "allow FTP inventory data and API ordering?</p>"
             "</div>"
-            "<p>Ask for both in the same email even if you only want the product feed today &mdash; requesting "
-            "ordering later means a second round trip with your rep. If you don't have a Wheel Pros dealer "
-            "account yet, open one first &mdash; the portal registration requires it.</p>"
 
             "<p><strong>2. Set your SFTP username</strong></p>"
             "<p>The SFTP delivery option stays locked until a username exists on your account, so do this "
