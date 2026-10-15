@@ -514,6 +514,60 @@ class ShopMonkeySyncExecution(django_db_models.Model):
         ]
 
 
+class PaceCatalogPart(django_db_models.Model):
+    """
+    One row per part pulled from AAM/PACE's public Algolia "parts" search index -- a shared
+    catalog reference (brand, part number, description, price, fitment) used across every
+    PACE-powered distributor site, not scoped to any one distributor. Seeded via
+    ``import_pace_catalog_from_algolia`` (a one-off local import, not scheduled -- see that
+    command's own docstring for why).
+
+    Deliberately excludes the per-distributor sub-objects the index also carries (each AAM
+    member's own live inventory count, e.g. "TSE" for Tri-State) -- only the shared catalog
+    fields below are ever requested from Algolia (via an explicit ``attributesToRetrieve``
+    allowlist), so that data is never even received, let alone stored here.
+    """
+
+    object_id = django_db_models.CharField(max_length=64, unique=True)  # Algolia objectID, e.g. "BBCG-57589"
+    aaia_brand_code = django_db_models.CharField(max_length=8, db_index=True)
+    part_number = django_db_models.CharField(max_length=64, db_index=True)
+
+    name = django_db_models.TextField(null=True, blank=True)
+    description = django_db_models.TextField(null=True, blank=True)
+    price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    category = django_db_models.CharField(max_length=255, null=True, blank=True)
+    subcategory = django_db_models.CharField(max_length=255, null=True, blank=True)
+    series = django_db_models.CharField(max_length=255, null=True, blank=True)
+
+    # Alternate part number spellings/prefixes this index matches it against (its own "did you
+    # mean" aliases), e.g. ["AIR57589", "AIR-57589", "ALC57589", ...].
+    part_search = django_db_models.JSONField(default=list, blank=True)
+
+    # The "pace" and "aw" sub-objects as Algolia returns them: {brand, name, image, slug} each --
+    # PACE-site and Aftermarket-Websites versions of the same listing respectively.
+    pace_brand = django_db_models.CharField(max_length=255, null=True, blank=True)
+    pace_name = django_db_models.TextField(null=True, blank=True)
+    pace_image = django_db_models.TextField(null=True, blank=True)
+    pace_slug = django_db_models.TextField(null=True, blank=True)
+    aw_brand = django_db_models.CharField(max_length=255, null=True, blank=True)
+    aw_name = django_db_models.TextField(null=True, blank=True)
+    aw_image = django_db_models.TextField(null=True, blank=True)
+    aw_slug = django_db_models.TextField(null=True, blank=True)
+
+    # Raw ACES-style vehicle-fitment IDs (opaque numeric references into AAM's own vehicle
+    # database -- we don't have that lookup table, so these aren't decodable to Year/Make/Model
+    # on our side yet). Stored as one JSON blob rather than ~30 mostly-zero/empty columns; only
+    # the non-zero/non-empty ones a part actually has are kept. Keys match Algolia's own
+    # attribute names verbatim (e.g. "BaseVehicleID", "SubModelID", "EngineBaseID", ...).
+    fitment = django_db_models.JSONField(default=dict, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "pace_catalog"
+
+
 class CustomIntegrationRequest(django_db_models.Model):
     company = django_db_models.ForeignKey(
         Company, on_delete=django_db_models.CASCADE, related_name="custom_integration_requests"
