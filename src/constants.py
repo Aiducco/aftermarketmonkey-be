@@ -760,7 +760,12 @@ PROVIDER_CATALOG = [
         # Email-channel ordering — see the matching note on Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
         "email_order_connection_optional_fields": ["account_number", "cc_email", "reply_to_email"],
-        "integration_time": "Data available within 1-2 hours",
+        # Not "within 1-2 hours" like the API-credential providers: nothing arrives until the
+        # dealer's rep sets up delivery to the relay folder, which is out of our hands and takes
+        # days in practice. Processing after the first drop is quick, but that is not what a
+        # dealer reading this is asking. Kept in step with the "can take a few days" line in the
+        # instructions below — change the two together.
+        "integration_time": "Data available after Meyer's first delivery, typically a few days",
         # {{SFTP_USER}}/{{SFTP_PASSWORD}} are substituted per company by
         # _render_relay_instructions_html (src/api/services/integrations.py) — they must stay
         # verbatim here, including inside the sample email below.
