@@ -7,11 +7,13 @@ this client is deliberately Tri-State-only for now -- see BrandProviderKind.TRI_
 Confirmed live 2026-10-15 against the ``TridentMotorsports`` App-Id:
   - ``test``                     -- works, used as the connection health check.
   - ``get_warehouses``           -- works.
-  - ``get_inventory_and_pricing``-- works; the one endpoint this integration actually needs.
-  - ``get_brands``               -- 403, ACL-restricted for this App-Id (pending wider scope --
-    see the email thread with Tri-State's rep). This is why TSEBrand is seeded from a bundled
-    file instead of fetched live -- see src.management.commands.seed_tse_brands.
-  - ``get_purchase_orders`` / ``submit_purchase_order`` -- also 403; irrelevant anyway since
+  - ``get_inventory_and_pricing``-- works; the main endpoint this integration needs.
+  - ``get_brands``               -- was 403 (ACL-restricted) earlier the same day, then granted
+    after following up with Tri-State's rep -- now returns the full real brand list (717 brands,
+    each with both ``brand_code`` and ``aaia_brand_code``), used by
+    src.integrations.services.tristate.refresh_tse_brands_from_api to authoritatively backfill
+    TSEBrand.warehouse_code instead of relying only on aliasing-based discovery.
+  - ``get_purchase_orders`` / ``submit_purchase_order`` -- still 403; irrelevant anyway since
     this integration deliberately does not implement ordering yet.
 
 Auth is two static headers, not a token exchange (no login/refresh step, unlike Turn14's OAuth
@@ -128,6 +130,16 @@ class TriStateApiClient:
 
     def get_warehouses(self) -> typing.List[typing.Dict]:
         data = self._call("get_warehouses")
+        return data if isinstance(data, list) else []
+
+    def get_brands(self) -> typing.List[typing.Dict]:
+        """
+        The real, full brand list for this account -- confirmed real shape per entry: at least
+        ``brand_code`` (the warehouse code needed by get_inventory_and_pricing) and
+        ``aaia_brand_code``, plus ``name``, ``url_string``, and optionally ``address``,
+        ``contact``, ``website``, ``logo`` when Tri-State has them on file for that brand.
+        """
+        data = self._call("get_brands")
         return data if isinstance(data, list) else []
 
     def get_inventory_and_pricing(

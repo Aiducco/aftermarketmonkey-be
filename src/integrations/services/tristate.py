@@ -1,29 +1,37 @@
 """
 Tri-State Enterprises (TSE) distributor integration services.
 
-Unlike every other provider in this package, Tri-State has no bulk catalog/brand feed to pull
-from -- its real, documented API (src.integrations.clients.tristate.client, PACE's Customer API)
-only exposes per-item ``get_inventory_and_pricing`` lookups, and ``get_brands`` is currently
-ACL-restricted for our App-Id (pending a wider scope grant from Tri-State's rep). So this module
-is built around two separate, narrower jobs instead of one feed-ingest job:
+Unlike every other provider in this package, Tri-State has no bulk catalog feed to pull from --
+its real, documented API (src.integrations.clients.tristate.client, PACE's Customer API) only
+exposes per-item ``get_inventory_and_pricing`` lookups for the catalog itself. ``get_brands`` WAS
+ACL-restricted for our App-Id, but access was granted after following up with Tri-State's rep
+(confirmed live 2026-10-15) -- see ``refresh_tse_brands_from_api`` below. So this module is built
+around a few narrower jobs instead of one feed-ingest job:
 
-  1. ``sync_unmapped_tse_brands_to_brands`` -- map TSEBrand rows (seeded one-time from
-     src/management/commands/data/tristate_brand_codes.json, see seed_tse_brands) to Brands by
-     exact AAIA code match only. No fuzzy name matching and no brand auto-creation: AAIA-code
-     matching was confirmed far more reliable than name matching for this distributor's brand
-     list during exploration, and creating new global Brands rows from a 146-brand curated list
-     is a bigger product decision than this integration should make unilaterally -- an unmatched
-     TSEBrand just stays unmapped (logged), and is skipped everywhere downstream.
+  1. ``refresh_tse_brands_from_api`` -- the authoritative brand source now that get_brands works:
+     calls it for one company's connection and backfills TSEBrand.name/warehouse_code by exact
+     AAIA code match (TSEBrand rows themselves are still seeded one-time from the bundled
+     src/management/commands/data/tristate_brand_codes.json via seed_tse_brands -- this only
+     refreshes fields on existing rows, it doesn't create new TSEBrand rows for brands outside
+     that curated 146-brand set, even though get_brands itself returns Tri-State's full ~717
+     brand catalog).
 
-  2. ``fetch_tristate_inventory_and_pricing_for_company`` -- the actual live sync: for a given
+  2. ``sync_unmapped_tse_brands_to_brands`` -- map TSEBrand rows to Brands by exact AAIA code
+     match only. No fuzzy name matching and no brand auto-creation: AAIA-code matching was
+     confirmed far more reliable than name matching for this distributor's brand list during
+     exploration, and creating new global Brands rows from a 146-brand curated list is a bigger
+     product decision than this integration should make unilaterally -- an unmatched TSEBrand
+     just stays unmapped (logged), and is skipped everywhere downstream.
+
+  3. ``fetch_tristate_inventory_and_pricing_for_company`` -- the actual live sync: for a given
      company's connection, batch-call get_inventory_and_pricing (always with ``aliasing=True``)
      for every TSEParts row, sending the brand's ``warehouse_code`` when known or its
      ``aaia_code`` otherwise -- aliasing resolves either against PACE's real brand_code and
-     echoes back the match (confirmed live, see TSEBrand's own docstring), so this also
-     self-heals ``TSEBrand.warehouse_code`` over time rather than needing it pre-populated.
-     Quantity/availability (shared, account-agnostic -- confirmed live) is written to TSEParts;
-     cost/list_price (genuinely account-specific) is upserted into TSECompanyPricing for this
-     company. This is the function wired into integration_pricing_sync_jobs._fetch_raw_pricing.
+     echoes back the match, so this also self-heals ``TSEBrand.warehouse_code`` for any brand
+     ``refresh_tse_brands_from_api`` hasn't covered. Quantity/availability (shared,
+     account-agnostic -- confirmed live) is written to TSEParts; cost/list_price (genuinely
+     account-specific) is upserted into TSECompanyPricing for this company. This is the function
+     wired into integration_pricing_sync_jobs._fetch_raw_pricing.
 
 TSEParts itself is NOT populated here -- see
 src.management.commands.sync_tse_parts_catalog, which copies from the already-imported
@@ -50,6 +58,73 @@ _LOG_PREFIX = "[TRISTATE-SERVICES]"
 
 PRICING_UPSERT_BATCH = 2000
 PRICING_FETCH_WORKERS = 4
+
+
+def refresh_tse_brands_from_api(company_provider_id: int) -> int:
+    """
+    Authoritatively backfill TSEBrand.warehouse_code (and refresh .name) from the real
+    get_brands endpoint, matched by exact AAIA code -- now that access is granted, this is
+    strictly better than waiting for fetch_tristate_inventory_and_pricing_for_company's
+    per-item aliasing to discover each brand's code one part at a time. Only touches existing
+    TSEBrand rows (the curated 146-brand set from seed_tse_brands); does not create new ones
+    for brands in Tri-State's full ~717-brand response that aren't in our curated list. Returns
+    the number of TSEBrand rows updated.
+    """
+    cp = src_models.CompanyProviders.objects.filter(id=company_provider_id).first()
+    if not cp:
+        logger.warning("{} No CompanyProviders row id={}.".format(_LOG_PREFIX, company_provider_id))
+        return 0
+
+    credentials = credentials_helper.get_feed_credentials(cp)
+    try:
+        client = tristate_client.TriStateApiClient(credentials=credentials)
+    except ValueError as e:
+        logger.warning(
+            "{} company_provider_id={}: invalid/missing credentials ({}). Skipping.".format(
+                _LOG_PREFIX, company_provider_id, e
+            )
+        )
+        return 0
+
+    try:
+        api_brands = client.get_brands()
+    except tristate_exceptions.TriStateException as e:
+        logger.error("{} get_brands failed: {}".format(_LOG_PREFIX, e))
+        return 0
+
+    by_aaia = {
+        b["aaia_brand_code"].upper(): b
+        for b in api_brands
+        if b.get("aaia_brand_code") and b.get("brand_code")
+    }
+    if not by_aaia:
+        logger.info("{} get_brands returned no usable rows.".format(_LOG_PREFIX))
+        return 0
+
+    to_update = []
+    for tb in src_models.TSEBrand.objects.all():
+        match = by_aaia.get((tb.aaia_code or "").upper())
+        if not match:
+            continue
+        changed = False
+        if tb.warehouse_code != match["brand_code"]:
+            tb.warehouse_code = match["brand_code"]
+            changed = True
+        if match.get("name") and tb.name != match["name"]:
+            tb.name = match["name"]
+            changed = True
+        if changed:
+            to_update.append(tb)
+
+    if to_update:
+        src_models.TSEBrand.objects.bulk_update(to_update, ["warehouse_code", "name"], batch_size=200)
+
+    logger.info(
+        "{} Refreshed {} TSEBrand row(s) from get_brands ({} brands returned by the API).".format(
+            _LOG_PREFIX, len(to_update), len(api_brands)
+        )
+    )
+    return len(to_update)
 
 
 def sync_unmapped_tse_brands_to_brands() -> int:

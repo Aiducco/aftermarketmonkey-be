@@ -1513,19 +1513,24 @@ class MeyerCompanyPricing(django_db_models.Model):
 class TSEBrand(django_db_models.Model):
     """
     Tri-State Enterprises (TSE) brand, keyed by the generic AAIA brand code (e.g. "BBCG" for Air
-    Lift) rather than a Tri-State-issued numeric id -- Tri-State's real PACE Customer API has no
-    get_brands endpoint reachable by our key (see src.integrations.clients.tristate.client's
-    module docstring), so there is no Tri-State-native brand id to key on. Seeded one-time from
-    the bundled tristate_brand_codes.json (146 brands Tri-State actually carries, scraped from
-    their own public catalog/Algolia data -- see src.management.commands.seed_tse_brands), not
-    fetched live. ``warehouse_code`` is the real PACE API's own brand code (e.g. "AIR" for Air
-    Lift) needed to call get_inventory_and_pricing -- distinct from aaia_code, and NOT present
-    anywhere in the public Algolia catalog data (confirmed by exhaustive grep). Self-heals rather
-    than needing manual scraping: get_inventory_and_pricing's ``aliasing=true`` option resolves
-    an AAIA code against the real warehouse code directly (confirmed live), so
+    Lift) rather than a Tri-State-issued numeric id -- there's no Tri-State-native id worth
+    keying on even though get_brands now works (see below). Rows themselves are still seeded
+    one-time from the bundled tristate_brand_codes.json (146 brands Tri-State actually carries,
+    scraped from their own public catalog/Algolia data -- see
+    src.management.commands.seed_tse_brands), not created from the API. ``warehouse_code`` is
+    the real PACE API's own brand code (e.g. "AIR" for Air Lift) needed to call
+    get_inventory_and_pricing -- distinct from aaia_code, and NOT present anywhere in the public
+    Algolia catalog data (confirmed by exhaustive grep). Two ways it gets filled in:
+    get_brands was ACL-restricted for our App-Id at first, then granted after following up with
+    Tri-State's rep (confirmed live 2026-10-15) -- it returns the full real brand list with both
+    codes per entry, so src.integrations.services.tristate.refresh_tse_brands_from_api is now
+    the authoritative, one-call way to backfill this for every known brand at once. Separately,
+    get_inventory_and_pricing's own ``aliasing=true`` option ALSO resolves an AAIA code against
+    the real warehouse code directly (confirmed live), so
     src.integrations.services.tristate.fetch_tristate_inventory_and_pricing_for_company always
     passes aliasing and backfills this field from the resolved ``brand_code`` the first time a
-    brand's items come back matched -- most rows just start out null until that happens.
+    brand's items come back matched -- a safety net for any brand refresh_tse_brands_from_api
+    hasn't (yet) resolved, e.g. one added to our curated set after the last brand refresh.
     """
 
     aaia_code = django_db_models.CharField(max_length=16, unique=True)

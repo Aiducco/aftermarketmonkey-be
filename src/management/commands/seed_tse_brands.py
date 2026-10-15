@@ -4,9 +4,11 @@ actually carries, curated from their own public catalog -- see that file's own h
 it came from), then auto-maps to Brands by AAIA code. Re-running is safe/idempotent (upsert on
 aaia_code).
 
-Tri-State's real get_brands API endpoint is ACL-restricted for our App-Id (confirmed 403), so
-this bundled file is the only brand-list source available right now -- see
-src.integrations.clients.tristate.client's module docstring.
+This bootstraps the initial 146-brand set with no credentials needed. get_brands itself now
+works (access was granted after following up with Tri-State's rep) and returns the full real
+brand list -- run src.integrations.services.tristate.refresh_tse_brands_from_api afterward
+(needs a connected company's credentials) to authoritatively backfill warehouse_code/name on
+these rows; it doesn't create new TSEBrand rows for brands outside this curated set.
 
     python manage.py seed_tse_brands
 """
