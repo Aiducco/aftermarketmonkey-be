@@ -781,7 +781,8 @@ PROVIDER_CATALOG = [
             "your feed folder.</p>"
             + _CALLOUT_OPEN +
             "<p>Hi,</p>"
-            "<p>We're connecting our Meyer account to AfterMarketScout and need two things set up:</p>"
+            "<p>We're setting up automated pricing and inventory updates on our side and need two things "
+            "from you:</p>"
             "<p><strong>1. SFTP feed delivery.</strong> Please deliver our pricing and inventory files to:</p>"
             "<p>"
             "Host: <code>5.161.121.143</code><br />"
