@@ -1664,62 +1664,55 @@ PROVIDER_CATALOG = [
         # Email-channel ordering — see the matching note on Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
         "email_order_connection_optional_fields": ["account_number", "cc_email", "reply_to_email"],
-        "integration_time": "Catalog available immediately; your pricing within 1-2 days",
+        # Catalog is live the moment they connect (we read Wheel Group's published mastersheet),
+        # but their own cost and stock wait on the rep setting up delivery to the relay folder —
+        # out of our hands, days in practice. Kept in step with the "a few days" line in the
+        # instructions below; change the two together.
+        "integration_time": "Catalog available immediately; your pricing after their first delivery",
         # {{SFTP_USER}}/{{SFTP_PASSWORD}} are substituted per company by
         # _render_relay_instructions_html — see the matching note on Meyer above.
         "installation_instructions_html": (
-            "<p><strong>The Wheel Group</strong> works like Meyer, A-Tech, and Crown: you don't enter any "
-            "credentials. AfterMarketScout has already created a dedicated SFTP account for your company. Your "
-            "only job is to pass the connection details to your Wheel Group rep so they can push the feed to "
-            "it.</p>"
+            "<p><strong>The Wheel Group</strong> works differently: there are no feed credentials to enter. "
+            "Their full wheel catalog, with specs, images, MSRP and MAP, is already in AfterMarketScout. "
+            "Connecting adds your own dealer pricing and stock, which The Wheel Group delivers to a private "
+            "SFTP folder we've created for your company.</p>"
 
-            "<p>The Wheel Group's wheel catalog &mdash; Touren, Mayhem, ION Alloy, Cali Off-Road, Ridler, "
-            "Dirty Life, Kraze, American Truxx, Mazzi, Tuff Stuff and ION Trailer, with full specs, images, "
-            "MSRP and MAP &mdash; is already in AfterMarketScout, read from the mastersheet they publish. "
-            "Connecting is what adds <strong>your dealer pricing and stock</strong> on top of it.</p>"
-
-            "<p><strong>1. Send the relay details to your Wheel Group rep</strong></p>"
-            "<p>The details below are unique to your company &mdash; they're generated automatically and shown "
-            "here already filled in.</p>"
+            "<p><strong>1. Email your Wheel Group rep</strong></p>"
+            "<p>Copy the message below and send it to your account rep, or to "
+            "<a href=\"mailto:prestonw@wheel-1.com\">prestonw@wheel-1.com</a>. The connection details are "
+            "unique to your company and already filled in. Keep them private, because anyone who has them can "
+            "write to your feed folder.</p>"
             + _CALLOUT_OPEN +
-            "<ul>"
-            "<li><strong>Host:</strong> <code>5.161.121.143</code> (SFTP)</li>"
-            "<li><strong>Port:</strong> <code>22</code></li>"
-            "<li><strong>Folder:</strong> <code>uploads</code></li>"
-            "<li><strong>Username:</strong> <code>{{SFTP_USER}}</code></li>"
-            "<li><strong>Password:</strong> <code>{{SFTP_PASSWORD}}</code></li>"
-            "</ul>"
-            "</div>"
-            "<p>Email your Wheel Group account representative, or "
-            "<a href=\"mailto:prestonw@wheel-1.com\">prestonw@wheel-1.com</a>:</p>"
-            + _CALLOUT_OPEN +
-            "<p>Could you please push our inventory and pricing feed to the SFTP endpoint below? Please place "
-            "the files in the <code>uploads</code> folder.</p>"
+            "<p>Hi,</p>"
+            "<p>We're setting up automated pricing and inventory updates on our side. Could you please deliver "
+            "our pricing and inventory files to:</p>"
             "<p>"
             "Host: <code>5.161.121.143</code><br />"
             "Port: <code>22</code><br />"
             "Username: <code>{{SFTP_USER}}</code><br />"
-            "Password: <code>{{SFTP_PASSWORD}}</code>"
+            "Password: <code>{{SFTP_PASSWORD}}</code><br />"
+            "Folder: <code>uploads</code>"
             "</p>"
+            "<p>Thanks!</p>"
             "</div>"
-            "<p>Treat these details as private &mdash; anyone with them can write to your feed folder.</p>"
 
             "<p><strong>2. Click Connect</strong></p>"
-            "<p>There are no credentials to enter. Click <strong>Connect</strong> and AfterMarketScout will "
-            "start watching the folder for your files.</p>"
-            "<p>The Wheel Group catalog with MSRP and MAP is available to you straight away. Your own cost and "
-            "stock appear once The Wheel Group sends the first delivery, which depends on how quickly your rep "
-            "sets it up on their side. If nothing arrives after a few days, follow up and confirm they're "
-            "using the exact host and folder above.</p>"
+            "<p>AfterMarketScout starts watching your folder. The catalog with MSRP and MAP is available right "
+            "away. Your cost and stock appear after The Wheel Group's first delivery, which can take a few days "
+            "depending on your rep.</p>"
 
-            "<p><strong>Notes</strong></p>"
+            "<p><strong>3. Optional: ordering</strong></p>"
+            "<p>The Wheel Group has no ordering API, so we email your rep a PDF purchase order instead. Add "
+            "your rep's email (and an optional internal <strong>CC</strong>) to enable this.</p>"
+
+            "<p><strong>Troubleshooting</strong></p>"
             "<ul>"
-            "<li><strong>No files arriving.</strong> The most common cause is a mismatch on their side &mdash; "
-            "usually a different folder. Ask your rep to confirm the files land in <code>uploads</code>. Your "
-            "catalog and list pricing keep working either way.</li>"
-            "<li><strong>Multiple Wheel Group accounts?</strong> Each account needs its own feed delivery. "
-            "Contact <a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a> and we'll "
-            "set up an additional endpoint for you.</li>"
+            "<li><strong>No files after a few days?</strong> Ask your rep to confirm the host and that the "
+            "files are going to the <code>uploads</code> folder. Your catalog and list pricing keep working in "
+            "the meantime.</li>"
+            "<li><strong>More than one Wheel Group account?</strong> Each account needs its own folder. Email "
+            "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a> and we'll create "
+            "another one.</li>"
             "<li><strong>Need help?</strong> Distributor: "
             "<a href=\"mailto:prestonw@wheel-1.com\">prestonw@wheel-1.com</a> &middot; AfterMarketScout: "
             "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a></li>"
