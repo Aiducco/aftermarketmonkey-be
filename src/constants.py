@@ -811,10 +811,9 @@ PROVIDER_CATALOG = [
             "please:</p>"
             "<ol>"
             "<li>Grant us production access to the PACE API for pricing, inventory and ordering</li>"
-            "<li>Issue an App-Id and Api-Key for our account</li>"
-            "<li>Allow connections from AfterMarketScout's IP address: <code>"
+            "<li>Allow connections from AfterMarketScout (IP <code>"
             + KEYSTONE_ALLOWLIST_IP +
-            "</code></li>"
+            "</code>) for our account</li>"
             "</ol>"
             "<p>Thanks!</p>"
             "</div>"
