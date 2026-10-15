@@ -43,6 +43,8 @@ from src.integrations.clients.the_wheel_group import client as the_wheel_group_c
 from src.integrations.clients.the_wheel_group import exceptions as the_wheel_group_exceptions
 from src.integrations.clients.tirerack import client as tirerack_client
 from src.integrations.clients.tirerack import exceptions as tirerack_exceptions
+from src.integrations.clients.tristate import client as tristate_client
+from src.integrations.clients.tristate import exceptions as tristate_exceptions
 from src.integrations.clients.turn_14 import client as turn14_client
 from src.integrations.clients.wps import client as wps_client
 from src.integrations.clients.wps import exceptions as wps_exceptions
@@ -484,6 +486,17 @@ def _validate_keystone_connection(credentials: typing.Dict[str, typing.Any]) -> 
     return None, None
 
 
+def _validate_tristate_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
+    try:
+        client = tristate_client.TriStateApiClient(credentials=credentials)
+        client.test_connection()
+    except tristate_exceptions.TriStateAuthError as e:
+        return str(e), CONNECTION_ERROR_INVALID_CREDENTIALS
+    except (tristate_exceptions.TriStateException, ValueError) as e:
+        return str(e), CONNECTION_ERROR_CONNECTION_FAILED
+    return None, None
+
+
 def _validate_premier_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
     try:
         client = premier_client.PremierFTPClient(credentials=credentials)
@@ -712,6 +725,7 @@ _CONNECTION_VALIDATORS: typing.Dict[int, typing.Callable[[typing.Dict[str, typin
     src_enums.BrandProviderKind.WESTERN_POWER_SPORTS.value: _validate_wps_connection,
     src_enums.BrandProviderKind.HELMHOUSE.value: _validate_helmet_house_connection,
     src_enums.BrandProviderKind.ALLPRO_DISTRIBUTING.value: _validate_allpro_connection,
+    src_enums.BrandProviderKind.TRI_STATE.value: _validate_tristate_connection,
 }
 
 

@@ -60,6 +60,7 @@ from src.integrations.services import (
     rough_country,
     the_wheel_group,
     tirerack,
+    tristate,
     vossen,
     wheelpros,
     wheelpros_products,
@@ -158,6 +159,7 @@ class Command(BaseCommand):
             "ingest_all_providers_elite_wheel",
             "ingest_all_providers_the_wheel_group",
             "ingest_all_providers_helmet_house",
+            "ingest_all_providers_tristate",
             "ingest_all_providers_sync_all_master_parts",
             "ingest_all_providers_enqueue_pricing_jobs",
             "ingest_all_providers_meilisearch_reindex",
@@ -199,6 +201,7 @@ class Command(BaseCommand):
                 ("wps",           self._run_wps),
                 ("the_wheel_group", self._run_the_wheel_group),
                 ("helmet_house",  self._run_helmet_house),
+                ("tristate",      self._run_tristate),
             ]
             for name, run_fn in phase1_providers:
                 self._ingest_log("phase 1 | starting {} fetch".format(name))
@@ -392,6 +395,16 @@ class Command(BaseCommand):
             self._ingest_log("DLG: inventory SFTP + upsert")
             dlg.fetch_and_save_dlg_catalog(force_download=False)
             dlg.sync_unmapped_dlg_brands_to_brands()
+
+    def _run_tristate(self) -> None:
+        with self._audited_step(
+            "ingest_all_providers_tristate",
+            "TSE catalog copy from tristate_parts + unmapped brand sync complete (derived in sync_all).",
+            continue_on_error=True,
+        ):
+            self._ingest_log("TSE: copying catalog from tristate_parts seed + unmapped brand sync")
+            tristate.sync_unmapped_tse_brands_to_brands()
+            tristate.sync_tse_parts_from_tristate_part_seed()
 
     def _run_wheelpros(self) -> None:
         with self._audited_step(

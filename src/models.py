@@ -1510,6 +1510,101 @@ class MeyerCompanyPricing(django_db_models.Model):
         unique_together = [["part", "company"]]
 
 
+class TSEBrand(django_db_models.Model):
+    """
+    Tri-State Enterprises (TSE) brand, keyed by the generic AAIA brand code (e.g. "BBCG" for Air
+    Lift) rather than a Tri-State-issued numeric id -- Tri-State's real PACE Customer API has no
+    get_brands endpoint reachable by our key (see src.integrations.clients.tristate.client's
+    module docstring), so there is no Tri-State-native brand id to key on. Seeded one-time from
+    the bundled tristate_brand_codes.json (146 brands Tri-State actually carries, scraped from
+    their own public catalog/Algolia data -- see src.management.commands.seed_tse_brands), not
+    fetched live. ``warehouse_code`` is the real PACE API's own brand code (e.g. "AIR" for Air
+    Lift) needed to call get_inventory_and_pricing -- distinct from aaia_code, and NOT present
+    anywhere in the public Algolia catalog data (confirmed by exhaustive grep); only resolved one
+    brand at a time via an authenticated catalog-page fetch, so most rows start out null here and
+    get filled in as each brand is confirmed. A brand with no warehouse_code yet is simply
+    skipped by the pricing sync rather than failing (see master_parts.sync_provider_pricing_from_tristate_for_company).
+    """
+
+    aaia_code = django_db_models.CharField(max_length=16, unique=True)
+    name = django_db_models.CharField(max_length=255)
+    warehouse_code = django_db_models.CharField(max_length=32, null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "tse_brands"
+
+
+class BrandTSEBrandMapping(django_db_models.Model):
+    brand = django_db_models.ForeignKey(Brands, on_delete=django_db_models.CASCADE, related_name="tse_brand_mappings")
+    tse_brand = django_db_models.ForeignKey(TSEBrand, on_delete=django_db_models.CASCADE, related_name="brand_mappings")
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "brand_tse_brand_mapping"
+        unique_together = ["brand", "tse_brand"]
+
+
+class TSEParts(django_db_models.Model):
+    """
+    Tri-State catalog row, keyed by (brand, part_number) -- no separate internal SKU distinct
+    from part_number (same single-key shape as DlgParts), since the source is TriStatePart's own
+    Algolia-derived catalog slice (see sync_master_parts_from_tristate, which populates this
+    table from ``tristate_parts`` rather than a live distributor feed -- Tri-State's real PACE
+    API has no bulk catalog dump, only a per-(warehouse_code, part_number) pricing/inventory
+    lookup). ``description``/``image_url`` are carried here for display; live cost/jobber/core
+    and quantity for a specific company come from TSECompanyPricing, fetched through the real
+    API one batch of known parts at a time.
+    """
+
+    brand = django_db_models.ForeignKey(TSEBrand, on_delete=django_db_models.CASCADE, related_name="parts")
+    part_number = django_db_models.CharField(max_length=255)
+    description = django_db_models.TextField(null=True, blank=True)
+    image_url = django_db_models.TextField(null=True, blank=True)
+    category = django_db_models.CharField(max_length=255, null=True, blank=True)
+    subcategory = django_db_models.CharField(max_length=255, null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "tse_parts"
+        unique_together = ["brand", "part_number"]
+
+
+class TSECompanyPricing(django_db_models.Model):
+    """
+    Per-company Tri-State pricing AND inventory for a catalog row (TSEParts), fetched live from
+    the real PACE Customer API's get_inventory_and_pricing (not a feed file) -- unlike every
+    other distributor's *CompanyPricing table, a row here is only ever as fresh as its last
+    on-demand API call, since Tri-State's API returns account-specific pricing directly rather
+    than publishing a dealer-wide feed. ``quantity_available``/``orderable`` are kept here
+    (rather than only in ProviderPartInventory) so the raw API response is preserved per
+    company, the same role every other distributor's raw *Parts/*CompanyPricing split plays.
+    """
+
+    part = django_db_models.ForeignKey(TSEParts, on_delete=django_db_models.CASCADE, related_name="company_pricing")
+    company = django_db_models.ForeignKey(Company, on_delete=django_db_models.CASCADE, related_name="tse_company_pricing")
+    # account_price from get_inventory_and_pricing -- what THIS company's account actually pays.
+    cost = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
+    # list_price from the same response -- Tri-State's own MSRP/list, not a separate dealer tier
+    # (the real API has no distinct "jobber" price -- account_price IS the dealer price).
+    list_price = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
+    quantity_available = django_db_models.IntegerField(null=True)
+    orderable = django_db_models.BooleanField(default=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "tse_company_pricing"
+        unique_together = ["part", "company"]
+
+
 class AtechBrand(django_db_models.Model):
     """Distributor brand for A-Tech (linked from SKU prefix via AtechPrefixBrand)."""
 

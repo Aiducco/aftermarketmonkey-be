@@ -38,6 +38,7 @@ from src.integrations.services import rough_country as rough_country_services
 from src.integrations.clients.the_wheel_group import exceptions as the_wheel_group_exceptions
 from src.integrations.services import the_wheel_group as the_wheel_group_services
 from src.integrations.services import tirerack as tirerack_services
+from src.integrations.services import tristate as tristate_services
 from src.integrations.services import turn_14 as turn_14_services
 from src.integrations.services import turn_14_sweeps
 from src.integrations.services import vossen as vossen_services
@@ -66,6 +67,7 @@ _PRICING_SYNC_KINDS = frozenset(
         src_enums.BrandProviderKind.WESTERN_POWER_SPORTS.value,
         src_enums.BrandProviderKind.HELMHOUSE.value,
         src_enums.BrandProviderKind.THE_WHEEL_GROUP.value,
+        src_enums.BrandProviderKind.TRI_STATE.value,
     }
 )
 
@@ -327,6 +329,9 @@ def _fetch_raw_pricing(cp: src_models.CompanyProviders, use_delta_fetch: bool = 
     elif kind == src_enums.BrandProviderKind.THE_WHEEL_GROUP.value:
         the_wheel_group_services.sync_the_wheel_group_company_pricing_for_company_provider(cp.id)
 
+    elif kind == src_enums.BrandProviderKind.TRI_STATE.value:
+        tristate_services.sync_tristate_company_pricing_for_company_provider(cp.id)
+
     else:
         raise ValueError("Unsupported provider kind for raw pricing fetch: {}".format(kind))
 
@@ -386,6 +391,9 @@ def _sync_master_pricing(cp: src_models.CompanyProviders) -> None:
 
     elif kind == src_enums.BrandProviderKind.THE_WHEEL_GROUP.value:
         master_parts.sync_provider_pricing_from_the_wheel_group_for_company(company_id)
+
+    elif kind == src_enums.BrandProviderKind.TRI_STATE.value:
+        master_parts.sync_provider_pricing_from_tristate_for_company(company_id)
 
     else:
         raise ValueError("Unsupported provider kind for master pricing sync: {}".format(kind))

@@ -2176,6 +2176,402 @@ def _ingest_dlg_parts_for_mapped_brands(
     return total_master, total_provider
 
 
+def _ingest_tse_parts_for_mapped_brands(
+    mapped_catalog_brand_ids: typing.Set[int],
+    tse_provider: src_models.Providers,
+    tse_brand_to_brand: typing.Dict[int, src_models.Brands],
+    tse_brand_to_aaia: typing.Dict[int, typing.Optional[str]],
+) -> typing.Tuple[int, int]:
+    """Batch-ingest TSEParts for one disjoint set of TSE catalog brand PKs. Exact
+    (brand_id, part_number) match only -- see sync_master_parts_from_tristate."""
+    if not mapped_catalog_brand_ids:
+        return 0, 0
+
+    total_master = 0
+    total_provider = 0
+    batch_num = 0
+    last_id = 0
+
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.TSEParts.objects.filter(
+                brand_id__in=mapped_catalog_brand_ids,
+                id__gt=last_id,
+            )
+            .order_by("id")
+            .values("id", "brand_id", "part_number", "description", "image_url", "updated_at")[:BATCH_SIZE_MASTER_PARTS]
+        )
+        if not batch:
+            break
+
+        last_id = batch[-1]["id"]
+        seen = set()
+        master_parts = []
+
+        for row in batch:
+            brand = tse_brand_to_brand.get(row["brand_id"])
+            if not brand:
+                continue
+            part_number = (row.get("part_number") or "").strip()
+            if not part_number:
+                continue
+            key = (brand.id, part_number)
+            if key not in seen:
+                seen.add(key)
+                aaia = tse_brand_to_aaia.get(row["brand_id"])
+                master_parts.append(
+                    src_models.MasterPart(
+                        brand=brand,
+                        part_number=part_number,
+                        sku=part_number,
+                        description=row.get("description"),
+                        aaia_code=aaia,
+                        image_url=row.get("image_url"),
+                    )
+                )
+
+        if not master_parts:
+            connection.close()
+            if len(batch) == BATCH_SIZE_MASTER_PARTS:
+                time.sleep(BATCH_DELAY_SECONDS)
+            continue
+
+        pairs = list(seen)
+        existing_by_key = {}
+        with connection.cursor() as cur:
+            cur.execute(
+                "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                (tuple(pairs),),
+            )
+            for row in cur.fetchall():
+                mp_id, b_id, p_num = row
+                existing_by_key[(b_id, p_num)] = mp_id
+
+        new_parts = [mp for mp in master_parts if (mp.brand_id, mp.part_number) not in existing_by_key]
+        existing_keys = [k for k in pairs if k in existing_by_key]
+
+        if new_parts:
+            new_parts = _dedupe_master_parts_for_upsert(
+                new_parts, context="TSE new_parts batch={}".format(batch_num)
+            )
+            pgbulk.upsert(
+                src_models.MasterPart,
+                new_parts,
+                unique_fields=["brand", "part_number"],
+                update_fields=[],
+            )
+            total_master += len(new_parts)
+
+        if existing_keys:
+            key_to_mp = {(mp.brand_id, mp.part_number): mp for mp in master_parts}
+            values = [(existing_by_key[k], key_to_mp[k].aaia_code) for k in existing_keys]
+            placeholders = ", ".join(["(%s::bigint, %s)"] * len(values))
+            params = [x for row_vals in values for x in row_vals]
+            with connection.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE master_parts mp SET aaia_code = v.aaia_code
+                    FROM (VALUES {}) AS v(id, aaia_code)
+                    WHERE mp.id = v.id
+                    """.format(placeholders),
+                    params,
+                )
+
+        brand_part_to_master = {}
+        for (b_id, p_num), mp_id in existing_by_key.items():
+            mp = src_models.MasterPart()
+            mp.id = mp_id
+            mp.brand_id = b_id
+            mp.part_number = p_num
+            brand_part_to_master[(b_id, p_num)] = mp
+        new_pairs = [k for k in pairs if k not in brand_part_to_master]
+        if new_pairs:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(new_pairs),),
+                )
+                for row in cur.fetchall():
+                    mp_id, b_id, p_num = row
+                    mp = src_models.MasterPart()
+                    mp.id = mp_id
+                    mp.brand_id = b_id
+                    mp.part_number = p_num
+                    brand_part_to_master[(b_id, p_num)] = mp
+
+        provider_parts_by_key = {}
+        for row in batch:
+            brand = tse_brand_to_brand.get(row["brand_id"])
+            if not brand:
+                continue
+            pn = (row.get("part_number") or "").strip()
+            if not pn:
+                continue
+            master_part = brand_part_to_master.get((brand.id, pn))
+            if not master_part:
+                continue
+            pp_key = (master_part.id, tse_provider.id)
+            provider_parts_by_key[pp_key] = src_models.ProviderPart(
+                master_part=master_part,
+                provider=tse_provider,
+                provider_external_id="{}_{}".format(row["brand_id"], pn),
+                distributor_refreshed_at=row.get("updated_at"),
+            )
+
+        provider_parts = list(provider_parts_by_key.values())
+        if provider_parts:
+            pgbulk.upsert(
+                src_models.ProviderPart,
+                provider_parts,
+                unique_fields=["master_part", "provider"],
+                update_fields=_PROVIDER_PART_SYNC_UPDATE_FIELDS,
+            )
+            total_provider += len(provider_parts)
+
+        logger.info("{} TSE batch {}: {} items -> {} master, {} provider (last_id={})".format(
+            _LOG_PREFIX, batch_num, len(batch), len(master_parts), len(provider_parts), last_id
+        ))
+        connection.close()
+        if len(batch) == BATCH_SIZE_MASTER_PARTS:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    return total_master, total_provider
+
+
+def sync_master_parts_from_tristate() -> None:
+    """
+    Create/update MasterPart and ProviderPart from TSEParts. Only rows whose TSEBrand has a
+    BrandTSEBrandMapping are included. Resolution uses **(catalog brand_id, part_number) only**
+    -- same simple single-key shape as sync_master_parts_from_dlg, no SKU bridge, no normalized
+    fallback (TSEParts' part numbers come from PACE's own structured catalog data, not a messy
+    feed, so the exact match is expected to be sufficient).
+    """
+    logger.info("{} Syncing master parts from TSE (batched, part_number only).".format(_LOG_PREFIX))
+
+    tse_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.TRI_STATE.value,
+    ).first()
+    if not tse_provider:
+        logger.info("{} No TSE provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(src_models.BrandTSEBrandMapping.objects.select_related("brand", "tse_brand"))
+    tse_brand_to_brand = {m.tse_brand_id: m.brand for m in mappings}
+    tse_brand_to_aaia = {m.tse_brand_id: (m.brand.aaia_code if m.brand else None) for m in mappings}
+    if not tse_brand_to_brand:
+        logger.info("{} No BrandTSEBrandMapping found. Nothing to sync.".format(_LOG_PREFIX))
+        return
+
+    chunks = _partition_mapped_brands_for_parallel_ingest(mappings, MASTER_PARTS_SYNC_MAX_WORKERS)
+    total_master, total_provider = _run_parallel_master_parts_ingest(
+        chunks,
+        mappings,
+        "tse_brand",
+        lambda cids: _ingest_tse_parts_for_mapped_brands(
+            cids, tse_provider, tse_brand_to_brand, tse_brand_to_aaia,
+        ),
+    )
+    logger.info("{} Synced {} master parts and {} provider parts from TSE total.".format(
+        _LOG_PREFIX, total_master, total_provider
+    ))
+
+
+def sync_provider_inventory_from_tristate() -> None:
+    """
+    Sync ProviderPartInventory from TSECompanyPricing -- sourced from whichever company has the
+    real Tri-State API connection (see CompanyProviders.primary), mirroring how every other
+    on-demand-only provider's "global" inventory snapshot is just its primary company's own data
+    rather than a true distributor-wide figure. Skipped entirely if no primary connection has
+    priced anything yet.
+    """
+    logger.info("{} Syncing provider inventory from TSE.".format(_LOG_PREFIX))
+
+    tse_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.TRI_STATE.value,
+    ).first()
+    if not tse_provider:
+        logger.info("{} No TSE provider found.".format(_LOG_PREFIX))
+        return
+
+    primary_cp = (
+        src_models.CompanyProviders.objects.filter(
+            provider=tse_provider, primary=True, active=True,
+        ).first()
+        or src_models.CompanyProviders.objects.filter(provider=tse_provider, active=True).first()
+    )
+    if not primary_cp:
+        logger.info("{} No active TSE CompanyProviders row. Nothing to sync.".format(_LOG_PREFIX))
+        return
+
+    provider_parts_by_key = {
+        row["provider_external_id"]: src_models.ProviderPart(id=row["id"])
+        for row in src_models.ProviderPart.objects.filter(provider=tse_provider).values(
+            "id", "provider_external_id"
+        )
+    }
+
+    now = timezone.now()
+    total_upserted = 0
+    batch_num = 0
+    last_id = 0
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.TSECompanyPricing.objects.filter(
+                id__gt=last_id, company_id=primary_cp.company_id,
+            )
+            .order_by("id")
+            .values("id", "quantity_available", "part__brand_id", "part__part_number")[:BATCH_SIZE_INVENTORY]
+        )
+        if not batch:
+            break
+        last_id = batch[-1]["id"]
+
+        to_upsert = []
+        for row in batch:
+            ext_id = "{}_{}".format(row["part__brand_id"], row["part__part_number"])
+            provider_part = provider_parts_by_key.get(ext_id)
+            if not provider_part:
+                continue
+            to_upsert.append(
+                src_models.ProviderPartInventory(
+                    provider_part=provider_part,
+                    warehouse_total_qty=row.get("quantity_available") or 0,
+                    manufacturer_inventory=None,
+                    manufacturer_esd=None,
+                    warehouse_availability=None,
+                    last_synced_at=now,
+                    updated_at=now,
+                )
+            )
+        if to_upsert:
+            to_upsert = _dedupe_provider_part_inventory_for_upsert(
+                to_upsert, context="TSE inventory batch={}".format(batch_num)
+            )
+            pgbulk.upsert(
+                src_models.ProviderPartInventory,
+                to_upsert,
+                unique_fields=["provider_part"],
+                update_fields=[
+                    "warehouse_total_qty", "manufacturer_inventory", "manufacturer_esd",
+                    "warehouse_availability", "last_synced_at", "updated_at",
+                ],
+            )
+            total_upserted += len(to_upsert)
+        connection.close()
+        if len(batch) == BATCH_SIZE_INVENTORY:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    logger.info("{} Synced {} TSE inventory records total.".format(_LOG_PREFIX, total_upserted))
+
+
+def sync_provider_pricing_from_tristate_for_company(company_id: int) -> None:
+    """Propagate TSECompanyPricing into ProviderPartCompanyPricing for one company."""
+    logger.info("{} Syncing TSE provider pricing for company_id={}.".format(_LOG_PREFIX, company_id))
+
+    tse_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.TRI_STATE.value,
+    ).first()
+    if not tse_provider:
+        logger.info("{} No TSE provider found.".format(_LOG_PREFIX))
+        return
+
+    provider_parts_by_key = {
+        row["provider_external_id"]: src_models.ProviderPart(id=row["id"])
+        for row in src_models.ProviderPart.objects.filter(provider=tse_provider).values(
+            "id", "provider_external_id"
+        )
+    }
+    if not provider_parts_by_key:
+        logger.info("{} No TSE ProviderPart rows yet. Nothing to price.".format(_LOG_PREFIX))
+        return
+
+    now = timezone.now()
+    sync_started_at = timezone.now()
+    company_provider = src_models.CompanyProviders.objects.filter(
+        company_id=company_id, provider=tse_provider,
+    ).first()
+    watermark = company_provider.pricing_propagation_watermark if company_provider else None
+
+    total_upserted = 0
+    batch_num = 0
+    last_id = 0
+    while True:
+        batch_num += 1
+        qs = src_models.TSECompanyPricing.objects.filter(id__gt=last_id, company_id=company_id)
+        if watermark:
+            qs = qs.filter(updated_at__gte=watermark)
+        batch = list(
+            qs.order_by("id").values(
+                "id", "cost", "list_price", "part__brand_id", "part__part_number",
+            )[:BATCH_SIZE_PRICING]
+        )
+        if not batch:
+            break
+        last_id = batch[-1]["id"]
+
+        to_upsert = []
+        for row in batch:
+            ext_id = "{}_{}".format(row["part__brand_id"], row["part__part_number"])
+            pp = provider_parts_by_key.get(ext_id)
+            if not pp:
+                continue
+            to_upsert.append(
+                src_models.ProviderPartCompanyPricing(
+                    provider_part=pp,
+                    company_id=company_id,
+                    cost=row.get("cost"),
+                    jobber_price=row.get("cost"),
+                    map_price=None,
+                    msrp=row.get("list_price"),
+                    retail_price=row.get("list_price"),
+                    last_synced_at=now,
+                )
+            )
+        if to_upsert:
+            to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                to_upsert, context="TSE pricing company={} batch={}".format(company_id, batch_num)
+            )
+            pgbulk.upsert(
+                src_models.ProviderPartCompanyPricing,
+                to_upsert,
+                unique_fields=["provider_part", "company"],
+                update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
+            )
+            total_upserted += len(to_upsert)
+        connection.close()
+        if len(batch) == BATCH_SIZE_PRICING:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    logger.info("{} Synced {} TSE pricing records for company_id={}.".format(
+        _LOG_PREFIX, total_upserted, company_id,
+    ))
+
+    if company_provider:
+        company_provider.pricing_propagation_watermark = sync_started_at
+        company_provider.save(update_fields=["pricing_propagation_watermark"])
+
+
+def sync_derived_from_tristate(*, skip_master_parts: bool = False, skip_pricing: bool = False) -> None:
+    """
+    Propagate TSE source data into MasterPart, ProviderPart, ProviderPartInventory. Pricing is
+    NOT looped over all companies here (unlike every other provider's sync_derived_from_*) --
+    Tri-State pricing is fetched live per company on-demand (see
+    integration_pricing_sync_jobs._fetch_raw_pricing), so there is no "global pricing sweep"
+    step; ``skip_pricing`` only controls whether the inventory step (which does reflect the
+    primary company's own pricing snapshot) runs.
+    """
+    logger.info("{} Starting TSE-only derived sync.".format(_LOG_PREFIX))
+    if not skip_master_parts:
+        sync_master_parts_from_tristate()
+        connection.close()
+    if not skip_pricing:
+        sync_provider_inventory_from_tristate()
+        connection.close()
+    logger.info("{} Completed TSE-only derived sync.".format(_LOG_PREFIX))
+
+
 def sync_master_parts_from_dlg() -> None:
     """
     Create/update MasterPart and ProviderPart from DlgParts.
@@ -12922,6 +13318,8 @@ def sync_all_master_parts_global() -> None:
     sync_derived_from_helmet_house(skip_pricing=True)
     _reclaim_memory()
     sync_derived_from_the_wheel_group(skip_pricing=True)
+    _reclaim_memory()
+    sync_derived_from_tristate(skip_pricing=True)
 
     logger.info("{} Completed global master parts sync (catalog + inventory, no pricing).".format(_LOG_PREFIX))
 
@@ -12957,5 +13355,6 @@ def sync_all_master_parts_incremental() -> None:
     sync_derived_from_wps(skip_master_parts=True)
     sync_derived_from_helmet_house(skip_master_parts=True)
     sync_derived_from_the_wheel_group(skip_master_parts=True)
+    sync_derived_from_tristate(skip_master_parts=True)
 
     logger.info("{} Completed incremental master parts sync.".format(_LOG_PREFIX))

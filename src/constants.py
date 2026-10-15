@@ -789,6 +789,38 @@ PROVIDER_CATALOG = [
         ),
     },
     {
+        "kind": enums.BrandProviderKind.TRI_STATE,
+        "name": "Tri-State",
+        "description": "Access live pricing and inventory from Tri-State Enterprises via their API.",
+        "icon_url": "https://api.aftermarketscout.com/uploads/tristate.png",
+        "category": "Distributors",
+        "connection_required_fields": ["app_id", "api_key"],
+        "integration_time": "Data available within 1-2 hours",
+        "installation_instructions_html": (
+            "<p><strong>Tri-State</strong> connects through its own API, using an "
+            "<strong>App-Id</strong> and <strong>Api-Key</strong> issued directly by your Tri-State "
+            "rep.</p>"
+            "<p><strong>1. Email your Tri-State rep</strong></p>"
+            "<p>Ask them to issue an App-Id and Api-Key for automated pricing and inventory access, "
+            "and to confirm the account number it's tied to.</p>"
+            "<p><strong>2. Connect the feed</strong></p>"
+            "<p>Paste the <strong>App-Id</strong> and <strong>Api-Key</strong> into the fields below "
+            "and click <strong>Save feed credentials</strong>. The card will show "
+            "<strong>Feed Connected</strong>.</p>"
+            "<p><strong>Note</strong></p>"
+            "<p>Tri-State's API returns pricing and inventory per item rather than a full catalog "
+            "dump, so coverage starts with the brands we've already mapped and widens over time as "
+            "more of Tri-State's catalog is confirmed against it.</p>"
+            "<p><strong>Troubleshooting</strong></p>"
+            "<ul>"
+            "<li><strong>Saved but no data?</strong> Confirm your rep issued a production "
+            "App-Id/Api-Key, not a test credential.</li>"
+            "<li><strong>More than one account?</strong> Each account needs its own App-Id/Api-Key. "
+            "Contact your rep for an additional one.</li>"
+            "</ul>"
+        ),
+    },
+    {
         "kind": enums.BrandProviderKind.ATECH,
         "name": "A-Tech",
         "description": "Access A-Tech catalog, inventory, and pricing from AfterMarketScout's SFTP relay.",
