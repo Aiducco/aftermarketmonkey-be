@@ -57,7 +57,12 @@ logger = logging.getLogger(__name__)
 _LOG_PREFIX = "[TRISTATE-SERVICES]"
 
 PRICING_UPSERT_BATCH = 2000
-PRICING_FETCH_WORKERS = 4
+# Each call measured at ~6.8s round trip regardless of batch size (backend-processing-bound,
+# not payload-bound -- see the client's DEFAULT_ITEMS_BATCH_SIZE comment), and a full-catalog
+# run is thousands of calls -- concurrency is what keeps that from taking hours. No documented
+# or observed rate limit for Tri-State specifically; 8 is a moderate step up from the original 4,
+# not an aggressive one.
+PRICING_FETCH_WORKERS = 8
 
 
 def refresh_tse_brands_from_api(company_provider_id: int) -> int:
@@ -263,6 +268,18 @@ def _warehouse_availability(locations: typing.Any) -> typing.Optional[typing.Dic
     return out or None
 
 
+def _report_sync_progress(cp: src_models.CompanyProviders, message: str) -> None:
+    """
+    Writes live progress into CompanyProviders.status_reason -- the same field the integrations
+    page already surfaces for every other provider's "Ingesting..."/"Waiting..." state (see
+    src.api.services.integrations), so anyone can check where a long-running Tri-State sync
+    stands at any time through the normal connection status, no SSH/log-tailing required.
+    """
+    cp.status_reason = message
+    cp.status_checked_at = timezone.now()
+    cp.save(update_fields=["status_reason", "status_checked_at"])
+
+
 def fetch_tristate_inventory_and_pricing_for_company(company_provider_id: int) -> int:
     """
     For one company's Tri-State connection: call get_inventory_and_pricing (aliasing=True) for
@@ -271,6 +288,9 @@ def fetch_tristate_inventory_and_pricing_for_company(company_provider_id: int) -
     docstring), backfills TSEBrand.warehouse_code from whatever aliasing resolves, and upserts
     cost/list_price into TSECompanyPricing for this company. Returns the number of
     TSECompanyPricing rows upserted.
+
+    Progress (batches done/total, items fetched, rows written) is written to
+    CompanyProviders.status_reason as it runs -- see _report_sync_progress.
     """
     cp = (
         src_models.CompanyProviders.objects.filter(id=company_provider_id)
@@ -358,6 +378,10 @@ def fetch_tristate_inventory_and_pricing_for_company(company_provider_id: int) -
             total_pricing_written += len(pricing_upserts)
             pricing_upserts = []
 
+    _report_sync_progress(
+        cp, "Tri-State sync starting: 0/{} batches ({} parts).".format(total_chunks, len(parts))
+    )
+
     with ThreadPoolExecutor(max_workers=PRICING_FETCH_WORKERS) as executor:
         futures = [executor.submit(_fetch_chunk, chunk) for chunk in chunks]
         for future in as_completed(futures):
@@ -401,13 +425,16 @@ def fetch_tristate_inventory_and_pricing_for_company(company_provider_id: int) -
 
             if len(pricing_upserts) >= PRICING_UPSERT_BATCH or len(part_updates) >= PRICING_UPSERT_BATCH:
                 _flush()
-                logger.info(
-                    "{} company_provider_id={}: {}/{} batches done, {} items fetched so far, "
+                pct = round(100 * chunks_done / total_chunks)
+                progress_message = (
+                    "Tri-State sync in progress: {}/{} batches ({}%), {} items fetched, "
                     "{} TSEParts + {} TSECompanyPricing written so far.".format(
-                        _LOG_PREFIX, company_provider_id, chunks_done, total_chunks,
+                        chunks_done, total_chunks, pct,
                         total_fetched, total_parts_written, total_pricing_written,
                     )
                 )
+                logger.info("{} company_provider_id={}: {}".format(_LOG_PREFIX, company_provider_id, progress_message))
+                _report_sync_progress(cp, progress_message)
 
     _flush()
 
@@ -429,12 +456,14 @@ def fetch_tristate_inventory_and_pricing_for_company(company_provider_id: int) -
                 )
             )
 
-    logger.info(
-        "{} company_provider_id={}: fetched {} items, updated {} TSEParts, upserted {} "
-        "TSECompanyPricing rows.".format(
-            _LOG_PREFIX, company_provider_id, total_fetched, total_parts_written, total_pricing_written
+    final_message = (
+        "Tri-State sync completed at {}: {} items fetched, {} TSEParts updated, "
+        "{} TSECompanyPricing rows upserted.".format(
+            timezone.now().strftime("%Y-%m-%d %H:%M:%S"), total_fetched, total_parts_written, total_pricing_written
         )
     )
+    logger.info("{} company_provider_id={}: {}".format(_LOG_PREFIX, company_provider_id, final_message))
+    _report_sync_progress(cp, final_message)
     return total_pricing_written
 
 

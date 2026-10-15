@@ -53,8 +53,12 @@ DEFAULT_BASE_URL = "https://etristate.com/api"
 REQUEST_TIMEOUT_SECONDS = 20
 
 # PACE's own documented best practice for get_inventory_and_pricing is to batch 50-100 "items"
-# per call rather than one call per part; 75 sits in the middle of that documented range.
-DEFAULT_ITEMS_BATCH_SIZE = 75
+# per call rather than one call per part. 100 (the top of that range) confirmed live: a 100-item
+# call succeeds and returns all 100 results, ~6.8s round trip -- call latency here is clearly
+# backend-processing-bound, not payload-size-bound (no documented rate limit found for Tri-State
+# specifically, unlike Turn14's 5 req/sec), so concurrency (PRICING_FETCH_WORKERS in
+# src.integrations.services.tristate) matters more for full-catalog runtime than batch size.
+DEFAULT_ITEMS_BATCH_SIZE = 100
 
 
 class TriStateApiClient:
