@@ -302,14 +302,19 @@ def fetch_and_save_allpro_company_pricing(company_provider_id: int) -> int:
     def _flush(batch_list: typing.List[src_models.AllProCompanyPricing]) -> int:
         if not batch_list:
             return 0
+        # MASTER_PRICEFILE.CSV has overlapping rows that resolve to the same full_part_number
+        # after the ":" strip (confirmed live -- Postgres' ON CONFLICT rejects a statement that
+        # would touch the same (part, company) row twice) -- dedupe within the batch, last row
+        # wins, same convention as every other provider's pricing upsert in master_parts.py.
+        deduped = {(r.part_id, r.company_id): r for r in batch_list}
         pgbulk.upsert(
             src_models.AllProCompanyPricing,
-            batch_list,
+            list(deduped.values()),
             unique_fields=["part", "company"],
             update_fields=["cost", "updated_at"],
             returning=False,
         )
-        return len(batch_list)
+        return len(deduped)
 
     try:
         for row in client.iter_pricing_records():
