@@ -1329,31 +1329,22 @@ PROVIDER_CATALOG = [
         # username/password into this copy: it would commit a live credential to the repo and
         # surface it in the public catalog response.
         "installation_instructions_html": (
-            "<p><strong>Helmet House</strong> publishes price and stock data over plain FTP. "
-            "AfterMarketScout connects to <code>ftp.helmethouse.com</code> on port <code>21</code> "
-            "automatically &mdash; there's no host or port to enter. You only provide the login.</p>"
-            "<p>Unlike most distributors, this isn't a dealer-specific account: Helmet House uses one shared "
-            "login for their published feed, so there's no application process and nothing to request.</p>"
+            "<p><strong>Helmet House</strong> publishes price and stock data with one shared FTP login for all "
+            "dealers, so there's nothing to apply for.</p>"
 
             "<p><strong>1. Enter the FTP login</strong></p>"
-            "<ol>"
-            "<li>Enter the Helmet House FTP <strong>username</strong> and <strong>password</strong> below.</li>"
-            "<li>Click <strong>Save</strong>.</li>"
-            "</ol>"
-            "<p>Don't have the shared login, or think it's changed? Contact "
-            "<a href=\"mailto:info@helmethouse.com\">info@helmethouse.com</a> for the current FTP username and "
-            "password.</p>"
-            "<p>Once validated, this integration shows <strong>Feed Connected</strong>.</p>"
+            "<p>Paste the Helmet House FTP <strong>username</strong> and <strong>password</strong> into the "
+            "fields below and click <strong>Save feed credentials</strong>. The card will show "
+            "<strong>Feed Connected</strong>.</p>"
+            "<p>Don't have the login? Email "
+            "<a href=\"mailto:info@helmethouse.com\">info@helmethouse.com</a> and ask for the current FTP "
+            "username and password.</p>"
 
-            "<p><strong>Notes</strong></p>"
+            "<p><strong>Troubleshooting</strong></p>"
             "<ul>"
-            "<li><strong>Connection fails.</strong> Re-paste the username and password to rule out a stray "
-            "space. If it still fails, ask <a href=\"mailto:info@helmethouse.com\">info@helmethouse.com</a> to "
-            "confirm the login is current &mdash; because it's shared rather than issued per dealer, it can "
-            "change without notice.</li>"
-            "<li><strong>Need help?</strong> Distributor: "
-            "<a href=\"mailto:info@helmethouse.com\">info@helmethouse.com</a> &middot; AfterMarketScout: "
-            "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a></li>"
+            "<li><strong>Connection fails?</strong> Re-paste both values. If it still fails, the shared login "
+            "may have changed without notice, so ask "
+            "<a href=\"mailto:info@helmethouse.com\">info@helmethouse.com</a> for the current one.</li>"
             "</ul>"
         ),
     },
