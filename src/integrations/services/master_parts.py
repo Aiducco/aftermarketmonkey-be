@@ -2658,14 +2658,25 @@ def _ingest_allpro_parts_for_mapped_brands(
 
         if existing_keys:
             key_to_mp = {(mp.brand_id, mp.part_number): mp for mp in master_parts}
-            values = [(existing_by_key[k], key_to_mp[k].aaia_code) for k in existing_keys]
-            placeholders = ", ".join(["(%s::bigint, %s)"] * len(values))
+            # COALESCE, not overwrite: an AllPro-sourced description only fills a currently-empty
+            # one -- a MasterPart also carried by another provider (e.g. Tri-State, confirmed live
+            # both can touch the same WeatherTech row) keeps that provider's description rather
+            # than AllPro's silently replacing it on every re-sync. Enrichment (AllProParts.
+            # description) runs after the first catalog ingest, so this is also what lets a
+            # re-run backfill description onto rows created before enrichment ever populated it.
+            values = [
+                (existing_by_key[k], key_to_mp[k].aaia_code, key_to_mp[k].description)
+                for k in existing_keys
+            ]
+            placeholders = ", ".join(["(%s::bigint, %s, %s)"] * len(values))
             params = [x for row_vals in values for x in row_vals]
             with connection.cursor() as cur:
                 cur.execute(
                     """
-                    UPDATE master_parts mp SET aaia_code = v.aaia_code
-                    FROM (VALUES {}) AS v(id, aaia_code)
+                    UPDATE master_parts mp SET
+                        aaia_code = v.aaia_code,
+                        description = COALESCE(mp.description, v.description)
+                    FROM (VALUES {}) AS v(id, aaia_code, description)
                     WHERE mp.id = v.id
                     """.format(placeholders),
                     params,
