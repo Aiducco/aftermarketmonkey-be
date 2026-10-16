@@ -13912,6 +13912,7 @@ def sync_all_master_parts_global() -> None:
     sync_derived_from_tristate(skip_pricing=True)
     _reclaim_memory()
     sync_derived_from_allpro(skip_pricing=True)
+    sync_derived_from_atd(skip_pricing=True)
 
     logger.info("{} Completed global master parts sync (catalog + inventory, no pricing).".format(_LOG_PREFIX))
 
@@ -13949,5 +13950,763 @@ def sync_all_master_parts_incremental() -> None:
     sync_derived_from_the_wheel_group(skip_master_parts=True)
     sync_derived_from_tristate(skip_master_parts=True)
     sync_derived_from_allpro(skip_master_parts=True)
+    sync_derived_from_atd(skip_master_parts=True)
 
     logger.info("{} Completed incremental master parts sync.".format(_LOG_PREFIX))
+
+
+# ==========================================================================================
+# ATD (American Tire Distributors) -- ATD Connect REST API
+#
+# Shaped differently from every other provider above: ATD's own API ties BOTH cost and stock to
+# the dealer's locationnumber (see src.models.ATDCompanyPricing's docstring), so there is no
+# "primary account" catalog sweep the way AllPro/TSE have -- every connected company's own
+# credentials run their own full productcatalog sweep (src.integrations.services.atd), and that
+# one sweep writes catalog (ATDPart, shared) and this company's own cost+stock
+# (ATDCompanyPricing) in one pass. That raw fetch is triggered per-company by
+# integration_pricing_sync_jobs (same as every per-company-credentialed provider's pricing fetch);
+# the functions below only propagate whatever is already in ATDPart/ATDCompanyPricing into the
+# master layer, same role every other provider's sync_derived_from_* plays.
+# ==========================================================================================
+_ATD_TIRE_PRODUCT_GROUPS = frozenset({
+    "passenger tires", "light truck tires", "medium truck tires", "small tires",
+    "boat trailer tires", "farm tires", "industrial tires", "trailer tires",
+    "otr,grader,em tires", "tubes and flaps",
+})
+
+_ATD_CATALOG_VALUES = (
+    "id", "brand_id", "atdproductnumber", "mfgproductnumber", "description", "image_url",
+    "upc", "productgroup", "updated_at",
+)
+
+_ATD_DETAILS_VALUES = (
+    "id", "brand_id", "atdproductnumber", "productgroup", "size", "upc", "shipping_weight",
+    "bolt_pattern_1", "bolt_pattern_2", "bolt_pattern_3", "bolt_pattern_4", "offset", "hub_bore",
+    "backspacing", "atd_finish", "mfg_finish", "load_rating", "material",
+    "load_index", "speed_rating", "load_range", "sidewall_description",
+    "winter_designation", "seasonal_designation", "run_flat", "treadwear",
+)
+
+# ATD tire productspecs this account genuinely measured with real values live -- none of our
+# other tire-carrying distributor feeds supply tread depth, UTQG grades or a rim-width range at
+# all (see TireSpec's "from distributor structured fields where available" block, previously
+# unfilled by any provider). Keyed by the ATDPart raw_specs key used below.
+_ATD_TIRE_SPEC_VALUES = (
+    "id", "productgroup", "raw_specs",
+    "provider_part__master_part_id",
+)
+
+
+def _atd_provider_external_id(atdproductnumber: str) -> str:
+    """ATD's atdproductnumber is already globally unique (section 10 of atd-connect-api.md --
+    the only one of ATD's own identifiers that is), so it is used directly, unlike every
+    brand-scoped provider above that has to compose one."""
+    return (atdproductnumber or "").strip()
+
+
+def _atd_part_number(row: typing.Dict) -> typing.Optional[str]:
+    """MasterPart.part_number should be the manufacturer's own part number (mfgproductnumber),
+    matching every other provider's part_number meaning -- atdproductnumber is ATD's internal SKU,
+    stored as ProviderPart.provider_external_id instead. Falls back to atdproductnumber on the
+    rare row with no mfgproductnumber, so a real product is never dropped for want of one."""
+    mfg = (row.get("mfgproductnumber") or "").strip()
+    if mfg:
+        return mfg
+    return (row.get("atdproductnumber") or "").strip() or None
+
+
+def _atd_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
+    """Wheel- or tire-spec attributes for an ATDPart row, shown as ProviderPart.product_details --
+    picks the relevant family off productgroup (see atd-connect-api.md section 4's two spec
+    families; a key from the wrong family is simply never populated for a given product)."""
+    is_tire = (row.get("productgroup") or "").strip().lower() in _ATD_TIRE_PRODUCT_GROUPS
+    details = [{"key": "size", "label": "Size", "value": row.get("size") or None}]
+    if is_tire:
+        details += [
+            {"key": "load_index", "label": "Load Index", "value": row.get("load_index") or None},
+            {"key": "speed_rating", "label": "Speed Rating", "value": row.get("speed_rating") or None},
+            {"key": "load_range", "label": "Load Range", "value": row.get("load_range") or None},
+            {"key": "sidewall", "label": "Sidewall", "value": row.get("sidewall_description") or None},
+            {
+                "key": "season", "label": "Season",
+                "value": row.get("winter_designation") or row.get("seasonal_designation") or None,
+            },
+            {"key": "run_flat", "label": "Run Flat", "value": row.get("run_flat") or None},
+            {"key": "treadwear", "label": "Treadwear", "value": row.get("treadwear") or None},
+        ]
+    else:
+        bolt_patterns = [row.get("bolt_pattern_1"), row.get("bolt_pattern_2"), row.get("bolt_pattern_3"), row.get("bolt_pattern_4")]
+        details += [
+            {"key": "bolt_pattern", "label": "Bolt Pattern", "value": " / ".join([bp for bp in bolt_patterns if bp]) or None},
+            {"key": "offset", "label": "Offset", "value": row.get("offset") or None},
+            {"key": "hub_bore", "label": "Centerbore", "value": row.get("hub_bore") or None},
+            {"key": "backspacing", "label": "Backspacing", "value": row.get("backspacing") or None},
+            {"key": "finish", "label": "Finish", "value": row.get("atd_finish") or row.get("mfg_finish") or None},
+            {"key": "load_rating", "label": "Load Rating", "value": row.get("load_rating") or None},
+            {"key": "material", "label": "Material", "value": row.get("material") or None},
+        ]
+    details.append({"key": "upc", "label": "UPC", "value": row.get("upc") or None})
+    details.append({"key": "shipping_weight", "label": "Ship Weight (lbs)", "value": row.get("shipping_weight") or None})
+    return details
+
+
+def _ingest_atd_parts_for_mapped_brands(
+    mapped_catalog_brand_ids: typing.Set[int],
+    atd_provider: src_models.Providers,
+    atd_brand_to_brand: typing.Dict[int, src_models.Brands],
+) -> typing.Tuple[int, int]:
+    """Batch-ingest ATDPart rows for one disjoint set of ATDBrand PKs. Same cursor-based,
+    two-phase upsert pattern as every other provider."""
+    if not mapped_catalog_brand_ids:
+        return 0, 0
+
+    total_master = 0
+    total_provider = 0
+    batch_num = 0
+    last_id = 0
+
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.ATDPart.objects.filter(brand_id__in=mapped_catalog_brand_ids, id__gt=last_id)
+            .order_by("id")
+            .values(*_ATD_CATALOG_VALUES)[:BATCH_SIZE_MASTER_PARTS]
+        )
+        if not batch:
+            break
+
+        last_id = batch[-1]["id"]
+        seen = set()
+        master_parts = []
+        atd_external_id_to_brand_part = {}
+
+        for row in batch:
+            brand = atd_brand_to_brand.get(row["brand_id"])
+            if not brand:
+                continue
+            part_number = _atd_part_number(row)
+            if not part_number:
+                continue
+
+            key = (brand.id, part_number)
+            if key not in seen:
+                seen.add(key)
+                master_parts.append(
+                    src_models.MasterPart(
+                        brand=brand,
+                        part_number=part_number,
+                        sku=part_number,
+                        description=row.get("description"),
+                        image_url=row.get("image_url"),
+                        gtin=row.get("upc") or None,
+                    )
+                )
+            atd_external_id_to_brand_part[
+                _atd_provider_external_id(row["atdproductnumber"])
+            ] = (brand.id, part_number)
+
+        if not master_parts:
+            connection.close()
+            if len(batch) == BATCH_SIZE_MASTER_PARTS:
+                time.sleep(BATCH_DELAY_SECONDS)
+            continue
+
+        pairs = list(seen)
+        existing_by_key = {}
+        if pairs:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(pairs),),
+                )
+                for mp_id, b_id, p_num in cur.fetchall():
+                    existing_by_key[(b_id, p_num)] = mp_id
+
+        mp_matching.extend_with_normalized_matches(
+            existing_by_key,
+            pairs,
+            {(mp.brand_id, mp.part_number): mp.gtin for mp in master_parts},
+            provider_id=atd_provider.id,
+            provider_kind=src_enums.BrandProviderKind.ATD.value,
+            external_id_by_key={v: k for k, v in atd_external_id_to_brand_part.items()},
+        )
+
+        new_parts = [mp for mp in master_parts if (mp.brand_id, mp.part_number) not in existing_by_key]
+        existing_keys = [k for k in pairs if k in existing_by_key]
+
+        if new_parts:
+            new_parts = _dedupe_master_parts_for_upsert(
+                new_parts, context="ATD new_parts batch={}".format(batch_num)
+            )
+            pgbulk.upsert(
+                src_models.MasterPart, new_parts, unique_fields=["brand", "part_number"], update_fields=[],
+            )
+            total_master += len(new_parts)
+
+        if existing_keys:
+            key_to_mp = {(mp.brand_id, mp.part_number): mp for mp in master_parts}
+            values = [
+                (existing_by_key[k], key_to_mp[k].gtin)
+                for k in existing_keys
+                if k in key_to_mp
+            ]
+            if values:
+                placeholders = ", ".join(["(%s::bigint, %s)"] * len(values))
+                params = [x for row in values for x in row]
+                with connection.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE master_parts mp SET gtin = COALESCE(mp.gtin, v.gtin)
+                        FROM (VALUES {}) AS v(id, gtin)
+                        WHERE mp.id = v.id::bigint
+                        """.format(placeholders),
+                        params,
+                    )
+
+        brand_part_to_master = mp_matching.master_part_stubs_for(existing_by_key)
+        unresolved_pairs = [k for k in pairs if k not in brand_part_to_master]
+        if unresolved_pairs:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(unresolved_pairs),),
+                )
+                for mp_id, b_id, p_num in cur.fetchall():
+                    mp = src_models.MasterPart()
+                    mp.id = mp_id
+                    mp.brand_id = b_id
+                    mp.part_number = p_num
+                    brand_part_to_master[(b_id, p_num)] = mp
+
+        provider_parts_by_key = {}
+        for row in batch:
+            ext_id = _atd_provider_external_id(row["atdproductnumber"])
+            key = atd_external_id_to_brand_part.get(ext_id)
+            if not key:
+                continue
+            master_part = brand_part_to_master.get(key)
+            if not master_part:
+                continue
+            provider_parts_by_key[(master_part.id, atd_provider.id)] = src_models.ProviderPart(
+                master_part=master_part,
+                provider=atd_provider,
+                provider_external_id=ext_id,
+                distributor_refreshed_at=row.get("updated_at"),
+            )
+
+        provider_parts = list(provider_parts_by_key.values())
+        if provider_parts:
+            pgbulk.upsert(
+                src_models.ProviderPart, provider_parts,
+                unique_fields=["master_part", "provider"], update_fields=_PROVIDER_PART_SYNC_UPDATE_FIELDS,
+            )
+            total_provider += len(provider_parts)
+
+        logger.info("{} ATD batch {}: {} items -> {} master, {} provider (last_id={})".format(
+            _LOG_PREFIX, batch_num, len(batch), len(master_parts), len(provider_parts), last_id
+        ))
+        connection.close()
+        if len(batch) == BATCH_SIZE_MASTER_PARTS:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    return total_master, total_provider
+
+
+def _atd_provider_and_mappings(
+    action: str,
+) -> typing.Tuple[
+    typing.Optional[src_models.Providers],
+    typing.List[src_models.BrandATDBrandMapping],
+    typing.Dict[int, src_models.Brands],
+]:
+    """Shared preamble for every ATD derived sync: provider row + brand mappings, or empties."""
+    atd_provider = src_models.Providers.objects.filter(kind=src_enums.BrandProviderKind.ATD.value).first()
+    if not atd_provider:
+        logger.info("{} No ATD provider found.".format(_LOG_PREFIX))
+        return None, [], {}
+
+    mappings = list(src_models.BrandATDBrandMapping.objects.select_related("brand", "atd_brand"))
+    atd_brand_to_brand = {m.atd_brand_id: m.brand for m in mappings}
+    if not atd_brand_to_brand:
+        logger.info("{} No BrandATDBrandMapping found. Nothing to {}.".format(_LOG_PREFIX, action))
+        return atd_provider, [], {}
+    return atd_provider, mappings, atd_brand_to_brand
+
+
+def sync_master_parts_from_atd() -> None:
+    """Create/update MasterPart and ProviderPart from ATDPart. Only processes parts whose
+    ATDBrand has a BrandATDBrandMapping. Same cursor-based, two-phase upsert pattern as every
+    other provider."""
+    logger.info("{} Syncing master parts from ATD (batched, cursor-based).".format(_LOG_PREFIX))
+
+    atd_provider, mappings, atd_brand_to_brand = _atd_provider_and_mappings("sync")
+    if not atd_provider or not atd_brand_to_brand:
+        return
+
+    chunks = _partition_mapped_brands_for_parallel_ingest(mappings, MASTER_PARTS_SYNC_MAX_WORKERS)
+    total_master, total_provider = _run_parallel_master_parts_ingest(
+        chunks, mappings, "atd_brand",
+        lambda cids: _ingest_atd_parts_for_mapped_brands(cids, atd_provider, atd_brand_to_brand),
+    )
+
+    logger.info("{} Synced {} master parts and {} provider parts from ATD.".format(
+        _LOG_PREFIX, total_master, total_provider
+    ))
+
+
+def sync_provider_details_from_atd() -> None:
+    """Refresh ProviderPart.product_details with ATD's wheel/tire-spec attributes."""
+    logger.info("{} Syncing provider product details from ATD.".format(_LOG_PREFIX))
+
+    atd_provider, mappings, atd_brand_to_brand = _atd_provider_and_mappings("sync")
+    if not atd_provider or not atd_brand_to_brand:
+        return
+
+    provider_parts = {
+        row["provider_external_id"]: src_models.ProviderPart(id=row["id"])
+        for row in src_models.ProviderPart.objects.filter(provider=atd_provider).values("id", "provider_external_id")
+    }
+
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_updated = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            batch = list(
+                src_models.ATDPart.objects.filter(id__gt=last_id, brand_id__in=catalog_ids)
+                .order_by("id")
+                .values(*_ATD_DETAILS_VALUES)[:BATCH_SIZE_INVENTORY]
+            )
+            if not batch:
+                break
+
+            last_id = batch[-1]["id"]
+            to_update = []
+            for row in batch:
+                ext_id = _atd_provider_external_id(row["atdproductnumber"])
+                pp = provider_parts.get(ext_id)
+                if not pp:
+                    continue
+                pp.product_details = _atd_product_details(row)
+                to_update.append(pp)
+
+            if to_update:
+                src_models.ProviderPart.objects.bulk_update(to_update, ["product_details"], batch_size=500)
+                total_updated += len(to_update)
+
+            logger.info("{} ATD details batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, batch_num, len(to_update), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_INVENTORY:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_updated
+
+    grand_total = _run_parallel_mapped_brand_int_worker(mappings, "atd_brand", _worker)
+    logger.info("{} Refreshed {} ATD product_details records.".format(_LOG_PREFIX, grand_total))
+
+
+def sync_provider_inventory_from_atd_for_company(company_id: int) -> int:
+    """
+    Merge this company's own ATD stock (ATDCompanyPricing's five availability buckets) into the
+    GLOBAL ProviderPartInventory.warehouse_availability JSON, keyed by this company's id instead
+    of a warehouse name -- see src.models.ATDCompanyPricing's docstring for why ATD's stock is
+    genuinely per-company rather than distributor-wide the way every other provider's is, and
+    src.api.services.parts.get_part_detail for where this gets decoded back out for the right
+    company. warehouse_total_qty is recomputed as the max `nationwide` figure across every
+    company's entry in the merged JSON -- an approximation (there is no single "the" stock number
+    for ATD), good enough for sorting/search where no specific company's context is available; the
+    real per-company number always lives in warehouse_availability.
+
+    Read-modify-write per batch, not row-locked: a rare concurrent write from a second company's
+    job landing in the same batch window could lose one update, self-healing on the next sync
+    cycle. Low stakes for a stock number refreshed hourly.
+    """
+    atd_provider = src_models.Providers.objects.filter(kind=src_enums.BrandProviderKind.ATD.value).first()
+    if not atd_provider:
+        return 0
+
+    company_key = str(company_id)
+    now = timezone.now()
+    total = 0
+    batch_num = 0
+    last_id = 0
+
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.ATDCompanyPricing.objects.filter(
+                id__gt=last_id, company_id=company_id, part__brand__brand_mappings__isnull=False,
+            )
+            .order_by("id")
+            .values(
+                "id", "part__atdproductnumber",
+                "local_qty", "localplus_qty", "nationwide_qty", "onhand_qty", "sthinventory_qty",
+            )
+            .distinct()[:BATCH_SIZE_INVENTORY]
+        )
+        if not batch:
+            break
+        last_id = batch[-1]["id"]
+
+        ext_ids = [row["part__atdproductnumber"] for row in batch]
+        provider_parts = {
+            row["provider_external_id"]: row["id"]
+            for row in src_models.ProviderPart.objects.filter(
+                provider=atd_provider, provider_external_id__in=ext_ids
+            ).values("id", "provider_external_id")
+        }
+        if not provider_parts:
+            connection.close()
+            continue
+
+        pp_ids = [provider_parts[eid] for eid in ext_ids if eid in provider_parts]
+        existing_inv = {
+            inv.provider_part_id: inv
+            for inv in src_models.ProviderPartInventory.objects.filter(provider_part_id__in=pp_ids)
+        }
+
+        to_upsert = []
+        for row in batch:
+            pp_id = provider_parts.get(row["part__atdproductnumber"])
+            if not pp_id:
+                continue
+            inv = existing_inv.get(pp_id)
+            wh_avail = dict(inv.warehouse_availability) if inv and isinstance(inv.warehouse_availability, dict) else {}
+            wh_avail[company_key] = {
+                "local": row.get("local_qty") or 0,
+                "localplus": row.get("localplus_qty") or 0,
+                "nationwide": row.get("nationwide_qty") or 0,
+                "onhand": row.get("onhand_qty") or 0,
+                "sthinventory": row.get("sthinventory_qty") or 0,
+            }
+            max_nationwide = max(
+                (v.get("nationwide") or 0 for v in wh_avail.values() if isinstance(v, dict)), default=0
+            )
+            to_upsert.append(
+                src_models.ProviderPartInventory(
+                    provider_part_id=pp_id,
+                    warehouse_total_qty=max_nationwide,
+                    warehouse_availability=wh_avail,
+                    last_synced_at=now,
+                )
+            )
+
+        if to_upsert:
+            to_upsert = _dedupe_provider_part_inventory_for_upsert(
+                to_upsert, context="ATD inventory company={} batch={}".format(company_id, batch_num)
+            )
+            pgbulk.upsert(
+                src_models.ProviderPartInventory, to_upsert, unique_fields=["provider_part"],
+                update_fields=["warehouse_total_qty", "warehouse_availability", "last_synced_at", "updated_at"],
+            )
+            total += len(to_upsert)
+        connection.close()
+
+    logger.info("{} Synced {} ATD inventory records for company_id={}.".format(_LOG_PREFIX, total, company_id))
+    return total
+
+
+def sync_provider_inventory_from_atd() -> int:
+    """All-companies pass for the global/incremental nightly cycle -- one
+    sync_provider_inventory_from_atd_for_company call per active ATD connection. Cheap at
+    today's connection counts; revisit with a real batched merge if ATD connection count grows
+    enough to matter."""
+    logger.info("{} Syncing provider inventory from ATD (all companies).".format(_LOG_PREFIX))
+    total = 0
+    company_ids = list(
+        src_models.CompanyProviders.objects.filter(
+            provider__kind=src_enums.BrandProviderKind.ATD.value, active=True,
+        ).values_list("company_id", flat=True)
+    )
+    for company_id in company_ids:
+        total += sync_provider_inventory_from_atd_for_company(company_id)
+        connection.close()
+    logger.info("{} Synced {} ATD inventory records total.".format(_LOG_PREFIX, total))
+    return total
+
+
+_ATD_PRICING_UPSERT_FIELDS = ["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"]
+
+_ATD_PRICING_VALUES = ("id", "company_id", "cost", "fet", "map_price", "msrp", "retail_price", "part__atdproductnumber")
+
+
+def _atd_pricing_rows_to_upsert(
+    batch: typing.List[typing.Dict], atd_provider: src_models.Providers, now,
+) -> typing.List[src_models.ProviderPartCompanyPricing]:
+    ext_ids = [row["part__atdproductnumber"] for row in batch]
+    pp_by_ext_id = {
+        row["provider_external_id"]: row["id"]
+        for row in src_models.ProviderPart.objects.filter(
+            provider=atd_provider, provider_external_id__in=ext_ids
+        ).values("id", "provider_external_id")
+    }
+    company_ids = {r["company_id"] for r in batch if r.get("company_id")}
+    companies_by_id = {c.id: c for c in src_models.Company.objects.filter(id__in=company_ids)}
+
+    to_upsert = []
+    for row in batch:
+        pp_id = pp_by_ext_id.get(row["part__atdproductnumber"])
+        if not pp_id:
+            continue
+        company = companies_by_id.get(row.get("company_id"))
+        if not company:
+            continue
+        to_upsert.append(
+            src_models.ProviderPartCompanyPricing(
+                provider_part_id=pp_id,
+                company=company,
+                cost=row.get("cost"),
+                jobber_price=None,
+                map_price=row.get("map_price"),
+                msrp=row.get("msrp"),
+                retail_price=row.get("retail_price"),
+                last_synced_at=now,
+            )
+        )
+    return to_upsert
+
+
+def sync_provider_pricing_from_atd() -> None:
+    """Sync ProviderPartCompanyPricing from ATDCompanyPricing (all companies)."""
+    logger.info("{} Syncing provider pricing from ATD.".format(_LOG_PREFIX))
+
+    atd_provider = src_models.Providers.objects.filter(kind=src_enums.BrandProviderKind.ATD.value).first()
+    if not atd_provider:
+        logger.info("{} No ATD provider found.".format(_LOG_PREFIX))
+        return
+
+    now = timezone.now()
+    total = 0
+    batch_num = 0
+    last_id = 0
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.ATDCompanyPricing.objects.filter(id__gt=last_id)
+            .order_by("id").values(*_ATD_PRICING_VALUES)[:BATCH_SIZE_PRICING]
+        )
+        if not batch:
+            break
+        last_id = batch[-1]["id"]
+        to_upsert = _atd_pricing_rows_to_upsert(batch, atd_provider, now)
+        if to_upsert:
+            to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                to_upsert, context="ATD pricing batch={}".format(batch_num)
+            )
+            pgbulk.upsert(
+                src_models.ProviderPartCompanyPricing, to_upsert,
+                unique_fields=["provider_part", "company"], update_fields=_ATD_PRICING_UPSERT_FIELDS,
+            )
+            total += len(to_upsert)
+        connection.close()
+        if len(batch) == BATCH_SIZE_PRICING:
+            time.sleep(BATCH_DELAY_SECONDS)
+    logger.info("{} Synced {} ATD pricing records total.".format(_LOG_PREFIX, total))
+
+
+def sync_provider_pricing_from_atd_for_company(company_id: int) -> None:
+    """One company's ATD pricing -- the per-company path used by IntegrationPricingSyncJob."""
+    logger.info("{} Syncing ATD provider pricing for company_id={}.".format(_LOG_PREFIX, company_id))
+
+    atd_provider = src_models.Providers.objects.filter(kind=src_enums.BrandProviderKind.ATD.value).first()
+    if not atd_provider:
+        logger.info("{} No ATD provider found.".format(_LOG_PREFIX))
+        return
+
+    now = timezone.now()
+    total = 0
+    batch_num = 0
+    last_id = 0
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.ATDCompanyPricing.objects.filter(id__gt=last_id, company_id=company_id)
+            .order_by("id").values(*_ATD_PRICING_VALUES)[:BATCH_SIZE_PRICING]
+        )
+        if not batch:
+            break
+        last_id = batch[-1]["id"]
+        to_upsert = _atd_pricing_rows_to_upsert(batch, atd_provider, now)
+        if to_upsert:
+            to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                to_upsert, context="ATD pricing company={} batch={}".format(company_id, batch_num)
+            )
+            pgbulk.upsert(
+                src_models.ProviderPartCompanyPricing, to_upsert,
+                unique_fields=["provider_part", "company"], update_fields=_ATD_PRICING_UPSERT_FIELDS,
+            )
+            total += len(to_upsert)
+        connection.close()
+        if len(batch) == BATCH_SIZE_PRICING:
+            time.sleep(BATCH_DELAY_SECONDS)
+    logger.info("{} Synced {} ATD pricing records for company_id={}.".format(_LOG_PREFIX, total, company_id))
+
+    cp = src_models.CompanyProviders.objects.filter(
+        company_id=company_id, provider__kind=src_enums.BrandProviderKind.ATD.value
+    ).first()
+    if cp:
+        cp.pricing_propagation_watermark = now
+        cp.save(update_fields=["pricing_propagation_watermark"])
+
+
+def _atd_safe_decimal(value: typing.Any) -> typing.Optional[float]:
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if f > 0 else None
+
+
+def _atd_safe_int(value: typing.Any) -> typing.Optional[int]:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def sync_tire_spec_distributor_fields_from_atd() -> int:
+    """
+    Fill TireSpec's "distributor structured field" tier (tread_depth_32nds, max_psi,
+    rim_width_min_in/rim_width_max_in, utqg_treadwear/utqg_traction/utqg_temperature) from ATD's
+    own measured tire productspecs (treaddepth, maxtirepressure, minrimwidth/maxrimwidth,
+    treadwear/tractionrating/temperaturerating) -- see TireSpec's docstring in src/models.py: none
+    of our other tire-carrying distributor feeds supply these at all, so this is a pure addition,
+    never a competing write against the parser/LLM-owned size block or any other provider.
+
+    Only UPDATES an existing TireSpec row (created by the general tire_enrichment pipeline from
+    the parser/LLM tiers) -- never creates one. A MasterPart whose TireSpec hasn't been built yet
+    simply isn't touched here; that is tire_enrichment's job, not this provider sync's.
+    """
+    logger.info("{} Syncing TireSpec distributor-structured fields from ATD.".format(_LOG_PREFIX))
+
+    atd_provider = src_models.Providers.objects.filter(kind=src_enums.BrandProviderKind.ATD.value).first()
+    if not atd_provider:
+        logger.info("{} No ATD provider found.".format(_LOG_PREFIX))
+        return 0
+
+    ext_id_to_master_part_id = {
+        row["provider_external_id"]: row["master_part_id"]
+        for row in src_models.ProviderPart.objects.filter(provider=atd_provider).values(
+            "provider_external_id", "master_part_id"
+        )
+    }
+    if not ext_id_to_master_part_id:
+        logger.info("{} No ATD ProviderPart rows yet. Nothing to fill.".format(_LOG_PREFIX))
+        return 0
+
+    total_updated = 0
+    batch_num = 0
+    last_id = 0
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.ATDPart.objects.filter(id__gt=last_id)
+            .order_by("id")
+            .values("id", "atdproductnumber", "productgroup", "raw_specs")[:BATCH_SIZE_INVENTORY]
+        )
+        if not batch:
+            break
+        last_id = batch[-1]["id"]
+
+        tire_rows = [
+            row for row in batch
+            if (row.get("productgroup") or "").strip().lower() in _ATD_TIRE_PRODUCT_GROUPS
+            and isinstance(row.get("raw_specs"), dict)
+        ]
+        master_part_ids = [
+            ext_id_to_master_part_id[row["atdproductnumber"]]
+            for row in tire_rows if row["atdproductnumber"] in ext_id_to_master_part_id
+        ]
+        existing_specs = {
+            ts.master_part_id: ts
+            for ts in src_models.TireSpec.objects.filter(master_part_id__in=master_part_ids)
+        }
+
+        to_update = []
+        for row in tire_rows:
+            master_part_id = ext_id_to_master_part_id.get(row["atdproductnumber"])
+            spec = existing_specs.get(master_part_id) if master_part_id else None
+            if not spec:
+                continue
+            specs = row["raw_specs"]
+            spec.tread_depth_32nds = _atd_safe_decimal(specs.get("treaddepth")) or spec.tread_depth_32nds
+            spec.max_psi = _atd_safe_int(specs.get("maxtirepressure")) or spec.max_psi
+            spec.rim_width_min_in = _atd_safe_decimal(specs.get("minrimwidth")) or spec.rim_width_min_in
+            spec.rim_width_max_in = _atd_safe_decimal(specs.get("maxrimwidth")) or spec.rim_width_max_in
+            spec.utqg_treadwear = _atd_safe_int(specs.get("treadwear")) or spec.utqg_treadwear
+            traction = (specs.get("tractionrating") or "").strip().upper()
+            spec.utqg_traction = traction or spec.utqg_traction
+            temperature = (specs.get("temperaturerating") or "").strip().upper()
+            spec.utqg_temperature = temperature or spec.utqg_temperature
+            to_update.append(spec)
+
+        if to_update:
+            src_models.TireSpec.objects.bulk_update(
+                to_update,
+                [
+                    "tread_depth_32nds", "max_psi", "rim_width_min_in", "rim_width_max_in",
+                    "utqg_treadwear", "utqg_traction", "utqg_temperature", "updated_at",
+                ],
+                batch_size=500,
+            )
+            total_updated += len(to_update)
+
+        logger.info("{} ATD TireSpec batch {}: {} records updated (last_id={})".format(
+            _LOG_PREFIX, batch_num, len(to_update), last_id
+        ))
+        connection.close()
+        if len(batch) == BATCH_SIZE_INVENTORY:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    logger.info("{} Filled distributor-structured TireSpec fields on {} records from ATD.".format(
+        _LOG_PREFIX, total_updated
+    ))
+    return total_updated
+
+
+def sync_derived_from_atd(
+    *, reindex_meilisearch: bool = False, skip_master_parts: bool = False, skip_pricing: bool = False
+) -> None:
+    """
+    Propagate ATD source data into MasterPart, ProviderPart, ProviderPart.product_details,
+    ProviderPartInventory, ProviderPartCompanyPricing, and TireSpec's distributor-structured-field
+    tier. Call after at least one company's ATD catalog sweep
+    (src.integrations.services.atd.fetch_and_save_atd_catalog_for_company_provider) has populated
+    ATDPart/ATDCompanyPricing.
+
+    Pass ``skip_master_parts=True`` to run only details + inventory + pricing + tire specs (fast
+    incremental path). Pass ``skip_pricing=True`` to run only master parts + details + inventory
+    (global catalog sync path) -- inventory still runs either way since, unlike every other
+    provider, ATD's own stock is per-company data with nowhere else to come from.
+    """
+    logger.info("{} Starting ATD-only derived sync ({}).".format(
+        _LOG_PREFIX,
+        "details + inventory + pricing + tire specs only" if skip_master_parts else
+        "parts, details, inventory" + ("" if skip_pricing else ", pricing, tire specs"),
+    ))
+    if not skip_master_parts:
+        sync_master_parts_from_atd()
+        connection.close()
+
+    def _cont() -> None:
+        sync_provider_details_from_atd()
+        connection.close()
+        sync_provider_inventory_from_atd()
+        connection.close()
+        if not skip_pricing:
+            sync_provider_pricing_from_atd()
+            connection.close()
+            sync_tire_spec_distributor_fields_from_atd()
+            connection.close()
+
+    if skip_master_parts:
+        _cont()
+    else:
+        _maybe_reindex_meilisearch_after_master_parts(
+            reindex_meilisearch=reindex_meilisearch, provider_label="ATD", continuation=_cont,
+        )
+    logger.info("{} Completed ATD-only derived sync.".format(_LOG_PREFIX))

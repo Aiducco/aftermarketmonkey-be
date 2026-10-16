@@ -46,6 +46,7 @@ from src.audit import scheduled_tasks as audit_scheduled_tasks
 from src.integrations import rate_limit as rate_limit_base
 from src.integrations.services import (
     allpro,
+    atd,
     atech,
     dlg,
     elite_wheel,
@@ -205,6 +206,7 @@ class Command(BaseCommand):
                 ("helmet_house",  self._run_helmet_house),
                 ("tristate",      self._run_tristate),
                 ("allpro",        self._run_allpro),
+                ("atd",          self._run_atd),
             ]
             for name, run_fn in phase1_providers:
                 self._ingest_log("phase 1 | starting {} fetch".format(name))
@@ -408,6 +410,21 @@ class Command(BaseCommand):
             self._ingest_log("TSE: copying catalog from tristate_parts seed + unmapped brand sync")
             tristate.sync_unmapped_tse_brands_to_brands()
             tristate.sync_tse_parts_from_tristate_part_seed()
+
+    def _run_atd(self) -> None:
+        with self._audited_step(
+            "ingest_all_providers_atd",
+            "ATD unmapped brand sync complete (catalog/pricing/stock fetched per-company via the "
+            "pricing job queue, not here -- see integration_pricing_sync_jobs' ATD branch).",
+            continue_on_error=True,
+        ):
+            # No shared/primary account to crawl here -- ATD ties catalog, cost AND stock all to
+            # the dealer's own locationnumber, so there is nothing to fetch without a specific
+            # company's credentials. Each active connection's own full sweep runs from the
+            # per-company pricing job queue instead (see _fetch_raw_pricing's ATD branch). This
+            # step only maps whatever ATDBrand rows those sweeps have discovered so far.
+            self._ingest_log("ATD: unmapped brand sync (catalog/pricing fetched per-company)")
+            atd.sync_unmapped_atd_brands_to_brands()
 
     def _run_allpro(self) -> None:
         with self._audited_step(

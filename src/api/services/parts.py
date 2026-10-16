@@ -62,6 +62,34 @@ def _map_turn14_warehouse_availability(
     return result if result else None
 
 
+def _atd_company_inventory(
+    warehouse_availability: typing.Optional[typing.Dict], company_id: typing.Optional[int],
+) -> typing.Tuple[typing.Optional[typing.Dict[str, typing.Union[int, float]]], typing.Optional[int]]:
+    """
+    Decode ATD's per-company stock out of ProviderPartInventory.warehouse_availability, which --
+    unlike every other provider -- stores one entry per company_id rather than per warehouse (see
+    src.integrations.services.master_parts.sync_provider_inventory_from_atd_for_company's
+    docstring for why: ATD's own API ties stock to the dealer's own locationnumber, so there is no
+    single distributor-wide number to show).
+
+    Returns (display dict for this company, this company's own warehouse_total_qty override).
+    (None, None) when this company has never synced ATD stock for this part -- never falls back
+    to another company's numbers.
+    """
+    if not warehouse_availability or not isinstance(warehouse_availability, dict) or company_id is None:
+        return None, None
+    entry = warehouse_availability.get(str(company_id))
+    if not isinstance(entry, dict):
+        return None, None
+    display = {
+        "Local DC": entry.get("local") or 0,
+        "Local + Adjacent DCs": entry.get("localplus") or 0,
+        "Nationwide": entry.get("nationwide") or 0,
+        "Ship-to-Home Eligible": entry.get("sthinventory") or 0,
+    }
+    return display, entry.get("nationwide") or 0
+
+
 _LOG_PREFIX = "[PARTS-SERVICES]"
 
 # Provider kind_name -> image URL (edit here to add logos)
@@ -569,10 +597,19 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
             provider_info["product_details"] = pp.product_details
             if inv_obj:
                 wh_avail = inv_obj.warehouse_availability
+                warehouse_total_qty = inv_obj.warehouse_total_qty
                 if kind_name == "TURN_14":
                     wh_avail = _map_turn14_warehouse_availability(wh_avail)
+                elif kind_name == "ATD":
+                    # ATD's warehouse_availability is keyed by company_id, not warehouse name (see
+                    # _atd_company_inventory's docstring) -- decode this specific company's own
+                    # entry and use it to override the global approximation in warehouse_total_qty.
+                    atd_display, atd_total = _atd_company_inventory(wh_avail, company_id)
+                    wh_avail = atd_display
+                    if atd_total is not None:
+                        warehouse_total_qty = atd_total
                 provider_info["inventory"] = {
-                    "warehouse_total_qty": inv_obj.warehouse_total_qty,
+                    "warehouse_total_qty": warehouse_total_qty,
                     "manufacturer_inventory": inv_obj.manufacturer_inventory,
                     "manufacturer_esd": inv_obj.manufacturer_esd.isoformat() if inv_obj.manufacturer_esd else None,
                     # Scout sees only the aggregate total above; the per-warehouse breakdown is

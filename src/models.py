@@ -7824,3 +7824,166 @@ class RawTireSpec(django_db_models.Model):
     def __str__(self):
         bits = [self.brand_name, self.model_name, self.size_display]
         return f"{' '.join(b for b in bits if b)} ({self.external_key})"
+
+
+# ==========================================================================================
+# ATD (American Tire Distributors) -- ATD Connect REST API
+#
+# Per-company credentials (username/password/client_id/locationnumber), same shape as Turn14's
+# client_id/client_secret -- see src.integrations.clients.atd.client. Unlike Turn14/TWG/TSE/AllPro,
+# ATD's own API ties BOTH cost and availability to the dealer's locationnumber: two different
+# companies' ATD accounts can see different stock and even different cost for the identical
+# atdproductnumber (see atd-connect-api.md sections 2-3, 7). Catalog attributes (brand, style,
+# description, specs, images) are treated as shared across every connected company's sweep, same
+# convention as AllProParts/TheWheelGroupPart -- only cost and stock are genuinely per-company,
+# so only those live on ATDCompanyPricing.
+# ==========================================================================================
+class ATDBrand(django_db_models.Model):
+    """
+    One brand observed in ATD's ``productcatalog`` feed, keyed by ATD's own numeric ``brandid``.
+    ATD gives no AAIA code anywhere in the product or brand data (confirmed live), so matching to
+    our Brands table is name-based (see BrandATDBrandMapping and
+    src.integrations.utils.brand_matching), same cascade as EliteWheelBrand/TheWheelGroupBrand.
+
+    Discovered incrementally as each company's catalog sweep encounters a new (brandid, brand)
+    pair -- there is no standalone "list all brands" endpoint (``/product/brands`` takes a brand
+    name it already knows and returns that brand's styles, it does not enumerate brands -- see
+    atd-connect-api.md section 16).
+    """
+
+    external_id = django_db_models.CharField(max_length=64, help_text="ATD's own brandid.")
+    name = django_db_models.CharField(max_length=255)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "atd_brands"
+        unique_together = [["external_id"]]
+
+
+class ATDPart(django_db_models.Model):
+    """
+    Shared ATD catalog row, keyed by ``atdproductnumber`` (ATD's own globally-unique SKU --
+    ``mfgproductnumber`` is NOT unique across brands, see atd-connect-api.md section 10). Catalog
+    attributes are shared across every connected company's sweep -- see the module-level note on
+    why only cost/stock (ATDCompanyPricing) are per-company.
+
+    Covers both wheels and tires -- ATD's ``productspecs`` vary by product family (47+ distinct
+    keys observed live against a real, tires-only account), far too many to give one-column-per-key
+    treatment the way TheWheelGroupPart does for its wheels-only sheet. Promotes the handful of
+    fields a fitment/display path actually needs to real columns (wheel and tire spec families
+    both, since an account could carry either) and keeps everything ATD sent, verbatim, in
+    ``raw_specs`` -- so a field nobody mapped yet is never silently lost.
+    """
+
+    brand = django_db_models.ForeignKey(ATDBrand, on_delete=django_db_models.CASCADE, related_name="parts")
+    atdproductnumber = django_db_models.CharField(max_length=64)
+    mfgproductnumber = django_db_models.CharField(max_length=64, null=True, blank=True)
+    style = django_db_models.CharField(max_length=255, null=True, blank=True)
+    styleid = django_db_models.CharField(max_length=64, null=True, blank=True)
+    productgroup = django_db_models.CharField(max_length=64, null=True, blank=True)
+    description = django_db_models.TextField(null=True, blank=True)
+    discontinued = django_db_models.BooleanField(default=False)
+    replaced = django_db_models.BooleanField(default=False)
+
+    # Shared between wheel and tire specs.
+    size = django_db_models.CharField(max_length=64, null=True, blank=True)
+    upc = django_db_models.CharField(max_length=64, null=True, blank=True)
+    shipping_weight = django_db_models.CharField(max_length=32, null=True, blank=True)
+    country_of_origin = django_db_models.CharField(max_length=64, null=True, blank=True)
+
+    # Wheel-spec family (see atd-connect-api.md section 5's wheel key table).
+    wheel_diameter = django_db_models.CharField(max_length=32, null=True, blank=True)
+    wheel_width = django_db_models.CharField(max_length=32, null=True, blank=True)
+    bolt_pattern_1 = django_db_models.CharField(max_length=64, null=True, blank=True)
+    bolt_pattern_2 = django_db_models.CharField(max_length=64, null=True, blank=True)
+    bolt_pattern_3 = django_db_models.CharField(max_length=64, null=True, blank=True)
+    bolt_pattern_4 = django_db_models.CharField(max_length=64, null=True, blank=True)
+    hub_bore = django_db_models.CharField(max_length=32, null=True, blank=True)
+    offset = django_db_models.CharField(max_length=32, null=True, blank=True)
+    backspacing = django_db_models.CharField(max_length=32, null=True, blank=True)
+    atd_finish = django_db_models.CharField(max_length=64, null=True, blank=True)
+    mfg_finish = django_db_models.CharField(max_length=255, null=True, blank=True)
+    load_rating = django_db_models.CharField(max_length=32, null=True, blank=True)
+    material = django_db_models.CharField(max_length=64, null=True, blank=True)
+    number_of_lug_holes = django_db_models.CharField(max_length=16, null=True, blank=True)
+
+    # Tire-spec family (see atd-connect-api.md section 5's tire key table).
+    tire_width = django_db_models.CharField(max_length=32, null=True, blank=True)
+    aspect_ratio = django_db_models.CharField(max_length=32, null=True, blank=True)
+    rim_diameter = django_db_models.CharField(max_length=32, null=True, blank=True)
+    load_index = django_db_models.CharField(max_length=32, null=True, blank=True)
+    speed_rating = django_db_models.CharField(max_length=16, null=True, blank=True)
+    load_range = django_db_models.CharField(max_length=16, null=True, blank=True)
+    sidewall_description = django_db_models.CharField(max_length=64, null=True, blank=True)
+    winter_designation = django_db_models.CharField(max_length=32, null=True, blank=True)
+    seasonal_designation = django_db_models.CharField(max_length=32, null=True, blank=True)
+    run_flat = django_db_models.CharField(max_length=16, null=True, blank=True)
+    treadwear = django_db_models.CharField(max_length=16, null=True, blank=True)
+
+    image_url = django_db_models.TextField(null=True, blank=True)
+    raw_images = django_db_models.JSONField(null=True, blank=True)
+    raw_specs = django_db_models.JSONField(null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "atd_parts"
+        unique_together = [["atdproductnumber"]]
+
+
+class ATDCompanyPricing(django_db_models.Model):
+    """
+    Per-company ATD cost AND stock for a catalog row (ATDPart) -- combined in one table, unlike
+    every other distributor here, because ATD's own API ties BOTH to the dealer's locationnumber
+    (see the module-level note above): there is no distributor-wide "the" stock number the way
+    Turn14/TWG/TSE/AllPro have.
+
+    The customer-facing layer still follows the normal global-table shape everyone else uses --
+    see master_parts.sync_provider_inventory_from_atd for how this per-company stock gets encoded
+    into ProviderPartInventory.warehouse_availability (keyed by company_id instead of a warehouse
+    name) so a per-company number can still ride through a table with no company column, decoded
+    back out for the right company at the API layer (src.api.services.parts.get_part_detail).
+    """
+
+    part = django_db_models.ForeignKey(ATDPart, on_delete=django_db_models.CASCADE, related_name="company_pricing")
+    company = django_db_models.ForeignKey(Company, on_delete=django_db_models.CASCADE, related_name="atd_company_pricing")
+
+    cost = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    fet = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    map_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    msrp = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    retail_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+
+    # ATD's five availability buckets -- see atd-connect-api.md section 7. All relative to this
+    # company's own locationnumber.
+    local_qty = django_db_models.IntegerField(null=True, blank=True)
+    localplus_qty = django_db_models.IntegerField(null=True, blank=True)
+    nationwide_qty = django_db_models.IntegerField(null=True, blank=True)
+    onhand_qty = django_db_models.IntegerField(null=True, blank=True)
+    sthinventory_qty = django_db_models.IntegerField(null=True, blank=True)
+
+    last_synced_at = django_db_models.DateTimeField(null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "atd_company_pricing"
+        unique_together = [["part", "company"]]
+
+
+class BrandATDBrandMapping(django_db_models.Model):
+    """Maps our Brands to ATDBrand (for master parts sync)."""
+
+    brand = django_db_models.ForeignKey(Brands, on_delete=django_db_models.CASCADE, related_name="atd_brand_mappings")
+    atd_brand = django_db_models.ForeignKey(ATDBrand, on_delete=django_db_models.CASCADE, related_name="brand_mappings")
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "brand_atd_brand_mapping"
+        unique_together = ["brand", "atd_brand"]

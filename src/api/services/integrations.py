@@ -16,6 +16,8 @@ from src.api.services import billing as billing_services
 from src.integrations import credentials as credentials_helper
 from src.integrations.clients.allpro import client as allpro_client
 from src.integrations.clients.allpro import exceptions as allpro_exceptions
+from src.integrations.clients.atd import client as atd_client
+from src.integrations.clients.atd import exceptions as atd_exceptions
 from src.integrations.clients.atech import client as atech_client
 from src.integrations.clients.atech import exceptions as atech_exceptions
 from src.integrations.clients.crown import client as crown_client
@@ -694,6 +696,24 @@ def _validate_allpro_connection(credentials: typing.Dict[str, typing.Any]) -> _V
     return None, None
 
 
+def _validate_atd_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
+    """
+    Validates ATD Connect credentials (username/password/client_id/location) by confirming the
+    given locationnumber actually resolves for this account -- see ATDApiClient.test_connection.
+    ATDAuthError covers both the 401 shape and the "location not found"/"no access to this
+    location" errorMessage shapes (see atd-connect-api.md section 2); either way it means a value
+    was mistyped or the location code is wrong, not a transient connectivity problem.
+    """
+    try:
+        client = atd_client.ATDApiClient(credentials=credentials)
+        client.test_connection()
+    except atd_exceptions.ATDAuthError as e:
+        return str(e), CONNECTION_ERROR_INVALID_CREDENTIALS
+    except (atd_exceptions.ATDAPIException, ValueError) as e:
+        return str(e), CONNECTION_ERROR_CONNECTION_FAILED
+    return None, None
+
+
 def _validate_tirerack_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
     try:
         client = tirerack_client.TireRackSFTPClient(credentials=credentials)
@@ -726,6 +746,7 @@ _CONNECTION_VALIDATORS: typing.Dict[int, typing.Callable[[typing.Dict[str, typin
     src_enums.BrandProviderKind.HELMHOUSE.value: _validate_helmet_house_connection,
     src_enums.BrandProviderKind.ALLPRO_DISTRIBUTING.value: _validate_allpro_connection,
     src_enums.BrandProviderKind.TRI_STATE.value: _validate_tristate_connection,
+    src_enums.BrandProviderKind.ATD.value: _validate_atd_connection,
 }
 
 
