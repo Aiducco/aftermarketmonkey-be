@@ -21,6 +21,7 @@ from django.utils import timezone
 
 from src import enums as src_enums
 from src import models as src_models
+from src.integrations.services import allpro as allpro_services
 from src.integrations.services import keystone as keystone_services
 from src.integrations.services import master_parts
 from src.integrations.services import atech as atech_services
@@ -68,6 +69,7 @@ _PRICING_SYNC_KINDS = frozenset(
         src_enums.BrandProviderKind.HELMHOUSE.value,
         src_enums.BrandProviderKind.THE_WHEEL_GROUP.value,
         src_enums.BrandProviderKind.TRI_STATE.value,
+        src_enums.BrandProviderKind.ALLPRO_DISTRIBUTING.value,
     }
 )
 
@@ -332,6 +334,9 @@ def _fetch_raw_pricing(cp: src_models.CompanyProviders, use_delta_fetch: bool = 
     elif kind == src_enums.BrandProviderKind.TRI_STATE.value:
         tristate_services.sync_tristate_company_pricing_for_company_provider(cp.id)
 
+    elif kind == src_enums.BrandProviderKind.ALLPRO_DISTRIBUTING.value:
+        allpro_services.sync_allpro_company_pricing_for_company_provider(cp.id)
+
     else:
         raise ValueError("Unsupported provider kind for raw pricing fetch: {}".format(kind))
 
@@ -394,6 +399,9 @@ def _sync_master_pricing(cp: src_models.CompanyProviders) -> None:
 
     elif kind == src_enums.BrandProviderKind.TRI_STATE.value:
         master_parts.sync_provider_pricing_from_tristate_for_company(company_id)
+
+    elif kind == src_enums.BrandProviderKind.ALLPRO_DISTRIBUTING.value:
+        master_parts.sync_provider_pricing_from_allpro_for_company(company_id)
 
     else:
         raise ValueError("Unsupported provider kind for master pricing sync: {}".format(kind))

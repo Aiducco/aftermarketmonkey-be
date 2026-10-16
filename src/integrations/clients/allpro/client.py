@@ -6,11 +6,25 @@ our own relay -- each dealer logs into AllPro's own FTP server directly with a u
 AllPro's rep issues per customer number (see PROVIDER_CATALOG's ALLPRO_DISTRIBUTING entry for the
 request instructions shown to the user).
 
-Only a connection/login test exists here so far. The connection itself is confirmed live
-2026-10-13 (host, port, and Trident's own apd-9010066 login all work -- three real files sit on
-the account: APDInventory.txt, APDLineCodes.txt, MASTER_PRICEFILE.CSV), but no sample has been
-read yet, so downloading and parsing a real feed from those is separate work.
+Three real files confirmed live 2026-10-15/16 against Trident's own apd-9010066 login:
+  - ``APDLineCodes.txt`` (pipe-delimited, ``LineCode|Brand|AAIA``) -- the brand list, 739 rows,
+    268 with a real (non-placeholder) AAIA code. One line_code can carry several different AAIA
+    codes (e.g. "ACI" -> ACCESS/LOMAX/ADARAC) -- see AllProBrand's own docstring for why AAIA,
+    not line_code, is the natural key.
+  - ``APDInventory.txt`` (pipe-delimited, ``APD Full Part Number|Line Code|Vendor Part
+    Number|AAIA|L|W|H|Wt|UPC|600 VA QOH|800 FL QOH|900 AL QOH|Total QOH``) -- the real
+    catalog+inventory feed, confirmed live at 491,806 rows (only 8,314 with Total QOH > 0).
+    ``APD Full Part Number`` = ``LineCode + VendorPartNumber`` concatenated with no separator
+    (confirmed: "DAY"+"KJ71051BK" -> "DAYKJ71051BK").
+  - ``MASTER_PRICEFILE.CSV`` (``"Unique APD Part Number","Brand Name","Cost"``) -- per-company
+    cost. Its part-number column uses a DIFFERENT format than the inventory file's (colon-
+    separated, e.g. "13F:BO2S71M") and only resolves against the inventory file's
+    full_part_number for a real subset of rows once the colon is stripped (confirmed live:
+    ~26% of a 300k-row sample) -- see src.integrations.services.allpro for the join and its
+    honest gap-logging, same pattern as every other real-world distributor data-quality gap in
+    this codebase.
 """
+import csv
 import ftplib
 import logging
 import socket
@@ -26,6 +40,7 @@ logger = logging.getLogger(__name__)
 _LOG_PREFIX = "[ALLPRO-FTP-CLIENT]"
 
 DEFAULT_CONNECT_TIMEOUT_SECONDS = 15
+_RETR_BLOCKSIZE = 65536
 
 
 def _setting_str(name: str, fallback: str) -> str:
@@ -147,3 +162,82 @@ class AllProFTPClient:
         """Connect and log in, then disconnect. Raises on any failure; returns nothing on success."""
         self._connect()
         self._disconnect()
+
+    def _iter_lines(self, remote_filename: str) -> typing.Iterator[str]:
+        """
+        Streams a remote file's lines -- confirmed necessary live (APDInventory.txt is ~33MB,
+        MASTER_PRICEFILE.CSV ~26MB). ftplib's retrbinary callback can't yield directly (it isn't
+        called from this generator's own frame), so chunks are collected into a list during the
+        transfer and decoded/split into lines once it completes -- one file's bytes held at a
+        time, same as downloading it to disk first would cost, just without the disk round trip.
+        Connects and disconnects for just this one file; a caller needing more than one file
+        calls this (or a wrapping iter_* method) once per file, each its own connection.
+        """
+        self._connect()
+        try:
+            chunks: typing.List[bytes] = []
+            try:
+                self._ftp.retrbinary("RETR {}".format(remote_filename), chunks.append, blocksize=_RETR_BLOCKSIZE)
+            except ftplib.error_perm as e:
+                msg = "AllPro FTP could not read {}: {}".format(remote_filename, str(e))
+                logger.error("{} {}".format(_LOG_PREFIX, msg))
+                raise exceptions.AllProFTPConnectionError(msg)
+
+            data = b"".join(chunks)
+            del chunks
+            text = data.decode("utf-8", errors="replace")
+            del data
+            for line in text.splitlines():
+                yield line
+        finally:
+            self._disconnect()
+
+    def iter_line_codes(self) -> typing.Iterator[typing.Dict]:
+        """Yields {line_code, name, aaia_code} from APDLineCodes.txt. aaia_code is uppercased;
+        rows with a blank line_code or brand name are skipped."""
+        lines = self._iter_lines("APDLineCodes.txt")
+        header = next(lines, None)
+        if header is None:
+            return
+        for line in lines:
+            parts = line.split("|")
+            if len(parts) < 3:
+                continue
+            line_code, name, aaia = (p.strip() for p in parts[:3])
+            if not line_code or not name:
+                continue
+            yield {"line_code": line_code, "name": name, "aaia_code": aaia.upper()}
+
+    _INVENTORY_COLUMNS = (
+        "full_part_number", "line_code", "part_number", "aaia_code",
+        "length", "width", "height", "weight", "upc",
+        "warehouse_va_qty", "warehouse_fl_qty", "warehouse_al_qty", "total_qty",
+    )
+
+    def iter_inventory_records(self) -> typing.Iterator[typing.Dict]:
+        """Yields one dict per APDInventory.txt row, keyed by _INVENTORY_COLUMNS in order.
+        Numeric fields are left as raw strings -- parsing/validation is the caller's job (see
+        src.integrations.services.allpro)."""
+        lines = self._iter_lines("APDInventory.txt")
+        header = next(lines, None)
+        if header is None:
+            return
+        n = len(self._INVENTORY_COLUMNS)
+        for line in lines:
+            parts = line.split("|")
+            if len(parts) < n:
+                continue
+            yield dict(zip(self._INVENTORY_COLUMNS, (p.strip() for p in parts[:n])))
+
+    def iter_pricing_records(self) -> typing.Iterator[typing.Dict]:
+        """Yields {raw_part_number, brand_name, cost} from MASTER_PRICEFILE.CSV (real CSV,
+        comma-delimited with quoted fields -- unlike the other two pipe-delimited files)."""
+        lines = self._iter_lines("MASTER_PRICEFILE.CSV")
+        reader = csv.reader(lines)
+        header = next(reader, None)
+        if header is None:
+            return
+        for row in reader:
+            if len(row) < 3:
+                continue
+            yield {"raw_part_number": row[0].strip(), "brand_name": row[1].strip(), "cost": row[2].strip()}

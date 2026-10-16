@@ -1624,6 +1624,121 @@ class TSECompanyPricing(django_db_models.Model):
         unique_together = ["part", "company"]
 
 
+class AllProBrand(django_db_models.Model):
+    """
+    AllPro Distributing brand, keyed by AAIA code -- seeded from their own FTP account's
+    ``APDLineCodes.txt`` (``LineCode|Brand|AAIA``, see src.integrations.services.allpro). AAIA
+    code is the natural key here, NOT line_code: confirmed live that one line_code can carry
+    several unrelated brands (e.g. "ACI" -> ACCESS, LOMAX, and ADARAC, three different AAIA
+    codes) -- ``APDInventory.txt`` carries AAIA directly per catalog row anyway, so line_code is
+    only kept here for reference/debugging, never used to resolve a brand. Many line-code rows
+    have a placeholder AAIA ("0" + 3 chars, e.g. "0171") for non-automotive lines (firearms,
+    ammo, outdoor gear) AllPro also carries -- those stay unmapped to Brands, same as any
+    AllProBrand whose real AAIA code has no match in our Brands table.
+    """
+
+    line_code = django_db_models.CharField(max_length=16)
+    aaia_code = django_db_models.CharField(max_length=16, unique=True)
+    name = django_db_models.CharField(max_length=255)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "allpro_brands"
+
+
+class BrandAllProBrandMapping(django_db_models.Model):
+    brand = django_db_models.ForeignKey(Brands, on_delete=django_db_models.CASCADE, related_name="allpro_brand_mappings")
+    allpro_brand = django_db_models.ForeignKey(
+        AllProBrand, on_delete=django_db_models.CASCADE, related_name="brand_mappings"
+    )
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "brand_allpro_brand_mapping"
+        unique_together = ["brand", "allpro_brand"]
+
+
+class AllProParts(django_db_models.Model):
+    """
+    AllPro catalog + inventory row from ``APDInventory.txt`` (shared -- see
+    src.integrations.services.allpro; this is a genuine bulk feed, unlike Tri-State's per-item
+    API). ``full_part_number`` is AllPro's own "APD Full Part Number" column (confirmed live:
+    LineCode + VendorPartNumber concatenated, e.g. "DAY"+"KJ71051BK" -> "DAYKJ71051BK") and is
+    the real natural key AllPro itself treats as globally unique -- used here directly rather
+    than a derived composite key. Per-warehouse quantity columns are AllPro's own three named
+    warehouses (confirmed live: "600 VA", "800 FL", "900 AL" -- Virginia/Florida/Alabama by
+    their codes); ``total_qty`` is their own "Total QOH" column, not a computed sum, so it's kept
+    verbatim even though it should equal the three added together.
+
+    ``description``/``image_url``/``category``/``subcategory``/``series`` are NOT in AllPro's own
+    feed at all -- they're backfilled separately from the shared Algolia catalog (see
+    enrich_allpro_parts_from_algolia), matched by (aaia_code, part_number). Per explicit
+    instruction, ``image_url`` here is for this table only -- master_parts.py's AllPro ingest
+    must never copy it onto MasterPart/ProviderPart.
+    """
+
+    brand = django_db_models.ForeignKey(AllProBrand, on_delete=django_db_models.CASCADE, related_name="parts")
+    full_part_number = django_db_models.CharField(max_length=255, unique=True)
+    part_number = django_db_models.CharField(max_length=255, db_index=True)
+    line_code = django_db_models.CharField(max_length=16, blank=True)
+
+    length = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    width = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    height = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    weight = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    upc = django_db_models.CharField(max_length=64, null=True, blank=True)
+
+    warehouse_va_qty = django_db_models.IntegerField(null=True, blank=True)
+    warehouse_fl_qty = django_db_models.IntegerField(null=True, blank=True)
+    warehouse_al_qty = django_db_models.IntegerField(null=True, blank=True)
+    total_qty = django_db_models.IntegerField(null=True, blank=True)
+
+    # Backfilled from Algolia -- see this model's own docstring.
+    description = django_db_models.TextField(null=True, blank=True)
+    image_url = django_db_models.TextField(null=True, blank=True)
+    category = django_db_models.CharField(max_length=255, null=True, blank=True)
+    subcategory = django_db_models.CharField(max_length=255, null=True, blank=True)
+    series = django_db_models.CharField(max_length=255, null=True, blank=True)
+    enriched_at = django_db_models.DateTimeField(null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "allpro_parts"
+        indexes = [
+            django_db_models.Index(fields=["brand", "part_number"], name="allpro_brand_part_idx"),
+        ]
+
+
+class AllProCompanyPricing(django_db_models.Model):
+    """
+    Per-company AllPro cost for a catalog row (AllProParts), from that company's own
+    ``MASTER_PRICEFILE.CSV`` download (``"Unique APD Part Number","Brand Name","Cost"``). Joined
+    to AllProParts via that file's part-number column with its ``:`` separator stripped, matched
+    against ``full_part_number`` -- confirmed live this only resolves a real subset of pricing
+    rows (not every priced item currently appears in the inventory feed, or vice versa); unjoined
+    rows are skipped and logged rather than failing the whole import, same as every other
+    distributor's real-world data-quality gaps in this codebase. Only ``cost`` is available --
+    AllPro's feed has no separate jobber/map/list tier.
+    """
+
+    part = django_db_models.ForeignKey(AllProParts, on_delete=django_db_models.CASCADE, related_name="company_pricing")
+    company = django_db_models.ForeignKey(Company, on_delete=django_db_models.CASCADE, related_name="allpro_company_pricing")
+    cost = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "allpro_company_pricing"
+        unique_together = ["part", "company"]
+
+
 class AtechBrand(django_db_models.Model):
     """Distributor brand for A-Tech (linked from SKU prefix via AtechPrefixBrand)."""
 

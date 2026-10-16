@@ -45,6 +45,7 @@ from django.core.management.base import BaseCommand
 from src.audit import scheduled_tasks as audit_scheduled_tasks
 from src.integrations import rate_limit as rate_limit_base
 from src.integrations.services import (
+    allpro,
     atech,
     dlg,
     elite_wheel,
@@ -160,6 +161,7 @@ class Command(BaseCommand):
             "ingest_all_providers_the_wheel_group",
             "ingest_all_providers_helmet_house",
             "ingest_all_providers_tristate",
+            "ingest_all_providers_allpro",
             "ingest_all_providers_sync_all_master_parts",
             "ingest_all_providers_enqueue_pricing_jobs",
             "ingest_all_providers_meilisearch_reindex",
@@ -202,6 +204,7 @@ class Command(BaseCommand):
                 ("the_wheel_group", self._run_the_wheel_group),
                 ("helmet_house",  self._run_helmet_house),
                 ("tristate",      self._run_tristate),
+                ("allpro",        self._run_allpro),
             ]
             for name, run_fn in phase1_providers:
                 self._ingest_log("phase 1 | starting {} fetch".format(name))
@@ -405,6 +408,21 @@ class Command(BaseCommand):
             self._ingest_log("TSE: copying catalog from tristate_parts seed + unmapped brand sync")
             tristate.sync_unmapped_tse_brands_to_brands()
             tristate.sync_tse_parts_from_tristate_part_seed()
+
+    def _run_allpro(self) -> None:
+        with self._audited_step(
+            "ingest_all_providers_allpro",
+            "AllPro FTP brand + catalog/inventory sync complete (derived in sync_all).",
+            continue_on_error=True,
+        ):
+            primary_cp = allpro.primary_allpro_company_provider()
+            if not primary_cp:
+                self._ingest_log("AllPro: no active primary connection -- skipping.")
+                return
+            self._ingest_log("AllPro: fetching brands + unmapped brand sync + catalog/inventory (FTP)")
+            allpro.fetch_and_save_allpro_brands(primary_cp.id)
+            allpro.sync_unmapped_allpro_brands_to_brands()
+            allpro.fetch_and_save_allpro_catalog(primary_cp.id)
 
     def _run_wheelpros(self) -> None:
         with self._audited_step(
