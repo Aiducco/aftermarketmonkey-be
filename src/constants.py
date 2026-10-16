@@ -536,16 +536,13 @@ PROVIDER_CATALOG = [
             "<p>Paste the link into <strong>Feed URL</strong> and click <strong>Save feed credentials</strong>. "
             "The card will show <strong>Feed Connected</strong>.</p>"
 
+            "<p><strong>Troubleshooting</strong></p>"
             "<ul>"
             "<li><strong>No JOBBER card?</strong> Jobber pricing may not be enabled on your account. Ask your "
             "Rough Country rep.</li>"
             "<li><strong>More than one account?</strong> Each account has its own URL. Repeat these steps for "
             "each one.</li>"
             "</ul>"
-
-            "<p><strong>Optional: ordering</strong></p>"
-            "<p>Rough Country has no ordering API, so we email your rep a PDF purchase order instead. Add your "
-            "rep's email (and an optional internal <strong>CC</strong>) to enable this.</p>"
         ),
     },
     {
