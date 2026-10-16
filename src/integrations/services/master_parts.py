@@ -3491,6 +3491,197 @@ def sync_master_part_fitments_from_turn14_vcdb() -> None:
     logger.info("{} Synced {} Turn14 master part fitment records via VCdb total.".format(_LOG_PREFIX, total_upserted))
 
 
+PACE_CATALOG_FITMENT_BATCH_SIZE = 500
+
+
+def sync_master_part_fitments_from_pace_catalog_vcdb(
+    limit: typing.Optional[int] = None,
+) -> typing.Tuple[int, int]:
+    """
+    One-time: decode PaceCatalogPart.fitment (the shared Algolia/PACE catalog's own fitment
+    blob, see src.management.commands.import_pace_catalog_from_algolia) via VcdbVehicle and
+    upsert into MasterPartFitment. Not provider-specific -- PaceCatalogPart is AAM's generic
+    catalog, keyed by (aaia_brand_code, part_number), so this backfills fitment onto whatever
+    MasterPart rows already exist for that (brand, part_number) regardless of which distributor
+    actually sourced them (Tri-State, AllPro, or any future one) -- source_provider is left NULL
+    since the fitment itself comes from PACE's shared data, not any one distributor's feed.
+
+    Confirmed live 2026-10-16: a PaceCatalogPart's ``fitment`` dict holds exactly two keys,
+    ``BaseVehicleID`` and ``SubModelID``, each the FULL FLAT LIST of ids that apply anywhere
+    across the part's fitment (not paired per application -- e.g. a universal-fit part can list
+    thousands of BaseVehicleIDs). There is no way to tell which SubModelID goes with which
+    BaseVehicleID from this data (same "opaque without AAM's own vehicle DB" conclusion reached
+    exploring this data live), so this only ever resolves **(year, make, model)** -- submodel/
+    engine/drive_type are always left blank ("", matching MasterPartFitment's own default for
+    "unknown"). That's still real, usable data: BaseVehicleID alone is submodel-independent in
+    VCdb (BaseVehicle = Year+Make+Model by definition -- confirmed in import_vcdb_vehicles.py,
+    every VcdbVehicle row sharing a base_vehicle_id agrees on year/make/model), so resolving it
+    is never ambiguous. Match rate confirmed live on a 2000-row sample: 97% of BaseVehicleIDs
+    found a VcdbVehicle row.
+
+    Each PaceCatalogPart row already carries its part's COMPLETE fitment list in one place
+    (unlike Turn14ItemFitment, which spreads one item's vehicles across many rows) -- so unlike
+    the Turn14 VCdb sync, there's no risk of under-collapsing years by batching: every row's
+    years are collapsed into ranges within the same batch they were read in.
+
+    ``limit``: process only the first N fitment-bearing PaceCatalogPart rows (by id) -- for a
+    quick test run before committing to the full backfill. None processes everything.
+
+    Returns (rows_processed, fitment_rows_upserted).
+    """
+    logger.info(
+        "{} Syncing master part fitments from PaceCatalogPart (via VCdb){}.".format(
+            _LOG_PREFIX, " -- limit={}".format(limit) if limit else ""
+        )
+    )
+
+    vcdb_by_base_vehicle_id: typing.Dict[int, typing.Tuple[int, str, str]] = {}
+    for row in (
+        src_models.VcdbVehicle.objects.order_by("base_vehicle_id")
+        .distinct("base_vehicle_id")
+        .values("base_vehicle_id", "year", "make", "model")
+    ):
+        vcdb_by_base_vehicle_id[row["base_vehicle_id"]] = (row["year"], row["make"], row["model"])
+    if not vcdb_by_base_vehicle_id:
+        logger.info("{} VcdbVehicle table is empty. Run import_vcdb_vehicles first.".format(_LOG_PREFIX))
+        return 0, 0
+    logger.info("{} Loaded {} distinct VCdb base vehicles.".format(_LOG_PREFIX, len(vcdb_by_base_vehicle_id)))
+
+    aaia_codes = set(
+        src_models.PaceCatalogPart.objects.exclude(fitment={})
+        .exclude(aaia_brand_code__isnull=True)
+        .values_list("aaia_brand_code", flat=True)
+        .distinct()
+    )
+    brand_by_aaia: typing.Dict[str, src_models.Brands] = {}
+    for b in src_models.Brands.objects.filter(aaia_code__in=aaia_codes).order_by("id"):
+        key = (b.aaia_code or "").strip().upper()
+        if key and key not in brand_by_aaia:
+            brand_by_aaia[key] = b
+    logger.info(
+        "{} {} distinct AAIA codes with fitment data; {} resolve to a Brands row.".format(
+            _LOG_PREFIX, len(aaia_codes), len(brand_by_aaia)
+        )
+    )
+
+    qs = src_models.PaceCatalogPart.objects.exclude(fitment={}).order_by("id").values(
+        "id", "aaia_brand_code", "part_number", "fitment"
+    )
+
+    total_processed = 0
+    total_upserted = 0
+    skipped_no_brand = 0
+    skipped_no_master_part = 0
+    batch_num = 0
+    last_id = 0
+
+    while True:
+        if limit is not None and total_processed >= limit:
+            break
+        batch_qs = qs.filter(id__gt=last_id)
+        if limit is not None:
+            batch_qs = batch_qs[: min(PACE_CATALOG_FITMENT_BATCH_SIZE, limit - total_processed)]
+        else:
+            batch_qs = batch_qs[:PACE_CATALOG_FITMENT_BATCH_SIZE]
+        batch = list(batch_qs)
+        if not batch:
+            break
+        batch_num += 1
+        last_id = batch[-1]["id"]
+
+        # Resolve (brand, part_number) -> MasterPart.id for this batch in one query, same
+        # pattern as every other provider's ingest in this file.
+        pairs = []
+        row_brand = {}
+        for row in batch:
+            brand = brand_by_aaia.get((row["aaia_brand_code"] or "").upper())
+            if not brand:
+                skipped_no_brand += 1
+                continue
+            row_brand[row["id"]] = brand
+            pairs.append((brand.id, row["part_number"]))
+
+        master_part_id_by_key = {}
+        if pairs:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(pairs),),
+                )
+                for mp_id, b_id, p_num in cur.fetchall():
+                    master_part_id_by_key[(b_id, p_num)] = mp_id
+
+        years_by_key: typing.Dict[typing.Tuple, typing.Set[int]] = {}
+        for row in batch:
+            brand = row_brand.get(row["id"])
+            if not brand:
+                continue
+            master_part_id = master_part_id_by_key.get((brand.id, row["part_number"]))
+            if not master_part_id:
+                skipped_no_master_part += 1
+                continue
+            base_vehicle_ids = (row.get("fitment") or {}).get("BaseVehicleID") or []
+            for bv_id in base_vehicle_ids:
+                vcdb = vcdb_by_base_vehicle_id.get(int(bv_id))
+                if not vcdb:
+                    continue
+                year, make, model = vcdb
+                key = (master_part_id, make, model)
+                years_by_key.setdefault(key, set()).add(year)
+
+        to_upsert = []
+        for (master_part_id, make, model), years in years_by_key.items():
+            for year_start, year_end in _collapse_years_to_ranges(years):
+                to_upsert.append(
+                    src_models.MasterPartFitment(
+                        master_part_id=master_part_id,
+                        year_start=year_start,
+                        year_end=year_end,
+                        make=make,
+                        model=model,
+                        submodel="",
+                        engine="",
+                        drive_type="",
+                        source_provider=None,
+                    )
+                )
+
+        if to_upsert:
+            to_upsert = _dedupe_master_part_fitments_for_upsert(
+                to_upsert, context="PaceCatalog VCdb fitment batch={}".format(batch_num)
+            )
+            pgbulk.upsert(
+                src_models.MasterPartFitment,
+                to_upsert,
+                unique_fields=[
+                    "master_part", "year_start", "year_end", "make", "model",
+                    "submodel", "engine", "drive_type",
+                ],
+                update_fields=["source_provider"],
+            )
+            total_upserted += len(to_upsert)
+
+        total_processed += len(batch)
+        logger.info(
+            "{} batch {}: {} PaceCatalogPart rows -> {} fitment ranges upserted, "
+            "running_total processed={} upserted={} (skipped: no_brand={} no_master_part={})".format(
+                _LOG_PREFIX, batch_num, len(batch), len(to_upsert),
+                total_processed, total_upserted, skipped_no_brand, skipped_no_master_part,
+            )
+        )
+        connection.close()
+        if len(batch) == PACE_CATALOG_FITMENT_BATCH_SIZE:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    logger.info(
+        "{} Done: {} PaceCatalogPart rows processed, {} MasterPartFitment rows upserted "
+        "(skipped: no_brand={} no_master_part={}).".format(
+            _LOG_PREFIX, total_processed, total_upserted, skipped_no_brand, skipped_no_master_part,
+        )
+    )
+    return total_processed, total_upserted
+
+
 FITMENT_DELETE_BATCH_SIZE = 20000
 
 
