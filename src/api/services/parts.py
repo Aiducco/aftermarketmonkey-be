@@ -193,6 +193,16 @@ def _provider_go_to_link(
         if not pn_clean:
             return None
         return src_constants.WHEELPROS_INVENTORY_PART_URL_TEMPLATE.format(part_slug=quote(pn_clean, safe=""))
+    if kind_name == "SB":
+        # ``provider_external_id`` is ``{sb_brand_id}_{sku}``. S&B have no stable PDP slug we can
+        # derive -- their product URLs are long marketing slugs ("jlt-cold-air-intake-for-2024-
+        # 2025-ford-mustang-gt-5-0l-tune-required") that the dealer workbooks don't carry -- so
+        # this goes to their own site search on the SKU, which resolves to the product.
+        sku_src = ext.split("_", 1)[1] if "_" in ext else (master_part.part_number or "")
+        sku_clean = str(sku_src).strip()
+        if not sku_clean:
+            return None
+        return src_constants.SB_INVENTORY_SEARCH_URL_TEMPLATE.format(sku=quote(sku_clean, safe=""))
     return None
 
 
@@ -750,19 +760,26 @@ def get_parts_bulk_pricing(
         ).values("provider_part_id", "cost")
         if row["cost"] is not None
     }
-    # Not company-scoped like cost -- shown regardless of connection, see docstring.
+    # Not company-scoped like cost -- shown regardless of connection, see docstring. ATD is the
+    # one exception (see _atd_company_inventory's docstring): its warehouse_total_qty is only a
+    # platform-wide approximation, and the real number lives per-company inside
+    # warehouse_availability, decoded below for ATD rows only.
     qty_by_provider_part_id = {
-        row["provider_part_id"]: row["warehouse_total_qty"]
+        row["provider_part_id"]: (row["warehouse_total_qty"], row["warehouse_availability"])
         for row in src_models.ProviderPartInventory.objects.filter(
             provider_part_id__in=[pp["id"] for pp in provider_parts],
-        ).values("provider_part_id", "warehouse_total_qty")
+        ).values("provider_part_id", "warehouse_total_qty", "warehouse_availability")
     }
 
     for pp in provider_parts:
         mpid = pp["master_part_id"]
         connected = pp["provider_id"] in connected_provider_ids
         cost = cost_by_provider_part_id.get(pp["id"]) if connected else None
-        qty = qty_by_provider_part_id.get(pp["id"]) or 0
+        qty, wh_avail = qty_by_provider_part_id.get(pp["id"]) or (0, None)
+        qty = qty or 0
+        if pp["provider__kind_name"] == "ATD":
+            _, atd_total = _atd_company_inventory(wh_avail, company_id)
+            qty = atd_total if atd_total is not None else 0
         in_stock = qty > 0
         entry = result[mpid]
         entry["providers"].append(
