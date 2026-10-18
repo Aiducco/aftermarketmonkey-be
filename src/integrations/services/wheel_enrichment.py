@@ -260,11 +260,74 @@ _TITLE_SELECT = """
     ORDER BY mp.id
 """
 
+# ATD -- unlike the four feeds built through _feed(), ATD's ProviderPart.provider_external_id is
+# the bare atdproductnumber with no compound "<brandid>_<partnumber>" shape (atdproductnumber is
+# already globally unique on its own -- see src.models.ATDPart's docstring), so _COMMON_SELECT's
+# join (``split_part(pp.provider_external_id, '_', 2)``) would return an empty string and match
+# nothing. Hand-written SQL with a direct join, same shape _TITLE_SELECT already uses for its own
+# reason. finish COALESCEs atd_finish (the ATD enum) with mfg_finish (always present, free text)
+# since either alone misses rows the other has -- see atd-connect-api.md section 20.
+_ATD_SELECT = r"""
+    SELECT DISTINCT ON (mp.id)
+           mp.id                                      AS master_part_id,
+           mp.description                             AS master_description,
+           f.atdproductnumber                         AS part_number,
+           f.description                              AS title,
+           f.size                                     AS size_raw,
+           f.wheel_diameter                            AS diameter_raw,
+           f.wheel_width                               AS width_raw,
+           f.bolt_pattern_1                            AS bolt_pattern_1,
+           f.bolt_pattern_2                            AS bolt_pattern_2,
+           f."offset"                                  AS offset_raw,
+           f.hub_bore                                  AS center_bore_raw,
+           f.load_rating                               AS load_rating_raw,
+           -- ATD's own docs call this field inches (example "5.90"), but it is not reliable --
+           -- confirmed live 2026-10-17: a real Konig 19x8.5 wheel published backspacing "163",
+           -- which is nonsensical as inches (no wheel has 163" backspacing) but a plausible 6.4"
+           -- in millimetres. Treat anything over 15 (no real wheel backspaces past ~10") as
+           -- millimetres and convert; WheelSpec.backspacing_in is NUMERIC(4,2), so an unconverted
+           -- bad value would overflow the column and crash the whole batch insert.
+           CASE
+               WHEN f.backspacing !~ '^[0-9]+(\.[0-9]+)?$' THEN f.backspacing
+               WHEN f.backspacing::numeric > 15 AND f.backspacing::numeric / 25.4 <= 20
+                   THEN (f.backspacing::numeric / 25.4)::text
+               WHEN f.backspacing::numeric > 15 THEN NULL
+               ELSE f.backspacing
+           END                                         AS backspace_raw,
+           f.shipping_weight                           AS weight_raw,
+           COALESCE(f.atd_finish, f.mfg_finish)         AS finish_raw,
+           f.style                                     AS model_raw,
+           f.styleid                                   AS style_number_raw,
+           NULL                                        AS lug_seat_raw,
+           NULL                                        AS lug_thread_raw,
+           NULL                                        AS structural_warranty_raw,
+           NULL                                        AS finish_warranty_raw,
+           NULL                                        AS tpms_raw,
+           NULL                                        AS dually_raw,
+           f.image_url                                 AS image_url
+    FROM master_parts mp
+    -- ATD's own Providers.id (kind=ATD=9) -- hardcoded the same way _feed()'s callers hardcode
+    -- their provider ids (6, 31, 37, 17 below); this is a stable production row id, not derived.
+    JOIN provider_parts pp ON pp.master_part_id = mp.id AND pp.provider_id = 10
+    JOIN atd_parts f ON f.atdproductnumber = pp.provider_external_id
+    WHERE mp.id > %s
+      -- Positive match on ATD's real wheel productgroups (atd-connect-api.md section 4's "Wheel
+      -- specs" family) -- NOT a tire/tube exclusion. "wheel accessories" sits in ATD's own "Other"
+      -- family alongside tools/supplies and is lock sets, valve stems and centre caps (confirmed
+      -- live: McGard lock sets, torsion bar keys), not wheels, so an exclusion-only filter let
+      -- those through; this excludes them positively instead.
+      AND f.productgroup IN ('custom wheels', 'steel wheels', 'ag wheels')
+      {brand_filter}
+    ORDER BY mp.id, f.updated_at DESC NULLS LAST, f.id DESC
+    LIMIT %s
+"""
+
 FEED_TITLE = "title"
 FEED_WHEELPROS = "wheelpros"
 FEED_THEWHEELGROUP = "thewheelgroup"
 FEED_VOSSEN = "vossen"
 FEED_ELITEWHEELS = "elitewheels"
+FEED_ATD = "atd"
 
 # Precedence, best first. Consulted only when two feeds describe the same master part, which does
 # not happen today -- measured across all four, zero master parts are reached by more than one, and
@@ -276,7 +339,9 @@ FEED_ELITEWHEELS = "elitewheels"
 # Elite carry dimensions only.
 # ``title`` is deliberately last: any vendor that publishes an attribute column outranks a figure
 # read out of a sentence, so a wheel that later appears in a real feed is upgraded automatically.
-FEED_ORDER = (FEED_THEWHEELGROUP, FEED_WHEELPROS, FEED_VOSSEN, FEED_ELITEWHEELS, FEED_TITLE)
+# ATD sits after the other four structured feeds (no brand overlap measured against any of them
+# yet, so its rank has not been tested in practice) but still ahead of title.
+FEED_ORDER = (FEED_THEWHEELGROUP, FEED_WHEELPROS, FEED_VOSSEN, FEED_ELITEWHEELS, FEED_ATD, FEED_TITLE)
 
 FEEDS = {
     FEED_WHEELPROS: _feed(
@@ -344,6 +409,7 @@ FEEDS = {
         center_bore="f.center_bore",
     ),
     FEED_TITLE: Feed(name=FEED_TITLE, provider_id=0, sql=_TITLE_SELECT),
+    FEED_ATD: Feed(name=FEED_ATD, provider_id=10, sql=_ATD_SELECT),
     FEED_ELITEWHEELS: _feed(
         FEED_ELITEWHEELS,
         17,
