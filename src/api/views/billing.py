@@ -194,6 +194,44 @@ class CreateCheckoutSessionView(views.View):
 
 
 @method_decorator(csrf_exempt, name="dispatch")
+class SwitchTrialPlanView(views.View):
+    """
+    POST /api/billing/switch-trial-plan/
+    Self-serve plan switch for a company on a manually comp'd trial -- see
+    billing_services.switch_comped_trial_plan for why these can't use the Billing Portal.
+    Request body: { "plan_id": "tracker"|"hunter"|"pack" }
+    Response: { "subscription": {...} } or a 400 if this company isn't on a comp'd trial.
+    """
+
+    def post(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
+        company_id, err = _auth_and_company(request)
+        if err:
+            return _json_response({"message": err}, status=401 if "authenticated" in err else 400)
+
+        try:
+            body = json.loads(request.body) if request.body else {}
+            validated = common_utils.validate_data_schema(
+                data=body,
+                schema=billing_schema.SwitchTrialPlanSchema(),
+            )
+        except common_exceptions.ValidationSchemaException as e:
+            return _json_response(
+                {"message": "Invalid payload", "data": common_utils.get_exception_message(exception=e)},
+                status=400,
+            )
+        except json.JSONDecodeError:
+            return _json_response({"message": "Invalid JSON body"}, status=400)
+
+        result, service_err = billing_services.switch_comped_trial_plan(
+            company_id=company_id, plan_id=validated["plan_id"],
+        )
+        if service_err:
+            return _json_response({"message": service_err}, status=400)
+
+        return _json_response({"subscription": result})
+
+
+@method_decorator(csrf_exempt, name="dispatch")
 class WebhookView(views.View):
     """
     POST /api/billing/webhook/

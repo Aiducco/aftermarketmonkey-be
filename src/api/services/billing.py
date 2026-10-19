@@ -234,6 +234,52 @@ def create_checkout_session(
         return None
 
 
+def switch_comped_trial_plan(company_id: int, plan_id: str) -> tuple[Optional[dict], Optional[str]]:
+    """
+    Self-serve plan switch for a company on a manually-comp'd trial (``Company.
+    manual_trial_granted_at`` set) -- there is no real Stripe subscription behind one of these
+    (confirmed live 2026-10-19: zero Stripe subscriptions existed for a comp'd-trial customer who
+    was sent to the Billing Portal to "downgrade" and found nothing there to change), so there is
+    nothing for the Portal to manage. This changes only ``subscription_plan`` and leaves
+    ``subscription_period_end``/``manual_trial_granted_at`` untouched -- picking a different plan
+    does not grant or reset trial time, it only changes which plan the existing trial clock
+    applies to.
+
+    Refuses (does not silently no-op) when the company is not on a comp'd trial: a company with a
+    real Stripe subscription must go through the Portal/Checkout instead, since only Stripe's own
+    webhook is allowed to write ``subscription_plan`` for those (see ``_sync_company_subscription``)
+    -- writing it here too would race with that and could stick on a stale value.
+
+    Returns (result, error) -- result is None on failure, with error set.
+    """
+    try:
+        company = src_models.Company.objects.get(id=company_id)
+    except src_models.Company.DoesNotExist:
+        return None, "Company not found"
+
+    if not company.manual_trial_granted_at:
+        return None, "This company is not on a comp'd trial -- use the billing portal to change plans."
+
+    plans = getattr(settings, "PLANS", {})
+    if plan_id not in plans:
+        return None, "Invalid plan_id"
+
+    company.subscription_plan = plan_id
+    company.subscription_status = "trialing"
+    company.save(update_fields=["subscription_plan", "subscription_status", "updated_at"])
+
+    logger.info("Switched company_id=%s comp'd trial to plan=%s", company_id, plan_id)
+
+    return {
+        "company_id": company.id,
+        "subscription_plan": company.subscription_plan,
+        "subscription_status": company.subscription_status,
+        "subscription_period_end": (
+            company.subscription_period_end.isoformat() if company.subscription_period_end else None
+        ),
+    }, None
+
+
 # ---------------------------------------------------------------------------
 # Subscription state (local-first, Stripe as fallback)
 # ---------------------------------------------------------------------------
@@ -306,6 +352,16 @@ def get_subscription(company_id: int) -> Optional[dict]:
             "billing_period": billing_period,
             "renewal_date": renewal_date,
             "status": company.subscription_status,
+            # Tells the frontend which action is even possible: a comp'd trial (manually granted,
+            # no real Stripe subscription behind it -- see Company.manual_trial_granted_at) has
+            # nothing for the Billing Portal to manage, so "change plan" must call
+            # switch-trial-plan instead of create-portal-session for these. has_stripe_subscription
+            # is the inverse check by subscription_id instead, for a company whose comp'd trial
+            # already converted to a real one (manual_trial_granted_at is cleared on conversion,
+            # see _sync_company_subscription) but this field makes the distinction explicit rather
+            # than relying on the frontend inferring it from the trial flag alone.
+            "is_comped_trial": bool(company.manual_trial_granted_at),
+            "has_stripe_subscription": bool(company.subscription_id),
         }
 
     if not company.stripe_customer_id:

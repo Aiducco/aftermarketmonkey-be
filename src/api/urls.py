@@ -65,6 +65,7 @@ from src.api.views.billing import (
     CreatePortalSessionView,
     CreateCheckoutSessionView,
     SubscriptionView,
+    SwitchTrialPlanView,
     UsageView,
     WebhookView,
 )
@@ -500,6 +501,11 @@ urlpatterns = [
         "billing/create-checkout-session/",
         CreateCheckoutSessionView.as_view(),
         name="billing_create_checkout_session",
+    ),
+    path(
+        "billing/switch-trial-plan/",
+        SwitchTrialPlanView.as_view(),
+        name="billing_switch_trial_plan",
     ),
     path(
         "billing/usage/",

@@ -14,3 +14,9 @@ class CreateCheckoutSessionSchema(Schema):
     quantity = fields.Integer(required=False, load_default=1, validate=validate.Range(min=1, max=20))
     success_url = fields.Url(required=True)
     cancel_url = fields.Url(required=True)
+
+
+class SwitchTrialPlanSchema(Schema):
+    # Same choices as checkout -- "scout" has no comp'd-trial state to switch to, it's just the
+    # fallback when subscription_plan is unset.
+    plan_id = fields.String(required=True, validate=validate.OneOf(["tracker", "hunter", "pack"]))
