@@ -287,7 +287,7 @@ def create_company_for_admin(
         raise ValueError("A user with this email already exists.")
 
     now = timezone.now()
-    resolved_trial_days = trial_days or getattr(settings, "NEW_SIGNUP_TRIAL_DAYS", 21)
+    resolved_trial_days = trial_days or getattr(settings, "NEW_SIGNUP_TRIAL_DAYS", 30)
     resolved_plan = subscription_plan or getattr(settings, "NEW_SIGNUP_TRIAL_PLAN", "hunter")
     resolved_password = password or _generate_password()
 

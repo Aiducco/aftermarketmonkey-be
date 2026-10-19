@@ -447,7 +447,7 @@ PACK_LOCATION_MAX_QUANTITY = 20
 # the demote_expired_trials management command (cron) unless they've converted to a real Stripe
 # subscription by then. See src/api/services/onboarding.py:register_user.
 NEW_SIGNUP_TRIAL_PLAN = "hunter"
-NEW_SIGNUP_TRIAL_DAYS = 21
+NEW_SIGNUP_TRIAL_DAYS = 30
 
 # WheelPros SFTP: host/port for all connections (override via env). Per-company user/password in
 # CompanyProviders.credentials; optional WHEELPROS_SFTP_USER/PASSWORD for local/dev sync only.

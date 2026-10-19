@@ -94,7 +94,7 @@ def register_user(
     # get the full product experience; demote_expired_trials.py (cron) drops them back to Scout
     # if they haven't converted to a real Stripe subscription by the time it expires.
     now = timezone.now()
-    trial_days = getattr(settings, "NEW_SIGNUP_TRIAL_DAYS", 21)
+    trial_days = getattr(settings, "NEW_SIGNUP_TRIAL_DAYS", 30)
     company = src_models.Company.objects.create(
         name=company_name,
         slug=_generate_slug(company_name),
