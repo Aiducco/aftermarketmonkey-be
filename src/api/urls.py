@@ -9,6 +9,9 @@ from src.api.views.authentication import LoginView, ChangePasswordView
 from src.api.views.admin import (
     AdminCompaniesView,
     AdminCompanyDetailView,
+    AdminCreateCompanyView,
+    AdminResetUserPasswordView,
+    AdminExtendTrialView,
     AdminProvidersView,
     AdminProviderDetailView,
 )
@@ -547,6 +550,21 @@ urlpatterns = [
         "admin/companies/<int:id>/",
         AdminCompanyDetailView.as_view(),
         name="admin_company_detail",
+    ),
+    path(
+        "admin/companies/create/",
+        AdminCreateCompanyView.as_view(),
+        name="admin_create_company",
+    ),
+    path(
+        "admin/companies/<int:company_id>/users/<int:user_id>/reset-password/",
+        AdminResetUserPasswordView.as_view(),
+        name="admin_reset_user_password",
+    ),
+    path(
+        "admin/companies/<int:company_id>/extend-trial/",
+        AdminExtendTrialView.as_view(),
+        name="admin_extend_trial",
     ),
     path(
         "admin/providers/",
