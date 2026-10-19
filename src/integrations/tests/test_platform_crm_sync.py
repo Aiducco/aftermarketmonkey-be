@@ -16,6 +16,7 @@ from django.contrib.auth.models import User
 from django.test import SimpleTestCase, override_settings
 
 from src import models as src_models
+from src.integrations.services import instantly_freshsales_sync as ifs_sync
 from src.integrations.services import platform_crm_sync as sync
 
 INTERNAL_DOMAINS = frozenset(
@@ -207,3 +208,76 @@ class FreshsalesIdTests(SimpleTestCase):
         self.assertEqual(sync._as_id("127015863079"), 127015863079)
         self.assertEqual(sync._as_id("abc"), "abc")
         self.assertIsNone(sync._as_id(None))
+
+
+@override_settings(
+    FRESHSALES_DEAL_PIPELINE_ID=127000525268,
+    FRESHSALES_SIGNUP_DEAL_STAGE_ID=127003680895,
+    FRESHSALES_SIGNUP_DEAL_SOURCE="Self sign-up",
+    FRESHSALES_DEFAULT_DEAL_AMOUNT=0,
+)
+class SignupDealTests(SimpleTestCase):
+    """
+    FRESHSALES_SIGNUP_CREATE_DEALS's own behaviour: a direct platform signup opens a deal past
+    "New Lead" -- they already have an account, so there is no "Day 0: create their account" step
+    left for them. Confirmed live 2026-10-19: the real pipeline has no "Qualified" stage; "Account
+    Sent" is the one that already means "they have an account", and "Self sign-up" is a real
+    cf_inbound_source dropdown option.
+    """
+
+    databases = []
+
+    def test_no_contact_id_skips_rather_than_guesses(self):
+        """The primary profile's own push failed this run -- retried next run, not guessed at now."""
+        crm = mock.Mock()
+        company = _company(freshsales_account_id="55")
+        profile = _profile(company=company, freshsales_contact_id=None)
+        summary = {"deals_created": 0, "deals_reused": 0}
+
+        sync._maybe_create_signup_deal(crm, company, [profile], {}, summary)
+
+        crm.create_deal.assert_not_called()
+        self.assertIsNone(company.freshsales_deal_id)
+        self.assertEqual(summary["deals_created"], 0)
+
+    def test_an_existing_open_deal_is_reused_not_duplicated(self):
+        """E.g. the Instantly sync already opened one for the same person -- one deal, not two."""
+        crm = mock.Mock()
+        company = _company(freshsales_account_id="55")
+        company.save = mock.Mock()
+        profile = _profile(company=company, freshsales_contact_id="9")
+        summary = {"deals_created": 0, "deals_reused": 0}
+
+        with mock.patch.object(ifs_sync, "find_open_deal_for_contact", return_value="deal-1") as find:
+            sync._maybe_create_signup_deal(crm, company, [profile], {10: "Open"}, summary)
+
+        find.assert_called_once_with(crm, "9", {10: "Open"})
+        crm.create_deal.assert_not_called()
+        self.assertEqual(company.freshsales_deal_id, "deal-1")
+        self.assertEqual(summary["deals_reused"], 1)
+        self.assertEqual(summary["deals_created"], 0)
+
+    def test_a_new_deal_lands_at_account_sent_with_self_signup_source(self):
+        crm = mock.Mock()
+        crm.create_deal.return_value = "deal-99"
+        company = _company(freshsales_account_id="55")
+        company.save = mock.Mock()
+        profile = _profile(company=company, freshsales_contact_id="9")
+        summary = {"deals_created": 0, "deals_reused": 0}
+
+        with mock.patch.object(ifs_sync, "find_open_deal_for_contact", return_value=None):
+            sync._maybe_create_signup_deal(crm, company, [profile], {}, summary)
+
+        kwargs = crm.create_deal.call_args.kwargs
+        self.assertEqual(kwargs["pipeline_id"], 127000525268)
+        self.assertEqual(kwargs["stage_id"], 127003680895)
+        self.assertEqual(kwargs["sales_account_id"], "55")
+        self.assertEqual(kwargs["contact_id"], "9")
+        self.assertEqual(kwargs["custom_field"], {"cf_inbound_source": "Self sign-up"})
+        self.assertEqual(company.freshsales_deal_id, "deal-99")
+        self.assertEqual(summary["deals_created"], 1)
+        self.assertEqual(summary["deals_reused"], 0)
+        crm.create_note.assert_called_once()
+        note_kwargs = crm.create_note.call_args.kwargs
+        self.assertEqual(note_kwargs["targetable_id"], "deal-99")
+        self.assertEqual(note_kwargs["targetable_type"], "Deal")

@@ -844,8 +844,11 @@ class PlatformStatusWinsTests(SimpleTestCase):
         crm.upsert_sales_account.return_value = ("1", True)
         crm.upsert_contact.return_value = ("2", True)
         crm.create_note.return_value = "3"
+        crm.get_contact_deals.return_value = []
         with mock.patch.object(sync.platform_crm_sync, "is_platform_contact", return_value=is_platform):
-            sync._push_one_contact(crm, reply, {"Interested": 127004315050}, collections.defaultdict(int))
+            sync._push_one_contact(
+                crm, reply, {"Interested": 127004315050}, {}, collections.defaultdict(int)
+            )
         return crm.upsert_contact.call_args.kwargs["fields"]
 
     def test_a_signups_status_is_left_alone(self):
@@ -861,6 +864,66 @@ class PlatformStatusWinsTests(SimpleTestCase):
         reply.save = mock.Mock()
         fields = self._push(reply, is_platform=False)
         self.assertEqual(fields["contact_status_id"], 127004315050)
+
+
+class PushOpenDealNoteTests(SimpleTestCase):
+    """
+    "Instantly reply -> note on the deal": every reply, not just positive ones, gets posted onto
+    the contact's already-open deal (if any) -- keeps an ongoing conversation visible to whoever is
+    working the deal, independent of FRESHSALES_CREATE_DEALS (this never creates a deal, only
+    notes one that already exists -- ours or one a human opened by hand).
+    """
+
+    databases = []
+
+    def _push(self, reply, open_deal_id):
+        crm = mock.Mock()
+        crm.resolve_contact_status_id.return_value = 127004315050
+        crm.upsert_sales_account.return_value = ("1", True)
+        crm.upsert_contact.return_value = ("2", True)
+        crm.create_note.return_value = "note-1"
+        crm.get_contact_deals.return_value = (
+            [{"id": open_deal_id, "deal_stage_id": 10}] if open_deal_id else []
+        )
+        with mock.patch.object(sync.platform_crm_sync, "is_platform_contact", return_value=False):
+            sync._push_one_contact(crm, reply, {"Interested": 127004315050}, {10: "Open"}, collections.defaultdict(int))
+        return crm
+
+    def test_an_open_deal_gets_this_reply_as_a_note(self):
+        reply = _reply(freshsales_account_id="1", freshsales_contact_id=None, freshsales_note_id=None)
+        reply.save = mock.Mock()
+        crm = self._push(reply, open_deal_id="deal-5")
+
+        deal_note_call = next(
+            c for c in crm.create_note.call_args_list if c.kwargs.get("targetable_type") == "Deal"
+        )
+        self.assertEqual(deal_note_call.kwargs["targetable_id"], "deal-5")
+        self.assertEqual(reply.freshsales_deal_id, "deal-5")
+        self.assertEqual(reply.freshsales_deal_note_id, "note-1")
+        self.assertIsNotNone(reply.deal_created_at)
+
+    def test_no_open_deal_means_no_deal_note(self):
+        reply = _reply(freshsales_account_id="1", freshsales_contact_id=None, freshsales_note_id=None)
+        reply.save = mock.Mock()
+        crm = self._push(reply, open_deal_id=None)
+
+        self.assertFalse(any(c.kwargs.get("targetable_type") == "Deal" for c in crm.create_note.call_args_list))
+        self.assertIsNone(reply.freshsales_deal_id)
+        self.assertIsNone(reply.freshsales_deal_note_id)
+
+    def test_a_reply_already_noted_is_not_posted_again(self):
+        """Avoids a double-post against create_deals' own open-deal path for a positive reply."""
+        reply = _reply(
+            freshsales_account_id="1",
+            freshsales_contact_id="2",
+            freshsales_note_id="existing-note",
+            freshsales_deal_note_id="already-posted",
+        )
+        reply.save = mock.Mock()
+        crm = self._push(reply, open_deal_id="deal-5")
+
+        crm.get_contact_deals.assert_not_called()
+        self.assertFalse(any(c.kwargs.get("targetable_type") == "Deal" for c in crm.create_note.call_args_list))
 
 
 # -------------------------------------------------------------------------------------------

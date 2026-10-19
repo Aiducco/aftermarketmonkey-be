@@ -920,6 +920,19 @@ FRESHSALES_SIGNUP_MIN_ONBOARDING_STEP = int(os.environ.get("FRESHSALES_SIGNUP_MI
 # platform_crm_sync.is_platform_contact). Resolved by name at runtime, never as a numeric id.
 FRESHSALES_SIGNUP_CONTACT_STATUS = os.environ.get("FRESHSALES_SIGNUP_CONTACT_STATUS") or "Qualified"
 
+# Opens a deal for every signup synced above, same pipeline as the Instantly rescue process
+# (FRESHSALES_DEAL_PIPELINE_ID) but starting past "New Lead" -- a direct signup already has an
+# account, so there is no "Day 0: create their account" step left to do for it. Confirmed live
+# 2026-10-19: the pipeline's real stage list has no "Qualified" stage at all; "Account Sent" is
+# the stage that already means "they have an account", which is exactly this case. Independent
+# flag, off by default, same reasoning as FRESHSALES_CREATE_DEALS -- an auto-opened deal in a
+# shared pipeline is somebody else's forecast, so it is a deliberate choice, not a default.
+FRESHSALES_SIGNUP_CREATE_DEALS = (
+    os.environ.get("FRESHSALES_SIGNUP_CREATE_DEALS") or ""
+).strip().lower() in ("1", "true", "yes", "on")
+FRESHSALES_SIGNUP_DEAL_STAGE_ID = int(os.environ.get("FRESHSALES_SIGNUP_DEAL_STAGE_ID") or 127003680895)
+FRESHSALES_SIGNUP_DEAL_SOURCE = os.environ.get("FRESHSALES_SIGNUP_DEAL_SOURCE") or "Self sign-up"
+
 # Domains that are only ever ours -- staff, demo, support, smoke tests, pentest accounts. A company
 # whose every user sits on one of these is skipped, which keeps new internal signups out without
 # anyone remembering to set Company.is_internal. Individual users on these domains are skipped even

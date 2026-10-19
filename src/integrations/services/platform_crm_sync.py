@@ -235,6 +235,9 @@ def run(
     crm = freshsales_client.FreshsalesApiClient()
     status_ids = crm.contact_status_ids_by_name()
     signup_status_id = crm.resolve_contact_status_id(settings.FRESHSALES_SIGNUP_CONTACT_STATUS, status_ids)
+    # Resolved only when the flag is on -- an idle tick on a disabled feature should not spend a
+    # FreshSales call finding out it is disabled.
+    stage_types = crm.deal_stage_types_by_id() if settings.FRESHSALES_SIGNUP_CREATE_DEALS else None
 
     grouped = syncable_profiles_by_company()
     companies = {c.id: c for c in syncable_companies()}
@@ -249,6 +252,8 @@ def run(
         "contacts_created": 0,
         "contacts_updated": 0,
         "notes_created": 0,
+        "deals_created": 0,
+        "deals_reused": 0,
         "companies_skipped_no_users": 0,
         "failed": 0,
     }
@@ -270,7 +275,7 @@ def run(
             break
 
         try:
-            _push_company(crm, company, profiles, signup_status_id, summary)
+            _push_company(crm, company, profiles, signup_status_id, stage_types, summary)
             pushed += 1
         except (
             freshsales_exceptions.FreshsalesRateLimited,
@@ -294,6 +299,7 @@ def _push_company(
     company: "src_models.Company",
     profiles: typing.Sequence["src_models.UserProfile"],
     signup_status_id: int,
+    stage_types: typing.Optional[typing.Dict[int, str]],
     summary: typing.Dict[str, typing.Any],
 ) -> None:
     emails = [p.user.email for p in profiles]
@@ -330,9 +336,66 @@ def _push_company(
             profile.save(update_fields=["freshsales_last_error", "updated_at"])
             logger.exception("{} User {} failed to sync.".format(_LOG_PREFIX, profile.user.email))
 
+    if stage_types is not None and not company.freshsales_deal_id:
+        _maybe_create_signup_deal(crm, company, profiles, stage_types, summary)
+
     company.freshsales_synced_at = timezone.now()
     company.freshsales_last_error = None
     company.save(update_fields=["freshsales_synced_at", "freshsales_last_error", "updated_at"])
+
+
+def _maybe_create_signup_deal(
+    crm: "freshsales_client.FreshsalesApiClient",
+    company: "src_models.Company",
+    profiles: typing.Sequence["src_models.UserProfile"],
+    stage_types: typing.Dict[int, str],
+    summary: typing.Dict[str, typing.Any],
+) -> None:
+    """
+    Opens a deal for a direct platform signup, same pipeline as the Instantly rescue process but
+    starting at "Account Sent" -- they already have an account, so there is no "Day 0" step left.
+    Only called when FRESHSALES_SIGNUP_CREATE_DEALS is on and this company has no deal recorded
+    yet (see :func:`_push_company`).
+
+    Local import of :func:`find_open_deal_for_contact` avoids a circular import --
+    ``instantly_freshsales_sync`` already imports this module for :func:`is_platform_contact`.
+
+    The primary (admin) profile stands in for the company: ``syncable_profiles_by_company`` already
+    orders profiles admin-first, and one deal per company is the point, not one per user. If that
+    profile has no FreshSales contact yet (its own push failed this run), this is skipped and
+    retried next run rather than guessed at with no contact to attach the deal to.
+    """
+    from src.integrations.services import instantly_freshsales_sync
+
+    primary = profiles[0]
+    if not primary.freshsales_contact_id:
+        return
+
+    reused = instantly_freshsales_sync.find_open_deal_for_contact(crm, primary.freshsales_contact_id, stage_types)
+    if reused:
+        company.freshsales_deal_id = reused
+        company.save(update_fields=["freshsales_deal_id", "updated_at"])
+        summary["deals_reused"] += 1
+        logger.info(
+            "{} Company {!r} reuses open deal {} instead of opening a second one.".format(
+                _LOG_PREFIX, company.name, reused
+            )
+        )
+        return
+
+    deal_id = crm.create_deal(
+        name=company.name,
+        amount=settings.FRESHSALES_DEFAULT_DEAL_AMOUNT,
+        sales_account_id=company.freshsales_account_id,
+        contact_id=primary.freshsales_contact_id,
+        pipeline_id=settings.FRESHSALES_DEAL_PIPELINE_ID,
+        stage_id=settings.FRESHSALES_SIGNUP_DEAL_STAGE_ID,
+        custom_field={"cf_inbound_source": settings.FRESHSALES_SIGNUP_DEAL_SOURCE},
+    )
+    crm.create_note(description=note_description(primary), targetable_id=deal_id, targetable_type="Deal")
+    company.freshsales_deal_id = deal_id
+    company.save(update_fields=["freshsales_deal_id", "updated_at"])
+    summary["deals_created"] += 1
 
 
 def _push_profile(

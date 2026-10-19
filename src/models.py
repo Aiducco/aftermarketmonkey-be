@@ -59,6 +59,11 @@ class Company(django_db_models.Model):
     freshsales_account_id = django_db_models.TextField(null=True, blank=True)
     freshsales_synced_at = django_db_models.DateTimeField(null=True, blank=True)
     freshsales_last_error = django_db_models.TextField(null=True, blank=True)
+    # Set when FRESHSALES_SIGNUP_CREATE_DEALS opens a deal for this signup (see
+    # platform_crm_sync._push_company) -- null means not attempted, not created yet, or it reused
+    # an already-open deal found on the primary contact (e.g. one the Instantly sync created first
+    # for the same person) rather than opening a second one.
+    freshsales_deal_id = django_db_models.TextField(null=True, blank=True)
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
@@ -3344,6 +3349,11 @@ class InstantlyReply(django_db_models.Model):
     freshsales_contact_id = django_db_models.TextField(null=True, blank=True)
     freshsales_note_id = django_db_models.TextField(null=True, blank=True)
     freshsales_deal_id = django_db_models.TextField(null=True, blank=True)
+    # Set once this reply has been posted as its own note onto a deal -- whether that deal was
+    # just created for it, already open from an earlier reply, or created by hand in FreshSales.
+    # Lets push_contacts (every reply) and create_deals (positive replies only) share one open-deal
+    # note path without double-posting the same reply twice across the two passes.
+    freshsales_deal_note_id = django_db_models.TextField(null=True, blank=True)
     contact_synced_at = django_db_models.DateTimeField(null=True, blank=True)
     deal_created_at = django_db_models.DateTimeField(null=True, blank=True)
 

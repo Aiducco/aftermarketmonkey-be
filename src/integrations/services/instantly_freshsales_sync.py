@@ -565,11 +565,18 @@ def push_contacts(
     Each id is saved the moment the CRM returns it, so a crash between the contact and the note
     resumes rather than creating the contact twice. One reply failing is recorded on its row and
     the pass continues -- a single malformed reply must not stall the queue behind it.
+
+    Also -- regardless of FRESHSALES_CREATE_DEALS -- posts the reply as a note on the contact's
+    deal when one is already open (see :func:`_push_one_contact`), so an ongoing conversation
+    stays visible on whichever deal a human (or :func:`create_deals`) is working, not just on the
+    contact. ``stage_types`` is resolved lazily, once, only the first time a contact actually needs
+    the lookup, same reasoning as :func:`create_deals`.
     """
     counts = {
         "contacts_created": 0,
         "contacts_updated": 0,
         "notes_created": 0,
+        "deal_notes_created": 0,
         "skipped_no_email": 0,
         "failed": 0,
         "budget_stopped": 0,
@@ -579,6 +586,7 @@ def push_contacts(
     # FreshSales calls on the same selector just to find there is nothing to push.
     if status_ids is None:
         status_ids = crm.contact_status_ids_by_name()
+    stage_types: typing.Optional[typing.Dict[int, str]] = None
 
     queryset = src_models.InstantlyReply.objects.filter(
         contact_synced_at__isnull=True,
@@ -602,7 +610,9 @@ def push_contacts(
             continue
 
         try:
-            _push_one_contact(crm, reply, status_ids, counts)
+            if stage_types is None:
+                stage_types = crm.deal_stage_types_by_id()
+            _push_one_contact(crm, reply, status_ids, stage_types, counts)
         except (
             freshsales_exceptions.FreshsalesRateLimited,
             freshsales_exceptions.FreshsalesAuthError,
@@ -629,6 +639,7 @@ def _push_one_contact(
     crm: "freshsales_client.FreshsalesApiClient",
     reply: "src_models.InstantlyReply",
     status_ids: typing.Dict[str, int],
+    stage_types: typing.Dict[int, str],
     counts: typing.Dict[str, int],
 ) -> None:
     company = company_name_for(reply.lead_email, reply.lead_payload, person_name=reply.from_name or "")
@@ -662,6 +673,26 @@ def _push_one_contact(
         reply.freshsales_note_id = note_id
         reply.save(update_fields=["freshsales_note_id", "updated_at"])
         counts["notes_created"] += 1
+
+    # Keep an already-open deal's conversation current -- every reply, not just positive ones, so
+    # a routine back-and-forth after "Interested" still shows up where a rep is actually looking.
+    # Independent of FRESHSALES_CREATE_DEALS: this never creates a deal, only notes an existing
+    # one (ours or one a human opened by hand). freshsales_deal_note_id is the single idempotency
+    # marker shared with create_deals' own open-deal path, so the same reply is never posted twice
+    # across the two passes -- see that function's docstring.
+    if not reply.freshsales_deal_note_id and reply.freshsales_contact_id:
+        open_deal_id = find_open_deal_for_contact(crm, reply.freshsales_contact_id, stage_types)
+        if open_deal_id:
+            note_id = crm.create_note(
+                description=note_description(reply), targetable_id=open_deal_id, targetable_type="Deal"
+            )
+            reply.freshsales_deal_id = open_deal_id
+            reply.freshsales_deal_note_id = note_id
+            reply.deal_created_at = timezone.now()
+            reply.save(
+                update_fields=["freshsales_deal_id", "freshsales_deal_note_id", "deal_created_at", "updated_at"]
+            )
+            counts["deal_notes_created"] += 1
 
     reply.contact_synced_at = timezone.now()
     reply.last_error = None
@@ -1027,13 +1058,27 @@ def create_deals(
 
             open_deal_id = find_open_deal_for_contact(crm, reply.freshsales_contact_id, stage_types)
             if open_deal_id:
-                crm.create_note(
-                    description=note_description(reply), targetable_id=open_deal_id, targetable_type="Deal"
-                )
+                # push_contacts (pass 2, every reply) already posts this same reply onto an
+                # already-open deal and sets freshsales_deal_note_id -- the deal_created_at__isnull
+                # filter above normally keeps this queryset from ever reaching that case, but the
+                # note itself is still guarded here rather than assumed, in case that ever drifts.
+                if not reply.freshsales_deal_note_id:
+                    note_id = crm.create_note(
+                        description=note_description(reply), targetable_id=open_deal_id, targetable_type="Deal"
+                    )
+                    reply.freshsales_deal_note_id = note_id
                 reply.freshsales_deal_id = open_deal_id
                 reply.deal_created_at = timezone.now()
                 reply.last_error = None
-                reply.save(update_fields=["freshsales_deal_id", "deal_created_at", "last_error", "updated_at"])
+                reply.save(
+                    update_fields=[
+                        "freshsales_deal_id",
+                        "freshsales_deal_note_id",
+                        "deal_created_at",
+                        "last_error",
+                        "updated_at",
+                    ]
+                )
                 counts["skipped_existing_deal"] += 1
                 continue
 
@@ -1093,7 +1138,11 @@ def create_deals(
 
         # Step 6 -- the full reply as a note on the new deal.
         try:
-            crm.create_note(description=note_description(reply), targetable_id=deal_id, targetable_type="Deal")
+            note_id = crm.create_note(
+                description=note_description(reply), targetable_id=deal_id, targetable_type="Deal"
+            )
+            reply.freshsales_deal_note_id = note_id
+            reply.save(update_fields=["freshsales_deal_note_id", "updated_at"])
         except Exception as e:
             logger.warning(
                 "{} Deal {} created for {} but its note failed: {}".format(
