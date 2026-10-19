@@ -3,9 +3,12 @@ Transport client for Freshworks CRM (FreshSales) -- the endpoints the reply sync
 
 * ``POST /sales_accounts/upsert``  the shop as a company
 * ``POST /contacts/upsert``        the person who replied
-* ``POST /notes``                  the reply text, attached to the contact
+* ``POST /notes``                  the reply text, attached to the contact or a deal
 * ``POST /deals``                  a positive reply's opportunity
 * ``GET  /selector/contact_statuses``  status name -> id, resolved at runtime
+* ``GET  /selector/deal_stages``       stage id -> type (Open/Won/Lost), resolved at runtime
+* ``GET  /lookup``                     find an existing contact by email before upserting
+* ``GET  /contacts/{id}?include=deals`` a contact's deals, to check for an already-open one
 
 Base URL is ``https://<bundle-alias>.myfreshworks.com/crm/sales/api``, where the alias is the
 ``<name>`` in the URL the CRM is logged into. Auth is ``Authorization: Token token=<key>`` -- note
@@ -162,6 +165,70 @@ class FreshsalesApiClient(object):
             )
         return status_id
 
+    def deal_stage_types_by_id(self) -> typing.Dict[int, str]:
+        """
+        Deal stage id -> its type ("Open" / "Won" / "Lost"), the same selector-endpoint pattern as
+        :meth:`contact_status_ids_by_name` -- resolved per run, never hardcoded, so a pipeline
+        edited in the CRM is read correctly rather than against a stale assumption.
+
+        Used to decide whether a contact's existing deal is still active (type "Open") before
+        creating a second one for the same shop -- see
+        instantly_freshsales_sync.find_open_deal_for_contact. **Unverified against the live
+        account** (the FreshSales API key has been rejected with 401 since 2026-10-17 -- see that
+        incident) -- confirm the response actually nests a "type" field per stage once access is
+        restored; if it does not, this needs a different field name, not a redesign.
+        """
+        _, payload = self._request("GET", "selector/deal_stages")
+        stages = payload.get("deal_stages") or []
+        return {
+            s.get("id"): str(s.get("type") or "")
+            for s in stages
+            if isinstance(s, dict) and s.get("id")
+        }
+
+    def find_contact_by_email(self, email: str) -> typing.Optional[dict]:
+        """
+        ``GET /lookup?q=<email>&f=email&entities=contact`` -- the contact for an address, or None.
+
+        Used ahead of :meth:`upsert_contact` specifically to check for an *existing* deal before
+        deciding whether a reply needs a new one (see
+        instantly_freshsales_sync.find_open_deal_for_contact) -- upsert_contact alone would not
+        tell the caller whether the contact already existed. **Unverified against the live
+        account**, same caveat as :meth:`deal_stage_types_by_id` -- the exact nesting of the
+        "contacts" key below is Freshworks' documented lookup-search shape, not one this client has
+        actually seen a response for yet.
+        """
+        if not email:
+            return None
+        _, payload = self._request("GET", "lookup", params={"q": email, "f": "email", "entities": "contact"})
+        contacts = payload.get("contacts") or {}
+        items = contacts.get("contacts") if isinstance(contacts, dict) else contacts
+        for item in items or []:
+            if isinstance(item, dict) and item.get("id"):
+                return item
+        return None
+
+    def get_contact_deals(self, contact_id: str) -> typing.List[dict]:
+        """
+        ``GET /contacts/{id}?include=deals`` -- every deal on a contact (each carrying at least
+        ``id`` and ``deal_stage_id``). **Unverified against the live account**, same caveat as
+        :meth:`find_contact_by_email` -- falls back to a top-level sideloaded "deals" map/list if
+        the contact's own "deals" key turns out to hold bare ids rather than inline objects, since
+        Freshworks' sideloading convention varies by ``include`` and this one has not been observed
+        live; confirm which shape the real account returns before trusting this silently.
+        """
+        _, payload = self._request("GET", "contacts/{}".format(contact_id), params={"include": "deals"})
+        contact = payload.get("contact") or {}
+        deals = contact.get("deals")
+        if isinstance(deals, list) and deals and isinstance(deals[0], dict):
+            return deals
+        sideloaded = payload.get("deals")
+        if isinstance(sideloaded, dict):
+            return [d for d in sideloaded.values() if isinstance(d, dict)]
+        if isinstance(sideloaded, list):
+            return [d for d in sideloaded if isinstance(d, dict)]
+        return []
+
     # -- writes -------------------------------------------------------------------------
 
     def upsert_sales_account(self, name: str, fields: typing.Optional[dict] = None) -> typing.Tuple[str, bool]:
@@ -197,14 +264,15 @@ class FreshsalesApiClient(object):
             )
         return str(contact_id), status_code == 201
 
-    def create_note(self, description: str, contact_id: str) -> str:
-        """Attach a note to a contact. Notes are append-only -- there is no upsert, which is why
-        the caller must guard on ``freshsales_note_id`` rather than re-posting."""
+    def create_note(self, description: str, targetable_id: str, targetable_type: str = "Contact") -> str:
+        """Attach a note to a contact or a deal. Notes are append-only -- there is no upsert,
+        which is why the caller must guard on ``freshsales_note_id``/``freshsales_deal_note_id``
+        rather than re-posting."""
         body = {
             "note": {
                 "description": description,
-                "targetable_type": "Contact",
-                "targetable_id": contact_id,
+                "targetable_type": targetable_type,
+                "targetable_id": targetable_id,
             }
         }
         _, payload = self._request("POST", "notes", json_body=body)
@@ -238,17 +306,33 @@ class FreshsalesApiClient(object):
         amount: typing.Union[int, float],
         sales_account_id: str,
         contact_id: typing.Optional[str] = None,
+        pipeline_id: typing.Optional[int] = None,
+        stage_id: typing.Optional[int] = None,
+        custom_field: typing.Optional[dict] = None,
     ) -> str:
         """
         Create a deal. ``name``, ``amount`` and ``sales_account_id`` are all required by the API.
 
-        Pipeline, stage and owner are deliberately omitted so the CRM applies its own defaults --
-        today that is the Default Pipeline at stage "New". Passing them would pin this sync to
-        numeric ids that change when the pipeline is edited.
+        ``pipeline_id``/``stage_id`` pin the deal to a specific pipeline/stage rather than letting
+        the CRM apply its own default -- used by the cold-reply deal flow
+        (settings.FRESHSALES_DEAL_PIPELINE_ID/_STAGE_ID), which needs every such deal to land in
+        the same place to work from. Omit both (as every other caller still does) to get the CRM's
+        own default pipeline at its default stage.
+
+        ``custom_field`` is passed through verbatim as FreshSales' own ``custom_field`` object --
+        dropdown-backed custom fields (e.g. Lead Source, Rescue Step, Assigned To) reject any value
+        that is not an exact existing option, so a typo here fails loudly rather than silently
+        landing on the wrong value.
         """
         deal = {"name": name, "amount": amount, "sales_account_id": sales_account_id}
         if contact_id:
             deal["contacts_added_list"] = [contact_id]
+        if pipeline_id is not None:
+            deal["deal_pipeline_id"] = pipeline_id
+        if stage_id is not None:
+            deal["deal_stage_id"] = stage_id
+        if custom_field:
+            deal["custom_field"] = custom_field
         _, payload = self._request("POST", "deals", json_body={"deal": deal})
         created = payload.get("deal") or {}
         deal_id = created.get("id")

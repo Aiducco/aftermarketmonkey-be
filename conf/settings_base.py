@@ -874,6 +874,20 @@ FRESHSALES_DEFAULT_DEAL_AMOUNT = float(os.environ.get("FRESHSALES_DEFAULT_DEAL_A
 # cannot lock us out of our own CRM.
 FRESHSALES_MAX_CALLS_PER_RUN = int(os.environ.get("FRESHSALES_MAX_CALLS_PER_RUN") or 600)
 
+# Deal creation specifics -- only read when FRESHSALES_CREATE_DEALS is on. These are account-
+# specific numeric/string configuration (which pipeline, which starting stage, which dropdown
+# values), not business logic, so they live here rather than hardcoded in the sync -- same reason
+# FRESHSALES_DEFAULT_DEAL_AMOUNT does. A value typed into these dropdowns that does not match a
+# real option exactly is rejected by FreshSales, not silently coerced.
+FRESHSALES_DEAL_PIPELINE_ID = int(os.environ.get("FRESHSALES_DEAL_PIPELINE_ID") or 127000525268)
+FRESHSALES_DEAL_STAGE_ID = int(os.environ.get("FRESHSALES_DEAL_STAGE_ID") or 127003680894)
+FRESHSALES_DEAL_SOURCE = os.environ.get("FRESHSALES_DEAL_SOURCE") or "Cold email"
+FRESHSALES_DEAL_RESCUE_STEP = os.environ.get("FRESHSALES_DEAL_RESCUE_STEP") or "Day 0"
+FRESHSALES_DEAL_NEXT_STEP = os.environ.get("FRESHSALES_DEAL_NEXT_STEP") or (
+    "Day 0: create their account, send the login email with the distributor question"
+)
+FRESHSALES_DEAL_ASSIGNED_TO = os.environ.get("FRESHSALES_DEAL_ASSIGNED_TO") or "Adams"
+
 
 # ---------------------------------------------------------------------------------------------
 # Platform signups -> FreshSales (src/integrations/services/platform_crm_sync.py,

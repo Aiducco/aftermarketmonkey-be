@@ -220,6 +220,23 @@ class InstantlyApiClient(object):
                 return item
         return None
 
+    def remove_lead_from_campaign(self, lead_id: str, campaign_id: str) -> None:
+        """
+        Stops a lead's cold sequence by removing it from the given campaign -- ``DELETE
+        /api/v2/leads`` scoped to ``campaign_id`` + ``ids``, not a general lead delete (the same
+        endpoint also accepts ``list_id`` instead of ``campaign_id``, mutually exclusive, which
+        this client never uses).
+
+        **Unverified against the live account** -- unlike every other method in this file (see the
+        module docstring's "verified against the production workspace" note), this one has not
+        been called against real data: Instantly's own docs document the shape but the live
+        response was never observed, and it is a destructive call that was not safe to try blind.
+        Confirm it against one real lead before relying on it unattended.
+        """
+        if not lead_id or not campaign_id:
+            raise ValueError("remove_lead_from_campaign requires both lead_id and campaign_id.")
+        self._request("DELETE", "leads", json_body={"campaign_id": campaign_id, "ids": [lead_id]})
+
     def list_campaigns(self) -> typing.Dict[str, str]:
         """Campaign id -> name, for naming deals. One call; there are two campaigns today."""
         names = {}

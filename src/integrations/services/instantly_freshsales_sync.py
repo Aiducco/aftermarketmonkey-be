@@ -13,6 +13,19 @@ re-runnable, because the useful failure mode is "stopped halfway and resumed", n
 is on**, which it is not by default: deals are opened by hand. A positive reply still lands as a
 contact whose FreshSales status reads "Interested", which is the queue to work from.
 
+**When it is on**, create_deals follows the rescue-process spec exactly (2026-10-19): check
+FreshSales directly for a deal already open on the contact (not just our own
+``freshsales_deal_id``) before creating a second one, pin the new deal to a specific
+pipeline/stage with the custom fields the rescue process reads from
+(settings.FRESHSALES_DEAL_*), remove the lead from its Instantly campaign so the cold sequence
+stops, and add the full reply as a note on the deal. The campaign-removal step
+(:meth:`InstantlyApiClient.remove_lead_from_campaign`) and three of the new FreshSales client
+methods it needs (:meth:`find_contact_by_email`, :meth:`get_contact_deals`,
+:meth:`deal_stage_types_by_id`) are **unverified against the live account** -- the FreshSales API
+key has been rejected with 401 since 2026-10-17 (see that incident), so none of this could be
+tested against real data; confirm the response shapes once access is restored, per each method's
+own docstring.
+
 **Why pass 3 exists.** Instantly's label is not always set when the reply arrives: their AI applies
 it shortly after, and a human relabelling in Unibox can change it much later. In the live account 4
 of 22 replies are unlabelled, two of them a month old. Reading ``i_status`` once at ingest and never
@@ -203,6 +216,21 @@ def domain_of(email: str) -> str:
     return (email or "").strip().lower().rpartition("@")[2]
 
 
+def domain_of_url(url: str) -> str:
+    """The bare host of a website custom variable ("https://www.rhinoutah.com/shop" -> "rhinoutah.com"),
+    for company_name_for's website-domain fallback. Not domain_of -- that splits on "@" and would
+    return a URL unchanged since it has none."""
+    text = (url or "").strip().lower()
+    if not text:
+        return ""
+    text = text.split("://", 1)[-1]  # drop a scheme if present
+    text = text.split("/", 1)[0]  # drop any path
+    text = text.split(":", 1)[0]  # drop a port
+    if text.startswith("www."):
+        text = text[4:]
+    return text
+
+
 def display_name_of(email_payload: dict) -> str:
     """The sender's own From-header display name, which is what they typed, not a guess."""
     addresses = email_payload.get("from_address_json") or []
@@ -246,21 +274,34 @@ def split_display_name(display_name: str, company_name: str = "") -> typing.Tupl
     return parts[0], " ".join(parts[1:])
 
 
-def company_name_for(lead_email: str, lead_payload: typing.Optional[dict] = None) -> str:
+def company_name_for(
+    lead_email: str, lead_payload: typing.Optional[dict] = None, person_name: str = ""
+) -> str:
     """
-    The shop's name: Instantly's ``companyName`` custom variable, else the reply's domain.
+    The shop's name, in order: Instantly's ``companyName`` custom variable; else the website's own
+    domain; else the reply's email domain (skipped for a free mailbox -- those fall through
+    instead, so fourteen unrelated gmail repliers do not all land under one "gmail.com" account);
+    else the person's full name; else the email address itself, as the last resort of last
+    resorts.
 
-    The domain fallback never fires for a free mailbox -- those fall back to the address itself, so
-    fourteen unrelated gmail repliers do not all land under one "gmail.com" account.
+    ``person_name`` is optional so every existing caller that has not been updated to pass one
+    (and every old test) keeps its previous behaviour -- it only changes the answer for an address
+    that reaches step 4 with no name supplied.
     """
     payload = lead_payload or {}
     for key in ("companyName", "company_name"):
         value = (payload.get(key) or "").strip()
         if value:
             return value
+    website_domain = domain_of_url(payload.get("website") or "")
+    if website_domain and website_domain not in _GENERIC_EMAIL_DOMAINS:
+        return website_domain
     domain = domain_of(lead_email)
     if domain and domain not in _GENERIC_EMAIL_DOMAINS:
         return domain
+    name = (person_name or "").strip()
+    if name:
+        return name
     return lead_email or domain or "Unknown"
 
 
@@ -311,7 +352,7 @@ def contact_fields(reply: "src_models.InstantlyReply", contact_status_id: int) -
     else from Instantly's custom variables, which are our own export's data coming home.
     """
     payload = reply.lead_payload or {}
-    company = company_name_for(reply.lead_email, payload)
+    company = company_name_for(reply.lead_email, payload, person_name=reply.from_name or "")
     first_name, last_name = split_display_name(reply.from_name or "", company)
 
     fields = {
@@ -407,10 +448,8 @@ def note_description(reply: "src_models.InstantlyReply") -> str:
 
 
 def deal_name(reply: "src_models.InstantlyReply") -> str:
-    company = company_name_for(reply.lead_email, reply.lead_payload)
-    if reply.campaign_name:
-        return "{} — {}".format(company, reply.campaign_name)
-    return "{} — Instantly reply".format(company)
+    """Just the company name -- no "Deal" suffix, no campaign name appended. Exact spec."""
+    return company_name_for(reply.lead_email, reply.lead_payload, person_name=reply.from_name or "")
 
 
 def watermark(overlap_minutes: int, initial_days: int) -> typing.Optional[datetime.datetime]:
@@ -592,7 +631,7 @@ def _push_one_contact(
     status_ids: typing.Dict[str, int],
     counts: typing.Dict[str, int],
 ) -> None:
-    company = company_name_for(reply.lead_email, reply.lead_payload)
+    company = company_name_for(reply.lead_email, reply.lead_payload, person_name=reply.from_name or "")
 
     if not reply.freshsales_account_id:
         account_id, _ = crm.upsert_sales_account(name=company, fields=sales_account_fields(reply))
@@ -619,7 +658,7 @@ def _push_one_contact(
         counts["contacts_created" if created else "contacts_updated"] += 1
 
     if not reply.freshsales_note_id:
-        note_id = crm.create_note(description=note_description(reply), contact_id=reply.freshsales_contact_id)
+        note_id = crm.create_note(description=note_description(reply), targetable_id=reply.freshsales_contact_id)
         reply.freshsales_note_id = note_id
         reply.save(update_fields=["freshsales_note_id", "updated_at"])
         counts["notes_created"] += 1
@@ -758,22 +797,95 @@ def refresh_interest(
     return counts
 
 
+def find_open_deal_for_contact(
+    crm: "freshsales_client.FreshsalesApiClient",
+    contact_id: str,
+    stage_types: typing.Dict[int, int],
+) -> typing.Optional[str]:
+    """
+    Step 1 of the cold-reply deal flow: does this contact already have a deal that is not Won or
+    Lost? If so, its id is returned and the caller must not create a second deal -- only add the
+    reply as a note on this one instead (see :func:`create_deals`).
+
+    A stage this account's selector does not recognise (``stage_types`` has no entry for it) is
+    treated as open rather than skipped -- the safe failure here is "add a note to a deal that may
+    already be closed", not "silently open a duplicate deal".
+    """
+    for deal in crm.get_contact_deals(contact_id):
+        deal_id = deal.get("id")
+        if not deal_id:
+            continue
+        stage_type = stage_types.get(deal.get("deal_stage_id"), "")
+        if stage_type not in ("Won", "Lost"):
+            return str(deal_id)
+    return None
+
+
+def _deal_custom_fields(reply: "src_models.InstantlyReply", conf: typing.Any) -> dict:
+    """
+    The dropdown-backed fields the rescue process reads from. Values for cf_inbound_source,
+    cf_rescue_step and cf_assigned_to must match an existing FreshSales dropdown option exactly
+    (configured in settings, not typed inline here, so a renamed option is one settings change,
+    not a code change) -- see settings.FRESHSALES_DEAL_* and FreshsalesApiClient.create_deal's
+    custom_field note.
+    """
+    return {
+        "cf_inbound_source": conf.FRESHSALES_DEAL_SOURCE,
+        "cf_source_campaign": reply.campaign_name or "",
+        "cf_first_reply": (reply.body_text or "")[:250],
+        "cf_unibox_link": unibox_url(reply) or "",
+        "cf_rescue_step": conf.FRESHSALES_DEAL_RESCUE_STEP,
+        "cf_next_step": conf.FRESHSALES_DEAL_NEXT_STEP,
+        "cf_next_step_date": timezone.now().date().isoformat(),
+        "cf_assigned_to": conf.FRESHSALES_DEAL_ASSIGNED_TO,
+    }
+
+
 def create_deals(
     crm: "freshsales_client.FreshsalesApiClient",
+    instantly: "instantly_client.InstantlyApiClient",
     default_amount: typing.Union[int, float] = 0,
     limit: typing.Optional[int] = None,
     max_calls: typing.Optional[int] = None,
     max_attempts: int = 5,
+    settings_module: typing.Any = None,
 ) -> typing.Dict[str, int]:
     """
-    One deal per positive reply that has no deal yet, skipping addresses that already have one.
+    One deal per positive reply whose contact has no open deal yet. Six steps, matching the
+    rescue-process spec exactly:
 
-    **One deal per address, not per reply.** Someone who replies twice is one opportunity, and the
-    live account has 22 replies from 14 addresses, so without this the pipeline would double-count.
-    The guard is a query rather than a constraint because the first deal may have been created in
-    an earlier run.
+      1. Check FreshSales directly (not just our own ``freshsales_deal_id``) for a deal already on
+         this contact that is not Won/Lost -- someone who replies twice, or who already has an
+         open deal from some other route into the CRM, is one opportunity, not two. If one exists,
+         only add the reply as a note on it and stop.
+      2+3. The sales account and contact already exist by this point -- pass 2
+         (:func:`push_contacts`) created both before a reply can ever reach this function.
+      4. Create the deal, pinned to the cold-reply pipeline/stage
+         (settings.FRESHSALES_DEAL_PIPELINE_ID/_STAGE_ID) with the custom fields above. Deal value
+         is left at ``default_amount`` (0 unless configured) -- it is set later, by hand, once they
+         pick a plan.
+      5. Remove the lead from its Instantly campaign so the cold sequence stops sending. Best
+         effort: a failure here is logged and counted but does not undo the deal just created, and
+         does not stop the pass -- a human can remove it from Instantly by hand.
+      6. Add the full reply as a note on the deal (distinct from pass 2's note on the contact,
+         which still happens separately and is not duplicated here).
     """
-    counts = {"deals_created": 0, "skipped_existing_deal": 0, "skipped_no_contact": 0, "failed": 0}
+    from django.conf import settings as django_settings
+
+    conf = settings_module or django_settings
+
+    counts = {
+        "deals_created": 0,
+        "skipped_existing_deal": 0,
+        "skipped_no_contact": 0,
+        "removed_from_campaign": 0,
+        "campaign_removal_failed": 0,
+        "failed": 0,
+    }
+
+    # Resolved once per run, lazily -- an idle tick with nothing positive to do should not spend a
+    # FreshSales call finding out that out.
+    stage_types: typing.Optional[typing.Dict[int, str]] = None
 
     queryset = src_models.InstantlyReply.objects.filter(
         is_positive=True,
@@ -798,25 +910,30 @@ def create_deals(
             counts["skipped_no_contact"] += 1
             continue
 
-        existing = (
-            src_models.InstantlyReply.objects.filter(lead_email=reply.lead_email, freshsales_deal_id__isnull=False)
-            .exclude(id=reply.id)
-            .values_list("freshsales_deal_id", flat=True)
-            .first()
-        )
-        if existing:
-            reply.freshsales_deal_id = existing
-            reply.deal_created_at = timezone.now()
-            reply.save(update_fields=["freshsales_deal_id", "deal_created_at", "updated_at"])
-            counts["skipped_existing_deal"] += 1
-            continue
-
         try:
+            if stage_types is None:
+                stage_types = crm.deal_stage_types_by_id()
+
+            open_deal_id = find_open_deal_for_contact(crm, reply.freshsales_contact_id, stage_types)
+            if open_deal_id:
+                crm.create_note(
+                    description=note_description(reply), targetable_id=open_deal_id, targetable_type="Deal"
+                )
+                reply.freshsales_deal_id = open_deal_id
+                reply.deal_created_at = timezone.now()
+                reply.last_error = None
+                reply.save(update_fields=["freshsales_deal_id", "deal_created_at", "last_error", "updated_at"])
+                counts["skipped_existing_deal"] += 1
+                continue
+
             deal_id = crm.create_deal(
                 name=deal_name(reply),
                 amount=default_amount,
                 sales_account_id=reply.freshsales_account_id,
                 contact_id=reply.freshsales_contact_id,
+                pipeline_id=conf.FRESHSALES_DEAL_PIPELINE_ID,
+                stage_id=conf.FRESHSALES_DEAL_STAGE_ID,
+                custom_field=_deal_custom_fields(reply, conf),
             )
         except (
             freshsales_exceptions.FreshsalesRateLimited,
@@ -836,6 +953,42 @@ def create_deals(
         reply.last_error = None
         reply.save(update_fields=["freshsales_deal_id", "deal_created_at", "last_error", "updated_at"])
         counts["deals_created"] += 1
+
+        # Step 5 -- stop the cold sequence. Best-effort: logged and counted, never raised, so a
+        # campaign-removal failure cannot undo (or retry-loop) the deal just created.
+        if reply.campaign_id:
+            try:
+                lead = instantly.find_lead(reply.lead_email)
+                if lead and lead.get("id"):
+                    instantly.remove_lead_from_campaign(str(lead["id"]), reply.campaign_id)
+                    counts["removed_from_campaign"] += 1
+                else:
+                    counts["campaign_removal_failed"] += 1
+                    logger.warning(
+                        "{} Deal created for {} but its Instantly lead id could not be found -- "
+                        "remove it from the campaign by hand.".format(_LOG_PREFIX, reply.lead_email)
+                    )
+            except Exception as e:
+                counts["campaign_removal_failed"] += 1
+                logger.warning(
+                    "{} Deal created for {} but removing it from campaign {} failed: {} -- remove "
+                    "it by hand in Instantly.".format(
+                        _LOG_PREFIX,
+                        reply.lead_email,
+                        reply.campaign_id,
+                        common_utils.get_exception_message(exception=e),
+                    )
+                )
+
+        # Step 6 -- the full reply as a note on the new deal.
+        try:
+            crm.create_note(description=note_description(reply), targetable_id=deal_id, targetable_type="Deal")
+        except Exception as e:
+            logger.warning(
+                "{} Deal {} created for {} but its note failed: {}".format(
+                    _LOG_PREFIX, deal_id, reply.lead_email, common_utils.get_exception_message(exception=e)
+                )
+            )
 
     return counts
 
@@ -1020,10 +1173,12 @@ def run(
         summary.update(
             create_deals(
                 crm=crm,
+                instantly=instantly,
                 default_amount=conf.FRESHSALES_DEFAULT_DEAL_AMOUNT,
                 limit=limit,
                 max_calls=conf.FRESHSALES_MAX_CALLS_PER_RUN,
                 max_attempts=max_attempts,
+                settings_module=conf,
             )
         )
     else:

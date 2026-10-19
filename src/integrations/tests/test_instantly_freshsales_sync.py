@@ -591,11 +591,13 @@ class CrmPayloadTests(SimpleTestCase):
         description = sync.note_description(_reply(interest_status=None, is_positive=False))
         self.assertIn("unlabelled", description)
 
-    def test_the_deal_is_named_for_the_shop_and_campaign(self):
-        self.assertEqual(sync.deal_name(_reply()), "Rhino Utah — Realtruck - 1/3 locations")
+    def test_the_deal_is_named_for_the_shop_only(self):
+        """No "Deal" suffix, no campaign name appended -- just the company name (spec change
+        2026-10-19: the campaign now lives in cf_source_campaign on the deal itself instead)."""
+        self.assertEqual(sync.deal_name(_reply()), "Rhino Utah")
 
-    def test_a_deal_without_a_campaign_name_still_reads_sensibly(self):
-        self.assertEqual(sync.deal_name(_reply(campaign_name=None)), "Rhino Utah — Instantly reply")
+    def test_a_deal_name_is_unaffected_by_campaign_name(self):
+        self.assertEqual(sync.deal_name(_reply(campaign_name=None)), "Rhino Utah")
 
 
 # -------------------------------------------------------------------------------------------
@@ -859,3 +861,234 @@ class PlatformStatusWinsTests(SimpleTestCase):
         reply.save = mock.Mock()
         fields = self._push(reply, is_platform=False)
         self.assertEqual(fields["contact_status_id"], 127004315050)
+
+
+# -------------------------------------------------------------------------------------------
+# Deal creation -- the rescue-process spec (2026-10-19)
+# -------------------------------------------------------------------------------------------
+
+
+class FindOpenDealForContactTests(SimpleTestCase):
+    """A deal in any stage but Won/Lost blocks a new deal; the reply becomes a note on it instead
+    (see create_deals). An unrecognised stage type is treated as open -- the safe failure is an
+    extra note on a possibly-closed deal, not a silent duplicate deal."""
+
+    databases = []
+
+    def test_no_deals_at_all_returns_none(self):
+        crm = mock.Mock()
+        crm.get_contact_deals.return_value = []
+        self.assertIsNone(sync.find_open_deal_for_contact(crm, "7", {}))
+
+    def test_a_won_deal_does_not_block(self):
+        crm = mock.Mock()
+        crm.get_contact_deals.return_value = [{"id": 1, "deal_stage_id": 10}]
+        self.assertIsNone(sync.find_open_deal_for_contact(crm, "7", {10: "Won"}))
+
+    def test_a_lost_deal_does_not_block(self):
+        crm = mock.Mock()
+        crm.get_contact_deals.return_value = [{"id": 1, "deal_stage_id": 11}]
+        self.assertIsNone(sync.find_open_deal_for_contact(crm, "7", {11: "Lost"}))
+
+    def test_an_open_deal_is_returned(self):
+        crm = mock.Mock()
+        crm.get_contact_deals.return_value = [{"id": 42, "deal_stage_id": 12}]
+        self.assertEqual(sync.find_open_deal_for_contact(crm, "7", {12: "Open"}), "42")
+
+    def test_an_unrecognised_stage_is_treated_as_open(self):
+        crm = mock.Mock()
+        crm.get_contact_deals.return_value = [{"id": 42, "deal_stage_id": 999}]
+        self.assertEqual(sync.find_open_deal_for_contact(crm, "7", {}), "42")
+
+    def test_a_won_deal_followed_by_an_open_one_still_blocks(self):
+        crm = mock.Mock()
+        crm.get_contact_deals.return_value = [
+            {"id": 1, "deal_stage_id": 10},
+            {"id": 42, "deal_stage_id": 12},
+        ]
+        self.assertEqual(sync.find_open_deal_for_contact(crm, "7", {10: "Won", 12: "Open"}), "42")
+
+
+class DealCustomFieldsTests(SimpleTestCase):
+    """The dropdown-backed fields come from settings, never typed inline -- a renamed CRM option
+    is then one settings change, not a code change."""
+
+    databases = []
+
+    def _conf(self, **overrides):
+        conf = mock.Mock(
+            FRESHSALES_DEAL_SOURCE="Cold email",
+            FRESHSALES_DEAL_RESCUE_STEP="Day 0",
+            FRESHSALES_DEAL_NEXT_STEP="Day 0: create their account, send the login email with the distributor question",
+            FRESHSALES_DEAL_ASSIGNED_TO="Adams",
+        )
+        for key, value in overrides.items():
+            setattr(conf, key, value)
+        return conf
+
+    def test_the_first_reply_preview_is_truncated_to_250_chars(self):
+        reply = _reply(body_text="x" * 400)
+        fields = sync._deal_custom_fields(reply, self._conf())
+        self.assertEqual(len(fields["cf_first_reply"]), 250)
+        self.assertEqual(fields["cf_first_reply"], "x" * 250)
+
+    def test_the_dropdown_fields_come_straight_from_settings(self):
+        reply = _reply()
+        fields = sync._deal_custom_fields(reply, self._conf())
+        self.assertEqual(fields["cf_inbound_source"], "Cold email")
+        self.assertEqual(fields["cf_rescue_step"], "Day 0")
+        self.assertEqual(fields["cf_assigned_to"], "Adams")
+        self.assertEqual(fields["cf_source_campaign"], "Realtruck - 1/3 locations")
+
+    def test_next_step_date_is_todays_date(self):
+        reply = _reply()
+        fields = sync._deal_custom_fields(reply, self._conf())
+        self.assertEqual(fields["cf_next_step_date"], datetime.date.today().isoformat())
+
+
+class CompanyNameFallbackOrderTests(SimpleTestCase):
+    """Instantly's companyName wins; then the website's own domain; then the reply's email domain
+    (never for a free mailbox); then the person's name; then, as the last resort, the address."""
+
+    databases = []
+
+    def test_a_website_domain_outranks_the_email_domain(self):
+        self.assertEqual(
+            sync.company_name_for(
+                "someone@gmail.com", {"website": "https://www.example-shop.com/contact"}
+            ),
+            "example-shop.com",
+        )
+
+    def test_company_name_still_wins_over_a_website(self):
+        self.assertEqual(
+            sync.company_name_for(
+                "someone@gmail.com", {"companyName": "Example Shop", "website": "https://other.com"}
+            ),
+            "Example Shop",
+        )
+
+    def test_the_persons_name_is_the_fallback_before_the_address(self):
+        self.assertEqual(
+            sync.company_name_for("flatoutauto84@gmail.com", {}, person_name="Pat Original"),
+            "Pat Original",
+        )
+
+    def test_the_address_is_the_last_resort_with_no_name_either(self):
+        self.assertEqual(sync.company_name_for("flatoutauto84@gmail.com", {}), "flatoutauto84@gmail.com")
+
+
+@override_settings(**FRESHSALES_SETTINGS)
+class FreshsalesDealTransportTests(SimpleTestCase):
+    """The new client methods the rescue-process deal flow needs -- transport only, same style as
+    the existing create_deal/upsert_contact tests."""
+
+    databases = []
+
+    def test_create_deal_can_pin_a_pipeline_stage_and_custom_fields(self):
+        client = freshsales_client.FreshsalesApiClient()
+        with mock.patch.object(freshsales_client, "_session") as session:
+            session.request.return_value = _FakeResponse(payload={"deal": {"id": 9}})
+            client.create_deal(
+                name="Rhino Utah",
+                amount=0,
+                sales_account_id="5",
+                contact_id="7",
+                pipeline_id=127000525268,
+                stage_id=127003680894,
+                custom_field={"cf_inbound_source": "Cold email"},
+            )
+        deal = session.request.call_args.kwargs["json"]["deal"]
+        self.assertEqual(deal["deal_pipeline_id"], 127000525268)
+        self.assertEqual(deal["deal_stage_id"], 127003680894)
+        self.assertEqual(deal["custom_field"], {"cf_inbound_source": "Cold email"})
+
+    def test_create_note_can_target_a_deal(self):
+        client = freshsales_client.FreshsalesApiClient()
+        with mock.patch.object(freshsales_client, "_session") as session:
+            session.request.return_value = _FakeResponse(payload={"note": {"id": 3}})
+            client.create_note(description="hi", targetable_id="99", targetable_type="Deal")
+        note = session.request.call_args.kwargs["json"]["note"]
+        self.assertEqual(note["targetable_type"], "Deal")
+        self.assertEqual(note["targetable_id"], "99")
+
+    def test_create_note_still_defaults_to_a_contact(self):
+        client = freshsales_client.FreshsalesApiClient()
+        with mock.patch.object(freshsales_client, "_session") as session:
+            session.request.return_value = _FakeResponse(payload={"note": {"id": 3}})
+            client.create_note(description="hi", targetable_id="42")
+        note = session.request.call_args.kwargs["json"]["note"]
+        self.assertEqual(note["targetable_type"], "Contact")
+
+    def test_deal_stage_types_by_id(self):
+        client = freshsales_client.FreshsalesApiClient()
+        with mock.patch.object(freshsales_client, "_session") as session:
+            session.request.return_value = _FakeResponse(
+                payload={"deal_stages": [{"id": 1, "name": "New", "type": "Open"}, {"id": 2, "name": "Won", "type": "Won"}]}
+            )
+            stages = client.deal_stage_types_by_id()
+        self.assertEqual(stages, {1: "Open", 2: "Won"})
+
+    def test_find_contact_by_email_reads_the_lookup_shape(self):
+        client = freshsales_client.FreshsalesApiClient()
+        with mock.patch.object(freshsales_client, "_session") as session:
+            session.request.return_value = _FakeResponse(
+                payload={"contacts": {"contacts": [{"id": 7, "email": "a@b.com"}]}}
+            )
+            contact = client.find_contact_by_email("a@b.com")
+        self.assertEqual(contact["id"], 7)
+
+    def test_find_contact_by_email_returns_none_when_nothing_matches(self):
+        client = freshsales_client.FreshsalesApiClient()
+        with mock.patch.object(freshsales_client, "_session") as session:
+            session.request.return_value = _FakeResponse(payload={"contacts": {"contacts": []}})
+            self.assertIsNone(client.find_contact_by_email("a@b.com"))
+
+    def test_get_contact_deals_reads_inline_deal_objects(self):
+        client = freshsales_client.FreshsalesApiClient()
+        with mock.patch.object(freshsales_client, "_session") as session:
+            session.request.return_value = _FakeResponse(
+                payload={"contact": {"id": 7, "deals": [{"id": 1, "deal_stage_id": 10}]}}
+            )
+            deals = client.get_contact_deals("7")
+        self.assertEqual(deals, [{"id": 1, "deal_stage_id": 10}])
+
+    def test_get_contact_deals_falls_back_to_a_sideloaded_map(self):
+        client = freshsales_client.FreshsalesApiClient()
+        with mock.patch.object(freshsales_client, "_session") as session:
+            session.request.return_value = _FakeResponse(
+                payload={"contact": {"id": 7, "deals": [1]}, "deals": {"1": {"id": 1, "deal_stage_id": 10}}}
+            )
+            deals = client.get_contact_deals("7")
+        self.assertEqual(deals, [{"id": 1, "deal_stage_id": 10}])
+
+    def test_get_contact_deals_with_no_deals_is_an_empty_list(self):
+        client = freshsales_client.FreshsalesApiClient()
+        with mock.patch.object(freshsales_client, "_session") as session:
+            session.request.return_value = _FakeResponse(payload={"contact": {"id": 7}})
+            self.assertEqual(client.get_contact_deals("7"), [])
+
+
+@override_settings(**INSTANTLY_SETTINGS)
+class InstantlyRemoveLeadFromCampaignTests(SimpleTestCase):
+    """Stops the cold sequence -- step 5 of the rescue-process deal flow. Unverified against the
+    live account (see the client method's own docstring); this pins the request shape only."""
+
+    databases = []
+
+    def test_sends_a_delete_scoped_to_the_campaign_and_lead_id(self):
+        client = instantly_client.InstantlyApiClient()
+        with mock.patch.object(instantly_client, "_session") as session:
+            session.request.return_value = _FakeResponse(payload={})
+            client.remove_lead_from_campaign("lead-123", "camp-456")
+        call = session.request.call_args
+        self.assertEqual(call.kwargs["method"], "DELETE")
+        self.assertTrue(call.kwargs["url"].endswith("/leads"))
+        self.assertEqual(call.kwargs["json"], {"campaign_id": "camp-456", "ids": ["lead-123"]})
+
+    def test_requires_both_ids(self):
+        client = instantly_client.InstantlyApiClient()
+        with self.assertRaises(ValueError):
+            client.remove_lead_from_campaign("", "camp-456")
+        with self.assertRaises(ValueError):
+            client.remove_lead_from_campaign("lead-123", "")
