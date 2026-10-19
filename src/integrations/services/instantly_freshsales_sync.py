@@ -803,20 +803,23 @@ def find_open_deal_for_contact(
     stage_types: typing.Dict[int, int],
 ) -> typing.Optional[str]:
     """
-    Step 1 of the cold-reply deal flow: does this contact already have a deal that is not Won or
-    Lost? If so, its id is returned and the caller must not create a second deal -- only add the
-    reply as a note on this one instead (see :func:`create_deals`).
+    Step 1 of the cold-reply deal flow: does this contact already have a deal whose stage's
+    ``forecast_type`` is not "Closed Won" or "Closed Lost"? If so, its id is returned and the
+    caller must not create a second deal -- only add the reply as a note on this one instead (see
+    :func:`create_deals`).
 
     A stage this account's selector does not recognise (``stage_types`` has no entry for it) is
     treated as open rather than skipped -- the safe failure here is "add a note to a deal that may
-    already be closed", not "silently open a duplicate deal".
+    already be closed", not "silently open a duplicate deal". Confirmed live 2026-10-19 against a
+    real open deal (forecast_type "Open" on its stage) -- this must not create a second deal for
+    that contact's next reply.
     """
     for deal in crm.get_contact_deals(contact_id):
         deal_id = deal.get("id")
         if not deal_id:
             continue
         stage_type = stage_types.get(deal.get("deal_stage_id"), "")
-        if stage_type not in ("Won", "Lost"):
+        if stage_type not in ("Closed Won", "Closed Lost"):
             return str(deal_id)
     return None
 
@@ -841,6 +844,107 @@ def _deal_custom_fields(reply: "src_models.InstantlyReply", conf: typing.Any) ->
     }
 
 
+def provision_platform_account_for_reply(
+    reply: "src_models.InstantlyReply", crm: "freshsales_client.FreshsalesApiClient", deal_id: str
+) -> typing.Optional[dict]:
+    """
+    "Day 0: create their account" (cf_next_step's own text) -- automated rather than done by
+    hand, the moment this reply's deal is created.
+
+    Checked first against :func:`platform_crm_sync.is_platform_contact` so this can never create a
+    duplicate ``Company`` for someone who already has a real platform account (a genuine signup
+    that beat the rescue process to it). Everything after that is best-effort and never raises: a
+    failure provisioning the account, or recording it on the deal, must not undo the deal itself.
+
+    Records the result on the deal exactly where the rescue process already looks for it --
+    ``cf_platform_account_email`` / ``cf_account_created_date``, both real custom fields observed
+    live on existing deals, not invented here -- plus a note carrying the generated password
+    once. The password is never stored anywhere else (see InstantlyReply.platform_company_id's own
+    docstring); a lost password is retrieved via the admin-panel reset-password endpoint, not by
+    re-reading this note.
+
+    Returns the created account dict (see admin_services.create_company_for_admin), or None when
+    nothing was created.
+    """
+    from src.api.services import admin as admin_services
+
+    if platform_crm_sync.is_platform_contact(reply.lead_email):
+        logger.info(
+            "{} {} already has a platform account -- skipping auto-provision.".format(
+                _LOG_PREFIX, reply.lead_email
+            )
+        )
+        return None
+
+    company = company_name_for(reply.lead_email, reply.lead_payload, person_name=reply.from_name or "")
+    first_name, last_name = split_display_name(reply.from_name or "", company)
+
+    try:
+        account = admin_services.create_company_for_admin(
+            company_name=company,
+            email=reply.lead_email,
+            first_name=first_name,
+            last_name=last_name,
+        )
+    except ValueError as e:
+        # Most likely "a user with this email already exists" (a race with the
+        # is_platform_contact check above, or an account created some other way) -- not worth
+        # retrying with the same inputs.
+        logger.warning(
+            "{} Could not auto-provision a platform account for {}: {}".format(_LOG_PREFIX, reply.lead_email, e)
+        )
+        return None
+    except Exception:
+        logger.exception(
+            "{} Unexpected error auto-provisioning a platform account for {}.".format(
+                _LOG_PREFIX, reply.lead_email
+            )
+        )
+        return None
+
+    today = timezone.now().date().isoformat()
+    try:
+        crm.update_deal(
+            deal_id, custom_field={"cf_platform_account_email": account["email"], "cf_account_created_date": today}
+        )
+    except Exception as e:
+        logger.warning(
+            "{} Platform account created for {} but updating deal {} failed: {}".format(
+                _LOG_PREFIX, reply.lead_email, deal_id, common_utils.get_exception_message(exception=e)
+            )
+        )
+
+    try:
+        crm.create_note(
+            description=(
+                "AftermarketScout account auto-created.\n"
+                "Login: {}\n"
+                "Temporary password: {}\n"
+                "Relay this to the customer (or they can use \"forgot password\") -- this is the "
+                "only place this password is recorded.".format(account["email"], account["password"])
+            ),
+            targetable_id=deal_id,
+            targetable_type="Deal",
+        )
+    except Exception as e:
+        logger.warning(
+            "{} Platform account created for {} but the credentials note on deal {} failed: {} -- "
+            "use the admin-panel reset-password endpoint to get the customer a fresh password "
+            "rather than retrying this.".format(
+                _LOG_PREFIX, reply.lead_email, deal_id, common_utils.get_exception_message(exception=e)
+            )
+        )
+
+    reply.platform_company_id = account["company_id"]
+    reply.platform_user_id = account["user_id"]
+    reply.platform_account_created_at = timezone.now()
+    reply.save(
+        update_fields=["platform_company_id", "platform_user_id", "platform_account_created_at", "updated_at"]
+    )
+
+    return account
+
+
 def create_deals(
     crm: "freshsales_client.FreshsalesApiClient",
     instantly: "instantly_client.InstantlyApiClient",
@@ -849,6 +953,7 @@ def create_deals(
     max_calls: typing.Optional[int] = None,
     max_attempts: int = 5,
     settings_module: typing.Any = None,
+    provision_platform_accounts: bool = False,
 ) -> typing.Dict[str, int]:
     """
     One deal per positive reply whose contact has no open deal yet. Six steps, matching the
@@ -869,6 +974,11 @@ def create_deals(
          does not stop the pass -- a human can remove it from Instantly by hand.
       6. Add the full reply as a note on the deal (distinct from pass 2's note on the contact,
          which still happens separately and is not duplicated here).
+      7. When ``provision_platform_accounts`` is on (its own flag, independent of
+         ``FRESHSALES_CREATE_DEALS`` -- deals can be enabled while this stays off): auto-create an
+         AftermarketScout account for the company ("Day 0: create their account" from
+         cf_next_step, automated rather than done by hand) and record it on the deal. See
+         :func:`provision_platform_account_for_reply`.
     """
     from django.conf import settings as django_settings
 
@@ -880,6 +990,7 @@ def create_deals(
         "skipped_no_contact": 0,
         "removed_from_campaign": 0,
         "campaign_removal_failed": 0,
+        "platform_accounts_created": 0,
         "failed": 0,
     }
 
@@ -989,6 +1100,12 @@ def create_deals(
                     _LOG_PREFIX, deal_id, reply.lead_email, common_utils.get_exception_message(exception=e)
                 )
             )
+
+        # Step 7 -- "Day 0: create their account" (cf_next_step), automated. Never raises; see
+        # provision_platform_account_for_reply's own docstring for why a failure here must not
+        # undo the deal or stop the pass.
+        if provision_platform_accounts and provision_platform_account_for_reply(reply, crm, deal_id):
+            counts["platform_accounts_created"] += 1
 
     return counts
 
@@ -1179,6 +1296,7 @@ def run(
                 max_calls=conf.FRESHSALES_MAX_CALLS_PER_RUN,
                 max_attempts=max_attempts,
                 settings_module=conf,
+                provision_platform_accounts=getattr(conf, "FRESHSALES_AUTO_PROVISION_PLATFORM_ACCOUNT", False),
             )
         )
     else:

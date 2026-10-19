@@ -165,23 +165,35 @@ class FreshsalesApiClient(object):
             )
         return status_id
 
+    def update_deal(self, deal_id: str, custom_field: dict) -> None:
+        """
+        Merge-update a deal's custom fields -- ``PUT /deals/{id}``, same shape as
+        :meth:`update_note`. Used to record the platform account provisioned for a deal's company
+        after the deal already exists (cf_platform_account_email, cf_account_created_date) --
+        there is no reason to require that information at deal-creation time via
+        :meth:`create_deal` itself, since provisioning the account is a separate step that can
+        fail independently of the deal.
+        """
+        self._request("PUT", "deals/{}".format(deal_id), json_body={"deal": {"custom_field": custom_field}})
+
     def deal_stage_types_by_id(self) -> typing.Dict[int, str]:
         """
-        Deal stage id -> its type ("Open" / "Won" / "Lost"), the same selector-endpoint pattern as
-        :meth:`contact_status_ids_by_name` -- resolved per run, never hardcoded, so a pipeline
-        edited in the CRM is read correctly rather than against a stale assumption.
+        Deal stage id -> its ``forecast_type`` ("Open" / "Closed Won" / "Closed Lost"), the same
+        selector-endpoint pattern as :meth:`contact_status_ids_by_name` -- resolved per run, never
+        hardcoded, so a pipeline edited in the CRM is read correctly rather than against a stale
+        assumption.
 
-        Used to decide whether a contact's existing deal is still active (type "Open") before
-        creating a second one for the same shop -- see
-        instantly_freshsales_sync.find_open_deal_for_contact. **Unverified against the live
-        account** (the FreshSales API key has been rejected with 401 since 2026-10-17 -- see that
-        incident) -- confirm the response actually nests a "type" field per stage once access is
-        restored; if it does not, this needs a different field name, not a redesign.
+        Used to decide whether a contact's existing deal is still active (``forecast_type`` ==
+        "Open") before creating a second one for the same shop -- see
+        instantly_freshsales_sync.find_open_deal_for_contact. **Verified live 2026-10-19** against
+        the real account: the field is ``forecast_type``, not ``type`` as first assumed (the same
+        field name :meth:`contact_status_ids_by_name`'s own endpoint uses, which is what the
+        original guess should have followed).
         """
         _, payload = self._request("GET", "selector/deal_stages")
         stages = payload.get("deal_stages") or []
         return {
-            s.get("id"): str(s.get("type") or "")
+            s.get("id"): str(s.get("forecast_type") or "")
             for s in stages
             if isinstance(s, dict) and s.get("id")
         }

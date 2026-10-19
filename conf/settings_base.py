@@ -888,6 +888,16 @@ FRESHSALES_DEAL_NEXT_STEP = os.environ.get("FRESHSALES_DEAL_NEXT_STEP") or (
 )
 FRESHSALES_DEAL_ASSIGNED_TO = os.environ.get("FRESHSALES_DEAL_ASSIGNED_TO") or "Adams"
 
+# Auto-provisions an AftermarketScout account for a deal's company the moment the deal is created
+# ("Day 0: create their account" from cf_next_step, automated instead of done by hand) -- its own
+# flag, independent of FRESHSALES_CREATE_DEALS, so deal creation can be enabled while this stays
+# off until it has been exercised against a few real replies. Off by default for the same reason
+# FRESHSALES_CREATE_DEALS is: creating a real Company + User + sending its password in a CRM note
+# is a bigger action than a deal, and should be a deliberate choice, not a default.
+FRESHSALES_AUTO_PROVISION_PLATFORM_ACCOUNT = (
+    os.environ.get("FRESHSALES_AUTO_PROVISION_PLATFORM_ACCOUNT") or ""
+).strip().lower() in ("1", "true", "yes", "on")
+
 
 # ---------------------------------------------------------------------------------------------
 # Platform signups -> FreshSales (src/integrations/services/platform_crm_sync.py,

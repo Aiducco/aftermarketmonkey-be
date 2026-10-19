@@ -3347,6 +3347,18 @@ class InstantlyReply(django_db_models.Model):
     contact_synced_at = django_db_models.DateTimeField(null=True, blank=True)
     deal_created_at = django_db_models.DateTimeField(null=True, blank=True)
 
+    # The AftermarketScout account auto-provisioned for this reply's company the moment its deal
+    # is created (see instantly_freshsales_sync.provision_platform_account_for_reply) -- "Day 0:
+    # create their account" from cf_next_step, automated rather than done by hand. Null means not
+    # attempted yet, or the email already belonged to an existing platform account (a genuine
+    # signup beat the rescue process to it -- see platform_crm_sync.is_platform_contact, checked
+    # first so this never creates a duplicate Company for someone already on the platform).
+    # No password column: the generated password is relayed once as a FreshSales deal note
+    # (create_company_for_admin's own plaintext-once convention) and never stored a second place.
+    platform_company_id = django_db_models.IntegerField(null=True, blank=True)
+    platform_user_id = django_db_models.IntegerField(null=True, blank=True)
+    platform_account_created_at = django_db_models.DateTimeField(null=True, blank=True)
+
     sync_attempts = django_db_models.IntegerField(default=0)
     last_error = django_db_models.TextField(null=True, blank=True)
 

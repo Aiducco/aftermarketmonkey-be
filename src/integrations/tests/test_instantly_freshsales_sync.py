@@ -883,12 +883,12 @@ class FindOpenDealForContactTests(SimpleTestCase):
     def test_a_won_deal_does_not_block(self):
         crm = mock.Mock()
         crm.get_contact_deals.return_value = [{"id": 1, "deal_stage_id": 10}]
-        self.assertIsNone(sync.find_open_deal_for_contact(crm, "7", {10: "Won"}))
+        self.assertIsNone(sync.find_open_deal_for_contact(crm, "7", {10: "Closed Won"}))
 
     def test_a_lost_deal_does_not_block(self):
         crm = mock.Mock()
         crm.get_contact_deals.return_value = [{"id": 1, "deal_stage_id": 11}]
-        self.assertIsNone(sync.find_open_deal_for_contact(crm, "7", {11: "Lost"}))
+        self.assertIsNone(sync.find_open_deal_for_contact(crm, "7", {11: "Closed Lost"}))
 
     def test_an_open_deal_is_returned(self):
         crm = mock.Mock()
@@ -906,7 +906,7 @@ class FindOpenDealForContactTests(SimpleTestCase):
             {"id": 1, "deal_stage_id": 10},
             {"id": 42, "deal_stage_id": 12},
         ]
-        self.assertEqual(sync.find_open_deal_for_contact(crm, "7", {10: "Won", 12: "Open"}), "42")
+        self.assertEqual(sync.find_open_deal_for_contact(crm, "7", {10: "Closed Won", 12: "Open"}), "42")
 
 
 class DealCustomFieldsTests(SimpleTestCase):
@@ -1024,10 +1024,15 @@ class FreshsalesDealTransportTests(SimpleTestCase):
         client = freshsales_client.FreshsalesApiClient()
         with mock.patch.object(freshsales_client, "_session") as session:
             session.request.return_value = _FakeResponse(
-                payload={"deal_stages": [{"id": 1, "name": "New", "type": "Open"}, {"id": 2, "name": "Won", "type": "Won"}]}
+                payload={
+                    "deal_stages": [
+                        {"id": 1, "name": "New", "forecast_type": "Open"},
+                        {"id": 2, "name": "Won", "forecast_type": "Closed Won"},
+                    ]
+                }
             )
             stages = client.deal_stage_types_by_id()
-        self.assertEqual(stages, {1: "Open", 2: "Won"})
+        self.assertEqual(stages, {1: "Open", 2: "Closed Won"})
 
     def test_find_contact_by_email_reads_the_lookup_shape(self):
         client = freshsales_client.FreshsalesApiClient()
@@ -1092,3 +1097,97 @@ class InstantlyRemoveLeadFromCampaignTests(SimpleTestCase):
             client.remove_lead_from_campaign("", "camp-456")
         with self.assertRaises(ValueError):
             client.remove_lead_from_campaign("lead-123", "")
+
+
+@override_settings(**FRESHSALES_SETTINGS)
+class FreshsalesUpdateDealTests(SimpleTestCase):
+    def test_update_deal_sends_a_put_with_custom_field(self):
+        client = freshsales_client.FreshsalesApiClient()
+        with mock.patch.object(freshsales_client, "_session") as session:
+            session.request.return_value = _FakeResponse(payload={"deal": {"id": 9}})
+            client.update_deal("9", custom_field={"cf_platform_account_email": "a@b.com"})
+        call = session.request.call_args
+        self.assertEqual(call.kwargs["method"], "PUT")
+        self.assertTrue(call.kwargs["url"].endswith("/deals/9"))
+        self.assertEqual(
+            call.kwargs["json"], {"deal": {"custom_field": {"cf_platform_account_email": "a@b.com"}}}
+        )
+
+
+class ProvisionPlatformAccountForReplyTests(SimpleTestCase):
+    """Day 0 of the rescue process, automated: create the platform account and record it on the
+    deal. Never raises -- a failure here must not undo the deal that already exists."""
+
+    databases = []
+
+    def _reply_with_mocked_save(self, **overrides):
+        reply = _reply(**overrides)
+        reply.save = mock.Mock()
+        return reply
+
+    def test_an_existing_platform_contact_is_skipped(self):
+        crm = mock.Mock()
+        with mock.patch.object(sync.platform_crm_sync, "is_platform_contact", return_value=True):
+            result = sync.provision_platform_account_for_reply(self._reply_with_mocked_save(), crm, "deal-1")
+        self.assertIsNone(result)
+        crm.update_deal.assert_not_called()
+        crm.create_note.assert_not_called()
+
+    def test_a_new_account_is_created_and_recorded_on_the_deal(self):
+        reply = self._reply_with_mocked_save()
+        crm = mock.Mock()
+        account = {
+            "company_id": 73,
+            "user_id": 80,
+            "email": "andrew@rhinoutah.com",
+            "password": "generated-pw",
+        }
+        with mock.patch.object(sync.platform_crm_sync, "is_platform_contact", return_value=False), mock.patch(
+            "src.api.services.admin.create_company_for_admin", return_value=account
+        ) as create_company:
+            result = sync.provision_platform_account_for_reply(reply, crm, "deal-1")
+
+        self.assertEqual(result, account)
+        create_company.assert_called_once()
+        self.assertEqual(create_company.call_args.kwargs["email"], "andrew@rhinoutah.com")
+
+        update_call = crm.update_deal.call_args
+        self.assertEqual(update_call.args[0], "deal-1")
+        self.assertEqual(update_call.kwargs["custom_field"]["cf_platform_account_email"], "andrew@rhinoutah.com")
+
+        note_call = crm.create_note.call_args
+        self.assertEqual(note_call.kwargs["targetable_id"], "deal-1")
+        self.assertEqual(note_call.kwargs["targetable_type"], "Deal")
+        self.assertIn("generated-pw", note_call.kwargs["description"])
+
+        self.assertEqual(reply.platform_company_id, 73)
+        self.assertEqual(reply.platform_user_id, 80)
+        self.assertIsNotNone(reply.platform_account_created_at)
+        reply.save.assert_called_once()
+
+    def test_a_duplicate_email_is_a_soft_failure_not_a_crash(self):
+        reply = self._reply_with_mocked_save()
+        crm = mock.Mock()
+        with mock.patch.object(sync.platform_crm_sync, "is_platform_contact", return_value=False), mock.patch(
+            "src.api.services.admin.create_company_for_admin",
+            side_effect=ValueError("A user with this email already exists."),
+        ):
+            result = sync.provision_platform_account_for_reply(reply, crm, "deal-1")
+        self.assertIsNone(result)
+        crm.update_deal.assert_not_called()
+        reply.save.assert_not_called()
+
+    def test_a_deal_update_failure_does_not_stop_the_credentials_note(self):
+        """The deal's custom fields and its note are two independent best-effort writes -- one
+        failing must not skip the other."""
+        reply = self._reply_with_mocked_save()
+        crm = mock.Mock()
+        crm.update_deal.side_effect = Exception("boom")
+        account = {"company_id": 1, "user_id": 2, "email": "andrew@rhinoutah.com", "password": "pw"}
+        with mock.patch.object(sync.platform_crm_sync, "is_platform_contact", return_value=False), mock.patch(
+            "src.api.services.admin.create_company_for_admin", return_value=account
+        ):
+            result = sync.provision_platform_account_for_reply(reply, crm, "deal-1")
+        self.assertEqual(result, account)
+        crm.create_note.assert_called_once()
+        reply.save.assert_called_once()
