@@ -2377,13 +2377,24 @@ def sync_master_parts_from_tristate() -> None:
     ))
 
 
+def _tse_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
+    """product_details for a TSEParts row (shown on ProviderPart). No UPC/weight/dimensions/
+    line_code here -- TSEParts doesn't carry any of those, unlike AllPro's feed."""
+    return [
+        {"key": "description", "label": "Description", "value": row.get("description") or None},
+        {"key": "category", "label": "Category", "value": row.get("category") or None},
+        {"key": "subcategory", "label": "Subcategory", "value": row.get("subcategory") or None},
+    ]
+
+
 def sync_provider_inventory_from_tristate() -> None:
     """
     Sync ProviderPartInventory from TSEParts -- quantity/availability lives on the shared
     catalog table, not per company (confirmed live: Tri-State's physical warehouse stock is the
     same regardless of which account's credentials asked -- see TSEParts' own docstring),
     mirroring exactly how Keystone/Meyer's inventory sync reads their own *Parts table directly
-    rather than *CompanyPricing.
+    rather than *CompanyPricing. Also refreshes ProviderPart.product_details from the same row,
+    same pattern as AllPro/Rough Country.
     """
     logger.info("{} Syncing provider inventory from TSE.".format(_LOG_PREFIX))
 
@@ -2414,6 +2425,7 @@ def sync_provider_inventory_from_tristate() -> None:
             .order_by("id")
             .values(
                 "id", "brand_id", "part_number", "quantity_available", "warehouse_availability",
+                "description", "category", "subcategory",
             )[:BATCH_SIZE_INVENTORY]
         )
         if not batch:
@@ -2451,6 +2463,20 @@ def sync_provider_inventory_from_tristate() -> None:
                 ],
             )
             total_upserted += len(to_upsert)
+
+        # Update product_details on ProviderPart (product metadata, not inventory).
+        pp_details_to_update = []
+        for row in batch:
+            ext_id = "{}_{}".format(row["brand_id"], row["part_number"])
+            pp = provider_parts_by_key.get(ext_id)
+            if pp:
+                pp.product_details = _tse_product_details(row)
+                pp_details_to_update.append(pp)
+        if pp_details_to_update:
+            src_models.ProviderPart.objects.bulk_update(
+                pp_details_to_update, ["product_details"], batch_size=500
+            )
+
         connection.close()
         if len(batch) == BATCH_SIZE_INVENTORY:
             time.sleep(BATCH_DELAY_SECONDS)
