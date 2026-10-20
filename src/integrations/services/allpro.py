@@ -32,9 +32,15 @@ category, image -- NOT in AllPro's own feed at all):
      proven on Tri-State (APD also hits Algolia's 1000-hit cap per brand, confirmed live against
      WeatherTech/BHTJ), matched by (brand.aaia_code, part_number) -- Algolia's own "part" field
      for APD entries is the vendor part number, not AllPro's concatenated full_part_number.
-     Writes AllProParts.description/image_url/category/subcategory/series only -- NEVER read by
-     master_parts.py's AllPro ingest for image_url, per explicit instruction: AllPro images must
-     never reach MasterPart/ProviderPart.
+     Writes AllProParts.description/image_url/category/subcategory/series. image_url here is
+     still never read by master_parts.py's regular AllPro ingest (_ingest_allpro_parts_for_mapped_brands
+     passes image_url=None on purpose) -- see job 6 for the one place it is deliberately read.
+
+  6. ``backfill_allpro_images_onto_master_parts`` -- fill-only backfill of the image_url job 5
+     wrote onto MasterPart.image_url/MasterPartData.images, for parts that don't already have a
+     real image from another source. Per explicit instruction 2026-10-20, reverses this module's
+     earlier rule that AllPro images must never reach MasterPart/ProviderPart -- run by hand,
+     after job 5, not wired into the regular ingest.
 """
 import logging
 import typing
@@ -682,3 +688,162 @@ def enrich_allpro_parts_from_algolia(aaia_codes: typing.Optional[typing.List[str
 
     logger.info("{} Enrichment complete: {} AllProParts rows updated across {} brands.".format(_LOG_PREFIX, total, len(brands)))
     return total
+
+
+_IMAGE_BACKFILL_BATCH = 2000
+_IMAGE_PLACEHOLDER_VALUES = frozenset({"na", "n/a", "none", "null", "unknown", "-", "--", "tbd"})
+
+
+def _is_blank_image(value: typing.Optional[str]) -> bool:
+    """Same placeholder rule as master_part_enrichment._PLACEHOLDER_VALUES -- 'NA' etc. count as
+    no image, same as a blank/null one."""
+    if not value:
+        return True
+    text = value.strip()
+    return not text or text.casefold() in _IMAGE_PLACEHOLDER_VALUES
+
+
+def backfill_allpro_images_onto_master_parts() -> typing.Tuple[int, int, int]:
+    """
+    Fill-only backfill of AllProParts.image_url (itself backfilled from Algolia -- see
+    enrich_allpro_parts_from_algolia) onto MasterPart.image_url and MasterPartData.images, for
+    AllPro-mapped parts that don't already carry a real image from another source.
+
+    Per explicit instruction 2026-10-20, this reverses this module's own earlier rule that AllPro
+    images must never reach MasterPart/ProviderPart. Run by hand after enrichment -- not wired
+    into fetch_and_save_allpro_catalog or master_parts.py's regular ingest, which still never
+    passes image_url automatically.
+
+    Fill-only, same rule as backfill_tdg_images: never overwrites an existing non-placeholder
+    image on either MasterPart or MasterPartData -- AllPro's Algolia-sourced images aren't a
+    better source than whatever is already there, just a fallback for parts with nothing. Unlike
+    TDG's backfill, a MasterPartData row is created (not skipped) when none exists -- AllPro has
+    a real Providers row to attribute provenance to, unlike TDG.
+
+    Returns (candidates with a usable AllPro image, MasterPart.image_url rows filled,
+    MasterPartData rows filled-or-created).
+    """
+    allpro_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.ALLPRO_DISTRIBUTING.value,
+    ).first()
+    if not allpro_provider:
+        logger.warning("{} AllPro provider not found. Skipping image backfill.".format(_LOG_PREFIX))
+        return 0, 0, 0
+
+    allpro_brand_to_brand_id = {
+        m.allpro_brand_id: m.brand_id for m in src_models.BrandAllProBrandMapping.objects.all()
+    }
+    if not allpro_brand_to_brand_id:
+        logger.info("{} No BrandAllProBrandMapping rows. Nothing to backfill.".format(_LOG_PREFIX))
+        return 0, 0, 0
+
+    candidates = 0
+    image_filled = 0
+    data_filled_or_created = 0
+    part_updates: typing.List[src_models.MasterPart] = []
+    data_updates: typing.List[src_models.MasterPartData] = []
+    data_creates: typing.List[src_models.MasterPartData] = []
+    now = timezone.now()
+
+    def _flush() -> None:
+        nonlocal part_updates, data_updates, data_creates
+        if part_updates:
+            src_models.MasterPart.objects.bulk_update(part_updates, ["image_url", "updated_at"], batch_size=500)
+            part_updates = []
+        if data_updates:
+            src_models.MasterPartData.objects.bulk_update(data_updates, ["images", "updated_at"], batch_size=500)
+            data_updates = []
+        if data_creates:
+            pgbulk.upsert(
+                src_models.MasterPartData, data_creates, unique_fields=["master_part"], update_fields=[],
+            )
+            data_creates = []
+
+    batch_num = 0
+    last_id = 0
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.AllProParts.objects.exclude(image_url__isnull=True)
+            .exclude(image_url="")
+            .filter(id__gt=last_id)
+            .order_by("id")
+            .values("id", "brand_id", "part_number", "image_url", "full_part_number")[:_IMAGE_BACKFILL_BATCH]
+        )
+        if not batch:
+            break
+        last_id = batch[-1]["id"]
+
+        by_key: typing.Dict[typing.Tuple[int, str], typing.Dict] = {}
+        for row in batch:
+            brand_id = allpro_brand_to_brand_id.get(row["brand_id"])
+            if not brand_id or _is_blank_image(row["image_url"]):
+                continue
+            pn = (row["part_number"] or "").strip()
+            if pn:
+                by_key[(brand_id, pn)] = row
+        if not by_key:
+            continue
+        candidates += len(by_key)
+
+        brand_ids = {k[0] for k in by_key}
+        part_numbers = {k[1] for k in by_key}
+        master_parts = list(
+            src_models.MasterPart.objects.filter(
+                brand_id__in=brand_ids, part_number__in=part_numbers,
+            ).values("id", "brand_id", "part_number", "image_url")
+        )
+        mp_by_key = {
+            (mp["brand_id"], mp["part_number"]): mp
+            for mp in master_parts
+            if (mp["brand_id"], mp["part_number"]) in by_key
+        }
+        mp_ids = [mp["id"] for mp in mp_by_key.values()]
+        existing_data = {
+            d.master_part_id: d
+            for d in src_models.MasterPartData.objects.filter(master_part_id__in=mp_ids)
+        }
+
+        for key, row in by_key.items():
+            mp = mp_by_key.get(key)
+            if not mp:
+                continue
+            url = row["image_url"].strip()
+
+            if _is_blank_image(mp["image_url"]):
+                part_updates.append(src_models.MasterPart(id=mp["id"], image_url=url, updated_at=now))
+                image_filled += 1
+
+            data = existing_data.get(mp["id"])
+            if data is None:
+                data_creates.append(
+                    src_models.MasterPartData(
+                        master_part_id=mp["id"],
+                        images=[url],
+                        source_provider=allpro_provider,
+                        source_external_id=row["full_part_number"],
+                    )
+                )
+                data_filled_or_created += 1
+            elif not data.images:
+                data.images = [url]
+                data.updated_at = now
+                data_updates.append(data)
+                data_filled_or_created += 1
+
+        _flush()
+        logger.info(
+            "{} Image backfill batch {}: {} candidates, {} MasterPart.image_url filled, "
+            "{} MasterPartData filled/created so far.".format(
+                _LOG_PREFIX, batch_num, candidates, image_filled, data_filled_or_created
+            )
+        )
+
+    _flush()
+    logger.info(
+        "{} Image backfill complete: {} candidates, {} MasterPart.image_url filled, "
+        "{} MasterPartData filled/created.".format(
+            _LOG_PREFIX, candidates, image_filled, data_filled_or_created
+        )
+    )
+    return candidates, image_filled, data_filled_or_created
