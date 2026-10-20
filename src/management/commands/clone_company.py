@@ -5,7 +5,7 @@ Copies: Company record, CompanyProviders, CompanyOnboardingPreferences,
 CompanyBrands, CompanyBrandDestinations, and all per-company pricing tables
 (Turn14BrandPricing, KeystoneCompanyPricing, MeyerCompanyPricing,
 AtechCompanyPricing, DlgCompanyPricing, WheelProsCompanyPricing,
-RoughCountryCompanyPricing, ProviderPartCompanyPricing).
+RoughCountryCompanyPricing, SbCompanyPricing, ProviderPartCompanyPricing).
 
 Usage:
     python manage.py clone_company --source-id 16 --email gojko@aftermarketscout.com
@@ -31,6 +31,7 @@ from src.models import (
     MeyerCompanyPricing,
     ProviderPartCompanyPricing,
     RoughCountryCompanyPricing,
+    SbCompanyPricing,
     Turn14BrandPricing,
     UserProfile,
     WheelProsCompanyPricing,
@@ -206,6 +207,9 @@ class Command(BaseCommand):
                     new_company,
                     "RoughCountryCompanyPricing",
                     self.stdout,
+                )
+                _bulk_clone_pricing(
+                    SbCompanyPricing, "company", source, new_company, "SbCompanyPricing", self.stdout
                 )
                 _bulk_clone_pricing(
                     ProviderPartCompanyPricing,

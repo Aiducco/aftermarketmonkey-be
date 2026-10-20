@@ -78,6 +78,101 @@ All nine folders exist and are currently empty — expected, since Rough Country
 
 ---
 
+## Round trip confirmed (16-19 Oct 2026)
+
+We sent a hand-built test 850 and Rough Country answered with a real 855. This is the first
+end-to-end proof the mailbox works in both directions, and it closes four open questions.
+
+    sent      /Inbound/850/850_TEST-C16-20261016_20261016T131914Z.x12
+              ISA  TRIDENT -> 64ROUGHCT, ISA15=T, ICN 010161319
+              BEG*00*DS*TEST-C16-20261016**20261016, one PO1 (VC 922 / SK RC-922, 1 EA @ 33.22)
+    received  /Outbound/855/22338~64~430772341~BusinessDocument~Create~1~4120~<uuid>.X12
+              ISA  64ROUGHCT -> TRIDENT, ISA15=T, ICN 430772341
+              BAK*00*AD*TEST-C16-20261016*20261016, PO1 echoed, ACK*IA*1*EA, CTT*1, SE*9 (correct)
+
+**Answered:**
+
+* **Q1 — our trading-partner id is `TRIDENT`.** They addressed the 855 to `ZZ`/`TRIDENT` in both
+  ISA08 and GS03, so the samples were right and there is no separate test id on our side.
+* **Q4 — the 855 carries no Rough Country order number.** `BAK` has exactly four elements; no
+  `BAK08`/`BAK09`, no `REF*ON`. We key everything on our own PO number from `BAK03`, exactly as
+  `EmailOrderAdapter` does. The only RC-side identifiers we will ever learn are the ASN's `BSN02`
+  and the invoice number.
+* **Q6 (partly) — filenames.** Ours (`850_<po>_<stamp>.x12`) was accepted. Theirs is
+  Alluvia-generated: `<id>~<partner>~<ICN>~BusinessDocument~Create~<n>~<n>~<uuid>.X12`. Note the
+  `~` — their segment terminator — appears *in filenames*; it is harmless for FTP and POSIX paths
+  and the collector handles it, but nothing downstream may ever derive a delimiter from a filename.
+  Still unknown whether they write to a temp name and rename.
+* **`ISA15=T` is accepted and echoed.** Their own sample 850 used `P` against the test id, so this
+  was a real risk; it is settled. Test traffic stays `64ROUGHCT` + `T`.
+
+Their 855 is also free of the two defects in the 855 *sample*: `ACK02` agrees with `PO1-02`, and
+`CTT01` matches the line count. The sample's contradictions were hand-edits, not real behavior.
+
+**Not answered — `ACK01` is still only ever `IA`.** One accepted line on one test order tells us
+nothing about the backordered / rejected / quantity-changed vocabulary, which is what the line
+status mapping actually needs. Q3 stays blocking.
+
+Verified on 19 Oct 2026 that `manage.py fetch_rough_country_edi` collects this document, accepts it
+as a complete interchange and moves it to `/Archive/855` unaided.
+
+---
+
+### Full cycle closed (19-20 Oct 2026)
+
+Rough Country posted a real 856 and 810 against the same test PO, so every document in the cycle
+has now been exchanged with their production generator. Both parse clean with correct `SE01`
+counts; `fetch_rough_country_edi` collected and archived both unaided.
+
+    856  BSN*00*12013357*20261016*125500*0001      shipment id 12013357
+         TD5****ZZ*99                               ship method code "99"
+         REF*CN*546558395139 / MAN*CP*546558395139  tracking, identical (single package)
+         N1*SE*Rough Country*92*435 + 1400 Morgan Road, Dyersburg TN 38024
+         HL*2*1*O -> PRF*TEST-C16-20261016          join key
+         HL*4*3*I -> LIN*24154877*VC*922*SK*RC-922, SN1**1*EA
+    810  BIG*20261016*12484183*20261016*TEST-C16-20261016   invoice 12484183
+         N1*BT**12*7012535906 + 13000 Research Blvd, Austin TX 78750
+         ITD*******0                                net 0, not the sample's net 30
+         IT1**1*EA*33.2168**VC*922*SK*RC-922        their price, four decimal places
+         TDS*3322                                   $33.22
+         CAD*ZZ***99*Shopground                     no SCAC; code 99 again
+
+**What this settles:**
+
+* **We do get RC-side identifiers, just not on the 855.** The ASN carries `BSN02` (shipment
+  12013357) and the invoice carries `BIG02` (12484183). Only the 855 has nothing, so
+  `distributor_order_number` still falls back to our own PO reference.
+* **Q8 — pricing authority is theirs.** We sent `33.22`; they invoiced `33.2168`. They price from
+  their own system and ignore `PO1-04`, so our 850 prices are informational. Note the **four
+  decimal places**: `PurchaseOrderInvoice` line prices must not be coerced to 2dp on the way in.
+* **`TDS` rounds, lines do not.** `TDS*3322` is $33.22 while the single line extends to $33.2168.
+  Harmless at qty 1; at qty 100 the line extends to $3,321.68 and any reconciliation that
+  recomputes the total from 2dp line prices will drift. Compare `TDS` with a tolerance, never for
+  equality.
+* **Q16 stays a real risk.** `IT1-01` and the ASN's `LIN` still carry no PO line number
+  (`LIN01` 24154877 is RC-internal). Matching remains part-number-only, so kit expansion that puts
+  one SKU on two lines must aggregate by SKU before applying.
+
+**New open questions:**
+
+* **`ITD*******0` — net 0 terms?** The sample said net 30. If this is real it changes when Trident
+  owes money; if it is an unset element it will mislead any terms display we build.
+* **`N1*BT` has an empty name element.** Qualifier `12` + `7012535906` and our Austin address, but
+  `N102` is blank.
+* **Ship method `99` / `"Shopground"`.** Neither appears in the samples (`FG` / `FEDEX_GROUND`).
+  Q5's code list is now clearly needed for `list_shipping_methods()`.
+* **Q9 is still untested** — this invoice carried no freight `SAC` at all, and `TDS` equals the
+  line amount exactly, so whether `TDS` includes freight remains unknown.
+
+**Latent delimiter hazard (not yet triggered).** The 810's `PID` carries RC's own catalog title,
+`2 Inch Leveling Kit | Chevy/GMC Canyon/Colorado 2WD/4WD (2015-2022)` — containing `|`, which is
+the repetition separator their **856** declares in ISA11. Checked: no file so far contains its own
+ISA11 character in the body, so nothing is broken today. But the same description reaching an 856
+`PID` would be malformed for any translator that honours ISA11. Our reader never splits on the
+repetition separator, so we survive it either way.
+
+---
+
 ## 1. The headline problem: EDI is asynchronous, our order stack is not
 
 Every adapter we have today (Turn14, Keystone, Meyer, Premier, WheelPros) is synchronous
@@ -251,9 +346,8 @@ Maps to `PurchaseOrderInvoice` (`invoice_number` ← `BIG02`, PO match ← `BIG0
 
 **Blocking — cannot implement correctly without answers**
 
-1. **Our trading-partner ID.** Is `TRIDENT` our real assigned ISA/GS ID, and is it the same for
-   test and production, or does Alluvia assign a separate test ID (as RC has `64ROUGHC` vs
-   `64ROUGHCT`)?
+1. ~~**Our trading-partner ID.**~~ **ANSWERED 16 Oct 2026: `TRIDENT`**, same for test and
+   production — see the round-trip section above.
 2. **Acknowledgments for our 850s.** `/Inbound/997` confirms they want 997s from us for their
    810/855/856. But with no `/Outbound/997`, a syntactically bad 850 of ours is discarded
    silently and the order simply never happens, with no signal on our side. Can they publish
@@ -261,8 +355,8 @@ Maps to `PurchaseOrderInvoice` (`invoice_number` ← `BIG02`, PO match ← `BIG0
    failure and alerting — which is worth building either way.
 3. **`ACK01` and `BAK02` code lists** for the 855 (§2.2) — the accepted / backordered / rejected
    / quantity-changed vocabulary, so we can map to line-item statuses.
-4. **RC's own order number.** Does the production 855 carry RC's sales-order number
-   (`BAK08`/`BAK09`/`REF*ON`)? If not, we key everything on our own PO number.
+4. ~~**RC's own order number.**~~ **ANSWERED 16 Oct 2026: no.** Their 855 `BAK` stops at four
+   elements. We key on our own PO number. Worth re-confirming against a production 855.
 5. **Ship-method code list.** The full set of mutually-defined `TD5-05` / `CAD04` codes (`FG`,
    `FEDEX_GROUND`, …), including expedited air and LTL/freight for heavy items (bumpers,
    long-arm kits). This becomes our `list_shipping_methods()`.
@@ -279,9 +373,10 @@ Maps to `PurchaseOrderInvoice` (`invoice_number` ← `BIG02`, PO match ← `BIG0
 
 **Important — affects design, not blocking**
 
-8. **Pricing authority.** Are the `PO1-04` prices on our 850 informational, or does RC validate
-   them? Does RC price the order from our 850 or from our jobber price file? (The sample 810 bills
-   at exactly the prices the 850 sent, which would be unusual.)
+8. ~~**Pricing authority.**~~ **ANSWERED 19 Oct 2026: theirs**, confirmed by Gojko — no need to
+   re-ask Alluvia. We sent `33.22`, they invoiced `33.2168`. `PO1-04` is informational, their
+   price is authoritative, and it carries four decimals: never coerce an 810 line price to 2dp,
+   and never treat a difference from our own catalog price as a mismatch to flag.
 9. **`TDS` vs `SAC`** — is the invoice total inclusive of freight? (§2.4)
 10. **`SAC` on our outbound 850** — what is `D500`, and should we send a `SAC` at all?
 11. **Order cancellation.** Is there any cancel path — an 850 with `BEG01=01`, or an 860? Our

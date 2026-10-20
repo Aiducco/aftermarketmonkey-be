@@ -153,6 +153,13 @@ summit_racing_cookie.local.txt
 /*.csv
 /result.txt
 logs/*.jsonl
+# Same category, but one directory down, where the root-only `/*.csv` rule above can't reach:
+# the distributor prospecting set (Hunter enrichment output -- ~700 named contacts with work
+# emails, phone numbers and LinkedIn URLs) and the outreach workbooks built from it. Personal
+# data about real people, regenerable from the scripts in scripts/, and no business being in
+# git history.
+data/
+/*.xlsx
 
 # Timestamped .env backups (.env.bak.reoon.1788352112, .env.bak.tavily3.1788420328, ...).
 # The bare `.env.bak` and `.env.bak2` below were already ignored, but the suffixed ones were not,
