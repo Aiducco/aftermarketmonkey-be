@@ -2792,10 +2792,34 @@ def _allpro_warehouse_availability(va: typing.Optional[int], fl: typing.Optional
     return out or None
 
 
+def _allpro_dimensions(row: typing.Dict) -> typing.Optional[str]:
+    l, w, h = row.get("length"), row.get("width"), row.get("height")
+    if l is None and w is None and h is None:
+        return None
+    return "{} x {} x {} in".format(l or "?", w or "?", h or "?")
+
+
+def _allpro_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
+    """product_details for an AllProParts row (shown on ProviderPart). category/subcategory/
+    series/description are backfilled from Algolia (see AllProParts docstring) so they may lag
+    behind the raw feed columns by one enrichment pass."""
+    return [
+        {"key": "line_code", "label": "Line Code", "value": row.get("line_code") or None},
+        {"key": "upc", "label": "UPC", "value": row.get("upc") or None},
+        {"key": "description", "label": "Description", "value": row.get("description") or None},
+        {"key": "category", "label": "Category", "value": row.get("category") or None},
+        {"key": "subcategory", "label": "Subcategory", "value": row.get("subcategory") or None},
+        {"key": "series", "label": "Series", "value": row.get("series") or None},
+        {"key": "weight", "label": "Weight (lbs)", "value": str(row["weight"]) if row.get("weight") is not None else None},
+        {"key": "dimensions", "label": "Dimensions", "value": _allpro_dimensions(row)},
+    ]
+
+
 def sync_provider_inventory_from_allpro() -> None:
     """Sync ProviderPartInventory from AllProParts -- shared catalog-level inventory (AllPro's
     real warehouse stock), same precedent as Keystone/DLG reading their own *Parts table
-    directly rather than *CompanyPricing."""
+    directly rather than *CompanyPricing. Also refreshes ProviderPart.product_details from the
+    same row, same pattern as Rough Country."""
     logger.info("{} Syncing provider inventory from AllPro.".format(_LOG_PREFIX))
 
     allpro_provider = src_models.Providers.objects.filter(
@@ -2824,6 +2848,8 @@ def sync_provider_inventory_from_allpro() -> None:
             .values(
                 "id", "brand_id", "part_number", "total_qty",
                 "warehouse_va_qty", "warehouse_fl_qty", "warehouse_al_qty",
+                "line_code", "upc", "description", "category", "subcategory", "series",
+                "weight", "length", "width", "height",
             )[:BATCH_SIZE_INVENTORY]
         )
         if not batch:
@@ -2863,6 +2889,20 @@ def sync_provider_inventory_from_allpro() -> None:
                 ],
             )
             total_upserted += len(to_upsert)
+
+        # Update product_details on ProviderPart (product metadata, not inventory).
+        pp_details_to_update = []
+        for row in batch:
+            ext_id = "{}_{}".format(row["brand_id"], row["part_number"])
+            pp = provider_parts_by_key.get(ext_id)
+            if pp:
+                pp.product_details = _allpro_product_details(row)
+                pp_details_to_update.append(pp)
+        if pp_details_to_update:
+            src_models.ProviderPart.objects.bulk_update(
+                pp_details_to_update, ["product_details"], batch_size=500
+            )
+
         connection.close()
         if len(batch) == BATCH_SIZE_INVENTORY:
             time.sleep(BATCH_DELAY_SECONDS)
