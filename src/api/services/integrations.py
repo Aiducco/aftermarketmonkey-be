@@ -24,6 +24,8 @@ from src.integrations.clients.crown import client as crown_client
 from src.integrations.clients.crown import exceptions as crown_exceptions
 from src.integrations.clients.dlg import client as dlg_client
 from src.integrations.clients.dlg import exceptions as dlg_exceptions
+from src.integrations.clients.sb import exceptions as sb_exceptions
+from src.integrations.clients.sb import relay as sb_relay
 from src.integrations.clients.elite_wheel import client as elite_wheel_client
 from src.integrations.clients.elite_wheel import exceptions as elite_wheel_exceptions
 from src.integrations.clients.helmet_house import client as helmet_house_client
@@ -928,6 +930,11 @@ _RELAY_FEED_CHECK_KINDS = {
     src_enums.BrandProviderKind.CROWN_AUTOMOTIVE.value,
     src_enums.BrandProviderKind.DLG.value,
     src_enums.BrandProviderKind.THE_WHEEL_GROUP.value,
+    # S&B's catalog does not come through the relay at all (it is two shared Google Sheets), but
+    # their live-inventory file does, and it is the only per-company delivery there is anything
+    # to check for. A WAITING S&B connection therefore means "no stock yet", not "no data yet" --
+    # pricing, fitment and product data are already live. See the SB entry in PROVIDER_CATALOG.
+    src_enums.BrandProviderKind.SB.value,
 }
 
 # kind -> (client class, exception base) for every relay kind whose check is a plain
@@ -941,6 +948,7 @@ _RELAY_FEED_PRESENT_CLIENTS: typing.Dict[int, typing.Tuple[typing.Any, typing.An
     src_enums.BrandProviderKind.ATECH.value: (atech_client.AtechSFTPClient, atech_exceptions.AtechException),
     src_enums.BrandProviderKind.CROWN_AUTOMOTIVE.value: (crown_client.CrownSFTPClient, crown_exceptions.CrownException),
     src_enums.BrandProviderKind.DLG.value: (dlg_client.DlgSFTPClient, dlg_exceptions.DlgException),
+    src_enums.BrandProviderKind.SB.value: (sb_relay.SbRelayClient, sb_exceptions.SbException),
 }
 
 
@@ -1010,6 +1018,23 @@ def _relay_feed_connection_status(
             src_enums.CompanyProviderConnectionStatus.INGESTING,
             "File received — waiting for it to be processed.",
         )
+
+    if kind == src_enums.BrandProviderKind.SB.value:
+        # S&B is the one relay kind whose catalog does not depend on the relay: pricing, fitment
+        # and product data come from shared workbooks and are already live here. Kept at WAITING
+        # anyway — the same call made for The Wheel Group above, since a connection with no stock
+        # should not look complete — but with a message that says which half is missing, because
+        # "ask your rep to push a file" is not how a dealer gets S&B stock.
+        return (
+            src_enums.CompanyProviderConnectionStatus.WAITING,
+            "Catalog, pricing and fitment are live. For stock, email {} with \"{}\" in the "
+            "subject, then forward their reply to {}.".format(
+                src_constants.SB_INVENTORY_REQUEST_EMAIL,
+                src_constants.SB_INVENTORY_REQUEST_SUBJECT,
+                src_constants.SB_INVENTORY_FORWARD_TO_EMAIL,
+            ),
+        )
+
     return (
         src_enums.CompanyProviderConnectionStatus.WAITING,
         "Please read the setup instructions and ask your rep to push your feed file to our relay.",

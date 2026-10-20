@@ -13861,6 +13861,758 @@ def sync_derived_from_the_wheel_group(
     logger.info("{} Completed The Wheel Group-only derived sync.".format(_LOG_PREFIX))
 
 
+# ==========================================================================================
+# S&B Filters
+#
+# Catalog-shaped like Rough Country (one flat catalog table with images, prices and a separate
+# fitment table) with two differences worth knowing:
+#
+#   * **Inventory is optional and lives in its own table.** A part has no SbInventory row until a
+#     dealer's forwarded live-inventory file has named it, and that absence means "we were never
+#     told", not zero. Parts in that state get no ProviderPartInventory row at all rather than a
+#     row claiming 0 in stock.
+#   * **Pricing is derived, not fetched.** S&B publish one price sheet for the whole dealer
+#     network, so SbCompanyPricing is this company's level applied to those published numbers
+#     (see src.integrations.services.sb) rather than a per-dealer feed.
+# ==========================================================================================
+def _sb_provider_external_id(sb_brand_id: int, sku: str) -> str:
+    """Unique per S&B provider: sb_brand_id + sku (S&B and JLT ship through the same files)."""
+    return "{}_{}".format(sb_brand_id, (sku or "").strip())
+
+
+def _sb_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
+    """
+    product_details for an SbPart row.
+
+    S&B ship compliance and installation facts no other distributor here does, and they are the
+    ones a counter person is actually asked about: whether a part needs a tune, whether it is
+    legal in all 50 states, its CARB EO number, and where the instructions are. Those earn their
+    place on the part page; the Prop 65 text does not (it is a wall of boilerplate, kept on the
+    model for whoever needs to reproduce it verbatim).
+    """
+    return [
+        {"key": "sku",                   "label": "SKU",                        "value": row.get("sku") or None},
+        {"key": "upc",                   "label": "UPC",                        "value": row.get("upc") or None},
+        {"key": "category",              "label": "Category",                   "value": row.get("category") or None},
+        {"key": "filter_type",           "label": "Filter Media",               "value": row.get("filter_type") or None},
+        {"key": "vehicle_type",          "label": "Application",                "value": row.get("vehicle_type") or None},
+        {"key": "tune_required",         "label": "Tune Required",              "value": row.get("tune_required") or None},
+        {"key": "street_legal",          "label": "50-State Street Legal",      "value": row.get("fifty_state_street_legal") or None},
+        {"key": "carb_exempt_id",        "label": "CARB EO Number",             "value": row.get("carb_exempt_id") or None},
+        {"key": "emissions_code",        "label": "Emissions Code",             "value": row.get("emissions_code") or None},
+        {"key": "warning_label_letter",  "label": "Warning Label",              "value": row.get("warning_label_letter") or None},
+        {"key": "quantity_of_oil",       "label": "Filter Oil Required",        "value": row.get("quantity_of_oil") or None},
+        {"key": "install_instructions",  "label": "Installation Instructions",  "value": row.get("installation_instructions_url") or None},
+        {"key": "install_video",         "label": "Installation Video",         "value": row.get("install_video_url") or None},
+    ]
+
+
+def _ingest_sb_parts_for_mapped_brands(
+    mapped_catalog_brand_ids: typing.Set[int],
+    sb_provider: src_models.Providers,
+    sb_brand_to_brand: typing.Dict[int, src_models.Brands],
+    sb_brand_to_aaia: typing.Dict[int, typing.Optional[str]],
+    category_by_source: typing.Dict[str, typing.Tuple[typing.Optional[str], typing.Optional[str]]],
+) -> typing.Tuple[int, int]:
+    """Batch-ingest SbPart rows for one disjoint set of S&B catalog brand PKs."""
+    if not mapped_catalog_brand_ids:
+        return 0, 0
+
+    total_master = 0
+    total_provider = 0
+    batch_num = 0
+    last_id = 0
+
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.SbPart.objects.filter(
+                brand_id__in=mapped_catalog_brand_ids,
+                id__gt=last_id,
+            )
+            .order_by("id")
+            .values(
+                "id",
+                "brand_id",
+                "sku",
+                "title",
+                "description",
+                "image_1",
+                "updated_at",
+                "category",
+                "upc",
+            )[:BATCH_SIZE_MASTER_PARTS]
+        )
+        if not batch:
+            break
+
+        last_id = batch[-1]["id"]
+        seen = set()
+        master_parts = []
+        sb_external_id_to_brand_part = {}
+
+        for row in batch:
+            brand = sb_brand_to_brand.get(row["brand_id"])
+            if not brand:
+                continue
+
+            part_number = (row.get("sku") or "").strip()
+            if not part_number:
+                continue
+
+            key = (brand.id, part_number)
+            if key not in seen:
+                seen.add(key)
+                # title is the dealer-sheet description; the Shopify body is HTML and belongs in
+                # MasterPartData (see master_part_enrichment), not in MasterPart.description.
+                master_parts.append(
+                    src_models.MasterPart(
+                        brand=brand,
+                        part_number=part_number,
+                        sku=part_number,
+                        description=row.get("title"),
+                        aaia_code=sb_brand_to_aaia.get(row["brand_id"]),
+                        image_url=row.get("image_1"),
+                        gtin=row.get("upc") or None,
+                    )
+                )
+            sb_external_id_to_brand_part[
+                _sb_provider_external_id(row["brand_id"], row["sku"])
+            ] = (brand.id, part_number)
+
+        if not master_parts:
+            connection.close()
+            if len(batch) == BATCH_SIZE_MASTER_PARTS:
+                time.sleep(BATCH_DELAY_SECONDS)
+            continue
+
+        pairs = list(seen)
+        existing_by_key = {}
+        if pairs:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(pairs),),
+                )
+                for mp_id, b_id, p_num in cur.fetchall():
+                    existing_by_key[(b_id, p_num)] = mp_id
+
+        # S&B hyphenate their own part numbers in several styles across product lines
+        # ("75-5061-1", "CAI2-FMG-11", "101010"), so anything the exact match missed gets the
+        # same guarded normalized pass every other flat-feed provider uses.
+        mp_matching.extend_with_normalized_matches(
+            existing_by_key,
+            pairs,
+            {(mp.brand_id, mp.part_number): mp.gtin for mp in master_parts},
+            provider_id=sb_provider.id,
+            provider_kind=src_enums.BrandProviderKind.SB.value,
+            sku_by_key={(mp.brand_id, mp.part_number): mp.sku for mp in master_parts},
+            external_id_by_key={v: k for k, v in sb_external_id_to_brand_part.items()},
+        )
+
+        new_parts = [mp for mp in master_parts if (mp.brand_id, mp.part_number) not in existing_by_key]
+        existing_keys = [k for k in pairs if k in existing_by_key]
+
+        if new_parts:
+            new_parts = _dedupe_master_parts_for_upsert(
+                new_parts, context="S&B new_parts batch={}".format(batch_num)
+            )
+            pgbulk.upsert(
+                src_models.MasterPart,
+                new_parts,
+                unique_fields=["brand", "part_number"],
+                update_fields=[],
+            )
+            total_master += len(new_parts)
+
+        if existing_keys:
+            key_to_mp = {(mp.brand_id, mp.part_number): mp for mp in master_parts}
+            values = [
+                (
+                    existing_by_key[k],
+                    key_to_mp[k].aaia_code,
+                    key_to_mp[k].gtin,
+                    key_to_mp[k].image_url,
+                )
+                for k in existing_keys
+            ]
+            placeholders = ", ".join(["(%s::bigint, %s, %s, %s)"] * len(values))
+            params = [x for row in values for x in row]
+            with connection.cursor() as cur:
+                # Unlike the other flat feeds, this also fills image_url -- but only when what is
+                # already there is nothing or a feed placeholder, never over a real URL from
+                # another distributor.
+                #
+                # 749 of S&B's 828 SKUs merge onto master parts that already exist (Premier,
+                # Quadratec, A-Tech and Turn 14 all carry S&B product), and Premier writes the
+                # literal string 'NA' into image_url on 536,353 of its rows -- so without this, a
+                # part with real S&B product photography renders with "NA" as its image. Confirmed
+                # on the first production run: 75-5222 came out of the merge carrying 'NA' while
+                # S&B ship 16 photos for it, and enrichment's blank-fields mode would not fix it
+                # either (it tests NULL and '', and 'NA' is neither). The placeholder list is
+                # master_part_enrichment._PLACEHOLDER_VALUES.
+                cur.execute(
+                    """
+                    UPDATE master_parts mp SET
+                        aaia_code = v.aaia_code,
+                        gtin = COALESCE(mp.gtin, v.gtin),
+                        image_url = CASE
+                            WHEN v.image_url IS NULL OR btrim(v.image_url) = '' THEN mp.image_url
+                            WHEN mp.image_url IS NULL
+                                 OR btrim(mp.image_url) = ''
+                                 OR lower(btrim(mp.image_url)) IN (
+                                     'na', 'n/a', 'none', 'null', 'unknown', '-', '--', 'tbd'
+                                 )
+                            THEN v.image_url
+                            ELSE mp.image_url
+                        END
+                    FROM (VALUES {}) AS v(id, aaia_code, gtin, image_url)
+                    WHERE mp.id = v.id::bigint
+                    """.format(placeholders),
+                    params,
+                )
+
+        # Seed from the resolved ids first: a row matched on formatting has no MasterPart under
+        # the feed's own spelling, so the exact-part_number query below cannot find it.
+        brand_part_to_master = mp_matching.master_part_stubs_for(existing_by_key)
+        unresolved_pairs = [k for k in pairs if k not in brand_part_to_master]
+        if unresolved_pairs:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(unresolved_pairs),),
+                )
+                for mp_id, b_id, p_num in cur.fetchall():
+                    mp = src_models.MasterPart()
+                    mp.id = mp_id
+                    mp.brand_id = b_id
+                    mp.part_number = p_num
+                    brand_part_to_master[(b_id, p_num)] = mp
+
+        provider_parts_by_key = {}
+        for row in batch:
+            ext_id = _sb_provider_external_id(row["brand_id"], row["sku"])
+            key = sb_external_id_to_brand_part.get(ext_id)
+            if not key:
+                continue
+            master_part = brand_part_to_master.get(key)
+            if not master_part:
+                continue
+            cat_v, over_v = _lookup_categories_from_mapping(
+                row.get("category"), category_by_source
+            )
+            provider_parts_by_key[(master_part.id, sb_provider.id)] = src_models.ProviderPart(
+                master_part=master_part,
+                provider=sb_provider,
+                provider_external_id=ext_id,
+                distributor_refreshed_at=row.get("updated_at"),
+                category=cat_v,
+                overview_category=over_v,
+            )
+
+        provider_parts = list(provider_parts_by_key.values())
+        if provider_parts:
+            pgbulk.upsert(
+                src_models.ProviderPart,
+                provider_parts,
+                unique_fields=["master_part", "provider"],
+                update_fields=TURN14_PROVIDER_PART_SYNC_UPDATE_FIELDS,
+            )
+            total_provider += len(provider_parts)
+
+        logger.info("{} S&B batch {}: {} items -> {} master, {} provider (last_id={})".format(
+            _LOG_PREFIX, batch_num, len(batch), len(master_parts), len(provider_parts), last_id
+        ))
+        connection.close()
+        if len(batch) == BATCH_SIZE_MASTER_PARTS:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    return total_master, total_provider
+
+
+def sync_master_parts_from_sb() -> None:
+    """
+    Create/update MasterPart and ProviderPart from SbPart.
+    Only processes parts whose SbBrand has a BrandSbBrandMapping.
+    """
+    logger.info("{} Syncing master parts from S&B (batched, cursor-based).".format(_LOG_PREFIX))
+
+    sb_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.SB.value,
+    ).first()
+    if not sb_provider:
+        logger.info("{} No S&B provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandSbBrandMapping.objects.select_related("brand", "sb_brand")
+    )
+    sb_brand_to_brand = {m.sb_brand_id: m.brand for m in mappings}
+    sb_brand_to_aaia = {
+        m.sb_brand_id: (m.sb_brand.aaia_code if m.sb_brand else None) for m in mappings
+    }
+    if not sb_brand_to_brand:
+        logger.info("{} No BrandSbBrandMapping found. Nothing to sync.".format(_LOG_PREFIX))
+        return
+
+    category_by_source = _load_category_mapping_by_source()
+    chunks = _partition_mapped_brands_for_parallel_ingest(mappings, MASTER_PARTS_SYNC_MAX_WORKERS)
+    total_master, total_provider = _run_parallel_master_parts_ingest(
+        chunks,
+        mappings,
+        "sb_brand",
+        lambda cids: _ingest_sb_parts_for_mapped_brands(
+            cids,
+            sb_provider,
+            sb_brand_to_brand,
+            sb_brand_to_aaia,
+            category_by_source,
+        ),
+    )
+    logger.info("{} Synced {} master parts and {} provider parts from S&B total.".format(
+        _LOG_PREFIX, total_master, total_provider
+    ))
+
+
+def sync_provider_inventory_from_sb() -> None:
+    """
+    Sync ProviderPartInventory from SbInventory, and ProviderPart.product_details from SbPart.
+
+    A part with no SbInventory row has never appeared in a forwarded live-inventory file (S&B
+    publish no stock feed -- see src.integrations.services.sb) and gets **no ProviderPartInventory
+    row**: writing warehouse_total_qty=0 would be a claim S&B never made, and the parts API already
+    renders a missing row as ``inventory: null`` rather than out-of-stock. A row whose
+    ``available_qty`` *is* 0 is a real statement and is synced through as 0.
+
+    product_details is refreshed for every part regardless, so the compliance and install facts a
+    counter person is asked about appear whether or not stock has ever arrived.
+    """
+    logger.info("{} Syncing provider inventory from S&B.".format(_LOG_PREFIX))
+
+    sb_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.SB.value,
+    ).first()
+    if not sb_provider:
+        logger.info("{} No S&B provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandSbBrandMapping.objects.select_related("brand", "sb_brand")
+    )
+    if not mappings:
+        logger.info("{} No BrandSbBrandMapping found.".format(_LOG_PREFIX))
+        return
+
+    provider_parts = {
+        row["provider_external_id"]: src_models.ProviderPart(id=row["id"])
+        for row in src_models.ProviderPart.objects.filter(provider=sb_provider).values(
+            "id", "provider_external_id"
+        )
+    }
+
+    now = timezone.now()
+
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            batch = list(
+                src_models.SbPart.objects.filter(id__gt=last_id, brand_id__in=catalog_ids)
+                .order_by("id")
+                .values(
+                    "id", "brand_id", "sku",
+                    # Stock lives in its own table on its own cadence; joined in rather than read
+                    # off the part -- see SbInventory.
+                    "inventory__available_qty", "inventory__last_synced_at",
+                    "upc", "category", "filter_type", "vehicle_type", "tune_required",
+                    "fifty_state_street_legal", "carb_exempt_id", "emissions_code",
+                    "warning_label_letter", "quantity_of_oil",
+                    "installation_instructions_url", "install_video_url",
+                )[:BATCH_SIZE_INVENTORY]
+            )
+            if not batch:
+                break
+
+            last_id = batch[-1]["id"]
+            to_upsert = []
+            for row in batch:
+                qty = row.get("inventory__available_qty")
+                if qty is None:
+                    continue
+                provider_part = provider_parts.get(
+                    _sb_provider_external_id(row["brand_id"], row["sku"])
+                )
+                if not provider_part:
+                    continue
+                to_upsert.append(
+                    src_models.ProviderPartInventory(
+                        provider_part=provider_part,
+                        warehouse_total_qty=qty,
+                        manufacturer_inventory=None,
+                        manufacturer_esd=None,
+                        # S&B's emailed file is one national figure, not per warehouse, so there
+                        # is nothing to break out here.
+                        warehouse_availability=None,
+                        last_synced_at=row.get("inventory__last_synced_at") or now,
+                        updated_at=now,
+                    )
+                )
+
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_inventory_for_upsert(
+                    to_upsert, context="S&B inventory batch={}".format(batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartInventory,
+                    to_upsert,
+                    unique_fields=["provider_part"],
+                    update_fields=[
+                        "warehouse_total_qty",
+                        "manufacturer_inventory",
+                        "manufacturer_esd",
+                        "warehouse_availability",
+                        "last_synced_at",
+                        "updated_at",
+                    ],
+                )
+                total_upserted += len(to_upsert)
+
+            pp_details_to_update = []
+            for row in batch:
+                pp = provider_parts.get(_sb_provider_external_id(row["brand_id"], row["sku"]))
+                if pp:
+                    pp.product_details = _sb_product_details(row)
+                    pp_details_to_update.append(pp)
+            if pp_details_to_update:
+                src_models.ProviderPart.objects.bulk_update(
+                    pp_details_to_update, ["product_details"], batch_size=500
+                )
+
+            logger.info("{} S&B inventory batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_INVENTORY:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "sb_brand", _worker)
+    logger.info("{} Synced {} S&B inventory records total.".format(_LOG_PREFIX, total_upserted))
+
+
+def sync_master_part_fitments_from_sb() -> None:
+    """
+    Sync MasterPartFitment from SbFitment, joined via ProviderPart.provider_external_id -- the
+    same sb_brand_id+sku composite key inventory and pricing use.
+
+    Unlike Rough Country's fitment (which has no engine column), S&B's carries one, so
+    MasterPartFitment.engine is populated here -- that is what makes a YMM-plus-engine search
+    actually narrow an S&B intake to the right truck.
+    """
+    logger.info("{} Syncing master part fitments from S&B.".format(_LOG_PREFIX))
+
+    sb_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.SB.value,
+    ).first()
+    if not sb_provider:
+        logger.info("{} No S&B provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandSbBrandMapping.objects.select_related("brand", "sb_brand")
+    )
+    if not mappings:
+        logger.info("{} No BrandSbBrandMapping found.".format(_LOG_PREFIX))
+        return
+
+    master_part_id_by_ext_id = {
+        row["provider_external_id"]: row["master_part_id"]
+        for row in src_models.ProviderPart.objects.filter(provider=sb_provider).values(
+            "provider_external_id", "master_part_id"
+        )
+    }
+
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            batch = list(
+                src_models.SbFitment.objects.filter(
+                    id__gt=last_id, part__brand_id__in=catalog_ids
+                )
+                .order_by("id")
+                .values(
+                    "id", "part__brand_id", "part__sku",
+                    "start_year", "end_year", "make", "model", "submodel", "engine",
+                )[:BATCH_SIZE_INVENTORY]
+            )
+            if not batch:
+                break
+
+            last_id = batch[-1]["id"]
+            to_upsert = []
+            for row in batch:
+                master_part_id = master_part_id_by_ext_id.get(
+                    _sb_provider_external_id(row["part__brand_id"], row["part__sku"])
+                )
+                if not master_part_id:
+                    continue
+                if row["start_year"] is None or row["end_year"] is None:
+                    continue
+                make = (row["make"] or "").strip()
+                model = (row["model"] or "").strip()
+                if not make or not model:
+                    continue
+                to_upsert.append(
+                    src_models.MasterPartFitment(
+                        master_part_id=master_part_id,
+                        year_start=row["start_year"],
+                        year_end=row["end_year"],
+                        make=make,
+                        model=model,
+                        submodel=(row["submodel"] or "").strip(),
+                        engine=(row["engine"] or "").strip(),
+                        drive_type="",
+                        source_provider=sb_provider,
+                    )
+                )
+
+            if to_upsert:
+                to_upsert = _dedupe_master_part_fitments_for_upsert(
+                    to_upsert, context="S&B fitment batch={}".format(batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.MasterPartFitment,
+                    to_upsert,
+                    unique_fields=[
+                        "master_part", "year_start", "year_end", "make", "model",
+                        "submodel", "engine", "drive_type",
+                    ],
+                    update_fields=["source_provider"],
+                )
+                total_upserted += len(to_upsert)
+
+            logger.info("{} S&B fitment batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_INVENTORY:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "sb_brand", _worker)
+    logger.info(
+        "{} Synced {} S&B master part fitment records total.".format(_LOG_PREFIX, total_upserted)
+    )
+
+
+def _sync_sb_pricing(company_id: typing.Optional[int] = None) -> None:
+    """
+    Propagate SbCompanyPricing into ProviderPartCompanyPricing, for one company or all of them.
+
+    Mapping: ``cost`` is this company's dealer-level price and ``retail_price``/``msrp`` S&B's
+    published retail for their region. ``map_price``/``jobber_price`` are deliberately left NULL:
+    S&B publish no MAP or jobber column, and copying retail into them would present an invented
+    floor as a real one.
+    """
+    label = "all companies" if company_id is None else "company_id={}".format(company_id)
+    logger.info("{} Syncing S&B provider pricing for {}.".format(_LOG_PREFIX, label))
+
+    sb_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.SB.value,
+    ).first()
+    if not sb_provider:
+        logger.info("{} No S&B provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandSbBrandMapping.objects.select_related("brand", "sb_brand")
+    )
+    if not mappings:
+        logger.info("{} No BrandSbBrandMapping found. Nothing to price.".format(_LOG_PREFIX))
+        return
+
+    now = timezone.now()
+
+    # Watermark -- see sync_provider_pricing_from_meyer_for_company for the full rationale. Only
+    # meaningful for a single-company run; the all-companies pass has no one connection to track.
+    sync_started_at = timezone.now()
+    company_provider = None
+    watermark = None
+    if company_id is not None:
+        company_provider = src_models.CompanyProviders.objects.filter(
+            company_id=company_id, provider__kind=src_enums.BrandProviderKind.SB.value,
+        ).first()
+        watermark = company_provider.pricing_propagation_watermark if company_provider else None
+        logger.info(
+            "{} S&B pricing company={}: propagation watermark={}.".format(
+                _LOG_PREFIX, company_id, watermark or "none (processing everything)",
+            )
+        )
+
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            qs = src_models.SbCompanyPricing.objects.filter(
+                id__gt=last_id, part__brand_id__in=catalog_ids
+            )
+            if company_id is not None:
+                qs = qs.filter(company_id=company_id)
+            if watermark:
+                qs = qs.filter(updated_at__gte=watermark)
+            batch = list(
+                qs.order_by("id").values(
+                    "id", "company_id", "cost", "retail_price",
+                    "part__brand_id", "part__sku",
+                )[:BATCH_SIZE_PRICING]
+            )
+            if not batch:
+                break
+
+            last_id = batch[-1]["id"]
+            companies_by_id = {
+                c.id: c
+                for c in src_models.Company.objects.filter(
+                    id__in={r["company_id"] for r in batch if r.get("company_id")}
+                )
+            }
+
+            # Joined on provider_external_id, not (brand, part_number).
+            #
+            # Those are not the same thing here: master parts sync resolves a SKU the exact match
+            # missed against the normalized part number (see mp_matching), so an S&B row can be
+            # attached to a MasterPart carrying a *different* spelling -- "SBAF-S557R" onto an
+            # existing "SBAF-S557-R", "JLTMC-GT500-20" onto "MC-GT500-20". A (brand, part_number)
+            # lookup keyed on the feed's own spelling misses exactly those, and they silently get
+            # no cost at all. Confirmed on the first production run: 4 of 828 parts.
+            # provider_external_id is the key inventory and fitment already use, and it is exact.
+            ext_ids = []
+            for row in batch:
+                sku = str(row.get("part__sku") or "").strip()
+                if sku and row.get("part__brand_id"):
+                    ext_ids.append(_sb_provider_external_id(row["part__brand_id"], sku))
+            pp_by_ext_id = {
+                pp.provider_external_id: pp
+                for pp in src_models.ProviderPart.objects.filter(
+                    provider=sb_provider, provider_external_id__in=ext_ids
+                )
+            }
+
+            to_upsert = []
+            for row in batch:
+                sku = str(row.get("part__sku") or "").strip()
+                if not sku or not row.get("part__brand_id"):
+                    continue
+                provider_part = pp_by_ext_id.get(
+                    _sb_provider_external_id(row["part__brand_id"], sku)
+                )
+                company = companies_by_id.get(row.get("company_id"))
+                if not provider_part or not company:
+                    continue
+                retail = row.get("retail_price")
+                to_upsert.append(
+                    src_models.ProviderPartCompanyPricing(
+                        provider_part=provider_part,
+                        company=company,
+                        cost=row.get("cost"),
+                        jobber_price=None,
+                        map_price=None,
+                        msrp=retail,
+                        retail_price=retail,
+                        last_synced_at=now,
+                    )
+                )
+
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                    to_upsert, context="S&B pricing {} batch={}".format(label, batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartCompanyPricing,
+                    to_upsert,
+                    unique_fields=["provider_part", "company"],
+                    update_fields=[
+                        "cost", "jobber_price", "map_price", "msrp", "retail_price",
+                        "last_synced_at",
+                    ],
+                )
+                total_upserted += len(to_upsert)
+
+            logger.info("{} S&B pricing {} batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, label, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_PRICING:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "sb_brand", _worker)
+    logger.info("{} Synced {} S&B pricing records for {}.".format(
+        _LOG_PREFIX, total_upserted, label,
+    ))
+
+    if company_provider:
+        company_provider.pricing_propagation_watermark = sync_started_at
+        company_provider.save(update_fields=["pricing_propagation_watermark"])
+
+
+def sync_provider_pricing_from_sb() -> None:
+    _sync_sb_pricing()
+
+
+def sync_provider_pricing_from_sb_for_company(company_id: int) -> None:
+    _sync_sb_pricing(company_id=company_id)
+
+
+def sync_derived_from_sb(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False, skip_pricing: bool = False) -> None:
+    """
+    Propagate S&B source data into MasterPart, ProviderPart, ProviderPartInventory,
+    MasterPartFitment, and ProviderPartCompanyPricing. Call after the S&B feed ingest.
+
+    Pass ``skip_master_parts=True`` to run only inventory + fitment + pricing (fast incremental path).
+    Pass ``skip_pricing=True`` to run only master parts + inventory + fitment (global catalog sync path).
+    """
+    logger.info("{} Starting S&B-only derived sync ({}).".format(
+        _LOG_PREFIX,
+        "inventory + pricing only" if skip_master_parts else "parts, inventory" + ("" if skip_pricing else ", pricing"),
+    ))
+    if not skip_master_parts:
+        sync_master_parts_from_sb()
+        connection.close()
+
+    def _cont() -> None:
+        sync_provider_inventory_from_sb()
+        connection.close()
+        sync_master_part_fitments_from_sb()
+        connection.close()
+        if not skip_pricing:
+            sync_provider_pricing_from_sb()
+            connection.close()
+
+    if skip_master_parts:
+        _cont()
+    else:
+        _maybe_reindex_meilisearch_after_master_parts(
+            reindex_meilisearch=reindex_meilisearch,
+            provider_label="S&B",
+            continuation=_cont,
+        )
+    logger.info("{} Completed S&B-only derived sync.".format(_LOG_PREFIX))
+
+
 def sync_all_master_parts() -> None:
     """
     Run each distributor's derived sync in order (master + provider parts, then inventory, then pricing
@@ -13895,6 +14647,8 @@ def sync_all_master_parts() -> None:
     sync_derived_from_elite_wheel(reindex_meilisearch=False, skip_pricing=True)
     _reclaim_memory()
     sync_derived_from_the_wheel_group(reindex_meilisearch=False, skip_pricing=True)
+    _reclaim_memory()
+    sync_derived_from_sb(reindex_meilisearch=False, skip_pricing=True)
 
     logger.info("{} Completed full master parts sync.".format(_LOG_PREFIX))
 
@@ -13952,6 +14706,9 @@ def sync_all_master_parts_global() -> None:
     sync_derived_from_tristate(skip_pricing=True)
     _reclaim_memory()
     sync_derived_from_allpro(skip_pricing=True)
+    _reclaim_memory()
+    sync_derived_from_sb(skip_pricing=True)
+    _reclaim_memory()
     sync_derived_from_atd(skip_pricing=True)
 
     logger.info("{} Completed global master parts sync (catalog + inventory, no pricing).".format(_LOG_PREFIX))
@@ -13990,6 +14747,7 @@ def sync_all_master_parts_incremental() -> None:
     sync_derived_from_the_wheel_group(skip_master_parts=True)
     sync_derived_from_tristate(skip_master_parts=True)
     sync_derived_from_allpro(skip_master_parts=True)
+    sync_derived_from_sb(skip_master_parts=True)
     sync_derived_from_atd(skip_master_parts=True)
 
     logger.info("{} Completed incremental master parts sync.".format(_LOG_PREFIX))

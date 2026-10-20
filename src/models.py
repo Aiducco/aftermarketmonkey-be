@@ -2572,6 +2572,283 @@ class TireRackCompanyPricing(django_db_models.Model):
         unique_together = [["part", "company"]]
 
 
+class SbBrand(django_db_models.Model):
+    """
+    Brand label from the S&B dealer workbooks (stored uppercase). S&B ship more than one line
+    through the same files: ``S&B`` and ``JLT`` in the pricing master's ``brand`` column, plus
+    ``J&L`` in the Shopify export's ``Vendor`` column (JLT's earlier name, still on some older
+    products). Each gets its own row so BrandSbBrandMapping can point them at different
+    ``Brands`` -- an S&B intake and a JLT intake are not the same brand to a dealer.
+    """
+
+    external_id = django_db_models.CharField(max_length=255)
+    name = django_db_models.CharField(max_length=255)
+    aaia_code = django_db_models.CharField(max_length=255, null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "sb_brands"
+        unique_together = [["external_id"]]
+
+
+class BrandSbBrandMapping(django_db_models.Model):
+    """Maps our Brands to SbBrand (for master parts sync)."""
+
+    brand = django_db_models.ForeignKey(
+        Brands,
+        on_delete=django_db_models.CASCADE,
+        related_name="sb_brand_mappings",
+    )
+    sb_brand = django_db_models.ForeignKey(
+        SbBrand,
+        on_delete=django_db_models.CASCADE,
+        related_name="brand_mappings",
+    )
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "brand_sb_brand_mapping"
+        unique_together = ["brand", "sb_brand"]
+
+
+class SbPart(django_db_models.Model):
+    """
+    One S&B/JLT SKU, assembled from both of S&B's shared dealer workbooks (see the S&B block in
+    ``src/constants.py`` for what each one is):
+
+      * the pricing master's ``All Product Info`` tab is the authoritative catalog -- it decides
+        which SKUs exist, and carries pricing, dimensions, compliance text and the install links.
+      * the Shopify export adds what a dealer actually needs to merchandise the part: the HTML
+        description and the product imagery. It is matched in by SKU and only ever fills fields
+        the pricing master doesn't have, so a SKU missing from Shopify is still a complete part.
+
+    **Prices here are S&B's published numbers, identical for every dealer** -- including both
+    dealer levels, because the sheet lists both and which one applies is a fact about the dealer
+    rather than the part. The per-company resolution of that lives in SbCompanyPricing.
+
+    Stock is deliberately **not** on this model: it is the one thing not in either workbook, it
+    arrives by a completely different route (a dealer emails S&B, forwards the reply, support drops
+    it on the relay) and on its own cadence, so it lives in ``SbInventory``. A part with no
+    ``SbInventory`` row has never been quoted a stock figure, which is a different statement from
+    being out of stock -- see that model.
+    """
+
+    brand = django_db_models.ForeignKey(
+        SbBrand,
+        on_delete=django_db_models.CASCADE,
+        related_name="parts",
+    )
+    sku = django_db_models.CharField(max_length=255)
+    upc = django_db_models.CharField(max_length=255, null=True, blank=True)
+    title = django_db_models.CharField(max_length=512, null=True, blank=True)
+    # HTML, from the Shopify export's "Body (HTML)" column; NULL for SKUs not in that workbook.
+    description = django_db_models.TextField(null=True, blank=True)
+    category = django_db_models.CharField(max_length=255, null=True, blank=True)
+    # S&B's own filter media ("Cotton", "Dry", "Dry Cleanable") and application ("Gas", "Diesel",
+    # "UTV", "Van") vocabularies. The sheet writes "-" for not-applicable; that is normalized to
+    # NULL on ingest so a missing value never reads as a real one.
+    filter_type = django_db_models.CharField(max_length=64, null=True, blank=True)
+    vehicle_type = django_db_models.CharField(max_length=64, null=True, blank=True)
+    # Shopify's own product type, a second and coarser category vocabulary than S&B's above.
+    shopify_product_type = django_db_models.CharField(max_length=255, null=True, blank=True)
+    shopify_product_id = django_db_models.CharField(max_length=64, null=True, blank=True)
+
+    # Published prices, the same for every dealer. level_1/level_2 are dealer cost; level_2 needs
+    # $5,000+ in annual purchases (S&B's note on the sheet) -- see SbCompanyPricing.
+    us_retail_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    canadian_retail_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    level_1_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    level_2_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+
+    weight = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    shipping_width = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    shipping_height = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    shipping_length = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+
+    # Compliance / legal, all straight from the sheet. Worth keeping verbatim rather than
+    # summarising: prop_65_warning is the exact text a dealer is required to reproduce, and the
+    # CARB fields decide whether a part may be sold in California at all.
+    prop_65_warning = django_db_models.TextField(null=True, blank=True)
+    warning_label_letter = django_db_models.CharField(max_length=8, null=True, blank=True)
+    emissions_code = django_db_models.CharField(max_length=16, null=True, blank=True)
+    carb_exempt_id = django_db_models.CharField(max_length=128, null=True, blank=True)
+    # "Yes" / "No" / "Pending" in the sheet -- tri-state, so NullBooleanField would lose
+    # "Pending" (a part mid-certification, which a dealer must not treat as either).
+    fifty_state_street_legal = django_db_models.CharField(max_length=16, null=True, blank=True)
+    tune_required = django_db_models.CharField(max_length=16, null=True, blank=True)
+
+    iso5011_test_results = django_db_models.TextField(null=True, blank=True)
+    install_video_url = django_db_models.TextField(null=True, blank=True)
+    installation_instructions_url = django_db_models.TextField(null=True, blank=True)
+    quantity_of_oil = django_db_models.CharField(max_length=64, null=True, blank=True)
+    quantity_of_oil_power_stack = django_db_models.CharField(max_length=64, null=True, blank=True)
+
+    # image_1..image_6 mirror RoughCountryPart's shape so master_part_enrichment can read S&B the
+    # same way it reads Rough Country; ``images`` keeps the full list for the parts that have more
+    # than six (S&B's richest products carry 20+).
+    image_1 = django_db_models.TextField(null=True, blank=True)
+    image_2 = django_db_models.TextField(null=True, blank=True)
+    image_3 = django_db_models.TextField(null=True, blank=True)
+    image_4 = django_db_models.TextField(null=True, blank=True)
+    image_5 = django_db_models.TextField(null=True, blank=True)
+    image_6 = django_db_models.TextField(null=True, blank=True)
+    images = django_db_models.JSONField(null=True, blank=True)
+    video = django_db_models.TextField(null=True, blank=True)
+
+    raw_data = django_db_models.JSONField(null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "sb_parts"
+        unique_together = [["brand", "sku"]]
+        indexes = [
+            django_db_models.Index(fields=["sku"], name="sb_parts_sku_idx"),
+        ]
+
+
+class SbInventory(django_db_models.Model):
+    """
+    Live stock for one SbPart.
+
+    Its own table rather than a column on SbPart because the data has nothing in common with the
+    catalog: it is not in either of S&B's workbooks, it arrives by a different route entirely (a
+    dealer emails S&B with "Live Inventory" in the subject, forwards the reply to support, and
+    support drops the attachment on that company's relay folder -- see
+    ``src.integrations.clients.sb.relay``), and it changes on its own cadence. Keeping it separate
+    means the nightly catalog ingest and the inventory sweep never write the same row, and
+    "we have no stock figure for this part" is the absence of a row rather than a NULL that has to
+    be told apart from a real zero.
+
+    **One row per part, not per company.** S&B send each dealer their own file, but everything else
+    about SbPart is shared across the network, and ProviderPartInventory itself is per
+    provider-part rather than per company -- so a per-company figure here could not propagate
+    anywhere. ``source_company`` records whose forwarded file a figure came from, so the sharing is
+    auditable instead of invisible; revisit the shape if real files from two dealers ever turn out
+    to disagree.
+
+    ``available_qty`` of 0 is a real statement ("S&B told us this is out of stock") and is synced
+    through to ProviderPartInventory as such. No row at all is the "never told" case.
+    """
+
+    part = django_db_models.OneToOneField(
+        SbPart,
+        on_delete=django_db_models.CASCADE,
+        related_name="inventory",
+    )
+    available_qty = django_db_models.IntegerField(null=True, blank=True)
+    # Whose forwarded file this figure came from -- SET_NULL so losing the company that supplied
+    # it never deletes a stock figure the rest of the network is still reading.
+    source_company = django_db_models.ForeignKey(
+        Company,
+        on_delete=django_db_models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="sb_inventory_contributions",
+    )
+    # The basename of the relay file, kept for support: "which file said 7?" is the first question
+    # when a dealer disputes a quantity.
+    source_filename = django_db_models.CharField(max_length=255, null=True, blank=True)
+    last_synced_at = django_db_models.DateTimeField(null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "sb_inventory"
+
+
+class SbCompanyPricing(django_db_models.Model):
+    """
+    Per-company resolution of S&B's published prices for one SbPart.
+
+    S&B publish one file for the whole dealer network, so unlike Rough Country or DLG there is no
+    per-company feed to read -- this table exists because the *same* published numbers resolve
+    differently per dealer. Two inputs, both from CompanyProviders.credentials["feed"]:
+    ``pricing_level`` picks ``cost`` from the part's level_1_price or level_2_price, and
+    ``price_region`` picks ``retail_price`` from its US or Canadian column.
+
+    Keeping it as a table rather than computing it on the fly in
+    ``sync_provider_pricing_from_sb_for_company`` buys one real thing: every other provider's
+    pricing job reads a per-company table, so S&B's job is the same shape as all of them, and a
+    dealer's effective cost is inspectable in SQL when they query an invoice.
+    """
+
+    part = django_db_models.ForeignKey(
+        SbPart,
+        on_delete=django_db_models.CASCADE,
+        related_name="company_pricing",
+    )
+    company = django_db_models.ForeignKey(
+        Company,
+        on_delete=django_db_models.CASCADE,
+        related_name="sb_company_pricing",
+    )
+    # The level actually applied, stored alongside the amount: when a dealer disputes a cost the
+    # first question is which level we had them on at the time.
+    pricing_level = django_db_models.IntegerField(null=True, blank=True)
+    cost = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    retail_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "sb_company_pricing"
+        unique_together = [["part", "company"]]
+
+
+class SbFitment(django_db_models.Model):
+    """
+    Vehicle fitment for an SbPart, normalized from the three different spellings S&B ship it in
+    (see ``src.integrations.services.sb`` for the parsers):
+
+      * the pricing master's ``Fitment`` tab -- ``sku | Year | Make | Model | Engine``, where Year
+        is anything from ``2015`` to ``1990 - 1991, 1993 - 1996``.
+      * the Shopify export's ``convermax.fitment`` metafield -- ``2015-2026|Ford|F-150|3.5L
+        Ecoboost, Gas``, newline-separated on one tab and a JSON array on the other.
+      * the pricing master's ``miva export`` tab -- ``2022>Toyota>Tundra>3.5L, Gas``, one row per
+        SKU with every vehicle pipe-joined. A legacy storefront dump, and by far the widest
+        coverage: it carries fitment for thousands of older SKUs the Fitment tab has dropped.
+
+    ``source`` records which one produced the row. All three feed the same unique key, so a
+    vehicle listed in two of them is one row, not two; ingest prefers the richest source for a
+    given vehicle and ``source`` names the winner.
+
+    Year ranges are stored as a range, matching MasterPartFitment -- a ``1990 - 1991, 1993 - 1996``
+    cell becomes two rows rather than one row spanning 1990-1996, because the gap years are
+    genuinely not covered and flattening them would invent fitment.
+    """
+
+    part = django_db_models.ForeignKey(
+        SbPart,
+        on_delete=django_db_models.CASCADE,
+        related_name="fitments",
+    )
+    start_year = django_db_models.IntegerField(null=True, blank=True)
+    end_year = django_db_models.IntegerField(null=True, blank=True)
+    make = django_db_models.CharField(max_length=128, null=True, blank=True)
+    model = django_db_models.CharField(max_length=128, null=True, blank=True)
+    # blank=True, default="" rather than null: Postgres treats each NULL as distinct for
+    # uniqueness, which would break pgbulk.upsert dedup on unique_together below. Same reason
+    # MasterPartFitment does it.
+    submodel = django_db_models.CharField(max_length=255, blank=True, default="")
+    engine = django_db_models.CharField(max_length=255, blank=True, default="")
+    source = django_db_models.CharField(max_length=32, null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "sb_fitment"
+        unique_together = [["part", "start_year", "end_year", "make", "model", "submodel", "engine"]]
+
+
 class MasterPart(django_db_models.Model):
     brand = django_db_models.ForeignKey(Brands, on_delete=django_db_models.CASCADE, related_name="master_parts")
     part_number = django_db_models.CharField(max_length=255)

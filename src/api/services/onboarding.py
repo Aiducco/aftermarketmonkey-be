@@ -355,6 +355,33 @@ def get_distributor_credentials_info() -> dict:
             "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("DLG", "DLG"),
             "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("DLG") or None,
         },
+        "sb": {
+            # Nothing is required: S&B's catalog, pricing and fitment workbooks are the same files
+            # for every dealer (URLs in src.constants), so the only inputs are optional and both
+            # have safe defaults — Level 1 pricing and US retail.
+            "required": [],
+            "optional": [
+                src_constants.SB_CREDENTIALS_PRICING_LEVEL,
+                src_constants.SB_CREDENTIALS_PRICE_REGION,
+            ],
+            "description": (
+                "No credentials needed — S&B's catalog, dealer pricing and fitment come from "
+                "workbooks they share with their whole dealer network. Optionally set "
+                + src_constants.SB_CREDENTIALS_PRICING_LEVEL
+                + " to 1 or 2 (Level 2 needs $5,000+ in annual purchases; defaults to 1, the "
+                "higher cost) and "
+                + src_constants.SB_CREDENTIALS_PRICE_REGION
+                + " to US or CA (defaults to US). For stock, email "
+                + src_constants.SB_INVENTORY_REQUEST_EMAIL
+                + ' with "'
+                + src_constants.SB_INVENTORY_REQUEST_SUBJECT
+                + '" in the subject, then forward their reply to '
+                + src_constants.SB_INVENTORY_FORWARD_TO_EMAIL
+                + "."
+            ),
+            "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("SB", "S&B Filters"),
+            "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("SB") or None,
+        },
         "vossen": {
             "required": [
                 src_constants.VOSSEN_CREDENTIALS_FEED_URL,

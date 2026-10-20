@@ -16,13 +16,16 @@ resurrected from a stale relay file:
     re-checked every cycle forever -- see _invalid_credentials_retry_delay and
     CompanyProviders.status_consecutive_failures. Nothing else defers: a transient failure is
     retried on the normal cadence.
-  - Relay-provisioned kinds with an ingest client (Meyer, A-Tech, Crown, DLG, The Wheel Group):
-    via integrations_services._relay_feed_connection_status — same helper connect_provider/
+  - Relay-provisioned kinds with an ingest client (Meyer, A-Tech, Crown, DLG, The Wheel Group,
+    S&B): via integrations_services._relay_feed_connection_status — same helper connect_provider/
     update_connection use to set the initial status, so there's one source of truth for
     what "file arrived" means. The Wheel Group's own shared public mastersheet (catalog + list
     price, readable with no relay file at all) does not count as "arrived" here — this still
     checks for that company's own relay drop, same as every other kind (see that helper's own
-    docstring for why, added 2026-10-13).
+    docstring for why, added 2026-10-13). S&B is the same call for the same reason: their shared
+    workbooks carry real dealer cost and fitment, but stock only arrives as a forwarded email, so
+    a connection stays WAITING until that file lands — with a message saying so (its catalog is
+    live meanwhile, unlike every other WAITING kind here).
   - Everything else (no ingest client built yet — CTP, DIX, and the rest of the catalog-only
     distributors): left untouched, nothing to check against.
 

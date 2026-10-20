@@ -38,6 +38,7 @@ PROVIDER_DISPLAY_NAMES = {
     "MOTOR_STATE_DISTRIBUTING": "Motor State Distributing",
     "QUADRATEC": "Quadratec",
     "TRI_STATE": "Tri-State",
+    "SB": "S&B Filters",
 }
 
 # Provider kind_name -> image URL (used by parts API)
@@ -78,6 +79,7 @@ PROVIDER_IMAGE_URLS = {
     "MOTOR_STATE_DISTRIBUTING": "https://api.aftermarketscout.com/uploads/motor_state_logo.png",
     "QUADRATEC": "https://api.aftermarketscout.com/uploads/quadratec_logo.png",
     "TRI_STATE": "https://api.aftermarketscout.com/uploads/tristate.png",
+    "SB": "https://api.aftermarketscout.com/uploads/sb_logo.png",
 }
 
 # Public "open in distributor" links (parts API ``provider_go_to_link``); ``urllib.parse.quote`` at call sites.
@@ -142,6 +144,86 @@ def dlg_b2b_search_keywords(dlg_brand_name: typing.Optional[str], part_number: s
 
 # CompanyProviders.credentials JSON key for Rough Country: jobber Excel URL (required per connection).
 ROUGH_COUNTRY_CREDENTIALS_FEED_URL = "feed_url"
+
+
+# ==========================================================================================
+# S&B Filters (S&B Tactical Filters / JLT) — two shared Google Sheets for catalog + fitment,
+# plus a per-company emailed live-inventory file on our relay.
+#
+# S&B publishes no per-dealer feed and has no API. Everything static — pricing, specs, fitment,
+# imagery — comes from two workbooks S&B maintain and share with their whole dealer network, so
+# the URLs live here rather than in CompanyProviders.credentials (contrast Rough Country, where
+# every dealer has their own jobber URL):
+#
+#   * pricing master ("S&B and JLT Product Pricing Master"): tabs ``All Product Info`` (the
+#     catalog, header on row 3), ``Fitment`` (sku/Year/Make/Model/Engine), ``Notes`` (dealer
+#     terms) and ``miva export`` (a legacy storefront dump whose ``YEAR_MAKE_MODEL_ENGINE``
+#     column carries fitment for thousands of older SKUs the Fitment tab no longer lists).
+#   * Shopify export ("S&B Shopify Export with Fitment and Images"): product imagery, HTML
+#     descriptions and a third fitment spelling (``convermax.fitment``).
+#
+# The one genuinely per-company number is which dealer price level the company is on: Level 1 is
+# the base dealer price, Level 2 needs $5,000+ in annual purchases (S&B's own note on the sheet)
+# and is not retroactive. That is a fact about the dealer, not about the file, so it is stored on
+# the connection as ``pricing_level`` — see SB_CREDENTIALS_PRICING_LEVEL below.
+# ==========================================================================================
+SB_PRICING_MASTER_SHEET_ID = "16ip6rkPxZdlNvR5ypsDoHsM3P5BCQKnNBfBRoGBQTgM"
+SB_SHOPIFY_EXPORT_SHEET_ID = "1zK8Y6vtRy0eZnmQZbvUdaAAk4C1CMUqFrEOPrvzxlaQ"
+# Google Sheets' own xlsx export endpoint — one request returns every tab, which is why the
+# workbooks are read as Excel rather than per-tab CSV (the CSV endpoint needs a gid per tab).
+SB_SHEET_EXPORT_URL_TEMPLATE = "https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
+
+# Dealer price levels on the pricing master's ``Level 1`` / ``Level 2`` columns.
+SB_PRICING_LEVEL_1 = 1
+SB_PRICING_LEVEL_2 = 2
+SB_PRICING_LEVELS = (SB_PRICING_LEVEL_1, SB_PRICING_LEVEL_2)
+SB_DEFAULT_PRICING_LEVEL = SB_PRICING_LEVEL_1
+# Which retail column a company's ProviderPartCompanyPricing.retail_price/msrp comes from.
+SB_PRICE_REGION_US = "US"
+SB_PRICE_REGION_CA = "CA"
+SB_PRICE_REGIONS = (SB_PRICE_REGION_US, SB_PRICE_REGION_CA)
+SB_DEFAULT_PRICE_REGION = SB_PRICE_REGION_US
+
+# CompanyProviders.credentials["feed"] keys.
+SB_CREDENTIALS_PRICING_LEVEL = "pricing_level"
+SB_CREDENTIALS_PRICE_REGION = "price_region"
+
+# Live inventory: the dealer emails S&B with "Live Inventory" in the subject, then forwards S&B's
+# reply here; support drops the attachment in that company's relay folder under this name.
+SB_INVENTORY_FORWARD_TO_EMAIL = "support@aftermarketscout.com"
+SB_INVENTORY_REQUEST_EMAIL = "sales@sbfilters.com"
+SB_INVENTORY_REQUEST_SUBJECT = "Live Inventory"
+# Same shared relay every relay-provisioned provider uses (see DLG above and the Crown client).
+SB_RELAY_SFTP_HOST = "5.161.121.143"
+SB_RELAY_SFTP_PORT = 22
+SB_RELAY_SFTP_DIRECTORY = "uploads"
+# Accepted basenames for that file, in preference order. S&B has not yet delivered one, so the
+# parser is header-driven rather than pinned to a column layout — see
+# src.integrations.clients.sb.feed_spec for what it looks for and what happens when it can't
+# find it.
+SB_INVENTORY_FILENAMES = (
+    "sb_inventory.csv",
+    "sb_inventory.xlsx",
+    "sb_inventory.csv",
+    "sb_inventory.xlsx",
+)
+
+# Public "open in distributor" link for the parts API (``provider_go_to_link``).
+SB_INVENTORY_SEARCH_URL_TEMPLATE = "https://sbfilters.com/search?q={sku}"
+
+# Which company S&B's brand mapping attaches BrandProviders/CompanyBrands to. Every other
+# distributor uses the internal ``TICK_PERFORMANCE`` catalog company; S&B deliberately uses the
+# live Trident Motorsports tenant instead.
+#
+# **Resolved by slug, not name, and that matters.** Production has two companies called
+# "Trident Motorsports" -- id 12 (created 2026-03-17, zero users, zero connections, an abandoned
+# duplicate signup) and id 16 (3 users, 19 distributor connections, the real one). A name lookup
+# with ``.first()`` orders by id and would silently pick the empty shell, mapping every S&B brand
+# onto a company nobody uses. Slugs are unique per company, so this cannot happen.
+SB_MASTER_COMPANY_SLUG = "trident-motorsports-9992401f"
+# Logging/diagnostics only -- never used to look the company up, for the reason above.
+SB_MASTER_COMPANY_NAME = "Trident Motorsports"
+
 
 # CompanyProviders.credentials JSON keys for Quadratec: two per-connection feed URLs. The catalog
 # feed (pricingSheet_quad.xlsx: Quadratec PN, MPN, Description, UPC, Brand, Retail/Wholesale price,
@@ -994,6 +1076,114 @@ PROVIDER_CATALOG = [
             email_from_key=DLG_CREDENTIALS_EMAIL_FROM,
         ),
         # Email-channel ordering — DLG has no order API of its own; see the matching note on
+        # Turn 14 above.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["account_number", "cc_email", "reply_to_email"],
+    },
+    {
+        "kind": enums.BrandProviderKind.SB,
+        "name": "S&B Filters",
+        "description": (
+            "S&B and JLT catalog, dealer pricing, fitment and imagery from S&B's shared dealer "
+            "workbooks. Live inventory arrives by email."
+        ),
+        "icon_url": "https://api.aftermarketscout.com/uploads/sb_logo.png",
+        "category": "Distributors",
+        # Nothing to paste: the catalog, pricing and fitment workbooks are the same files for
+        # every S&B dealer and their URLs live in src.constants. The only per-company input is
+        # which dealer price level this company is on, which is optional and defaults to Level 1
+        # (see SB_DEFAULT_PRICING_LEVEL) — so a connection with an empty form is valid and still
+        # gets a complete catalog.
+        "connection_required_fields": [],
+        "connection_optional_fields": [
+            SB_CREDENTIALS_PRICING_LEVEL,
+            SB_CREDENTIALS_PRICE_REGION,
+        ],
+        # Relay-provisioned for the live-inventory file only — see the instructions below. The
+        # catalog does not depend on it, but the connection's feed status does (it is the one
+        # per-company delivery we can actually check for).
+        "relay_provisioned": True,
+        "relay_credential_fields": ("sftp_user", "sftp_password"),
+        "integration_time": "Catalog available immediately; live inventory within 1-2 days",
+        "installation_instructions_html": (
+            "<p><strong>S&amp;B Filters</strong> connects differently from most distributors. S&amp;B "
+            "maintain their catalog, dealer pricing, vehicle fitment and product imagery in two "
+            "workbooks shared with their whole dealer network, and AfterMarketScout reads those "
+            "directly &mdash; so there are no credentials to enter and your S&amp;B and JLT catalog "
+            "appears straight away.</p>"
+            "<p>The one thing S&amp;B do not publish is stock. That comes by email, on request, and "
+            "step 2 is how it reaches your account.</p>"
+
+            "<p><strong>1. Confirm your dealer price level</strong></p>"
+            "<p>S&amp;B publish two dealer price levels. <strong>Level 1</strong> is the standard "
+            "dealer price; <strong>Level 2</strong> requires a minimum of $5,000 in annual purchases "
+            "and is not retroactive. Pick yours in the <strong>{pricing_level_key}</strong> field "
+            "below &mdash; if you leave it empty we use Level&nbsp;1, which is the safer default: it "
+            "is the higher cost, so your margins are never overstated.</p>"
+            "<p>Canadian dealers should also set <strong>{price_region_key}</strong> to "
+            "<code>{region_ca}</code> so retail prices come from S&amp;B's Canadian column rather "
+            "than the US one. Leave it empty for <code>{region_us}</code>.</p>"
+            "<p>Not sure which level you're on? Ask your S&amp;B rep &mdash; it's on your dealer "
+            "agreement.</p>"
+
+            "<p><strong>2. Set up live inventory</strong></p>"
+            "<p>S&amp;B send stock figures on request rather than publishing a feed, so this is a "
+            "two-part setup: ask once, then forward automatically.</p>"
+            "<ol>"
+            "<li>Email <a href=\"mailto:{sb_email}\">{sb_email}</a> from your dealer address with "
+            "<strong>{subject}</strong> in the subject line, and ask them to add you to their live "
+            "inventory list.</li>"
+            "<li>When their reply arrives, forward it &mdash; attachment included &mdash; to "
+            "<a href=\"mailto:{sb_fwd}\">{sb_fwd}</a>.</li>"
+            "<li>Then set up a rule so you never have to do it again: forward anything from S&amp;B "
+            "with <strong>{subject}</strong> in the subject to "
+            "<a href=\"mailto:{sb_fwd}\">{sb_fwd}</a>. In Gmail that's <strong>Settings &rarr; "
+            "Filters and Blocked Addresses</strong>; in Outlook it's <strong>Rules</strong>. Your IT "
+            "team can do this in a couple of minutes, and it's the difference between stock that "
+            "stays current and stock that goes stale the week someone's on holiday.</li>"
+            "</ol>"
+            "<p>Your connection shows <strong>Waiting</strong> until the first file arrives. Pricing, "
+            "fitment and product data are already live at that point &mdash; only stock quantities "
+            "are waiting.</p>"
+
+            "<p><strong>3. Optional &mdash; place orders through AfterMarketScout</strong></p>"
+            "<p>Skip this if you don't plan to send purchase orders from AfterMarketScout. S&amp;B "
+            "have no ordering API, so orders go to your rep as a PDF purchase order by email.</p>"
+            "<ol>"
+            "<li>Enter your S&amp;B rep's <strong>email</strong> address below.</li>"
+            "<li>Optionally add an internal <strong>CC</strong> address so your own team receives a "
+            "copy of every order.</li>"
+            "<li>Click <strong>Save</strong>.</li>"
+            "</ol>"
+            "<p>Because orders arrive as email rather than through an API, confirmation and tracking "
+            "come back from your rep directly, not automatically into AfterMarketScout.</p>"
+
+            "<p><strong>Worth knowing</strong></p>"
+            "<ul>"
+            "<li><strong>Free freight.</strong> S&amp;B cover shipping on orders of $5,000 or more "
+            "(tanks excluded) in the continental USA and many Canadian locations. Tanks ship free "
+            "only in orders of 8 or more. Canadian dealers pay their own broker fees.</li>"
+            "<li><strong>Stock shows nothing.</strong> Check whether an S&amp;B live inventory email "
+            "has arrived and been forwarded since you connected. Everything else on the page works "
+            "without it.</li>"
+            "<li><strong>Prices look wrong.</strong> Check <strong>{pricing_level_key}</strong> above "
+            "&mdash; a Level 2 dealer left on Level 1 sees costs that are too high, and the other way "
+            "round understates them.</li>"
+            "<li><strong>A part number is missing.</strong> The workbooks are S&amp;B's own; if a SKU "
+            "isn't in them we don't see it. Ask your rep to have it added.</li>"
+            "<li><strong>Need help?</strong> Contact "
+            "<a href=\"mailto:{sb_fwd}\">{sb_fwd}</a>.</li>"
+            "</ul>"
+        ).format(
+            sb_email=SB_INVENTORY_REQUEST_EMAIL,
+            sb_fwd=SB_INVENTORY_FORWARD_TO_EMAIL,
+            subject=SB_INVENTORY_REQUEST_SUBJECT,
+            pricing_level_key=SB_CREDENTIALS_PRICING_LEVEL,
+            price_region_key=SB_CREDENTIALS_PRICE_REGION,
+            region_us=SB_PRICE_REGION_US,
+            region_ca=SB_PRICE_REGION_CA,
+        ),
+        # Email-channel ordering — S&B have no order API of their own; see the matching note on
         # Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
         "email_order_connection_optional_fields": ["account_number", "cc_email", "reply_to_email"],

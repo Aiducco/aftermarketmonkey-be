@@ -26,7 +26,9 @@ audit, Meilisearch handoff -- is source-agnostic.
 """
 import dataclasses
 import html as html_lib
+import json as json_lib
 import logging
+import re
 import typing
 from urllib.parse import urlparse
 
@@ -1609,12 +1611,163 @@ class _QuadratecSource(_FlatFeedSource):
         return payload
 
 
+#: Block-level tags that end a line of copy. Anything else is dropped as inline markup, so a
+#: ``<strong>`` or a ``<span style=...>`` inside a sentence does not split it.
+_HTML_BLOCK_BREAK_RE = re.compile(
+    r"</?(?:p|div|br|ul|ol|h[1-6]|tr|table|section|article)[^>]*>", re.IGNORECASE
+)
+#: List items are marked rather than just broken, so the structure of the original copy survives
+#: being flattened -- see ``_html_to_prose_and_bullets``.
+_HTML_LIST_ITEM_RE = re.compile(r"<li[^>]*>", re.IGNORECASE)
+_HTML_LIST_ITEM_END_RE = re.compile(r"</li[^>]*>", re.IGNORECASE)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+#: Feeds that hand-roll a bullet glyph inside their own <li>; the composer adds the list markup
+#: itself, so the glyph would be doubled.
+_HTML_BULLET_PREFIX_RE = re.compile(r"^\s*(?:[-\u2022*\u00b7]|\d+[.)])\s+")
+_LIST_ITEM_MARKER = "\x00li\x00"
+
+
+def _html_to_prose_and_bullets(
+    value: typing.Any,
+) -> typing.Tuple[typing.List[str], typing.List[str]]:
+    """
+    Third-party HTML copy -> ``(paragraphs, bullets)`` of plain text.
+
+    For feeds that ship a rendered description rather than typed pieces (S&B's comes straight out
+    of Shopify). **The HTML is never passed through.** Every description this module writes is
+    rebuilt by ``compose_description_html``, which escapes what it is given -- that is the
+    invariant keeping a distributor's markup, and anything their CMS lets into it, off our product
+    pages. So the markup is reduced to text here and recomposed there.
+
+    The paragraph/bullet split is kept rather than flattening everything into one list: a Shopify
+    body typically opens with a sentence or two of prose and then lists features, and feeding the
+    prose in as bullets turns a product's own opening line into a stray bullet point.
+    """
+    text = _clean(value)
+    if text is None:
+        return [], []
+
+    # Mark list items before the generic tag strip, so <li> content can still be told apart.
+    text = _HTML_LIST_ITEM_END_RE.sub("\n", text)
+    text = _HTML_LIST_ITEM_RE.sub("\n" + _LIST_ITEM_MARKER, text)
+    # Blocks become newlines, or paragraphs would run together once the tags are gone.
+    text = _HTML_BLOCK_BREAK_RE.sub("\n", text)
+    text = _HTML_TAG_RE.sub("", text)
+    text = html_lib.unescape(text)
+
+    paragraphs: typing.List[str] = []
+    bullets: typing.List[str] = []
+    for raw_line in text.splitlines():
+        is_bullet = _LIST_ITEM_MARKER in raw_line
+        line = " ".join(raw_line.replace(_LIST_ITEM_MARKER, " ").split())
+        if not line:
+            continue
+        line = _HTML_BULLET_PREFIX_RE.sub("", line).strip()
+        if not line:
+            continue
+        (bullets if is_bullet else paragraphs).append(line)
+    return paragraphs, bullets
+
+
+def _json_list(value: typing.Any) -> typing.Optional[typing.List]:
+    """
+    A JSON/JSONB column read back through raw SQL, as a list.
+
+    ``_raw_rows_by_external_id`` selects columns with a hand-written query rather than through the
+    ORM, so a JSONField arrives as the raw ``str`` psycopg2 hands over -- not the decoded list a
+    model attribute would give. Decoding it here is what makes a part's full image list usable
+    instead of silently falling back to the first few numbered columns.
+    """
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str) and value.strip().startswith("["):
+        try:
+            decoded = json_lib.loads(value)
+        except ValueError:
+            return None
+        return decoded if isinstance(decoded, list) else None
+    return None
+
+
+class _SbSource(_FlatFeedSource):
+    """
+    S&B's two shared dealer workbooks, already merged onto ``sb_parts`` by
+    ``src.integrations.services.sb``: Shopify imagery on 784 of 828 rows (up to 20+ per part,
+    the first six in ``image_1``..``image_6`` and the full list in ``images``), a real HTML
+    description on 780, and a specs list no other feed here carries -- whether the part needs an
+    ECU tune, whether it is legal in all 50 states, its CARB EO number and how much filter oil it
+    takes.
+
+    The description is the only feed in this module that arrives as rendered HTML. It is reduced
+    to text and recomposed rather than passed through -- see ``_html_to_prose_and_bullets`` for why.
+    """
+
+    name = "sb"
+    provider_kind = src_enums.BrandProviderKind.SB.value
+    table = "sb_parts"
+    key_column = "sku"
+    select_columns = (
+        "sku", "title", "description", "images", "image_1", "image_2", "image_3", "image_4",
+        "image_5", "image_6", "video", "upc", "weight", "shipping_length", "shipping_width",
+        "shipping_height", "category", "filter_type", "vehicle_type", "tune_required",
+        "fifty_state_street_legal", "carb_exempt_id", "quantity_of_oil",
+        "installation_instructions_url",
+    )
+
+    def payload_from_row(self, row, *, applications, want_description):
+        # ``images`` holds the complete list (S&B's richest products carry 16-23); the numbered
+        # columns are its first six and the fallback for a row written before it was populated.
+        stored = _json_list(row.get("images"))
+        candidates = stored if stored else [
+            row.get("image_{}".format(n)) for n in range(1, 7)
+        ]
+        images = _image_urls(candidates)
+
+        field_specs = _specs([
+            ("UPC", _clean_barcode(row.get("upc"))),
+            ("Category", row.get("category")),
+            ("Filter Media", row.get("filter_type")),
+            ("Application", row.get("vehicle_type")),
+            ("Tune Required", row.get("tune_required")),
+            ("50-State Street Legal", row.get("fifty_state_street_legal")),
+            ("CARB EO Number", row.get("carb_exempt_id")),
+            ("Filter Oil Required", row.get("quantity_of_oil")),
+            ("Length", row.get("shipping_length")),
+            ("Width", row.get("shipping_width")),
+            ("Height", row.get("shipping_height")),
+            ("Weight", row.get("weight")),
+        ])
+
+        video = _clean(row.get("video"))
+        payload = EnrichmentPayload(
+            images=images or None,
+            youtube_video=video if (video and _is_youtube_video_url(video)) else None,
+            field_specs=field_specs or None,
+            core_image_url=images[0] if images else None,
+            core_description=_clean(row.get("title")),
+            core_gtin=_clean_barcode(row.get("upc")),
+        )
+        if want_description:
+            paragraphs, bullets = _html_to_prose_and_bullets(row.get("description"))
+            payload.description = compose_description_html(
+                # compose_description_html splits prose on newlines into <p> of its own, so the
+                # body's paragraph breaks survive. Falling back to the dealer-sheet title keeps a
+                # part that is missing from the Shopify export from having no description at all.
+                prose="\n".join(paragraphs) or _clean(row.get("title")),
+                features=bullets,
+                field_specs=field_specs,
+                applications=applications,
+            ) or None
+        return payload
+
+
 #: Registry. Dict order is the recommended run order = per-field precedence (see module docstring).
 SOURCES: typing.Dict[str, typing.Any] = {
     source.name: source
     for source in (
         _Turn14Source(),
         _RoughCountrySource(),
+        _SbSource(),
         _TheWheelGroupSource(),
         _WpsSource(),
         _WheelProsSource(),
@@ -1640,6 +1793,10 @@ DEFAULT_SOURCE = _Turn14Source.name
 #: have no usable image column at all).
 RECOMMENDED_ORDER = (
     "rough_country",
+    # Placed right after Rough Country on measured fill rates of its own: images on 784 of 828
+    # rows, a real description on 780, and a specs list (tune required, 50-state legality, CARB
+    # EO) nothing else in this list carries.
+    "sb",
     "the_wheel_group",
     "wps",
     "wheelpros",

@@ -37,6 +37,7 @@ from src.integrations.services import quadratec as quadratec_services
 from src.integrations import credentials as credentials_helper
 from src.integrations import rate_limit as rate_limit_base
 from src.integrations.services import rough_country as rough_country_services
+from src.integrations.services import sb as sb_services
 from src.integrations.clients.the_wheel_group import exceptions as the_wheel_group_exceptions
 from src.integrations.services import the_wheel_group as the_wheel_group_services
 from src.integrations.services import tirerack as tirerack_services
@@ -71,6 +72,7 @@ _PRICING_SYNC_KINDS = frozenset(
         src_enums.BrandProviderKind.THE_WHEEL_GROUP.value,
         src_enums.BrandProviderKind.TRI_STATE.value,
         src_enums.BrandProviderKind.ALLPRO_DISTRIBUTING.value,
+        src_enums.BrandProviderKind.SB.value,
         src_enums.BrandProviderKind.ATD.value,
     }
 )
@@ -299,6 +301,12 @@ def _fetch_raw_pricing(cp: src_models.CompanyProviders, use_delta_fetch: bool = 
     elif kind == src_enums.BrandProviderKind.DLG.value:
         dlg_services.sync_dlg_company_pricing_for_company_provider(cp.id)
 
+    elif kind == src_enums.BrandProviderKind.SB.value:
+        # Reads no feed: S&B publish one price sheet for the whole dealer network, so this just
+        # applies this company's dealer level to prices the catalog ingest already stored. See
+        # src.integrations.services.sb's module docstring.
+        sb_services.sync_sb_company_pricing_for_company_provider(cp.id)
+
     elif kind == src_enums.BrandProviderKind.PREMIER_PERFORMANCE.value:
         # NOT fetch_and_save_all_premier_brand_parts() -- that only maintains the SHARED
         # PremierParts/PremierBrand catalog via the primary CompanyProvider (still called from
@@ -378,6 +386,9 @@ def _sync_master_pricing(cp: src_models.CompanyProviders) -> None:
 
     elif kind == src_enums.BrandProviderKind.DLG.value:
         master_parts.sync_provider_pricing_from_dlg_for_company(company_id)
+
+    elif kind == src_enums.BrandProviderKind.SB.value:
+        master_parts.sync_provider_pricing_from_sb_for_company(company_id)
 
     elif kind == src_enums.BrandProviderKind.PREMIER_PERFORMANCE.value:
         master_parts.sync_provider_pricing_from_premier_for_company(company_id)

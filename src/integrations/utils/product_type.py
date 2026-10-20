@@ -332,6 +332,54 @@ WPS_PRODUCT_TYPE_TYPES = {
     "Replacement Parts": None,
 }
 
+# S&B Filters ``category`` -- the complete 38-value vocabulary, every row of the catalog carries
+# one. S&B make intakes, filters, fuel and water tanks, particle separators and the brackets and
+# pipework that go with them; **there is not a wheel or a tire anywhere in the catalog**, so every
+# value resolves to PART and none is left undecided. That makes this a closed vocabulary in the
+# strongest sense -- unlike Turn 14's or Keystone's, there is no catch-all bucket here that could
+# quietly hold a wheel.
+SB_CATEGORY_TYPES = {
+    "Air Filter": PART,
+    "Air Hood Scoops": PART,
+    "Air Intake Kit": PART,
+    "Air Scoop": PART,
+    "Battery Hold-Down Brackets": PART,
+    "Body Mount": PART,
+    "Boot Kit": PART,
+    "Cleaning Kit": PART,
+    "Cold Air Intake": PART,
+    "Fog Light Kit": PART,
+    "Fuel Sending Unit": PART,
+    "Fuel Tank": PART,
+    "Fuel Tank Accessory": PART,
+    "Heater Block": PART,
+    "Heater Core Hose": PART,
+    "Intake Elbow": PART,
+    "Intercooler Pipe": PART,
+    "Intercooler Pipe Kit": PART,
+    "JLT Accessory": PART,
+    "JLT Air Filter": PART,
+    "JLT Cold Air Intake": PART,
+    "JLT Filter Wrap": PART,
+    "MAP Sensor Spacer": PART,
+    "Mud Flap Delete": PART,
+    "Open Air Intake": PART,
+    "Particle Separator": PART,
+    "Particle Separator Accessory": PART,
+    "Resonator Delete": PART,
+    "S&B Filter Wrap": PART,
+    "Snorkel": PART,
+    "Tool Tray": PART,
+    "Trailing Arm Sensor Guards": PART,
+    "Turbo Inlet Manifold": PART,
+    "Turbo Screen": PART,
+    "Valance": PART,
+    "Van Wideouts": PART,
+    "Water Tank": PART,
+    "Y-Pipe": PART,
+}
+
+
 # Rough Country ``category`` -- complete 35-value vocabulary. ``RC Wheels`` (716) is their own
 # wheel line and ``Wheels`` (41) the generic bucket; ``Wheel Well Liners`` (63) is bodywork.
 ROUGH_COUNTRY_CATEGORY_TYPES = {
@@ -456,6 +504,11 @@ def classify_wps(product_type: typing.Any) -> typing.Optional[Verdict]:
 def classify_rough_country(category: typing.Any) -> typing.Optional[Verdict]:
     """Rough Country ``category`` (7,959 of 7,960 rows carry one)."""
     return _lookup_category(category, ROUGH_COUNTRY_CATEGORY_TYPES, "rough_country:category")
+
+
+def classify_sb(category: typing.Any) -> typing.Optional[Verdict]:
+    """S&B ``category`` (every catalog row carries one). See SB_CATEGORY_TYPES."""
+    return _lookup_category(category, SB_CATEGORY_TYPES, "sb:category")
 
 
 def classify_premier_category(part_category: typing.Any) -> typing.Optional[Verdict]:
@@ -675,6 +728,7 @@ SOURCE_TIER = {
     "turn14": 2,
     "wps": 2,
     "rough_country": 2,
+    "sb": 2,
     "helmet_house": 2,
     "meyer": 2,
     "premier": 2,

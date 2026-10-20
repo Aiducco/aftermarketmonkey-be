@@ -184,6 +184,10 @@ def _rough_country(row, ctx):
     return pt.classify_rough_country(row["category"])
 
 
+def _sb(row, ctx):
+    return pt.classify_sb(row["category"])
+
+
 def _helmet_house(row, ctx):
     return pt.classify_helmet_house(row["category"])
 
@@ -298,6 +302,14 @@ SOURCES = (
         raw_key_column="sku",
         select_columns=("category",),
         classify=_rough_country,
+    ),
+    _Source(
+        name="sb",
+        provider_kind=src_enums.BrandProviderKind.SB.value,
+        raw_table="sb_parts",
+        raw_key_column="sku",
+        select_columns=("category",),
+        classify=_sb,
     ),
     _Source(
         name="helmet_house",

@@ -153,6 +153,14 @@ def _get_mappings_for_brand(brand):
         out.append("helmet_house")
     if src_models.BrandTheWheelGroupBrandMapping.objects.filter(brand=brand).exists():
         out.append("the_wheel_group")
+    if src_models.BrandAllProBrandMapping.objects.filter(brand=brand).exists():
+        out.append("allpro")
+    if src_models.BrandTSEBrandMapping.objects.filter(brand=brand).exists():
+        out.append("tse")
+    if src_models.BrandSbBrandMapping.objects.filter(brand=brand).exists():
+        out.append("sb")
+    if src_models.BrandATDBrandMapping.objects.filter(brand=brand).exists():
+        out.append("atd")
     return out
 
 
@@ -481,6 +489,98 @@ def merge_brands(brand_to_keep, brand_to_delete, confirm=_confirm):
             if confirm(
                 "  Update mapping id={} brand_id {} -> {} (the_wheel_group_brand={})?".format(
                     m.id, delete_id, keep_id, m.the_wheel_group_brand.name
+                )
+            ):
+                m.brand_id = keep_id
+                m.save()
+
+    # 5k. BrandAllProBrandMapping
+    allpro_list = list(
+        src_models.BrandAllProBrandMapping.objects.filter(brand_id=delete_id).select_related("allpro_brand")
+    )
+    print("\n--- BrandAllProBrandMapping: {} to process ---".format(len(allpro_list)))
+    for m in allpro_list:
+        existing = src_models.BrandAllProBrandMapping.objects.filter(
+            brand_id=keep_id, allpro_brand=m.allpro_brand
+        ).first()
+        if existing:
+            if confirm(
+                "  Delete mapping id={} (allpro_brand={})? Keep already has.".format(m.id, m.allpro_brand.name)
+            ):
+                m.delete()
+        else:
+            if confirm(
+                "  Update mapping id={} brand_id {} -> {} (allpro_brand={})?".format(
+                    m.id, delete_id, keep_id, m.allpro_brand.name
+                )
+            ):
+                m.brand_id = keep_id
+                m.save()
+
+    # 5l. BrandTSEBrandMapping
+    tse_list = list(
+        src_models.BrandTSEBrandMapping.objects.filter(brand_id=delete_id).select_related("tse_brand")
+    )
+    print("\n--- BrandTSEBrandMapping: {} to process ---".format(len(tse_list)))
+    for m in tse_list:
+        existing = src_models.BrandTSEBrandMapping.objects.filter(
+            brand_id=keep_id, tse_brand=m.tse_brand
+        ).first()
+        if existing:
+            if confirm(
+                "  Delete mapping id={} (tse_brand={})? Keep already has.".format(m.id, m.tse_brand.name)
+            ):
+                m.delete()
+        else:
+            if confirm(
+                "  Update mapping id={} brand_id {} -> {} (tse_brand={})?".format(
+                    m.id, delete_id, keep_id, m.tse_brand.name
+                )
+            ):
+                m.brand_id = keep_id
+                m.save()
+
+    # 5m. BrandSbBrandMapping
+    sb_list = list(
+        src_models.BrandSbBrandMapping.objects.filter(brand_id=delete_id).select_related("sb_brand")
+    )
+    print("\n--- BrandSbBrandMapping: {} to process ---".format(len(sb_list)))
+    for m in sb_list:
+        existing = src_models.BrandSbBrandMapping.objects.filter(
+            brand_id=keep_id, sb_brand=m.sb_brand
+        ).first()
+        if existing:
+            if confirm(
+                "  Delete mapping id={} (sb_brand={})? Keep already has.".format(m.id, m.sb_brand.name)
+            ):
+                m.delete()
+        else:
+            if confirm(
+                "  Update mapping id={} brand_id {} -> {} (sb_brand={})?".format(
+                    m.id, delete_id, keep_id, m.sb_brand.name
+                )
+            ):
+                m.brand_id = keep_id
+                m.save()
+
+    # 5n. BrandATDBrandMapping
+    atd_list = list(
+        src_models.BrandATDBrandMapping.objects.filter(brand_id=delete_id).select_related("atd_brand")
+    )
+    print("\n--- BrandATDBrandMapping: {} to process ---".format(len(atd_list)))
+    for m in atd_list:
+        existing = src_models.BrandATDBrandMapping.objects.filter(
+            brand_id=keep_id, atd_brand=m.atd_brand
+        ).first()
+        if existing:
+            if confirm(
+                "  Delete mapping id={} (atd_brand={})? Keep already has.".format(m.id, m.atd_brand.name)
+            ):
+                m.delete()
+        else:
+            if confirm(
+                "  Update mapping id={} brand_id {} -> {} (atd_brand={})?".format(
+                    m.id, delete_id, keep_id, m.atd_brand.name
                 )
             ):
                 m.brand_id = keep_id

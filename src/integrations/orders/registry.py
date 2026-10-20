@@ -1,6 +1,6 @@
 """
 Maps a distributor's ``Providers.kind`` to its ``DistributorOrderAdapter`` implementation.
-Distributors with no entry here (today: SDC, A-Tech, DLG, Rough Country) have no order API of
+Distributors with no entry here (today: SDC, A-Tech, DLG, S&B, Rough Country) have no order API of
 their own — but may still be order-capable via the Email channel (see get_adapter() below).
 
 Adapters are added one at a time as each distributor's phase lands (see the Purchase Orders

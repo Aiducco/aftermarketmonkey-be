@@ -113,6 +113,13 @@ PROVIDER_PRIORITY = [
     "WHEELPROS",            # 100%, 341 chars. product_type.py: structural feed signal
     "TIRERACK",             # 100%, 158 chars. Confirmed rich real tire titles
     "ROUGH_COUNTRY",        # 100%, 216 chars
+    "SB",                  # NOT measured against live rows -- placed here on the fields it
+                            # carries, not on a sample: a closed 38-value category vocabulary
+                            # (product_type.py), a title that names the part type outright
+                            # ("56 Gallon Replacement Fuel Tank for 2011-2016 Ford Powerstroke
+                            # 6.7L"), filter media and application, plus a real HTML description
+                            # on 780 of 828 rows. Re-measure it the next time this list is
+                            # re-sampled and move it on the number rather than the reasoning.
     "MOTOR_STATE_DISTRIBUTING",  # 100%, 204 chars -- see the note below; promoted out of the
                                  # no-signal tier, it carries a dedicated long_description
     "THE_WHEEL_GROUP",      # 100%, 198 chars. product_type.py: structural feed signal

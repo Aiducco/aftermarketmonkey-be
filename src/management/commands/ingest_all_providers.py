@@ -5,7 +5,7 @@ enqueued for all active company-providers, then Meilisearch zero-downtime reinde
 
 Architecture overview:
   Phase 1 — Source fetch (all providers sequential):
-    All distributors (Turn14, Keystone, Meyer, A-Tech, Rough Country, DLG, WheelPros,
+    All distributors (Turn14, Keystone, Meyer, A-Tech, Rough Country, DLG, S&B, WheelPros,
     Premier) run one-at-a-time with memory reclaimed between each to stay within
     server RAM limits. Per-company pricing is no longer embedded here, so each
     provider only loads its own catalog/inventory — much lighter than before.
@@ -60,6 +60,7 @@ from src.integrations.services import (
     premier,
     quadratec,
     rough_country,
+    sb,
     the_wheel_group,
     tirerack,
     tristate,
@@ -163,6 +164,7 @@ class Command(BaseCommand):
             "ingest_all_providers_helmet_house",
             "ingest_all_providers_tristate",
             "ingest_all_providers_allpro",
+            "ingest_all_providers_sb",
             "ingest_all_providers_sync_all_master_parts",
             "ingest_all_providers_enqueue_pricing_jobs",
             "ingest_all_providers_meilisearch_reindex",
@@ -206,6 +208,7 @@ class Command(BaseCommand):
                 ("helmet_house",  self._run_helmet_house),
                 ("tristate",      self._run_tristate),
                 ("allpro",        self._run_allpro),
+                ("sb",           self._run_sb),
                 ("atd",          self._run_atd),
             ]
             for name, run_fn in phase1_providers:
@@ -400,6 +403,28 @@ class Command(BaseCommand):
             self._ingest_log("DLG: inventory SFTP + upsert")
             dlg.fetch_and_save_dlg_catalog(force_download=False)
             dlg.sync_unmapped_dlg_brands_to_brands()
+
+    def _run_sb(self) -> None:
+        with self._audited_step(
+            "ingest_all_providers_sb",
+            "S&B source fetch + unmapped brand sync complete (derived in sync_all).",
+            continue_on_error=True,
+        ):
+            # Two shared Google Sheets hold the whole S&B/JLT catalog, pricing and fitment, so
+            # there is nothing per-company to iterate here. force_download is deliberately OFF:
+            # this command runs hourly, the client caches both workbooks for six hours, and S&B
+            # revise their price sheet a handful of times a year -- pulling 2 MB from Google every
+            # hour would buy nothing and invite throttling. Same reasoning as Rough Country, whose
+            # client caches for the same six hours. Use ``sync_sb --force-download`` for an
+            # immediate refresh after S&B announce a price change.
+            self._ingest_log("S&B: dealer workbooks + unmapped brand sync")
+            sb.fetch_and_save_sb(force_download=False)
+            sb.sync_unmapped_sb_brands_to_brands()
+            # Live inventory is the per-company half: each dealer's forwarded file on their own
+            # relay folder. Cached the same way, so an hourly pass is a cheap stat() unless a new
+            # file has actually landed.
+            self._ingest_log("S&B: live inventory relay sweep")
+            sb.fetch_and_save_sb_inventory(force_download=False)
 
     def _run_tristate(self) -> None:
         with self._audited_step(

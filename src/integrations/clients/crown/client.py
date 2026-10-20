@@ -15,7 +15,7 @@ anything at all, so the connection can move off WAITING. Parsing/ingestion (a re
 provider-part sync, the way Meyer and A-Tech have) is a separate piece of work for once a real
 file -- and its format -- actually exists to build against.
 
-Every relay-provisioned provider (Meyer, A-Tech, DLG, TWG, Crown) shares one ``uploads/`` folder
+Every relay-provisioned provider (Meyer, A-Tech, DLG, TWG, S&B, Crown) shares one ``uploads/`` folder
 per company, so "any file" has to exclude the other providers' own known filenames -- otherwise a
 file one of THEM dropped reads as Crown's. Confirmed live 2026-10-13: SunCoast's Crown connection
 read DLG's freshly-dropped ``dlg_inventory.csv`` as its own and reported INGESTING with nothing
@@ -53,6 +53,12 @@ _OTHER_PROVIDER_EXACT_FILENAMES = frozenset({
     "meyer pricing.csv",
     "meyer inventory.csv",
     "atechfile.txt",
+    # S&B's forwarded live-inventory file -- see src.constants.SB_INVENTORY_FILENAMES, which is
+    # the list this mirrors. Keep the two in step.
+    "sb_inventory.csv",
+    "sb_inventory.xlsx",
+    "sb_inventory.csv",
+    "sb_inventory.xlsx",
 })
 _OTHER_PROVIDER_FILENAME_PATTERNS = (re.compile(r"^twg.*inventory.*\.csv$", re.IGNORECASE),)
 

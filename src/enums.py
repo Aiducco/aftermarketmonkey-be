@@ -100,6 +100,7 @@ class BrandProviderKind(enum.Enum):
     TIRERACK = 36
     QUADRATEC = 37
     TRI_STATE = 38
+    SB = 39
 
 class ProductType(enum.Enum):
     """

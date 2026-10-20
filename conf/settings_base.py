@@ -594,6 +594,31 @@ DLG_SFTP_DIRECTORY = os.environ.get("DLG_SFTP_DIRECTORY") or "uploads"
 DLG_INVENTORY_REMOTE_FILE = os.environ.get("DLG_INVENTORY_REMOTE_FILE") or "dlg_inventory.csv"
 DLG_INVENTORY_LOCAL_PATH = os.environ.get("DLG_INVENTORY_LOCAL_PATH", "/tmp/dlg_inventory.csv")
 
+# S&B Filters. The catalog, pricing and fitment workbooks are shared with S&B's whole dealer
+# network, so their URLs default from ``src.constants`` and these are overrides only -- useful for
+# pointing a staging box at a copy of the sheets, or if S&B move them. Set the full export URL,
+# not the sheet id.
+SB_PRICING_MASTER_URL = os.environ.get("SB_PRICING_MASTER_URL", "")
+SB_SHOPIFY_EXPORT_URL = os.environ.get("SB_SHOPIFY_EXPORT_URL", "")
+# Where the downloaded workbooks are cached (6-hour TTL, see the client). Defaults to the system
+# temp dir, which is right for a single-process box; point it at a shared volume if the ingest and
+# the pricing jobs ever run on different hosts, so they share one cache.
+SB_LOCAL_FEED_DIR = os.environ.get("SB_LOCAL_FEED_DIR", "")
+
+# S&B live inventory: relay host/port/folder default from ``src.constants``; the app-level SFTP
+# login (used only when a CompanyProvider has no relay account of its own) comes from env, same as
+# DLG above.
+SB_RELAY_SFTP_USER = os.environ.get("SB_RELAY_SFTP_USER", "")
+SB_RELAY_SFTP_PASSWORD = os.environ.get("SB_RELAY_SFTP_PASSWORD", "")
+try:
+    _sb_port = int(os.environ.get("SB_SFTP_PORT") or "22")
+except ValueError:
+    _sb_port = 22
+SB_SFTP_HOST = os.environ.get("SB_SFTP_HOST") or ""
+SB_SFTP_PORT = _sb_port if 1 <= _sb_port <= 65535 else 22
+SB_SFTP_DIRECTORY = os.environ.get("SB_SFTP_DIRECTORY") or ""
+SB_INVENTORY_LOCAL_DIR = os.environ.get("SB_INVENTORY_LOCAL_DIR", "/tmp")
+
 # ASAP Network: paid catalog API, global token (not per-company — see CompanyProviders docstring
 # for why this isn't stored there). No documented rate limit. Lowered from an earlier default of
 # 8 concurrent workers after a full-catalog run hit repeated read timeouts - likely us overloading

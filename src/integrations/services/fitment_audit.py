@@ -40,12 +40,17 @@ logger = logging.getLogger(__name__)
 
 _LOG_PREFIX = "[FITMENT-AUDIT]"
 
-# Providers whose feeds actually carry vehicle fitment -- confirmed against
-# master_part_fitments.source_provider_id, which holds exactly these three and nothing else
-# (Turn 14 14.3M rows, ASAP Network 905k, Rough Country 273k). A vehicle-specific part sold
-# only through anything else cannot have fitment no matter how correct the rest of the pipeline
-# is, and that difference is the whole point of splitting the gap in two.
-FITMENT_CAPABLE_PROVIDERS = ("Turn 14", "ASAP Network", "Rough Country")
+# Providers whose feeds actually carry vehicle fitment -- measured against
+# master_part_fitments.source_provider_id (Turn 14 14.3M rows, ASAP Network 905k, Rough Country
+# 273k). A vehicle-specific part sold only through anything else cannot have fitment no matter how
+# correct the rest of the pipeline is, and that difference is the whole point of splitting the gap
+# in two.
+#
+# S&B joined the list when their integration landed: their dealer workbooks carry year/make/model
+# **and engine** for 724 of 828 SKUs, written through sync_master_part_fitments_from_sb. Leaving
+# them out would have filed S&B's vehicle-specific intakes under "cannot have fitment", which is
+# no longer true -- re-measure the row counts here the next time this comment is revisited.
+FITMENT_CAPABLE_PROVIDERS = ("Turn 14", "ASAP Network", "Rough Country", "S&B Filters")
 
 # Feeds whose entire catalog is one non-fitted product class, keyed by BrandProviderKind.
 _CATALOG_LEVEL_SOURCES = (
