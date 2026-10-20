@@ -16,12 +16,12 @@ around a few narrower jobs instead of one feed-ingest job:
      that curated 146-brand set, even though get_brands itself returns Tri-State's full ~717
      brand catalog).
 
-  2. ``sync_unmapped_tse_brands_to_brands`` -- map TSEBrand rows to Brands by exact AAIA code
-     match only. No fuzzy name matching and no brand auto-creation: AAIA-code matching was
-     confirmed far more reliable than name matching for this distributor's brand list during
-     exploration, and creating new global Brands rows from a 146-brand curated list is a bigger
-     product decision than this integration should make unilaterally -- an unmatched TSEBrand
-     just stays unmapped (logged), and is skipped everywhere downstream.
+  2. ``sync_unmapped_tse_brands_to_brands`` -- map TSEBrand rows to Brands: exact AAIA code, then
+     compact-key, then fuzzy word-prefix match, otherwise create a new Brands row -- same
+     technique as AllPro/Keystone/DLG (see src.integrations.utils.brand_matching). Confirmed live
+     2026-10-20 that AAIA-only left 46% of TSE's 146 curated brands unmapped despite most of them
+     already existing in Brands under a different code or name variant, the same class of gap
+     found and fixed for AllPro the same day.
 
   3. ``fetch_tristate_inventory_and_pricing_for_company`` -- the actual live sync: for a given
      company's connection, batch-call get_inventory_and_pricing (always with ``aliasing=True``)
@@ -51,6 +51,22 @@ from src import models as src_models
 from src.integrations import credentials as credentials_helper
 from src.integrations.clients.tristate import client as tristate_client
 from src.integrations.clients.tristate import exceptions as tristate_exceptions
+from src.integrations.utils.brand_matching import (
+    best_fuzzy_brand_match,
+    brands_by_compact_key,
+    brands_by_first_token_upper,
+    normalize_compact_key,
+    normalize_upper_words,
+)
+
+# Hand-verified collision, confirmed live 2026-10-20: the fuzzy matcher's otherwise-correct
+# word-prefix logic resolves this TSEBrand to Brand id=3978 ("RAM", aaia=BCKL) -- the same
+# canonical row AllPro's unrelated "RAM Trailer Parts" also resolves to. "Ram Mounts" (phone/
+# tablet mounting hardware) and "RAM Trailer Parts" (towing equipment) are almost certainly two
+# different real-world brands sharing one ambiguous single-word canonical entry -- auto-linking
+# either would risk misattributing parts to the wrong brand, so this one name is excluded from
+# fuzzy resolution rather than trusted. Left for manual review instead.
+_FUZZY_MATCH_EXCLUSIONS = {"RAM MOUNTS"}
 
 logger = logging.getLogger(__name__)
 
@@ -133,8 +149,33 @@ def refresh_tse_brands_from_api(company_provider_id: int) -> int:
 
 
 def sync_unmapped_tse_brands_to_brands() -> int:
-    """Map TSEBrand -> Brands by exact AAIA code only. Returns the number newly mapped."""
-    logger.info("{} Syncing unmapped TSE brands to Brands (AAIA code only).".format(_LOG_PREFIX))
+    """
+    Map TSEBrand -> Brands: exact AAIA code, then compact-key, then fuzzy word-prefix match --
+    same technique as AllPro/Keystone/DLG, see src.integrations.utils.brand_matching. Confirmed
+    live 2026-10-20 that AAIA-only left 67 of TSE's 146 curated brands unmapped (46%), yet 54 of
+    those 67 already existed in Brands under a different code or name variant -- several of them
+    (GEN-Y Hitch, Big Country Truck Accessories, Iconic Accessories, Boomerang Rubber Company)
+    are the exact same AllPro-confirmed cases fixed the same day. Supersedes this function's
+    earlier AAIA-only approach and its docstring's claim that fuzzy matching was "confirmed less
+    reliable" -- that exploration evidently predates this technique's word-prefix alignment.
+
+    For whatever still remains unresolved, creates a new Brands row -- same as AllPro's phase 4,
+    per explicit instruction 2026-10-20. Confirmed live only 13 of TSE's 146 curated brands reach
+    this phase (AAMP of America, Milwaukee Tool, Polk Audio, Powerbass, etc.) after the three
+    phases above, so this is a small, deliberate top-up rather than blind mass-creation. See
+    _FUZZY_MATCH_EXCLUSIONS for one hand-verified exception excluded from auto-resolution even
+    though the matcher finds it (left unmapped rather than wrongly linked or wrongly created).
+
+    Also upserts BrandProviders(brand, TSE) for every resolved brand, same bookkeeping AllPro's
+    equivalent added. Returns the number of TSEBrand rows newly mapped.
+    """
+    logger.info(
+        "{} Syncing unmapped TSE brands to Brands (code, compact, fuzzy, else leave unmapped).".format(_LOG_PREFIX)
+    )
+
+    tse_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.TRI_STATE.value,
+    ).first()
 
     mapped_tse_ids = set(
         src_models.BrandTSEBrandMapping.objects.values_list("tse_brand_id", flat=True).distinct()
@@ -149,22 +190,116 @@ def sync_unmapped_tse_brands_to_brands() -> int:
         logger.info("{} No unmapped TSE brands with an AAIA code. Nothing to sync.".format(_LOG_PREFIX))
         return 0
 
+    resolved_by_id: typing.Dict[int, src_models.Brands] = {}
+
+    # Phase 1 -- exact AAIA code.
     aaia_codes = {tb.aaia_code.strip().upper() for tb in unmapped if tb.aaia_code}
     brand_by_aaia: typing.Dict[str, src_models.Brands] = {}
     for b in src_models.Brands.objects.filter(aaia_code__in=aaia_codes).order_by("id"):
         key = (b.aaia_code or "").strip().upper()
         if key and key not in brand_by_aaia:
             brand_by_aaia[key] = b
-
-    new_mappings = []
-    unresolved = []
     for tb in unmapped:
-        brand = brand_by_aaia.get((tb.aaia_code or "").strip().upper())
-        if brand:
-            new_mappings.append(src_models.BrandTSEBrandMapping(brand=brand, tse_brand=tb))
-        else:
-            unresolved.append("{} ({})".format(tb.name, tb.aaia_code))
+        code = (tb.aaia_code or "").strip().upper()
+        if code:
+            brand = brand_by_aaia.get(code)
+            if brand:
+                resolved_by_id[tb.id] = brand
 
+    # Phase 2 -- compact key.
+    still_unresolved = [tb for tb in unmapped if tb.id not in resolved_by_id]
+    compact_matches = 0
+    if still_unresolved:
+        compact_index = brands_by_compact_key()
+        for tb in still_unresolved:
+            if (tb.name or "").strip().upper() in _FUZZY_MATCH_EXCLUSIONS:
+                continue
+            key = normalize_compact_key(tb.name or "")
+            if not key:
+                continue
+            brand = compact_index.get(key)
+            if brand:
+                resolved_by_id[tb.id] = brand
+                compact_matches += 1
+
+    # Phase 3 -- fuzzy word-prefix match.
+    still_unresolved = [tb for tb in unmapped if tb.id not in resolved_by_id]
+    fuzzy_matches = 0
+    if still_unresolved:
+        brands_first_index = brands_by_first_token_upper()
+        all_brands_fallback: typing.Optional[typing.List[src_models.Brands]] = None
+        for tb in still_unresolved:
+            if (tb.name or "").strip().upper() in _FUZZY_MATCH_EXCLUSIONS:
+                continue
+            parts = normalize_upper_words(tb.name or "").split()
+            candidates: typing.List[src_models.Brands] = (
+                list(brands_first_index.get(parts[0], ())) if parts else []
+            )
+            if not candidates:
+                if all_brands_fallback is None:
+                    all_brands_fallback = list(
+                        src_models.Brands.objects.only("id", "name", "aaia_code").order_by("id")
+                    )
+                candidates = all_brands_fallback
+            brand = best_fuzzy_brand_match(tb.name or "", candidates)
+            if brand:
+                resolved_by_id[tb.id] = brand
+                fuzzy_matches += 1
+                logger.debug(
+                    "{} Fuzzy-matched TSE {!r} to Brand id={} name={!r}.".format(
+                        _LOG_PREFIX, tb.name, brand.id, brand.name
+                    )
+                )
+
+    # Phase 4 -- create a new Brands row for anything still unresolved (excluding the hand-
+    # verified collision in _FUZZY_MATCH_EXCLUSIONS, which stays unmapped on purpose).
+    still_unresolved = [
+        tb for tb in unmapped
+        if tb.id not in resolved_by_id and (tb.name or "").strip().upper() not in _FUZZY_MATCH_EXCLUSIONS
+    ]
+    created_brands = 0
+    if still_unresolved:
+        new_name_to_aaia: typing.Dict[str, typing.Optional[str]] = {}
+        for tb in sorted(still_unresolved, key=lambda x: x.id):
+            name_upper = (tb.name or "").strip().upper()
+            if not name_upper or name_upper in new_name_to_aaia:
+                continue
+            new_name_to_aaia[name_upper] = (tb.aaia_code or "").strip().upper() or None
+
+        existing_names = set(
+            src_models.Brands.objects.filter(name__in=list(new_name_to_aaia.keys())).values_list(
+                "name", flat=True
+            )
+        )
+        new_rows = [
+            src_models.Brands(
+                name=name,
+                status=src_enums.BrandProviderStatus.ACTIVE.value,
+                status_name=src_enums.BrandProviderStatus.ACTIVE.name,
+                aaia_code=aaia_val,
+            )
+            for name, aaia_val in new_name_to_aaia.items()
+            if name not in existing_names
+        ]
+        if new_rows:
+            src_models.Brands.objects.bulk_create(new_rows, ignore_conflicts=True)
+            created_brands = len(new_rows)
+
+        by_name = {
+            b.name: b
+            for b in src_models.Brands.objects.filter(name__in=list(new_name_to_aaia.keys()))
+        }
+        for tb in still_unresolved:
+            name_upper = (tb.name or "").strip().upper()
+            brand = by_name.get(name_upper)
+            if brand:
+                resolved_by_id[tb.id] = brand
+
+    new_mappings = [
+        src_models.BrandTSEBrandMapping(brand=resolved_by_id[tb.id], tse_brand=tb)
+        for tb in unmapped
+        if tb.id in resolved_by_id
+    ]
     if new_mappings:
         pgbulk.upsert(
             src_models.BrandTSEBrandMapping,
@@ -172,9 +307,33 @@ def sync_unmapped_tse_brands_to_brands() -> int:
             unique_fields=["brand", "tse_brand"],
             update_fields=[],
         )
+
+    bp_to_create = []
+    if tse_provider and resolved_by_id:
+        brand_ids = {b.id for b in resolved_by_id.values()}
+        existing_bp_ids = set(
+            src_models.BrandProviders.objects.filter(
+                provider=tse_provider, brand_id__in=brand_ids,
+            ).values_list("brand_id", flat=True)
+        )
+        bp_to_create = [
+            src_models.BrandProviders(brand_id=bid, provider_id=tse_provider.id)
+            for bid in brand_ids
+            if bid not in existing_bp_ids
+        ]
+        if bp_to_create:
+            src_models.BrandProviders.objects.bulk_create(bp_to_create, ignore_conflicts=True)
+
+    unresolved_names = [
+        "{} ({})".format(tb.name, tb.aaia_code) for tb in unmapped if tb.id not in resolved_by_id
+    ]
     logger.info(
-        "{} Mapped {}/{} unmapped TSE brands; {} unresolved (no matching AAIA code in Brands): {}".format(
-            _LOG_PREFIX, len(new_mappings), len(unmapped), len(unresolved), ", ".join(unresolved[:20])
+        "{} Mapped {}/{} unmapped TSE brands (aaia: {}, compact: {}, fuzzy: {}, created: {}); "
+        "{} unresolved; {} BrandProviders created. Unresolved: {}".format(
+            _LOG_PREFIX, len(resolved_by_id), len(unmapped),
+            len(resolved_by_id) - compact_matches - fuzzy_matches - created_brands,
+            compact_matches, fuzzy_matches, created_brands,
+            len(unresolved_names), len(bp_to_create), ", ".join(unresolved_names[:20]),
         )
     )
     return len(new_mappings)
