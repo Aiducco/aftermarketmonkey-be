@@ -12,6 +12,10 @@ resurrected from a stale relay file:
     stored credentials.
       passes -> INGESTING (connectivity fine, sync just hasn't finished yet)
       fails  -> FAILING, reason = the validator's message
+    A row the distributor keeps rejecting as invalid_credentials backs off instead of being
+    re-checked every cycle forever -- see _invalid_credentials_retry_delay and
+    CompanyProviders.status_consecutive_failures. Nothing else defers: a transient failure is
+    retried on the normal cadence.
   - Relay-provisioned kinds with an ingest client (Meyer, A-Tech, Crown, DLG, The Wheel Group):
     via integrations_services._relay_feed_connection_status — same helper connect_provider/
     update_connection use to set the initial status, so there's one source of truth for
@@ -73,6 +77,43 @@ _LOG_PREFIX = "[CHECK-COMPANY-PROVIDER-CONNECTIONS]"
 # (Keystone, Meyer, Premier, WheelPros) need 5-minute resolution either.
 _ORDER_RECHECK_INTERVAL = datetime.timedelta(hours=2)
 
+# Backoff for a feed check the distributor answers with "these credentials are wrong"
+# (CONNECTION_ERROR_INVALID_CREDENTIALS). Such a connection cannot recover on its own -- the
+# only fix is the dealer entering new credentials, which resets this state through
+# integrations_services._connection_status_fields -- so re-authenticating against the vendor
+# every 5 minutes forever buys nothing and costs a lot: ATD's Frontline Off-Road connection
+# (company 61) accumulated ~1,150 rejected logins over four days in 2026-10 that way, which is
+# how distributors come to lock an account or throttle the source IP for everyone on it.
+#
+# Mapping is "after N consecutive invalid-credential checks, wait this long before the next
+# one". The first _INVALID_CREDENTIALS_GRACE_CHECKS failures are deliberately NOT deferred:
+# someone who just mistyped a password is usually still on the page, and the 5-minute cadence is
+# what makes the status flip to CONNECTED feel immediate once they fix it. Past that it's a
+# standing misconfiguration, not a live troubleshooting session.
+_INVALID_CREDENTIALS_GRACE_CHECKS = 2
+_INVALID_CREDENTIALS_BACKOFF_SCHEDULE = (
+    (3, datetime.timedelta(minutes=15)),
+    (4, datetime.timedelta(hours=1)),
+    (5, datetime.timedelta(hours=6)),
+)
+_INVALID_CREDENTIALS_MAX_BACKOFF = datetime.timedelta(hours=24)
+
+
+def _invalid_credentials_retry_delay(
+    consecutive_failures: int,
+) -> typing.Optional[datetime.timedelta]:
+    """
+    How long to wait before re-checking a connection whose credentials have now been rejected
+    ``consecutive_failures`` times in a row, or None to leave it on the normal every-cycle
+    cadence. See _INVALID_CREDENTIALS_BACKOFF_SCHEDULE.
+    """
+    if consecutive_failures <= _INVALID_CREDENTIALS_GRACE_CHECKS:
+        return None
+    for threshold, delay in _INVALID_CREDENTIALS_BACKOFF_SCHEDULE:
+        if consecutive_failures <= threshold:
+            return delay
+    return _INVALID_CREDENTIALS_MAX_BACKOFF
+
 
 class Command(BaseCommand):
     help = (
@@ -85,6 +126,7 @@ class Command(BaseCommand):
     def handle(self, *args: typing.Any, **options: typing.Any) -> None:
         checked = 0
         skipped = 0
+        deferred = 0
         order_checked = 0
         try:
             queryset = (
@@ -106,19 +148,29 @@ class Command(BaseCommand):
                     if not credentials_helper.get_feed_credentials(cp):
                         skipped += 1
                         continue
-                    try:
-                        if kind in integrations_services._CONNECTION_VALIDATORS:
-                            self._check_validated(cp, kind)
-                            checked += 1
-                        elif kind in integrations_services._RELAY_FEED_CHECK_KINDS:
-                            self._check_relay_feed(cp, kind)
-                            checked += 1
-                        else:
-                            skipped += 1
-                    except Exception as e:  # noqa: BLE001 — one row's failure shouldn't kill the run
-                        logger.error(
-                            "{} Error checking company_provider_id={}: {}".format(_LOG_PREFIX, cp.id, e)
-                        )
+                    # Backed off after repeated credential rejections (see
+                    # _invalid_credentials_retry_delay). Only that path ever sets this, so a
+                    # relay-feed row or a row failing for transient reasons never lands here.
+                    # Skips the FEED check only, not `continue` -- order credentials live on
+                    # their own accounts with their own transport and their own recheck
+                    # interval, and a rejected feed login says nothing about whether they still
+                    # work (see this module's docstring).
+                    if cp.status_next_check_at and cp.status_next_check_at > timezone.now():
+                        deferred += 1
+                    else:
+                        try:
+                            if kind in integrations_services._CONNECTION_VALIDATORS:
+                                self._check_validated(cp, kind)
+                                checked += 1
+                            elif kind in integrations_services._RELAY_FEED_CHECK_KINDS:
+                                self._check_relay_feed(cp, kind)
+                                checked += 1
+                            else:
+                                skipped += 1
+                        except Exception as e:  # noqa: BLE001 — one row's failure shouldn't kill the run
+                            logger.error(
+                                "{} Error checking company_provider_id={}: {}".format(_LOG_PREFIX, cp.id, e)
+                            )
 
                 if kind in integrations_services._ORDER_CONNECTION_VALIDATORS:
                     now = timezone.now()
@@ -140,9 +192,10 @@ class Command(BaseCommand):
                                 )
                             )
 
-            message = "Checked {} connection(s), {} order connection(s), skipped {} (no check available).".format(
-                checked, order_checked, skipped
-            )
+            message = (
+                "Checked {} connection(s), {} order connection(s), skipped {} (no check "
+                "available), deferred {} (backed off after repeated credential rejections)."
+            ).format(checked, order_checked, skipped, deferred)
             self.stdout.write(self.style.SUCCESS(message))
         except Exception as e:
             self.stdout.write(self.style.ERROR("Error: {}".format(str(e))))
@@ -153,22 +206,75 @@ class Command(BaseCommand):
         cp: src_models.CompanyProviders,
         status: "src_enums.CompanyProviderConnectionStatus",
         reason: typing.Optional[str],
+        consecutive_failures: int = 0,
+        next_check_at: typing.Optional[datetime.datetime] = None,
     ) -> None:
+        """Writes the feed status plus its backoff state. The backoff arguments default to
+        "clear it" so every caller that isn't the credential-rejection path (a passing check, a
+        relay-feed check) puts the connection back on the normal every-cycle cadence without
+        having to say so."""
         cp.status = status.value
         cp.status_name = status.name
         cp.status_reason = reason
         cp.status_checked_at = timezone.now()
+        cp.status_consecutive_failures = consecutive_failures
+        cp.status_next_check_at = next_check_at
         cp.save(
-            update_fields=["status", "status_name", "status_reason", "status_checked_at", "updated_at"]
+            update_fields=[
+                "status",
+                "status_name",
+                "status_reason",
+                "status_checked_at",
+                "status_consecutive_failures",
+                "status_next_check_at",
+                "updated_at",
+            ]
         )
 
     def _check_validated(self, cp: src_models.CompanyProviders, kind: int) -> None:
         validator = integrations_services._CONNECTION_VALIDATORS[kind]
-        message, _code = validator(credentials_helper.get_feed_credentials(cp))
-        if message:
-            self._save_status(cp, src_enums.CompanyProviderConnectionStatus.FAILING, message)
-        else:
+        message, code = validator(credentials_helper.get_feed_credentials(cp))
+        if not message:
             self._save_status(cp, src_enums.CompanyProviderConnectionStatus.INGESTING, None)
+            return
+
+        if code != integrations_services.CONNECTION_ERROR_INVALID_CREDENTIALS:
+            # A timeout, an unreachable host, a 5xx -- nothing about the stored credentials is
+            # known to be wrong, and the condition can clear on its own, so this keeps the
+            # normal cadence and leaves the rejection counter untouched rather than resetting
+            # it: one blip mid-backoff shouldn't buy a permanently-bad credential set a fresh
+            # round of 5-minute retries.
+            self._save_status(
+                cp,
+                src_enums.CompanyProviderConnectionStatus.FAILING,
+                message,
+                consecutive_failures=cp.status_consecutive_failures,
+                next_check_at=cp.status_next_check_at,
+            )
+            return
+
+        consecutive_failures = (cp.status_consecutive_failures or 0) + 1
+        delay = _invalid_credentials_retry_delay(consecutive_failures)
+        next_check_at = (timezone.now() + delay) if delay else None
+        if delay:
+            logger.info(
+                "{} company_provider_id={} ({} / {}): credentials rejected {}x in a row, "
+                "next check deferred until {}.".format(
+                    _LOG_PREFIX,
+                    cp.id,
+                    cp.company.name if cp.company else "?",
+                    cp.provider.name if cp.provider else "?",
+                    consecutive_failures,
+                    next_check_at,
+                )
+            )
+        self._save_status(
+            cp,
+            src_enums.CompanyProviderConnectionStatus.FAILING,
+            message,
+            consecutive_failures=consecutive_failures,
+            next_check_at=next_check_at,
+        )
 
     def _check_relay_feed(self, cp: src_models.CompanyProviders, kind: int) -> None:
         status, reason = integrations_services._relay_feed_connection_status(cp.company, kind)

@@ -186,6 +186,22 @@ class CompanyProviders(django_db_models.Model):
     status_reason = django_db_models.TextField(null=True, blank=True)
     status_checked_at = django_db_models.DateTimeField(null=True, blank=True)
 
+    # Backoff state for the feed check above, driven entirely by check_company_provider_
+    # connections (see that command's _invalid_credentials_retry_delay). Credentials the
+    # distributor rejects outright don't start working on their own -- only the dealer entering
+    # new ones fixes them -- but the cron re-validates every pending row every ~5 minutes, which
+    # means a permanently-bad credential set keeps authenticating against the vendor forever.
+    # ATD's Frontline Off-Road connection (company 61) drove ~1,150 rejected logins that way
+    # between 2026-10-16 and 2026-10-20 before this existed; vendors lock accounts, and throttle
+    # whole source IPs, over exactly that. ``status_consecutive_failures`` counts how many checks
+    # in a row came back invalid_credentials and ``status_next_check_at`` is when the cron may
+    # try again -- both reset to 0/null the moment the check passes, the feed credentials are
+    # re-saved (see integrations_services._connection_status_fields), or the feed is
+    # disconnected. Only the credential-rejection path defers: a transient connection failure
+    # isn't the dealer's fault and still gets retried every cycle.
+    status_consecutive_failures = django_db_models.PositiveSmallIntegerField(default=0)
+    status_next_check_at = django_db_models.DateTimeField(null=True, blank=True)
+
     # Order-placement connectivity status (see src.enums.CompanyProviderOrderConnectionStatus).
     # Independent of the feed status above — a company can have a working feed with no order
     # credentials configured (null here), or order credentials that validate fine but sit in

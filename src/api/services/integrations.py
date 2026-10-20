@@ -1057,12 +1057,23 @@ def _connection_status_fields(
     """
     Field values for CompanyProviders.status/status_name/status_reason/status_checked_at —
     a dict so it works both as ``.create(**fields)`` kwargs and via setattr on an existing row.
+
+    Also clears the credential-rejection backoff the check_company_provider_connections cron
+    maintains (see CompanyProviders.status_consecutive_failures). Every caller of this reached
+    it by actually submitting feed credentials, which is the one event that can turn a rejected
+    connection into a working one — a connection sitting on a 24-hour deferral has to go back
+    to being checked promptly the moment the dealer enters something new. Note that a *failed*
+    submit never gets here: connect_provider/update_connection return the validator's error
+    without saving, so re-submitting the same bad credentials correctly leaves the backoff
+    where it is.
     """
     return {
         "status": status.value if status else None,
         "status_name": status.name if status else None,
         "status_reason": reason,
         "status_checked_at": timezone.now() if status else None,
+        "status_consecutive_failures": 0,
+        "status_next_check_at": None,
     }
 
 
@@ -1666,6 +1677,10 @@ def disconnect_provider(
         cp.status_name = None
         cp.status_reason = None
         cp.status_checked_at = None
+        # Nothing left to back off from -- and a reconnect must not inherit the old
+        # credentials' deferral (see CompanyProviders.status_consecutive_failures).
+        cp.status_consecutive_failures = 0
+        cp.status_next_check_at = None
         # Also reset the durable "has synced at least once" fact, not just the narrower status
         # enum — otherwise a later order-only call would see initial_sync_completed still True
         # and incorrectly treat this now-disconnected feed as connected for order-gating purposes

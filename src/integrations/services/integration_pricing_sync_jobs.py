@@ -748,6 +748,13 @@ def run_integration_pricing_sync_job(job: src_models.IntegrationPricingSyncJob) 
             status_name=src_enums.CompanyProviderConnectionStatus.CONNECTED.name,
             status_reason=None,
             status_checked_at=timezone.now(),
+            # A completed sync is proof the credentials work, so drop any credential-rejection
+            # backoff check_company_provider_connections had built up (see
+            # CompanyProviders.status_consecutive_failures). Rows reaching CONNECTED leave that
+            # cron's scope anyway; this keeps the state from being left behind for a later
+            # disconnect/reconnect to inherit.
+            status_consecutive_failures=0,
+            status_next_check_at=None,
         )
         # Order credentials may have already validated fine and been sitting in WAITING because
         # the feed wasn't CONNECTED yet (see CompanyProviderOrderConnectionStatus) — now that it
