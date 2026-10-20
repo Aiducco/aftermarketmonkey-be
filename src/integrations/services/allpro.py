@@ -8,9 +8,12 @@ files and their confirmed-live shapes/sizes. Four jobs, run in this order:
   1. ``fetch_and_save_allpro_brands`` -- upsert AllProBrand from APDLineCodes.txt. Prerequisite
      for catalog ingestion (AllProParts.brand is a FK to AllProBrand, not a raw AAIA string).
 
-  2. ``sync_unmapped_allpro_brands_to_brands`` -- map AllProBrand -> Brands by exact AAIA code
-     only, same reasoning as Tri-State's own brand-mapping function (AAIA-code matching is
-     reliable; no fuzzy name matching, no auto-creating new Brands rows).
+  2. ``sync_unmapped_allpro_brands_to_brands`` -- map AllProBrand -> Brands: exact AAIA code,
+     then compact-key, then fuzzy word-prefix match, otherwise create a new Brands row -- same
+     technique as Keystone/DLG/Rough Country (see src.integrations.utils.brand_matching).
+     Confirmed live 2026-10-20 that exact-AAIA-only (the original, more conservative approach)
+     left 80% of AllPro's own catalog unmapped despite most of those brands already existing in
+     Brands under a different code or name variant.
 
   3. ``fetch_and_save_allpro_catalog`` -- stream APDInventory.txt into AllProParts (shared
      catalog+inventory, not per-company -- this is AllPro's real warehouse stock, the same
@@ -47,6 +50,13 @@ from src import models as src_models
 from src.integrations import credentials as credentials_helper
 from src.integrations.clients.allpro import client as allpro_client
 from src.integrations.clients.allpro import exceptions as allpro_exceptions
+from src.integrations.utils.brand_matching import (
+    best_fuzzy_brand_match,
+    brands_by_compact_key,
+    brands_by_first_token_upper,
+    normalize_compact_key,
+    normalize_upper_words,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -119,8 +129,44 @@ def fetch_and_save_allpro_brands(company_provider_id: int) -> int:
 
 
 def sync_unmapped_allpro_brands_to_brands() -> int:
-    """Map AllProBrand -> Brands by exact AAIA code only. Returns the number newly mapped."""
-    logger.info("{} Syncing unmapped AllPro brands to Brands (AAIA code only).".format(_LOG_PREFIX))
+    """
+    Map AllProBrand -> Brands: exact AAIA code, then compact-key (punctuation/spacing-only
+    differences, e.g. 'BIG COUNTRY TRUCK ACCESSORIES' feed name vs catalog row 'BIG COUNTRY'
+    caught by the earlier fuzzy phase instead -- compact-key specifically catches things like
+    'AUTOMETER' vs 'AUTO METER'), then fuzzy word-prefix match with truncation on either side
+    (e.g. 'Big Country' vs 'BIG COUNTRY TRUCK ACCESSORIES'). Otherwise creates a new Brands row.
+    Same technique as Keystone/DLG/Rough Country -- see src.integrations.utils.brand_matching.
+
+    Confirmed live 2026-10-20: 30 of AllPro's 589 previously-"unmapped" brands (80% of its
+    catalog) were never actually missing from Brands at all -- exact-AAIA-only matching just
+    never found them (e.g. AllPro's "BDS Suspension" vs catalog's bare "BDS", "RDS Manufacturing"
+    vs "RDS MFG INC" -- an abbreviation difference no algorithm catches, added by hand once).
+
+    Backfills Brands.aaia_code when a compact/fuzzy match's own code is still null -- AllPro's
+    code is as good a source as any other distributor's for a brand nobody has coded yet, same
+    self-healing precedent as TSEBrand.warehouse_code. Never overwrites an existing code: several
+    of AllPro's own codes disagree with an already-coded Brands row (its own feed isn't always in
+    sync with AAIA's canonical list), and that existing code is presumably already relied on by
+    other distributors' own AAIA-code matching.
+
+    Also upserts BrandProviders(brand, AllPro) -- generic "this provider carries this brand"
+    bookkeeping, same role as Keystone/DLG's own BrandProviders upsert, independent of which
+    companies are actually connected (AllPro already has real company connections, unlike
+    Keystone/DLG's TICK_PERFORMANCE catalog-only placeholder, so there's no CompanyBrands step
+    here).
+
+    Returns the number of AllProBrand rows newly mapped (matched or created).
+    """
+    logger.info(
+        "{} Syncing unmapped AllPro brands to Brands (code, compact, fuzzy, else create).".format(_LOG_PREFIX)
+    )
+
+    allpro_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.ALLPRO_DISTRIBUTING.value,
+    ).first()
+    if not allpro_provider:
+        logger.warning("{} AllPro provider not found. Skipping sync.".format(_LOG_PREFIX))
+        return 0
 
     mapped_ids = set(
         src_models.BrandAllProBrandMapping.objects.values_list("allpro_brand_id", flat=True).distinct()
@@ -130,22 +176,120 @@ def sync_unmapped_allpro_brands_to_brands() -> int:
         logger.info("{} No unmapped AllPro brands. Nothing to sync.".format(_LOG_PREFIX))
         return 0
 
-    aaia_codes = {ab.aaia_code.upper() for ab in unmapped}
+    resolved_by_id: typing.Dict[int, src_models.Brands] = {}
+    backfill_aaia: typing.Dict[int, str] = {}  # brand_id -> aaia_code, only when brand's own is null
+
+    # Phase 1 -- exact AAIA code.
+    aaia_codes = {ab.aaia_code.strip().upper() for ab in unmapped if (ab.aaia_code or "").strip()}
     brand_by_aaia: typing.Dict[str, src_models.Brands] = {}
-    for b in src_models.Brands.objects.filter(aaia_code__in=aaia_codes).order_by("id"):
-        key = (b.aaia_code or "").strip().upper()
-        if key and key not in brand_by_aaia:
-            brand_by_aaia[key] = b
-
-    new_mappings = []
-    unresolved = 0
+    if aaia_codes:
+        for b in src_models.Brands.objects.filter(aaia_code__in=aaia_codes).order_by("id"):
+            key = (b.aaia_code or "").strip().upper()
+            if key and key not in brand_by_aaia:
+                brand_by_aaia[key] = b
     for ab in unmapped:
-        brand = brand_by_aaia.get(ab.aaia_code.upper())
-        if brand:
-            new_mappings.append(src_models.BrandAllProBrandMapping(brand=brand, allpro_brand=ab))
-        else:
-            unresolved += 1
+        code = (ab.aaia_code or "").strip().upper()
+        if code:
+            brand = brand_by_aaia.get(code)
+            if brand:
+                resolved_by_id[ab.id] = brand
 
+    # Phase 2 -- compact key (punctuation/spacing-only differences).
+    still_unresolved = [ab for ab in unmapped if ab.id not in resolved_by_id]
+    compact_matches = 0
+    if still_unresolved:
+        compact_index = brands_by_compact_key()
+        for ab in still_unresolved:
+            key = normalize_compact_key(ab.name or "")
+            if not key:
+                continue
+            brand = compact_index.get(key)
+            if brand:
+                resolved_by_id[ab.id] = brand
+                compact_matches += 1
+                if not brand.aaia_code and (ab.aaia_code or "").strip():
+                    backfill_aaia[brand.id] = ab.aaia_code.strip().upper()
+
+    # Phase 3 -- fuzzy word-prefix match.
+    still_unresolved = [ab for ab in unmapped if ab.id not in resolved_by_id]
+    fuzzy_matches = 0
+    if still_unresolved:
+        brands_first_index = brands_by_first_token_upper()
+        all_brands_fallback: typing.Optional[typing.List[src_models.Brands]] = None
+        for ab in still_unresolved:
+            parts = normalize_upper_words(ab.name or "").split()
+            candidates: typing.List[src_models.Brands] = (
+                list(brands_first_index.get(parts[0], ())) if parts else []
+            )
+            if not candidates:
+                if all_brands_fallback is None:
+                    all_brands_fallback = list(
+                        src_models.Brands.objects.only("id", "name", "aaia_code").order_by("id")
+                    )
+                candidates = all_brands_fallback
+            brand = best_fuzzy_brand_match(ab.name or "", candidates)
+            if brand:
+                resolved_by_id[ab.id] = brand
+                fuzzy_matches += 1
+                if not brand.aaia_code and (ab.aaia_code or "").strip():
+                    backfill_aaia[brand.id] = ab.aaia_code.strip().upper()
+                logger.debug(
+                    "{} Fuzzy-matched AllPro {!r} to Brand id={} name={!r}.".format(
+                        _LOG_PREFIX, ab.name, brand.id, brand.name
+                    )
+                )
+
+    # Phase 4 -- create a new Brands row for anything still unresolved.
+    still_unresolved = [ab for ab in unmapped if ab.id not in resolved_by_id]
+    created_brands = 0
+    if still_unresolved:
+        new_name_to_aaia: typing.Dict[str, typing.Optional[str]] = {}
+        for ab in sorted(still_unresolved, key=lambda x: x.id):
+            name_upper = (ab.name or "").strip().upper()
+            if not name_upper or name_upper in new_name_to_aaia:
+                continue
+            new_name_to_aaia[name_upper] = (ab.aaia_code or "").strip().upper() or None
+
+        existing_names = set(
+            src_models.Brands.objects.filter(name__in=list(new_name_to_aaia.keys())).values_list(
+                "name", flat=True
+            )
+        )
+        new_rows = [
+            src_models.Brands(
+                name=name,
+                status=src_enums.BrandProviderStatus.ACTIVE.value,
+                status_name=src_enums.BrandProviderStatus.ACTIVE.name,
+                aaia_code=aaia_val,
+            )
+            for name, aaia_val in new_name_to_aaia.items()
+            if name not in existing_names
+        ]
+        if new_rows:
+            src_models.Brands.objects.bulk_create(new_rows, ignore_conflicts=True)
+            created_brands = len(new_rows)
+
+        by_name = {
+            b.name: b
+            for b in src_models.Brands.objects.filter(name__in=list(new_name_to_aaia.keys()))
+        }
+        for ab in still_unresolved:
+            name_upper = (ab.name or "").strip().upper()
+            brand = by_name.get(name_upper)
+            if brand:
+                resolved_by_id[ab.id] = brand
+
+    if backfill_aaia:
+        src_models.Brands.objects.bulk_update(
+            [src_models.Brands(id=bid, aaia_code=code) for bid, code in backfill_aaia.items()],
+            ["aaia_code"],
+        )
+
+    new_mappings = [
+        src_models.BrandAllProBrandMapping(brand=resolved_by_id[ab.id], allpro_brand=ab)
+        for ab in unmapped
+        if ab.id in resolved_by_id
+    ]
     if new_mappings:
         pgbulk.upsert(
             src_models.BrandAllProBrandMapping,
@@ -153,9 +297,29 @@ def sync_unmapped_allpro_brands_to_brands() -> int:
             unique_fields=["brand", "allpro_brand"],
             update_fields=[],
         )
+
+    brand_ids = {resolved_by_id[ab.id].id for ab in unmapped if ab.id in resolved_by_id}
+    existing_bp_ids = set(
+        src_models.BrandProviders.objects.filter(
+            provider=allpro_provider, brand_id__in=brand_ids,
+        ).values_list("brand_id", flat=True)
+    )
+    bp_to_create = [
+        src_models.BrandProviders(brand_id=bid, provider_id=allpro_provider.id)
+        for bid in brand_ids
+        if bid not in existing_bp_ids
+    ]
+    if bp_to_create:
+        src_models.BrandProviders.objects.bulk_create(bp_to_create, ignore_conflicts=True)
+
+    unresolved = len(unmapped) - len(resolved_by_id)
     logger.info(
-        "{} Mapped {}/{} unmapped AllPro brands; {} unresolved (no matching AAIA code in Brands).".format(
-            _LOG_PREFIX, len(new_mappings), len(unmapped), unresolved
+        "{} Sync complete. {}/{} unmapped AllPro brands resolved (aaia: {}, compact: {}, fuzzy: {}, "
+        "created: {}); {} unresolved; {} Brands.aaia_code backfilled; {} BrandProviders created.".format(
+            _LOG_PREFIX, len(resolved_by_id), len(unmapped),
+            len(resolved_by_id) - compact_matches - fuzzy_matches - created_brands,
+            compact_matches, fuzzy_matches, created_brands, unresolved,
+            len(backfill_aaia), len(bp_to_create),
         )
     )
     return len(new_mappings)
