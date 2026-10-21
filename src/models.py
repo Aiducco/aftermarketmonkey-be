@@ -9036,3 +9036,45 @@ class PacePart(django_db_models.Model):
 
     def __str__(self) -> str:
         return "{} {}".format(self.aaia_brand_code, self.part)
+
+
+class BrandPaceBrandMapping(django_db_models.Model):
+    """
+    PaceBrand -> Brands, resolved by ``sync_pace_brands_to_brands``: exact AAIA code, then
+    compact key, then fuzzy word-prefix -- the same three phases as the TSE/AllPro/Keystone/DLG
+    syncs (src.integrations.utils.brand_matching).
+
+    Exists because PACE brand codes do NOT line up with ours: only 366 of PACE's 628 real AAIA
+    codes (58%) match a ``Brands.aaia_code`` outright, and PACE and Brands demonstrably assign
+    different codes to the same company (Putco BCJH vs FKLF, Covercraft BBLQ vs FQMN,
+    Competition Clutch GPTP vs BXVR). Without this mapping, counting how much of PACE we already
+    carry has to fall back to matching part numbers alone, which overcounts badly -- 55% on a
+    part-number-only join against 25% on brand+part.
+
+    ``match_phase`` records which phase resolved the row, so a fuzzy result can be reviewed or
+    reverted without disturbing the exact-code ones.
+    """
+
+    brand = django_db_models.ForeignKey(
+        Brands, on_delete=django_db_models.CASCADE, related_name="pace_brand_mappings"
+    )
+    pace_brand = django_db_models.ForeignKey(
+        PaceBrand, on_delete=django_db_models.CASCADE, related_name="brand_mappings"
+    )
+
+    # "aaia_code" | "compact_key" | "fuzzy" -- provenance, same reasoning as
+    # MasterPart.product_type_source: the inferential tier can be reverted on its own.
+    match_phase = django_db_models.CharField(max_length=16, blank=True, default="")
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "brand_pace_brand_mapping"
+        unique_together = ["brand", "pace_brand"]
+        indexes = [
+            django_db_models.Index(fields=["match_phase"], name="bpbm_phase_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return "{} -> {}".format(self.pace_brand_id, self.brand_id)
