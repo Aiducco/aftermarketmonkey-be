@@ -8473,6 +8473,18 @@ class PacePartBase(django_db_models.Model):
     aces = django_db_models.IntegerField(default=0, db_index=True)
 
     part_search = django_db_models.JSONField(default=list, blank=True)
+
+    # DISPLAY ONLY -- never derive fitment from these. They are three independent flattened
+    # sets, not positionally paired (CRK2046 carries 3 makes and 11 models, so no makes[i] <->
+    # models[i] mapping can exist) and 29.5% of aces=1 rows have several of both at once.
+    # Cross-producting them fabricates fitments that do not exist: for CRK2046, 3 makes x 11
+    # models x 8 years = 264 combinations of which 205 (78%) are invented -- "Cadillac
+    # Silverado 1500", "Chevrolet Escalade" and 20 other pairs that were never built.
+    #
+    # The authoritative fitment is fitment["BaseVehicleID"], joined to
+    # VcdbVehicle.base_vehicle_id, which decodes to exactly one (year, make, model) each --
+    # CRK2046's 59 ids resolve to 59 correct triples, 0 unresolved. Same trap as the flat
+    # SubModelID/EngineBaseID lists, one level up, and the same remedy.
     makes = django_db_models.JSONField(default=list, blank=True)
     models = django_db_models.JSONField(default=list, blank=True)
     years = django_db_models.JSONField(default=list, blank=True)
