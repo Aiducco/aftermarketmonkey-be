@@ -8302,3 +8302,110 @@ class BrandATDBrandMapping(django_db_models.Model):
     class Meta:
         db_table = "brand_atd_brand_mapping"
         unique_together = ["brand", "atd_brand"]
+
+
+# ---------------------------------------------------------------------------------------------
+# AAM/PACE Meilisearch taxonomy for Tri-State's storefront (search.theaamgroup.com), indexes
+# PACE_TSE_categories / PACE_TSE_brands / PACE_TSE_series.
+#
+# Deliberately standalone: these three tables are a raw landing zone for that search backend's
+# taxonomy, seeded by the one-off `import_pace_tse_taxonomy` command. They are NOT wired into
+# the Tri-State distributor integration (TSEBrand / tristate_parts / the PACE Customer API
+# client) and nothing in that integration reads them. Keeping them uncoupled is the point --
+# it lets us explore the backend without touching anything that serves live pricing.
+#
+# Every document in all three indexes embeds a full `parts` array of that node's part numbers,
+# so these are reverse indexes rather than pure taxonomy -- hence `parts` on each model.
+# ---------------------------------------------------------------------------------------------
+class PaceTseCategory(django_db_models.Model):
+    """One document of the PACE_TSE_categories index (718 as of 2026-10-21)."""
+
+    object_id = django_db_models.CharField(max_length=64, unique=True)  # md5 hash, not a code
+    name = django_db_models.CharField(max_length=255, db_index=True)
+    slug = django_db_models.CharField(max_length=255, blank=True, default="")
+
+    # Two-level hierarchy -- a top-level category has these empty, a child names its parent.
+    parent_name = django_db_models.CharField(max_length=255, blank=True, default="")
+    parent_slug = django_db_models.CharField(max_length=255, blank=True, default="")
+
+    parts = django_db_models.JSONField(default=list, blank=True)
+    series = django_db_models.JSONField(default=list, blank=True)
+    brands = django_db_models.JSONField(default=list, blank=True)  # display names, not codes
+
+    site_id = django_db_models.CharField(max_length=16, blank=True, default="")
+    member_code = django_db_models.CharField(max_length=16, blank=True, default="")
+    group_name = django_db_models.CharField(max_length=32, blank=True, default="")
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "pace_tse_categories"
+        indexes = [
+            django_db_models.Index(fields=["parent_slug"], name="ptc_parent_slug_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class PaceTseBrand(django_db_models.Model):
+    """One document of the PACE_TSE_brands index (670 as of 2026-10-21)."""
+
+    # This index's objectID *is* the AAIA brand code, so both are stored -- object_id to stay
+    # consistent with the sibling tables, aaia_brand_code because that is what it means.
+    object_id = django_db_models.CharField(max_length=64, unique=True)
+    aaia_brand_code = django_db_models.CharField(max_length=8, db_index=True)
+    name = django_db_models.CharField(max_length=255, db_index=True)
+    slug = django_db_models.CharField(max_length=255, blank=True, default="")
+    image = django_db_models.TextField(blank=True, default="")  # imgix logo URL
+
+    parts = django_db_models.JSONField(default=list, blank=True)
+    categories = django_db_models.JSONField(default=list, blank=True)
+    subcategories = django_db_models.JSONField(default=list, blank=True)
+    series = django_db_models.JSONField(default=list, blank=True)
+
+    site_id = django_db_models.CharField(max_length=16, blank=True, default="")
+    member_code = django_db_models.CharField(max_length=16, blank=True, default="")
+    group_name = django_db_models.CharField(max_length=32, blank=True, default="")
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "pace_tse_brands"
+
+    def __str__(self) -> str:
+        return "{} ({})".format(self.name, self.aaia_brand_code)
+
+
+class PaceTseSeries(django_db_models.Model):
+    """One document of the PACE_TSE_series index (9,396 as of 2026-10-21)."""
+
+    object_id = django_db_models.CharField(max_length=64, unique=True)  # md5 hash, not a code
+    name = django_db_models.CharField(max_length=255, db_index=True)
+    slug = django_db_models.CharField(max_length=255, blank=True, default="")
+
+    brand = django_db_models.CharField(max_length=255, blank=True, default="")
+    aaia_brand_code = django_db_models.CharField(max_length=8, blank=True, default="", db_index=True)
+    brand_slug = django_db_models.CharField(max_length=255, blank=True, default="")
+
+    parts = django_db_models.JSONField(default=list, blank=True)
+    categories = django_db_models.JSONField(default=list, blank=True)
+    subcategories = django_db_models.JSONField(default=list, blank=True)
+
+    site_id = django_db_models.CharField(max_length=16, blank=True, default="")
+    member_code = django_db_models.CharField(max_length=16, blank=True, default="")
+    group_name = django_db_models.CharField(max_length=32, blank=True, default="")
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "pace_tse_series"
+        indexes = [
+            django_db_models.Index(fields=["aaia_brand_code", "name"], name="pts_brand_name_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return "{} / {}".format(self.brand, self.name)
