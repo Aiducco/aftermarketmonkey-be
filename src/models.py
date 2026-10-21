@@ -8304,27 +8304,46 @@ class BrandATDBrandMapping(django_db_models.Model):
         unique_together = ["brand", "atd_brand"]
 
 
-# ---------------------------------------------------------------------------------------------
-# AAM/PACE Meilisearch taxonomy for Tri-State's storefront (search.theaamgroup.com), indexes
-# PACE_TSE_categories / PACE_TSE_brands / PACE_TSE_series.
+# =============================================================================================
+# AAM/PACE Meilisearch landing zone -- one set of four tables per PACE member distributor
+# (search.theaamgroup.com, indexes PACE_<member>_{categories,brands,series,parts}).
 #
-# Deliberately standalone: these three tables are a raw landing zone for that search backend's
-# taxonomy, seeded by the one-off `import_pace_tse_taxonomy` command. They are NOT wired into
-# the Tri-State distributor integration (TSEBrand / tristate_parts / the PACE Customer API
-# client) and nothing in that integration reads them. Keeping them uncoupled is the point --
-# it lets us explore the backend without touching anything that serves live pricing.
+# TEMPORARY, by design: these tables exist for a one-off ingestion and analysis pass across the
+# members below, after which the data gets consolidated and they are dropped. That is why each
+# member gets its own isolated tables rather than one shared table keyed by member_code.
 #
-# Every document in all three indexes embeds a full `parts` array of that node's part numbers,
-# so these are reverse indexes rather than pure taxonomy -- hence `parts` on each model.
-# ---------------------------------------------------------------------------------------------
-class PaceTseCategory(django_db_models.Model):
-    """One document of the PACE_TSE_categories index (718 as of 2026-10-21)."""
+# Standalone -- nothing in any distributor integration (the PACE Customer API client, TSEBrand,
+# tristate_parts) reads these, and they read nothing from it.
+#
+# Confirmed live 2026-10-21, documents per index:
+#     member  categories  brands  series   parts        distributor
+#     TSE        718        670    9,396   1,693,697    Tri-State Enterprises
+#     DPN        918        464   16,845     961,757    DIX Performance
+#     LOR         --        298       --      855,886    Lordco Auto Parts
+#     TFT         --        191       --      606,019    Toys for Trucks
+#     A1D         --        155       --      463,845    A1 Distributing
+#     APD         --        148       --      352,281    AllPro Distributing
+#     AAS         --         64       --      346,331    Alamo Auto Supply
+#     RPT         --        125       --      294,153    RPT Distributing
+#     MWW         --        465       --      180,512    Midwest Wheel
+#
+# Field counts differ per member (TSE/TFT/APD/MWW parts carry 65-66 fields including ACES
+# fitment; LOR/RPT/AAS 22; A1D 20), so every optional field has a default and anything not
+# given its own column lands in `fitment`.
+#
+# The four abstract bases below hold the shared shape; each member subclasses them purely to
+# name its own table and indexes. See src/management/commands/_pace_search.py for the import
+# plumbing and the 1,000-result cap that shapes it.
+# =============================================================================================
+class PaceCategoryBase(django_db_models.Model):
+    """One document of a PACE_<member>_categories index."""
 
     object_id = django_db_models.CharField(max_length=64, unique=True)  # md5 hash, not a code
     name = django_db_models.CharField(max_length=255, db_index=True)
     slug = django_db_models.CharField(max_length=255, blank=True, default="")
 
-    # Two-level hierarchy -- a top-level category has these empty, a child names its parent.
+    # Two-level hierarchy. Note the parents are NOT themselves documents -- they exist only as
+    # these strings on their children, so the top level has to be derived from distinct values.
     parent_name = django_db_models.CharField(max_length=255, blank=True, default="")
     parent_slug = django_db_models.CharField(max_length=255, blank=True, default="")
 
@@ -8340,20 +8359,23 @@ class PaceTseCategory(django_db_models.Model):
     updated_at = django_db_models.DateTimeField(auto_now=True)
 
     class Meta:
-        db_table = "pace_tse_categories"
-        indexes = [
-            django_db_models.Index(fields=["parent_slug"], name="ptc_parent_slug_idx"),
-        ]
+        abstract = True
 
     def __str__(self) -> str:
         return self.name
 
 
-class PaceTseBrand(django_db_models.Model):
-    """One document of the PACE_TSE_brands index (670 as of 2026-10-21)."""
+class PaceBrandBase(django_db_models.Model):
+    """One document of a PACE_<member>_brands index.
 
-    # This index's objectID *is* the AAIA brand code, so both are stored -- object_id to stay
-    # consistent with the sibling tables, aaia_brand_code because that is what it means.
+    ``objectID`` on this index IS the AAIA brand code, so both are stored -- object_id to stay
+    consistent with the sibling tables, aaia_brand_code because that is what it means.
+
+    The ``parts`` array is NOT complete: 42% of the Covercraft parts reachable by other means
+    are absent from it (90,894 listed vs 155,440 documents in the index). Treat it as a seed
+    list for id-batch fetching, never as the brand's full catalog.
+    """
+
     object_id = django_db_models.CharField(max_length=64, unique=True)
     aaia_brand_code = django_db_models.CharField(max_length=8, db_index=True)
     name = django_db_models.CharField(max_length=255, db_index=True)
@@ -8373,14 +8395,14 @@ class PaceTseBrand(django_db_models.Model):
     updated_at = django_db_models.DateTimeField(auto_now=True)
 
     class Meta:
-        db_table = "pace_tse_brands"
+        abstract = True
 
     def __str__(self) -> str:
         return "{} ({})".format(self.name, self.aaia_brand_code)
 
 
-class PaceTseSeries(django_db_models.Model):
-    """One document of the PACE_TSE_series index (9,396 as of 2026-10-21)."""
+class PaceSeriesBase(django_db_models.Model):
+    """One document of a PACE_<member>_series index."""
 
     object_id = django_db_models.CharField(max_length=64, unique=True)  # md5 hash, not a code
     name = django_db_models.CharField(max_length=255, db_index=True)
@@ -8402,10 +8424,415 @@ class PaceTseSeries(django_db_models.Model):
     updated_at = django_db_models.DateTimeField(auto_now=True)
 
     class Meta:
+        abstract = True
+
+    def __str__(self) -> str:
+        return "{} / {}".format(self.brand, self.name)
+
+
+class PacePartBase(django_db_models.Model):
+    """One document of a PACE_<member>_parts index.
+
+    Documents are not uniformly shaped: a part with ACES fitment (``aces == 1``) carries 66
+    fields including the per-attribute fitment ID arrays plus makes/models/years, one without
+    carries 23 and omits all of them, and some members' indexes have no fitment fields at all.
+    ``stock_number`` is absent on some documents too.
+    """
+
+    object_id = django_db_models.CharField(max_length=64, unique=True)  # 64-char hash
+    part = django_db_models.CharField(max_length=128, db_index=True)
+    aaia_brand_code = django_db_models.CharField(max_length=8, db_index=True)
+
+    # "<aaia_brand_code>-<part number>", and 1:1 with documents (verified over 27,219
+    # Covercraft rows: no part number appeared in more than one document). This is what makes
+    # id-batch fetching able to sidestep the 1,000-result cap entirely.
+    catalog_object_id = django_db_models.CharField(max_length=255, blank=True, default="")
+    stock_number = django_db_models.CharField(max_length=128, blank=True, default="")
+
+    brand = django_db_models.CharField(max_length=255, blank=True, default="")
+    name = django_db_models.TextField(blank=True, default="")
+    ext = django_db_models.TextField(blank=True, default="")  # long description
+    slug = django_db_models.TextField(blank=True, default="")
+    image = django_db_models.TextField(blank=True, default="")
+    has_image = django_db_models.BooleanField(default=False)
+
+    category = django_db_models.CharField(max_length=255, blank=True, default="")
+    subcategory = django_db_models.CharField(max_length=255, blank=True, default="")
+    series = django_db_models.CharField(max_length=255, blank=True, default="")
+
+    # 4 decimal places on purpose: 38 of WeatherTech's 363 price points carry four decimals
+    # (55.2075, 101.9575, ...) and 55.2075 alone covers 1,205 parts, so decimal_places=2 would
+    # silently round a large slice of the catalog. NULL means the document has no `price` field
+    # at all -- it is never stored as 0, and 76% of the TSE index is like this.
+    price = django_db_models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
+    inventory = django_db_models.IntegerField(default=0)
+    sales = django_db_models.IntegerField(default=0)  # index field is "Sales"
+    viewed = django_db_models.IntegerField(default=0)
+
+    # -1 = no ACES fitment, 0 = partial, 1 = fitment present. Only aces == 1 carries years.
+    aces = django_db_models.IntegerField(default=0, db_index=True)
+
+    part_search = django_db_models.JSONField(default=list, blank=True)
+    makes = django_db_models.JSONField(default=list, blank=True)
+    models = django_db_models.JSONField(default=list, blank=True)
+    years = django_db_models.JSONField(default=list, blank=True)
+
+    # Every remaining ACES-style *ID attribute in one blob -- these are not uniformly typed
+    # across documents (BodyTypeID arrives as a bare int on some, a list on others), so giving
+    # each its own typed column would fight the source data for no gain.
+    fitment = django_db_models.JSONField(default=dict, blank=True)
+
+    site_id = django_db_models.CharField(max_length=16, blank=True, default="")
+    member_code = django_db_models.CharField(max_length=16, blank=True, default="")
+    group_name = django_db_models.CharField(max_length=32, blank=True, default="")
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        abstract = True
+
+    def __str__(self) -> str:
+        return "{} {}".format(self.aaia_brand_code, self.part)
+
+
+class PaceTseCategory(PaceCategoryBase):
+    """Tri-State Enterprises (TSE) -- PACE_TSE_categories."""
+
+    class Meta:
+        db_table = "pace_tse_categories"
+        indexes = [
+            django_db_models.Index(fields=["parent_slug"], name="ptc_parent_slug_idx"),
+        ]
+
+
+class PaceTseBrand(PaceBrandBase):
+    """Tri-State Enterprises (TSE) -- PACE_TSE_brands."""
+
+    class Meta:
+        db_table = "pace_tse_brands"
+
+
+class PaceTseSeries(PaceSeriesBase):
+    """Tri-State Enterprises (TSE) -- PACE_TSE_series."""
+
+    class Meta:
         db_table = "pace_tse_series"
         indexes = [
             django_db_models.Index(fields=["aaia_brand_code", "name"], name="pts_brand_name_idx"),
         ]
 
-    def __str__(self) -> str:
-        return "{} / {}".format(self.brand, self.name)
+
+class PaceTsePart(PacePartBase):
+    """Tri-State Enterprises (TSE) -- PACE_TSE_parts."""
+
+    class Meta:
+        db_table = "pace_tse_parts"
+        indexes = [
+            django_db_models.Index(fields=["aaia_brand_code", "part"], name="ptp_brand_part_idx"),
+            django_db_models.Index(fields=["aaia_brand_code", "price"], name="ptp_brand_price_idx"),
+        ]
+
+
+class PaceDpnCategory(PaceCategoryBase):
+    """DIX Performance (DPN) -- PACE_DPN_categories."""
+
+    class Meta:
+        db_table = "pace_dpn_categories"
+        indexes = [
+            django_db_models.Index(fields=["parent_slug"], name="pdc_parent_slug_idx"),
+        ]
+
+
+class PaceDpnBrand(PaceBrandBase):
+    """DIX Performance (DPN) -- PACE_DPN_brands."""
+
+    class Meta:
+        db_table = "pace_dpn_brands"
+
+
+class PaceDpnSeries(PaceSeriesBase):
+    """DIX Performance (DPN) -- PACE_DPN_series."""
+
+    class Meta:
+        db_table = "pace_dpn_series"
+        indexes = [
+            django_db_models.Index(fields=["aaia_brand_code", "name"], name="pds_brand_name_idx"),
+        ]
+
+
+class PaceDpnPart(PacePartBase):
+    """DIX Performance (DPN) -- PACE_DPN_parts."""
+
+    class Meta:
+        db_table = "pace_dpn_parts"
+        indexes = [
+            django_db_models.Index(fields=["aaia_brand_code", "part"], name="pdp_brand_part_idx"),
+            django_db_models.Index(fields=["aaia_brand_code", "price"], name="pdp_brand_price_idx"),
+        ]
+
+
+class PaceLorCategory(PaceCategoryBase):
+    """Lordco Auto Parts (LOR) -- PACE_LOR_categories."""
+
+    class Meta:
+        db_table = "pace_lor_categories"
+        indexes = [
+            django_db_models.Index(fields=["parent_slug"], name="plc_parent_slug_idx"),
+        ]
+
+
+class PaceLorBrand(PaceBrandBase):
+    """Lordco Auto Parts (LOR) -- PACE_LOR_brands."""
+
+    class Meta:
+        db_table = "pace_lor_brands"
+
+
+class PaceLorSeries(PaceSeriesBase):
+    """Lordco Auto Parts (LOR) -- PACE_LOR_series."""
+
+    class Meta:
+        db_table = "pace_lor_series"
+        indexes = [
+            django_db_models.Index(fields=["aaia_brand_code", "name"], name="pls_brand_name_idx"),
+        ]
+
+
+class PaceLorPart(PacePartBase):
+    """Lordco Auto Parts (LOR) -- PACE_LOR_parts."""
+
+    class Meta:
+        db_table = "pace_lor_parts"
+        indexes = [
+            django_db_models.Index(fields=["aaia_brand_code", "part"], name="plp_brand_part_idx"),
+            django_db_models.Index(fields=["aaia_brand_code", "price"], name="plp_brand_price_idx"),
+        ]
+
+
+class PaceTftCategory(PaceCategoryBase):
+    """Toys for Trucks (TFT) -- PACE_TFT_categories."""
+
+    class Meta:
+        db_table = "pace_tft_categories"
+        indexes = [
+            django_db_models.Index(fields=["parent_slug"], name="pfc_parent_slug_idx"),
+        ]
+
+
+class PaceTftBrand(PaceBrandBase):
+    """Toys for Trucks (TFT) -- PACE_TFT_brands."""
+
+    class Meta:
+        db_table = "pace_tft_brands"
+
+
+class PaceTftSeries(PaceSeriesBase):
+    """Toys for Trucks (TFT) -- PACE_TFT_series."""
+
+    class Meta:
+        db_table = "pace_tft_series"
+        indexes = [
+            django_db_models.Index(fields=["aaia_brand_code", "name"], name="pfs_brand_name_idx"),
+        ]
+
+
+class PaceTftPart(PacePartBase):
+    """Toys for Trucks (TFT) -- PACE_TFT_parts."""
+
+    class Meta:
+        db_table = "pace_tft_parts"
+        indexes = [
+            django_db_models.Index(fields=["aaia_brand_code", "part"], name="pfp_brand_part_idx"),
+            django_db_models.Index(fields=["aaia_brand_code", "price"], name="pfp_brand_price_idx"),
+        ]
+
+
+class PaceA1dCategory(PaceCategoryBase):
+    """A1 Distributing (A1D) -- PACE_A1D_categories."""
+
+    class Meta:
+        db_table = "pace_a1d_categories"
+        indexes = [
+            django_db_models.Index(fields=["parent_slug"], name="pac_parent_slug_idx"),
+        ]
+
+
+class PaceA1dBrand(PaceBrandBase):
+    """A1 Distributing (A1D) -- PACE_A1D_brands."""
+
+    class Meta:
+        db_table = "pace_a1d_brands"
+
+
+class PaceA1dSeries(PaceSeriesBase):
+    """A1 Distributing (A1D) -- PACE_A1D_series."""
+
+    class Meta:
+        db_table = "pace_a1d_series"
+        indexes = [
+            django_db_models.Index(fields=["aaia_brand_code", "name"], name="pas_brand_name_idx"),
+        ]
+
+
+class PaceA1dPart(PacePartBase):
+    """A1 Distributing (A1D) -- PACE_A1D_parts."""
+
+    class Meta:
+        db_table = "pace_a1d_parts"
+        indexes = [
+            django_db_models.Index(fields=["aaia_brand_code", "part"], name="pap_brand_part_idx"),
+            django_db_models.Index(fields=["aaia_brand_code", "price"], name="pap_brand_price_idx"),
+        ]
+
+
+class PaceApdCategory(PaceCategoryBase):
+    """AllPro Distributing (APD) -- PACE_APD_categories."""
+
+    class Meta:
+        db_table = "pace_apd_categories"
+        indexes = [
+            django_db_models.Index(fields=["parent_slug"], name="pzc_parent_slug_idx"),
+        ]
+
+
+class PaceApdBrand(PaceBrandBase):
+    """AllPro Distributing (APD) -- PACE_APD_brands."""
+
+    class Meta:
+        db_table = "pace_apd_brands"
+
+
+class PaceApdSeries(PaceSeriesBase):
+    """AllPro Distributing (APD) -- PACE_APD_series."""
+
+    class Meta:
+        db_table = "pace_apd_series"
+        indexes = [
+            django_db_models.Index(fields=["aaia_brand_code", "name"], name="pzs_brand_name_idx"),
+        ]
+
+
+class PaceApdPart(PacePartBase):
+    """AllPro Distributing (APD) -- PACE_APD_parts."""
+
+    class Meta:
+        db_table = "pace_apd_parts"
+        indexes = [
+            django_db_models.Index(fields=["aaia_brand_code", "part"], name="pzp_brand_part_idx"),
+            django_db_models.Index(fields=["aaia_brand_code", "price"], name="pzp_brand_price_idx"),
+        ]
+
+
+class PaceRptCategory(PaceCategoryBase):
+    """RPT Distributing (RPT) -- PACE_RPT_categories."""
+
+    class Meta:
+        db_table = "pace_rpt_categories"
+        indexes = [
+            django_db_models.Index(fields=["parent_slug"], name="prc_parent_slug_idx"),
+        ]
+
+
+class PaceRptBrand(PaceBrandBase):
+    """RPT Distributing (RPT) -- PACE_RPT_brands."""
+
+    class Meta:
+        db_table = "pace_rpt_brands"
+
+
+class PaceRptSeries(PaceSeriesBase):
+    """RPT Distributing (RPT) -- PACE_RPT_series."""
+
+    class Meta:
+        db_table = "pace_rpt_series"
+        indexes = [
+            django_db_models.Index(fields=["aaia_brand_code", "name"], name="prs_brand_name_idx"),
+        ]
+
+
+class PaceRptPart(PacePartBase):
+    """RPT Distributing (RPT) -- PACE_RPT_parts."""
+
+    class Meta:
+        db_table = "pace_rpt_parts"
+        indexes = [
+            django_db_models.Index(fields=["aaia_brand_code", "part"], name="prp_brand_part_idx"),
+            django_db_models.Index(fields=["aaia_brand_code", "price"], name="prp_brand_price_idx"),
+        ]
+
+
+class PaceAasCategory(PaceCategoryBase):
+    """Alamo Auto Supply (AAS) -- PACE_AAS_categories."""
+
+    class Meta:
+        db_table = "pace_aas_categories"
+        indexes = [
+            django_db_models.Index(fields=["parent_slug"], name="pmc_parent_slug_idx"),
+        ]
+
+
+class PaceAasBrand(PaceBrandBase):
+    """Alamo Auto Supply (AAS) -- PACE_AAS_brands."""
+
+    class Meta:
+        db_table = "pace_aas_brands"
+
+
+class PaceAasSeries(PaceSeriesBase):
+    """Alamo Auto Supply (AAS) -- PACE_AAS_series."""
+
+    class Meta:
+        db_table = "pace_aas_series"
+        indexes = [
+            django_db_models.Index(fields=["aaia_brand_code", "name"], name="pms_brand_name_idx"),
+        ]
+
+
+class PaceAasPart(PacePartBase):
+    """Alamo Auto Supply (AAS) -- PACE_AAS_parts."""
+
+    class Meta:
+        db_table = "pace_aas_parts"
+        indexes = [
+            django_db_models.Index(fields=["aaia_brand_code", "part"], name="pmp_brand_part_idx"),
+            django_db_models.Index(fields=["aaia_brand_code", "price"], name="pmp_brand_price_idx"),
+        ]
+
+
+class PaceMwwCategory(PaceCategoryBase):
+    """Midwest Wheel (MWW) -- PACE_MWW_categories."""
+
+    class Meta:
+        db_table = "pace_mww_categories"
+        indexes = [
+            django_db_models.Index(fields=["parent_slug"], name="pwc_parent_slug_idx"),
+        ]
+
+
+class PaceMwwBrand(PaceBrandBase):
+    """Midwest Wheel (MWW) -- PACE_MWW_brands."""
+
+    class Meta:
+        db_table = "pace_mww_brands"
+
+
+class PaceMwwSeries(PaceSeriesBase):
+    """Midwest Wheel (MWW) -- PACE_MWW_series."""
+
+    class Meta:
+        db_table = "pace_mww_series"
+        indexes = [
+            django_db_models.Index(fields=["aaia_brand_code", "name"], name="pws_brand_name_idx"),
+        ]
+
+
+class PaceMwwPart(PacePartBase):
+    """Midwest Wheel (MWW) -- PACE_MWW_parts."""
+
+    class Meta:
+        db_table = "pace_mww_parts"
+        indexes = [
+            django_db_models.Index(fields=["aaia_brand_code", "part"], name="pwp_brand_part_idx"),
+            django_db_models.Index(fields=["aaia_brand_code", "price"], name="pwp_brand_price_idx"),
+        ]
