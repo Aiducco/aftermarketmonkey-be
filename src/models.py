@@ -8848,3 +8848,191 @@ class PaceMwwPart(PacePartBase):
             django_db_models.Index(fields=["aaia_brand_code", "part"], name="pwp_brand_part_idx"),
             django_db_models.Index(fields=["aaia_brand_code", "price"], name="pwp_brand_price_idx"),
         ]
+# =============================================================================================
+# CONSOLIDATED PACE CATALOG -- one deduplicated set of tables built from the nine per-member
+# pace_<member>_* landing tables by the `consolidate_pace_catalog` command. Replaces reading
+# pace_catalog for this purpose.
+#
+# Deduplication key is ``object_id``, which is GLOBALLY STABLE across members -- verified, not
+# assumed: all 197,799 parts that TSE and DPN both carry have byte-identical object_id values.
+# It hashes the shared catalog identity, so part/name/image/ext/series agree across members
+# essentially always (100% / 100% / 100% / 99.99% / 99.99%).
+#
+# What does NOT travel with that hash, and is therefore resolved or dropped here:
+#   - category and subcategory diverge on 15% of shared parts (each distributor files the same
+#     part differently), so these are resolved by most-frequent-wins across the members that
+#     carry the part. The per-member tables remain authoritative for one distributor's own
+#     filing; this is a canonical view, not a replacement for it.
+#   - price, inventory, viewed and sales are deliberately absent. price turned out to be a
+#     shared list price rather than any distributor's actual cost (it agrees 100% across
+#     members), and the other three are per-member stock/telemetry -- none belong in a
+#     consolidated catalog. Real pricing comes from each distributor's own API.
+#
+# The taxonomy tables are derived FROM THE PARTS rather than from the brands/categories/series
+# indexes. That is what recovers the series data those indexes could not give us: each
+# PACE_<member>_series index reports 9,396-16,845 documents but a plain walk is capped at 1,000,
+# whereas every part carries its series name, so the complete unique set is recoverable here.
+# Series rows deliberately carry no parts array -- the link is pace_parts.series.
+# =============================================================================================
+class PaceBrand(django_db_models.Model):
+    """Unique brand across all PACE members, keyed by AAIA code."""
+
+    aaia_brand_code = django_db_models.CharField(max_length=8, unique=True)
+    name = django_db_models.CharField(max_length=255, db_index=True)
+    slug = django_db_models.CharField(max_length=255, blank=True, default="")
+    image = django_db_models.TextField(blank=True, default="")
+
+    # TWO CATALOG REGIMES SHARE THIS TABLE -- filter on this flag rather than deleting.
+    # 1,028 of the 1,656 codes start A6/A7/A8 and are not AAIA codes at all, but AAM
+    # member-local line codes sitting in an aaia_brand_code column. Measured, not inferred:
+    #   - NOT ONE of the 1,028 appears in more than one member (avg exactly 1.00), whereas 320
+    #     of the 628 real codes are shared, averaging 2.47 members. A real AAIA code is an
+    #     industry identifier, so being confined to a single distributor 1,028 times out of
+    #     1,028 is decisive.
+    #   - 1,022 of 1,028 have a name of <=3 characters ("SPC", "DOR", "RAY") against 25 of 628
+    #     in the real regime, and only 69 carry a logo against 597 of 628.
+    #   - Their parts are empty shells. Of Tri-State's 758,465 pseudo-regime parts: 0 have a
+    #     description, 0 an image, 0 a price, 0 ACES fitment, 0 a series, and 1 a category.
+    #     Names are bare "<code> <part number>" templates, e.g. "SPC 170IA55010C-340M".
+    #   - They are still useful: `part` is the real manufacturer part number and
+    #     `part_search` its normalised variants, so they serve as a part-number
+    #     cross-reference for lines (Dorman, Raybestos, SKF, ...) that appear nowhere in
+    #     PACE under a real AAIA code. A second catalog layer, not duplicates.
+    # Concentrated in TSE (52.4% of its rows) and DPN (27.7%); six of the nine members have
+    # essentially none. Across everything ingested it is 1,024,218 of 5,123,431 rows (20%).
+    has_real_aaia_code = django_db_models.BooleanField(default=True, db_index=True)
+
+    # Which member distributors carry this brand, e.g. ["DPN", "LOR", "TSE"].
+    member_codes = django_db_models.JSONField(default=list, blank=True)
+    part_count = django_db_models.IntegerField(default=0)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "pace_brands"
+
+    def __str__(self) -> str:
+        return "{} ({})".format(self.name, self.aaia_brand_code)
+
+
+class PaceCategory(django_db_models.Model):
+    """Unique top-level category name across all PACE members."""
+
+    name = django_db_models.CharField(max_length=255, unique=True)
+    member_codes = django_db_models.JSONField(default=list, blank=True)
+    part_count = django_db_models.IntegerField(default=0)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "pace_categories"
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class PaceSubcategory(django_db_models.Model):
+    """Unique (category, subcategory) pair. Subcategory names are not unique on their own --
+    the same name recurs under different categories -- so the parent is part of the key."""
+
+    category = django_db_models.CharField(max_length=255, db_index=True)
+    name = django_db_models.CharField(max_length=255, db_index=True)
+    member_codes = django_db_models.JSONField(default=list, blank=True)
+    part_count = django_db_models.IntegerField(default=0)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "pace_subcategories"
+        unique_together = [["category", "name"]]
+
+    def __str__(self) -> str:
+        return "{} / {}".format(self.category, self.name)
+
+
+class PaceSeries(django_db_models.Model):
+    """Unique (brand, series) pair -- series names repeat across brands, so the brand is part
+    of the key. No parts array: the link is pace_parts.series."""
+
+    aaia_brand_code = django_db_models.CharField(max_length=8, db_index=True)
+    brand = django_db_models.CharField(max_length=255, blank=True, default="")
+    name = django_db_models.CharField(max_length=255, db_index=True)
+    member_codes = django_db_models.JSONField(default=list, blank=True)
+    part_count = django_db_models.IntegerField(default=0)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "pace_series"
+        unique_together = [["aaia_brand_code", "name"]]
+
+    def __str__(self) -> str:
+        return "{} / {}".format(self.brand, self.name)
+
+
+class PacePart(django_db_models.Model):
+    """One row per unique part across all nine PACE members, keyed by the globally stable
+    object_id. See this section's header for what is resolved and what is deliberately absent."""
+
+    object_id = django_db_models.CharField(max_length=64, unique=True)
+    catalog_object_id = django_db_models.CharField(max_length=255, db_index=True)
+    aaia_brand_code = django_db_models.CharField(max_length=8, db_index=True)
+    part = django_db_models.CharField(max_length=128, db_index=True)
+    brand = django_db_models.CharField(max_length=255, blank=True, default="")
+
+    name = django_db_models.TextField(blank=True, default="")
+    ext = django_db_models.TextField(blank=True, default="")
+    slug = django_db_models.TextField(blank=True, default="")
+    image = django_db_models.TextField(blank=True, default="")
+    has_image = django_db_models.BooleanField(default=False)
+
+    # Resolved by most-frequent-wins across the members carrying this part; they disagree on
+    # roughly 15% of shared parts.
+    category = django_db_models.CharField(max_length=255, blank=True, default="", db_index=True)
+    subcategory = django_db_models.CharField(max_length=255, blank=True, default="")
+    series = django_db_models.CharField(max_length=255, blank=True, default="")
+
+    # -1 / 0 = no ACES fitment, 1 = fitment present. Only aces == 1 rows carry years/fitment.
+    aces = django_db_models.IntegerField(default=0, db_index=True)
+    part_search = django_db_models.JSONField(default=list, blank=True)
+
+    # DISPLAY ONLY -- never cross-product these; see PacePartBase for the full explanation.
+    # Authoritative fitment is fitment["BaseVehicleID"] joined to VcdbVehicle.base_vehicle_id.
+    makes = django_db_models.JSONField(default=list, blank=True)
+    models = django_db_models.JSONField(default=list, blank=True)
+    years = django_db_models.JSONField(default=list, blank=True)
+    fitment = django_db_models.JSONField(default=dict, blank=True)
+
+    # False when aaia_brand_code is an AAM member-local jobber line code rather than a real
+    # AAIA code -- see PaceBrand.has_real_aaia_code. Mirrored onto the part so the ~1.02M
+    # line-code rows can be filtered without a join.
+    #
+    # These rows are KEPT on purpose. They carry no description, image, price, category,
+    # series or fitment, so they are useless for catalog display -- but `part` is the real
+    # manufacturer part number and `part_search` holds its normalised variants, which makes
+    # them a legitimate part-number cross-reference for the traditional hard-parts lines
+    # (Dorman, Raybestos, Standard, Centric, SKF, Timken, Gates). None of those manufacturers
+    # appears anywhere in PACE under a real AAIA code, so this is a second catalog layer
+    # rather than duplicates of the branded catalog. Filter on the flag; do not delete.
+    has_real_aaia_code = django_db_models.BooleanField(default=True, db_index=True)
+
+    # Which member distributors carry this part, e.g. ["DPN", "TSE"].
+    member_codes = django_db_models.JSONField(default=list, blank=True)
+    member_count = django_db_models.PositiveSmallIntegerField(default=0, db_index=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "pace_parts"
+        indexes = [
+            django_db_models.Index(fields=["aaia_brand_code", "part"], name="pp_brand_part_idx"),
+            django_db_models.Index(fields=["aaia_brand_code", "series"], name="pp_brand_series_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return "{} {}".format(self.aaia_brand_code, self.part)
