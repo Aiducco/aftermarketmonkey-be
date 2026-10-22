@@ -52,7 +52,22 @@ def _transient_meilisearch_error(exc: BaseException) -> bool:
     return any(s in msg for s in _REINDEX_TRANSIENT_SUBSTRINGS)
 
 # Searchable: what the user types to find results (brand_name is on the document for filtering only)
-SEARCHABLE_ATTRIBUTES = ["part_number", "sku", "description", "aaia_code", "gtin"]
+# Order is relevance order in Meilisearch: a match in an earlier attribute outranks a later one,
+# which is why part_aliases sits directly behind part_number -- an alias hit is still a
+# part-number hit, and must beat a coincidental match in the description prose.
+SEARCHABLE_ATTRIBUTES = ["part_number", "part_aliases", "sku", "description", "aaia_code", "gtin"]
+
+# Attributes where a one-character difference means a DIFFERENT product, not a near miss.
+# Meilisearch allows 1 typo at >=5 chars and 2 at >=9 by default, so without this 'C16444D4'
+# matches 'C16444D5' and every part-number search becomes approximate. The same reasoning
+# already applies in tires_index.py and wheels_index.py, which disable it on their own
+# identifier attributes.
+#
+# This has to be applied in BOTH setup_index() and the zero-downtime staging path: the staging
+# index is created fresh on every nightly swap and configured by hand there, so a setting added
+# only to setup_index() is silently reset the next time the swap runs (exactly what happened to
+# maxValuesPerFacet and maxTotalHits -- see the comments in that path).
+TYPO_DISABLED_ATTRIBUTES = ["part_number", "part_aliases", "sku", "aaia_code", "gtin"]
 
 # Filterable: for sidebar / API filters; categories come from first ProviderPart with non-empty category
 # fitment_keys: one entry per (year, make, model) the part fits, plus a more specific
@@ -130,9 +145,10 @@ def setup_index() -> bool:
         index.update_sortable_attributes(SORTABLE_ATTRIBUTES)
         index.update_faceting_settings({"maxValuesPerFacet": PARTS_MAX_VALUES_PER_FACET})
         index.update_pagination_settings({"maxTotalHits": PARTS_MAX_TOTAL_HITS})
+        index.update_typo_tolerance({"disableOnAttributes": TYPO_DISABLED_ATTRIBUTES})
 
-        logger.info("Meilisearch index '%s' configured: searchable=%s, filterable=%s, sortable=%s, maxValuesPerFacet=%s, maxTotalHits=%s",
-                    INDEX_NAME, SEARCHABLE_ATTRIBUTES, FILTERABLE_ATTRIBUTES, SORTABLE_ATTRIBUTES, PARTS_MAX_VALUES_PER_FACET, PARTS_MAX_TOTAL_HITS)
+        logger.info("Meilisearch index '%s' configured: searchable=%s, filterable=%s, sortable=%s, maxValuesPerFacet=%s, maxTotalHits=%s, typoDisabled=%s",
+                    INDEX_NAME, SEARCHABLE_ATTRIBUTES, FILTERABLE_ATTRIBUTES, SORTABLE_ATTRIBUTES, PARTS_MAX_VALUES_PER_FACET, PARTS_MAX_TOTAL_HITS, TYPO_DISABLED_ATTRIBUTES)
         return True
     except Exception as e:
         logger.exception("Meilisearch setup failed: %s", str(e))
@@ -372,6 +388,7 @@ def _build_docs_for_batch(
             "brand_id": part.brand_id,
             "brand_name": brand_name or "",
             "part_number": part.part_number or "",
+            "part_aliases": part.part_aliases or [],
             "sku": part.sku or "",
             "description": (part.description or "")[:10000],
             "aaia_code": part.aaia_code or "",
@@ -537,6 +554,7 @@ def master_part_to_index_shape(part) -> typing.Dict:
         "brand_id": part.brand_id,
         "brand_name": brand_name or "",  # Never None for Meilisearch
         "part_number": part.part_number or "",
+        "part_aliases": part.part_aliases or [],
         "sku": part.sku or "",
         "description": (part.description or "")[:10000],  # Meilisearch has limits
         "aaia_code": part.aaia_code or "",
@@ -1307,7 +1325,12 @@ def reindex_all_master_parts_zero_downtime(
         # -- Meilisearch's default (1000) silently makes any offset+limit beyond the first 1000
         # matches (e.g. paginating the full ~4,200-brand list) return nothing past that point.
         staging.update_pagination_settings({"maxTotalHits": PARTS_MAX_TOTAL_HITS})
-        logger.info("Meilisearch zero-downtime reindex: staging index configured")
+        # And again for typo tolerance: a fresh index allows typos on every attribute, which
+        # would make every part-number search approximate the moment this index went live.
+        staging.update_typo_tolerance({"disableOnAttributes": TYPO_DISABLED_ATTRIBUTES})
+        logger.info("Meilisearch zero-downtime reindex: staging index configured "
+                    "(searchable=%s, typoDisabled=%s)",
+                    SEARCHABLE_ATTRIBUTES, TYPO_DISABLED_ATTRIBUTES)
 
         # --- Step 2: delete any stale docs in staging (from previous failed run) ---
         try:

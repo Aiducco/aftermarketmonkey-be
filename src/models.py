@@ -2877,6 +2877,19 @@ class MasterPart(django_db_models.Model):
     # (brand:, keyword:) can be reverted on their own with a single DELETE-shaped UPDATE without
     # touching anything a distributor actually told us.
     product_type_source = django_db_models.CharField(max_length=64, null=True, blank=True)
+    # Extra spellings of this part's number that a customer might type, indexed as a searchable
+    # attribute alongside part_number (see src.search.meilisearch_client.SEARCHABLE_ATTRIBUTES).
+    #
+    # Populated from the PACE catalog's own search-key expansion (pace_parts.part_search) by
+    # backfill_master_part_aliases_from_pace. These are NOT interchange or superseded numbers:
+    # PACE generates them from the part's own number -- punctuation stripped, then each form
+    # prefixed with the AAM member's line code, with and without a hyphen. So '71822-00-88'
+    # carries ['718220088', 'COV718220088', 'COV-718220088', 'COV71822-00-88',
+    # 'COV-71822-00-88']. Indexing them means a search for any of those forms lands on the part.
+    #
+    # Typo tolerance is disabled on this attribute: one character off a part number is a
+    # different part, not a near miss.
+    part_aliases = django_db_models.JSONField(default=list, blank=True)
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
