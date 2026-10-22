@@ -637,6 +637,30 @@ def _merge_fitments(keep_id: int, dup_id: int) -> None:
         print("      fitments: {} moved, {} duplicates dropped".format(moved, dropped))
 
 
+def _merge_one_to_one_derived(keep_id: int, dup_id: int) -> None:
+    """
+    Move each derived 1:1 row off the duplicate, or drop it when the keeper already has one.
+
+    Raw SQL rather than the ORM because these tables have no Django model in ``src.models`` --
+    they are written by the spec-enrichment and classification pipelines.
+    """
+    with connection.cursor() as cur:
+        for table in _ONE_TO_ONE_DERIVED_TABLES:
+            cur.execute(
+                """
+                UPDATE {table} SET master_part_id = %s
+                WHERE master_part_id = %s
+                  AND NOT EXISTS (SELECT 1 FROM {table} k WHERE k.master_part_id = %s)
+                """.format(table=table),
+                [keep_id, dup_id, keep_id],
+            )
+            moved = cur.rowcount
+            cur.execute("DELETE FROM {} WHERE master_part_id = %s".format(table), [dup_id])
+            dropped = cur.rowcount
+            if moved or dropped:
+                print("      {}: {} moved, {} dropped".format(table, moved, dropped))
+
+
 def merge_ids(ids: typing.Sequence[int], dry_run: bool = True) -> bool:
     """
     Merge an explicit list of MasterPart ids known to be the same part. Use this for groups you
@@ -687,6 +711,7 @@ def _merge_rows(rows: typing.Sequence[MasterPartRow], dry_run: bool) -> bool:
             _merge_provider_parts(keep_id=keep_obj.id, dup_id=dup_obj.id)
             _merge_master_part_data(keep_id=keep_obj.id, dup_id=dup_obj.id)
             _merge_fitments(keep_id=keep_obj.id, dup_id=dup_obj.id)
+            _merge_one_to_one_derived(keep_id=keep_obj.id, dup_id=dup_obj.id)
 
             remaining = src_models.ProviderPart.objects.filter(master_part_id=dup_obj.id).count()
             if remaining:
@@ -712,12 +737,23 @@ _FITMENT_KEY_COLUMNS = ("year_start", "year_end", "make", "model", "submodel", "
 # appeared mid-run and took out ~1,200 groups a chunk at a time -- so the set is asserted against
 # the live schema rather than assumed. Adding a table here means teaching _merge_rows and
 # merge_groups_bulk what to do with it.
+# Tables that are 1:1 with master_part (unique index on master_part_id) and hold *derived* data:
+# specs inferred from a part's attributes, or an ML classification of it. On a merge the keeper's
+# row is authoritative and the duplicate's is dropped -- re-deriving is cheap and keeping the
+# loser's would mean choosing between two inferences of the same part with nothing to break the
+# tie. Same handling as product_group_member.
+_ONE_TO_ONE_DERIVED_TABLES = (
+    "tire_specs",
+    "wheel_specs",
+    "ml_part_terminology_classification",
+)
+
 _KNOWN_MASTER_PART_REFERENCES = frozenset({
     "provider_parts",
     "master_part_data",
     "master_part_fitments",
     "product_group_member",
-})
+}) | frozenset(_ONE_TO_ONE_DERIVED_TABLES)
 
 
 def assert_all_master_part_references_handled() -> None:
@@ -760,6 +796,22 @@ def merge_groups_bulk(groups: typing.Sequence[Group], dry_run: bool = True,
     groups = [g for g in groups if g.safe]
     results: typing.Dict[str, typing.Any] = {"merged": 0, "deleted": 0, "fallback": [], "failed": []}
 
+    # ``dry_run`` used to be accepted and silently ignored here, so the documented
+    # "preview first" call wrote for real. Report and return instead.
+    if dry_run:
+        would_delete = 0
+        for group in groups:
+            if _providers_overlap(group.rows):
+                results["failed"].append((group.normalized_part_number, "providers overlap"))
+                continue
+            _keep, dups = _pick_canonical(group.rows)
+            would_delete += len(dups)
+        print("[DRY-RUN] {} group(s) would merge, {} MasterPart row(s) would be deleted, "
+              "{} refused on provider overlap".format(
+                  len(groups) - len(results["failed"]), would_delete, len(results["failed"])))
+        results["merged"] = len(groups) - len(results["failed"])
+        return results
+
     for start in range(0, len(groups), chunk_size):
         chunk = groups[start : start + chunk_size]
         pairs: typing.List[typing.Tuple[int, int]] = []   # (dup_id, keep_id)
@@ -769,6 +821,18 @@ def merge_groups_bulk(groups: typing.Sequence[Group], dry_run: bool = True,
                 results["failed"].append((group.normalized_part_number, "providers overlap"))
                 continue
             keep, dups = _pick_canonical(group.rows)
+            # A group can be gate-safe and still collide here. `_providers_overlap` tolerates the
+            # same provider sitting on both rows when its external id is IDENTICAL -- that is one
+            # catalog entry attached to two master parts (damage, not two products), and treating
+            # it as evidence would make the duplicate permanently unmergeable. But repointing it
+            # would violate provider_parts(master_part_id, provider_id), which rolled back whole
+            # chunks: 4 of 4 on the first live run, 0 rows merged. Set-based SQL cannot pick a
+            # winner between two ProviderParts, so hand these to the row-by-row path, which
+            # resolves them on distributor_refreshed_at and relocates the loser's purchase-order
+            # lines and kit components before deleting it.
+            if any(d.provider_ids & keep.provider_ids for d in dups):
+                results["fallback"].extend(sorted(d.id for d in dups))
+                continue
             keep_ids.append(keep.id)
             pairs.extend((d.id, keep.id) for d in dups)
         if not pairs:
@@ -892,6 +956,26 @@ def merge_groups_bulk(groups: typing.Sequence[Group], dry_run: bool = True,
                         "DELETE FROM product_group_member WHERE master_part_id IN %s",
                         (tuple(dup_ids),),
                     )
+
+                    # Derived 1:1 rows (tire/wheel specs, ML classification): identical shape.
+                    # These must be handled before the master_parts DELETE or their unique index
+                    # on master_part_id turns the whole chunk into a rollback.
+                    for table in _ONE_TO_ONE_DERIVED_TABLES:
+                        cur.execute(
+                            """
+                            UPDATE {table} t SET master_part_id = m.keep_id
+                            FROM (VALUES {values}) AS m(dup_id, keep_id)
+                            WHERE t.master_part_id = m.dup_id
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM {table} k WHERE k.master_part_id = m.keep_id
+                              )
+                            """.format(table=table, values=values),
+                            params,
+                        )
+                        cur.execute(
+                            "DELETE FROM {} WHERE master_part_id IN %s".format(table),
+                            (tuple(dup_ids),),
+                        )
 
                     deletable = list(dup_ids)
                     if deletable:
