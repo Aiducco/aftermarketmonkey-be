@@ -16,6 +16,10 @@ from django.db import migrations
 
 _TRI_STATE_KIND = 38
 
+# src.enums.CompanyProviderConnectionStatus.WAITING -- frozen here rather than imported, like
+# the kind above: a migration must keep meaning the same thing if the enum is ever renumbered.
+_STATUS_WAITING = 3
+
 
 def forwards(apps, schema_editor):
     CompanyProviders = apps.get_model("src", "CompanyProviders")
@@ -54,7 +58,32 @@ def forwards(apps, schema_editor):
             credentials["feed"] = {}
         credentials.pop("order", None)  # never persisted here; see credentials.get_order_credentials
         cp.credentials = credentials
-        cp.save(update_fields=["credentials"])
+
+        # The stored status has to go back to WAITING too. It says CONNECTED, which under the
+        # old shape meant "the PACE key authenticated" -- under the new one the feed status
+        # answers "has Tri-State delivered a file", and none ever has. Leaving it would show a
+        # dealer a connected feed that has received nothing. initial_sync_completed goes back to
+        # False for the same reason, and it is also what puts the row back in
+        # check_company_provider_connections' scope so the cron maintains it from here.
+        cp.initial_sync_completed = False
+        cp.status = _STATUS_WAITING
+        cp.status_name = "WAITING"
+        cp.status_reason = (
+            "Please read the setup instructions and ask your rep to push your feed file to our relay."
+        )
+        cp.status_checked_at = None
+        cp.status_consecutive_failures = 0
+        cp.status_next_check_at = None
+        cp.save(update_fields=[
+            "credentials",
+            "initial_sync_completed",
+            "status",
+            "status_name",
+            "status_reason",
+            "status_checked_at",
+            "status_consecutive_failures",
+            "status_next_check_at",
+        ])
 
 
 def backwards(apps, schema_editor):
@@ -62,6 +91,10 @@ def backwards(apps, schema_editor):
     Put the PACE pair back in credentials.feed and drop the order account this created. The
     relay credentials written into feed are not recoverable (they were never there before), so
     going back restores the API pair, which is what the old code read from feed.
+
+    The status fields are deliberately NOT restored: the old CONNECTED was a statement about a
+    key that PACE now rejects, so re-asserting it would be worse than leaving the row to be
+    re-checked.
     """
     CompanyProviders = apps.get_model("src", "CompanyProviders")
     CompanyProviderOrderAccount = apps.get_model("src", "CompanyProviderOrderAccount")

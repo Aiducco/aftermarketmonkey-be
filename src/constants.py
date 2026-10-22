@@ -913,11 +913,14 @@ PROVIDER_CATALOG = [
         # _render_relay_instructions_html -- see the matching note on Meyer above. They must
         # stay verbatim here, including inside the sample email below.
         "installation_instructions_html": (
-            "<p><strong>Tri-State</strong> works in two halves. Your catalog, pricing and inventory arrive as "
-            "files Tri-State delivers to a private SFTP folder we've already created for your company &mdash; "
-            "there are no feed credentials to enter. Live stock checks on a single part use Tri-State's PACE "
-            "API instead, which needs an <strong>App-Id</strong> and <strong>Api-Key</strong>. One email to "
-            "your rep covers both.</p>"
+            "<p><strong>Tri-State</strong> works in two halves, and you need both.</p>"
+            "<p>The <strong>feed</strong> is a bulk delivery: Tri-State sends your catalog, pricing and "
+            "inventory files to a private SFTP folder we've already created for your company. There are no "
+            "feed credentials to enter &mdash; they're ours to issue, and they're already filled in below.</p>"
+            "<p>The <strong>PACE API</strong> is how we ask Tri-State about one part at a time, which is what "
+            "gives you live stock and your own account pricing on a part you're looking at. It needs an "
+            "<strong>App-Id</strong> and <strong>Api-Key</strong> issued by Tri-State.</p>"
+            "<p>One email to your rep covers both.</p>"
 
             "<p><strong>1. Email Tri-State</strong></p>"
             "<p>Copy the message below and send it to Mitch Sharp at "
@@ -932,7 +935,7 @@ PROVIDER_CATALOG = [
             "<p><strong>1. SFTP feed delivery.</strong> Please deliver our catalog, pricing and inventory files "
             "to AfterMarketScout's server:</p>"
             "<p>"
-            "Host: <code>" + KEYSTONE_ALLOWLIST_IP + "</code><br />"
+            "Host: <code>5.161.121.143</code><br />"
             "Port: <code>22</code><br />"
             "Username: <code>{{SFTP_USER}}</code><br />"
             "Password: <code>{{SFTP_PASSWORD}}</code><br />"
@@ -949,13 +952,16 @@ PROVIDER_CATALOG = [
             "</div>"
 
             "<p><strong>2. Click Connect</strong></p>"
-            "<p>AfterMarketScout starts watching your folder. Data appears after Tri-State's first delivery, "
-            "which can take a few days depending on your rep.</p>"
+            "<p>AfterMarketScout starts watching your folder straight away. Your connection sits at "
+            "<strong>Waiting</strong> until Tri-State's first delivery actually lands, which can take a few "
+            "days depending on your rep &mdash; that part is in their hands, not ours.</p>"
 
-            "<p><strong>3. Add an ordering account</strong></p>"
-            "<p>When Mitch sends your App-Id and Api-Key, click <strong>+ Add account</strong> under "
-            "<strong>Ordering</strong> below. Enter both values and click <strong>Save</strong>. This is what "
-            "powers live stock checks on individual parts.</p>"
+            "<p><strong>3. Add your App-Id and Api-Key</strong></p>"
+            "<p>When Mitch sends them, click <strong>+ Add account</strong> under <strong>Ordering</strong> "
+            "below, enter both values and click <strong>Save</strong>. We check them against Tri-State while "
+            "you wait, so you'll know immediately whether they work rather than finding out later.</p>"
+            "<p>Don't wait on the feed to do this. Live stock checks on a part work the moment the pair is "
+            "saved, and your account pricing fills in on the next sync after that.</p>"
 
             "<p><strong>Troubleshooting</strong></p>"
             "<ul>"
