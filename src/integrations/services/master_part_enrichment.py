@@ -1554,24 +1554,32 @@ class _MeyerSource(_FlatFeedSource):
 
 class _MotorStateSource(_FlatFeedSource):
     """
-    Thin: a short description and Motor State's own notes. Their richer per-product detail is
-    behind a throttled per-item API that the nightly ingest deliberately does not call.
+    Thin prose: a short description and Motor State's own notes. Their richer per-product detail
+    is behind a throttled per-item API that the nightly ingest deliberately does not call.
+
+    It does carry one image per product though -- 100,346 of its 163,649 rows, as absolute
+    msimg.blob.core.windows.net URLs. Those reach ``MasterPart.image_url`` at ingest but were
+    invisible here because ``image_url`` was missing from ``select_columns``, so the gallery on a
+    Motor-State-only part stayed empty while its thumbnail rendered fine.
     """
 
     name = "motorstate"
     provider_kind = src_enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING.value
     table = "motorstate_products"
     key_column = "part_number"
-    select_columns = ("part_number", "short_description", "vendor_part_number", "data")
+    select_columns = ("part_number", "short_description", "vendor_part_number", "image_url", "data")
 
     def payload_from_row(self, row, *, applications, want_description):
         data = row.get("data") if isinstance(row.get("data"), dict) else {}
+        images = _image_urls([row.get("image_url")])
         field_specs = _specs([
             ("Manufacturer Part Number", row.get("vendor_part_number")),
             ("Notes", data.get("MotorStateNotes")),
         ])
         payload = EnrichmentPayload(
+            images=images or None,
             field_specs=field_specs or None,
+            core_image_url=images[0] if images else None,
             core_description=_clean(row.get("short_description")),
         )
         if want_description:
@@ -1789,8 +1797,9 @@ DEFAULT_SOURCE = _Turn14Source.name
 #: Run these in order and precedence takes care of itself: fill-if-blank means the first source
 #: to supply a field keeps it. Ordered by how much each one actually carries per part -- measured,
 #: not guessed (image fill rates: Rough Country 15,689/15,695, WPS 114,909/126,712, WheelPros
-#: 61,048/69,058, Premier 150,318/686,935, A-Tech 7/1,434,995; Vossen, TireRack and Helmet House
-#: have no usable image column at all).
+#: 61,048/69,058, Premier 150,318/686,935, Motor State 100,346/163,649, A-Tech 7/1,434,995;
+#: Vossen, TireRack and Helmet House have no usable image column at all, and neither do Meyer or
+#: Quadratec -- an images-only run over those four is a guaranteed no-op).
 RECOMMENDED_ORDER = (
     "rough_country",
     # Placed right after Rough Country on measured fill rates of its own: images on 784 of 828
