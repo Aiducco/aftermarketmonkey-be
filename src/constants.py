@@ -885,9 +885,6 @@ PROVIDER_CATALOG = [
         "description": "Access live pricing and inventory from Tri-State Enterprises via their API.",
         "icon_url": "https://api.aftermarketscout.com/uploads/tristate.png",
         "category": "Distributors",
-        # Temporarily withheld from the catalog and onboarding picker — see the note on CTP
-        # Distributors above. Delete this line to bring it back.
-        "hidden": True,
         "connection_required_fields": ["app_id", "api_key"],
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
