@@ -1,12 +1,24 @@
 """
 Tri-State Enterprises (TSE) distributor integration services.
 
-Unlike every other provider in this package, Tri-State has no bulk catalog feed to pull from --
-its real, documented API (src.integrations.clients.tristate.client, PACE's Customer API) only
-exposes per-item ``get_inventory_and_pricing`` lookups for the catalog itself. ``get_brands`` WAS
-ACL-restricted for our App-Id, but access was granted after following up with Tri-State's rep
-(confirmed live 2026-10-15) -- see ``refresh_tse_brands_from_api`` below. So this module is built
-around a few narrower jobs instead of one feed-ingest job:
+Two halves, the same split Meyer has (see src.integrations.services.meyer):
+
+  * The FEED is an SFTP relay delivery. Tri-State pushes catalog/pricing/inventory files to the
+    company's own folder on our relay box, authenticating with the relay credentials we issue
+    (src.integrations.services.relay_sftp_provisioning) -- nothing the dealer types in. Read by
+    src.integrations.clients.tristate.sftp_client. See
+    ``fetch_and_save_tristate_catalog_and_inventory`` at the bottom of this module, which is a
+    PLACEHOLDER: the transport is real and complete, the row parser is not, because as of
+    2026-10-22 Tri-State has not delivered a file and nobody has seen its layout.
+
+  * The API is PACE's Customer API (src.integrations.clients.tristate.client), authenticated
+    with an App-Id/Api-Key pair stored on the connection's ORDER account, not on the feed. It
+    serves per-item ``get_inventory_and_pricing`` lookups and the brand list. This is what every
+    function in this module other than the feed one below runs on.
+
+``get_brands`` WAS ACL-restricted for our App-Id, but access was granted after following up
+with Tri-State's rep (confirmed live 2026-10-15). Until the feed lands the API half is the whole
+working integration, and it is built around a few narrow jobs rather than one feed-ingest job:
 
   1. ``refresh_tse_brands_from_api`` -- the authoritative brand source now that get_brands works:
      calls it for one company's connection and backfills TSEBrand.name/warehouse_code by exact
@@ -37,6 +49,7 @@ TSEParts itself is NOT populated here -- see
 src.management.commands.sync_tse_parts_catalog, which copies from the already-imported
 ``tristate_parts`` (TriStatePart, Algolia-sourced) table rather than re-fetching anything.
 """
+import csv
 import logging
 import typing
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -51,6 +64,7 @@ from src import models as src_models
 from src.integrations import credentials as credentials_helper
 from src.integrations.clients.tristate import client as tristate_client
 from src.integrations.clients.tristate import exceptions as tristate_exceptions
+from src.integrations.clients.tristate import sftp_client as tristate_sftp_client
 from src.integrations.utils.brand_matching import (
     best_fuzzy_brand_match,
     brands_by_compact_key,
@@ -96,7 +110,7 @@ def refresh_tse_brands_from_api(company_provider_id: int) -> int:
         logger.warning("{} No CompanyProviders row id={}.".format(_LOG_PREFIX, company_provider_id))
         return 0
 
-    credentials = credentials_helper.get_feed_credentials(cp)
+    credentials = credentials_helper.get_order_credentials(cp)
     try:
         client = tristate_client.TriStateApiClient(credentials=credentials)
     except ValueError as e:
@@ -474,7 +488,7 @@ def fetch_tristate_inventory_and_pricing_for_company(
         logger.warning("{} No CompanyProviders row id={}.".format(_LOG_PREFIX, company_provider_id))
         return 0
 
-    credentials = credentials_helper.get_feed_credentials(cp)
+    credentials = credentials_helper.get_order_credentials(cp)
     try:
         client = tristate_client.TriStateApiClient(credentials=credentials)
     except ValueError as e:
@@ -668,3 +682,188 @@ def fetch_tristate_inventory_and_pricing_for_company(
 def sync_tristate_company_pricing_for_company_provider(company_provider_id: int) -> None:
     """Entry point wired into integration_pricing_sync_jobs._fetch_raw_pricing."""
     fetch_tristate_inventory_and_pricing_for_company(company_provider_id)
+
+
+# ==========================================================================================
+# SFTP relay feed -- PLACEHOLDER
+#
+# Everything above this line runs on the PACE API. This section is the other half: the files
+# Tri-State delivers to our relay, shaped exactly like Meyer's
+# fetch_and_save_meyer_catalog_and_inventory so that filling it in later is a matter of writing
+# the row parser and nothing else.
+#
+# What is REAL here: resolving the connection, building the client from its relay credentials,
+# downloading, and reporting what arrived. All of that runs against our own relay box and can
+# be exercised today.
+#
+# What is a PLACEHOLDER: the parse-and-upsert step. We have never seen one of these files --
+# not the column names, not whether pricing and inventory arrive separately (Meyer's shape, and
+# what the dealer-facing instructions ask for) or combined (A-Tech's shape). Writing a parser
+# against a guessed layout would be worse than writing none, because it would look finished and
+# would silently upsert garbage the first time a real file arrived. So the ingest logs the
+# header and row count it found and writes nothing, which turns the first real delivery into
+# the schema documentation this needs -- see _log_feed_layout.
+#
+# TSEParts / TSEBrand / TSECompanyPricing already exist and are the tables this will write to,
+# so no new models are needed when the parser lands.
+# ==========================================================================================
+
+# Enough rows to see the shape of a file (types, blanks, whether a "warehouse" column repeats
+# per row or per column) without pulling a multi-hundred-MB feed into memory.
+_FEED_LAYOUT_SAMPLE_ROWS = 3
+
+
+def _active_tristate_company_providers_queryset():
+    return src_models.CompanyProviders.objects.filter(
+        provider__kind=src_enums.BrandProviderKind.TRI_STATE.value,
+        provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
+    ).select_related("company", "provider")
+
+
+def _primary_tristate_company_provider() -> typing.Optional[src_models.CompanyProviders]:
+    """
+    The connection whose relay folder the shared catalog is read from: primary=True when one is
+    marked, else the lowest-id active connection. Same resolution Meyer uses
+    (_primary_meyer_company_provider) and the same caveat applies -- catalog and inventory are
+    account-agnostic, so any real delivery will do, while per-company cost belongs to whichever
+    company's own folder it came from.
+    """
+    base = _active_tristate_company_providers_queryset()
+    return base.filter(primary=True).first() or base.first()
+
+
+def _log_feed_layout(label: str, path: str) -> int:
+    """
+    Log the header and the first few rows of a delivered feed file, and return the header's
+    column count (0 when the file is empty or unreadable as CSV).
+
+    This is the point of the placeholder: the one thing standing between here and a working
+    feed parser is knowing what the columns are called, and this is what will tell us the first
+    time Tri-State delivers. Reads at most _FEED_LAYOUT_SAMPLE_ROWS rows, so it is safe on a
+    large file.
+    """
+    try:
+        with open(path, "r", encoding="utf-8-sig", errors="replace", newline="") as handle:
+            reader = csv.reader(handle)
+            try:
+                header = next(reader)
+            except StopIteration:
+                logger.warning("{} {} feed at {} is empty.".format(_LOG_PREFIX, label, path))
+                return 0
+            sample = []
+            for row in reader:
+                sample.append(row)
+                if len(sample) >= _FEED_LAYOUT_SAMPLE_ROWS:
+                    break
+    except OSError as e:
+        logger.error("{} Could not read the {} feed at {}: {}".format(_LOG_PREFIX, label, path, e))
+        return 0
+
+    logger.warning(
+        "{} FIRST {} DELIVERY RECEIVED -- layout below is what the parser must be written "
+        "against. {} column(s): {!r}. First {} row(s): {!r}".format(
+            _LOG_PREFIX, label.upper(), len(header), header, len(sample), sample
+        )
+    )
+    return len(header)
+
+
+def describe_tristate_relay_folder(
+    company_provider_id: typing.Optional[int] = None,
+) -> typing.List[typing.Dict[str, typing.Any]]:
+    """
+    List what is actually sitting in a company's relay folder, newest-looking name first.
+
+    Needed because the file names we watch for are our own choice, published to the rep in the
+    setup instructions, and a rep who delivers under a different name produces a folder that
+    feed_present() calls empty. This answers "empty, or named something else?" -- the input to
+    setting TRISTATE_PRICING_REMOTE_FILE / TRISTATE_INVENTORY_REMOTE_FILE for that connection.
+
+    Defaults to the primary connection. Returns [] when there is no connection or no relay
+    credentials yet; relay failures propagate so a caller can tell them from an empty folder.
+    """
+    cp = (
+        src_models.CompanyProviders.objects.filter(id=company_provider_id).select_related("company").first()
+        if company_provider_id
+        else _primary_tristate_company_provider()
+    )
+    if not cp:
+        logger.info("{} No Tri-State connection to inspect.".format(_LOG_PREFIX))
+        return []
+
+    try:
+        client = tristate_sftp_client.TriStateSFTPClient(credentials=credentials_helper.get_feed_credentials(cp))
+    except ValueError as e:
+        logger.warning(
+            "{} company_provider_id={}: no usable relay credentials ({}).".format(_LOG_PREFIX, cp.id, e)
+        )
+        return []
+
+    entries = client.list_relay_files()
+    logger.info(
+        "{} company_provider_id={}: {} file(s) on the relay: {}".format(
+            _LOG_PREFIX,
+            cp.id,
+            len(entries),
+            ", ".join("{} ({} bytes)".format(row["filename"], row["size_bytes"]) for row in entries) or "none",
+        )
+    )
+    return entries
+
+
+def fetch_and_save_tristate_catalog_and_inventory(force_download: bool = False) -> int:
+    """
+    Download Tri-State's pricing + inventory files from the primary connection's relay folder
+    and report their layout. Returns the number of TSEParts rows written -- always 0 today,
+    because the parser is not written yet (see this section's header comment).
+
+    Entry point for src.management.commands.ingest_all_providers._run_tristate and for the
+    ``sync_tristate_feed`` command, mirroring Meyer's
+    fetch_and_save_meyer_catalog_and_inventory signature so neither caller changes when the
+    parser lands.
+
+    Does not raise when nothing has been delivered: "the rep hasn't set this up yet" is the
+    expected state for every Tri-State connection right now, and an hourly ingest step should
+    not fail over it. Connection failures DO raise -- a relay we cannot reach is a real problem
+    and is worth failing the step for.
+    """
+    cp = _primary_tristate_company_provider()
+    if not cp:
+        logger.info("{} No active Tri-State connection. Skipping feed ingest.".format(_LOG_PREFIX))
+        return 0
+
+    try:
+        client = tristate_sftp_client.TriStateSFTPClient(credentials=credentials_helper.get_feed_credentials(cp))
+    except ValueError as e:
+        logger.warning(
+            "{} company_provider_id={}: no usable relay credentials ({}). Skipping feed "
+            "ingest.".format(_LOG_PREFIX, cp.id, e)
+        )
+        return 0
+
+    try:
+        pricing_path = client.download_pricing_file(force_download=force_download)
+        inventory_path = client.download_inventory_file(force_download=force_download)
+    except tristate_exceptions.TriStateFileNotFoundError as e:
+        # Expected until a rep sets delivery up. Log what IS in the folder, so a file delivered
+        # under an unexpected name shows up here instead of looking like nothing at all.
+        logger.info(
+            "{} company_provider_id={}: no feed delivered yet ({}).".format(_LOG_PREFIX, cp.id, e)
+        )
+        try:
+            describe_tristate_relay_folder(cp.id)
+        except tristate_exceptions.TriStateException as inner:
+            logger.warning("{} Could not list the relay folder: {}".format(_LOG_PREFIX, inner))
+        return 0
+
+    _log_feed_layout("pricing", pricing_path)
+    _log_feed_layout("inventory", inventory_path)
+
+    logger.warning(
+        "{} company_provider_id={}: Tri-State feed files downloaded but NOT ingested -- the row "
+        "parser is still a placeholder. The layouts logged just above are what it has to be "
+        "written against; nothing was written to TSEParts or TSECompanyPricing.".format(
+            _LOG_PREFIX, cp.id
+        )
+    )
+    return 0

@@ -331,6 +331,21 @@ def get_distributor_credentials_info() -> dict:
             "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("MEYER", "Meyer"),
             "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("MEYER") or None,
         },
+        "tristate": {
+            # Relay-provisioned: the dealer enters nothing for the feed, we issue the relay
+            # account and their rep delivers into it. The App-Id/Api-Key pair is the ORDER
+            # namespace (PACE API) and is optional -- it buys live per-item stock checks.
+            "required": [],
+            "optional": ["app_id", "api_key"],
+            "description": (
+                "No feed credentials to enter: Tri-State delivers your catalog, pricing and inventory to "
+                "AfterMarketScout's relay (host 5.161.121.143, port 22, folder uploads, files "
+                "Tri-State Pricing.csv and Tri-State Inventory.csv). Ask your rep for a PACE API App-Id and "
+                "Api-Key as well, and add them under Ordering for live stock checks on individual parts."
+            ),
+            "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("TRI_STATE", "Tri-State"),
+            "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("TRI_STATE") or None,
+        },
         "atech": {
             "required": ["sftp_user", "sftp_password"],
             "description": (

@@ -3,9 +3,12 @@ TriStateLiveInventoryProvider -- on-demand single-item inventory refresh via Tri
 get_inventory_and_pricing endpoint, which IS itself a single/few-item live lookup (not a bulk
 feed) -- so "live refresh" here is just calling the same client used for the scheduled sync,
 one item at a time, always with ``aliasing=True`` (see the client's and
-src.integrations.services.tristate's docstrings for why). Uses FEED credentials
-(app_id/api_key), unlike Keystone/Meyer which need separate order credentials for live
-inventory -- Tri-State's real API has no such split.
+src.integrations.services.tristate's docstrings for why). Uses ORDER credentials
+(PACE app_id/api_key) -- the same arrangement as Meyer, whose ItemInformation lookups also run
+on its order api_key rather than its feed: Tri-State's FEED is the SFTP relay delivery, which
+carries relay credentials that say nothing about the PACE API. A company with the feed
+connected but no API pair gets no live refresh (get_provider returns None on the resulting
+ValueError), which is the intended behaviour, not a failure.
 """
 import logging
 
@@ -29,7 +32,7 @@ class TriStateLiveInventoryProvider(base.LiveInventoryProvider):
 
     def __init__(self, company_provider: src_models.CompanyProviders) -> None:
         base.LiveInventoryProvider.__init__(self, company_provider)
-        credentials = credentials_helper.get_feed_credentials(company_provider)
+        credentials = credentials_helper.get_order_credentials(company_provider)
         self._client = tristate_client.TriStateApiClient(credentials=credentials)
 
     def refresh(self, provider_part: src_models.ProviderPart) -> src_models.ProviderPartInventory:

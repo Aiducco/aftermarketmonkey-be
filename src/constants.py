@@ -882,51 +882,98 @@ PROVIDER_CATALOG = [
     {
         "kind": enums.BrandProviderKind.TRI_STATE,
         "name": "Tri-State",
-        "description": "Access live pricing and inventory from Tri-State Enterprises via their API.",
+        "description": "Access Tri-State catalog, inventory, and pricing from AfterMarketScout's SFTP relay.",
         "icon_url": "https://api.aftermarketscout.com/uploads/tristate.png",
         "category": "Distributors",
-        "connection_required_fields": ["app_id", "api_key"],
-        "integration_time": "Data available within 1-2 hours",
+        "connection_required_fields": [],
+        "connection_optional_fields": [],
+        "relay_provisioned": True,
+        "relay_credential_fields": ("sftp_user", "sftp_password"),
+        # Two namespaces, same split Meyer draws. The FEED is the relay delivery above -- no
+        # credentials for the dealer to type, because they are ours to issue. ORDER credentials
+        # are the PACE Customer API pair (https://etristate.com/api): "app_id" and "api_key",
+        # two static headers issued directly by a Tri-State rep with no token exchange (see
+        # clients/tristate/client.py). That one pair is what the on-demand live-inventory
+        # refresh and the per-company pricing sync authenticate with, and what order placement
+        # will use once Tri-State grants the ACL for it. Optional: a company can run the feed
+        # without ever entering it and loses only the live per-item calls.
+        "order_connection_required_fields": ["app_id", "api_key"],
+        # Email-channel ordering -- see the matching note on Turn 14 above. Today this is the
+        # only ordering channel Tri-State actually has: PACE's submit_purchase_order answers
+        # 403 for our App-Id (confirmed live 2026-10-15), so TRI_STATE is deliberately not in
+        # src/integrations/orders/registry.py yet.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["account_number", "cc_email", "reply_to_email"],
+        # Was "within 1-2 hours" while this was a pure API integration. Now that the catalog
+        # arrives as a relay delivery, nothing shows up until Tri-State's rep sets that up --
+        # out of our hands, days in practice. Same reasoning as Meyer's; kept in step with the
+        # "a few days" line in the instructions below, so change the two together.
+        "integration_time": "Data available after Tri-State's first delivery, typically a few days",
+        # {{SFTP_USER}}/{{SFTP_PASSWORD}} are substituted per company by
+        # _render_relay_instructions_html -- see the matching note on Meyer above. They must
+        # stay verbatim here, including inside the sample email below.
         "installation_instructions_html": (
-            "<p><strong>Tri-State</strong> connects through the PACE API, using an <strong>App-Id</strong> "
-            "and <strong>Api-Key</strong> issued by Tri-State. The same credentials cover pricing and "
-            "inventory.</p>"
+            "<p><strong>Tri-State</strong> works in two halves. Your catalog, pricing and inventory arrive as "
+            "files Tri-State delivers to a private SFTP folder we've already created for your company &mdash; "
+            "there are no feed credentials to enter. Live stock checks on a single part use Tri-State's PACE "
+            "API instead, which needs an <strong>App-Id</strong> and <strong>Api-Key</strong>. One email to "
+            "your rep covers both.</p>"
 
             "<p><strong>1. Email Tri-State</strong></p>"
-            "<p>Send the message below to Mitch Sharp at "
+            "<p>Copy the message below and send it to Mitch Sharp at "
             "<a href=\"mailto:mitch.sharp@etristate.com\">mitch.sharp@etristate.com</a>, with "
             "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a> on CC so we can "
-            "follow up if anything stalls.</p>"
+            "follow up if anything stalls. The connection details are unique to your company and already "
+            "filled in. Keep them private, because anyone who has them can write to your feed folder.</p>"
             + _CALLOUT_OPEN +
             "<p>Hi Mitch,</p>"
-            "<p>We're integrating our Tri-State account [your account number] with AfterMarketScout. Could you "
-            "please:</p>"
-            "<ol>"
-            "<li>Grant us production access to the PACE API for pricing, inventory and ordering</li>"
-            "<li>Allow connections from AfterMarketScout (IP <code>"
-            + KEYSTONE_ALLOWLIST_IP +
-            "</code>) for our account</li>"
-            "</ol>"
+            "<p>We use AfterMarketScout as our product information management (PIM) and ordering platform, and "
+            "need two things set up for our Tri-State account [your account number]:</p>"
+            "<p><strong>1. SFTP feed delivery.</strong> Please deliver our catalog, pricing and inventory files "
+            "to AfterMarketScout's server:</p>"
+            "<p>"
+            "Host: <code>" + KEYSTONE_ALLOWLIST_IP + "</code><br />"
+            "Port: <code>22</code><br />"
+            "Username: <code>{{SFTP_USER}}</code><br />"
+            "Password: <code>{{SFTP_PASSWORD}}</code><br />"
+            "Folder: <code>uploads</code><br />"
+            "File names: <code>Tri-State Pricing.csv</code> and <code>Tri-State Inventory.csv</code>"
+            "</p>"
+            "<p><strong>2. PACE API access.</strong> Please issue an App-Id and Api-Key for our account with "
+            "access to pricing, inventory and ordering, and allow connections from AfterMarketScout "
+            "(IP <code>" + KEYSTONE_ALLOWLIST_IP + "</code>).</p>"
+            "<p>I've copied AfterMarketScout support "
+            "(<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a>) in case you "
+            "have any technical questions.</p>"
             "<p>Thanks!</p>"
             "</div>"
 
-            "<p><strong>2. Connect the feed</strong></p>"
-            "<p>When Mitch sends your App-Id and Api-Key, paste them into the <strong>Product feed</strong> "
-            "fields below and click <strong>Save feed credentials</strong>. The card will show "
-            "<strong>Feed Connected</strong>.</p>"
+            "<p><strong>2. Click Connect</strong></p>"
+            "<p>AfterMarketScout starts watching your folder. Data appears after Tri-State's first delivery, "
+            "which can take a few days depending on your rep.</p>"
 
-            "<p><strong>Note</strong></p>"
-            "<p>Tri-State's API returns pricing and inventory per item rather than a full catalog dump, so "
-            "coverage starts with the brands we've already mapped and widens over time.</p>"
+            "<p><strong>3. Add an ordering account</strong></p>"
+            "<p>When Mitch sends your App-Id and Api-Key, click <strong>+ Add account</strong> under "
+            "<strong>Ordering</strong> below. Enter both values and click <strong>Save</strong>. This is what "
+            "powers live stock checks on individual parts.</p>"
 
             "<p><strong>Troubleshooting</strong></p>"
             "<ul>"
-            "<li><strong>Saved but no data?</strong> Check that you got production credentials, not test ones, "
-            "and that the IP <code>"
+            "<li><strong>No files after a few days?</strong> Ask your rep to confirm the host, that the files "
+            "are going to the <code>uploads</code> folder, and that they're named <code>Tri-State "
+            "Pricing.csv</code> and <code>Tri-State Inventory.csv</code> exactly &mdash; we look for those "
+            "names and won't see the feed under any other. If your rep can only send them under a different "
+            "name, email <a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a> and "
+            "we'll point the watcher at it.</li>"
+            "<li><strong>Feed works but the API key doesn't?</strong> The SFTP delivery and PACE API access "
+            "are set up separately at Tri-State. Check that your rep actually issued the key, that it's a "
+            "production key rather than a test one, and that the IP <code>"
             + KEYSTONE_ALLOWLIST_IP +
             "</code> was allowed.</li>"
-            "<li><strong>More than one Tri-State account?</strong> Each account needs its own App-Id and "
-            "Api-Key. Ask Mitch for one per account.</li>"
+            "<li><strong>More than one Tri-State account?</strong> Each account needs its own folder and its "
+            "own App-Id and Api-Key. Email "
+            "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a> and we'll "
+            "create another one.</li>"
             "</ul>"
         ),
     },

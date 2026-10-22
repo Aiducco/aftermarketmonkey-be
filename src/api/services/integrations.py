@@ -49,6 +49,7 @@ from src.integrations.clients.tirerack import client as tirerack_client
 from src.integrations.clients.tirerack import exceptions as tirerack_exceptions
 from src.integrations.clients.tristate import client as tristate_client
 from src.integrations.clients.tristate import exceptions as tristate_exceptions
+from src.integrations.clients.tristate import sftp_client as tristate_sftp_client
 from src.integrations.clients.turn_14 import client as turn14_client
 from src.integrations.clients.wps import client as wps_client
 from src.integrations.clients.wps import exceptions as wps_exceptions
@@ -490,17 +491,6 @@ def _validate_keystone_connection(credentials: typing.Dict[str, typing.Any]) -> 
     return None, None
 
 
-def _validate_tristate_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
-    try:
-        client = tristate_client.TriStateApiClient(credentials=credentials)
-        client.test_connection()
-    except tristate_exceptions.TriStateAuthError as e:
-        return str(e), CONNECTION_ERROR_INVALID_CREDENTIALS
-    except (tristate_exceptions.TriStateException, ValueError) as e:
-        return str(e), CONNECTION_ERROR_CONNECTION_FAILED
-    return None, None
-
-
 def _validate_premier_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
     try:
         client = premier_client.PremierFTPClient(credentials=credentials)
@@ -747,7 +737,6 @@ _CONNECTION_VALIDATORS: typing.Dict[int, typing.Callable[[typing.Dict[str, typin
     src_enums.BrandProviderKind.WESTERN_POWER_SPORTS.value: _validate_wps_connection,
     src_enums.BrandProviderKind.HELMHOUSE.value: _validate_helmet_house_connection,
     src_enums.BrandProviderKind.ALLPRO_DISTRIBUTING.value: _validate_allpro_connection,
-    src_enums.BrandProviderKind.TRI_STATE.value: _validate_tristate_connection,
     src_enums.BrandProviderKind.ATD.value: _validate_atd_connection,
 }
 
@@ -824,6 +813,31 @@ def _validate_meyer_order_connection(credentials: typing.Dict[str, typing.Any]) 
     return None, None
 
 
+def _validate_tristate_order_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
+    """
+    Tests the submitted app_id/api_key against Tri-State's PACE Customer API. Lives on the
+    ORDER namespace rather than the feed: the feed is a relay delivery with system-generated
+    credentials (see _RELAY_FEED_CHECK_KINDS), and this pair is what the live-inventory refresh
+    and the per-company pricing sync actually authenticate with -- the same arrangement as
+    Meyer, whose order api_key likewise powers its live-inventory lookups.
+
+    Hits the ``test`` endpoint, which is confirmed never ACL-restricted for a valid pair -- so a
+    TriStatePermissionError here means the credentials are real but this App-Id is barred from
+    an endpoint, which is permission_denied rather than connection_failed (same distinction
+    Turn 14's validator draws).
+    """
+    try:
+        client = tristate_client.TriStateApiClient(credentials=credentials)
+        client.test_connection()
+    except tristate_exceptions.TriStateAuthError as e:
+        return str(e), CONNECTION_ERROR_INVALID_CREDENTIALS
+    except tristate_exceptions.TriStatePermissionError as e:
+        return str(e), CONNECTION_ERROR_PERMISSION_DENIED
+    except (tristate_exceptions.TriStateException, ValueError) as e:
+        return str(e), CONNECTION_ERROR_CONNECTION_FAILED
+    return None, None
+
+
 def _validate_premier_order_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
     try:
         environment = getattr(settings, "PREMIER_ORDER_ENVIRONMENT", "production")
@@ -865,6 +879,7 @@ _ORDER_CONNECTION_VALIDATORS: typing.Dict[int, typing.Callable[[typing.Dict[str,
     src_enums.BrandProviderKind.TURN_14.value: _validate_turn14_order_connection,
     src_enums.BrandProviderKind.KEYSTONE.value: _validate_keystone_order_connection,
     src_enums.BrandProviderKind.MEYER.value: _validate_meyer_order_connection,
+    src_enums.BrandProviderKind.TRI_STATE.value: _validate_tristate_order_connection,
     src_enums.BrandProviderKind.PREMIER_PERFORMANCE.value: _validate_premier_order_connection,
     src_enums.BrandProviderKind.WHEELPROS.value: _validate_wheelpros_order_connection,
 }
@@ -926,6 +941,7 @@ def _validate_order_connection_for_method(
 # built yet, so there's nothing to check against.
 _RELAY_FEED_CHECK_KINDS = {
     src_enums.BrandProviderKind.MEYER.value,
+    src_enums.BrandProviderKind.TRI_STATE.value,
     src_enums.BrandProviderKind.ATECH.value,
     src_enums.BrandProviderKind.CROWN_AUTOMOTIVE.value,
     src_enums.BrandProviderKind.DLG.value,
@@ -940,11 +956,18 @@ _RELAY_FEED_CHECK_KINDS = {
 # kind -> (client class, exception base) for every relay kind whose check is a plain
 # feed_present() -> bool, same contract Meyer/A-Tech originated (True = a real file for *this*
 # company exists on the relay). Crown (built 2026-10-13, presence-only — see its client's own
-# docstring) and DLG now follow the same shape. The Wheel Group is handled separately below: its
+# docstring), DLG and Tri-State now follow the same shape — Tri-State's check is real even
+# though its row PARSER is still a placeholder (see services/tristate.py): whether a file has
+# landed is answerable today, and is exactly what a WAITING connection needs to report. The
+# Wheel Group is handled separately below: its
 # presence check is inventory_feed_present() with a different constructor (force_public_share)
 # and a different FAILING/WAITING message.
 _RELAY_FEED_PRESENT_CLIENTS: typing.Dict[int, typing.Tuple[typing.Any, typing.Any]] = {
     src_enums.BrandProviderKind.MEYER.value: (meyer_client.MeyerSFTPClient, meyer_exceptions.MeyerException),
+    src_enums.BrandProviderKind.TRI_STATE.value: (
+        tristate_sftp_client.TriStateSFTPClient,
+        tristate_exceptions.TriStateException,
+    ),
     src_enums.BrandProviderKind.ATECH.value: (atech_client.AtechSFTPClient, atech_exceptions.AtechException),
     src_enums.BrandProviderKind.CROWN_AUTOMOTIVE.value: (crown_client.CrownSFTPClient, crown_exceptions.CrownException),
     src_enums.BrandProviderKind.DLG.value: (dlg_client.DlgSFTPClient, dlg_exceptions.DlgException),

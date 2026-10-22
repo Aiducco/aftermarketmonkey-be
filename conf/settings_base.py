@@ -521,6 +521,31 @@ MEYER_ORDER_ENVIRONMENT = os.environ.get("MEYER_ORDER_ENVIRONMENT", "production"
 # IPs directly and the proxy is no longer needed).
 MEYER_ORDER_PROXY_URL = os.environ.get("MEYER_ORDER_PROXY_URL", "socks5h://54.236.214.147:1080")
 
+# Tri-State relay SFTP: same shape as Meyer above -- Tri-State pushes their feed files to our
+# own relay box and each company authenticates with the relay sftp_user/sftp_password that
+# relay_sftp_provisioning issues it, not with anything Tri-State hands out.
+#
+# The two remote file names are PLACEHOLDERS. Tri-State has not delivered a file yet, so the
+# names below are our own guess in Meyer's "<Distributor> <Feed>.csv" style, and they are read
+# from the environment precisely so the real names can be set without a deploy the moment the
+# rep confirms them. Same for the split into pricing + inventory: if Tri-State ships one
+# combined file instead (A-Tech's shape), point both vars at it.
+try:
+    _tristate_port = int(os.environ.get("TRISTATE_SFTP_PORT") or "22")
+except ValueError:
+    _tristate_port = 22
+TRISTATE_SFTP_HOST = os.environ.get("TRISTATE_SFTP_HOST") or "5.161.121.143"
+TRISTATE_SFTP_PORT = _tristate_port if 1 <= _tristate_port <= 65535 else 22
+TRISTATE_SFTP_DIRECTORY = os.environ.get("TRISTATE_SFTP_DIRECTORY") or "uploads"
+TRISTATE_PRICING_REMOTE_FILE = os.environ.get("TRISTATE_PRICING_REMOTE_FILE") or "Tri-State Pricing.csv"
+TRISTATE_INVENTORY_REMOTE_FILE = os.environ.get("TRISTATE_INVENTORY_REMOTE_FILE") or "Tri-State Inventory.csv"
+TRISTATE_PRICING_LOCAL_PATH = os.environ.get("TRISTATE_PRICING_LOCAL_PATH", "/tmp/tristate_pricing.csv")
+TRISTATE_INVENTORY_LOCAL_PATH = os.environ.get("TRISTATE_INVENTORY_LOCAL_PATH", "/tmp/tristate_inventory.csv")
+
+# PACE Customer API (Tri-State's own host). Not an order-environment split like Meyer/Turn14:
+# PACE has one host and the App-Id/Api-Key pair is issued against it directly.
+TRISTATE_API_BASE_URL = os.environ.get("TRISTATE_API_BASE_URL") or "https://etristate.com/api"
+
 # A-Tech relay SFTP: same pattern as Meyer — per-company sftp_user/sftp_password in CompanyProviders.
 try:
     _atech_port = int(os.environ.get("ATECH_SFTP_PORT") or "22")

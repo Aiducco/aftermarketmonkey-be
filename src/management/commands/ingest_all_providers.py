@@ -429,9 +429,19 @@ class Command(BaseCommand):
     def _run_tristate(self) -> None:
         with self._audited_step(
             "ingest_all_providers_tristate",
-            "TSE catalog copy from tristate_parts + unmapped brand sync complete (derived in sync_all).",
+            "TSE relay feed check + catalog copy from tristate_parts + unmapped brand sync "
+            "complete (derived in sync_all).",
             continue_on_error=True,
         ):
+            # Tri-State's feed is a relay delivery (Meyer's shape) and no rep has set one up
+            # yet, so this call normally finds nothing and logs that. It is in the hourly cycle
+            # anyway because that is what turns the first real delivery into the logged layout
+            # the parser still needs -- see the placeholder note in services/tristate.py. It
+            # never raises on an undelivered feed, only on a relay we cannot reach.
+            self._ingest_log("TSE: relay feed check")
+            tristate.fetch_and_save_tristate_catalog_and_inventory(force_download=False)
+            # The catalog itself still comes from the PACE-sourced seed table, DB to DB -- no
+            # credentials, no network, and unrelated to the relay above.
             self._ingest_log("TSE: copying catalog from tristate_parts seed + unmapped brand sync")
             tristate.sync_unmapped_tse_brands_to_brands()
             tristate.sync_tse_parts_from_tristate_part_seed()
