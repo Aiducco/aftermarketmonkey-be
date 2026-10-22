@@ -15,6 +15,7 @@ from django.utils import timezone
 
 from src import enums as src_enums
 from src import models as src_models
+from src.integrations.utils import images as image_utils
 from src.integrations import credentials as credentials_helper
 from src.integrations.clients.premier import client as premier_client
 from src.integrations.clients.premier import exceptions as premier_exceptions
@@ -985,7 +986,7 @@ def _transform_single_premier_row(
             ky_qty=_safe_int(row.get("KY whse")),
             mfg_qty=_safe_int(row.get("MFG Invt")),
             wa_qty=_safe_int(row.get("WA whse")),
-            image_url=_clean(row.get("ImageURL")),
+            image_url=image_utils.clean_image_url(row.get("ImageURL")),
             ships_ltl=_safe_bool(row.get("ShipsLTL")),
             item_with_cores=_safe_bool(row.get("ItemWithCores")),
             prop65_carcinogen=_safe_bool(row.get("Proposition 65 Carcinogen")),

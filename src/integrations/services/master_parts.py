@@ -22,6 +22,7 @@ from src import enums as src_enums
 from src import models as src_models
 from src.integrations import credentials as credentials_helper
 from src.integrations.services import wps as wps_services
+from src.integrations.utils import images as image_utils
 from src.integrations.utils import master_part_matching as mp_matching
 from src.integrations.services.vossen import dealer_cost_from_price as vossen_dealer_cost_from_price
 from src.integrations.services.wheelpros import dealer_cost_from_msrp
@@ -1537,7 +1538,7 @@ def _ingest_atech_parts_for_mapped_brands(
                         sku=pn,
                         description=row.get("description"),
                         aaia_code=aaia,
-                        image_url=row.get("image_url"),
+                        image_url=image_utils.clean_image_url(row.get("image_url")),
                         gtin=row.get("gtin") or None,
                     )
                 )
@@ -2227,7 +2228,7 @@ def _ingest_tse_parts_for_mapped_brands(
                         sku=part_number,
                         description=row.get("description"),
                         aaia_code=aaia,
-                        image_url=row.get("image_url"),
+                        image_url=image_utils.clean_image_url(row.get("image_url")),
                     )
                 )
 
@@ -6189,7 +6190,7 @@ def _ingest_wps_items_for_mapped_brands(
                         # The item's own name is a short label ("MULTIRATE FORK SPRINGS 35MM");
                         # the long copy lives on the parent product.
                         description=row.get("product__description") or row.get("name"),
-                        image_url=row.get("image_url"),
+                        image_url=image_utils.clean_image_url(row.get("image_url")),
                         # 47% of WPS items carry a upc -- the corroboration
                         # extend_with_normalized_matches needs to accept a formatting-only match.
                         gtin=(row.get("upc") or None),
@@ -7665,7 +7666,7 @@ def _ingest_wheelpros_parts_for_mapped_brands(
                         sku=part_number,
                         description=row.get("part_description"),
                         aaia_code=aaia,
-                        image_url=row.get("image_url"),
+                        image_url=image_utils.clean_image_url(row.get("image_url")),
                     )
                 )
             wp_external_id_to_brand_part[_wheelpros_provider_external_id(row["brand_id"], part_number)] = (
@@ -11638,7 +11639,7 @@ def _ingest_premier_parts_for_mapped_brands(
                         sku=premier_pn,
                         description=row.get("long_description"),
                         aaia_code=aaia,
-                        image_url=row.get("image_url"),
+                        image_url=image_utils.clean_image_url(row.get("image_url")),
                         gtin=row.get("upc_code") or None,
                     )
                 )
@@ -14921,7 +14922,7 @@ def _ingest_atd_parts_for_mapped_brands(
                         part_number=part_number,
                         sku=part_number,
                         description=row.get("description"),
-                        image_url=row.get("image_url"),
+                        image_url=image_utils.clean_image_url(row.get("image_url")),
                         gtin=row.get("upc") or None,
                     )
                 )
