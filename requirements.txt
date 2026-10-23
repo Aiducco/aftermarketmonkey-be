@@ -57,6 +57,8 @@ django==4.1.7
     #   django-redis
 django-cors-headers==4.4.0
     # via -r requirements.in
+curl-cffi==0.16.0
+    # via -r requirements.in
 django-pgbulk==3.2.4
     # via -r requirements.in
 django-redis==5.2.0

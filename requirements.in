@@ -46,4 +46,4 @@ django-cors-headers
 ratelimit
 django-pgbulk
 meilisearch
-xhtml2pdf
+xhtml2pdfcurl-cffi==0.16.0
