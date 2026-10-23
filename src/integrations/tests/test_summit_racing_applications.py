@@ -166,3 +166,37 @@ class SkuLookupTests(SimpleTestCase):
         keys = summit_sku_index.candidate_keys_for_part_number("not-a-real-part")
 
         self.assertIsNone(next((lookup[k] for k in keys if k in lookup), None))
+
+
+class TokenRemintTests(SimpleTestCase):
+    """A challenge is fatal with a hand-pasted cookie but recoverable when we can mint our own."""
+
+    def test_client_requires_a_cookie_or_a_provider(self):
+        with self.assertRaises(summit_exceptions.SummitRacingError):
+            summit_client.SummitRacingClient("")
+
+    def test_provider_is_used_when_no_cookie_is_supplied(self):
+        calls = []
+
+        def provider(gateway):
+            calls.append(gateway)
+            return "reese84=minted-{}".format(len(calls)), "UA/1.0"
+
+        client = summit_client.SummitRacingClient(token_provider=provider, gateways=["sticky-a"])
+        self.assertTrue(client._remint())
+
+        # Minted on this client's own gateway: a token replayed from another exit is stubbed.
+        self.assertEqual(calls, ["sticky-a"])
+        self.assertEqual(client._user_agent, "UA/1.0")
+        self.assertEqual(client._cookies["reese84"], "minted-1")
+
+    def test_reminting_is_bounded(self):
+        def provider(gateway):
+            return "reese84=x", "UA/1.0"
+
+        client = summit_client.SummitRacingClient(token_provider=provider, gateways=[""], max_remints=2)
+
+        self.assertTrue(client._remint())
+        self.assertTrue(client._remint())
+        # Without a ceiling a permanently blocked IP would mint browsers forever.
+        self.assertFalse(client._remint())

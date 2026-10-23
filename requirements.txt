@@ -256,3 +256,5 @@ webencodings==0.5.1
     #   tinycss2
 xhtml2pdf==0.2.17
     # via -r requirements.in
+playwright==1.64.1
+    # via -r requirements.in

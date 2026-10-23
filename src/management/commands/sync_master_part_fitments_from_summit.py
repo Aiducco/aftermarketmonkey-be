@@ -112,6 +112,15 @@ class Command(BaseCommand):
             help="Attribute rows to this Providers.kind (default: NULL source_provider).",
         )
         parser.add_argument("--no-proxy", action="store_true", help="Go direct instead of through StormProxies.")
+        parser.add_argument(
+            "--mint-tokens",
+            action="store_true",
+            help=(
+                "Mint reese84 with headless Chromium per worker and re-mint when challenged, "
+                "instead of relying on a pasted cookie. Needs sticky gateways: a token replayed "
+                "from a different exit IP is stubbed."
+            ),
+        )
         parser.add_argument("--dry-run", action="store_true", help="Fetch and parse but write nothing.")
 
     def handle(self, *args, **options):
@@ -126,7 +135,8 @@ class Command(BaseCommand):
                 )
             brand_id = brands[0]
 
-        cookie_header = _load_cookie(options["cookie_file"])
+        # With minting on, a pasted cookie is optional -- each worker makes its own.
+        cookie_header = "" if options["mint_tokens"] else _load_cookie(options["cookie_file"])
         gateways = [""] if options["no_proxy"] else (summit_client.configured_gateways() or [""])
 
         prefix = options["sku_prefix"].lower()
@@ -168,6 +178,7 @@ class Command(BaseCommand):
             max_pages_per_part=options["max_pages_per_part"],
             batch_size=options["batch_size"],
             provider_kind=options["provider_kind"],
+            mint_tokens=options["mint_tokens"],
             dry_run=options["dry_run"],
             on_progress=self.stdout.write,
         )

@@ -16,15 +16,22 @@ site rather than assumed:
    ``summit_racing_cookie.local.txt``, the same convention
    ``backfill_atech_summit_image_urls`` already uses.
 
-3. **``reese84`` is NOT bound to the IP it was minted on.** Verified 2026-10-23: one token
-   minted in a desktop browser answered 200 through a StormProxies residential exit. This is the
-   opposite of Cloudflare's ``cf_clearance`` (see the JEGS notes) and it is what makes
-   parallelism possible at all -- one browser-minted token can fan out across N proxy exits.
+3. **A token must be used from the IP it was minted on.** A single replay from another IP may
+   succeed, which is misleading; sustained use does not. Measured 2026-10-23: 12 workers
+   sharing one token across 12 rotating exits were revoked after exactly 13 requests -- one per
+   worker -- while 4 workers on a single IP ran 61 requests clean. Replay from a different exit
+   is answered with the throttle stub, not an error.
 
-Concurrency therefore comes from *exit IPs, not threads on one IP*. A four-way concurrent burst
-from a single IP tripped the per-route throttle within ~60 requests and had not recovered 40s
-later, while the same work paced sequentially ran clean. Each worker here holds its own session
-bound to its own gateway, paces itself, and rotates its exit IP when throttled.
+Concurrency therefore needs **one token per sticky exit IP**, not threads on one IP and not a
+rotating gateway. A rotating gateway fails silently here: ``context.request`` calls inside a
+single browser context were observed leaving from 62.233.39.79 and then 185.201.139.248,
+because it rotates per connection, so the token and the exit drift apart mid-session. Point
+``STORM_PROXY_GATEWAY_SCRAPE`` at comma-separated **sticky** gateways and give each worker its
+own; ``token.mint_token`` then mints that worker's token through that same gateway.
+
+Imperva also throttles per IP cumulatively: enough traffic from one address earns a site-wide
+~900-byte stub on every route, in a real browser too, which takes hours to lift. Pace
+conservatively -- this is a backfill, not a race.
 """
 
 from __future__ import annotations
@@ -129,17 +136,27 @@ class SummitRacingClient:
 
     def __init__(
         self,
-        cookie_header: str,
+        cookie_header: str = "",
         *,
+        token_provider: typing.Optional[typing.Callable[[str], typing.Tuple[str, str]]] = None,
         gateways: typing.Optional[typing.Sequence[str]] = None,
         pace_seconds: float = 1.5,
         timeout: float = 60.0,
         max_attempts: int = 4,
         backoff_seconds: float = 20.0,
+        max_remints: int = 3,
     ) -> None:
-        if not cookie_header.strip():
-            raise exceptions.SummitRacingError("A summitracing.com cookie header is required.")
-        self._cookies = _parse_cookie_header(cookie_header)
+        if not cookie_header.strip() and token_provider is None:
+            raise exceptions.SummitRacingError(
+                "Pass a summitracing.com cookie header, or a token_provider that mints one."
+            )
+        # A minted token must be replayed from the IP *and* under the user agent it was minted
+        # with, so the provider hands back both and they are applied together.
+        self._token_provider = token_provider
+        self._user_agent: typing.Optional[str] = None
+        self._max_remints = max_remints
+        self._remints = 0
+        self._cookies = _parse_cookie_header(cookie_header) if cookie_header.strip() else {}
         # An empty gateway string means "go direct"; keeping it in the ring lets a caller run
         # without proxies by configuring nothing.
         self._gateways = list(gateways) if gateways else [""]
@@ -154,7 +171,25 @@ class SummitRacingClient:
         self.request_count = 0
         self.throttle_count = 0
 
+    def _remint(self) -> bool:
+        """Mint a fresh token on the current gateway. False when that is not possible.
+
+        The token is minted on *this* client's gateway, never a shared one: a token replayed
+        from a different exit IP is answered with the throttle stub, so one token per worker per
+        sticky exit is the only arrangement that holds.
+        """
+        if self._token_provider is None or self._remints >= self._max_remints:
+            return False
+        self._remints += 1
+        cookie_header, user_agent = self._token_provider(self._gateway)
+        self._cookies = _parse_cookie_header(cookie_header)
+        self._user_agent = user_agent
+        self._session = None  # rebuild with the new cookies and UA
+        return True
+
     def _ensure_session(self):
+        if self._session is None and not self._cookies and not self._remint():
+            raise exceptions.SummitRacingChallenged("No cookie available and no token provider.")
         if self._session is None:
             # Imported lazily so that importing this module (e.g. by Django's command autodiscovery)
             # does not hard-require curl_cffi in environments that never scrape.
@@ -166,6 +201,8 @@ class SummitRacingClient:
                 verify=False,  # noqa: S501 -- Imperva terminates TLS; cert pinning buys nothing here
             )
             self._session.headers.update(_DEFAULT_HEADERS)
+            if self._user_agent:
+                self._session.headers["user-agent"] = self._user_agent
             for name, value in self._cookies.items():
                 self._session.cookies.set(name, value, domain=".summitracing.com")
         return self._session
@@ -211,8 +248,20 @@ class SummitRacingClient:
                 self._last_request_at = time.monotonic()
                 classify_response(response.status_code, body)
                 return body
-            except exceptions.SummitRacingChallenged:
-                raise
+            except exceptions.SummitRacingChallenged as e:
+                # Recoverable only when we can mint our own replacement: a hand-supplied cookie
+                # fails identically on every attempt, so retrying it just delays the operator
+                # learning they need a new one.
+                last_error = e
+                self._last_request_at = time.monotonic()
+                if not self._remint():
+                    raise
+                logger.info(
+                    "%s re-minted token after a challenge (attempt %s/%s)",
+                    _LOG_PREFIX,
+                    attempt,
+                    self._max_attempts,
+                )
             except exceptions.SummitRacingThrottled as e:
                 self.throttle_count += 1
                 last_error = e

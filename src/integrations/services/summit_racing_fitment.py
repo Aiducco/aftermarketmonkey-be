@@ -35,6 +35,7 @@ from src.integrations.clients.summit_racing import applications as summit_applic
 from src.integrations.clients.summit_racing import client as summit_client
 from src.integrations.clients.summit_racing import exceptions as summit_exceptions
 from src.integrations.clients.summit_racing import sku_index as summit_sku_index
+from src.integrations.clients.summit_racing import token as summit_token
 from src.integrations.services import master_parts
 
 logger = logging.getLogger(__name__)
@@ -106,8 +107,16 @@ class _ClientPool:
     untouched.
     """
 
-    def __init__(self, cookie_header: str, gateways: typing.Sequence[str], pace_seconds: float, timeout: float):
+    def __init__(
+        self,
+        cookie_header: str,
+        gateways: typing.Sequence[str],
+        pace_seconds: float,
+        timeout: float,
+        mint_tokens: bool = False,
+    ):
         self._cookie_header = cookie_header
+        self._mint_tokens = mint_tokens
         self._gateways = list(gateways)
         self._pace_seconds = pace_seconds
         self._timeout = timeout
@@ -128,6 +137,9 @@ class _ClientPool:
         ordered = self._gateways[start:] + self._gateways[:start]
         client = summit_client.SummitRacingClient(
             self._cookie_header,
+            # Each worker mints on its own gateway, so its token and its exit IP stay paired --
+            # the pairing a shared token across rotating exits cannot keep.
+            token_provider=_mint_for_gateway if self._mint_tokens else None,
             gateways=ordered,
             pace_seconds=self._pace_seconds,
             timeout=self._timeout,
@@ -140,6 +152,11 @@ class _ClientPool:
     def totals(self) -> typing.Tuple[int, int]:
         with self._lock:
             return (sum(c.request_count for c in self._all), sum(c.throttle_count for c in self._all))
+
+
+def _mint_for_gateway(gateway: str) -> typing.Tuple[str, str]:
+    minted = summit_token.mint_token(gateway=gateway)
+    return minted.cookie_header, minted.user_agent
 
 
 def fetch_part_applications(
@@ -183,6 +200,7 @@ def sync_master_part_fitments_from_summit(
     max_pages_per_part: int = 40,
     batch_size: int = 200,
     provider_kind: typing.Optional[int] = None,
+    mint_tokens: bool = False,
     dry_run: bool = False,
     on_progress: typing.Optional[typing.Callable[[str], None]] = None,
 ) -> SweepResult:
@@ -212,7 +230,7 @@ def sync_master_part_fitments_from_summit(
         return result
 
     gateways = list(gateways) if gateways else [""]
-    pool = _ClientPool(cookie_header, gateways, pace_seconds, timeout)
+    pool = _ClientPool(cookie_header, gateways, pace_seconds, timeout, mint_tokens=mint_tokens)
     pending_rows: typing.List[src_models.MasterPartFitment] = []
     stop = threading.Event()
 
