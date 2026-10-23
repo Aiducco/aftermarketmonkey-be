@@ -9091,3 +9091,69 @@ class BrandPaceBrandMapping(django_db_models.Model):
 
     def __str__(self) -> str:
         return "{} -> {}".format(self.pace_brand_id, self.brand_id)
+
+
+class ApolloPhoneReveal(django_db_models.Model):
+    """
+    One row per person whose direct dial was requested from Apollo's enrichment API.
+
+    WHY THIS TABLE EXISTS
+    ---------------------
+    Apollo will not return a direct dial synchronously. ``people/match`` and
+    ``people/bulk_match`` both reject ``reveal_phone_number`` with HTTP 400
+    ``SEARCH.VALIDATION.WEBHOOK_URL_REQUIRED`` unless a ``webhook_url`` is supplied, because
+    phone resolution runs asynchronously on their side and the result is POSTed back minutes
+    later. There is no polling endpoint to read it from -- the callback is the only delivery
+    channel, so a reachable endpoint plus somewhere to land the payload is the minimum viable
+    setup. Hence this table and ``/api/apollo/phone-webhook/``.
+
+    A row is INSERTed by ``reveal_apollo_phones`` at request time with ``status="requested"``
+    and UPDATEd in place when the callback arrives. Rows that never leave "requested" are
+    reveals Apollo dropped or never resolved -- those still cost a credit, so the stale ones
+    are worth reviewing before re-requesting.
+
+    TWO TRAPS
+    ---------
+    1. Apollo validates ``webhook_url`` for *format only*, not reachability. Posting a reveal
+       with an unroutable URL returns HTTP 200 and silently spends the credit -- the result is
+       POSTed into the void. Confirmed against ``https://example.invalid/hook``. So the base
+       URL must be right before a batch is fired, not after.
+    2. The callback carries no auth header of its own and Apollo cannot be configured to add
+       one, so the shared secret rides in the query string and is compared with
+       ``hmac.compare_digest``. Treat it as a bearer credential: anything holding the URL can
+       write rows here.
+    """
+
+    apollo_person_id = django_db_models.CharField(max_length=64, unique=True)
+
+    # Snapshotted at request time from the search/enrich payload, so a row is readable without
+    # joining back to whatever produced it. Not authoritative -- the callback may disagree.
+    name = django_db_models.CharField(max_length=255, blank=True, default="")
+    title = django_db_models.CharField(max_length=255, blank=True, default="")
+    email = django_db_models.CharField(max_length=255, blank=True, default="")
+    organization_domain = django_db_models.CharField(max_length=255, blank=True, default="")
+
+    # "requested" -> "received" | "no_phone". Never deleted on re-request; the row is reused.
+    status = django_db_models.CharField(max_length=16, default="requested")
+
+    # Normalised list of {"raw": str, "sanitized": str, "type": str} pulled off the callback.
+    phone_numbers = django_db_models.JSONField(default=list, blank=True)
+
+    # The callback body verbatim. Apollo's phone payload shape is undocumented and has changed
+    # before; keeping it means a reshape can be re-derived without re-spending credits.
+    raw_payload = django_db_models.JSONField(
+        default=dict, blank=True, encoder=DjangoJSONEncoder
+    )
+
+    requested_at = django_db_models.DateTimeField(default=timezone.now)
+    received_at = django_db_models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "apollo_phone_reveal"
+        indexes = [
+            django_db_models.Index(fields=["organization_domain"], name="apr_org_domain_idx"),
+            django_db_models.Index(fields=["status"], name="apr_status_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return "{} ({})".format(self.name or self.apollo_person_id, self.status)

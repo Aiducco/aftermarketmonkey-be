@@ -1009,3 +1009,18 @@ FRESHSALES_INTERNAL_EMAIL_DOMAINS = frozenset(
 INSTANTLY_UNIBOX_URL_TEMPLATE = os.environ.get(
     "INSTANTLY_UNIBOX_URL_TEMPLATE", "https://app.instantly.ai/app/unibox?search=thread:{thread_id}"
 )
+
+
+# Apollo.io contact enrichment.
+#
+# Direct dials are the reason the webhook settings below exist: Apollo rejects
+# ``reveal_phone_number`` on people/match and people/bulk_match unless a ``webhook_url`` is
+# supplied, resolves the number asynchronously, and POSTs it back -- there is no endpoint to
+# poll. See src/api/views/apollo.py and the reveal_apollo_phones command.
+#
+# APOLLO_WEBHOOK_BASE_URL must be the PUBLIC origin of this service. Apollo validates the
+# webhook URL for format only, not reachability: an unroutable URL returns HTTP 200 and spends
+# the reveal credit anyway, with the result delivered nowhere.
+APOLLO_API_KEY = os.environ.get("APOLLO_API_KEY", "")
+APOLLO_WEBHOOK_SECRET = os.environ.get("APOLLO_WEBHOOK_SECRET", "")
+APOLLO_WEBHOOK_BASE_URL = os.environ.get("APOLLO_WEBHOOK_BASE_URL", "https://api.aftermarketscout.com")

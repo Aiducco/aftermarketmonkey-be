@@ -5,6 +5,7 @@ from src.api.views.address import (
     AddressSuggestView,
     AddressValidateView,
 )
+from src.api.views.apollo import ApolloPhoneWebhookView
 from src.api.views.authentication import LoginView, ChangePasswordView
 from src.api.views.admin import (
     AdminCompaniesView,
@@ -581,5 +582,10 @@ urlpatterns = [
         "admin/providers/<int:id>/",
         AdminProviderDetailView.as_view(),
         name="admin_provider_detail",
+    ),
+    path(
+        "apollo/phone-webhook/",
+        ApolloPhoneWebhookView.as_view(),
+        name="apollo_phone_webhook",
     ),
 ]
