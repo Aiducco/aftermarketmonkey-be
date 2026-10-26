@@ -276,5 +276,4 @@ class EmailOrderAdapter(base.DistributorOrderAdapter):
     def supports_cancel(self) -> bool:
         return False
 
-    def fulfillment_channel(self) -> str:
-        return "email"
+    fulfillment_channel_name = "email"

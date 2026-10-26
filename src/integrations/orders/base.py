@@ -369,14 +369,22 @@ class DistributorOrderAdapter(abc.ABC):
         """Override to return True for distributors whose adapter implements get_invoices()."""
         return False
 
+    # Declared as a class attribute as well as a method so callers can ask "what channel is
+    # this distributor?" without constructing an adapter — construction requires credentials,
+    # which a PO's order account may no longer resolve after a later credential change, and the
+    # channel is a property of the distributor rather than of one account's configuration. See
+    # registry.fulfillment_channel_for_kind.
+    fulfillment_channel_name: str = "api"
+
     def fulfillment_channel(self) -> str:
         """
-        'api' (default) or 'email' — lets callers (get_order_capabilities(),
+        'api' (default), 'email' or 'edi' — lets callers (get_order_capabilities(),
         _serialize_purchase_order) surface how a PO was actually placed without hardcoding a
-        list of which distributor kinds are email-based. Overridden to 'email' by
-        EmailOrderAdapter only.
+        list of which distributor kinds are which. 'email' is EmailOrderAdapter; 'edi' is
+        RoughCountryEdiOrderAdapter, where submitting delivers a file and confirmation arrives
+        separately, hours later.
         """
-        return "api"
+        return self.fulfillment_channel_name
 
     def get_invoices(self, purchase_order: src_models.PurchaseOrder) -> typing.List[DistributorInvoice]:
         """

@@ -9159,6 +9159,117 @@ class ApolloPhoneReveal(django_db_models.Model):
         return "{} ({})".format(self.name or self.apollo_person_id, self.status)
 
 
+class EdiControlNumber(django_db_models.Model):
+    """
+    Monotonic X12 control-number counters, one row per (partner_id, kind).
+
+    These cannot come from a clock. A duplicate ISA13 is a rejected interchange, and because
+    Rough Country publishes no 997 for our 850s a rejection is *silent* -- the shop sees a
+    submitted PO, nothing ever ships, and nobody finds out until the customer calls. So
+    ``next_value`` takes a row lock and increments inside the caller's transaction, which is
+    the only way two concurrent submits cannot mint the same number.
+
+    Separate from EdiDocument on purpose: a document row is written once per interchange and
+    kept forever, while this is a single hot row per counter that every send contends on.
+
+    ``partner_id`` here is OUR OWN ISA06 for one company's mailbox (Alluvia assigns each shop
+    its own), so the counters are naturally per shop and per distributor: two companies ordering
+    from Rough Country keep independent sequences, which is required, since each has its own
+    interchange history with the partner.
+    """
+    KIND_INTERCHANGE = "isa"  # ISA13 -- 9 digits, unique per partner for the life of the account
+    KIND_GROUP = "gs"  # GS06
+    KIND_TRANSACTION = "st"  # ST02
+
+    partner_id = django_db_models.CharField(max_length=15)
+    kind = django_db_models.CharField(max_length=16)
+    value = django_db_models.BigIntegerField(default=0)
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "edi_control_numbers"
+        unique_together = ("partner_id", "kind")
+        indexes = [
+            django_db_models.Index(fields=["partner_id", "kind"], name="edi_ctl_partner_kind_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return "{}/{} = {}".format(self.partner_id, self.kind, self.value)
+
+
+class EdiDocument(django_db_models.Model):
+    """
+    Every X12 interchange we send or receive, stored verbatim alongside what we made of it.
+
+    This is the audit trail. For an API distributor that role is played by
+    PurchaseOrderSubmissionAttempt.request_payload/response_payload, which for an EDI partner
+    would otherwise be empty -- there is no request and no response, only files in a directory.
+
+    It is also the deduplication key. FTP has no delivery semantics: the collector deliberately
+    leaves anything it could not archive in place so the next run finds it again, which makes
+    inbound delivery at-least-once. Without the unique constraint below, a replayed 810 would
+    create a second invoice and a replayed 855 would re-apply quantities.
+
+    ``purchase_order`` is nullable because a document is stored BEFORE it is matched -- an 855
+    naming a PO we do not have must still land somewhere a human can find it (status
+    UNMATCHED), never be dropped on the floor.
+    """
+    direction = django_db_models.PositiveSmallIntegerField()
+    direction_name = django_db_models.CharField(max_length=16)
+    # The other side's ISA id: who sent it to us, or who we sent it to.
+    partner_id = django_db_models.CharField(max_length=15)
+    # ST01 -- "850", "855", "856", "810", "997".
+    doc_type = django_db_models.CharField(max_length=8)
+    interchange_control_number = django_db_models.CharField(max_length=32)
+    group_control_number = django_db_models.CharField(max_length=32, null=True, blank=True)
+    transaction_control_number = django_db_models.CharField(max_length=32, null=True, blank=True)
+    # As it sat in the mailbox. Alluvia's names embed "~", their own segment terminator, so
+    # nothing may ever infer a delimiter from this value.
+    filename = django_db_models.CharField(max_length=255, null=True, blank=True)
+    raw_payload = django_db_models.TextField()
+    parsed_payload = django_db_models.JSONField(null=True, blank=True, encoder=DjangoJSONEncoder)
+    # Which company's mailbox this went through. Not nullable: every document is sent or
+    # collected under exactly one company's order account, and the dedup constraint below is
+    # only correct when it is scoped this way -- our outbound control numbers restart at 1 per
+    # shop, so two shops' first 850s would otherwise collide on the same interchange number.
+    company_provider = django_db_models.ForeignKey(
+        "CompanyProviders",
+        on_delete=django_db_models.CASCADE,
+        related_name="edi_documents",
+    )
+    purchase_order = django_db_models.ForeignKey(
+        "PurchaseOrder",
+        on_delete=django_db_models.SET_NULL,
+        related_name="edi_documents",
+        null=True,
+        blank=True,
+    )
+    status = django_db_models.PositiveSmallIntegerField()
+    status_name = django_db_models.CharField(max_length=32)
+    error_message = django_db_models.TextField(null=True, blank=True)
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "edi_documents"
+        # The dedup guarantee. Scoped by company because control numbers are per mailbox, and by
+        # direction because our own outbound sequence and the partner's inbound one are
+        # independent and will collide by chance.
+        unique_together = ("company_provider", "direction", "interchange_control_number")
+        indexes = [
+            django_db_models.Index(fields=["company_provider"], name="edi_doc_cp_idx"),
+            django_db_models.Index(fields=["purchase_order"], name="edi_doc_po_idx"),
+            django_db_models.Index(fields=["doc_type", "status"], name="edi_doc_type_status_idx"),
+            django_db_models.Index(fields=["created_at"], name="edi_doc_created_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return "{} {} {} ({})".format(
+            self.direction_name, self.doc_type, self.interchange_control_number, self.status_name
+        )
+
+
 class ThoroughbredBrand(django_db_models.Model):
     """Thoroughbred Diesel brand, discovered as a distinct value of the catalog's bare `b` field --
     HawkSearch has no separate brand-list endpoint, so brands are only known by crawling the

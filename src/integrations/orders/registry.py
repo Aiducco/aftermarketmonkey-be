@@ -1,6 +1,6 @@
 """
 Maps a distributor's ``Providers.kind`` to its ``DistributorOrderAdapter`` implementation.
-Distributors with no entry here (today: SDC, A-Tech, DLG, S&B, Rough Country) have no order API of
+Distributors with no entry here (today: SDC, A-Tech, DLG, S&B) have no order API of
 their own — but may still be order-capable via the Email channel (see get_adapter() below).
 
 Adapters are added one at a time as each distributor's phase lands (see the Purchase Orders
@@ -39,6 +39,24 @@ def supports_ordering(provider_kind: int) -> bool:
     usable, not just supported in the abstract.
     """
     return provider_kind in _ADAPTERS
+
+
+def fulfillment_channel_for_kind(provider_kind: int) -> str:
+    """
+    'api' | 'email' | 'edi' for this provider kind, read off the registered adapter CLASS.
+
+    Deliberately does not construct an adapter: construction needs credentials, which a given
+    PO's order account may no longer resolve, and the channel is a property of the distributor
+    rather than of one account's configuration. Kinds with no adapter report 'api', which is
+    what every caller assumed before any non-API channel existed.
+
+    This is the API-channel answer only. An account whose order_method is EMAIL routes to
+    EmailOrderAdapter regardless of kind (see get_adapter), so callers must check that first.
+    """
+    adapter_cls = _ADAPTERS.get(provider_kind)
+    if adapter_cls is None:
+        return "api"
+    return getattr(adapter_cls, "fulfillment_channel_name", "api")
 
 
 def get_adapter(
@@ -113,9 +131,7 @@ def get_adapter_unavailable_reason(
         return "Email ordering isn't fully configured for this connection yet — a rep email is required."
     if not supports_ordering(company_provider.provider.kind):
         return "{} does not support in-app ordering yet.".format(company_provider.provider.kind_name)
-    return "{} order credentials aren't configured for this connection yet.".format(
-        company_provider.provider.kind_name
-    )
+    return "{} order credentials aren't configured for this connection yet.".format(company_provider.provider.kind_name)
 
 
 # Self-register each implemented adapter. Imported here (rather than via a Django
@@ -124,6 +140,7 @@ def get_adapter_unavailable_reason(
 from src.integrations.orders import keystone as _keystone  # noqa: E402
 from src.integrations.orders import meyer as _meyer  # noqa: E402
 from src.integrations.orders import premier as _premier  # noqa: E402
+from src.integrations.orders import rough_country as _rough_country  # noqa: E402
 from src.integrations.orders import turn_14 as _turn_14  # noqa: E402
 from src.integrations.orders import wheelpros as _wheelpros  # noqa: E402
 
@@ -131,4 +148,9 @@ register(src_enums.BrandProviderKind.TURN_14.value, _turn_14.Turn14OrderAdapter)
 register(src_enums.BrandProviderKind.KEYSTONE.value, _keystone.KeystoneOrderAdapter)
 register(src_enums.BrandProviderKind.MEYER.value, _meyer.MeyerOrderAdapter)
 register(src_enums.BrandProviderKind.PREMIER_PERFORMANCE.value, _premier.PremierOrderAdapter)
+# Rough Country's transport is files in an FTP directory rather than an HTTP API, but it is
+# a real adapter and belongs here like any other. See orders/rough_country.py for how
+# "submitted but not confirmed" is expressed — the 855 that confirms an order arrives
+# minutes to hours after submit_order returns.
+register(src_enums.BrandProviderKind.ROUGH_COUNTRY.value, _rough_country.RoughCountryEdiOrderAdapter)
 register(src_enums.BrandProviderKind.WHEELPROS.value, _wheelpros.WheelProsOrderAdapter)

@@ -1,15 +1,16 @@
 """
 Rough Country EDI mailbox (Alluvia-hosted FTP).
 
-Scope today is deliberately narrow: collect the documents Rough Country has published for us
-and move each one into its Archive folder, which is what Alluvia asked us to do. Generating
-850s, acknowledging with 997s and applying documents to PurchaseOrder rows are separate,
-later pieces — see docs/ROUGH_COUNTRY_EDI_PLAN.md.
+One mailbox per company. Alluvia issues every shop its own FTP login and its own ISA/GS
+trading-partner id, so there is no global mailbox and no global credential: a client is always
+built for one CompanyProviderOrderAccount, via :meth:`RoughCountryEdiClient.for_account`. The
+global FTP settings this module started with existed only while Trident was the one test
+account and have been removed.
 
 Folder layout, as given by Alluvia. Note the names are from *their* point of view, so their
 "Inbound" is our outbound:
 
-    /Inbound/850    documents we send them
+    /Inbound/850    purchase orders we send them
     /Inbound/997    functional acknowledgments we send them
     /Outbound/855   PO acknowledgments        -> /Archive/855
     /Outbound/856   advance ship notices      -> /Archive/856
@@ -27,6 +28,8 @@ import typing
 
 from django.conf import settings
 
+from src import models as src_models
+from src.integrations.clients.rough_country import edi_config
 from src.integrations.edi import exceptions as edi_exceptions
 from src.integrations.edi import transport as edi_transport
 from src.integrations.edi import x12
@@ -37,65 +40,107 @@ _LOG_PREFIX = "[ROUGH-COUNTRY-EDI]"
 
 # Document types Rough Country publishes to us.
 INBOUND_DOCUMENT_TYPES = ("855", "856", "810")
+# Document types we publish to them.
+OUTBOUND_DOCUMENT_TYPES = ("850", "997")
 
+# Folder names are Alluvia's, from THEIR point of view, so their Inbound is what we write to.
 OUTBOUND_DIRECTORY_TEMPLATE = "/Outbound/{}"
 ARCHIVE_DIRECTORY_TEMPLATE = "/Archive/{}"
+SEND_DIRECTORY_TEMPLATE = "/Inbound/{}"
 
 
 class RoughCountryEdiClient:
-    """Thin wrapper over EdiFtpTransport that knows Rough Country's folder layout."""
+    """
+    Thin wrapper over EdiFtpTransport that knows Rough Country's folder layout, bound to one
+    company's mailbox.
+
+    Build it with :meth:`for_account` in anything that has a connection; the ``config``
+    constructor is for tests and for the CLI, which resolves an account itself so it can print
+    which environment it is about to talk to before doing anything.
+    """
 
     def __init__(
         self,
-        host: typing.Optional[str] = None,
-        port: typing.Optional[int] = None,
-        user: typing.Optional[str] = None,
-        password: typing.Optional[str] = None,
-        use_tls: typing.Optional[bool] = None,
+        config: edi_config.RoughCountryEdiConfig,
         local_dir: typing.Optional[str] = None,
     ) -> None:
-        self.host = (host or getattr(settings, "ROUGH_COUNTRY_EDI_FTP_HOST", "") or "").strip()
-        self.port = int(port or getattr(settings, "ROUGH_COUNTRY_EDI_FTP_PORT", 21) or 21)
-        self.user = (user or getattr(settings, "ROUGH_COUNTRY_EDI_FTP_USER", "") or "").strip()
-        self.password = password or getattr(settings, "ROUGH_COUNTRY_EDI_FTP_PASSWORD", "") or ""
-        self.use_tls = (
-            bool(use_tls)
-            if use_tls is not None
-            else bool(getattr(settings, "ROUGH_COUNTRY_EDI_FTP_USE_TLS", False))
-        )
-        self.local_dir = (
-            local_dir
-            or getattr(settings, "ROUGH_COUNTRY_EDI_LOCAL_DIR", "")
-            or "/tmp/rough_country_edi"
-        )
+        self.config = config
+        base_dir = local_dir or getattr(settings, "ROUGH_COUNTRY_EDI_LOCAL_DIR", "") or "/tmp/rough_country_edi"
+        # Namespaced by our trading-partner id so two shops collecting at once cannot overwrite
+        # each other's downloads. Alluvia's filenames carry a UUID, but relying on that to keep
+        # two companies' files apart would be luck rather than design.
+        self.local_dir = os.path.join(base_dir, config.sender_id)
 
-        missing = [
-            name
-            for name, value in (
-                ("ROUGH_COUNTRY_EDI_FTP_HOST", self.host),
-                ("ROUGH_COUNTRY_EDI_FTP_USER", self.user),
-                ("ROUGH_COUNTRY_EDI_FTP_PASSWORD", self.password),
-            )
-            if not value
-        ]
-        if missing:
-            raise ValueError(
-                "Rough Country EDI FTP is not configured — missing: {}.".format(", ".join(missing))
-            )
+    @classmethod
+    def for_account(
+        cls,
+        company_provider: src_models.CompanyProviders,
+        order_account: typing.Optional[src_models.CompanyProviderOrderAccount] = None,
+    ) -> "RoughCountryEdiClient":
+        """Raises ValueError when this account has no usable EDI credentials — the established
+        order-adapter contract (see src.integrations.orders.registry.get_adapter)."""
+        return cls(edi_config.for_account(company_provider, order_account))
+
+    # Kept as properties so existing callers and log lines that read client.host/user keep
+    # working now that the real source of truth is the config object.
+    @property
+    def host(self) -> str:
+        return self.config.host
+
+    @property
+    def port(self) -> int:
+        return self.config.port
+
+    @property
+    def user(self) -> str:
+        return self.config.user
+
+    @property
+    def use_tls(self) -> bool:
+        return self.config.use_tls
 
     def _transport(self) -> edi_transport.EdiFtpTransport:
         return edi_transport.EdiFtpTransport(
-            host=self.host,
-            user=self.user,
-            password=self.password,
-            port=self.port,
-            use_tls=self.use_tls,
+            host=self.config.host,
+            user=self.config.user,
+            password=self.config.password,
+            port=self.config.port,
+            use_tls=self.config.use_tls,
         )
 
     def _local_path(self, document_type: str, filename: str) -> str:
         directory = os.path.join(self.local_dir, document_type)
         os.makedirs(directory, exist_ok=True)
         return os.path.join(directory, filename)
+
+    # -- sending ------------------------------------------------------------------------------
+
+    def send_document(self, document_type: str, filename: str, payload: str) -> str:
+        """
+        Write one document into Rough Country's pickup folder and return the remote path.
+
+        The transport uploads to a ``.tmp`` name and renames it into place, so Rough Country can
+        never collect a half-written 850. A failed rename raises rather than returning quietly:
+        they do not pick up ``.tmp`` files, so the document has NOT been delivered and the
+        caller must not record it as sent.
+        """
+        if document_type not in OUTBOUND_DOCUMENT_TYPES:
+            raise ValueError(
+                "{} is not a document type we send (expected one of {}).".format(
+                    document_type, ", ".join(OUTBOUND_DOCUMENT_TYPES)
+                )
+            )
+        remote_path = posixpath.join(SEND_DIRECTORY_TEMPLATE.format(document_type), filename)
+        with self._transport() as ftp:
+            ftp.write_text(remote_path, payload)
+        logger.info(
+            "%s Sent %s to %s (%s).",
+            _LOG_PREFIX,
+            document_type,
+            remote_path,
+            self.config.describe(),
+        )
+        return remote_path
 
     def list_available(self) -> typing.Dict[str, typing.List[str]]:
         """{document_type: [filename, ...]} currently waiting in each Outbound folder."""
@@ -169,6 +214,81 @@ class RoughCountryEdiClient:
 
         return results
 
+    # -- collect + apply ----------------------------------------------------------------------
+
+    def process_waiting(
+        self,
+        handler: typing.Callable[[str, str, str], bool],
+        document_types: typing.Optional[typing.Sequence[str]] = None,
+        limit: typing.Optional[int] = None,
+    ) -> typing.List[typing.Dict]:
+        """
+        Download each waiting document, hand it to ``handler(document_type, filename, payload)``
+        and archive it only if the handler returns True.
+
+        The ordering is the whole point. ``collect`` archives as soon as a file is downloaded,
+        which is right when all we do is file it; when the document is also being applied to a
+        PurchaseOrder, the archive move must happen only after that work has committed.
+        Archiving first and crashing second would lose the document permanently — and since the
+        archive move is the only thing that stops us collecting a file again, leaving it in place
+        is what makes a retry possible. That makes delivery at-least-once, which is why the
+        handler is required to deduplicate (see services/rough_country_edi.record_inbound).
+
+        A handler that raises is reported and leaves the file in /Outbound; it is never allowed
+        to abort the sweep, so one unparseable document cannot block every later one.
+        """
+        wanted = [d for d in (document_types or INBOUND_DOCUMENT_TYPES) if d in INBOUND_DOCUMENT_TYPES]
+        results: typing.List[typing.Dict] = []
+        processed = 0
+
+        with self._transport() as ftp:
+            for document_type in wanted:
+                source_dir = OUTBOUND_DIRECTORY_TEMPLATE.format(document_type)
+                archive_dir = ARCHIVE_DIRECTORY_TEMPLATE.format(document_type)
+                for filename in ftp.list_files(source_dir):
+                    if limit is not None and processed >= limit:
+                        return results
+                    processed += 1
+                    entry = {
+                        "document_type": document_type,
+                        "filename": filename,
+                        "applied": False,
+                        "archived": False,
+                        "error": None,
+                    }
+                    remote_path = posixpath.join(source_dir, filename)
+                    try:
+                        payload = ftp.read_text(remote_path)
+                        _assert_complete(payload, remote_path)
+                    except (edi_exceptions.EdiTransportError, edi_exceptions.EdiParseError) as e:
+                        entry["error"] = str(e)
+                        logger.error("%s %s: %s", _LOG_PREFIX, remote_path, e)
+                        results.append(entry)
+                        continue
+
+                    try:
+                        entry["applied"] = bool(handler(document_type, filename, payload))
+                    except Exception as e:
+                        # Deliberately broad: a handler failure must quarantine one document,
+                        # not strand every document behind it. The file stays in /Outbound.
+                        entry["error"] = "could not be applied: {}".format(e)
+                        logger.exception("%s Failed applying %s.", _LOG_PREFIX, remote_path)
+                        results.append(entry)
+                        continue
+
+                    if entry["applied"]:
+                        try:
+                            ftp.move(remote_path, posixpath.join(archive_dir, filename))
+                            entry["archived"] = True
+                        except edi_exceptions.EdiTransportError as e:
+                            # Applied but not archived: harmless, because the next sweep
+                            # deduplicates on the interchange control number.
+                            entry["error"] = "applied, but archiving failed: {}".format(e)
+                            logger.error("%s %s: %s", _LOG_PREFIX, remote_path, e)
+                    results.append(entry)
+
+        return results
+
 
 def _assert_complete(payload: str, remote_path: str) -> None:
     """
@@ -182,9 +302,7 @@ def _assert_complete(payload: str, remote_path: str) -> None:
         x12.parse_interchange(payload)
     except edi_exceptions.EdiParseError as e:
         raise edi_exceptions.EdiParseError(
-            "{} is not a complete X12 interchange ({}). Leaving it in Outbound to retry.".format(
-                remote_path, e
-            )
+            "{} is not a complete X12 interchange ({}). Leaving it in Outbound to retry.".format(remote_path, e)
         )
 
 

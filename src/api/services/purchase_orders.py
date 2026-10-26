@@ -217,25 +217,35 @@ def _serialize_invoice(inv: src_models.PurchaseOrderInvoice) -> typing.Dict:
 
 def _po_fulfillment_channel(po: src_models.PurchaseOrder) -> str:
     """
-    'api' | 'email' — which channel po.order_account currently places orders through (see
-    src.enums.OrderMethod), read straight off the account's own order_method_name rather than
-    constructing a real adapter via orders.registry.get_adapter() (which this PO's order_account
-    may not even resolve credentials for anymore, e.g. after a later credential change — the
-    stored order_method_name is what's authoritative for "how was/will this PO be placed",
-    independent of whether the adapter can be constructed right now). Falls back to resolving
-    the connection's implicit default account when po.order_account is null, same convention as
+    'api' | 'email' | 'edi' — how this PO was (or will be) placed.
+
+    Read off the account's own order_method_name rather than constructing a real adapter via
+    orders.registry.get_adapter() (which this PO's order_account may not even resolve
+    credentials for anymore, e.g. after a later credential change — the stored
+    order_method_name is what's authoritative for "how was/will this PO be placed", independent
+    of whether the adapter can be constructed right now). Falls back to resolving the
+    connection's implicit default account when po.order_account is null, same convention as
     order_account_label above.
+
+    OrderMethod only distinguishes "use the integration" from "email a rep", so an API-channel
+    account then asks the registry what that distributor's integration actually IS: Rough
+    Country places orders by writing EDI files to an FTP mailbox, which behaves differently
+    enough from an HTTP API that the FE has to be able to tell them apart — submitting delivers
+    a document, and confirmation arrives separately, hours later.
     """
     account = po.order_account if po.order_account_id else credentials_helper.get_default_order_account(po.company_provider)
-    return account.order_method_name.lower() if account else "api"
+    method = account.order_method_name.lower() if account else "api"
+    if method == "email":
+        return "email"
+    return order_registry.fulfillment_channel_for_kind(po.company_provider.provider.kind)
 
 
 def _fulfillment_channels_by_po_id(
     pos: typing.List[src_models.PurchaseOrder],
 ) -> typing.Dict[int, str]:
     """
-    Bulk form of _po_fulfillment_channel for a whole page of POs, same 'api' | 'email' result
-    per PO. The per-PO helper falls back to credentials_helper.get_default_order_account() for
+    Bulk form of _po_fulfillment_channel for a whole page of POs, same 'api' | 'email' | 'edi'
+    result per PO. The per-PO helper falls back to credentials_helper.get_default_order_account() for
     POs with no explicit order_account, which is one query each — fine for a single PO detail
     response, an N+1 over the up-to-200 rows of list_purchase_orders. Here the default accounts
     for every connection the page touches are fetched in one narrow .values() query instead, and
@@ -252,13 +262,29 @@ def _fulfillment_channels_by_po_id(
                 row["company_provider_id"], row["order_method_name"]
             )
 
+    # Provider kind per connection, for the API-channel branch below — one query for the whole
+    # page rather than walking po.company_provider.provider on every row.
+    kind_by_cp_id: typing.Dict[int, int] = {}
+    all_cp_ids = {po.company_provider_id for po in pos}
+    if all_cp_ids:
+        for row in src_models.CompanyProviders.objects.filter(id__in=all_cp_ids).values(
+            "id", "provider__kind"
+        ):
+            kind_by_cp_id[row["id"]] = row["provider__kind"]
+
     channels: typing.Dict[int, str] = {}
     for po in pos:
         if po.order_account_id:
             method = po.order_account.order_method_name
         else:
             method = default_method_by_cp_id.get(po.company_provider_id)
-        channels[po.id] = method.lower() if method else "api"
+        if (method or "").lower() == "email":
+            channels[po.id] = "email"
+            continue
+        kind = kind_by_cp_id.get(po.company_provider_id)
+        channels[po.id] = (
+            order_registry.fulfillment_channel_for_kind(kind) if kind is not None else "api"
+        )
     return channels
 
 
@@ -281,7 +307,7 @@ def _serialize_purchase_order(po: src_models.PurchaseOrder, include_line_items: 
         # (e.g. "Keystone — Dropship · 2 items") instead of only showing the distributor name.
         "order_account_id": po.order_account_id,
         "order_account_label": po.order_account.label if po.order_account_id else "Default",
-        # 'api' | 'email' — see _po_fulfillment_channel. Lets the FE show an "Emailed to
+        # 'api' | 'email' | 'edi' — see _po_fulfillment_channel. Lets the FE show an "Emailed to
         # distributor" tag distinct from a real API-confirmed order without hardcoding which
         # distributor kinds are email-based (that's a per-order-account choice, not fixed per
         # distributor).
@@ -1128,10 +1154,12 @@ def get_confirmed_purchase_order_detail(company_id: int, purchase_order_id: int)
         "po_internal_number": po.po_number,
         "po_number": order_base.resolve_po_number(po),
         "status": po.status_name,
-        # 'api' | 'email' — see _po_fulfillment_channel. 'email' means this "confirmed" view is
-        # somewhat aspirational: there's no real distributor confirmation behind it, just the
-        # fact that a PDF was emailed — the FE should show a distinct "Emailed to distributor"
-        # tag rather than implying the same live-API confirmation the other 5 distributors get.
+        # 'api' | 'email' | 'edi' — see _po_fulfillment_channel. 'email' means this "confirmed"
+        # view is somewhat aspirational: there's no real distributor confirmation behind it, just
+        # the fact that a PDF was emailed — the FE should show a distinct "Emailed to
+        # distributor" tag rather than implying the same live-API confirmation the API
+        # distributors get. 'edi' DOES have a real confirmation behind it (Rough Country's 855),
+        # it just arrived asynchronously rather than in the submit response.
         "fulfillment_channel": fulfillment_channel,
         "distributor": {"name": provider.name, "kind": provider.kind_name},
         "shipped_to": _serialize_confirmed_shipped_to(po),
@@ -1707,7 +1735,7 @@ def get_order_capabilities(company_id: int) -> typing.List[typing.Dict]:
                 "provider_kind_name": cp.provider.kind_name,
                 "provider_name": cp.provider.name,
                 "can_order_in_app": bool(adapter),
-                # 'api' | 'email' | None — see base.DistributorOrderAdapter.fulfillment_channel.
+                # 'api' | 'email' | 'edi' | None — see base.DistributorOrderAdapter.fulfillment_channel.
                 # Lets the FE show an "Emailed to distributor" style tag without hardcoding
                 # which provider kinds are email-based (that's a per-order-account choice now,
                 # not fixed per distributor — see src.enums.OrderMethod).

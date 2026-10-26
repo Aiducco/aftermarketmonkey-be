@@ -147,6 +147,23 @@ def dlg_b2b_search_keywords(dlg_brand_name: typing.Optional[str], part_number: s
 # CompanyProviders.credentials JSON key for Rough Country: jobber Excel URL (required per connection).
 ROUGH_COUNTRY_CREDENTIALS_FEED_URL = "feed_url"
 
+# Rough Country ORDER credentials (EDI over Alluvia-hosted FTP) -- a separate namespace from the
+# jobber feed above, living on CompanyProviderOrderAccount like every other distributor's order
+# credentials. Alluvia issues each shop its own FTP login AND its own ISA/GS trading-partner id,
+# so all three are per company; Rough Country's own id is not (see
+# settings.ROUGH_COUNTRY_EDI_RECEIVER_ID_TEST / _PRODUCTION).
+ROUGH_COUNTRY_EDI_CREDENTIALS_FTP_USER = "ftp_user"
+ROUGH_COUNTRY_EDI_CREDENTIALS_FTP_PASSWORD = "ftp_password"
+ROUGH_COUNTRY_EDI_CREDENTIALS_SENDER_ID = "edi_sender_id"
+# "test" (default) or "production". One field rather than letting a shop type Rough Country's
+# receiver id themselves: the receiver id and ISA15 must agree, and a mismatch is how a test
+# file ends up placing a real order.
+ROUGH_COUNTRY_EDI_CREDENTIALS_ENVIRONMENT = "edi_environment"
+ROUGH_COUNTRY_EDI_CREDENTIALS_FTP_HOST = "ftp_host"
+# Alluvia restricts their FTP by source IP. From an unlisted address every port silently times
+# out rather than refusing, so this is the first thing to check when ordering "does nothing".
+ROUGH_COUNTRY_EDI_ALLOWLIST_IP = "5.161.121.143"
+
 
 # ==========================================================================================
 # S&B Filters (S&B Tactical Filters / JLT) — two shared Google Sheets for catalog + fitment,
@@ -593,9 +610,26 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/rough_country.png",
         "category": "Distributors",
         "connection_required_fields": [ROUGH_COUNTRY_CREDENTIALS_FEED_URL],
-        # Email-channel ordering — Rough Country has no order API of its own, so this is the
-        # only way to place orders through AfterMarketScout for it. See the matching note on
-        # Turn 14 above.
+        # Order-placement credentials (EDI X12 005010 over Alluvia-hosted FTP) — entirely
+        # separate from the jobber feed above, and optional: a company can connect the feed
+        # without ever filling these in, and ordering simply stays unavailable until they do.
+        # Alluvia issues each dealer its own FTP login AND its own ISA/GS trading-partner id,
+        # which is why the sender id is a per-company credential rather than a setting.
+        "order_connection_required_fields": [
+            ROUGH_COUNTRY_EDI_CREDENTIALS_FTP_USER,
+            ROUGH_COUNTRY_EDI_CREDENTIALS_FTP_PASSWORD,
+            ROUGH_COUNTRY_EDI_CREDENTIALS_SENDER_ID,
+        ],
+        # edi_environment is "test" (default) or "production", per company — one dealer can be
+        # live while another is still testing. Anything but the exact word "production" is
+        # treated as test, so a typo can never start placing real orders.
+        "order_connection_optional_fields": [
+            ROUGH_COUNTRY_EDI_CREDENTIALS_ENVIRONMENT,
+            ROUGH_COUNTRY_EDI_CREDENTIALS_FTP_HOST,
+        ],
+        # Email-channel ordering, kept as the fallback for dealers who are not set up on EDI
+        # yet: orders.registry is channel-first, so an account whose order_method is EMAIL
+        # still routes to EmailOrderAdapter even though a real adapter now exists for this kind.
         "email_order_connection_required_fields": ["rep_email"],
         "email_order_connection_optional_fields": ["account_number", "cc_email", "reply_to_email"],
         "integration_time": "Data available within 1-2 hours",
@@ -625,12 +659,63 @@ PROVIDER_CATALOG = [
             "<p>Paste the link into <strong>Feed URL</strong> and click <strong>Save feed credentials</strong>. "
             "The card will show <strong>Feed Connected</strong>.</p>"
 
+            "<p><strong>Ordering (set up separately)</strong></p>"
+            "<p>The feed above covers catalog, pricing and fitment. <strong>Placing orders</strong> uses Rough "
+            "Country's EDI, hosted by Alluvia on their behalf, with its own credentials issued per dealer. You "
+            "can connect the feed now and add ordering later.</p>"
+
+            "<p><strong>1. Ask Rough Country for EDI access</strong></p>"
+            "<p>Rough Country routes these requests through their customer service team. Email them with your "
+            "dealer account number, with <a href=\"mailto:support@aftermarketscout.com\">"
+            "support@aftermarketscout.com</a> on CC:</p>"
+            + _CALLOUT_OPEN
+            + "<p>Hi,</p>"
+            "<p>We'd like to set up EDI ordering with Rough Country through Alluvia for our account "
+            "<strong>[your account number]</strong>.</p>"
+            "<p>Our integration partner is AfterMarket Scout, copied here. Could you have Alluvia send us the "
+            "FTP credentials and our EDI trading-partner ID, and allowlist the IP address "
+            "<strong>" + ROUGH_COUNTRY_EDI_ALLOWLIST_IP + "</strong> so we can connect?</p>"
+            "<p>Thank you,<br />[your name]</p>"
+            + "</div>"
+
+            "<p><strong>2. Enter the credentials Alluvia sends</strong></p>"
+            "<p>They provide an <strong>FTP username</strong>, an <strong>FTP password</strong> and your "
+            "<strong>EDI ID</strong> &mdash; the trading-partner code that identifies your shop to Rough "
+            "Country. Paste all three into the ordering fields below.</p>"
+
+            "<p><strong>3. Check the IP allowlist</strong></p>"
+            "<p>Alluvia restricts their FTP by IP address. Until they allowlist "
+            "<code>" + ROUGH_COUNTRY_EDI_ALLOWLIST_IP + "</code>, every connection times out silently rather "
+            "than reporting an error, so confirm they have done it.</p>"
+
+            "<p><strong>4. Leave Environment set to Test at first</strong></p>"
+            "<p><strong>Test</strong> sends your orders to Rough Country's test system, so you and Alluvia can "
+            "verify the connection end to end without anything shipping or being invoiced. Switch to "
+            "<strong>Production</strong> only once Alluvia confirms you're live &mdash; from that point every "
+            "order you submit is real.</p>"
+
+            "<p><strong>What to expect when ordering</strong></p>"
+            "<ul>"
+            "<li><strong>Orders are confirmed a little later, not instantly.</strong> An order shows as "
+            "<strong>Submitted</strong> once we deliver it to Rough Country, and becomes "
+            "<strong>Confirmed</strong> when they acknowledge it &mdash; usually within a few hours.</li>"
+            "<li><strong>No shipping quote up front.</strong> You choose a shipping method, but Rough Country "
+            "doesn't price freight until they invoice, after the goods ship.</li>"
+            "<li><strong>Tracking arrives with the shipment notice</strong>, not at order time.</li>"
+            "<li><strong>Orders can't be cancelled through the integration.</strong> Call Rough Country "
+            "customer service.</li>"
+            "</ul>"
+
             "<p><strong>Troubleshooting</strong></p>"
             "<ul>"
             "<li><strong>No JOBBER card?</strong> Jobber pricing may not be enabled on your account. Ask your "
             "Rough Country rep.</li>"
             "<li><strong>More than one account?</strong> Each account has its own URL. Repeat these steps for "
             "each one.</li>"
+            "<li><strong>Orders failing immediately?</strong> Almost always the IP allowlist &mdash; check that "
+            "Alluvia has <code>" + ROUGH_COUNTRY_EDI_ALLOWLIST_IP + "</code>.</li>"
+            "<li><strong>An order stuck on Submitted?</strong> Rough Country acknowledges on their own "
+            "schedule. If one hasn't been confirmed within a day, contact Alluvia.</li>"
             "</ul>"
         ),
     },

@@ -8,11 +8,31 @@ What exists today:
 
 | Piece | State |
 |---|---|
-| `src/integrations/edi/x12.py` — X12 envelope reader/writer | done, tested against all four samples |
+| `src/integrations/edi/x12.py` — X12 envelope reader/writer | done, tested against the samples and the live documents |
 | `src/integrations/edi/transport.py` — FTP/FTPS transport | done |
-| `src/integrations/clients/rough_country/edi.py` — folder layout, download + archive | done |
-| `manage.py fetch_rough_country_edi` | done; verified live against the Alluvia FTP |
-| 850 generation, order adapter, 997s, applying documents to POs | not started — see §5 |
+| `src/integrations/edi/control_numbers.py` — row-locked ISA13/GS06/ST02 counters | done |
+| `EdiDocument` / `EdiControlNumber` + `migrations/0231_edi_documents.py` | done; **migration not yet applied** |
+| `clients/rough_country/edi_config.py` — per-company credentials | done |
+| `clients/rough_country/edi.py` — folder layout, send, collect, archive | done |
+| `clients/rough_country/po_850.py` — 850 generator | done |
+| `clients/rough_country/inbound.py` — 855/856/810 parsers | done |
+| `clients/rough_country/ack_997.py` — 997 generator | done |
+| `orders/rough_country.py` — `RoughCountryEdiOrderAdapter`, registered | done |
+| `services/rough_country_edi.py` — applies documents to POs | done |
+| `manage.py fetch_rough_country_edi` (collect only) | done; verified live |
+| `manage.py process_rough_country_edi` (collect + apply + 997) | done; **not yet scheduled on cron** |
+| `fulfillment_channel == "edi"` through the PO API | done; **front-end still needs to handle the value** |
+
+79 tests across `test_rough_country_edi{,_orders,_apply}.py`.
+
+**Credentials are per company, not global.** Alluvia issues each dealer its own FTP login and its
+own ISA/GS trading-partner id, so `ftp_user`, `ftp_password`, `edi_sender_id`, `edi_environment`
+and an optional `ftp_host` live on `CompanyProviderOrderAccount` like every other distributor's
+order credentials. The only Rough Country settings left are *their* receiver ids
+(`64ROUGHCT` / `64ROUGHC`), which are theirs and identical for every dealer. The global
+`ROUGH_COUNTRY_EDI_FTP_USER` / `_PASSWORD` settings existed only while Trident was the sole test
+account and have been removed. §4 below is therefore settled: one mailbox per shop, and
+`edi_environment` is per shop too, so Trident can be live while another dealer is still testing.
 
 Nothing writes to a `PurchaseOrder` yet, and nothing sends anything to Rough Country. The
 command downloads what they have published, verifies each file is a complete interchange, and
@@ -298,10 +318,15 @@ Feeds `DistributorOrderStatus.tracking_numbers` / `carrier` / `ship_date` and
   single-package sample they are identical. On a multi-package shipment they cannot both be right —
   need to know which is authoritative (`REF*CN` may become a master/BOL number).
 - **The ASN carries no PO line number.** No `PO1-01` echo, no line reference on `LIN`. Matching ASN
-  items back to `PurchaseOrderLineItem` is therefore by part number (`VC`/`SK`) only. That breaks
-  if the same SKU appears on two lines of one PO — which our kit expansion
-  (`PurchaseOrderLineItem.kit_source_provider_part`) can produce. Mitigation: aggregate by SKU
-  before applying. Better: ask RC to echo the PO line number.
+  items back to `PurchaseOrderLineItem` is therefore by part number (`VC`/`SK`) only, and the same
+  part number *can* appear on two lines of one PO. **Correction:** kit expansion, blamed here
+  originally, cannot cause that — `PurchaseOrderLineItem` is unique on
+  `(purchase_order, provider_part)`, so one `ProviderPart` appears at most once per PO. The real
+  route is duplicate master parts: `ProviderPart` is unique on `(master_part, provider)` and *not*
+  on `(provider, provider_external_id)`, so two master parts that are really the same product each
+  get their own `ProviderPart` pointing at the same Rough Country SKU. Mitigation implemented:
+  aggregate by part number, then fill each matching line up to its ordered quantity in id order.
+  Better: ask RC to echo the PO line number.
 - No estimated delivery date is present, so `estimated_delivery_date` stays null for RC.
 - `LIN01` (`22696824`) looks like an RC-internal item/line id; not joinable to anything of ours.
 

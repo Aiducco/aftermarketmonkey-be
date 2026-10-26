@@ -283,6 +283,37 @@ class DistributorOrderRawStatus(enum.Enum):
     OPEN = 1
     CLOSED = 2
 
+class EdiDirection(enum.Enum):
+    """Which way an EdiDocument travelled. Named from OUR point of view, deliberately the
+    opposite of Alluvia's folder names (their /Inbound is what we write to)."""
+    OUTBOUND = 1
+    INBOUND = 2
+
+
+class EdiDocumentStatus(enum.Enum):
+    """
+    Lifecycle of one stored X12 interchange.
+
+    Outbound documents go PENDING -> SENT. The row is written BEFORE the upload, so the unique
+    constraint catches a reused control number before the partner ever sees it, and a crash
+    mid-send leaves a PENDING row naming the exact payload rather than no record at all. SENT
+    means the file was renamed into place in the partner's pickup folder, which is the strongest
+    claim available: Rough Country publishes no 997 for our 850s, so nothing ever confirms they
+    read it.
+
+    Inbound documents walk RECEIVED -> PARSED -> APPLIED. UNMATCHED means it parsed but named a
+    PO we do not have, which is a real condition worth alerting on rather than an error, and
+    ERROR means it would not parse at all. Neither is ever silently dropped.
+    """
+    RECEIVED = 1
+    PARSED = 2
+    APPLIED = 3
+    UNMATCHED = 4
+    ERROR = 5
+    SENT = 6
+    PENDING = 7
+
+
 class AddressValidationStatus(enum.Enum):
     """
     Outcome of checking a ship-to address against the address provider (see

@@ -718,9 +718,16 @@ except ValueError:
 ALLPRO_FTP_HOST = os.environ.get("ALLPRO_FTP_HOST") or "apdftp.hhenterprises.com"
 ALLPRO_FTP_PORT = _allpro_ftp_port if 1 <= _allpro_ftp_port <= 65535 else 21
 
-# Rough Country EDI (X12 005010) mailbox, hosted by Alluvia. Documents we SEND go to their
+# Rough Country EDI (X12 005010) mailboxes, hosted by Alluvia. Documents we SEND go to their
 # /Inbound/<doctype>; documents we RECEIVE are collected from /Outbound/<doctype> and, per
 # Alluvia's request, moved to /Archive/<doctype> once downloaded.
+#
+# There are NO credentials here. Alluvia issues every shop its own FTP login and its own
+# ISA/GS trading-partner id, so all of that lives on that company's
+# CompanyProviderOrderAccount exactly like Keystone's or Meyer's order credentials -- see
+# src/integrations/clients/rough_country/edi_config.py. What remains below is only the shape of
+# Alluvia's platform (one hostname, one port, no TLS) and a local scratch directory, all of
+# which the host default can be overridden per company.
 #
 # Plain FTP is what Alluvia gave us (ftp://alluviaftp.alluviaplatform.com). The payloads carry
 # end-customer names and street addresses, so flip ROUGH_COUNTRY_EDI_FTP_USE_TLS to true the
@@ -734,14 +741,29 @@ try:
 except ValueError:
     _rough_country_edi_ftp_port = 21
 ROUGH_COUNTRY_EDI_FTP_PORT = _rough_country_edi_ftp_port if 1 <= _rough_country_edi_ftp_port <= 65535 else 21
-ROUGH_COUNTRY_EDI_FTP_USER = os.environ.get("ROUGH_COUNTRY_EDI_FTP_USER", "")
-ROUGH_COUNTRY_EDI_FTP_PASSWORD = os.environ.get("ROUGH_COUNTRY_EDI_FTP_PASSWORD", "")
 ROUGH_COUNTRY_EDI_FTP_USE_TLS = os.environ.get("ROUGH_COUNTRY_EDI_FTP_USE_TLS", "false").strip().lower() in (
     "true",
     "1",
     "yes",
 )
 ROUGH_COUNTRY_EDI_LOCAL_DIR = os.environ.get("ROUGH_COUNTRY_EDI_LOCAL_DIR", "/tmp/rough_country_edi")
+
+# Rough Country's OWN trading-partner ids (ISA08/GS03). These are Rough Country's, identical
+# for every shop, so they live here rather than in each company's credentials. OUR side of the
+# envelope (ISA06/GS02) is per company and comes from the order account -- Alluvia assigns each
+# shop its own id and its own FTP login. See
+# src/integrations/clients/rough_country/edi_config.py.
+#
+# Which of these two a given shop talks to is that shop's own "environment" credential, so one
+# company can be live while another is still testing. An 850 addressed to the production id is
+# a real purchase order that ships real product, which is why "test" is the default everywhere
+# and going live is a deliberate per-company change.
+ROUGH_COUNTRY_EDI_RECEIVER_ID_TEST = (
+    os.environ.get("ROUGH_COUNTRY_EDI_RECEIVER_ID_TEST") or "64ROUGHCT"
+).strip()
+ROUGH_COUNTRY_EDI_RECEIVER_ID_PRODUCTION = (
+    os.environ.get("ROUGH_COUNTRY_EDI_RECEIVER_ID_PRODUCTION") or "64ROUGHC"
+).strip()
 
 # ---------------------------------------------------------------------------
 # Ship-to address autocomplete & validation (see src/integrations/address/).
