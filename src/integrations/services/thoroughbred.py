@@ -20,6 +20,7 @@ from django.utils import timezone
 
 from src import enums as src_enums
 from src import models as src_models
+from src.integrations import credentials as credentials_helper
 from src.integrations.clients.thoroughbred import client as thoroughbred_client
 from src.integrations.utils.brand_matching import (
     best_fuzzy_brand_match,
@@ -479,7 +480,11 @@ def sync_thoroughbred_company_pricing_for_company_provider(company_provider_id: 
         )
     )
 
-    markup_pct = markup_percent_for_company(cp.credentials)
+    # Markup lives under credentials["feed"]["markup"] (CompanyProviders.credentials is namespaced
+    # {"feed": {...}, "order": {...}} -- see credentials_helper.get_feed_credentials), not at the
+    # top level of cp.credentials.
+    feed_credentials = credentials_helper.get_feed_credentials(cp)
+    markup_pct = markup_percent_for_company(feed_credentials)
     total_upserted = 0
     batch: typing.List[src_models.ThoroughbredCompanyPricing] = []
     last_id = 0
@@ -495,7 +500,7 @@ def sync_thoroughbred_company_pricing_for_company_provider(company_provider_id: 
         last_id = rows[-1]["id"]
 
         for row in rows:
-            cost = dealer_cost_from_retail(row.get("price"), cp.credentials)
+            cost = dealer_cost_from_retail(row.get("price"), feed_credentials)
             if cost is None:
                 continue
             batch.append(

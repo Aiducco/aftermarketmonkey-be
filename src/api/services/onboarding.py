@@ -507,4 +507,17 @@ def get_distributor_credentials_info() -> dict:
             ),
             "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("ALLPRO_DISTRIBUTING") or None,
         },
+        "thoroughbred_diesel": {
+            "required": ["markup"],
+            "description": (
+                "No account or login needed — Thoroughbred Diesel's catalog, pricing, and fitment "
+                "data are fully public. The only thing to enter is your own markup percentage "
+                "(0–100) off Thoroughbred's public retail price; your cost is computed as "
+                "retail * (1 - markup / 100)."
+            ),
+            "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get(
+                "THOROUGHBRED_DIESEL", "Thoroughbred Diesel"
+            ),
+            "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("THOROUGHBRED_DIESEL") or None,
+        },
     }
