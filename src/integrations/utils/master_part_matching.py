@@ -61,6 +61,8 @@ GTIN_LESS_PROVIDER_KINDS = frozenset({
     # providers on the same master part supplied one -- that says nothing about a
     # Motor-State-only candidate.
     src_enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING.value,
+    # HawkSearch's 36-field schema has no gtin/upc field at all (confirmed live, 2026-10-26).
+    src_enums.BrandProviderKind.THOROUGHBRED_DIESEL.value,
 })
 
 _LOOKUP_CHUNK = 2000

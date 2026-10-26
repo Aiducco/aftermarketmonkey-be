@@ -62,6 +62,7 @@ from src.integrations.services import (
     rough_country,
     sb,
     the_wheel_group,
+    thoroughbred,
     tirerack,
     tristate,
     vossen,
@@ -164,6 +165,7 @@ class Command(BaseCommand):
             "ingest_all_providers_helmet_house",
             "ingest_all_providers_tristate",
             "ingest_all_providers_allpro",
+            "ingest_all_providers_thoroughbred",
             "ingest_all_providers_sb",
             "ingest_all_providers_sync_all_master_parts",
             "ingest_all_providers_enqueue_pricing_jobs",
@@ -210,6 +212,7 @@ class Command(BaseCommand):
                 ("allpro",        self._run_allpro),
                 ("sb",           self._run_sb),
                 ("atd",          self._run_atd),
+                ("thoroughbred", self._run_thoroughbred),
             ]
             for name, run_fn in phase1_providers:
                 self._ingest_log("phase 1 | starting {} fetch".format(name))
@@ -475,6 +478,19 @@ class Command(BaseCommand):
             allpro.fetch_and_save_allpro_brands(primary_cp.id)
             allpro.sync_unmapped_allpro_brands_to_brands()
             allpro.fetch_and_save_allpro_catalog(primary_cp.id)
+
+    def _run_thoroughbred(self) -> None:
+        with self._audited_step(
+            "ingest_all_providers_thoroughbred",
+            "Thoroughbred Diesel public HawkSearch catalog fetch + unmapped brand sync "
+            "complete (derived in sync_all).",
+            continue_on_error=True,
+        ):
+            # No credentials needed at all -- the catalog is fully public. Unlike AllPro/TSE
+            # there is no "primary connection" to check first.
+            self._ingest_log("Thoroughbred: fetching public HawkSearch catalog + unmapped brand sync")
+            thoroughbred.fetch_and_save_thoroughbred_catalog()
+            thoroughbred.sync_unmapped_thoroughbred_brands_to_brands()
 
     def _run_wheelpros(self) -> None:
         with self._audited_step(

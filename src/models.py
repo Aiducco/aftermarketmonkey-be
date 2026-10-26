@@ -9157,3 +9157,122 @@ class ApolloPhoneReveal(django_db_models.Model):
 
     def __str__(self) -> str:
         return "{} ({})".format(self.name or self.apollo_person_id, self.status)
+
+
+class ThoroughbredBrand(django_db_models.Model):
+    """Thoroughbred Diesel brand, discovered as a distinct value of the catalog's bare `b` field --
+    HawkSearch has no separate brand-list endpoint, so brands are only known by crawling the
+    catalog itself. name is the natural key, same shape as WheelProsBrand (no AAIA code --
+    Thoroughbred brands are bare names, not AAIA-coded)."""
+    name = django_db_models.CharField(max_length=255, unique=True)
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "thoroughbred_brands"
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class BrandThoroughbredBrandMapping(django_db_models.Model):
+    brand = django_db_models.ForeignKey(
+        Brands, on_delete=django_db_models.CASCADE, related_name="thoroughbred_brand_mappings"
+    )
+    thoroughbred_brand = django_db_models.ForeignKey(
+        ThoroughbredBrand, on_delete=django_db_models.CASCADE, related_name="brand_mappings"
+    )
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "brand_thoroughbred_brand_mapping"
+        unique_together = [["brand", "thoroughbred_brand"]]
+
+
+class ThoroughbredParts(django_db_models.Model):
+    """One row per HawkSearch doc (id/sku/url are 1:1:1 per the distributor's own index).
+    external_id is HawkSearch's own Solr `id` -- the field HawkSearch itself treats as row
+    identity, used as ProviderPart.provider_external_id directly. sku is Thoroughbred's own
+    reseller SKU (often brand-prefixed over the manufacturer's own number, e.g.
+    "GAR851824-5001S") -- it is NOT a clean manufacturer part number, but it is the only
+    identifier-like field this feed has, so it is what MasterPart.part_number/sku get set to
+    (see master_parts.py's Thoroughbred ingest). price is parsed from the zero-padded Solr
+    string. inventory has the 99999999 unlimited/dropship sentinel clamped to NULL before
+    storage, never persisted raw. vehicleid is the raw int list straight off the doc -- fitment
+    sync reads it directly, no junction table."""
+    brand = django_db_models.ForeignKey(
+        ThoroughbredBrand, on_delete=django_db_models.CASCADE, related_name="parts", null=True
+    )
+    external_id = django_db_models.CharField(max_length=64, unique=True)
+    sku = django_db_models.CharField(max_length=255, db_index=True)
+    url = django_db_models.TextField(null=True, blank=True)
+    title = django_db_models.CharField(max_length=512, null=True, blank=True)
+    image_url = django_db_models.TextField(null=True, blank=True)
+    price = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    inventory = django_db_models.IntegerField(null=True, blank=True)
+    # HawkSearch "it": regular/child/parent/group.
+    item_type = django_db_models.CharField(max_length=32, null=True, blank=True)
+    # HawkSearch "kitshortdescription" -- fitment/compliance notes, NOT marketing copy.
+    kit_short_description = django_db_models.TextField(null=True, blank=True)
+    vehicleid = django_db_models.JSONField(null=True, blank=True)
+    raw_data = django_db_models.JSONField(null=True, blank=True)
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "thoroughbred_parts"
+        indexes = [
+            django_db_models.Index(fields=["brand", "sku"], name="tbd_brand_sku_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return "{} ({})".format(self.sku, self.external_id)
+
+
+class ThoroughbredCompanyPricing(django_db_models.Model):
+    """Per-company dealer cost: cost = price * (1 - markup/100), where markup comes from
+    CompanyProviders.credentials["markup"] -- see services/thoroughbred.py:dealer_cost_from_retail.
+    markup_percent_applied is kept purely as an audit trail of what percentage produced it (no
+    raw per-company feed exists to reconcile against, unlike AllPro/TSE)."""
+    part = django_db_models.ForeignKey(
+        ThoroughbredParts, on_delete=django_db_models.CASCADE, related_name="company_pricing"
+    )
+    company = django_db_models.ForeignKey(
+        Company, on_delete=django_db_models.CASCADE, related_name="thoroughbred_company_pricing"
+    )
+    cost = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    markup_percent_applied = django_db_models.DecimalField(
+        max_digits=5, decimal_places=2, null=True, blank=True
+    )
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "thoroughbred_company_pricing"
+        unique_together = [["part", "company"]]
+
+
+class ThoroughbredVehicle(django_db_models.Model):
+    """Thoroughbred's own private vehicle-id decode table (NOT VcdbVehicle -- these ids are
+    Thoroughbred's own scheme, walked via the three chained ajax.aspx GetYears/GetModels/
+    GetVehicle endpoints over 8 hardcoded makes, and only decode to year/make/model; there is no
+    submodel/engine/drive_type in this scheme, so MasterPartFitment rows sourced from here always
+    carry "" for those three fields). A decode miss (e.g. the confirmed orphan vehicle id 1678,
+    referenced by products but unreachable via the picker walk) is simply absent here -- callers
+    must treat it as "drop this fitment edge," never a hard failure."""
+    vehicle_id = django_db_models.IntegerField(unique=True)
+    year = django_db_models.IntegerField()
+    make = django_db_models.CharField(max_length=128)
+    model = django_db_models.CharField(max_length=128)
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "thoroughbred_vehicles"
+        indexes = [
+            django_db_models.Index(fields=["make", "model", "year"], name="tbd_veh_mmy_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return "{} {} {} (vid={})".format(self.year, self.make, self.model, self.vehicle_id)

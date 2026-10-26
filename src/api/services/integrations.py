@@ -459,6 +459,19 @@ def _validate_wheelpros_markup_fields(credentials: typing.Dict[str, typing.Any])
     return None
 
 
+def _validate_thoroughbred_markup_field(credentials: typing.Dict[str, typing.Any]) -> typing.Optional[str]:
+    """markup must be a numeric percentage in [0, 100] -- it is the company's only input,
+    there being no login of any kind for Thoroughbred's public catalog."""
+    raw = credentials.get("markup")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return "markup must be a number between 0 and 100."
+    if not (0 <= value <= 100):
+        return "markup must be between 0 and 100 (got {}).".format(raw)
+    return None
+
+
 _ValidatorResult = typing.Tuple[typing.Optional[str], typing.Optional[str]]  # (error_message, error_code)
 
 
@@ -517,6 +530,15 @@ def _validate_wheelpros_connection(credentials: typing.Dict[str, typing.Any]) ->
         return str(e), CONNECTION_ERROR_PERMISSION_DENIED
     except (wheelpros_exceptions.WheelProsException, ValueError) as e:
         return str(e), CONNECTION_ERROR_CONNECTION_FAILED
+    return None, None
+
+
+def _validate_thoroughbred_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
+    """No live network call -- there is nothing to authenticate against (Thoroughbred's catalog
+    is fully public). Only the markup credential needs validating."""
+    markup_error = _validate_thoroughbred_markup_field(credentials)
+    if markup_error:
+        return markup_error, CONNECTION_ERROR_INVALID_INPUT
     return None, None
 
 
@@ -738,6 +760,7 @@ _CONNECTION_VALIDATORS: typing.Dict[int, typing.Callable[[typing.Dict[str, typin
     src_enums.BrandProviderKind.HELMHOUSE.value: _validate_helmet_house_connection,
     src_enums.BrandProviderKind.ALLPRO_DISTRIBUTING.value: _validate_allpro_connection,
     src_enums.BrandProviderKind.ATD.value: _validate_atd_connection,
+    src_enums.BrandProviderKind.THOROUGHBRED_DIESEL.value: _validate_thoroughbred_connection,
 }
 
 

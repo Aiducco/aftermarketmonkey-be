@@ -40,6 +40,7 @@ from src.integrations.services import rough_country as rough_country_services
 from src.integrations.services import sb as sb_services
 from src.integrations.clients.the_wheel_group import exceptions as the_wheel_group_exceptions
 from src.integrations.services import the_wheel_group as the_wheel_group_services
+from src.integrations.services import thoroughbred as thoroughbred_services
 from src.integrations.services import tirerack as tirerack_services
 from src.integrations.services import tristate as tristate_services
 from src.integrations.services import turn_14 as turn_14_services
@@ -74,6 +75,7 @@ _PRICING_SYNC_KINDS = frozenset(
         src_enums.BrandProviderKind.ALLPRO_DISTRIBUTING.value,
         src_enums.BrandProviderKind.SB.value,
         src_enums.BrandProviderKind.ATD.value,
+        src_enums.BrandProviderKind.THOROUGHBRED_DIESEL.value,
     }
 )
 
@@ -354,6 +356,12 @@ def _fetch_raw_pricing(cp: src_models.CompanyProviders, use_delta_fetch: bool = 
         # src.integrations.services.atd's module docstring).
         atd_services.fetch_and_save_atd_catalog_for_company_provider(cp.id)
 
+    elif kind == src_enums.BrandProviderKind.THOROUGHBRED_DIESEL.value:
+        # No raw distributor feed to fetch here at all -- Thoroughbred exposes no wholesale cost
+        # anywhere public. This computes cost from this company's own markup credential applied
+        # to Thoroughbred's public retail price (see services.thoroughbred.dealer_cost_from_retail).
+        thoroughbred_services.sync_thoroughbred_company_pricing_for_company_provider(cp.id)
+
     else:
         raise ValueError("Unsupported provider kind for raw pricing fetch: {}".format(kind))
 
@@ -430,6 +438,9 @@ def _sync_master_pricing(cp: src_models.CompanyProviders) -> None:
         # only from the nightly catalog phase.
         master_parts.sync_provider_pricing_from_atd_for_company(company_id)
         master_parts.sync_provider_inventory_from_atd_for_company(company_id)
+
+    elif kind == src_enums.BrandProviderKind.THOROUGHBRED_DIESEL.value:
+        master_parts.sync_provider_pricing_from_thoroughbred_for_company(company_id)
 
     else:
         raise ValueError("Unsupported provider kind for master pricing sync: {}".format(kind))

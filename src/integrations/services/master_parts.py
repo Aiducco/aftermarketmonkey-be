@@ -3038,6 +3038,616 @@ def sync_derived_from_allpro(*, skip_master_parts: bool = False, skip_pricing: b
     logger.info("{} Completed AllPro-only derived sync.".format(_LOG_PREFIX))
 
 
+def _ingest_thoroughbred_parts_for_mapped_brands(
+    mapped_catalog_brand_ids: typing.Set[int],
+    thoroughbred_provider: src_models.Providers,
+    thoroughbred_brand_to_brand: typing.Dict[int, src_models.Brands],
+    thoroughbred_brand_to_aaia: typing.Dict[int, typing.Optional[str]],
+) -> typing.Tuple[int, int]:
+    """
+    Batch-ingest ThoroughbredParts for one disjoint set of ThoroughbredBrand catalog PKs.
+
+    Thoroughbred's HawkSearch feed has exactly one identifier-like field (``sku``) -- there is no
+    separate clean manufacturer part number, and ``external_id`` (HawkSearch's own doc id) is
+    Thoroughbred's own internal catalog id, useless for cross-provider matching. So, same as
+    WheelPros and Meyer: ``MasterPart.part_number = MasterPart.sku = ThoroughbredParts.sku``, and
+    the lookup tries the sku bridge before the exact match, then falls through to
+    ``mp_matching.extend_with_normalized_matches`` for anything still unplaced (punctuation-only
+    differences; the barcode rung can never fire since Thoroughbred has no GTIN/UPC at all --
+    see GTIN_LESS_PROVIDER_KINDS in master_part_matching.py). A Thoroughbred row whose sku carries
+    a brand-prefix a different distributor's part number doesn't share (e.g. Thoroughbred's
+    "GAR851824-5001S" vs. another provider's bare "851824-5001S") will not auto-match through any
+    rung and creates a new MasterPart instead -- known, accepted limitation, same as every other
+    GTIN-less prefixed-sku provider.
+    """
+    if not mapped_catalog_brand_ids:
+        return 0, 0
+
+    total_master = 0
+    total_provider = 0
+    batch_num = 0
+    last_id = 0
+
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.ThoroughbredParts.objects.filter(
+                brand_id__in=mapped_catalog_brand_ids,
+                id__gt=last_id,
+            )
+            .order_by("id")
+            .values("id", "brand_id", "sku", "external_id", "title", "image_url", "updated_at")[
+                :BATCH_SIZE_MASTER_PARTS
+            ]
+        )
+        if not batch:
+            break
+
+        last_id = batch[-1]["id"]
+        seen = set()
+        master_parts_list = []
+        thoroughbred_ext_id_to_brand_part = {}
+
+        for row in batch:
+            brand = thoroughbred_brand_to_brand.get(row["brand_id"])
+            if not brand:
+                continue
+            sku = (row.get("sku") or "").strip()
+            if not sku:
+                continue
+            key = (brand.id, sku)
+            if key not in seen:
+                seen.add(key)
+                aaia = thoroughbred_brand_to_aaia.get(row["brand_id"])
+                master_parts_list.append(
+                    src_models.MasterPart(
+                        brand=brand,
+                        part_number=sku,
+                        sku=sku,
+                        description=row.get("title"),
+                        aaia_code=aaia,
+                        image_url=image_utils.clean_image_url(row.get("image_url")),
+                    )
+                )
+            thoroughbred_ext_id_to_brand_part[row["external_id"]] = (brand.id, sku)
+
+        if not master_parts_list:
+            connection.close()
+            if len(batch) == BATCH_SIZE_MASTER_PARTS:
+                time.sleep(BATCH_DELAY_SECONDS)
+            continue
+
+        pairs = list(seen)
+        # sku bridge first (sku == part_number for Thoroughbred's own rows, but the bridge still
+        # matters against OTHER providers' MasterPart rows whose sku was set to a shared/clean
+        # value), then exact (brand_id, part_number). Two separate queries per chunk (no OR) to
+        # avoid the PostgreSQL stack depth limit; prefer the sku candidate whose part_number also
+        # matches when more than one MasterPart shares that sku.
+        existing_by_key = {}
+        id_to_mp = {}
+        existing_by_sku: typing.Dict[typing.Tuple[int, str], typing.List[typing.Tuple[int, str]]] = {}
+        existing_by_part = {}
+        for i in range(0, len(pairs), WHEELPROS_LOOKUP_CHUNK):
+            chunk = pairs[i : i + WHEELPROS_LOOKUP_CHUNK]
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number, sku FROM master_parts WHERE (brand_id, sku) IN %s",
+                    (tuple(chunk),),
+                )
+                for mp_id, b_id, p_num, sku_val in cur.fetchall():
+                    if mp_id not in id_to_mp:
+                        mp = src_models.MasterPart()
+                        mp.id = mp_id
+                        mp.brand_id = b_id
+                        mp.part_number = p_num
+                        id_to_mp[mp_id] = mp
+                    if sku_val is not None:
+                        sk_key = (b_id, (sku_val or "").strip())
+                        existing_by_sku.setdefault(sk_key, []).append((mp_id, p_num))
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(chunk),),
+                )
+                for mp_id, b_id, p_num in cur.fetchall():
+                    if mp_id not in id_to_mp:
+                        mp = src_models.MasterPart()
+                        mp.id = mp_id
+                        mp.brand_id = b_id
+                        mp.part_number = p_num
+                        id_to_mp[mp_id] = mp
+                    existing_by_part.setdefault((b_id, p_num), mp_id)
+        for (b_id, p_num) in pairs:
+            sku_candidates = existing_by_sku.get((b_id, p_num)) or []
+            sku_match = next((mp_id for mp_id, pn in sku_candidates if pn == p_num), None)
+            if sku_match is None and sku_candidates:
+                sku_match = sku_candidates[0][0]
+            existing_by_key[(b_id, p_num)] = sku_match or existing_by_part.get((b_id, p_num))
+
+        mp_matching.extend_with_normalized_matches(
+            existing_by_key,
+            pairs,
+            {(mp.brand_id, mp.part_number): mp.gtin for mp in master_parts_list},
+            provider_id=thoroughbred_provider.id,
+            provider_kind=src_enums.BrandProviderKind.THOROUGHBRED_DIESEL.value,
+            sku_by_key={(mp.brand_id, mp.part_number): mp.sku for mp in master_parts_list},
+            external_id_by_key={v: k for k, v in thoroughbred_ext_id_to_brand_part.items()},
+        )
+
+        new_parts = [
+            mp for mp in master_parts_list if existing_by_key.get((mp.brand_id, mp.part_number)) is None
+        ]
+        existing_keys = [k for k in pairs if existing_by_key.get(k) is not None]
+
+        # Insert-only for new parts, same as WheelPros/Meyer -- an existing matched row's
+        # sku/description/image_url is never overwritten (sku is the cross-provider matching key,
+        # set once at creation; see MasterPart's own docstring).
+        if new_parts:
+            new_parts = _dedupe_master_parts_for_upsert(
+                new_parts, context="Thoroughbred new_parts batch={}".format(batch_num)
+            )
+            pgbulk.upsert(
+                src_models.MasterPart,
+                new_parts,
+                unique_fields=["brand", "part_number"],
+                update_fields=[],
+            )
+            total_master += len(new_parts)
+
+        if existing_keys:
+            key_to_mp = {(mp.brand_id, mp.part_number): mp for mp in master_parts_list}
+            for i in range(0, len(existing_keys), WHEELPROS_LOOKUP_CHUNK):
+                chunk_keys = existing_keys[i : i + WHEELPROS_LOOKUP_CHUNK]
+                values = [(existing_by_key[k], key_to_mp[k].aaia_code) for k in chunk_keys]
+                placeholders = ", ".join(["(%s::bigint, %s)"] * len(values))
+                params = [x for row_vals in values for x in row_vals]
+                with connection.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE master_parts mp SET aaia_code = v.aaia_code
+                        FROM (VALUES {}) AS v(id, aaia_code)
+                        WHERE mp.id = v.id
+                        """.format(placeholders),
+                        params,
+                    )
+
+        brand_part_to_master = {}
+        for (b_id, p_num), mp_id in existing_by_key.items():
+            if mp_id is None:
+                continue
+            if mp_id in id_to_mp:
+                brand_part_to_master[(b_id, p_num)] = id_to_mp[mp_id]
+            else:
+                mp = src_models.MasterPart()
+                mp.id = mp_id
+                mp.brand_id = b_id
+                brand_part_to_master[(b_id, p_num)] = mp
+        new_pairs = [k for k in pairs if k not in brand_part_to_master]
+        if new_pairs:
+            for i in range(0, len(new_pairs), WHEELPROS_LOOKUP_CHUNK):
+                chunk = new_pairs[i : i + WHEELPROS_LOOKUP_CHUNK]
+                with connection.cursor() as cur:
+                    cur.execute(
+                        "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                        (tuple(chunk),),
+                    )
+                    for mp_id, b_id, p_num in cur.fetchall():
+                        mp = src_models.MasterPart()
+                        mp.id = mp_id
+                        mp.brand_id = b_id
+                        brand_part_to_master[(b_id, p_num)] = mp
+
+        provider_parts_by_key = {}
+        for row in batch:
+            brand = thoroughbred_brand_to_brand.get(row["brand_id"])
+            if not brand:
+                continue
+            sku = (row.get("sku") or "").strip()
+            if not sku:
+                continue
+            master_part = brand_part_to_master.get((brand.id, sku))
+            if not master_part:
+                continue
+            pp_key = (master_part.id, thoroughbred_provider.id)
+            provider_parts_by_key[pp_key] = src_models.ProviderPart(
+                master_part=master_part,
+                provider=thoroughbred_provider,
+                provider_external_id=row["external_id"],
+                distributor_refreshed_at=row.get("updated_at"),
+            )
+
+        provider_parts = list(provider_parts_by_key.values())
+        if provider_parts:
+            pgbulk.upsert(
+                src_models.ProviderPart,
+                provider_parts,
+                unique_fields=["master_part", "provider"],
+                update_fields=_PROVIDER_PART_SYNC_UPDATE_FIELDS,
+            )
+            total_provider += len(provider_parts)
+
+        logger.info("{} Thoroughbred batch {}: {} items -> {} master, {} provider (last_id={})".format(
+            _LOG_PREFIX, batch_num, len(batch), len(master_parts_list), len(provider_parts), last_id
+        ))
+        connection.close()
+        if len(batch) == BATCH_SIZE_MASTER_PARTS:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    return total_master, total_provider
+
+
+def sync_master_parts_from_thoroughbred() -> None:
+    """Create/update MasterPart and ProviderPart from ThoroughbredParts. Only rows whose
+    ThoroughbredBrand has a BrandThoroughbredBrandMapping are included. See
+    _ingest_thoroughbred_parts_for_mapped_brands for the sku-bridge matching design."""
+    logger.info("{} Syncing master parts from Thoroughbred Diesel (batched, sku bridge).".format(_LOG_PREFIX))
+
+    thoroughbred_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.THOROUGHBRED_DIESEL.value,
+    ).first()
+    if not thoroughbred_provider:
+        logger.info("{} No Thoroughbred Diesel provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandThoroughbredBrandMapping.objects.select_related("brand", "thoroughbred_brand")
+    )
+    thoroughbred_brand_to_brand = {m.thoroughbred_brand_id: m.brand for m in mappings}
+    thoroughbred_brand_to_aaia = {
+        m.thoroughbred_brand_id: (m.brand.aaia_code if m.brand else None) for m in mappings
+    }
+    if not thoroughbred_brand_to_brand:
+        logger.info("{} No BrandThoroughbredBrandMapping found. Nothing to sync.".format(_LOG_PREFIX))
+        return
+
+    chunks = _partition_mapped_brands_for_parallel_ingest(mappings, MASTER_PARTS_SYNC_MAX_WORKERS)
+    total_master, total_provider = _run_parallel_master_parts_ingest(
+        chunks,
+        mappings,
+        "thoroughbred_brand",
+        lambda cids: _ingest_thoroughbred_parts_for_mapped_brands(
+            cids, thoroughbred_provider, thoroughbred_brand_to_brand, thoroughbred_brand_to_aaia,
+        ),
+    )
+    logger.info("{} Synced {} master parts and {} provider parts from Thoroughbred Diesel total.".format(
+        _LOG_PREFIX, total_master, total_provider
+    ))
+
+
+def _thoroughbred_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
+    """product_details for a ThoroughbredParts row (shown on ProviderPart). kit_short_description
+    is fitment/compliance notes (e.g. CARB EO numbers), NOT marketing copy -- labeled plainly
+    here rather than promoted to a description field."""
+    return [
+        {"key": "item_type", "label": "Item Type", "value": row.get("item_type") or None},
+        {"key": "url", "label": "URL", "value": row.get("url") or None},
+        {
+            "key": "kit_short_description",
+            "label": "Fitment / Compliance Notes",
+            "value": row.get("kit_short_description") or None,
+        },
+    ]
+
+
+def sync_provider_inventory_from_thoroughbred() -> None:
+    """Sync ProviderPartInventory from ThoroughbredParts -- shared catalog-level inventory
+    (Thoroughbred's own public stock number, no per-warehouse breakdown in this feed). Also
+    refreshes ProviderPart.product_details from the same row, same pattern as AllPro/TSE."""
+    logger.info("{} Syncing provider inventory from Thoroughbred Diesel.".format(_LOG_PREFIX))
+
+    thoroughbred_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.THOROUGHBRED_DIESEL.value,
+    ).first()
+    if not thoroughbred_provider:
+        logger.info("{} No Thoroughbred Diesel provider found.".format(_LOG_PREFIX))
+        return
+
+    provider_parts_by_key = {
+        row["provider_external_id"]: src_models.ProviderPart(id=row["id"])
+        for row in src_models.ProviderPart.objects.filter(provider=thoroughbred_provider).values(
+            "id", "provider_external_id"
+        )
+    }
+
+    now = timezone.now()
+    total_upserted = 0
+    batch_num = 0
+    last_id = 0
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.ThoroughbredParts.objects.filter(id__gt=last_id)
+            .order_by("id")
+            .values("id", "external_id", "inventory", "item_type", "url", "kit_short_description")[
+                :BATCH_SIZE_INVENTORY
+            ]
+        )
+        if not batch:
+            break
+        last_id = batch[-1]["id"]
+
+        to_upsert = []
+        for row in batch:
+            provider_part = provider_parts_by_key.get(row["external_id"])
+            if not provider_part:
+                continue
+            to_upsert.append(
+                src_models.ProviderPartInventory(
+                    provider_part=provider_part,
+                    warehouse_total_qty=row.get("inventory") or 0,
+                    manufacturer_inventory=None,
+                    manufacturer_esd=None,
+                    warehouse_availability=None,
+                    last_synced_at=now,
+                    updated_at=now,
+                )
+            )
+        if to_upsert:
+            to_upsert = _dedupe_provider_part_inventory_for_upsert(
+                to_upsert, context="Thoroughbred inventory batch={}".format(batch_num)
+            )
+            pgbulk.upsert(
+                src_models.ProviderPartInventory,
+                to_upsert,
+                unique_fields=["provider_part"],
+                update_fields=[
+                    "warehouse_total_qty", "manufacturer_inventory", "manufacturer_esd",
+                    "warehouse_availability", "last_synced_at", "updated_at",
+                ],
+            )
+            total_upserted += len(to_upsert)
+
+        pp_details_to_update = []
+        for row in batch:
+            pp = provider_parts_by_key.get(row["external_id"])
+            if pp:
+                pp.product_details = _thoroughbred_product_details(row)
+                pp_details_to_update.append(pp)
+        if pp_details_to_update:
+            src_models.ProviderPart.objects.bulk_update(
+                pp_details_to_update, ["product_details"], batch_size=500
+            )
+
+        connection.close()
+        if len(batch) == BATCH_SIZE_INVENTORY:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    logger.info("{} Synced {} Thoroughbred Diesel inventory records total.".format(_LOG_PREFIX, total_upserted))
+
+
+def sync_provider_pricing_from_thoroughbred_for_company(company_id: int) -> None:
+    """Propagate ThoroughbredCompanyPricing into ProviderPartCompanyPricing for one company.
+    ThoroughbredCompanyPricing itself is populated by
+    thoroughbred.sync_thoroughbred_company_pricing_for_company_provider, which applies that
+    company's own markup credential to Thoroughbred's public retail price -- there is no raw
+    distributor cost feed to read here, unlike AllPro/TSE."""
+    logger.info("{} Syncing Thoroughbred Diesel provider pricing for company_id={}.".format(_LOG_PREFIX, company_id))
+
+    thoroughbred_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.THOROUGHBRED_DIESEL.value,
+    ).first()
+    if not thoroughbred_provider:
+        logger.info("{} No Thoroughbred Diesel provider found.".format(_LOG_PREFIX))
+        return
+
+    provider_parts_by_key = {
+        row["provider_external_id"]: src_models.ProviderPart(id=row["id"])
+        for row in src_models.ProviderPart.objects.filter(provider=thoroughbred_provider).values(
+            "id", "provider_external_id"
+        )
+    }
+    if not provider_parts_by_key:
+        logger.info("{} No Thoroughbred Diesel ProviderPart rows yet. Nothing to price.".format(_LOG_PREFIX))
+        return
+
+    now = timezone.now()
+    sync_started_at = timezone.now()
+    company_provider = src_models.CompanyProviders.objects.filter(
+        company_id=company_id, provider=thoroughbred_provider,
+    ).first()
+    watermark = company_provider.pricing_propagation_watermark if company_provider else None
+
+    total_upserted = 0
+    batch_num = 0
+    last_id = 0
+    while True:
+        batch_num += 1
+        qs = src_models.ThoroughbredCompanyPricing.objects.filter(id__gt=last_id, company_id=company_id)
+        if watermark:
+            qs = qs.filter(updated_at__gte=watermark)
+        batch = list(
+            qs.order_by("id").values(
+                "id", "cost", "part__external_id", "part__price",
+            )[:BATCH_SIZE_PRICING]
+        )
+        if not batch:
+            break
+        last_id = batch[-1]["id"]
+
+        to_upsert = []
+        for row in batch:
+            pp = provider_parts_by_key.get(row["part__external_id"])
+            if not pp:
+                continue
+            retail = row.get("part__price")
+            to_upsert.append(
+                src_models.ProviderPartCompanyPricing(
+                    provider_part=pp,
+                    company_id=company_id,
+                    cost=row.get("cost"),
+                    jobber_price=None,
+                    map_price=None,
+                    msrp=retail,
+                    retail_price=retail,
+                    last_synced_at=now,
+                )
+            )
+        if to_upsert:
+            to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                to_upsert, context="Thoroughbred pricing company={} batch={}".format(company_id, batch_num)
+            )
+            pgbulk.upsert(
+                src_models.ProviderPartCompanyPricing,
+                to_upsert,
+                unique_fields=["provider_part", "company"],
+                update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
+            )
+            total_upserted += len(to_upsert)
+        connection.close()
+        if len(batch) == BATCH_SIZE_PRICING:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    logger.info("{} Synced {} Thoroughbred Diesel pricing records for company_id={}.".format(
+        _LOG_PREFIX, total_upserted, company_id,
+    ))
+
+    if company_provider:
+        company_provider.pricing_propagation_watermark = sync_started_at
+        company_provider.save(update_fields=["pricing_propagation_watermark"])
+
+
+def sync_derived_from_thoroughbred(*, skip_master_parts: bool = False, skip_pricing: bool = False) -> None:
+    """Propagate Thoroughbred Diesel source data into MasterPart, ProviderPart,
+    ProviderPartInventory. Per-company pricing is NOT looped over here -- it's fetched
+    per-company by the standard IntegrationPricingSyncJob dispatch (see
+    integration_pricing_sync_jobs._fetch_raw_pricing), same as AllPro/DLG/Keystone. Fitment is
+    ALSO not run here -- see sync_master_part_fitments_from_thoroughbred, a standalone pipeline
+    with its own management command, same as every other native fitment writer."""
+    logger.info("{} Starting Thoroughbred Diesel-only derived sync.".format(_LOG_PREFIX))
+    if not skip_master_parts:
+        sync_master_parts_from_thoroughbred()
+        connection.close()
+    if not skip_pricing:
+        sync_provider_inventory_from_thoroughbred()
+        connection.close()
+    logger.info("{} Completed Thoroughbred Diesel-only derived sync.".format(_LOG_PREFIX))
+
+
+def sync_master_part_fitments_from_thoroughbred() -> None:
+    """
+    Decode ThoroughbredParts.vehicleid (the raw list of Thoroughbred's own vehicle ids, delivered
+    directly in the catalog doc -- no per-item API call needed) via ThoroughbredVehicle, collapse
+    into year ranges, and upsert MasterPartFitment. Same shape as Turn14's live fitment sweep
+    (turn_14_sweeps.sweep_fitment), except Thoroughbred has no submodel/engine/drive_type at all
+    (always "") and the vehicle ids are Thoroughbred's own private scheme, not VCdb.
+
+    A decode miss (an unmapped vehicle id, e.g. the confirmed orphan id 1678) or an item with no
+    resolvable MasterPart is counted, never raised -- the sweep must survive both without aborting.
+    """
+    logger.info("{} Starting Thoroughbred Diesel fitment sync.".format(_LOG_PREFIX))
+
+    thoroughbred_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.THOROUGHBRED_DIESEL.value,
+    ).first()
+    if not thoroughbred_provider:
+        logger.warning("{} No Thoroughbred Diesel provider found. Skipping.".format(_LOG_PREFIX))
+        return
+
+    vehicle_by_id: typing.Dict[int, typing.Tuple[int, str, str]] = {
+        row["vehicle_id"]: (row["year"], row["make"], row["model"])
+        for row in src_models.ThoroughbredVehicle.objects.values("vehicle_id", "year", "make", "model")
+    }
+    if not vehicle_by_id:
+        logger.warning(
+            "{} No ThoroughbredVehicle rows -- run fetch_thoroughbred_vehicles first. "
+            "Skipping.".format(_LOG_PREFIX)
+        )
+        return
+
+    master_part_id_by_external_id: typing.Dict[str, int] = {
+        row["provider_external_id"]: row["master_part_id"]
+        for row in src_models.ProviderPart.objects.filter(provider=thoroughbred_provider).values(
+            "provider_external_id", "master_part_id"
+        )
+    }
+    if not master_part_id_by_external_id:
+        logger.warning(
+            "{} No Thoroughbred Diesel ProviderPart rows yet -- run sync_master_parts_from_thoroughbred "
+            "first. Skipping.".format(_LOG_PREFIX)
+        )
+        return
+
+    skipped_unknown_item = 0
+    skipped_unknown_vehicle = 0
+    total_upserted = 0
+    batch_num = 0
+    last_id = 0
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.ThoroughbredParts.objects.exclude(vehicleid__isnull=True)
+            .filter(id__gt=last_id)
+            .order_by("id")
+            .values("id", "external_id", "vehicleid")[:FITMENT_ITEM_CHUNK_SIZE]
+        )
+        if not batch:
+            break
+        last_id = batch[-1]["id"]
+
+        to_upsert = []
+        for row in batch:
+            master_part_id = master_part_id_by_external_id.get(row["external_id"])
+            if not master_part_id:
+                skipped_unknown_item += 1
+                continue
+            years_by_key: typing.Dict[typing.Tuple[str, str], typing.Set[int]] = {}
+            for raw_vehicle_id in (row.get("vehicleid") or []):
+                try:
+                    vehicle_id = int(raw_vehicle_id)
+                except (TypeError, ValueError):
+                    continue
+                decoded = vehicle_by_id.get(vehicle_id)
+                if not decoded:
+                    skipped_unknown_vehicle += 1
+                    continue
+                year, make, model = decoded
+                years_by_key.setdefault((make, model), set()).add(year)
+
+            for (make, model), years in years_by_key.items():
+                for year_start, year_end in _collapse_years_to_ranges(years):
+                    to_upsert.append(
+                        src_models.MasterPartFitment(
+                            master_part_id=master_part_id,
+                            year_start=year_start,
+                            year_end=year_end,
+                            make=make,
+                            model=model,
+                            submodel="",
+                            engine="",
+                            drive_type="",
+                            source_provider=thoroughbred_provider,
+                        )
+                    )
+
+        if to_upsert:
+            to_upsert = _dedupe_master_part_fitments_for_upsert(
+                to_upsert, context="Thoroughbred fitment batch={}".format(batch_num)
+            )
+            pgbulk.upsert(
+                src_models.MasterPartFitment,
+                to_upsert,
+                unique_fields=[
+                    "master_part", "year_start", "year_end", "make", "model",
+                    "submodel", "engine", "drive_type",
+                ],
+                update_fields=["source_provider"],
+            )
+            total_upserted += len(to_upsert)
+
+        connection.close()
+        if len(batch) == FITMENT_ITEM_CHUNK_SIZE:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    if skipped_unknown_item or skipped_unknown_vehicle:
+        logger.warning(
+            "{} fitment sync: skipped {} row(s) for items with no MasterPart, {} vehicle_id(s) "
+            "not in ThoroughbredVehicle.".format(_LOG_PREFIX, skipped_unknown_item, skipped_unknown_vehicle)
+        )
+    logger.info(
+        "{} Synced {} Thoroughbred Diesel MasterPartFitment rows total.".format(_LOG_PREFIX, total_upserted)
+    )
+
+
 def sync_master_parts_from_dlg() -> None:
     """
     Create/update MasterPart and ProviderPart from DlgParts.
@@ -14737,6 +15347,8 @@ def sync_all_master_parts_global() -> None:
     sync_derived_from_sb(skip_pricing=True)
     _reclaim_memory()
     sync_derived_from_atd(skip_pricing=True)
+    _reclaim_memory()
+    sync_derived_from_thoroughbred(skip_pricing=True)
 
     logger.info("{} Completed global master parts sync (catalog + inventory, no pricing).".format(_LOG_PREFIX))
 
@@ -14776,6 +15388,7 @@ def sync_all_master_parts_incremental() -> None:
     sync_derived_from_allpro(skip_master_parts=True)
     sync_derived_from_sb(skip_master_parts=True)
     sync_derived_from_atd(skip_master_parts=True)
+    sync_derived_from_thoroughbred(skip_master_parts=True)
 
     logger.info("{} Completed incremental master parts sync.".format(_LOG_PREFIX))
 

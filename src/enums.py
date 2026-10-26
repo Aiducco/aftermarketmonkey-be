@@ -101,6 +101,7 @@ class BrandProviderKind(enum.Enum):
     QUADRATEC = 37
     TRI_STATE = 38
     SB = 39
+    THOROUGHBRED_DIESEL = 40
 
 class ProductType(enum.Enum):
     """

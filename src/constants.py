@@ -38,6 +38,7 @@ PROVIDER_DISPLAY_NAMES = {
     "MOTOR_STATE_DISTRIBUTING": "Motor State Distributing",
     "QUADRATEC": "Quadratec",
     "TRI_STATE": "Tri-State",
+    "THOROUGHBRED_DIESEL": "Thoroughbred Diesel",
     "SB": "S&B Filters",
 }
 
@@ -79,6 +80,7 @@ PROVIDER_IMAGE_URLS = {
     "MOTOR_STATE_DISTRIBUTING": "https://api.aftermarketscout.com/uploads/motor_state_logo.png",
     "QUADRATEC": "https://api.aftermarketscout.com/uploads/quadratec_logo.png",
     "TRI_STATE": "https://api.aftermarketscout.com/uploads/tristate.png",
+    "THOROUGHBRED_DIESEL": "https://api.aftermarketscout.com/uploads/thoroughbred_diesel_logo.png",
     "SB": "https://api.aftermarketscout.com/uploads/sb_logo.png",
 }
 
@@ -2362,6 +2364,30 @@ PROVIDER_CATALOG = [
             "<li><strong>Connection fails?</strong> Re-paste the password. If it still fails, ask Andrew to "
             "confirm your FTP access is active.</li>"
             "</ul>"
+        ),
+    },
+    {
+        "kind": enums.BrandProviderKind.THOROUGHBRED_DIESEL,
+        "name": "Thoroughbred Diesel",
+        "description": (
+            "Access Thoroughbred Diesel's public catalog, pricing, and fitment data — no login "
+            "required, just set your markup."
+        ),
+        "icon_url": "https://api.aftermarketscout.com/uploads/thoroughbred_diesel_logo.png",
+        "category": "Distributors",
+        # Thoroughbred's catalog is public (no login of any kind) -- the only thing a company
+        # supplies is their own markup off Thoroughbred's public retail price, since Thoroughbred
+        # exposes no wholesale/dealer cost anywhere. See services/thoroughbred.py:
+        # dealer_cost_from_retail and _validate_thoroughbred_markup_field in api/services/integrations.py.
+        "connection_required_fields": ["markup"],
+        "connection_optional_fields": [],
+        "integration_time": "Data available immediately — no account or approval needed",
+        "installation_instructions_html": (
+            "<p><strong>Thoroughbred Diesel</strong> publishes its catalog publicly — there's no "
+            "account to set up. Just tell us your markup percentage off retail and we'll compute "
+            "your cost automatically.</p>"
+            "<p>Enter a <strong>markup percentage</strong> (0-100) below and click "
+            "<strong>Save</strong>. Catalog, pricing, and fitment data sync automatically after that.</p>"
         ),
     },
 ]
