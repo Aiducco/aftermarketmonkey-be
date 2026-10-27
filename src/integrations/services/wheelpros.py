@@ -1,7 +1,20 @@
 """
-WheelPros feed integration: SFTP CSV feed with brand, part, pricing, and warehouse inventory.
-Syncs WheelProsBrand, WheelProsPart, WheelProsCompanyPricing, and BrandWheelProsBrandMapping.
-Catalog uses the primary CompanyProvider (or first active); pricing loads per company SFTP.
+WheelPros feed integration: SFTP CSV feed with brand, part, catalog-level MSRP/MAP, and
+warehouse inventory. Syncs WheelProsBrand, WheelProsPart, WheelProsCompanyPricing, and
+BrandWheelProsBrandMapping. Catalog (including MSRP/MAP -- manufacturer-published, not
+account-specific) uses the primary CompanyProvider (or first active); nothing per-company.
+
+Per-company COST is the one thing that differs by company, and a company picks one of two ways
+to get it ("pricing_mode" in credentials.feed, see PROVIDER_CATALOG's "feed_connection_modes"
+for WheelPros in src/constants.py):
+  - "markup" (default if unset, for every connection predating this split): cost is estimated
+    from the shared MSRP via that company's own wheel_markup/tire_markup/accessories_markup.
+  - "api": cost is the real, per-SKU dealer net price pulled from WheelPros' Pricing API
+    (src.integrations.clients.wheelpros.pricing_client), using that company's own
+    api_username/api_password -- confirmed live 2026-10-27 that this is genuine per-account
+    pricing, not another published list tier.
+Both modes converge on the same WheelProsCompanyPricing row shape -- see
+_upsert_wheelpros_company_pricing_batch.
 """
 import logging
 import math
@@ -23,6 +36,7 @@ from src.integrations import credentials as credentials_helper
 from src.integrations.clients.wheelpros import client as wheelpros_client
 from src.integrations.clients.wheelpros import exceptions as wheelpros_exceptions
 from src.integrations.clients.wheelpros.order_client import WheelProsOrderApiClient
+from src.integrations.clients.wheelpros.pricing_client import WheelProsPricingApiClient
 from src.integrations.utils.brand_matching import (
     best_fuzzy_brand_match,
     brands_by_compact_key,
@@ -632,27 +646,6 @@ def _wheelpros_credentials_for_catalog(
     return dict(_get_wheelpros_credentials() or {})
 
 
-def _wheelpros_pricing_map_from_records(
-    records: typing.List[typing.Dict],
-    brand_by_external_id: typing.Dict[str, src_models.WheelProsBrand],
-) -> typing.Dict[typing.Tuple[int, str], typing.Dict[str, typing.Any]]:
-    """Last row per (brand_id, part_number) wins."""
-    out: typing.Dict[typing.Tuple[int, str], typing.Dict[str, typing.Any]] = {}
-    for row in records:
-        pn = (_row_key(row, "PartNumber") or "").strip()
-        bkey = _normalize_wheelpros_brand_key(_row_key(row, "Brand"))
-        if not pn or not bkey:
-            continue
-        brand = brand_by_external_id.get(bkey)
-        if not brand:
-            continue
-        out[(brand.id, pn)] = {
-            "msrp_usd": _safe_decimal(_row_get(row, "MSRP_USD")),
-            "map_usd": _safe_decimal(_row_get(row, "MAP_USD")),
-        }
-    return out
-
-
 def _get_local_path_for_feed(feed_type: str) -> str:
     """Get local file path for feed type."""
     if feed_type == "wheel":
@@ -671,8 +664,12 @@ def fetch_and_save_wheelpros(
     feed_type: str = "wheel",
 ) -> None:
     """
-    Fetch the WheelPros CSV and upsert WheelProsBrand and WheelProsPart (catalog).
-    Company pricing is loaded per active CompanyProvider using each row's SFTP credentials.
+    Fetch the WheelPros CSV and upsert WheelProsBrand and WheelProsPart (catalog), including
+    msrp_usd/map_usd -- MSRP/MAP are manufacturer-published, not account-specific, so this one
+    shared pull (using the primary connection's credentials) is authoritative for every company;
+    no company needs its own SFTP login just to read these two columns. Per-company COST is a
+    separate concern, computed either from this shared MSRP via a company's own markup % or from
+    WheelPros' Pricing API -- see sync_wheelpros_company_pricing_for_company_provider.
     feed_type: "wheel" | "tire" | "accessories"
     """
     sftp_path = src_constants.WHEELPROS_FEED_PATHS.get(feed_type)
@@ -765,7 +762,7 @@ def fetch_and_save_wheelpros(
         if not brand:
             continue
         seen_by_key[(brand.id, part_number)] = _row_to_wheelpros_part(
-            row, brand, include_pricing=False, feed_type=feed_type
+            row, brand, include_pricing=True, feed_type=feed_type
         )
 
     part_instances = _dedupe_wheelpros_part_instances(list(seen_by_key.values()))
@@ -796,6 +793,8 @@ def fetch_and_save_wheelpros(
                 "inv_order_type",
                 "style",
                 "total_qoh",
+                "msrp_usd",
+                "map_usd",
                 "run_date",
                 "warehouse_availability",
                 "raw_data",
@@ -812,14 +811,160 @@ def fetch_and_save_wheelpros(
                 "Per-company pricing handled by Phase 3 pricing jobs.".format(_LOG_PREFIX, feed_type))
 
 
+def _upsert_wheelpros_company_pricing_batch(
+    pricing_to_upsert: typing.List[src_models.WheelProsCompanyPricing],
+) -> int:
+    """Hand-written upsert (not pgbulk) so unchanged rows are skipped in the same statement via
+    IS DISTINCT FROM -- see Meyer's _flush_buf for the full rationale. Shared by both pricing
+    modes (markup and API), which converge on this exact WheelProsCompanyPricing shape
+    regardless of how cost_usd was derived. Returns total rows affected."""
+    total = 0
+    for j in range(0, len(pricing_to_upsert), WP_PRICING_UPSERT_BATCH):
+        batch = pricing_to_upsert[j : j + WP_PRICING_UPSERT_BATCH]
+        now = timezone.now()
+        rows = [(p.part_id, p.company_id, p.msrp_usd, p.map_usd, p.cost_usd, now, now) for p in batch]
+        placeholders = ", ".join(["(%s, %s, %s, %s, %s, %s, %s)"] * len(rows))
+        params = [v for row in rows for v in row]
+        with connection.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO wheelpros_company_pricing
+                    (part_id, company_id, msrp_usd, map_usd, cost_usd, created_at, updated_at)
+                VALUES {}
+                ON CONFLICT (part_id, company_id) DO UPDATE SET
+                    msrp_usd = EXCLUDED.msrp_usd,
+                    map_usd = EXCLUDED.map_usd,
+                    cost_usd = EXCLUDED.cost_usd,
+                    updated_at = EXCLUDED.updated_at
+                WHERE (wheelpros_company_pricing.msrp_usd, wheelpros_company_pricing.map_usd,
+                       wheelpros_company_pricing.cost_usd)
+                    IS DISTINCT FROM (EXCLUDED.msrp_usd, EXCLUDED.map_usd, EXCLUDED.cost_usd)
+                """.format(placeholders),
+                params,
+            )
+            total += cur.rowcount
+        connection.close()
+    return total
+
+
+def _sync_wheelpros_company_pricing_via_markup(
+    cp: src_models.CompanyProviders, feed_credentials: typing.Dict
+) -> int:
+    """Pure DB computation -- no distributor network call at all. WheelProsPart.msrp_usd/map_usd
+    are already populated by the shared catalog pull (fetch_and_save_wheelpros, using the primary
+    connection's own SFTP credentials) -- MSRP/MAP are manufacturer-published, not
+    account-specific, so this company needs nothing of its own beyond its markup percentages."""
+    total_all = 0
+    for feed_type in ("wheel", "tire", "accessories"):
+        rows = list(
+            src_models.WheelProsPart.objects.filter(
+                feed_type=feed_type, msrp_usd__isnull=False,
+            ).values("id", "msrp_usd", "map_usd")
+        )
+        if not rows:
+            continue
+        pricing_to_upsert = [
+            src_models.WheelProsCompanyPricing(
+                part_id=row["id"],
+                company=cp.company,
+                msrp_usd=row["msrp_usd"],
+                map_usd=row["map_usd"],
+                cost_usd=dealer_cost_from_msrp(row["msrp_usd"], feed_type, feed_credentials),
+            )
+            for row in rows
+        ]
+        batch_total = _upsert_wheelpros_company_pricing_batch(pricing_to_upsert)
+        total_all += batch_total
+        logger.info(
+            "{} WheelPros {} company pricing (markup mode): {} rows for company_provider id={}.".format(
+                _LOG_PREFIX, feed_type, batch_total, cp.id,
+            )
+        )
+    return total_all
+
+
+def _sync_wheelpros_company_pricing_via_api(
+    cp: src_models.CompanyProviders, feed_credentials: typing.Dict
+) -> int:
+    """Real per-SKU dealer cost from WheelPros' Pricing API -- cost_usd is the returned "nip"
+    directly, no markup math involved. Not organized by feed_type the way the SFTP feeds are;
+    one pass over the whole shared catalog, batched through the client's own internal batching."""
+    client = WheelProsPricingApiClient(
+        credentials={
+            "username": feed_credentials.get("api_username"),
+            "password": feed_credentials.get("api_password"),
+        },
+    )
+
+    total_all = 0
+    last_id = 0
+    while True:
+        batch = list(
+            src_models.WheelProsPart.objects.filter(id__gt=last_id)
+            .order_by("id")
+            .values("id", "part_number")[:WP_PRICING_UPSERT_BATCH]
+        )
+        if not batch:
+            break
+        last_id = batch[-1]["id"]
+
+        # Keyed by part_number, not (brand, part_number): the Pricing API takes a flat sku list
+        # with no brand disambiguation, so a part_number shared across brands gets the same
+        # price applied to every WheelProsPart row carrying it -- the same ambiguity exists on
+        # WheelPros' side of this API, not something introduced here.
+        part_number_to_ids: typing.Dict[str, typing.List[int]] = {}
+        for row in batch:
+            pn = (row["part_number"] or "").strip()
+            if pn:
+                part_number_to_ids.setdefault(pn, []).append(row["id"])
+        if not part_number_to_ids:
+            continue
+
+        try:
+            priced = client.search_pricing(part_number_to_ids.keys())
+        except wheelpros_exceptions.WheelProsException as e:
+            logger.error(
+                "{} WheelPros Pricing API error company_provider id={}: {}.".format(_LOG_PREFIX, cp.id, str(e))
+            )
+            raise
+
+        pricing_to_upsert = []
+        for part_number, part_ids in part_number_to_ids.items():
+            prices = priced.get(part_number)
+            if not prices:
+                continue
+            for part_id in part_ids:
+                pricing_to_upsert.append(
+                    src_models.WheelProsCompanyPricing(
+                        part_id=part_id,
+                        company=cp.company,
+                        msrp_usd=prices.get("msrp"),
+                        map_usd=prices.get("map"),
+                        cost_usd=prices.get("nip"),
+                    )
+                )
+        if pricing_to_upsert:
+            total_all += _upsert_wheelpros_company_pricing_batch(pricing_to_upsert)
+
+    logger.info(
+        "{} WheelPros company pricing (API mode): {} rows for company_provider id={}.".format(
+            _LOG_PREFIX, total_all, cp.id,
+        )
+    )
+    return total_all
+
+
 def sync_wheelpros_company_pricing_for_company_provider(
     company_provider_id: int,
     download: bool = True,
     local_only: bool = False,
 ) -> None:
     """
-    For one CompanyProviders row, download each WheelPros SFTP pricing feed (wheel, tire, accessories)
-    and upsert WheelProsCompanyPricing. Parts must already exist for (brand, part_number).
+    For one CompanyProviders row, compute and upsert WheelProsCompanyPricing using whichever
+    pricing mode that company picked at connect time (credentials.feed["pricing_mode"] -- see
+    the module docstring). Parts must already exist (brand, part_number). ``download``/
+    ``local_only`` are accepted for call-site compatibility with the old SFTP-only signature but
+    no longer do anything in markup mode (there is no per-company download left to skip).
     """
     wp_provider = src_models.Providers.objects.filter(
         kind=src_enums.BrandProviderKind.WHEELPROS.value,
@@ -843,128 +988,15 @@ def sync_wheelpros_company_pricing_for_company_provider(
         )
         return
 
-    total_all = 0
-    for feed_type in ("wheel", "tire", "accessories"):
-        sftp_path = src_constants.WHEELPROS_FEED_PATHS.get(feed_type)
-        if not sftp_path:
-            continue
-        local_path = "/tmp/wheelpros_{}_cp_{}.csv".format(feed_type, company_provider_id)
+    feed_credentials = dict(credentials_helper.get_feed_credentials(cp))
+    # Every connection made before this split has no pricing_mode stored at all -- default to
+    # "markup" so every one of them keeps working unchanged.
+    mode = feed_credentials.get("pricing_mode") or "markup"
 
-        creds = dict(credentials_helper.get_feed_credentials(cp))
-        creds["sftp_path"] = sftp_path
-        pc = wheelpros_client.WheelProsSFTPClient(
-            credentials=creds,
-            local_file_path=local_path,
-            require_credentials=not local_only,
-        )
-        try:
-            price_records = pc.get_feed_records(
-                force_download=download,
-                local_only=local_only,
-                sftp_path=sftp_path,
-                local_file_path=local_path,
-            )
-        except wheelpros_exceptions.WheelProsException as e:
-            logger.error(
-                "{} WheelPros {} pricing feed error company_provider id={}: {}.".format(
-                    _LOG_PREFIX, feed_type, company_provider_id, str(e),
-                )
-            )
-            raise
-
-        if not price_records:
-            logger.warning(
-                "{} No rows for WheelPros {} pricing company_provider id={}.".format(
-                    _LOG_PREFIX, feed_type, company_provider_id,
-                )
-            )
-            continue
-
-        brand_names = set()
-        for row in price_records:
-            name = _row_key(row, "Brand")
-            if name:
-                brand_names.add(_normalize_wheelpros_brand_key(name))
-        brand_by_external = {
-            b.external_id: b
-            for b in src_models.WheelProsBrand.objects.filter(external_id__in=brand_names)
-        }
-        pmap = _wheelpros_pricing_map_from_records(price_records, brand_by_external)
-        if not pmap:
-            continue
-
-        pairs = list(pmap.keys())
-        id_by_brand_pn: typing.Dict[typing.Tuple[int, str], int] = {}
-        chunk_size = 3000
-        for i in range(0, len(pairs), chunk_size):
-            chunk = pairs[i : i + chunk_size]
-            if not chunk:
-                continue
-            with connection.cursor() as cur:
-                cur.execute(
-                    "SELECT id, brand_id, part_number FROM wheelpros_parts WHERE (brand_id, part_number) IN %s",
-                    (tuple(chunk),),
-                )
-                for pid, bid, pn in cur.fetchall():
-                    id_by_brand_pn[(bid, (pn or "").strip())] = pid
-
-        pricing_by_part_id: typing.Dict[int, typing.Dict[str, typing.Any]] = {}
-        for (bid, pn), pdata in pmap.items():
-            part_id = id_by_brand_pn.get((bid, pn))
-            if not part_id:
-                continue
-            pricing_by_part_id[int(part_id)] = pdata
-        creds_for_cost = dict(credentials_helper.get_feed_credentials(cp))
-        pricing_to_upsert = [
-            src_models.WheelProsCompanyPricing(
-                part_id=pid,
-                company=cp.company,
-                msrp_usd=pdata.get("msrp_usd"),
-                map_usd=pdata.get("map_usd"),
-                cost_usd=dealer_cost_from_msrp(pdata.get("msrp_usd"), feed_type, creds_for_cost),
-            )
-            for pid, pdata in pricing_by_part_id.items()
-        ]
-        batch_total = 0
-        for j in range(0, len(pricing_to_upsert), WP_PRICING_UPSERT_BATCH):
-            batch = pricing_to_upsert[j : j + WP_PRICING_UPSERT_BATCH]
-            # Hand-written upsert (not pgbulk) so unchanged rows are skipped in the same
-            # statement via IS DISTINCT FROM -- see Meyer's _flush_buf for the full rationale.
-            now = timezone.now()
-            rows = [(p.part_id, p.company_id, p.msrp_usd, p.map_usd, p.cost_usd, now, now) for p in batch]
-            placeholders = ", ".join(["(%s, %s, %s, %s, %s, %s, %s)"] * len(rows))
-            params = [v for row in rows for v in row]
-            with connection.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO wheelpros_company_pricing
-                        (part_id, company_id, msrp_usd, map_usd, cost_usd, created_at, updated_at)
-                    VALUES {}
-                    ON CONFLICT (part_id, company_id) DO UPDATE SET
-                        msrp_usd = EXCLUDED.msrp_usd,
-                        map_usd = EXCLUDED.map_usd,
-                        cost_usd = EXCLUDED.cost_usd,
-                        updated_at = EXCLUDED.updated_at
-                    WHERE (wheelpros_company_pricing.msrp_usd, wheelpros_company_pricing.map_usd,
-                           wheelpros_company_pricing.cost_usd)
-                        IS DISTINCT FROM (EXCLUDED.msrp_usd, EXCLUDED.map_usd, EXCLUDED.cost_usd)
-                    """.format(placeholders),
-                    params,
-                )
-                batch_total += cur.rowcount
-            connection.close()
-        total_all += batch_total
-        logger.info(
-            "{} WheelPros {} company pricing: {} rows for company_provider id={}.".format(
-                _LOG_PREFIX, feed_type, batch_total, company_provider_id,
-            )
-        )
-
-    logger.info(
-        "{} WheelPros company pricing total {} rows for company_provider id={}.".format(
-            _LOG_PREFIX, total_all, company_provider_id,
-        )
-    )
+    if mode == "api":
+        _sync_wheelpros_company_pricing_via_api(cp, feed_credentials)
+        return
+    _sync_wheelpros_company_pricing_via_markup(cp, feed_credentials)
 
 
 def _wheelpros_company_provider_with_order_credentials() -> typing.Optional[src_models.CompanyProviders]:

@@ -9881,6 +9881,7 @@ def sync_provider_pricing_from_wheelpros_for_company(company_id: int) -> None:
                     "company_id",
                     "msrp_usd",
                     "map_usd",
+                    "cost_usd",
                     "part__brand_id",
                     "part__part_number",
                     "part__feed_type",
@@ -9922,7 +9923,14 @@ def sync_provider_pricing_from_wheelpros_for_company(company_id: int) -> None:
                     continue
                 msrp = row.get("msrp_usd")
                 map_price = row.get("map_usd")
-                cost = dealer_cost_from_msrp(msrp, row.get("part__feed_type"), company_creds)
+                if company_creds.get("pricing_mode") == "api":
+                    # Real per-SKU dealer cost already computed and stored by
+                    # wheelpros._sync_wheelpros_company_pricing_via_api -- forward it as-is
+                    # rather than re-deriving a markup-based estimate from credentials that, in
+                    # API mode, carry no markup fields at all.
+                    cost = row.get("cost_usd")
+                else:
+                    cost = dealer_cost_from_msrp(msrp, row.get("part__feed_type"), company_creds)
                 to_upsert.append(
                     src_models.ProviderPartCompanyPricing(
                         provider_part=provider_part,

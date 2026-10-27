@@ -84,3 +84,15 @@ class WheelProsProductAPIException(WheelProsException):
 
 class WheelProsProductPermissionError(WheelProsException):
     """403 from a /products call — the account is not entitled to the Product API."""
+
+
+# -- Pricing API (REST, Bearer JWT auth) ---------------------------------------------------
+# Shares /auth/v1/authorize with the Order/Vehicle/Product APIs, but is its own entitlement
+# (wp-api-core-pricing) — an account can authenticate fine and still be refused by /pricings.
+
+class WheelProsPricingAPIException(WheelProsException):
+    """Transport-level or unexpected failure calling the Wheel Pros Pricing API."""
+
+
+class WheelProsPricingPermissionError(WheelProsException):
+    """403 from a /pricings call — the account is not entitled to the Pricing API."""

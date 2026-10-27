@@ -305,18 +305,30 @@ def get_distributor_credentials_info() -> dict:
             "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("ROUGH_COUNTRY") or None,
         },
         "wheelpros": {
-            "required": [
-                "sftp_user",
-                "sftp_password",
-                "wheel_markup",
-                "tire_markup",
-                "accessories_markup",
+            # Catalog, inventory, and MSRP sync automatically (one shared connection) -- a company
+            # only ever supplies pricing_mode plus ONE of two field sets. See "modes" below and
+            # PROVIDER_CATALOG's "feed_connection_modes" (src/constants.py), which this mirrors.
+            "required": ["pricing_mode"],
+            "optional": ["wheel_markup", "tire_markup", "accessories_markup", "api_username", "api_password"],
+            "modes": [
+                {
+                    "mode": "markup",
+                    "required": ["pricing_mode", "wheel_markup", "tire_markup", "accessories_markup"],
+                    "optional": [],
+                },
+                {
+                    "mode": "api",
+                    "required": ["pricing_mode", "api_username", "api_password"],
+                    "optional": [],
+                },
             ],
-            "optional": ["sftp_path"],
             "description": (
-                "Wheel Pros SFTP username and password (host sftp.wheelpros.com is fixed). "
-                "wheel_markup, tire_markup, accessories_markup: percent off MSRP (0–100) per feed; "
-                "default 20% per feed if not set. Optional sftp_path overrides default remote CSV paths."
+                "pricing_mode: \"markup\" or \"api\" (required). \"markup\": wheel_markup, tire_markup, "
+                "accessories_markup -- percent off MSRP (0-100) each, we estimate cost = MSRP * (1 - "
+                "percent/100). \"api\": api_username, api_password -- your Wheel Pros Product Data Portal "
+                "login; we pull your real per-SKU dealer cost from Wheel Pros' Pricing API instead of "
+                "estimating it. No SFTP credentials needed for either -- catalog/inventory/MSRP come "
+                "from a shared connection already."
             ),
             "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("WHEELPROS", "Wheel Pros"),
             "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("WHEELPROS") or None,

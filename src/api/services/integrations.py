@@ -64,9 +64,9 @@ from src.integrations.clients.turn_14 import exceptions as turn14_exceptions
 from src.integrations.clients.turn_14 import order_client as turn14_order_client
 from src.integrations.clients.vossen import client as vossen_client
 from src.integrations.clients.vossen import exceptions as vossen_exceptions
-from src.integrations.clients.wheelpros import client as wheelpros_client
 from src.integrations.clients.wheelpros import exceptions as wheelpros_exceptions
 from src.integrations.clients.wheelpros import order_client as wheelpros_order_client
+from src.integrations.clients.wheelpros import pricing_client as wheelpros_pricing_client
 from src.integrations.orders import registry as order_registry
 from src.integrations.services import integration_pricing_sync_jobs, relay_sftp_provisioning
 
@@ -323,6 +323,10 @@ def get_providers_catalog(company_id: int) -> typing.Dict:
             "category": entry.get("category", ""),
             "connection_required_fields": entry.get("connection_required_fields", []),
             "connection_optional_fields": entry.get("connection_optional_fields", []),
+            # Alternative credential sets a provider's feed can be connected with (e.g. WheelPros'
+            # markup-% vs. Pricing-API pricing modes) -- empty for every provider with only one way
+            # to connect. The FE renders one form per entry and lets the company pick.
+            "feed_connection_modes": entry.get("feed_connection_modes", []),
             "supports_ordering": _catalog_supports_ordering_display(entry),
             "order_credentials_mirror_feed": _catalog_order_credentials_mirror_feed(entry),
             "order_connection_required_fields": entry.get("order_connection_required_fields", []),
@@ -528,22 +532,50 @@ def _validate_premier_connection(credentials: typing.Dict[str, typing.Any]) -> _
     return None, None
 
 
-def _validate_wheelpros_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
-    markup_error = _validate_wheelpros_markup_fields(credentials)
-    if markup_error:
-        return markup_error, CONNECTION_ERROR_INVALID_INPUT
+def _validate_wheelpros_api_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
+    """Pricing-mode "api": real auth + Pricing-API-entitlement probe against WheelPros, using
+    this company's own api_username/api_password. Mirrors _validate_turn14_connection's shape."""
     try:
-        client = wheelpros_client.WheelProsSFTPClient(credentials=credentials)
-        # Check auth against all three feeds (wheel/tire/accessories), not just a bare login —
-        # some accounts authenticate fine but lack permission on a specific feed's directory.
-        client.test_connection(remote_paths=src_constants.WHEELPROS_FEED_PATHS.values())
-    except wheelpros_exceptions.WheelProsAuthError as e:
+        client = wheelpros_pricing_client.WheelProsPricingApiClient(
+            credentials={
+                "username": credentials.get("api_username"),
+                "password": credentials.get("api_password"),
+            },
+        )
+        client.test_connection()
+    except wheelpros_exceptions.WheelProsOrderAuthError as e:
         return str(e), CONNECTION_ERROR_INVALID_CREDENTIALS
-    except wheelpros_exceptions.WheelProsPermissionError as e:
+    except wheelpros_exceptions.WheelProsPricingPermissionError as e:
         return str(e), CONNECTION_ERROR_PERMISSION_DENIED
     except (wheelpros_exceptions.WheelProsException, ValueError) as e:
         return str(e), CONNECTION_ERROR_CONNECTION_FAILED
     return None, None
+
+
+def _validate_wheelpros_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
+    """Dispatches on "pricing_mode" (see PROVIDER_CATALOG's "feed_connection_modes" for
+    WheelPros in src/constants.py): "api" validates a live Pricing API login; "markup" (or
+    unset, which covers every connection made before this split existed) validates the three
+    markup percentages only -- there is no per-company SFTP login left to live-test, since
+    catalog/MSRP now come from the shared primary connection (see
+    services/wheelpros.py:fetch_and_save_wheelpros)."""
+    mode = credentials.get("pricing_mode")
+    if mode == "api":
+        if not credentials.get("api_username") or not credentials.get("api_password"):
+            return (
+                "api_username and api_password are required for the API pricing mode.",
+                CONNECTION_ERROR_INVALID_INPUT,
+            )
+        return _validate_wheelpros_api_connection(credentials)
+    if mode in ("markup", None, ""):
+        markup_error = _validate_wheelpros_markup_fields(credentials)
+        if markup_error:
+            return markup_error, CONNECTION_ERROR_INVALID_INPUT
+        return None, None
+    return (
+        "pricing_mode must be \"markup\" or \"api\" (got {!r}).".format(mode),
+        CONNECTION_ERROR_INVALID_INPUT,
+    )
 
 
 def _validate_thoroughbred_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
@@ -2509,6 +2541,7 @@ def get_company_provider_by_id(company_id: int, provider_id: int) -> typing.Opti
             "primary": company_provider.primary,
             "connection_required_fields": list(catalog_entry.get("connection_required_fields") or []),
             "connection_optional_fields": list(catalog_entry.get("connection_optional_fields") or []),
+            "feed_connection_modes": list(catalog_entry.get("feed_connection_modes") or []),
             "order_connection_required_fields": list(catalog_entry.get("order_connection_required_fields") or []),
             "order_connection_optional_fields": list(catalog_entry.get("order_connection_optional_fields") or []),
             "email_order_connection_required_fields": list(catalog_entry.get("email_order_connection_required_fields") or []),
@@ -2697,6 +2730,7 @@ def get_company_provider_connection_detail(
     out["category"] = catalog_entry.get("category", "")
     out["connection_required_fields"] = list(catalog_entry.get("connection_required_fields") or [])
     out["connection_optional_fields"] = list(catalog_entry.get("connection_optional_fields") or [])
+    out["feed_connection_modes"] = list(catalog_entry.get("feed_connection_modes") or [])
     out["order_connection_required_fields"] = list(catalog_entry.get("order_connection_required_fields") or [])
     out["order_connection_optional_fields"] = list(catalog_entry.get("order_connection_optional_fields") or [])
     out["email_order_connection_required_fields"] = list(catalog_entry.get("email_order_connection_required_fields") or [])

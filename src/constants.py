@@ -336,6 +336,19 @@ NTW_SFTP_OUTBOUND_DIRECTORY = "Outbound"
 NTW_FEED_FILENAME_PREFIX = "DELTI_"
 NTW_FEED_FILENAME_SUFFIX = ".csv"
 
+# CompanyProviderOrderAccount.credentials keys for NTW ordering. The gateway client
+# id/secret are NOT here: TBC registers one application to us and identifies the dealer by
+# customerId in the body, so they are account-level settings (NTW_API_CLIENT_ID /
+# NTW_API_CLIENT_SECRET) rather than per-connection credentials. This is the only provider in
+# the codebase split that way.
+#
+# ``customer_id`` is accepted on either namespace -- the onboarding card collects it with the
+# feed login, since the dealer's rep hands over both at once -- and the order account's own
+# value wins when both are present. See orders/ntw.py.
+NTW_ORDER_CREDENTIALS_CUSTOMER_ID = "customer_id"
+NTW_ORDER_CREDENTIALS_DEALER_CODE = "dealer_code"
+NTW_ORDER_CREDENTIALS_STORE_NUMBER = "store_number"
+
 # CompanyProviders.credentials JSON keys for Helmet House. Plain FTP on port 21 (no TLS -- their
 # server offers none), host fixed in settings, so a connection only carries the login. Unlike every
 # other distributor here this is NOT a per-dealer account: Helmet House publishes one shared login
@@ -2553,6 +2566,13 @@ PROVIDER_CATALOG = [
         "connection_optional_fields": [
             NTW_CREDENTIALS_CUSTOMER_ID,
         ],
+        "order_connection_required_fields": [
+            NTW_ORDER_CREDENTIALS_CUSTOMER_ID,
+        ],
+        "order_connection_optional_fields": [
+            NTW_ORDER_CREDENTIALS_DEALER_CODE,
+            NTW_ORDER_CREDENTIALS_STORE_NUMBER,
+        ],
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
             "<p><strong>NTW</strong> is the wholesale arm of TBC Corporation. NTW posts a tire cost "
@@ -2603,8 +2623,15 @@ PROVIDER_CATALOG = [
             "</ul>"
 
             "<p><strong>Ordering</strong></p>"
-            "<p>NTW ordering is not available in AfterMarketScout yet. For now, place NTW orders the "
-            "way you do today; the feed keeps your catalog, cost and availability current.</p>"
+            "<p>NTW ordering goes through TBC's order API. Enter your <strong>NTW customer ID</strong> "
+            "below, plus your <strong>dealer code</strong> and <strong>store number</strong> if your "
+            "rep gave you them, and click <strong>Save</strong>.</p>"
+            "<p>Before each order we check live availability with NTW and show you which branch can "
+            "fill each line. That check is only valid for 15 minutes, so if you leave an order sitting "
+            "you will be asked to refresh it before it can be sent &mdash; that is deliberate, so an "
+            "order is never placed against stale stock.</p>"
+            "<p>NTW cannot cancel an order through the API once it is placed, so cancellations go to "
+            "your rep directly.</p>"
 
             "<p><strong>Troubleshooting</strong></p>"
             "<ul>"
