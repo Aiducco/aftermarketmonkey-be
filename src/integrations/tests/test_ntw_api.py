@@ -18,7 +18,7 @@ import os
 import pathlib
 import typing
 
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, TestCase
 
 from src.integrations.clients.ntw import api_client as ntw_api
 from src.integrations.clients.ntw import exceptions as ntw_exceptions
@@ -379,12 +379,14 @@ def _status_payload(status, **extra):
     return payload
 
 
-class InvoiceFromOrderStatusTests(SimpleTestCase):
+class InvoiceFromOrderStatusTests(TestCase):
     """
     NTW has no invoice endpoint. TBC's status "Delivered" means invoiced OR shipped OR
     delivered, so it is the only billing signal available and get_invoices is built on it.
+
+    Needs a database, unlike the rest of this module: an order status is the only response that
+    carries a real branch NAME, so get_invoices records it on the way past.
     """
-    databases = []
 
     def test_a_delivered_order_produces_one_invoice(self):
         adapter = _adapter_with({"2244850569": _status_payload("Delivered", trackingNumber="1Z999")})
@@ -398,6 +400,22 @@ class InvoiceFromOrderStatusTests(SimpleTestCase):
         self.assertEqual(inv.line_items[0].part_number, "9630377")
         self.assertEqual(inv.line_items[0].quantity, 2)
         self.assertEqual(inv.line_items[0].warehouse_code, "3021")
+
+    def test_the_branch_name_is_learned_from_the_order_status(self):
+        """
+        The only place TBC ever supplies a branch NAME. Inventory responses carry an address
+        but no name, so without this the decode table would only ever know "RIVIERA BEACH, FL"
+        built from city and state, never TBC's own "RIVIERA BEACH FL2".
+        """
+        from src import models as m
+
+        adapter = _adapter_with({"1": _status_payload("Delivered")})
+        adapter.get_invoices(_FakePurchaseOrder(["1"]))
+        loc = m.NtwLocation.objects.get(external_id="3021")
+        self.assertEqual(loc.name, "RIVIERA BEACH FL2")
+        self.assertEqual(loc.city, "RIVIERA BEACH")
+        self.assertEqual(loc.state, "FL")
+        self.assertEqual(loc.label(), "RIVIERA BEACH FL2")
 
     def test_amounts_are_never_invented_from_our_own_quote(self):
         """An invoice must report what TBC billed. We hold a quote, so these stay blank."""

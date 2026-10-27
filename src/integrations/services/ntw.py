@@ -1035,10 +1035,23 @@ def record_ntw_locations(rows: typing.Iterable[typing.Dict]) -> int:
         external_id = str(row.get("locationId") or row.get("id") or "").strip()
         if not external_id:
             continue
-        address = row.get("address") or {}
+        # TBC describes a branch in two different shapes, and only handling one silently
+        # records a name with no address:
+        #
+        #   inventory availableSource  {"locationId": "3269",
+        #                               "address": {"streetName": .., "city": .., "zipCode": ..}}
+        #   order status location      {"id": "3021", "name": "RIVIERA BEACH FL2",
+        #                               "address": "5151 TYLERLAKES BLVD",   <- a STRING
+        #                               "city": .., "state": .., "postalCode": ..}
+        raw_address = row.get("address")
+        if isinstance(raw_address, dict):
+            address, street = raw_address, raw_address.get("streetName") or raw_address.get("address")
+        else:
+            address, street = row, raw_address
+
         seen[external_id] = {
             "name": _clean(row.get("name")) or "",
-            "street": _clean(address.get("streetName") or address.get("address")) or "",
+            "street": _clean(street) or "",
             "city": _clean(address.get("city")) or "",
             "state": _clean(address.get("state")) or "",
             "country": _clean(address.get("country")) or "",
