@@ -2572,6 +2572,142 @@ class TireRackCompanyPricing(django_db_models.Model):
         unique_together = [["part", "company"]]
 
 
+class NtwBrand(django_db_models.Model):
+    """
+    Tire manufacturer label from NTW's feed (column 12, e.g. "Michelin"). NTW is TBC
+    Corporation's wholesale arm and resells many manufacturers through one feed, so this is the
+    many-rows case like TireRackBrand rather than the single-row case like VossenBrand. The feed
+    carries no numeric brand id, so ``name`` is the natural key.
+
+    The feed's product id (column 14) is ``<PREFIX>-<part number>`` where the prefix is a short
+    code for the brand ("MICH-87266", "SAIL-5540843"). That prefix is NOT used as the key: 58 of
+    3,533 rows in the first live file do not follow the pattern, and the same prefix is not
+    guaranteed stable across TBC's own systems. Match on the spelled-out name.
+    """
+
+    name = django_db_models.CharField(max_length=255)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "ntw_brands"
+        unique_together = [["name"]]
+
+
+class BrandNtwBrandMapping(django_db_models.Model):
+    """Maps our Brands to NtwBrand (for master parts sync)."""
+
+    brand = django_db_models.ForeignKey(
+        Brands,
+        on_delete=django_db_models.CASCADE,
+        related_name="ntw_brand_mappings",
+    )
+    ntw_brand = django_db_models.ForeignKey(
+        NtwBrand,
+        on_delete=django_db_models.CASCADE,
+        related_name="brand_mappings",
+    )
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "brand_ntw_brand_mapping"
+        unique_together = [["brand", "ntw_brand"]]
+
+
+class NtwParts(django_db_models.Model):
+    """
+    Row from NTW's MOVEit CSV feed. The file is **headerless** -- 14 positional columns, verified
+    against the first live file (DELTI_0037746990_20261026230053.csv, 3,533 rows):
+
+        1 account number (zero-padded to 10)      8 size component 2
+        2 location/warehouse id                   9 size component 3 (rim diameter)
+        3 description (brand + model + use)      10 cost
+        4 size description (sidewall string)     11 model name
+        5 quantity (decimal-formatted)           12 brand name
+        6 category                               13 part number
+        7 size component 1                       14 product id ("<PREFIX>-<part number>")
+
+    Columns 7-9 are positional and their meaning depends on the notation: for metric they are
+    section width / aspect ratio / rim, but for a numeric size like "11X4.00-5" column 7 is the
+    overall diameter, not a width. They are stored verbatim as ``size_component_*`` and are
+    **never** read as dimensions -- ``src.domain.tire_size`` parses ``size_description`` instead,
+    which is the source of truth for every tire in this codebase (see TireSpec's docstring).
+
+    **The file lists in-stock items only.** Not one of those 3,533 rows had a zero quantity, so a
+    tire that sells out does not arrive with qty 0 -- it simply stops appearing. Catalog rows are
+    therefore kept and zeroed rather than deleted when they fall out of a file; see
+    ``src.integrations.services.ntw.zero_out_absent_ntw_parts``, which is the reconciliation pass
+    an upsert alone cannot provide.
+
+    ``quantity`` and ``cost`` here come from the PRIMARY connection's feed only, and are
+    warehouse-specific to whichever branch serves that dealer (3289 for the first account we
+    connected) -- so for other dealers they are indicative, not authoritative. Per-company cost
+    lives on NtwCompanyPricing, pulled from that company's own feed. Same split as TireRack and
+    DLG.
+    """
+
+    brand = django_db_models.ForeignKey(
+        NtwBrand,
+        on_delete=django_db_models.CASCADE,
+        related_name="parts",
+    )
+    part_number = django_db_models.CharField(max_length=255)
+    product_id = django_db_models.CharField(max_length=255, null=True, blank=True)
+    description = django_db_models.TextField(null=True, blank=True)
+    model_name = django_db_models.CharField(max_length=255, null=True, blank=True)
+    size_description = django_db_models.CharField(max_length=255, null=True, blank=True)
+    category = django_db_models.CharField(max_length=255, null=True, blank=True)
+    size_component_1 = django_db_models.CharField(max_length=32, null=True, blank=True)
+    size_component_2 = django_db_models.CharField(max_length=32, null=True, blank=True)
+    size_component_3 = django_db_models.CharField(max_length=32, null=True, blank=True)
+    quantity = django_db_models.IntegerField(null=True, blank=True)
+    cost = django_db_models.DecimalField(max_digits=14, decimal_places=5, null=True, blank=True)
+    location_id = django_db_models.CharField(max_length=64, null=True, blank=True)
+    raw_data = django_db_models.JSONField(null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "ntw_parts"
+        unique_together = [["part_number", "brand"]]
+
+
+class NtwCompanyPricing(django_db_models.Model):
+    """
+    Per-company NTW cost and on-hand quantity for an NtwParts row, from that company's own MOVEit
+    feed. Unlike TireRackCompanyPricing this carries ``quantity`` as well as ``cost``: NTW's file
+    is per-dealer-warehouse, so two dealers on different branches legitimately see different
+    quantities for the same tire, and the global ProviderPartInventory row (fed from the primary
+    connection) cannot represent both. The per-company number is the accurate one for that
+    company; the global one is what search and the catalog show.
+    """
+
+    part = django_db_models.ForeignKey(
+        NtwParts,
+        on_delete=django_db_models.CASCADE,
+        related_name="company_pricing",
+    )
+    company = django_db_models.ForeignKey(
+        Company,
+        on_delete=django_db_models.CASCADE,
+        related_name="ntw_company_pricing",
+    )
+    cost = django_db_models.DecimalField(max_digits=14, decimal_places=5, null=True, blank=True)
+    quantity = django_db_models.IntegerField(null=True, blank=True)
+    location_id = django_db_models.CharField(max_length=64, null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "ntw_company_pricing"
+        unique_together = [["part", "company"]]
+
+
 class SbBrand(django_db_models.Model):
     """
     Brand label from the S&B dealer workbooks (stored uppercase). S&B ship more than one line

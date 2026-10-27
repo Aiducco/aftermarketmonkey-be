@@ -338,6 +338,28 @@ WPS_PRODUCT_TYPE_TYPES = {
 # value resolves to PART and none is left undecided. That makes this a closed vocabulary in the
 # strongest sense -- unlike Turn 14's or Keystone's, there is no catch-all bucket here that could
 # quietly hold a wheel.
+NTW_CATEGORY_TYPES = {
+    # NTW's ``category`` column, closed vocabulary -- these 11 values covered all 3,533 rows of
+    # the first live file. NTW is a tire wholesaler and every category it publishes is a kind of
+    # tire, including the ones that do not read like one: SPECIALTY is lawn and golf-cart tires
+    # (Carlstar Turf Saver), FARM is tractor tires, OFF THE ROAD TIRE is earthmover. So every
+    # entry maps to TIRE, and the value of the vocabulary is the closed-ness itself -- a category
+    # NTW has not sent before yields no verdict instead of being assumed to be a tire, which is
+    # what would go wrong the day they start reselling wheels or TPMS sensors through this feed.
+    "PASSENGER": TIRE,
+    "PSUV": TIRE,
+    "RADIAL LT TRUCK": TIRE,
+    "MEDIUM RADIAL TRUCK": TIRE,
+    "BIAS LIGHT TRUCK": TIRE,
+    "MEDIUM BIAS TRUCK": TIRE,
+    "SPECIALTY": TIRE,
+    "FARM": TIRE,
+    "TRAILER": TIRE,
+    "INDUSTRIAL": TIRE,
+    "OFF THE ROAD TIRE": TIRE,
+}
+
+
 SB_CATEGORY_TYPES = {
     "Air Filter": PART,
     "Air Hood Scoops": PART,
@@ -509,6 +531,11 @@ def classify_rough_country(category: typing.Any) -> typing.Optional[Verdict]:
 def classify_sb(category: typing.Any) -> typing.Optional[Verdict]:
     """S&B ``category`` (every catalog row carries one). See SB_CATEGORY_TYPES."""
     return _lookup_category(category, SB_CATEGORY_TYPES, "sb:category")
+
+
+def classify_ntw(category: typing.Any) -> typing.Optional[Verdict]:
+    """NTW ``category`` (every row in the live feed carried one). See NTW_CATEGORY_TYPES."""
+    return _lookup_category(category, NTW_CATEGORY_TYPES, "ntw:category")
 
 
 def classify_premier_category(part_category: typing.Any) -> typing.Optional[Verdict]:

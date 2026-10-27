@@ -39,6 +39,7 @@ PROVIDER_DISPLAY_NAMES = {
     "QUADRATEC": "Quadratec",
     "TRI_STATE": "Tri-State",
     "THOROUGHBRED_DIESEL": "Thoroughbred Diesel",
+    "NTW": "NTW",
     "SB": "S&B Filters",
 }
 
@@ -81,6 +82,7 @@ PROVIDER_IMAGE_URLS = {
     "QUADRATEC": "https://api.aftermarketscout.com/uploads/quadratec_logo.png",
     "TRI_STATE": "https://api.aftermarketscout.com/uploads/tristate.png",
     "THOROUGHBRED_DIESEL": "https://api.aftermarketscout.com/uploads/thoroughbred_diesel_logo.png",
+    "NTW": "https://api.aftermarketscout.com/uploads/ntw_logo.png",
     "SB": "https://api.aftermarketscout.com/uploads/sb_logo.png",
 }
 
@@ -289,6 +291,32 @@ TIRERACK_CREDENTIALS_SFTP_HOST = "sftp_host"
 TIRERACK_CREDENTIALS_SFTP_PORT = "sftp_port"
 TIRERACK_CREDENTIALS_SFTP_USER = "sftp_user"
 TIRERACK_CREDENTIALS_SFTP_PASSWORD = "sftp_password"
+
+# CompanyProviders.credentials JSON keys for NTW's feed. NTW is the wholesale arm of TBC
+# Corporation, and the feed is a TBC MOVEit Transfer server: one per-dealer account, landing a
+# headerless CSV in that dealer's own ``/<Dealer Name>/Outbound`` folder four times a day. Host and
+# port are fixed (MOVEit is a single tenant, confirmed live 2026-10-27), so a connection carries
+# only the login -- same reasoning as Motor State, where host/port being fixed means two fields
+# instead of four and no typo'd hostnames in support tickets.
+#
+# ``customer_id`` is NTW's own account number for this dealer, the one zero-padded into the feed
+# filename (DELTI_0037746990_*.csv -> 37746990). It is NOT needed to read the feed, but it is the
+# join key for the on-demand inventory and order APIs, whose IBM client id/secret are
+# account-level rather than per-dealer. Collected here so a dealer enters it once.
+NTW_CREDENTIALS_SFTP_USER = "sftp_user"
+NTW_CREDENTIALS_SFTP_PASSWORD = "sftp_password"
+NTW_CREDENTIALS_CUSTOMER_ID = "customer_id"
+# Fixed transport, overridable per connection only for a migration or a test double.
+NTW_CREDENTIALS_SFTP_HOST = "sftp_host"
+NTW_CREDENTIALS_SFTP_PORT = "sftp_port"
+NTW_SFTP_DEFAULT_HOST = "moveit.tbccorp.com"
+NTW_SFTP_DEFAULT_PORT = 22
+# The dealer's drop folder, relative to the SFTP home (MOVEit lands the account in /<Dealer Name>).
+NTW_SFTP_OUTBOUND_DIRECTORY = "Outbound"
+# Feed files are DELTI_<10-digit account>_<YYYYMMDDHHMMSS>.csv. The timestamp is unique and
+# monotonic, and MOVEit exposes no content hash, so that stamp is the ingest watermark.
+NTW_FEED_FILENAME_PREFIX = "DELTI_"
+NTW_FEED_FILENAME_SUFFIX = ".csv"
 
 # CompanyProviders.credentials JSON keys for Helmet House. Plain FTP on port 21 (no TLS -- their
 # server offers none), host fixed in settings, so a connection only carries the login. Unlike every
@@ -2482,6 +2510,86 @@ PROVIDER_CATALOG = [
             "purchase order by email. Enter the purchase-order email your Thoroughbred rep gave "
             "you below, plus an optional internal <strong>CC</strong> so your team gets a copy of "
             "every order, and click <strong>Save</strong>.</p>"
+        ),
+    },
+    {
+        "kind": enums.BrandProviderKind.NTW,
+        "name": "NTW",
+        "description": (
+            "Access NTW (TBC Corporation) tire cost and availability from your dealer feed, "
+            "refreshed four times a day."
+        ),
+        "icon_url": PROVIDER_IMAGE_URLS["NTW"],
+        "category": "Distributors",
+        "connection_required_fields": [
+            NTW_CREDENTIALS_SFTP_USER,
+            NTW_CREDENTIALS_SFTP_PASSWORD,
+        ],
+        "connection_optional_fields": [
+            NTW_CREDENTIALS_CUSTOMER_ID,
+        ],
+        "integration_time": "Data available within 1-2 hours",
+        "installation_instructions_html": (
+            "<p><strong>NTW</strong> is the wholesale arm of TBC Corporation. NTW posts a tire cost "
+            "and availability file to your dealer account on TBC's secure file server "
+            "(<strong>MOVEit</strong>) four times a day, and AfterMarketScout collects it from "
+            "there. You need a MOVEit login for your NTW account, which your NTW rep arranges.</p>"
+
+            "<p><strong>1. Email your NTW rep</strong></p>"
+            "<p>Send the message below to your NTW rep, with "
+            "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a> on CC:</p>"
+            + _CALLOUT_OPEN +
+            "<p>Hi,</p>"
+            "<p>We use AfterMarketScout as our product information management (PIM) and ordering "
+            "platform, and need the following for our NTW account [your account number]:</p>"
+            "<ol>"
+            "<li>MOVEit feed access. Please have a MOVEit account created for us on "
+            "moveit.tbccorp.com with <strong>SFTP enabled</strong>, so our inventory and pricing "
+            "file can be collected automatically. Send us the username and password.</li>"
+            "<li>Please confirm our NTW customer ID.</li>"
+            "</ol>"
+            "<p>Thanks!</p>"
+            "</div>"
+
+            "<p><strong>2. Accept the security notice once</strong></p>"
+            "<p>TBC asks every new MOVEit account to accept a security notice at first sign-in, and "
+            "that has to be done by a person. Sign in once at "
+            "<a href=\"https://moveit.tbccorp.com\" target=\"_blank\" rel=\"noopener\">moveit.tbccorp.com</a> "
+            "with the credentials your rep sent and accept the notice. Automated collection cannot "
+            "do this step for you, and the feed will not connect until it is done.</p>"
+
+            "<p><strong>3. Connect the product feed</strong></p>"
+            "<p>Paste the <strong>username</strong> and <strong>password</strong> into the "
+            "<strong>Product feed</strong> fields below and click "
+            "<strong>Save feed credentials</strong>. Paste rather than retype, because a stray space "
+            "is the most common reason a connection fails. Add your <strong>NTW customer ID</strong> "
+            "if your rep has confirmed it — it is not needed for the feed, but it is required later "
+            "for live stock checks and ordering.</p>"
+            "<p>The card shows <strong>Feed Connected</strong>, and your tires appear after the next "
+            "file is collected.</p>"
+
+            "<p><strong>What you get</strong></p>"
+            "<ul>"
+            "<li>Your own NTW cost per tire, and the quantity on hand at the warehouse that serves "
+            "you, refreshed four times a day.</li>"
+            "<li>Only tires NTW currently has in stock for you are listed. A tire that sells out "
+            "drops out of the file, and we set it to zero rather than leaving a stale quantity "
+            "behind.</li>"
+            "</ul>"
+
+            "<p><strong>Ordering</strong></p>"
+            "<p>NTW ordering is not available in AfterMarketScout yet. For now, place NTW orders the "
+            "way you do today; the feed keeps your catalog, cost and availability current.</p>"
+
+            "<p><strong>Troubleshooting</strong></p>"
+            "<ul>"
+            "<li><strong>Feed will not connect.</strong> The most common causes are the security "
+            "notice in step 2 not yet accepted, or SFTP not enabled on the account — ask your rep to "
+            "confirm both.</li>"
+            "<li><strong>Password stopped working.</strong> MOVEit accounts cannot change their own "
+            "password, so a reset has to come from TBC. Ask your rep, then paste the new password "
+            "here.</li>"
+            "</ul>"
         ),
     },
 ]

@@ -57,6 +57,7 @@ from src.integrations.services import (
     meyer,
     motorstate,
     motorstate_feed,
+    ntw,
     premier,
     quadratec,
     rough_country,
@@ -213,6 +214,7 @@ class Command(BaseCommand):
                 ("sb",           self._run_sb),
                 ("atd",          self._run_atd),
                 ("thoroughbred", self._run_thoroughbred),
+                ("ntw",          self._run_ntw),
             ]
             for name, run_fn in phase1_providers:
                 self._ingest_log("phase 1 | starting {} fetch".format(name))
@@ -570,6 +572,16 @@ class Command(BaseCommand):
                 download=True,
             )
             vossen.ensure_vossen_brand_and_mapping()
+
+    def _run_ntw(self) -> None:
+        with self._audited_step(
+            "ingest_all_providers_ntw",
+            "NTW source fetch + brand mapping complete (derived in sync_all).",
+            continue_on_error=True,
+        ):
+            self._ingest_log("NTW: feed + brand mapping")
+            ntw.fetch_and_save_ntw_catalog()
+            ntw.sync_unmapped_ntw_brands_to_brands()
 
     def _run_tirerack(self) -> None:
         with self._audited_step(

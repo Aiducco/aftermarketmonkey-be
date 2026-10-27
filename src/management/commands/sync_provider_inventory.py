@@ -4,7 +4,10 @@ from src.integrations.services import master_parts
 
 
 class Command(BaseCommand):
-    help = "Sync ProviderPartInventory from Turn14, Keystone, Meyer, A-Tech, Rough Country, DLG, S&B, and WheelPros"
+    help = (
+        "Sync ProviderPartInventory from Turn14, Keystone, Meyer, A-Tech, Rough Country, DLG, "
+        "S&B, WheelPros, and NTW"
+    )
 
     def handle(self, *args, **options):
         self.stdout.write("Syncing provider inventory...")
@@ -17,6 +20,7 @@ class Command(BaseCommand):
             master_parts.sync_provider_inventory_from_dlg()
             master_parts.sync_provider_inventory_from_sb()
             master_parts.sync_provider_inventory_from_wheelpros()
+            master_parts.sync_provider_inventory_from_ntw()
             self.stdout.write(self.style.SUCCESS("Done."))
         except Exception as e:
             self.stdout.write(self.style.ERROR("Error: {}".format(str(e))))

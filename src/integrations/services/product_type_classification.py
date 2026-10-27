@@ -192,6 +192,10 @@ def _helmet_house(row, ctx):
     return pt.classify_helmet_house(row["category"])
 
 
+def _ntw(row, ctx):
+    return pt.classify_ntw(row["category"])
+
+
 def _tirerack(row, ctx):
     return pt.classify_tirerack_description(row["description"])
 
@@ -318,6 +322,14 @@ SOURCES = (
         raw_key_column="sku",
         select_columns=("category",),
         classify=_helmet_house,
+    ),
+    _Source(
+        name="ntw",
+        provider_kind=src_enums.BrandProviderKind.NTW.value,
+        raw_table="ntw_parts",
+        raw_key_column="part_number",
+        select_columns=("category",),
+        classify=_ntw,
     ),
     _Source(
         name="tirerack",

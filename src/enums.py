@@ -102,6 +102,7 @@ class BrandProviderKind(enum.Enum):
     TRI_STATE = 38
     SB = 39
     THOROUGHBRED_DIESEL = 40
+    NTW = 41
 
 class ProductType(enum.Enum):
     """

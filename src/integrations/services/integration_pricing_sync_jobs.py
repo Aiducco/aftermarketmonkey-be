@@ -32,6 +32,7 @@ from src.integrations.services import helmet_house as helmet_house_services
 from src.integrations.services import meyer as meyer_services
 from src.integrations.services import motorstate as motorstate_services
 from src.integrations.services import notifications as notifications_services
+from src.integrations.services import ntw as ntw_services
 from src.integrations.services import premier as premier_services
 from src.integrations.services import quadratec as quadratec_services
 from src.integrations import credentials as credentials_helper
@@ -72,6 +73,7 @@ _PRICING_SYNC_KINDS = frozenset(
         src_enums.BrandProviderKind.HELMHOUSE.value,
         src_enums.BrandProviderKind.THE_WHEEL_GROUP.value,
         src_enums.BrandProviderKind.TRI_STATE.value,
+        src_enums.BrandProviderKind.NTW.value,
         src_enums.BrandProviderKind.ALLPRO_DISTRIBUTING.value,
         src_enums.BrandProviderKind.SB.value,
         src_enums.BrandProviderKind.ATD.value,
@@ -355,6 +357,12 @@ def _fetch_raw_pricing(cp: src_models.CompanyProviders, use_delta_fetch: bool = 
         # and there is no separate "primary account" catalog crawl the way AllPro/TSE have (see
         # src.integrations.services.atd's module docstring).
         atd_services.fetch_and_save_atd_catalog_for_company_provider(cp.id)
+
+    elif kind == src_enums.BrandProviderKind.NTW.value:
+        # Pulls this company's own MOVEit file. NTW's feed carries cost AND that dealer's
+        # warehouse quantity in the same row, so unlike TireRack this writes both -- see
+        # NtwCompanyPricing's docstring for why quantity is per-company here.
+        ntw_services.sync_ntw_company_pricing_for_company_provider(cp.id)
 
     elif kind == src_enums.BrandProviderKind.THOROUGHBRED_DIESEL.value:
         # No raw distributor feed to fetch here at all -- Thoroughbred exposes no wholesale cost

@@ -435,6 +435,21 @@ def get_distributor_credentials_info() -> dict:
             "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("ELITE_WHEEL", "Elite Wheel"),
             "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("ELITE_WHEEL") or None,
         },
+        "ntw": {
+            "required": [
+                src_constants.NTW_CREDENTIALS_SFTP_USER,
+                src_constants.NTW_CREDENTIALS_SFTP_PASSWORD,
+            ],
+            "description": (
+                "NTW (TBC Corporation) MOVEit username and password, per company. Host and port "
+                "are fixed, so only the login is collected. Optionally the NTW customer ID, which "
+                "the feed does not need but live stock checks and ordering will. The shared "
+                "catalog is refreshed from the primary connection; each company's own feed drives "
+                "its own cost and warehouse quantity."
+            ),
+            "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("NTW", "NTW"),
+            "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("NTW") or None,
+        },
         "tirerack": {
             "required": [
                 src_constants.TIRERACK_CREDENTIALS_SFTP_HOST,

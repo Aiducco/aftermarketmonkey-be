@@ -45,6 +45,8 @@ from src.integrations.clients.rough_country import client as rough_country_clien
 from src.integrations.clients.rough_country import exceptions as rough_country_exceptions
 from src.integrations.clients.the_wheel_group import client as the_wheel_group_client
 from src.integrations.clients.the_wheel_group import exceptions as the_wheel_group_exceptions
+from src.integrations.clients.ntw import exceptions as ntw_exceptions
+from src.integrations.clients.ntw import sftp_client as ntw_client
 from src.integrations.clients.tirerack import client as tirerack_client
 from src.integrations.clients.tirerack import exceptions as tirerack_exceptions
 from src.integrations.clients.tristate import client as tristate_client
@@ -741,6 +743,26 @@ def _validate_tirerack_connection(credentials: typing.Dict[str, typing.Any]) -> 
     return None, None
 
 
+def _validate_ntw_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
+    """
+    NTW's feed is on TBC's MOVEit server. Two failures dominate on a fresh account and they are
+    not credential problems, so they must not be reported as ones: SFTP not yet enabled for the
+    account, and TBC's first-sign-in security notice not yet accepted by a person (MOVEit refuses
+    automated sessions until it is). Both surface as a connection failure rather than invalid
+    credentials, which is what the onboarding card's troubleshooting copy tells the dealer to check.
+    """
+    try:
+        client = ntw_client.NtwSFTPClient(credentials=credentials)
+        client.test_connection()
+    except ValueError as e:
+        return str(e), CONNECTION_ERROR_INVALID_INPUT
+    except ntw_exceptions.NtwSFTPConnectionError as e:
+        return str(e), CONNECTION_ERROR_INVALID_CREDENTIALS
+    except ntw_exceptions.NtwException as e:
+        return str(e), CONNECTION_ERROR_CONNECTION_FAILED
+    return None, None
+
+
 # Connection validators run synchronously at connect/update time, before credentials are saved,
 # so bad credentials fail the request instead of silently failing the first background sync.
 # Kinds without an entry here are not validated (relay-provisioned kinds, where credentials are
@@ -761,6 +783,7 @@ _CONNECTION_VALIDATORS: typing.Dict[int, typing.Callable[[typing.Dict[str, typin
     src_enums.BrandProviderKind.ALLPRO_DISTRIBUTING.value: _validate_allpro_connection,
     src_enums.BrandProviderKind.ATD.value: _validate_atd_connection,
     src_enums.BrandProviderKind.THOROUGHBRED_DIESEL.value: _validate_thoroughbred_connection,
+    src_enums.BrandProviderKind.NTW.value: _validate_ntw_connection,
 }
 
 

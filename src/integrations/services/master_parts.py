@@ -12389,6 +12389,513 @@ def _ingest_premier_parts_for_mapped_brands(
     return total_master, total_provider
 
 
+def _ntw_provider_external_id(ntw_brand_id: int, part_number: str) -> str:
+    """
+    Stable NTW ProviderPart key: NTW brand row id + NTW's own part number (the feed's column 13,
+    which is also what TBC's inventory and order APIs call ``partNo``).
+
+    Composite rather than bare part number for the same reason TireRack's is: the same number can
+    appear under more than one feed brand. The identity still comes from NTW's number and never
+    from our normalized form -- that is what we committed to in the August integration
+    questionnaire, where we told them every recurring sync matches their item id exactly.
+
+    Not keyed on the feed's product id (column 14, "SUMI-5530548") despite that being unique and
+    matching the APIs: 58 of 3,533 rows in the first live file did not follow the
+    ``<PREFIX>-<part number>`` pattern, so its prefix is not a reliable brand discriminator. The
+    value is kept on ``NtwParts.product_id`` for joining to the APIs.
+    """
+    pn = (part_number or "").strip()
+    return "{}_{}".format(int(ntw_brand_id), pn)
+
+
+def _ntw_product_details(row: typing.Dict, brand_name: typing.Optional[str] = None) -> typing.List[typing.Dict]:
+    return [
+        {"key": "sku",          "label": "SKU",              "value": row.get("part_number") or None},
+        {"key": "brand",        "label": "Brand",            "value": brand_name},
+        {"key": "description",  "label": "Description",      "value": row.get("description") or None},
+        {"key": "model_name",   "label": "Model",            "value": row.get("model_name") or None},
+        {"key": "size",         "label": "Size",             "value": row.get("size_description") or None},
+        {"key": "category",     "label": "Category",         "value": row.get("category") or None},
+        {"key": "ntw_product_id", "label": "NTW Product ID", "value": row.get("product_id") or None},
+    ]
+
+
+def _ingest_ntw_parts_for_mapped_brands(
+    mapped_catalog_brand_ids: typing.Set[int],
+    ntw_provider: src_models.Providers,
+    ntw_brand_to_brand: typing.Dict[int, src_models.Brands],
+    ntw_brand_to_aaia: typing.Dict[int, typing.Optional[str]],
+) -> typing.Tuple[int, int]:
+    """Batch-ingest NtwParts for one disjoint set of NTW catalog brand PKs. Mirrors _ingest_tirerack_parts_for_mapped_brands."""
+    if not mapped_catalog_brand_ids:
+        return 0, 0
+
+    total_master = 0
+    total_provider = 0
+    batch_num = 0
+    last_id = 0
+
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.NtwParts.objects.filter(
+                brand_id__in=mapped_catalog_brand_ids,
+                id__gt=last_id,
+            )
+            .order_by("id")
+            .values("id", "brand_id", "part_number", "description", "updated_at")[:BATCH_SIZE_MASTER_PARTS]
+        )
+        if not batch:
+            break
+
+        last_id = batch[-1]["id"]
+        seen = set()
+        master_parts = []
+        ntw_external_to_brand_part = {}
+
+        for row in batch:
+            brand = ntw_brand_to_brand.get(row["brand_id"])
+            if not brand:
+                continue
+
+            part_number = row.get("part_number") or ""
+            part_number = part_number.strip() if isinstance(part_number, str) else str(part_number or "").strip()
+            if not part_number:
+                continue
+
+            key = (brand.id, part_number)
+            if key not in seen:
+                seen.add(key)
+                master_parts.append(
+                    src_models.MasterPart(
+                        brand=brand,
+                        part_number=part_number,
+                        sku=part_number,
+                        description=row.get("description"),
+                        aaia_code=ntw_brand_to_aaia.get(row["brand_id"]),
+                        image_url=None,
+                    )
+                )
+            ntw_external_to_brand_part[
+                _ntw_provider_external_id(row["brand_id"], part_number)
+            ] = (brand.id, part_number)
+
+        if not master_parts:
+            connection.close()
+            if len(batch) == BATCH_SIZE_MASTER_PARTS:
+                time.sleep(BATCH_DELAY_SECONDS)
+            continue
+
+        pairs = list(seen)
+        existing_by_key = {}
+        if pairs:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(pairs),),
+                )
+                for mp_id, b_id, p_num in cur.fetchall():
+                    existing_by_key[(b_id, p_num)] = mp_id
+
+        mp_matching.extend_with_normalized_matches(
+            existing_by_key,
+            pairs,
+            {(mp.brand_id, mp.part_number): mp.gtin for mp in master_parts},
+            provider_id=ntw_provider.id,
+            provider_kind=src_enums.BrandProviderKind.NTW.value,
+            sku_by_key={(mp.brand_id, mp.part_number): mp.sku for mp in master_parts},
+            external_id_by_key={v: k for k, v in ntw_external_to_brand_part.items()},
+        )
+
+        new_parts = [mp for mp in master_parts if (mp.brand_id, mp.part_number) not in existing_by_key]
+        existing_keys = [k for k in pairs if k in existing_by_key]
+
+        if new_parts:
+            new_parts = _dedupe_master_parts_for_upsert(
+                new_parts, context="NTW new_parts batch={}".format(batch_num)
+            )
+            pgbulk.upsert(
+                src_models.MasterPart,
+                new_parts,
+                unique_fields=["brand", "part_number"],
+                update_fields=[],
+            )
+            total_master += len(new_parts)
+
+        if existing_keys:
+            key_to_mp = {(mp.brand_id, mp.part_number): mp for mp in master_parts}
+            values = [(existing_by_key[k], key_to_mp[k].aaia_code) for k in existing_keys]
+            placeholders = ", ".join(["(%s::bigint, %s)"] * len(values))
+            params = [x for row_vals in values for x in row_vals]
+            with connection.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE master_parts mp SET aaia_code = v.aaia_code
+                    FROM (VALUES {}) AS v(id, aaia_code)
+                    WHERE mp.id = v.id
+                    """.format(placeholders),
+                    params,
+                )
+
+        brand_part_to_master = mp_matching.master_part_stubs_for(existing_by_key)
+        unresolved_pairs = [k for k in pairs if k not in brand_part_to_master]
+        if unresolved_pairs:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(unresolved_pairs),),
+                )
+                for mp_id, b_id, p_num in cur.fetchall():
+                    mp = src_models.MasterPart()
+                    mp.id = mp_id
+                    mp.brand_id = b_id
+                    mp.part_number = p_num
+                    brand_part_to_master[(b_id, p_num)] = mp
+
+        provider_parts_by_key = {}
+        for row in batch:
+            pn = row.get("part_number") or ""
+            pn = pn.strip() if isinstance(pn, str) else str(pn or "").strip()
+            if not pn:
+                continue
+            ext_id = _ntw_provider_external_id(row["brand_id"], pn)
+            key_bp = ntw_external_to_brand_part.get(ext_id)
+            if not key_bp:
+                continue
+            master_part = brand_part_to_master.get(key_bp)
+            if not master_part:
+                continue
+            provider_parts_by_key[(master_part.id, ntw_provider.id)] = src_models.ProviderPart(
+                master_part=master_part,
+                provider=ntw_provider,
+                provider_external_id=ext_id,
+                distributor_refreshed_at=row.get("updated_at"),
+            )
+
+        provider_parts = list(provider_parts_by_key.values())
+        if provider_parts:
+            pgbulk.upsert(
+                src_models.ProviderPart,
+                provider_parts,
+                unique_fields=["master_part", "provider"],
+                update_fields=_PROVIDER_PART_SYNC_UPDATE_FIELDS,
+            )
+            total_provider += len(provider_parts)
+
+        logger.info("{} NTW batch {}: {} items -> {} master, {} provider (last_id={})".format(
+            _LOG_PREFIX, batch_num, len(batch), len(master_parts), len(provider_parts), last_id
+        ))
+        connection.close()
+        if len(batch) == BATCH_SIZE_MASTER_PARTS:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    return total_master, total_provider
+
+
+def sync_master_parts_from_ntw() -> None:
+    """
+    Create/update MasterPart and ProviderPart from NtwParts. Only rows whose NtwBrand has a
+    BrandNtwBrandMapping are included.
+
+    Resolution uses (catalog brand_id, part_number) only, same as TireRack and DLG.
+    """
+    logger.info("{} Syncing master parts from NTW (batched, part_number only).".format(_LOG_PREFIX))
+
+    ntw_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.NTW.value,
+    ).first()
+    if not ntw_provider:
+        logger.info("{} No NTW provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(src_models.BrandNtwBrandMapping.objects.select_related("brand", "ntw_brand"))
+    ntw_brand_to_brand = {m.ntw_brand_id: m.brand for m in mappings}
+    ntw_brand_to_aaia = {m.ntw_brand_id: (m.brand.aaia_code if m.brand else None) for m in mappings}
+    if not ntw_brand_to_brand:
+        logger.info("{} No BrandNtwBrandMapping found. Nothing to sync.".format(_LOG_PREFIX))
+        return
+
+    chunks = _partition_mapped_brands_for_parallel_ingest(mappings, MASTER_PARTS_SYNC_MAX_WORKERS)
+    total_master, total_provider = _run_parallel_master_parts_ingest(
+        chunks,
+        mappings,
+        "ntw_brand",
+        lambda cids: _ingest_ntw_parts_for_mapped_brands(
+            cids, ntw_provider, ntw_brand_to_brand, ntw_brand_to_aaia,
+        ),
+    )
+    logger.info("{} Synced {} master parts and {} provider parts from NTW total.".format(
+        _LOG_PREFIX, total_master, total_provider
+    ))
+
+
+def sync_provider_inventory_from_ntw() -> None:
+    """
+    Sync ProviderPartInventory from NtwParts (mapped brands).
+
+    ``warehouse_total_qty`` is whatever the latest file said, and a part the file no longer lists
+    has already been set to 0 by ntw.zero_out_absent_ntw_parts -- so a sold-out tire reaches this
+    table as a real zero rather than a stale quantity. That reconciliation is the feed's defining
+    requirement: it ships in-stock rows only. See the NtwParts docstring.
+
+    The quantity is warehouse-specific to the primary connection's servicing branch, so for other
+    dealers it is indicative. Their own number lives on NtwCompanyPricing.quantity.
+    """
+    logger.info("{} Syncing provider inventory from NTW.".format(_LOG_PREFIX))
+
+    ntw_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.NTW.value,
+    ).first()
+    if not ntw_provider:
+        logger.info("{} No NTW provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(src_models.BrandNtwBrandMapping.objects.select_related("brand", "ntw_brand"))
+    if not mappings:
+        logger.info("{} No BrandNtwBrandMapping found.".format(_LOG_PREFIX))
+        return
+
+    ntw_brand_id_to_name = {m.ntw_brand_id: m.ntw_brand.name for m in mappings}
+
+    provider_parts = {
+        row["provider_external_id"]: src_models.ProviderPart(id=row["id"])
+        for row in src_models.ProviderPart.objects.filter(provider=ntw_provider).values(
+            "id", "provider_external_id"
+        )
+    }
+
+    now = timezone.now()
+
+    def _worker(catalog_ids: typing.Set[int]) -> int:
+        if not catalog_ids:
+            return 0
+        total_upserted = 0
+        batch_num = 0
+        last_id = 0
+        while True:
+            batch_num += 1
+            batch = list(
+                src_models.NtwParts.objects.filter(id__gt=last_id, brand_id__in=catalog_ids)
+                .order_by("id")
+                .values(
+                    "id", "brand_id", "part_number", "product_id", "quantity", "description",
+                    "model_name", "size_description", "category", "location_id",
+                )[:BATCH_SIZE_INVENTORY]
+            )
+            if not batch:
+                break
+
+            last_id = batch[-1]["id"]
+            to_upsert = []
+            for row in batch:
+                pn = row.get("part_number") or ""
+                pn = pn.strip() if isinstance(pn, str) else str(pn or "").strip()
+                if not pn:
+                    continue
+                provider_part = provider_parts.get(_ntw_provider_external_id(row["brand_id"], pn))
+                if not provider_part:
+                    continue
+                qty = row.get("quantity")
+                try:
+                    total_qty = int(qty) if qty is not None else 0
+                    wh_avail = {"available_on_hand": total_qty if qty is not None else None}
+                except (TypeError, ValueError):
+                    total_qty = 0
+                    wh_avail = {"available_on_hand": None}
+                # Label the branch the quantity came from -- NTW serves each dealer from one
+                # location, so the code is the only way to tell later whose stock this was.
+                location_id = row.get("location_id")
+                if location_id:
+                    wh_avail["location_id"] = location_id
+                to_upsert.append(
+                    src_models.ProviderPartInventory(
+                        provider_part=provider_part,
+                        warehouse_total_qty=total_qty,
+                        manufacturer_inventory=None,
+                        manufacturer_esd=None,
+                        warehouse_availability=wh_avail,
+                        last_synced_at=now,
+                        updated_at=now,
+                    )
+                )
+
+            if to_upsert:
+                to_upsert = _dedupe_provider_part_inventory_for_upsert(
+                    to_upsert, context="NTW inventory batch={}".format(batch_num)
+                )
+                pgbulk.upsert(
+                    src_models.ProviderPartInventory,
+                    to_upsert,
+                    unique_fields=["provider_part"],
+                    update_fields=[
+                        "warehouse_total_qty",
+                        "manufacturer_inventory",
+                        "manufacturer_esd",
+                        "warehouse_availability",
+                        "last_synced_at",
+                        "updated_at",
+                    ],
+                )
+                total_upserted += len(to_upsert)
+
+            pp_details_to_update = []
+            for row in batch:
+                pn = row.get("part_number") or ""
+                pn = pn.strip() if isinstance(pn, str) else str(pn or "").strip()
+                if not pn:
+                    continue
+                pp = provider_parts.get(_ntw_provider_external_id(row["brand_id"], pn))
+                if pp:
+                    pp.product_details = _ntw_product_details(
+                        row, brand_name=ntw_brand_id_to_name.get(row.get("brand_id"))
+                    )
+                    pp_details_to_update.append(pp)
+            if pp_details_to_update:
+                src_models.ProviderPart.objects.bulk_update(
+                    pp_details_to_update, ["product_details"], batch_size=500
+                )
+
+            logger.info("{} NTW inventory batch {}: {} records (last_id={})".format(
+                _LOG_PREFIX, batch_num, len(to_upsert), last_id
+            ))
+            connection.close()
+            if len(batch) == BATCH_SIZE_INVENTORY:
+                time.sleep(BATCH_DELAY_SECONDS)
+        return total_upserted
+
+    total_upserted = _run_parallel_mapped_brand_int_worker(mappings, "ntw_brand", _worker)
+    logger.info("{} Synced {} NTW inventory records total.".format(_LOG_PREFIX, total_upserted))
+
+
+def sync_provider_pricing_from_ntw_for_company(company_id: int) -> None:
+    """
+    Write ProviderPartCompanyPricing for one company from its own NtwCompanyPricing rows
+    (cost only -- NTW's feed carries no MAP/retail/jobber columns). Populated by
+    ntw.sync_ntw_company_pricing_for_company_provider from that company's own MOVEit pull.
+    """
+    logger.info("{} Syncing NTW provider pricing for company_id={}.".format(_LOG_PREFIX, company_id))
+
+    ntw_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.NTW.value,
+    ).first()
+    if not ntw_provider:
+        logger.info("{} No NTW provider found.".format(_LOG_PREFIX))
+        return
+
+    now = timezone.now()
+    provider_part_by_ext = {
+        row["provider_external_id"]: row["id"]
+        for row in src_models.ProviderPart.objects.filter(provider=ntw_provider).values(
+            "id", "provider_external_id"
+        )
+    }
+    if not provider_part_by_ext:
+        logger.info("{} No NTW provider parts yet; nothing to price.".format(_LOG_PREFIX))
+        return
+
+    total_upserted = 0
+    batch_num = 0
+    last_id = 0
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.NtwCompanyPricing.objects.filter(company_id=company_id, id__gt=last_id)
+            .order_by("id")
+            .values("id", "cost", "part__brand_id", "part__part_number")[:BATCH_SIZE_PRICING]
+        )
+        if not batch:
+            break
+
+        last_id = batch[-1]["id"]
+        to_upsert = []
+        for row in batch:
+            pn = (row.get("part__part_number") or "").strip()
+            if not pn:
+                continue
+            pp_id = provider_part_by_ext.get(_ntw_provider_external_id(row["part__brand_id"], pn))
+            if not pp_id:
+                continue
+            to_upsert.append(
+                src_models.ProviderPartCompanyPricing(
+                    provider_part_id=pp_id,
+                    company_id=company_id,
+                    cost=row.get("cost"),
+                    jobber_price=None,
+                    map_price=None,
+                    msrp=None,
+                    retail_price=None,
+                    last_synced_at=now,
+                )
+            )
+
+        if to_upsert:
+            pgbulk.upsert(
+                src_models.ProviderPartCompanyPricing,
+                to_upsert,
+                unique_fields=["provider_part", "company"],
+                update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
+            )
+            total_upserted += len(to_upsert)
+
+        logger.info("{} NTW pricing company={} batch {}: {} records (last_id={})".format(
+            _LOG_PREFIX, company_id, batch_num, len(to_upsert), last_id,
+        ))
+        connection.close()
+        if len(batch) == BATCH_SIZE_PRICING:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    logger.info("{} Synced {} NTW pricing records for company_id={}.".format(
+        _LOG_PREFIX, total_upserted, company_id
+    ))
+
+
+def sync_provider_pricing_from_ntw() -> None:
+    """Run sync_provider_pricing_from_ntw_for_company for every company with NTW pricing rows."""
+    company_ids = list(
+        src_models.NtwCompanyPricing.objects.values_list("company_id", flat=True).distinct()
+    )
+    if not company_ids:
+        logger.info("{} No NTW company pricing rows; nothing to sync.".format(_LOG_PREFIX))
+        return
+    for company_id in company_ids:
+        sync_provider_pricing_from_ntw_for_company(company_id)
+        connection.close()
+
+
+def sync_derived_from_ntw(*, reindex_meilisearch: bool = False, skip_master_parts: bool = False, skip_pricing: bool = False) -> None:
+    """
+    Propagate NTW source data into MasterPart, ProviderPart, ProviderPartInventory, and
+    ProviderPartCompanyPricing. Call after ntw.fetch_and_save_ntw_catalog.
+
+    Pass ``skip_master_parts=True`` to run only inventory + pricing (fast incremental path).
+    Pass ``skip_pricing=True`` to run only master parts + inventory (global catalog sync path).
+    """
+    logger.info("{} Starting NTW-only derived sync ({}).".format(
+        _LOG_PREFIX,
+        "inventory + pricing only" if skip_master_parts else "parts, inventory" + ("" if skip_pricing else ", pricing"),
+    ))
+    if not skip_master_parts:
+        sync_master_parts_from_ntw()
+        connection.close()
+
+    def _cont() -> None:
+        sync_provider_inventory_from_ntw()
+        connection.close()
+        if not skip_pricing:
+            sync_provider_pricing_from_ntw()
+            connection.close()
+
+    if skip_master_parts:
+        _cont()
+    else:
+        _maybe_reindex_meilisearch_after_master_parts(
+            reindex_meilisearch=reindex_meilisearch,
+            provider_label="NTW",
+            continuation=_cont,
+        )
+    logger.info("{} Completed NTW-only derived sync.".format(_LOG_PREFIX))
+
+
 def sync_master_parts_from_premier() -> None:
     """
     Create/update MasterPart and ProviderPart from PremierParts.
@@ -15286,6 +15793,8 @@ def sync_all_master_parts() -> None:
     sync_derived_from_the_wheel_group(reindex_meilisearch=False, skip_pricing=True)
     _reclaim_memory()
     sync_derived_from_sb(reindex_meilisearch=False, skip_pricing=True)
+    _reclaim_memory()
+    sync_derived_from_ntw(reindex_meilisearch=False, skip_pricing=True)
 
     logger.info("{} Completed full master parts sync.".format(_LOG_PREFIX))
 
@@ -15349,6 +15858,8 @@ def sync_all_master_parts_global() -> None:
     sync_derived_from_atd(skip_pricing=True)
     _reclaim_memory()
     sync_derived_from_thoroughbred(skip_pricing=True)
+    _reclaim_memory()
+    sync_derived_from_ntw(skip_pricing=True)
 
     logger.info("{} Completed global master parts sync (catalog + inventory, no pricing).".format(_LOG_PREFIX))
 
@@ -15389,6 +15900,7 @@ def sync_all_master_parts_incremental() -> None:
     sync_derived_from_sb(skip_master_parts=True)
     sync_derived_from_atd(skip_master_parts=True)
     sync_derived_from_thoroughbred(skip_master_parts=True)
+    sync_derived_from_ntw(skip_master_parts=True)
 
     logger.info("{} Completed incremental master parts sync.".format(_LOG_PREFIX))
 
