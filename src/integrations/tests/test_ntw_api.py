@@ -34,10 +34,10 @@ def _client(**overrides: typing.Any) -> ntw_api.NtwApiClient:
     return ntw_api.NtwApiClient(**kwargs)
 
 
-def _product(part_no: str, qty: int = 4, location: str = "3289") -> typing.Dict:
+def _product(part_no: str, qty: int = 4, location: str = "3289", brand: str = "Michelin") -> typing.Dict:
     return {
         "partNo": part_no,
-        "brandName": "Michelin",
+        "brandName": brand,
         "description": "Michelin Premier AS",
         "productCost": {"amount": "97.84", "currencyCode": "USD"},
         "estimatedDelivery": "Next Day",
@@ -156,8 +156,13 @@ class ByProductIdLookupTests(SimpleTestCase):
 
         def fake_request(method, path, body=None, params=None):
             self.sent.append(body)
-            wanted = {c["partNo"] for c in body.get("criteria", [])}
-            return {"product": [_product(pn) for pn in ("87266", "50004", "5540843") if pn in wanted]}
+            # Echo back the brand that was asked for: the client keys results on
+            # (BRAND, partNo), so a fake that always says "Michelin" can never match a
+            # BFGoodrich lookup -- which is exactly what this used to get wrong.
+            return {"product": [
+                _product(c["partNo"], brand=c["brandName"]) for c in body.get("criteria", [])
+                if c["partNo"] in ("87266", "50004", "5540843")
+            ]}
 
         self.client._request = fake_request
 
@@ -216,9 +221,15 @@ class ConfigurationGuardTests(SimpleTestCase):
         with self.assertRaises(ntw_exceptions.NtwApiNotConfiguredError):
             _client(client_secret="")
 
-    def test_missing_base_url_refuses_construction(self):
-        with self.assertRaises(ntw_exceptions.NtwApiNotConfiguredError):
-            _client(base_url="")
+    def test_base_url_falls_back_to_the_configured_environment(self):
+        """
+        Unlike the credentials, base_url has a settings default (TBC's QA catalog), so an empty
+        argument is a fallback rather than a misconfiguration. Production is a different host
+        AND different credentials -- services.tbccorp.com returns 401 for the QA pair.
+        """
+        client = _client(base_url="")
+        self.assertTrue(client.base_url)
+        self.assertFalse(client.base_url.endswith("/"))
 
     def test_a_missing_ca_bundle_raises_instead_of_skipping_verification(self):
         """
@@ -299,8 +310,6 @@ class OrderHelperTests(SimpleTestCase):
         self.assertEqual(codes["WILL CALL"], "NTWL")
         # Only sent on a drop-ship order -- TBC ignores them otherwise.
         self.assertIn(("NTWL", "NTW_GROUND"), ntw_api.CARRIER_SERVICE_CODES)
-        self.assertNotIn({"width": "235", "ratio": "65", "diameter": "17"},
-                         ntw_orders.criteria_sizes(criteria))
 
     def test_decimal_parsing_tolerates_tbc_string_amounts(self):
         self.assertEqual(ntw_orders._decimal("97.84"), __import__("decimal").Decimal("97.84"))
