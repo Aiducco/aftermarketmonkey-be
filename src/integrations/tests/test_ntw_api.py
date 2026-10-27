@@ -257,22 +257,39 @@ class ConfigurationGuardTests(SimpleTestCase):
 class OrderHelperTests(SimpleTestCase):
     databases = []
 
-    def test_tbc_date_formats(self):
+    def test_both_tbc_date_formats(self):
+        """
+        The two APIs disagree: inventory sends M/D/YYYY, the order service sends RFC 3339 with a
+        trailing Z and no seconds. Only knowing the first silently dropped every order ETA.
+        """
         self.assertEqual(ntw_orders._date("11/06/2026"), datetime.date(2026, 11, 6))
+        self.assertEqual(ntw_orders._date("2023-11-01T13:50Z"), datetime.date(2023, 11, 1))
+        self.assertEqual(ntw_orders._date("2017-06-01T19:30Z"), datetime.date(2017, 6, 1))
+        self.assertEqual(ntw_orders._date("2026-10-27T08:20:33+00:00"), datetime.date(2026, 10, 27))
         self.assertEqual(ntw_orders._date("2026-11-06"), datetime.date(2026, 11, 6))
         self.assertIsNone(ntw_orders._date(""))
         self.assertIsNone(ntw_orders._date(None))
         self.assertIsNone(ntw_orders._date("sometime next week"))
 
-    def test_delivery_status_is_none_unless_tbc_actually_says_so(self):
-        # Their status vocabulary is undocumented and we have never seen a real value, so
-        # anything unrecognised must stay unknown rather than be mapped optimistically.
-        self.assertIsNone(ntw_orders._delivery_status("PROCESSING"))
-        self.assertIsNone(ntw_orders._delivery_status(""))
-        self.assertIsNone(ntw_orders._delivery_status(None))
-        self.assertEqual(ntw_orders._delivery_status("In Transit"), "in_transit")
-        self.assertEqual(ntw_orders._delivery_status("DELIVERED"), "delivered")
-        self.assertEqual(ntw_orders._delivery_status("Cancelled"), "cancelled")
+    def test_delivery_status_is_a_closed_vocabulary(self):
+        """
+        TBC documents exactly three statuses. Anything else yields no signal rather than a
+        guess, so a value they add later shows as unknown instead of being mis-asserted.
+        """
+        self.assertEqual(ntw_orders._delivery_status("Rejected"), "cancelled")
+        self.assertEqual(ntw_orders._delivery_status("  delivered "), "delivered")
+        self.assertIsNone(ntw_orders._delivery_status("Processing"))
+        for unknown in ("Shipped", "In Transit", "Invoiced", "", None):
+            self.assertIsNone(ntw_orders._delivery_status(unknown), unknown)
+
+    def test_delivered_is_tbcs_billing_signal_not_proof_of_arrival(self):
+        """
+        TBC's "Delivered" means invoiced OR shipped OR delivered -- they collapse all three. It
+        is the nearest thing to an invoice feed this integration has, since there is no invoice
+        endpoint, and it must not be read as "the customer has the tires".
+        """
+        self.assertEqual(ntw_orders._delivery_status("Delivered"), "delivered")
+        self.assertNotIn("INVOICED", ntw_orders._TBC_DELIVERY_STATUS)
 
     def test_carrier_catalogue_matches_the_published_enumeration(self):
         codes = dict((c, s) for s, c in ntw_api.CARRIER_SERVICE_CODES)

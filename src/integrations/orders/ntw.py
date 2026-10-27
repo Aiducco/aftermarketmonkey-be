@@ -29,6 +29,7 @@ describes something retired.
 """
 import datetime
 import logging
+import re
 import typing
 from decimal import Decimal, InvalidOperation
 
@@ -71,13 +72,30 @@ def _decimal(value: typing.Any) -> typing.Optional[Decimal]:
 
 
 def _date(value: typing.Any) -> typing.Optional[datetime.date]:
-    """TBC writes dates as M/D/YYYY in the inventory response (e.g. "11/06/2026")."""
+    """
+    TBC writes dates in two different shapes depending on which API answered, and an earlier
+    version of this function only knew the first:
+
+      inventory  estimatedDeliveryDate  "11/06/2026"            M/D/YYYY
+      order      estDelivery            "2023-11-01T13:50Z"     RFC 3339, per the spec's own
+                                                                "Date/Time Format" section
+
+    So every estimated delivery date coming back from an order status was silently dropped.
+    """
     text = (str(value) or "").strip() if value is not None else ""
     if not text:
         return None
     for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m/%d/%y"):
         try:
             return datetime.datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    # RFC 3339. Python's fromisoformat does not accept a trailing "Z" before 3.11, and TBC's
+    # samples omit seconds ("13:50Z"), which it also rejects -- so normalise both.
+    iso = text.replace("Z", "+00:00")
+    for candidate in (iso, re.sub(r"T(\d{2}):(\d{2})([+-])", r"T\1:\2:00\3", iso)):
+        try:
+            return datetime.datetime.fromisoformat(candidate).date()
         except ValueError:
             continue
     return None
@@ -514,19 +532,27 @@ class NtwOrderAdapter(base.DistributorOrderAdapter):
 
 
 
+# TBC documents exactly three order statuses (Order Service v1.0), and the mapping is not
+# one-to-one with ours:
+#
+#   "Processing"  the order is confirmed and nothing has shipped -> no delivery signal yet
+#   "Rejected"    the order was cancelled                        -> cancelled
+#   "Delivered"   "If the order is Invoiced or Shipped or Delivered"
+#
+# That last one is the important caveat: TBC collapses invoiced, shipped and delivered into one
+# word, so it means "TBC is done with it", NOT that a tire reached the customer. It is also the
+# closest thing this integration gets to an invoice signal, since TBC exposes no invoice
+# endpoint -- an order reaching "Delivered" is when it has been billed.
+#
+# A closed vocabulary rather than substring matching: an unrecognised status yields no signal,
+# so if TBC adds a value we show nothing instead of guessing it.
+_TBC_DELIVERY_STATUS = {
+    "DELIVERED": "delivered",
+    "REJECTED": "cancelled",
+    "PROCESSING": None,
+}
+
+
 def _delivery_status(raw_status: str) -> typing.Optional[str]:
-    """
-    Normalise to the vocabulary base.DistributorOrderStatus documents, and only where TBC's own
-    wording actually says so -- None rather than a guess, since their status values are
-    undocumented and we have never seen a real one.
-    """
-    text = (raw_status or "").strip().lower()
-    if not text:
-        return None
-    if "cancel" in text:
-        return "cancelled"
-    if "deliver" in text:
-        return "delivered"
-    if "transit" in text or "shipped" in text:
-        return "in_transit"
-    return None
+    """Normalise to base.DistributorOrderStatus's vocabulary, or None when TBC gives no signal."""
+    return _TBC_DELIVERY_STATUS.get((raw_status or "").strip().upper())
