@@ -1089,8 +1089,6 @@ def _validate_ntw_order_connection(credentials: typing.Dict[str, typing.Any]) ->
         client.get_tire_inventory(
             customer_id,
             [{"tireSize": {"width": "225", "ratio": "55", "diameter": "16"}, "requestedQty": 0}],
-            dealer_code=(credentials.get(src_constants.NTW_ORDER_CREDENTIALS_DEALER_CODE) or "").strip() or None,
-            store_number=(credentials.get(src_constants.NTW_ORDER_CREDENTIALS_STORE_NUMBER) or "").strip() or None,
         )
     except ntw_exceptions.NtwApiNotConfiguredError as e:
         return str(e), CONNECTION_ERROR_CONNECTION_FAILED

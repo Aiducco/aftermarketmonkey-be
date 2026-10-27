@@ -132,14 +132,13 @@ class NtwOrderAdapter(base.DistributorOrderAdapter):
         order_credentials = credentials_helper.get_order_credentials(company_provider, order_account)
 
         # Everything the two TBC APIs need lives on the order account: the dealer's own
-        # application key/secret, their NTW account number, and optionally a dealer code and
-        # store number. The product feed holds only an SFTP login -- reading a file needs no
-        # account number, so requiring one there would block a feed that works without it.
+        # application key/secret and their NTW account number. The product feed holds only an
+        # SFTP login -- reading a file needs no account number, so requiring one there would
+        # block a feed that works without it. dealerCode and storeNumber are not collected:
+        # TBC's own spec says dealerCode is unnecessary once customerId is present.
         self._customer_id = (
             order_credentials.get(constants.NTW_ORDER_CREDENTIALS_CUSTOMER_ID) or ""
         ).strip()
-        self._dealer_code = (order_credentials.get(constants.NTW_ORDER_CREDENTIALS_DEALER_CODE) or "").strip()
-        self._store_number = (order_credentials.get(constants.NTW_ORDER_CREDENTIALS_STORE_NUMBER) or "").strip()
         client_id = (order_credentials.get(constants.NTW_ORDER_CREDENTIALS_CLIENT_ID) or "").strip()
         client_secret = (order_credentials.get(constants.NTW_ORDER_CREDENTIALS_CLIENT_SECRET) or "").strip()
 
@@ -247,8 +246,6 @@ class NtwOrderAdapter(base.DistributorOrderAdapter):
                 pairs,
                 ship_to=_ship_to_payload(ship_to),
                 is_drop_ship=not ship_to.is_shop_address,
-                dealer_code=self._dealer_code or None,
-                store_number=self._store_number or None,
             )
         except ntw_exceptions.NtwApiBusinessError as e:
             raise order_exceptions.OrderValidationError(
@@ -410,8 +407,6 @@ class NtwOrderAdapter(base.DistributorOrderAdapter):
             "items": items,
             "placed": purchase_order.submitted_at.isoformat() if purchase_order.submitted_at else None,
         }
-        if self._dealer_code:
-            body["dealerCode"] = self._dealer_code
 
         try:
             response = self._client.create_order(body)

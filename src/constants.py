@@ -353,8 +353,11 @@ NTW_FEED_FILENAME_SUFFIX = ".csv"
 NTW_ORDER_CREDENTIALS_CLIENT_ID = "client_id"
 NTW_ORDER_CREDENTIALS_CLIENT_SECRET = "client_secret"
 NTW_ORDER_CREDENTIALS_CUSTOMER_ID = "customer_id"
-NTW_ORDER_CREDENTIALS_DEALER_CODE = "dealer_code"
-NTW_ORDER_CREDENTIALS_STORE_NUMBER = "store_number"
+# dealerCode and storeNumber are deliberately NOT collected. Both are optional on TBC's side
+# and redundant once customerId is present -- the Order Service spec says so outright: "If
+# customerId exist in the request then DealerCode is not required". Asking a dealer for two
+# values that change nothing is two more ways for onboarding to stall. The API client still
+# accepts them, so a future per-location case can pass them without a schema change.
 
 # CompanyProviders.credentials JSON keys for Helmet House. Plain FTP on port 21 (no TLS -- their
 # server offers none), host fixed in settings, so a connection only carries the login. Unlike every
@@ -2571,10 +2574,6 @@ PROVIDER_CATALOG = [
             NTW_ORDER_CREDENTIALS_CLIENT_ID,
             NTW_ORDER_CREDENTIALS_CLIENT_SECRET,
             NTW_ORDER_CREDENTIALS_CUSTOMER_ID,
-        ],
-        "order_connection_optional_fields": [
-            NTW_ORDER_CREDENTIALS_DEALER_CODE,
-            NTW_ORDER_CREDENTIALS_STORE_NUMBER,
         ],
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
