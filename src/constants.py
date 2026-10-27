@@ -2466,6 +2466,10 @@ PROVIDER_CATALOG = [
         # dealer_cost_from_retail and _validate_thoroughbred_markup_field in api/services/integrations.py.
         "connection_required_fields": ["markup"],
         "connection_optional_fields": [],
+        # Thoroughbred has no order API of its own, so Email is the only ordering channel --
+        # same shape as AllPro/Rough Country's fallback. See the matching note on AllPro above.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["account_number", "cc_email", "reply_to_email"],
         "integration_time": "Data available immediately — no account or approval needed",
         "installation_instructions_html": (
             "<p><strong>Thoroughbred Diesel</strong> publishes its catalog publicly — there's no "
@@ -2473,6 +2477,11 @@ PROVIDER_CATALOG = [
             "your cost automatically.</p>"
             "<p>Enter a <strong>markup percentage</strong> (0-100) below and click "
             "<strong>Save</strong>. Catalog, pricing, and fitment data sync automatically after that.</p>"
+            "<p><strong>Ordering</strong></p>"
+            "<p>Thoroughbred Diesel has no ordering API, so orders go to your rep as a PDF "
+            "purchase order by email. Enter the purchase-order email your Thoroughbred rep gave "
+            "you below, plus an optional internal <strong>CC</strong> so your team gets a copy of "
+            "every order, and click <strong>Save</strong>.</p>"
         ),
     },
 ]
