@@ -142,13 +142,21 @@ class NtwOrderAdapter(base.DistributorOrderAdapter):
         ).strip()
         self._dealer_code = (order_credentials.get(constants.NTW_ORDER_CREDENTIALS_DEALER_CODE) or "").strip()
         self._store_number = (order_credentials.get(constants.NTW_ORDER_CREDENTIALS_STORE_NUMBER) or "").strip()
+        client_id = (order_credentials.get(constants.NTW_ORDER_CREDENTIALS_CLIENT_ID) or "").strip()
+        client_secret = (order_credentials.get(constants.NTW_ORDER_CREDENTIALS_CLIENT_SECRET) or "").strip()
 
         if not self._customer_id:
             raise ValueError(
-                "NTW connection {} has no customer_id; TBC's order API requires it and it is not "
-                "the account number in the feed filename.".format(company_provider.id)
+                "NTW connection {} has no customer_id; TBC's order API requires the dealer's NTW "
+                "account number.".format(company_provider.id)
             )
-        self._client = ntw_api.NtwApiClient()
+        if not client_id or not client_secret:
+            raise ValueError(
+                "NTW connection {} has no TBC API key/secret. Each dealer creates their own "
+                "application in TBC's developer portal and subscribes it to the InventoryService "
+                "and OrderService plans.".format(company_provider.id)
+            )
+        self._client = ntw_api.NtwApiClient(client_id=client_id, client_secret=client_secret)
 
     # -- helpers -------------------------------------------------------------
 

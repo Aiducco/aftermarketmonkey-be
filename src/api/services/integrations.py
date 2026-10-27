@@ -1037,32 +1037,70 @@ def _validate_rough_country_order_connection(credentials: typing.Dict[str, typin
 # src/integrations/orders/).
 def _validate_ntw_order_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
     """
-    Checks the customerId by actually using it: TBC's inventory API rejects a bad one loudly
-    (``400 Customer id - 00... is invalid``) while a good one returns rows, so one cheap call
-    settles it. Worth doing at connect time because this value is the one nobody can derive --
-    it is NOT the account number in the dealer's feed filename, despite the two looking alike.
+    Checks the dealer's own TBC application by using it: one cheap inventory call with their key,
+    secret and customer number settles all three at once, and each failure mode is distinct.
 
-    A gateway/configuration failure is reported as a connection failure rather than bad input:
-    the dealer's number may be perfectly correct while our own API credentials, plan subscription
-    or CA bundle are not, and telling them to re-check their customer ID would send them chasing
-    something that is not wrong.
+    The three are worth separating because they send the dealer to different places:
+      401  the key/secret are wrong -- re-copy them, or the secret was never captured (TBC shows
+           it once).
+      403  "Not registered to plan" -- the application exists and authenticates but has not been
+           subscribed to the InventoryService/OrderService plans. Reported as a connection
+           failure, not bad credentials, because nothing the dealer typed is wrong.
+      400  the customer number is rejected -- it is the 10-digit NTW account number, not the
+           MOVEit username.
     """
+    client_id = (credentials.get(src_constants.NTW_ORDER_CREDENTIALS_CLIENT_ID) or "").strip()
+    client_secret = (credentials.get(src_constants.NTW_ORDER_CREDENTIALS_CLIENT_SECRET) or "").strip()
     customer_id = (credentials.get(src_constants.NTW_ORDER_CREDENTIALS_CUSTOMER_ID) or "").strip()
-    if not customer_id:
-        return "An NTW customer ID is required to place orders.", CONNECTION_ERROR_INVALID_INPUT
+    if not client_id or not client_secret:
+        return (
+            "A TBC API key and secret are required. Create an application in TBC's developer "
+            "portal and paste both here.",
+            CONNECTION_ERROR_INVALID_INPUT,
+        )
 
     try:
-        client = ntw_api_client.NtwApiClient()
+        client = ntw_api_client.NtwApiClient(client_id=client_id, client_secret=client_secret)
+    except ntw_exceptions.NtwApiNotConfiguredError as e:
+        return str(e), CONNECTION_ERROR_CONNECTION_FAILED
+
+    if not customer_id:
+        # The key/secret are well-formed but we cannot exercise them without a customer number,
+        # and guessing one would make a 400 look like a credential failure.
+        return (
+            "An NTW customer number is required. It is the 10-digit account number NTW "
+            "confirmed, and it is also saved with your product feed credentials.",
+            CONNECTION_ERROR_INVALID_INPUT,
+        )
+
+    try:
         client.get_tire_inventory(
             customer_id,
-            [{"tireSize": {"width": "225", "ratio": "55", "diameter": "16"}, "requestedQty": 1}],
+            [{"tireSize": {"width": "225", "ratio": "55", "diameter": "16"}, "requestedQty": 0}],
             dealer_code=(credentials.get(src_constants.NTW_ORDER_CREDENTIALS_DEALER_CODE) or "").strip() or None,
             store_number=(credentials.get(src_constants.NTW_ORDER_CREDENTIALS_STORE_NUMBER) or "").strip() or None,
         )
     except ntw_exceptions.NtwApiNotConfiguredError as e:
         return str(e), CONNECTION_ERROR_CONNECTION_FAILED
-    except ntw_exceptions.NtwApiBusinessError as e:
-        return str(e), CONNECTION_ERROR_INVALID_CREDENTIALS
+    except ntw_exceptions.NtwApiError as e:
+        if e.status == 401:
+            return (
+                "TBC rejected this API key and secret. Re-copy them from your application in "
+                "TBC's developer portal -- the secret is shown only once.",
+                CONNECTION_ERROR_INVALID_CREDENTIALS,
+            )
+        if e.status == 403:
+            return (
+                "TBC accepted the key but the application is not subscribed to the "
+                "InventoryService and OrderService plans. Subscribe it in the portal and try "
+                "again.",
+                CONNECTION_ERROR_CONNECTION_FAILED,
+            )
+        if e.status == 400:
+            # TBC's own wording is "Customer id - 0012345678 is invalid". The credentials are
+            # fine; the number is not -- so this is the dealer's input, not a connection fault.
+            return str(e), CONNECTION_ERROR_INVALID_INPUT
+        return str(e), CONNECTION_ERROR_CONNECTION_FAILED
     except ntw_exceptions.NtwException as e:
         return str(e), CONNECTION_ERROR_CONNECTION_FAILED
     return None, None

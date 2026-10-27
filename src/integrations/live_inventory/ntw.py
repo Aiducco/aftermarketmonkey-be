@@ -11,11 +11,16 @@ number. An earlier version asked for the whole tire SIZE and filtered, because t
 string does not parse -- commercial and farm sizes, ~4% of the feed -- could not be refreshed at
 all. Direct lookup has no such hole.
 
-**Its credentials come from two places.** The gateway client id/secret are account-level and live
-in settings; ``customer_id`` is per-dealer and lives on the connection. Every other live-inventory
-provider reads exactly one credential namespace (see this package's registry docstring), so this
-split is deliberate rather than an oversight -- and the dealer-specific half is the half that is
-usually missing, since TBC issues it separately from the feed login.
+**Its credentials come from two places, and neither is ours.** Each dealer creates their own
+application in TBC's developer portal and subscribes it to the InventoryService plan, so the
+gateway key/secret live on that company's ORDER account -- the same namespace Keystone uses for
+the same reason, its stock check being part of the order service. ``customer_id`` is the
+dealer's NTW account number and is collected with the feed login. Every other live-inventory
+provider reads exactly one namespace, so this split is deliberate rather than an oversight.
+
+Missing either one raises ValueError, which the registry turns into None, which the product page
+reads as "live check not available for this connection" -- a disabled affordance rather than a
+failing click.
 """
 import logging
 import typing
@@ -68,15 +73,30 @@ class NtwLiveInventoryProvider(base.LiveInventoryProvider):
     def __init__(self, company_provider: src_models.CompanyProviders) -> None:
         base.LiveInventoryProvider.__init__(self, company_provider)
         feed_credentials = credentials_helper.get_feed_credentials(company_provider)
-        self._customer_id = (feed_credentials.get(constants.NTW_CREDENTIALS_CUSTOMER_ID) or "").strip()
+        order_credentials = credentials_helper.get_order_credentials(company_provider)
+        self._customer_id = (
+            order_credentials.get(constants.NTW_ORDER_CREDENTIALS_CUSTOMER_ID)
+            or feed_credentials.get(constants.NTW_CREDENTIALS_CUSTOMER_ID)
+            or ""
+        ).strip()
+        client_id = (order_credentials.get(constants.NTW_ORDER_CREDENTIALS_CLIENT_ID) or "").strip()
+        client_secret = (order_credentials.get(constants.NTW_ORDER_CREDENTIALS_CLIENT_SECRET) or "").strip()
+
+        # ValueError is the registry's convention for "registered, but this connection cannot use
+        # it" -- get_provider() returns None and the product page shows feed values only.
         if not self._customer_id:
-            # Raising ValueError is the registry's convention for "registered but this connection
-            # cannot use it" -- get_provider() returns None and the FE falls back to feed values.
             raise ValueError(
-                "NTW connection {} has no customer_id; live inventory needs TBC's own customer "
-                "number for this dealer.".format(company_provider.id)
+                "NTW connection {} has no customer_id; a live stock check needs the dealer's NTW "
+                "account number.".format(company_provider.id)
             )
-        self._client = ntw_api.NtwApiClient()
+        if not client_id or not client_secret:
+            raise ValueError(
+                "NTW connection {} has no TBC API key/secret. Each dealer creates their own "
+                "application in TBC's developer portal; add it under Ordering.".format(
+                    company_provider.id
+                )
+            )
+        self._client = ntw_api.NtwApiClient(client_id=client_id, client_secret=client_secret)
         self._ship_to = _ship_to_for(company_provider)
 
     # -- part resolution -----------------------------------------------------

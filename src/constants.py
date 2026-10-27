@@ -317,10 +317,10 @@ TIRERACK_CREDENTIALS_SFTP_PASSWORD = "sftp_password"
 # only the login -- same reasoning as Motor State, where host/port being fixed means two fields
 # instead of four and no typo'd hostnames in support tickets.
 #
-# ``customer_id`` is NTW's own account number for this dealer, the one zero-padded into the feed
-# filename (DELTI_0037746990_*.csv -> 37746990). It is NOT needed to read the feed, but it is the
-# join key for the on-demand inventory and order APIs, whose IBM client id/secret are
-# account-level rather than per-dealer. Collected here so a dealer enters it once.
+# ``customer_id`` is the dealer's NTW account number -- the 10-digit value zero-padded into the
+# feed filename (DELTI_0037746990_*.csv). It is not needed to READ the feed, but it identifies
+# the dealer to both TBC APIs and nothing else can stand in for it, so it is collected with the
+# login as a required field rather than left to be chased later.
 NTW_CREDENTIALS_SFTP_USER = "sftp_user"
 NTW_CREDENTIALS_SFTP_PASSWORD = "sftp_password"
 NTW_CREDENTIALS_CUSTOMER_ID = "customer_id"
@@ -336,15 +336,23 @@ NTW_SFTP_OUTBOUND_DIRECTORY = "Outbound"
 NTW_FEED_FILENAME_PREFIX = "DELTI_"
 NTW_FEED_FILENAME_SUFFIX = ".csv"
 
-# CompanyProviderOrderAccount.credentials keys for NTW ordering. The gateway client
-# id/secret are NOT here: TBC registers one application to us and identifies the dealer by
-# customerId in the body, so they are account-level settings (NTW_API_CLIENT_ID /
-# NTW_API_CLIENT_SECRET) rather than per-connection credentials. This is the only provider in
-# the codebase split that way.
+# CompanyProviderOrderAccount.credentials keys for NTW's two TBC APIs (inventory AND ordering).
+#
+# The client id/secret are PER-DEALER, not ours: each dealer signs in to TBC's developer portal
+# with their own NTW login, creates an application, and subscribes it to the InventoryService
+# and OrderService plans. So every connected company brings its own gateway credentials, and
+# there is no single application of ours to provision -- which is also why an unsubscribed app
+# fails with 403 "Not registered to plan" rather than a credential error.
+#
+# They live on the ORDER account even though on-demand stock checks need them too. That is the
+# same split Keystone already has, where CheckInventory is part of the order service rather than
+# the feed; see src.integrations.live_inventory.registry's docstring on credential namespaces.
 #
 # ``customer_id`` is accepted on either namespace -- the onboarding card collects it with the
-# feed login, since the dealer's rep hands over both at once -- and the order account's own
-# value wins when both are present. See orders/ntw.py.
+# feed login, since the dealer gets it from the same rep -- and the order account's own value
+# wins when both are present. See orders/ntw.py.
+NTW_ORDER_CREDENTIALS_CLIENT_ID = "client_id"
+NTW_ORDER_CREDENTIALS_CLIENT_SECRET = "client_secret"
 NTW_ORDER_CREDENTIALS_CUSTOMER_ID = "customer_id"
 NTW_ORDER_CREDENTIALS_DEALER_CODE = "dealer_code"
 NTW_ORDER_CREDENTIALS_STORE_NUMBER = "store_number"
@@ -2559,85 +2567,126 @@ PROVIDER_CATALOG = [
         "connection_required_fields": [
             NTW_CREDENTIALS_SFTP_USER,
             NTW_CREDENTIALS_SFTP_PASSWORD,
-        ],
-        "connection_optional_fields": [
             NTW_CREDENTIALS_CUSTOMER_ID,
         ],
         "order_connection_required_fields": [
-            NTW_ORDER_CREDENTIALS_CUSTOMER_ID,
+            NTW_ORDER_CREDENTIALS_CLIENT_ID,
+            NTW_ORDER_CREDENTIALS_CLIENT_SECRET,
         ],
         "order_connection_optional_fields": [
+            NTW_ORDER_CREDENTIALS_CUSTOMER_ID,
             NTW_ORDER_CREDENTIALS_DEALER_CODE,
             NTW_ORDER_CREDENTIALS_STORE_NUMBER,
         ],
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
-            "<p><strong>NTW</strong> is the wholesale arm of TBC Corporation. NTW posts a tire cost "
-            "and availability file to your dealer account on TBC's secure file server "
-            "(<strong>MOVEit</strong>) four times a day, and AfterMarketScout collects it from "
-            "there. You need a MOVEit login for your NTW account, which your NTW rep arranges.</p>"
+            "<p><strong>NTW</strong> connects with a product feed delivered through TBC "
+            "Corporation&rsquo;s <strong>MOVEit</strong>, plus an API key and secret from "
+            "TBC&rsquo;s developer portal for live stock checks and ordering. One email to NTW "
+            "gets you access to both.</p>"
 
-            "<p><strong>1. Email your NTW rep</strong></p>"
-            "<p>Send the message below to your NTW rep, with "
-            "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a> on CC:</p>"
+            "<p><strong>1. Email NTW</strong></p>"
+            "<p>Send the message below to <strong>Tommy Williams</strong> at "
+            "<a href=\"mailto:twilliams1@ntw.com\">twilliams1@ntw.com</a>, with "
+            "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a> "
+            "on CC:</p>"
             + _CALLOUT_OPEN +
-            "<p>Hi,</p>"
+            "<p>Hi Tommy,</p>"
             "<p>We use AfterMarketScout as our product information management (PIM) and ordering "
-            "platform, and need the following for our NTW account [your account number]:</p>"
+            "platform, and need two things set up for our NTW account [your account number]:</p>"
             "<ol>"
-            "<li>MOVEit feed access. Please have a MOVEit account created for us on "
-            "moveit.tbccorp.com with <strong>SFTP enabled</strong>, so our inventory and pricing "
-            "file can be collected automatically. Send us the username and password.</li>"
-            "<li>Please confirm our NTW customer ID.</li>"
+            "<li><strong>Product feed.</strong> Please set up our product, pricing and inventory "
+            "feed through TBC&rsquo;s MOVEit and send us the login details.</li>"
+            "<li><strong>API access.</strong> Please send us a login for TBC&rsquo;s developer "
+            "portal so we can connect the Inventory and Order APIs.</li>"
             "</ol>"
+            "<p>Could you also confirm our 10-digit NTW customer number?</p>"
+            "<p>I&rsquo;ve copied AfterMarketScout support "
+            "(support@aftermarketscout.com) in case you have any technical questions.</p>"
             "<p>Thanks!</p>"
             "</div>"
 
-            "<p><strong>2. Accept the security notice once</strong></p>"
-            "<p>TBC asks every new MOVEit account to accept a security notice at first sign-in, and "
-            "that has to be done by a person. Sign in once at "
+            "<p><strong>2. Connect the product feed</strong></p>"
+            "<p>When TBC sends your MOVEit login, sign in once at "
             "<a href=\"https://moveit.tbccorp.com\" target=\"_blank\" rel=\"noopener\">moveit.tbccorp.com</a> "
-            "with the credentials your rep sent and accept the notice. Automated collection cannot "
-            "do this step for you, and the feed will not connect until it is done.</p>"
+            "and accept their security notice &mdash; TBC asks every new account to do this, and "
+            "automated collection cannot do it for you.</p>"
+            "<p>Then paste the <strong>username</strong>, <strong>password</strong> and your "
+            "<strong>NTW account number</strong> into the <strong>Product feed</strong> fields "
+            "below and click <strong>Save feed credentials</strong>. The card will show "
+            "<strong>Feed Connected</strong>, and your tires appear after the next file is "
+            "collected. Paste rather than retype &mdash; a stray space is the most common reason "
+            "a connection fails.</p>"
 
-            "<p><strong>3. Connect the product feed</strong></p>"
-            "<p>Paste the <strong>username</strong> and <strong>password</strong> into the "
-            "<strong>Product feed</strong> fields below and click "
-            "<strong>Save feed credentials</strong>. Paste rather than retype, because a stray space "
-            "is the most common reason a connection fails. Add your <strong>NTW customer ID</strong> "
-            "if your rep has confirmed it — it is not needed for the feed, but it is required later "
-            "for live stock checks and ordering.</p>"
-            "<p>The card shows <strong>Feed Connected</strong>, and your tires appear after the next "
-            "file is collected.</p>"
+            "<p><strong>3. Create an application in TBC&rsquo;s developer portal</strong></p>"
+            "<p>Sign in to the "
+            "<a href=\"https://developerqa.tbccorp.com/tbccorp/qa/\" target=\"_blank\" rel=\"noopener\">"
+            "TBC developer portal</a> with the login NTW sent you.</p>"
+            "<p><img src=\"https://api.aftermarketscout.com/uploads/ntw-step3a-tbc-portal-home.png\" "
+            "alt=\"TBC developer portal home, listing InventoryService and OrderService\" "
+            "style=\"max-width:100%;height:auto;\" /></p>"
+            "<p>Go to <strong>Apps</strong> and create a new application:</p>"
+            "<ul>"
+            "<li><strong>Title:</strong> AfterMarketScout</li>"
+            "<li><strong>Description:</strong> AfterMarketScout</li>"
+            "<li><strong>Application OAuth Redirect URL(s):</strong> "
+            "<code>https://api.aftermarketscout.com/api/integrations/ntw/oauth/callback/</code></li>"
+            "</ul>"
+            "<p>Click <strong>Save</strong>.</p>"
+            "<p><img src=\"https://api.aftermarketscout.com/uploads/ntw-step3b-create-application-filled.png\" "
+            "alt=\"Create a new application form, filled in\" "
+            "style=\"max-width:100%;height:auto;\" /></p>"
+
+            "<p><strong>4. Add your API key and secret</strong></p>"
+            "<p>TBC now shows your <strong>Key</strong> and <strong>Secret</strong>. The secret "
+            "is shown <strong>only once</strong>, so copy both before clicking OK.</p>"
+            "<p><img src=\"https://api.aftermarketscout.com/uploads/ntw-step4-key-and-secret.png\" "
+            "alt=\"New application credentials, showing Key and Secret\" "
+            "style=\"max-width:100%;height:auto;\" /></p>"
+            "<p>In AfterMarketScout, click <strong>+ Add account</strong> under "
+            "<strong>Ordering</strong>, enter a label (for example &ldquo;Primary&rdquo;), paste "
+            "the <strong>Key</strong> and <strong>Secret</strong>, and click "
+            "<strong>Add Account</strong>. These credentials power <em>both</em> live stock "
+            "checks and ordering, even though they are entered under Ordering.</p>"
+
+            "<p><strong>5. Subscribe your application to Inventory and Orders</strong></p>"
+            "<p>Back in the portal, open <strong>InventoryService</strong>, click "
+            "<strong>Select</strong> on the Default Plan and choose your AfterMarketScout "
+            "application. Then do the same on <strong>OrderService</strong>. Both are required: "
+            "stock checks use the first and ordering the second.</p>"
+            "<p><img src=\"https://api.aftermarketscout.com/uploads/ntw-step5-default-plan-select.png\" "
+            "alt=\"Default Plan with the Select button\" "
+            "style=\"max-width:100%;height:auto;\" /></p>"
+            "<p>The card will show <strong>Ordering Connected</strong>.</p>"
 
             "<p><strong>What you get</strong></p>"
             "<ul>"
-            "<li>Your own NTW cost per tire, and the quantity on hand at the warehouse that serves "
-            "you, refreshed four times a day.</li>"
+            "<li>Your own NTW cost per tire and the quantity on hand at the warehouse that "
+            "serves you, refreshed four times a day from the feed.</li>"
             "<li>Only tires NTW currently has in stock for you are listed. A tire that sells out "
-            "drops out of the file, and we set it to zero rather than leaving a stale quantity "
-            "behind.</li>"
+            "drops out of the file, and we set it to zero rather than leaving a stale "
+            "quantity behind.</li>"
+            "<li>A live stock check on any tire&rsquo;s page, and ordering with NTW&rsquo;s own "
+            "carrier options.</li>"
             "</ul>"
-
-            "<p><strong>Ordering</strong></p>"
-            "<p>NTW ordering goes through TBC's order API. Enter your <strong>NTW customer ID</strong> "
-            "below, plus your <strong>dealer code</strong> and <strong>store number</strong> if your "
-            "rep gave you them, and click <strong>Save</strong>.</p>"
-            "<p>Before each order we check live availability with NTW and show you which branch can "
-            "fill each line. That check is only valid for 15 minutes, so if you leave an order sitting "
-            "you will be asked to refresh it before it can be sent &mdash; that is deliberate, so an "
-            "order is never placed against stale stock.</p>"
-            "<p>NTW cannot cancel an order through the API once it is placed, so cancellations go to "
-            "your rep directly.</p>"
 
             "<p><strong>Troubleshooting</strong></p>"
             "<ul>"
-            "<li><strong>Feed will not connect.</strong> The most common causes are the security "
-            "notice in step 2 not yet accepted, or SFTP not enabled on the account — ask your rep to "
-            "confirm both.</li>"
-            "<li><strong>Password stopped working.</strong> MOVEit accounts cannot change their own "
-            "password, so a reset has to come from TBC. Ask your rep, then paste the new password "
-            "here.</li>"
+            "<li><strong>Closed the window before copying the secret?</strong> Delete the "
+            "application under Apps and create a new one, then repeat steps 3 to 5.</li>"
+            "<li><strong>Stock checks or orders do not work?</strong> Check that your application "
+            "is subscribed to <em>both</em> InventoryService and OrderService (step 5). An "
+            "unsubscribed application fails with &ldquo;Not registered to plan&rdquo;, which "
+            "looks like a credential problem but is not.</li>"
+            "<li><strong>Stock checks say the customer number is invalid?</strong> It is the "
+            "10-digit number NTW confirmed in step 1, not your MOVEit username.</li>"
+            "<li><strong>Feed connection fails?</strong> Re-paste the MOVEit login, and check the "
+            "security notice in step 2 has been accepted. If it still fails, ask Tommy to confirm "
+            "with TBC that the MOVEit account is active and has SFTP enabled.</li>"
+            "<li><strong>Password stopped working?</strong> MOVEit accounts cannot change their "
+            "own password, so a reset has to come from TBC.</li>"
+            "<li><strong>More than one NTW account?</strong> Each account needs its own portal "
+            "login and its own application. Repeat these steps for each.</li>"
             "</ul>"
         ),
     },
