@@ -2230,6 +2230,17 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/atd_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["username", "password", "client_id", "location"],
+        # API-channel ordering. Deliberately NOTHING required: ATD issues one credential set per
+        # dealer and it covers the catalog feed and the SOAP order service alike, so
+        # ATDOrderAdapter reads the feed namespace and there is nothing for a dealer to re-enter
+        # (unlike Turn 14, whose Order API credentials are genuinely separate from its feed's).
+        #
+        # The optional location override exists because the order service takes a locationnumber
+        # of its own, and a dealer who pulls catalog from one ATD DC may buy from another. Left
+        # empty -- which is the normal case -- ordering uses the location from the feed
+        # credentials above. It is also what makes an API order account creatable at all:
+        # create_order_account refuses a provider whose API field lists are both empty.
+        "order_connection_optional_fields": ["location"],
         # Email-channel ordering — see the matching note on Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
         "email_order_connection_optional_fields": ["account_number", "cc_email", "reply_to_email"],

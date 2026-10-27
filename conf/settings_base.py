@@ -225,6 +225,19 @@ WPS_BASE_URL = os.environ.get("WPS_BASE_URL", "https://api.wps-inc.com")
 # Motor State Distributing read-only catalog/pricing API (see src.integrations.clients.motorstate).
 MOTOR_STATE_BASE_URL = os.environ.get("MOTOR_STATE_BASE_URL", "https://api.motorstate.com")
 
+# American Tire Distributors. Two separate services on the same host, sharing one credential set
+# per dealer location: the REST catalog/pricing API the feed uses (/rs/3_6, see
+# src.integrations.clients.atd.client) and the SOAP order service (/ws/3_6/orders, see
+# src.integrations.clients.atd.order_client).
+#
+# Set ATD_ORDERS_USE_SANDBOX=true to point ORDER placement at testws.atdconnect.com, where
+# placeOrder commits nothing real. Use it to validate a dealer end-to-end before the first live
+# order. It does NOT affect the feed, which always reads production. Note that the sandbox host
+# only serves 3_4, so its responses may lack 3_6 fields.
+ATD_ORDERS_USE_SANDBOX = os.environ.get("ATD_ORDERS_USE_SANDBOX", "").strip().lower() in (
+    "1", "true", "yes",
+)
+
 # Helmet House price/stock feed (see src.integrations.clients.helmet_house). Plain FTP, port 21 --
 # their server offers no TLS at all, so this cannot be upgraded to FTPS like Keystone's. Host and
 # port are fixed here rather than collected per connection: dealers are given only a username and

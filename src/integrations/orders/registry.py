@@ -173,6 +173,7 @@ def get_adapter_unavailable_reason(
 # Self-register each implemented adapter. Imported here (rather than via a Django
 # AppConfig.ready() hook, which this project doesn't use) so registration happens as soon as
 # anything imports this module.
+from src.integrations.orders import atd as _atd  # noqa: E402
 from src.integrations.orders import keystone as _keystone  # noqa: E402
 from src.integrations.orders import meyer as _meyer  # noqa: E402
 from src.integrations.orders import ntw as _ntw  # noqa: E402
@@ -195,3 +196,7 @@ register(src_enums.BrandProviderKind.WHEELPROS.value, _wheelpros.WheelProsOrderA
 # inventory API, which is also where the per-line warehouse is chosen. Submitting is blocked
 # until TBC documents the HMAC signature their order endpoints require.
 register(src_enums.BrandProviderKind.NTW.value, _ntw.NtwOrderAdapter)
+# ATD's ordering is SOAP (/ws/3_6/orders) while its catalog is REST -- same
+# credentials, separate entitlement, so a connected feed does not imply ordering
+# works. See orders/atd.py.
+register(src_enums.BrandProviderKind.ATD.value, _atd.ATDOrderAdapter)
