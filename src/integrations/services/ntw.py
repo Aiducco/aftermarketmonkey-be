@@ -183,6 +183,23 @@ def parse_feed_content(content: bytes) -> typing.List[typing.Dict[str, typing.An
     return rows
 
 
+def _json_safe_row(row: typing.Dict) -> typing.Dict[str, typing.Any]:
+    """
+    Stringify a parsed row for ``NtwParts.raw_data``. The parse step types two columns -- an int
+    quantity and a Decimal cost -- and Django's plain JSONField cannot serialise a Decimal, so
+    writing the dict straight in raises ``TypeError: Object of type Decimal is not JSON
+    serializable`` at upsert time. Same helper, same reason, as TireRack's.
+
+    Strings rather than an encoder on the field: raw_data exists to let us re-parse a feed
+    without re-fetching it, and the feed itself is all text, so text is the honest shape to keep
+    it in.
+    """
+    return {
+        (k if isinstance(k, str) else str(k)): (None if v is None else str(v))
+        for k, v in row.items()
+    }
+
+
 def _brand_key(value: typing.Any) -> typing.Optional[str]:
     text = _clean(value)
     return text.upper() if text else None
@@ -455,7 +472,7 @@ def _parts_from_rows(
             quantity=row.get("quantity"),
             cost=row.get("cost"),
             location_id=row.get("location_id"),
-            raw_data=row,
+            raw_data=_json_safe_row(row),
         )
     return list(by_key.values())
 
