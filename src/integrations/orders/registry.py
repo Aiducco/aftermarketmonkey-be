@@ -175,6 +175,7 @@ def get_adapter_unavailable_reason(
 # anything imports this module.
 from src.integrations.orders import keystone as _keystone  # noqa: E402
 from src.integrations.orders import meyer as _meyer  # noqa: E402
+from src.integrations.orders import ntw as _ntw  # noqa: E402
 from src.integrations.orders import premier as _premier  # noqa: E402
 from src.integrations.orders import rough_country as _rough_country  # noqa: E402
 from src.integrations.orders import turn_14 as _turn_14  # noqa: E402
@@ -190,3 +191,7 @@ register(src_enums.BrandProviderKind.PREMIER_PERFORMANCE.value, _premier.Premier
 # minutes to hours after submit_order returns.
 register(src_enums.BrandProviderKind.ROUGH_COUNTRY.value, _rough_country.RoughCountryEdiOrderAdapter)
 register(src_enums.BrandProviderKind.WHEELPROS.value, _wheelpros.WheelProsOrderAdapter)
+# NTW has no quote endpoint of its own -- orders/ntw.py synthesises the quote from TBC's
+# inventory API, which is also where the per-line warehouse is chosen. Submitting is blocked
+# until TBC documents the HMAC signature their order endpoints require.
+register(src_enums.BrandProviderKind.NTW.value, _ntw.NtwOrderAdapter)

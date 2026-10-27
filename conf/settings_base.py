@@ -297,6 +297,31 @@ TURN14_GLOBAL_CLIENT_SECRET = os.environ.get("TURN14_GLOBAL_CLIENT_SECRET", "")
 # How long a PurchaseOrder's quote stays valid before submit is blocked and a re-quote is
 # required. Distributor pricing/availability can shift between quote and submit; this stops
 # a stale quote from being submitted against materially different real-world stock/pricing.
+# NTW (TBC Corporation) APIs -- the on-demand inventory and order gateway, NOT the MOVEit feed
+# (that is per-dealer and lives in CompanyProviders.credentials). TBC registers ONE application
+# to us and identifies the dealer by customerId in the request body, so these are account-level.
+#
+# Read from the real environment, like everything else here: this module runs before
+# load_dotenv(), so a value in .env alone will not be seen.
+NTW_API_CLIENT_ID = os.environ.get("NTW_API_CLIENT_ID", "")
+NTW_API_CLIENT_SECRET = os.environ.get("NTW_API_CLIENT_SECRET", "")
+# QA is the only base URL TBC has given us; their docs list it for "Production, Development"
+# both, which cannot be right for production. Ask before pointing this at anything live.
+NTW_API_BASE_URL = os.environ.get(
+    "NTW_API_BASE_URL", "https://tbcservicesqa.tbccorp.com/tbccorp/qa/tbc/api"
+)
+# Path to a PEM bundle containing the "Go Daddy Secure Certificate Authority - G2" intermediate.
+# TBC's gateway serves only its leaf certificate, so without this requests cannot build a chain
+# and every call fails with "unable to get local issuer certificate". Browsers hide the problem
+# by fetching the intermediate themselves; requests does not. Unset means the API refuses to
+# make calls rather than skipping verification -- see clients/ntw/api_client.py.
+NTW_API_CA_BUNDLE = os.environ.get("NTW_API_CA_BUNDLE", "")
+# Shared secret for the HMAC SHA-256 signature TBC's order endpoints require. Unset blocks
+# ordering outright: what string TBC signs is still undocumented, and sending an unsigned or
+# wrongly-signed order is worse than not sending it (they publish no acknowledgement we could
+# check it against).
+NTW_API_SIGNING_SECRET = os.environ.get("NTW_API_SIGNING_SECRET", "")
+
 PURCHASE_ORDER_QUOTE_TTL_MINUTES = int(os.environ.get("PURCHASE_ORDER_QUOTE_TTL_MINUTES", "15"))
 
 # Keystone FTP (implicit FTPS, port 990)

@@ -1,7 +1,9 @@
 # NTW (TBC Corporation) — Full Integration Plan
 
-**Status:** feed implemented 2026-10-27 (Phases 1-4 + product-type classification). Ordering
-deferred by decision -- see §9, which stays a plan. Last verified live 2026-10-27.
+**Status:** fully implemented 2026-10-27 -- feed (Phases 1-4), product-type classification,
+on-demand inventory (Phase 6) and ordering (Phase 7). Ordering cannot be *enabled* until TBC
+answers two questions (the HMAC signature spec and each dealer's API `customerId`); the adapter
+refuses to send rather than guessing. Last verified live 2026-10-27.
 
 **What landed:** `BrandProviderKind.NTW = 41`, the `PROVIDER_CATALOG` entry with onboarding
 instructions, four models + `migrations/0233_ntw_models.py`, `clients/ntw/` (SFTP, host-key
@@ -9,6 +11,11 @@ pinned), `services/ntw.py` (parse, brand mapping, catalog ingest, zero-out, per-
 five `master_parts` functions wired into all three `sync_all` orchestrators, the feed connection
 validator, `_PRICING_SYNC_KINDS` + `_fetch_raw_pricing`, both cron entrypoints, and
 `tests/test_ntw_feed.py` against a 19-row fixture of real rows.
+
+**Then (same day):** `clients/ntw/api_client.py` for TBC's gateway (criteria chunked in pairs,
+200-with-error-body handling, CA-bundle enforcement, isolated HMAC signer),
+`live_inventory/ntw.py` + registry, `orders/ntw.py` + registry, the order-connection validator,
+the `NTW_API_*` settings, and `tests/test_ntw_api.py`.
 
 NTW is the wholesale arm of **TBC Corporation**. Everything is TBC-branded underneath: the
 feed is a TBC MOVEit server, the APIs are a TBC IBM API Connect gateway. There is no "NTW"
@@ -188,7 +195,7 @@ blank. Nullable means unknown, never false — `is_3pmsf` especially.
 
 No `WheelSpec` work. If TBC later sends wheels, that is a separate phase.
 
-## 8. Phase 6 — on-demand live inventory
+## 8. Phase 6 — on-demand live inventory (implemented)
 
 `src/integrations/live_inventory/ntw.py`, registered in that package's `registry.py`.
 Interface is one method: `refresh(provider_part) -> ProviderPartInventory`
@@ -215,7 +222,7 @@ is per-dealer. So the pair lives in settings/env and the `customerId` lives in t
 `credentials["feed"]`. That split is new — every existing live-inventory provider reads one
 namespace — and is worth a comment in the class.
 
-## 9. Phase 7 — ordering adapter
+## 9. Phase 7 — ordering adapter (implemented, not enableable)
 
 `src/integrations/orders/ntw.py` implementing `DistributorOrderAdapter`
 (`src/integrations/orders/base.py:281`), registered in `orders/registry.py`.
@@ -245,9 +252,13 @@ Two consequences for us:
 `location`, `pickUpPhone`, `trackingNumber` → `OrderStatusResult`.
 
 **Signing.** Both order calls take `timestamp` and a `signature` (HMAC SHA-256) query
-parameter. We do not know what string is signed or with which key — that is §10 Q4 and it
-blocks this phase. Build the signer as one small isolated function so the canonicalization can
-change without touching the adapter.
+parameter, and TBC has not documented what string is signed (their example value is
+`"demiwiru"`). Implemented as `NtwApiClient._signature` — one isolated method using the
+conventional construction (timestamp + compact sorted body, keyed with the shared secret) so the
+canonicalization can be corrected without touching the adapter. With `NTW_API_SIGNING_SECRET`
+unset it **raises** rather than sending an unsigned order: TBC publishes no acknowledgement we
+could check a wrong signature against, so a silently-accepted-but-unsigned order and one
+rejected hours later are both worse than not sending.
 
 **Capabilities:** `supports_cancel()` → `False` (no cancel endpoint exists);
 `supports_shipping_method_selection()` → `True` (`carrierServiceCode`/`SCAC` per line);

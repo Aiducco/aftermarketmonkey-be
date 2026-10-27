@@ -293,13 +293,21 @@ class Command(BaseCommand):
         """Validates and stores status on EVERY given account individually — each one is its own
         source of truth (see CompanyProviderOrderAccount's docstring) — then mirrors whichever
         account is currently the connection's default onto CompanyProviders.order_status/..."""
-        validator = integrations_services._ORDER_CONNECTION_VALIDATORS[kind]
         feed_status_enum = integrations_services._order_gating_feed_status_enum(cp)
         any_updated = False
         for account in accounts:
-            message, _code = validator(account.credentials)
+            # Channel-first, matching orders.registry.get_adapter and the connect/update
+            # endpoints. Picking the validator by kind alone meant an EMAIL-channel account was
+            # measured against the API channel's credentials: a Rough Country shop ordering by
+            # email was told "Both the FTP username and password from Alluvia are required",
+            # which is not something that shop has ever been asked for or could act on. Keystone
+            # had the same latent mismatch, since it also has both a validator and email
+            # accounts.
+            validated, message, _code = integrations_services._validate_order_connection_for_method(
+                kind, account.order_method, account.credentials
+            )
             status, reason = integrations_services._resolve_order_status(
-                order_validated=(message is None),
+                order_validated=validated,
                 order_val_error=message,
                 feed_status_enum=feed_status_enum,
             )

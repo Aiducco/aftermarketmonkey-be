@@ -49,6 +49,7 @@ from src.integrations.edi import exceptions as edi_exceptions
 from src.integrations.edi import transport as edi_transport
 from src.integrations.clients.the_wheel_group import client as the_wheel_group_client
 from src.integrations.clients.the_wheel_group import exceptions as the_wheel_group_exceptions
+from src.integrations.clients.ntw import api_client as ntw_api_client
 from src.integrations.clients.ntw import exceptions as ntw_exceptions
 from src.integrations.clients.ntw import sftp_client as ntw_client
 from src.integrations.clients.tirerack import client as tirerack_client
@@ -999,6 +1000,39 @@ def _validate_rough_country_order_connection(credentials: typing.Dict[str, typin
 # both "feed" and "order" are optional at connect/update time, either may be submitted alone).
 # Populated per vendor as each order adapter's transport client is built (see
 # src/integrations/orders/).
+def _validate_ntw_order_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
+    """
+    Checks the customerId by actually using it: TBC's inventory API rejects a bad one loudly
+    (``400 Customer id - 00... is invalid``) while a good one returns rows, so one cheap call
+    settles it. Worth doing at connect time because this value is the one nobody can derive --
+    it is NOT the account number in the dealer's feed filename, despite the two looking alike.
+
+    A gateway/configuration failure is reported as a connection failure rather than bad input:
+    the dealer's number may be perfectly correct while our own API credentials, plan subscription
+    or CA bundle are not, and telling them to re-check their customer ID would send them chasing
+    something that is not wrong.
+    """
+    customer_id = (credentials.get(src_constants.NTW_ORDER_CREDENTIALS_CUSTOMER_ID) or "").strip()
+    if not customer_id:
+        return "An NTW customer ID is required to place orders.", CONNECTION_ERROR_INVALID_INPUT
+
+    try:
+        client = ntw_api_client.NtwApiClient()
+        client.get_tire_inventory(
+            customer_id,
+            [{"tireSize": {"width": "225", "ratio": "55", "diameter": "16"}, "requestedQty": 1}],
+            dealer_code=(credentials.get(src_constants.NTW_ORDER_CREDENTIALS_DEALER_CODE) or "").strip() or None,
+            store_number=(credentials.get(src_constants.NTW_ORDER_CREDENTIALS_STORE_NUMBER) or "").strip() or None,
+        )
+    except ntw_exceptions.NtwApiNotConfiguredError as e:
+        return str(e), CONNECTION_ERROR_CONNECTION_FAILED
+    except ntw_exceptions.NtwApiBusinessError as e:
+        return str(e), CONNECTION_ERROR_INVALID_CREDENTIALS
+    except ntw_exceptions.NtwException as e:
+        return str(e), CONNECTION_ERROR_CONNECTION_FAILED
+    return None, None
+
+
 _ORDER_CONNECTION_VALIDATORS: typing.Dict[int, typing.Callable[[typing.Dict[str, typing.Any]], _ValidatorResult]] = {
     src_enums.BrandProviderKind.TURN_14.value: _validate_turn14_order_connection,
     src_enums.BrandProviderKind.KEYSTONE.value: _validate_keystone_order_connection,
@@ -1007,6 +1041,7 @@ _ORDER_CONNECTION_VALIDATORS: typing.Dict[int, typing.Callable[[typing.Dict[str,
     src_enums.BrandProviderKind.PREMIER_PERFORMANCE.value: _validate_premier_order_connection,
     src_enums.BrandProviderKind.WHEELPROS.value: _validate_wheelpros_order_connection,
     src_enums.BrandProviderKind.ROUGH_COUNTRY.value: _validate_rough_country_order_connection,
+    src_enums.BrandProviderKind.NTW.value: _validate_ntw_order_connection,
 }
 
 

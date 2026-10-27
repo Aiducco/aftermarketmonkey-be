@@ -428,3 +428,56 @@ class OrderConnectionValidationTests(SimpleTestCase):
                 {"ftp_user": "TridentRC", "ftp_password": "TridentRC@64"}
             )
         self.assertNotIn("TridentRC@64", message)
+
+
+class OrderStatusChannelDispatchTests(SimpleTestCase):
+    """
+    The periodic connection check must pick its validator by the account's CHANNEL, not by the
+    distributor's kind.
+
+    Picking by kind alone measured an email-channel account against the API channel's
+    credentials. A Rough Country shop ordering by email was told "Both the FTP username and
+    password from Alluvia are required" -- something that shop had never been asked for and
+    could not act on. Keystone carries the same mismatch latently, since it also has both an API
+    validator and live email accounts.
+    """
+
+    def _for_method(self, kind, method, credentials):
+        from src.api.services import integrations
+
+        return integrations._validate_order_connection_for_method(kind, method, credentials)
+
+    def test_an_email_account_is_not_measured_against_the_api_validator(self):
+        from src import enums as src_enums
+
+        validated, message, _code = self._for_method(
+            src_enums.BrandProviderKind.KEYSTONE.value,
+            src_enums.OrderMethod.EMAIL.value,
+            {"rep_email": "rep@keystone.com"},
+        )
+        self.assertTrue(validated)
+        self.assertIsNone(message)
+
+    def test_an_email_account_on_a_withdrawn_channel_says_so(self):
+        from src import enums as src_enums
+
+        validated, message, code = self._for_method(
+            src_enums.BrandProviderKind.ROUGH_COUNTRY.value,
+            src_enums.OrderMethod.EMAIL.value,
+            {"rep_email": "rep@roughcountry.com"},
+        )
+        self.assertFalse(validated)
+        self.assertIn("no longer accepts orders by email", message)
+        self.assertNotIn("FTP", message)
+
+    def test_an_api_account_still_gets_the_api_validator(self):
+        from src import enums as src_enums
+
+        with mock.patch("socket.create_connection", side_effect=OSError("timed out")):
+            validated, message, _code = self._for_method(
+                src_enums.BrandProviderKind.ROUGH_COUNTRY.value,
+                src_enums.OrderMethod.API.value,
+                {"ftp_user": "u", "ftp_password": "p"},
+            )
+        self.assertFalse(validated)
+        self.assertIn("allowlisted", message)

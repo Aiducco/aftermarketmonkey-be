@@ -60,6 +60,7 @@ def get_provider(
 # this module.
 from src.integrations.live_inventory import keystone as _keystone  # noqa: E402
 from src.integrations.live_inventory import meyer as _meyer  # noqa: E402
+from src.integrations.live_inventory import ntw as _ntw  # noqa: E402
 from src.integrations.live_inventory import premier as _premier  # noqa: E402
 from src.integrations.live_inventory import tristate as _tristate  # noqa: E402
 from src.integrations.live_inventory import turn_14 as _turn_14  # noqa: E402
@@ -71,3 +72,4 @@ register(src_enums.BrandProviderKind.MEYER.value, _meyer.MeyerLiveInventoryProvi
 register(src_enums.BrandProviderKind.PREMIER_PERFORMANCE.value, _premier.PremierLiveInventoryProvider)
 register(src_enums.BrandProviderKind.WHEELPROS.value, _wheelpros.WheelProsLiveInventoryProvider)
 register(src_enums.BrandProviderKind.TRI_STATE.value, _tristate.TriStateLiveInventoryProvider)
+register(src_enums.BrandProviderKind.NTW.value, _ntw.NtwLiveInventoryProvider)
