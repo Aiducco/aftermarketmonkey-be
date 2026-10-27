@@ -161,7 +161,25 @@ ROUGH_COUNTRY_EDI_CREDENTIALS_SENDER_ID = "edi_sender_id"
 # receiver id themselves: the receiver id and ISA15 must agree, and a mismatch is how a test
 # file ends up placing a real order.
 ROUGH_COUNTRY_EDI_CREDENTIALS_ENVIRONMENT = "edi_environment"
+# Per-account override of Alluvia's hostname. Not offered on the connection form: Alluvia runs
+# one platform host for every dealer, so settings.ROUGH_COUNTRY_EDI_FTP_HOST is the single place
+# it changes. Kept readable here so a one-off dealer on a different host needs a credential, not
+# a release.
 ROUGH_COUNTRY_EDI_CREDENTIALS_FTP_HOST = "ftp_host"
+
+# Alluvia host and provision Rough Country's EDI mailboxes, so they -- not Rough Country -- are
+# who actually issues a dealer's FTP login. Rough Country still has to authorise the request
+# first (their customer service team owns that), which is why the dealer emails Rough Country
+# and copies Alluvia rather than going straight to Alluvia.
+ALLUVIA_EDI_CONTACT_NAME = "Michael McBride"
+ALLUVIA_EDI_CONTACT_EMAIL = "michaelm@alluviaplatform.com"
+
+# Rough Country's own EDI owner. A dealer's request is authorised by Rough Country's customer
+# service team, but this is who runs the EDI programme and told us EDI is their preferred
+# ordering channel -- copying him keeps a request from stalling in a queue that does not know
+# what EDI is.
+ROUGH_COUNTRY_EDI_CONTACT_NAME = "Jonathan Thompson"
+ROUGH_COUNTRY_EDI_CONTACT_EMAIL = "jthompson1@roughcountry.com"
 # Alluvia restricts their FTP by source IP. From an unlisted address every port silently times
 # out rather than refusing, so this is the first thing to check when ordering "does nothing".
 ROUGH_COUNTRY_EDI_ALLOWLIST_IP = "5.161.121.143"
@@ -646,14 +664,26 @@ PROVIDER_CATALOG = [
         "order_connection_required_fields": [
             ROUGH_COUNTRY_EDI_CREDENTIALS_FTP_USER,
             ROUGH_COUNTRY_EDI_CREDENTIALS_FTP_PASSWORD,
-            ROUGH_COUNTRY_EDI_CREDENTIALS_SENDER_ID,
         ],
         # edi_environment is "test" (default) or "production", per company — one dealer can be
         # live while another is still testing. Anything but the exact word "production" is
         # treated as test, so a typo can never start placing real orders.
+        # Optional to the DEALER, required by the integration: both of these are ours to set
+        # once Alluvia has issued the mailbox, and neither is something a shop can know or
+        # should have to type.
+        #
+        # edi_sender_id is the shop's own ISA06/GS02, which Alluvia assigns. Ordering stays
+        # unavailable until it is present -- edi_config raises ValueError without it, which
+        # orders.registry reports as "not configured yet" rather than crashing.
+        #
+        # edi_environment defaults to PRODUCTION: the integration is proven, so a new dealer is
+        # live as soon as Alluvia has issued their mailbox. It is still a field rather than a
+        # constant because test mode has to remain reachable per dealer -- Trident is pinned to
+        # "test" while it is verified with Alluvia -- and because an unrecognised value raises
+        # rather than being guessed in either direction (see edi_config).
         "order_connection_optional_fields": [
+            ROUGH_COUNTRY_EDI_CREDENTIALS_SENDER_ID,
             ROUGH_COUNTRY_EDI_CREDENTIALS_ENVIRONMENT,
-            ROUGH_COUNTRY_EDI_CREDENTIALS_FTP_HOST,
         ],
         # Email-channel ordering, kept as the fallback for dealers who are not set up on EDI
         # yet: orders.registry is channel-first, so an account whose order_method is EMAIL
@@ -688,62 +718,91 @@ PROVIDER_CATALOG = [
             "The card will show <strong>Feed Connected</strong>.</p>"
 
             "<p><strong>Ordering (set up separately)</strong></p>"
-            "<p>The feed above covers catalog, pricing and fitment. <strong>Placing orders</strong> uses Rough "
-            "Country's EDI, hosted by Alluvia on their behalf, with its own credentials issued per dealer. You "
-            "can connect the feed now and add ordering later.</p>"
-
-            "<p><strong>1. Ask Rough Country for EDI access</strong></p>"
-            "<p>Rough Country routes these requests through their customer service team. Email them with your "
-            "dealer account number, with <a href=\"mailto:support@aftermarketscout.com\">"
-            "support@aftermarketscout.com</a> on CC:</p>"
+            "<p>The feed above covers catalog, pricing and fitment. <strong>Placing orders</strong> goes "
+            "through Rough Country's EDI, which Alluvia runs on their behalf. It has its own credentials, "
+            "issued per dealer, so it's a separate step &mdash; connect the feed now and add ordering "
+            "whenever you're ready.</p>"
+            "<p>Two parties are involved, which is worth knowing before you start: <strong>Rough Country</strong> "
+            "approves the request, and <strong>Alluvia</strong> then issues your login. Emailing Alluvia first "
+            "just means waiting for Rough Country anyway, so send one email to Rough Country and copy Alluvia "
+            "on it.</p>"
+            "<p><strong>What we need from you</strong></p>"
+            "<ul>"
+            "<li>An <strong>active Rough Country dealer account</strong> with jobber pricing. EDI ordering "
+            "isn't available on a retail account.</li>"
+            "<li>Your <strong>Rough Country dealer account number</strong>.</li>"
+            "<li>The <strong>name and email of your Rough Country contact</strong> &mdash; your sales rep, or "
+            "their customer service team. They're the ones who authorise EDI on your account.</li>"
+            "</ul>"
+            "<p>That's it. The FTP login comes from Alluvia, and the technical EDI settings are ours to fill "
+            "in once they've issued it.</p>"
+            "<p><strong>1. Email Rough Country, copying their EDI lead, Alluvia and us</strong></p>"
+            "<p>Send this to your own Rough Country contact, and put all three of these on CC:</p>"
+            "<ul>"
+            "<li><strong>" + ROUGH_COUNTRY_EDI_CONTACT_EMAIL + "</strong> &mdash; "
+            + ROUGH_COUNTRY_EDI_CONTACT_NAME + ", who runs EDI at Rough Country</li>"
+            "<li><strong>" + ALLUVIA_EDI_CONTACT_EMAIL + "</strong> &mdash; " + ALLUVIA_EDI_CONTACT_NAME
+            + ", Alluvia's EDI team, who issue the login</li>"
+            "<li><a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a> &mdash; us</li>"
+            "</ul>"
             + _CALLOUT_OPEN
-            + "<p>Hi,</p>"
-            "<p>We'd like to set up EDI ordering with Rough Country through Alluvia for our account "
+            + "<p>Hi [Rough Country contact],</p>"
+            "<p>We'd like to enable EDI ordering on our Rough Country account "
             "<strong>[your account number]</strong>.</p>"
-            "<p>Our integration partner is AfterMarket Scout, copied here. Could you have Alluvia send us the "
-            "FTP credentials and our EDI trading-partner ID, and allowlist the IP address "
-            "<strong>" + ROUGH_COUNTRY_EDI_ALLOWLIST_IP + "</strong> so we can connect?</p>"
+            "<p>Copying " + ROUGH_COUNTRY_EDI_CONTACT_NAME + " at Rough Country, "
+            + ALLUVIA_EDI_CONTACT_NAME + " at Alluvia, who hosts your EDI, and AfterMarket Scout, our "
+            "integration partner &mdash; they'll handle the technical setup between them.</p>"
+            "<p>Once approved, could Alluvia send the FTP login and our EDI trading-partner ID, and allowlist "
+            "the IP address <strong>" + ROUGH_COUNTRY_EDI_ALLOWLIST_IP + "</strong>?</p>"
             "<p>Thank you,<br />[your name]</p>"
             + "</div>"
-
-            "<p><strong>2. Enter the credentials Alluvia sends</strong></p>"
-            "<p>They provide an <strong>FTP username</strong>, an <strong>FTP password</strong> and your "
-            "<strong>EDI ID</strong> &mdash; the trading-partner code that identifies your shop to Rough "
-            "Country. Paste all three into the ordering fields below.</p>"
-
-            "<p><strong>3. Check the IP allowlist</strong></p>"
-            "<p>Alluvia restricts their FTP by IP address. Until they allowlist "
-            "<code>" + ROUGH_COUNTRY_EDI_ALLOWLIST_IP + "</code>, every connection times out silently rather "
-            "than reporting an error, so confirm they have done it.</p>"
-
-            "<p><strong>4. Leave Environment set to Test at first</strong></p>"
-            "<p><strong>Test</strong> sends your orders to Rough Country's test system, so you and Alluvia can "
-            "verify the connection end to end without anything shipping or being invoiced. Switch to "
-            "<strong>Production</strong> only once Alluvia confirms you're live &mdash; from that point every "
-            "order you submit is real.</p>"
-
+            "<p>All three CCs matter. Rough Country's customer service team authorises the request, their EDI "
+            "lead makes sure it doesn't stall in a queue that doesn't know what EDI is, and Alluvia is who "
+            "actually creates the mailbox. On one thread it happens in a single pass instead of three "
+            "hand-offs.</p>"
+            "<p><strong>2. Enter the FTP login</strong></p>"
+            "<p>Alluvia replies with an <strong>FTP username</strong> and <strong>FTP password</strong>. Those "
+            "are the only two things you need to enter &mdash; paste them into the ordering fields below and "
+            "save.</p>"
+            "<p>Their reply will also contain an <strong>EDI ID</strong> (they may call it your ISA ID, GS ID "
+            "or trading-partner ID) and confirmation of the IP allowlist. You don't need to do anything with "
+            "those &mdash; we're on the thread and we'll configure them. Leave the remaining fields blank.</p>"
+            "<p><strong>3. You're live straight away</strong></p>"
+            "<p>Once the FTP login is saved, ordering is live &mdash; the orders you place are real orders "
+            "and Rough Country ships against them. There's no separate activation step and nothing further "
+            "for you to do.</p>"
+            "<p>Place a small order first if you'd rather see the whole round trip before relying on it. It "
+            "will ship like any other, and you'll see it move from Submitted to Confirmed, then pick up "
+            "tracking and an invoice as Rough Country sends them.</p>"
+            "<p><strong>If you have more than one Rough Country account</strong></p>"
+            "<p>Each account gets its own EDI ID and its own FTP login, so send the request for each one and "
+            "add them as separate ordering accounts. Don't reuse one login across accounts &mdash; it's how "
+            "Rough Country tells your orders apart.</p>"
             "<p><strong>What to expect when ordering</strong></p>"
             "<ul>"
-            "<li><strong>Orders are confirmed a little later, not instantly.</strong> An order shows as "
-            "<strong>Submitted</strong> once we deliver it to Rough Country, and becomes "
+            "<li><strong>Orders confirm shortly after, not instantly.</strong> An order shows as "
+            "<strong>Submitted</strong> once we've delivered it to Rough Country, and turns "
             "<strong>Confirmed</strong> when they acknowledge it &mdash; usually within a few hours.</li>"
-            "<li><strong>No shipping quote up front.</strong> You choose a shipping method, but Rough Country "
+            "<li><strong>No shipping quote up front.</strong> You pick a shipping method, but Rough Country "
             "doesn't price freight until they invoice, after the goods ship.</li>"
             "<li><strong>Tracking arrives with the shipment notice</strong>, not at order time.</li>"
+            "<li><strong>The invoice is the authority on what you're charged.</strong> Rough Country prices "
+            "from their own system, so figures shown at order time are indicative.</li>"
             "<li><strong>Orders can't be cancelled through the integration.</strong> Call Rough Country "
             "customer service.</li>"
             "</ul>"
-
             "<p><strong>Troubleshooting</strong></p>"
             "<ul>"
             "<li><strong>No JOBBER card?</strong> Jobber pricing may not be enabled on your account. Ask your "
             "Rough Country rep.</li>"
-            "<li><strong>More than one account?</strong> Each account has its own URL. Repeat these steps for "
+            "<li><strong>More than one account?</strong> Each has its own feed URL. Repeat the feed steps for "
             "each one.</li>"
-            "<li><strong>Orders failing immediately?</strong> Almost always the IP allowlist &mdash; check that "
-            "Alluvia has <code>" + ROUGH_COUNTRY_EDI_ALLOWLIST_IP + "</code>.</li>"
+            "<li><strong>Ordering fails straight away?</strong> Almost always the IP allowlist &mdash; ask "
+            "Alluvia to confirm they have <code>" + ROUGH_COUNTRY_EDI_ALLOWLIST_IP + "</code>.</li>"
             "<li><strong>An order stuck on Submitted?</strong> Rough Country acknowledges on their own "
-            "schedule. If one hasn't been confirmed within a day, contact Alluvia.</li>"
+            "schedule. If one hasn't confirmed within a day, contact us and we'll chase Alluvia.</li>"
+            "<li><strong>Orders look placed but nothing ships?</strong> Tell us &mdash; we can check "
+            "whether Rough Country acknowledged the order at all, which is the usual cause.</li>"
             "</ul>"
         ),
     },

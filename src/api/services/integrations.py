@@ -1,4 +1,5 @@
 import logging
+import socket
 import typing
 
 from django.conf import settings
@@ -43,6 +44,9 @@ from src.integrations.clients.premier import exceptions as premier_exceptions
 from src.integrations.clients.premier import order_client as premier_order_client
 from src.integrations.clients.rough_country import client as rough_country_client
 from src.integrations.clients.rough_country import exceptions as rough_country_exceptions
+from src.integrations.clients.rough_country import edi as rough_country_edi
+from src.integrations.edi import exceptions as edi_exceptions
+from src.integrations.edi import transport as edi_transport
 from src.integrations.clients.the_wheel_group import client as the_wheel_group_client
 from src.integrations.clients.the_wheel_group import exceptions as the_wheel_group_exceptions
 from src.integrations.clients.ntw import exceptions as ntw_exceptions
@@ -72,6 +76,12 @@ _LOG_PREFIX = '[INTEGRATIONS-SERVICES]'
 # Stable error codes returned alongside a human-readable "message" from connect_provider /
 # update_connection, so the frontend can branch on `error_code` (e.g. highlight the password
 # field, or show a "contact distributor support" banner) instead of parsing message text.
+# Rough Country's EDI validator runs inside the dealer's save request, and the likeliest
+# failure is Alluvia's source-IP filter, which does not refuse — it drops. Both timeouts are
+# therefore short enough that a filtered address fails fast instead of hanging the request.
+_ROUGH_COUNTRY_EDI_PROBE_TIMEOUT = 8
+_ROUGH_COUNTRY_EDI_LOGIN_TIMEOUT = 15
+
 CONNECTION_ERROR_MISSING_FIELDS = "missing_fields"
 CONNECTION_ERROR_INVALID_INPUT = "invalid_input"
 CONNECTION_ERROR_INVALID_CREDENTIALS = "invalid_credentials"
@@ -917,6 +927,74 @@ def _validate_wheelpros_order_connection(credentials: typing.Dict[str, typing.An
 
 
 # Order-credential validators — parallel to _CONNECTION_VALIDATORS but for the "order" namespace,
+def _validate_rough_country_order_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
+    """
+    Log in to the dealer's Alluvia FTP mailbox to prove the credentials actually work.
+
+    Only the FTP login is checked, because that is all the dealer enters. ``edi_sender_id`` is an
+    ISA id Alluvia issues alongside it and support fills in afterwards, so its absence must NOT
+    fail validation — the connection is legitimately "credentials good, not order-ready yet"
+    until we add it, and orders.registry already reports that state (edi_config raises
+    ValueError without it).
+
+    Reachability is probed separately from login, on purpose. Alluvia filters their FTP by source
+    IP and an unlisted address gets no refusal at all — every port simply times out. Tested as
+    one step that would surface as "login failed", sending a dealer to re-check a username that
+    was correct all along; tested separately it surfaces as what it is, the allowlist.
+    """
+    user = (credentials.get(src_constants.ROUGH_COUNTRY_EDI_CREDENTIALS_FTP_USER) or "").strip()
+    password = credentials.get(src_constants.ROUGH_COUNTRY_EDI_CREDENTIALS_FTP_PASSWORD) or ""
+    if not user or not password:
+        return (
+            "Both the FTP username and password from Alluvia are required.",
+            CONNECTION_ERROR_MISSING_FIELDS,
+        )
+
+    host = (
+        credentials.get(src_constants.ROUGH_COUNTRY_EDI_CREDENTIALS_FTP_HOST) or ""
+    ).strip() or (getattr(settings, "ROUGH_COUNTRY_EDI_FTP_HOST", "") or "").strip()
+    port = int(getattr(settings, "ROUGH_COUNTRY_EDI_FTP_PORT", 21) or 21)
+    if not host:
+        return "No Rough Country EDI host is configured.", CONNECTION_ERROR_CONNECTION_FAILED
+
+    # Short on purpose: this runs inside the dealer's save request, and the failure we are most
+    # likely to hit is a silent filter, which would otherwise hang until the socket default.
+    try:
+        with socket.create_connection((host, port), timeout=_ROUGH_COUNTRY_EDI_PROBE_TIMEOUT):
+            pass
+    except OSError:
+        return (
+            "Could not reach Rough Country's EDI server at {}. Alluvia restricts it by IP "
+            "address, so this usually means they have not allowlisted {} yet — the credentials "
+            "themselves may be fine.".format(host, src_constants.ROUGH_COUNTRY_EDI_ALLOWLIST_IP),
+            CONNECTION_ERROR_CONNECTION_FAILED,
+        )
+
+    try:
+        with edi_transport.EdiFtpTransport(
+            host=host,
+            user=user,
+            password=password,
+            port=port,
+            use_tls=bool(getattr(settings, "ROUGH_COUNTRY_EDI_FTP_USE_TLS", False)),
+            timeout=_ROUGH_COUNTRY_EDI_LOGIN_TIMEOUT,
+        ) as ftp:
+            # Listing proves the session is usable, not just authenticated. An empty mailbox
+            # returns [] rather than raising, which is the normal state for a new dealer, so
+            # this cannot fail for having no documents waiting.
+            ftp.list_files(rough_country_edi.OUTBOUND_DIRECTORY_TEMPLATE.format("855"))
+    except edi_exceptions.EdiTransportError as e:
+        # The transport's message names the host and user but never the password.
+        return (
+            "Alluvia's FTP would not accept this login. Check the username and password exactly "
+            "as Alluvia sent them — {}".format(e),
+            CONNECTION_ERROR_INVALID_CREDENTIALS,
+        )
+    except (ValueError, OSError) as e:
+        return str(e), CONNECTION_ERROR_CONNECTION_FAILED
+    return None, None
+
+
 # only run when a company actually submits order credentials (see _merge_update_credentials —
 # both "feed" and "order" are optional at connect/update time, either may be submitted alone).
 # Populated per vendor as each order adapter's transport client is built (see
@@ -928,6 +1006,7 @@ _ORDER_CONNECTION_VALIDATORS: typing.Dict[int, typing.Callable[[typing.Dict[str,
     src_enums.BrandProviderKind.TRI_STATE.value: _validate_tristate_order_connection,
     src_enums.BrandProviderKind.PREMIER_PERFORMANCE.value: _validate_premier_order_connection,
     src_enums.BrandProviderKind.WHEELPROS.value: _validate_wheelpros_order_connection,
+    src_enums.BrandProviderKind.ROUGH_COUNTRY.value: _validate_rough_country_order_connection,
 }
 
 

@@ -15,6 +15,7 @@ shipment to every item instead of walking the HL tree.
 import datetime
 import decimal
 import os
+from unittest import mock
 
 from django.test import SimpleTestCase, TestCase
 
@@ -259,8 +260,16 @@ class Parse810Tests(SimpleTestCase):
 
 
 class EdiConfigTests(SimpleTestCase):
-    def test_defaults_to_the_test_environment(self):
+    def test_defaults_to_production(self):
+        """A new dealer is live as soon as Alluvia has issued their mailbox. The integration is
+        proven, so making every shop repeat a test round trip buys nothing."""
         config = edi_config.from_credentials(_CREDS)
+        self.assertEqual(config.receiver_id, "64ROUGHC")
+        self.assertEqual(config.usage_indicator, "P")
+        self.assertTrue(config.is_production)
+
+    def test_test_mode_has_to_be_asked_for_by_name(self):
+        config = edi_config.from_credentials(dict(_CREDS, edi_environment="test"))
         self.assertEqual(config.receiver_id, "64ROUGHCT")
         self.assertEqual(config.usage_indicator, "T")
         self.assertFalse(config.is_production)
@@ -271,13 +280,22 @@ class EdiConfigTests(SimpleTestCase):
         self.assertEqual(config.usage_indicator, "P")
         self.assertTrue(config.is_production)
 
-    def test_an_unrecognised_environment_fails_safe_to_test(self):
-        """'prod' must not be read as production: ISA15=P against the production id is how a
-        test file becomes a real shipment."""
-        for value in ("prod", "live", "PRODUCTIONN", ""):
+    def test_an_unrecognised_environment_is_refused_rather_than_guessed(self):
+        """
+        Guessing is the expensive failure in both directions: read 'tst' as production and a
+        test order ships real goods, read it as test and a real order silently never happens
+        (Rough Country publishes no 997 for our 850s, so nothing reports it). So an
+        unrecognised value surfaces as a misconfigured connection instead.
+        """
+        for value in ("prod", "live", "PRODUCTIONN", "tst", "Production!"):
+            with self.assertRaises(ValueError, msg=value):
+                edi_config.from_credentials(dict(_CREDS, edi_environment=value))
+
+    def test_a_blank_environment_is_production_not_an_error(self):
+        """Blank is the default, which is production -- distinct from a typo."""
+        for value in ("", "   "):
             config = edi_config.from_credentials(dict(_CREDS, edi_environment=value))
-            self.assertEqual(config.usage_indicator, "T", value)
-            self.assertEqual(config.receiver_id, "64ROUGHCT", value)
+            self.assertTrue(config.is_production, value)
 
     def test_environment_is_case_and_whitespace_insensitive(self):
         config = edi_config.from_credentials(dict(_CREDS, edi_environment=" Production "))
@@ -338,3 +356,75 @@ class ControlNumberTests(TestCase):
     def test_blank_partner_id_is_refused(self):
         with self.assertRaises(ValueError):
             control_numbers.next_interchange_control_number("  ")
+
+
+class OrderConnectionValidationTests(SimpleTestCase):
+    """
+    The validator that runs when a dealer saves their FTP login.
+
+    Its real job is telling two failures apart. Alluvia filters their FTP by source IP and an
+    unlisted address is dropped, not refused, so a reachability failure and a rejected password
+    are indistinguishable if you only try to log in -- and the wrong diagnosis sends a dealer
+    to re-check a username that was correct all along.
+    """
+
+    def _validate(self, credentials):
+        from src.api.services import integrations
+
+        return integrations._validate_rough_country_order_connection(credentials)
+
+    def test_both_ftp_fields_are_required(self):
+        for credentials in ({}, {"ftp_user": "TridentRC"}, {"ftp_password": "secret"}):
+            message, code = self._validate(credentials)
+            self.assertEqual(code, "missing_fields", credentials)
+
+    def test_a_missing_edi_sender_id_does_not_fail_validation(self):
+        """The dealer never has it -- Alluvia issues it and support fills it in. The connection
+        is legitimately 'credentials good, not order-ready yet'."""
+        with mock.patch("socket.create_connection"), mock.patch(
+            "src.integrations.edi.transport.EdiFtpTransport"
+        ) as transport:
+            transport.return_value.__enter__.return_value.list_files.return_value = []
+            message, code = self._validate({"ftp_user": "u", "ftp_password": "p"})
+        self.assertIsNone(message)
+        self.assertIsNone(code)
+
+    def test_an_unreachable_host_blames_the_allowlist_not_the_credentials(self):
+        with mock.patch("socket.create_connection", side_effect=OSError("timed out")):
+            message, code = self._validate({"ftp_user": "u", "ftp_password": "p"})
+        self.assertEqual(code, "connection_failed")
+        self.assertIn("allowlisted", message)
+        self.assertIn("credentials themselves may be fine", message)
+
+    def test_a_rejected_login_is_reported_as_bad_credentials(self):
+        from src.integrations.edi import exceptions as edi_exceptions
+
+        with mock.patch("socket.create_connection"), mock.patch(
+            "src.integrations.edi.transport.EdiFtpTransport",
+            side_effect=edi_exceptions.EdiTransportError("530 Login or password incorrect!"),
+        ):
+            message, code = self._validate({"ftp_user": "u", "ftp_password": "wrong"})
+        self.assertEqual(code, "invalid_credentials")
+        self.assertIn("530", message)
+
+    def test_an_empty_mailbox_is_not_a_failure(self):
+        """A new dealer's Outbound folders are empty, which list_files reports as [] -- the
+        normal state, not a broken connection."""
+        with mock.patch("socket.create_connection"), mock.patch(
+            "src.integrations.edi.transport.EdiFtpTransport"
+        ) as transport:
+            transport.return_value.__enter__.return_value.list_files.return_value = []
+            message, code = self._validate({"ftp_user": "u", "ftp_password": "p"})
+        self.assertIsNone(code)
+
+    def test_the_password_is_never_echoed_back(self):
+        from src.integrations.edi import exceptions as edi_exceptions
+
+        with mock.patch("socket.create_connection"), mock.patch(
+            "src.integrations.edi.transport.EdiFtpTransport",
+            side_effect=edi_exceptions.EdiTransportError("Could not connect as TridentRC: 530"),
+        ):
+            message, code = self._validate(
+                {"ftp_user": "TridentRC", "ftp_password": "TridentRC@64"}
+            )
+        self.assertNotIn("TridentRC@64", message)

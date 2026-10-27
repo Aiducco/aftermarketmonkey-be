@@ -174,13 +174,28 @@ Fields: `ftp_user`, `ftp_password`
 
 Login only, same pattern as Keystone. Host is fixed.
 
-### Rough Country — HTTPS feed URL
-Fields: `feed_url`
+### Rough Country — HTTPS feed URL (catalog) + FTP (ordering)
+Fields: `feed_url` for the feed; `ftp_user` / `ftp_password` for ordering.
 
-No login — a ranged request confirms the URL resolves and returns content, without
+**Feed.** No login — a ranged request confirms the URL resolves and returns content, without
 downloading the full spreadsheet. Prefix format is checked before any network call.
 - `invalid_input` — wrong URL prefix
 - `connection_failed` — unreachable / bad HTTP status
+
+**Ordering (EDI over Alluvia's FTP).** A real login against the dealer's Alluvia mailbox.
+Reachability is probed as a separate step before the login, which is the whole point of this
+validator: Alluvia filters their FTP by source IP and an unlisted address is *dropped, not
+refused*, so testing it as one step would report a correct username as a bad credential. The two
+failures therefore carry different messages, and the unreachable one says explicitly that the
+credentials may be fine.
+
+An empty mailbox is not a failure — a new dealer's Outbound folders are empty, which lists as
+`[]`. A missing `edi_sender_id` is not a failure either: the dealer never has it (Alluvia issues
+it and support fills it in), so the connection is legitimately "credentials good, not order-ready
+yet" and `orders.registry` reports that separately.
+- `missing_fields` — username or password absent
+- `connection_failed` — host unreachable, almost always the IP allowlist
+- `invalid_credentials` — FTP returned `530`
 
 ### Meyer, A-Tech — relay-provisioned SFTP
 **Not validated at connect time.** Credentials are ours, generated at connect time — there's

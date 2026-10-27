@@ -118,8 +118,19 @@ def from_credentials(creds: typing.Optional[typing.Dict]) -> RoughCountryEdiConf
         )
 
     raw_environment = (values.get(src_constants.ROUGH_COUNTRY_EDI_CREDENTIALS_ENVIRONMENT) or "").strip().lower()
-    # Fail safe: only the exact string "production" opts a shop into real orders.
-    environment = ENVIRONMENT_PRODUCTION if raw_environment == ENVIRONMENT_PRODUCTION else ENVIRONMENT_TEST
+    if not raw_environment:
+        # Unset means live. The integration is proven; a new dealer only needs their mailbox.
+        environment = ENVIRONMENT_PRODUCTION
+    elif raw_environment in (ENVIRONMENT_TEST, ENVIRONMENT_PRODUCTION):
+        environment = raw_environment
+    else:
+        # Never guess. "tst" resolving to production would ship real goods on a test order, and
+        # resolving to test would make a real order silently never happen.
+        raise ValueError(
+            "Rough Country EDI environment {!r} is not recognised — use {!r} or {!r}.".format(
+                raw_environment, ENVIRONMENT_TEST, ENVIRONMENT_PRODUCTION
+            )
+        )
     receiver_id = _receiver_id_for(environment)
     if not receiver_id:
         raise ValueError("No Rough Country receiver id is configured for the {} environment.".format(environment))

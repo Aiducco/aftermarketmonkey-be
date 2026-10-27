@@ -219,6 +219,28 @@ class AdapterCapabilityTests(RoughCountryEdiFixture):
         self.account.save(update_fields=["credentials"])
         self.assertIsNone(order_registry.get_adapter(self.company_provider, self.account))
 
+    def test_ftp_login_alone_is_saved_but_not_yet_order_ready(self):
+        """
+        A dealer enters only the FTP username and password -- the EDI trading-partner id is an
+        ISA value Alluvia issues alongside it and support fills in. Until it is present the
+        connection must report "not configured" rather than half-work, because an 850 cannot be
+        addressed without a sender id.
+        """
+        self.account.credentials = {"ftp_user": "TridentRC", "ftp_password": "secret"}
+        self.account.save(update_fields=["credentials"])
+        self.assertIsNone(order_registry.get_adapter(self.company_provider, self.account))
+        self.assertIn(
+            "aren't configured",
+            order_registry.get_adapter_unavailable_reason(self.company_provider, self.account),
+        )
+
+        self.account.credentials = dict(self.account.credentials, edi_sender_id="TRIDENT")
+        self.account.save(update_fields=["credentials"])
+        adapter = order_registry.get_adapter(self.company_provider, self.account)
+        self.assertIsInstance(adapter, rough_country_orders.RoughCountryEdiOrderAdapter)
+        # No environment set, so the connection is live -- that is the default for a new dealer.
+        self.assertTrue(adapter.config.is_production)
+
     def test_shipping_methods_are_rough_countrys_own_codes(self):
         methods = self.adapter().list_shipping_methods()
         self.assertEqual([m.code for m in methods], ["55", "58", "78", "79"])
@@ -284,10 +306,19 @@ class AdapterSubmitTests(RoughCountryEdiFixture):
         self.assertEqual(result.line_item_placements, [])
 
     def test_test_environment_addresses_the_test_partner(self):
+        self.set_environment("test")
         _, send = self._submit()
         interchange = x12.parse_interchange(send.call_args[0][2])
         self.assertEqual(interchange.receiver_id, "64ROUGHCT")
         self.assertEqual(interchange.usage_indicator, "T")
+
+    def test_an_account_with_no_environment_addresses_the_production_partner(self):
+        """The default. A new dealer places real orders as soon as their mailbox exists."""
+        self.assertIsNone(self.account.credentials.get("edi_environment"))
+        _, send = self._submit()
+        interchange = x12.parse_interchange(send.call_args[0][2])
+        self.assertEqual(interchange.receiver_id, "64ROUGHC")
+        self.assertEqual(interchange.usage_indicator, "P")
 
     def test_production_environment_addresses_the_production_partner(self):
         self.set_environment("production")
