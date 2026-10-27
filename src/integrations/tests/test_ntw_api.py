@@ -307,3 +307,105 @@ class OrderHelperTests(SimpleTestCase):
         self.assertIsNone(ntw_orders._decimal(""))
         self.assertIsNone(ntw_orders._decimal(None))
         self.assertIsNone(ntw_orders._decimal("n/a"))
+
+
+class _FakeDistributorOrder:
+    def __init__(self, number):
+        self.distributor_order_number = number
+
+
+class _FakeRelated:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def all(self):
+        return self._rows
+
+
+class _FakePurchaseOrder:
+    def __init__(self, numbers):
+        self.distributor_orders = _FakeRelated([_FakeDistributorOrder(n) for n in numbers])
+
+
+def _adapter_with(responses):
+    """
+    An NtwOrderAdapter without its __init__: construction needs a CompanyProviders row and real
+    credentials, and none of the invoice path touches either.
+    """
+    adapter = ntw_orders.NtwOrderAdapter.__new__(ntw_orders.NtwOrderAdapter)
+    adapter._client = type("C", (), {"get_order": staticmethod(lambda oid: responses[oid])})()
+    return adapter
+
+
+def _status_payload(status, **extra):
+    payload = {
+        "status": status,
+        "estDelivery": "2023-11-01T13:50Z",
+        "location": {"id": "3021", "name": "RIVIERA BEACH FL2", "city": "RIVIERA BEACH", "state": "FL"},
+        "pickUpPhone": "(800) 474-9980",
+        "items": [{"brandName": "Sailun", "partNo": "9630377", "qty": 2}],
+    }
+    payload.update(extra)
+    return payload
+
+
+class InvoiceFromOrderStatusTests(SimpleTestCase):
+    """
+    NTW has no invoice endpoint. TBC's status "Delivered" means invoiced OR shipped OR
+    delivered, so it is the only billing signal available and get_invoices is built on it.
+    """
+    databases = []
+
+    def test_a_delivered_order_produces_one_invoice(self):
+        adapter = _adapter_with({"2244850569": _status_payload("Delivered", trackingNumber="1Z999")})
+        invoices = adapter.get_invoices(_FakePurchaseOrder(["2244850569"]))
+        self.assertEqual(len(invoices), 1)
+        inv = invoices[0]
+        self.assertEqual(inv.invoice_number, "2244850569")
+        self.assertEqual(inv.distributor_order_number, "2244850569")
+        self.assertEqual([t.tracking_number for t in inv.tracking], ["1Z999"])
+        self.assertEqual(len(inv.line_items), 1)
+        self.assertEqual(inv.line_items[0].part_number, "9630377")
+        self.assertEqual(inv.line_items[0].quantity, 2)
+        self.assertEqual(inv.line_items[0].warehouse_code, "3021")
+
+    def test_amounts_are_never_invented_from_our_own_quote(self):
+        """An invoice must report what TBC billed. We hold a quote, so these stay blank."""
+        adapter = _adapter_with({"1": _status_payload("Delivered")})
+        inv = adapter.get_invoices(_FakePurchaseOrder(["1"]))[0]
+        self.assertIsNone(inv.total_price)
+        self.assertIsNone(inv.freight)
+        self.assertIsNone(inv.amount_due)
+        self.assertIsNone(inv.paid_amount)
+        self.assertIsNone(inv.invoice_date)
+        self.assertIsNone(inv.line_items[0].unit_price)
+        self.assertIsNone(inv.line_items[0].total_price)
+        self.assertIn("not a real invoice document", inv.comments)
+
+    def test_an_unbilled_or_cancelled_order_yields_no_invoice(self):
+        adapter = _adapter_with({
+            "a": _status_payload("Processing"),
+            "b": _status_payload("Rejected"),
+        })
+        self.assertEqual(adapter.get_invoices(_FakePurchaseOrder(["a", "b"])), [])
+
+    def test_one_po_can_accumulate_several_invoices(self):
+        adapter = _adapter_with({
+            "o1": _status_payload("Delivered", trackingNumber="T1"),
+            "o2": _status_payload("Processing"),
+            "o3": _status_payload("Delivered", trackingNumber="T3"),
+        })
+        invoices = adapter.get_invoices(_FakePurchaseOrder(["o1", "o2", "o3"]))
+        self.assertEqual([i.invoice_number for i in invoices], ["o1", "o3"])
+
+    def test_no_distributor_orders_means_no_call_and_no_invoices(self):
+        adapter = ntw_orders.NtwOrderAdapter.__new__(ntw_orders.NtwOrderAdapter)
+        adapter._client = type("C", (), {"get_order": staticmethod(
+            lambda oid: (_ for _ in ()).throw(AssertionError("should not be called")))})()
+        self.assertEqual(adapter.get_invoices(_FakePurchaseOrder([])), [])
+
+    def test_the_adapter_advertises_invoices(self):
+        adapter = ntw_orders.NtwOrderAdapter.__new__(ntw_orders.NtwOrderAdapter)
+        self.assertTrue(adapter.supports_invoices())
+        self.assertFalse(adapter.supports_cancel())
+        self.assertTrue(adapter.supports_shipping_method_selection())

@@ -527,7 +527,94 @@ class NtwOrderAdapter(base.DistributorOrderAdapter):
         ]
 
     def supports_invoices(self) -> bool:
-        return False
+        return True
+
+    def get_invoices(self, purchase_order: src_models.PurchaseOrder) -> typing.List[base.DistributorInvoice]:
+        """
+        Synthesized from order status, because TBC exposes no invoice endpoint for NTW.
+
+        What makes this possible is the one word in their status vocabulary: "Delivered" means
+        "If the order is Invoiced or Shipped or Delivered" (Order Service v1.0). So an order
+        reaching that state HAS been billed, and that is the only billing signal this
+        integration can observe. "Processing" means confirmed but not yet billed, and "Rejected"
+        means cancelled -- neither produces an invoice.
+
+        Same approach as Keystone, which also has no invoice document and groups its order-history
+        rows into one. The difference, and it is the honest caveat here: Keystone at least has a
+        real invoice number and billed line prices in that feed, and NTW has neither.
+
+          invoice_number   TBC's ORDER id. There is no invoice number anywhere in their API, and
+                           a synthesized one would be a number that exists nowhere on their side
+                           and cannot be quoted back to a rep. comments says so explicitly.
+          money fields     left None. We hold a quote, not a bill. Filling total_price from our
+                           own quoted cost would present an estimate as the amount TBC charged,
+                           which is the one thing an invoice must not do.
+          invoice_date     left None. estDelivery is a delivery estimate, not a billing date.
+
+        What it does carry is real: the billed line items, the fulfilling warehouse, and the
+        tracking number.
+        """
+        distributor_orders = list(purchase_order.distributor_orders.all())
+        if not distributor_orders:
+            return []
+
+        invoices: typing.List[base.DistributorInvoice] = []
+        for distributor_order in distributor_orders:
+            order_number = distributor_order.distributor_order_number
+            try:
+                payload = self._client.get_order(order_number)
+            except ntw_exceptions.NtwApiNotConfiguredError as e:
+                raise order_exceptions.OrderAdapterNotImplementedError(str(e)) from e
+            except ntw_exceptions.NtwException as e:
+                logger.error(
+                    "{} Invoice lookup failed for order {}: {}".format(_LOG_PREFIX, order_number, str(e))
+                )
+                raise order_exceptions.OrderAdapterError(str(e)) from e
+
+            if _delivery_status(str(payload.get("status") or "")) != "delivered":
+                # Not billed yet (Processing), or never will be (Rejected).
+                continue
+
+            location = payload.get("location") or {}
+            warehouse_code = str(location.get("id") or "") or None
+            items = payload.get("items") or []
+            if isinstance(items, dict):
+                items = [items]
+
+            line_items = [
+                base.InvoiceLineItem(
+                    part_number=str(item.get("partNo") or "") or None,
+                    description=str(item.get("brandName") or "") or None,
+                    quantity=int(item["qty"]) if isinstance(item.get("qty"), (int, float)) else None,
+                    warehouse_code=warehouse_code,
+                )
+                for item in items
+            ]
+            tracking_number = str(payload.get("trackingNumber") or "").strip()
+
+            invoices.append(
+                base.DistributorInvoice(
+                    invoice_number=order_number,
+                    distributor_order_number=order_number,
+                    tracking=(
+                        [base.InvoiceTrackingEntry(tracking_number=tracking_number)]
+                        if tracking_number else []
+                    ),
+                    line_items=line_items,
+                    comments=(
+                        "Synthesized from NTW order status, not a real invoice document. TBC "
+                        "exposes no invoice endpoint, and their status 'Delivered' covers "
+                        "invoiced, shipped and delivered alike -- so this records that the order "
+                        "has been billed, not what was billed. The invoice number shown is TBC's "
+                        "ORDER id: they issue no invoice number through this API. Amounts and "
+                        "the invoice date are unavailable and are deliberately left blank rather "
+                        "than filled from our own quote."
+                    ),
+                    raw_response=payload,
+                )
+            )
+
+        return invoices
 
 
 
