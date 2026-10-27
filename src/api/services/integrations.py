@@ -173,6 +173,7 @@ def _merge_update_credentials(
     catalog_entry: typing.Dict[str, typing.Any],
     existing: typing.Optional[typing.Dict[str, typing.Any]],
     patch: typing.Dict[str, typing.Any],
+    order_method: typing.Optional[int] = None,
 ) -> typing.Tuple[typing.Optional[typing.Dict[str, typing.Any]], typing.Optional[str], typing.Optional[str]]:
     """
     Apply a partial patch shaped ``{"feed": {...}, "order": {...}}`` onto the existing namespaced
@@ -183,6 +184,14 @@ def _merge_update_credentials(
     a brand-new connection can be created order-first, with "feed" configured later in a separate
     call — see :func:`connect_provider`, which uses this same function (not a separate "build"
     path) for exactly that reason. Returns (credentials, error_message, error_code).
+
+    ``order_method`` should be the existing connection's default ``CompanyProviderOrderAccount
+    .order_method`` (``None`` for a brand-new connection with no account yet) — it picks which of
+    the catalog's two parallel order field lists apply (see :func:`_order_credential_fields_for_method`).
+    Without it, an EMAIL-method account (e.g. ``cc_email``/``rep_email``) gets validated against the
+    API method's fields (e.g. ``username``/``password``) and fails every subsequent PATCH that
+    touches "order" at all, even one that doesn't change it — confirmed live against a real
+    WheelPros email-order account.
     """
     patch = patch or {}
     if "feed" not in patch and "order" not in patch:
@@ -207,8 +216,11 @@ def _merge_update_credentials(
         if err:
             return None, err, err_code
 
-    order_required = [str(f) for f in (catalog_entry.get("order_connection_required_fields") or [])]
-    order_optional = [str(f) for f in (catalog_entry.get("order_connection_optional_fields") or [])]
+    if order_method is not None:
+        order_required, order_optional = _order_credential_fields_for_method(catalog_entry, order_method)
+    else:
+        order_required = [str(f) for f in (catalog_entry.get("order_connection_required_fields") or [])]
+        order_optional = [str(f) for f in (catalog_entry.get("order_connection_optional_fields") or [])]
     if "order" in patch:
         err, err_code = _merge_namespace_credentials(out["order"], order_required, order_optional, patch.get("order"))
         if err:
@@ -1573,8 +1585,12 @@ def connect_provider(
     # merge/relay baseline below from this connection's actual default account instead, so a
     # feed-only request still correctly carries forward whatever order credentials already exist.
     existing_creds = dict(existing.credentials or {}) if existing else None
+    existing_order_method = None
     if existing:
         existing_creds["order"] = credentials_helper.get_order_credentials(existing)
+        existing_default_account = credentials_helper.get_default_order_account(existing)
+        if existing_default_account:
+            existing_order_method = existing_default_account.order_method
 
     # Distributor-connection cap: only relevant when this call would newly connect this
     # provider's PRODUCT FEED for the first time — relay-provisioned providers always populate
@@ -1611,8 +1627,11 @@ def connect_provider(
         # not run through _merge_update_credentials. "order" (e.g. Meyer's order API creds) is
         # still a normal user-submitted, independently-saveable namespace, same as non-relay.
         user_field, password_field = catalog_entry.get("relay_credential_fields", ("sftp_user", "sftp_password"))
-        order_required = [str(f) for f in (catalog_entry.get("order_connection_required_fields") or [])]
-        order_optional = [str(f) for f in (catalog_entry.get("order_connection_optional_fields") or [])]
+        if existing_order_method is not None:
+            order_required, order_optional = _order_credential_fields_for_method(catalog_entry, existing_order_method)
+        else:
+            order_required = [str(f) for f in (catalog_entry.get("order_connection_required_fields") or [])]
+            order_optional = [str(f) for f in (catalog_entry.get("order_connection_optional_fields") or [])]
         order_creds = dict((existing_creds or {}).get("order") or {})
         order_raw = credentials.get("order") if isinstance(credentials, dict) else None
         if order_raw:
@@ -1658,7 +1677,9 @@ def connect_provider(
         else:
             order_validated, order_status_enum, order_status_reason = None, None, None
     else:
-        creds, err, err_code = _merge_update_credentials(catalog_entry, existing_creds, credentials)
+        creds, err, err_code = _merge_update_credentials(
+            catalog_entry, existing_creds, credentials, order_method=existing_order_method
+        )
         if err:
             return None, err, err_code
 
@@ -1807,10 +1828,12 @@ def update_connection(
     # correctly carries forward whatever order credentials already exist.
     merge_baseline = dict(cp.credentials or {})
     merge_baseline["order"] = credentials_helper.get_order_credentials(cp)
+    default_order_account = credentials_helper.get_default_order_account(cp)
     creds, err, err_code = _merge_update_credentials(
         catalog_entry,
         merge_baseline,
         credentials,
+        order_method=default_order_account.order_method if default_order_account else None,
     )
     if err:
         return None, err, err_code
