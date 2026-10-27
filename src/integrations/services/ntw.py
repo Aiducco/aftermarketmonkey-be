@@ -82,6 +82,25 @@ _NTW_CSV_ENCODINGS = ("utf-8-sig", "utf-8", "cp1252", "latin-1")
 # entries here only with the evidence that made them necessary, as TireRack's equivalent does.
 _NTW_UNMAPPED_SYNC_CANONICAL_BRAND: typing.Dict[str, str] = {}
 
+# Feed brand labels where the fuzzy phase finds a confident-looking match that is WRONG, so it is
+# skipped and a new Brands row is created instead. Each entry is here because the candidate's
+# actual parts were checked, not because the name looked odd:
+#
+#   Advance    -> ADVANCE MANUFACTURING LIMITED (aaia FDNP). Its 39 parts are "CustomFlow
+#                 Louvered Tailgate" and similar -- a truck accessory maker, not the Advance
+#                 tire brand.
+#   Crosswind  -> CRO (aaia A6ND). A line-code brand whose 83 parts are described only as
+#                 "CRO <number>". Nothing identifies them as Crosswind, and unverifiable is not
+#                 a match.
+#   Multi Mile -> MUL (aaia A6RH). Same line-code shape, and its part numbers (TR-1, MHC-48,
+#                 ST-32, BBHC-16) are hitch/towing-shaped rather than tire sizes.
+#
+# Attaching a tire feed to the wrong brand is worse than creating a duplicate: it puts NTW's cost
+# and stock onto another manufacturer's parts, and search would then serve them as that brand.
+# Revisit an entry only by looking at the candidate's parts again, not by re-reading the name.
+_NTW_FUZZY_MATCH_BLOCKLIST = frozenset({"ADVANCE", "CROSSWIND", "MULTI MILE"})
+
+
 _maxint = sys.maxsize
 while True:
     try:
@@ -323,6 +342,8 @@ def sync_unmapped_ntw_brands_to_brands(dry_run: bool = False) -> typing.List[src
     all_brands_fallback: typing.Optional[typing.List[src_models.Brands]] = None
     for nb in unresolved_after_compact:
         source = nb.name or ""
+        if source.strip().upper() in _NTW_FUZZY_MATCH_BLOCKLIST:
+            continue
         parts = normalize_upper_words(source).split()
         candidates: typing.List[src_models.Brands] = []
         if parts:
