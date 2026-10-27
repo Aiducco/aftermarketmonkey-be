@@ -35,7 +35,12 @@ number that some feed rows carry in ``product_id``. A single-SKU lookup therefor
 SKU's tire size and filters the response, which is what ``find_tire_by_part_number`` does.
 """
 import logging
+import os
+import pathlib
+import tempfile
 import typing
+
+import certifi
 
 import requests
 from django.conf import settings
@@ -52,6 +57,11 @@ MAX_CRITERIA_PER_CALL = 2
 STOCK_READ_QTY = 1
 
 DEFAULT_TIMEOUT_SECONDS = 45
+
+# Shipped beside this module; see its header for what each certificate is and why.
+_TBC_CA_CHAIN_FILENAME = "tbc_ca_chain.pem"
+# certifi + that chain, written once per process.
+_COMPOSED_CA_BUNDLE_PATH = None
 
 SEARCH_BY_TIRE_SIZE = "ByTireSize"
 # The ONLY other valid search type. There is no "ByPartNumber" -- asking for one returns
@@ -121,19 +131,44 @@ class NtwApiClient:
 
     def _verify(self) -> typing.Any:
         """
-        The CA bundle that completes TBC's chain. Missing configuration raises rather than
-        falling back to ``verify=False``: a silent downgrade here would post a dealer's
-        credentials and orders into an unauthenticated connection.
+        A CA bundle that can actually verify TBC, built once and cached.
+
+        Both their gateways serve only a leaf certificate and omit the intermediate, so the
+        default trust store fails with "unable to get local issuer certificate" -- verified from
+        inside the app container against both hosts. Browsers hide this by chasing the
+        certificate's AIA extension; requests does not.
+
+        So the bundle is certifi's roots plus ``tbc_ca_chain.pem`` (the two missing
+        intermediates, and production's root, which is newer than the Mozilla set certifi
+        ships). Composed at runtime rather than committed whole, so certifi keeps updating
+        normally and we carry only the three certificates it lacks.
+
+        ``settings.NTW_API_CA_BUNDLE`` overrides it, for the day TBC fixes their chain or an
+        operator needs to point at something else. Verification is never disabled: these calls
+        carry a dealer's cost and place real orders.
         """
-        if not self.ca_bundle:
+        if self.ca_bundle:
+            return self.ca_bundle
+
+        global _COMPOSED_CA_BUNDLE_PATH
+        if _COMPOSED_CA_BUNDLE_PATH and os.path.exists(_COMPOSED_CA_BUNDLE_PATH):
+            return _COMPOSED_CA_BUNDLE_PATH
+
+        chain = os.path.join(os.path.dirname(os.path.abspath(__file__)), _TBC_CA_CHAIN_FILENAME)
+        if not os.path.exists(chain):
             raise exceptions.NtwApiNotConfiguredError(
-                "NTW_API_CA_BUNDLE is not set. TBC's gateway serves only its leaf certificate, so "
-                "a bundle containing the 'Go Daddy Secure Certificate Authority - G2' intermediate "
-                "is required (the certificate's AIA extension names it: "
-                "http://certificates.godaddy.com/repository/gdig2.crt). Verification is not "
-                "optional for this API."
+                "{} is missing, so TBC's incomplete certificate chain cannot be completed. Set "
+                "NTW_API_CA_BUNDLE to a bundle that includes the GoDaddy intermediates.".format(chain)
             )
-        return self.ca_bundle
+
+        handle, path = tempfile.mkstemp(prefix="ntw_tbc_ca_", suffix=".pem")
+        with os.fdopen(handle, "wb") as out:
+            out.write(pathlib.Path(certifi.where()).read_bytes())
+            out.write(b"\n")
+            out.write(pathlib.Path(chain).read_bytes())
+        _COMPOSED_CA_BUNDLE_PATH = path
+        logger.info("{} Composed CA bundle at {} (certifi + TBC chain).".format(_LOG_PREFIX, path))
+        return path
 
     def _headers(self) -> typing.Dict[str, str]:
         return {
