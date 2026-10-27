@@ -58,6 +58,7 @@ def get_provider(
 # Self-register each implemented provider. Imported here (rather than an AppConfig.ready()
 # hook, which this project doesn't use) so registration happens as soon as anything imports
 # this module.
+from src.integrations.live_inventory import atd as _atd  # noqa: E402
 from src.integrations.live_inventory import keystone as _keystone  # noqa: E402
 from src.integrations.live_inventory import meyer as _meyer  # noqa: E402
 from src.integrations.live_inventory import ntw as _ntw  # noqa: E402
@@ -73,3 +74,8 @@ register(src_enums.BrandProviderKind.PREMIER_PERFORMANCE.value, _premier.Premier
 register(src_enums.BrandProviderKind.WHEELPROS.value, _wheelpros.WheelProsLiveInventoryProvider)
 register(src_enums.BrandProviderKind.TRI_STATE.value, _tristate.TriStateLiveInventoryProvider)
 register(src_enums.BrandProviderKind.NTW.value, _ntw.NtwLiveInventoryProvider)
+# ATD needs no credentials of its own here: one dealer credential set covers catalog,
+# availability and ordering, so this works wherever the ATD feed is connected. See
+# live_inventory/atd.py on why the availability endpoint's response differs from the
+# catalog sweep's.
+register(src_enums.BrandProviderKind.ATD.value, _atd.ATDLiveInventoryProvider)
