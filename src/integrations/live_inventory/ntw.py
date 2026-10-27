@@ -15,7 +15,8 @@ all. Direct lookup has no such hole.
 application in TBC's developer portal and subscribes it to the InventoryService plan, so the
 gateway key/secret live on that company's ORDER account -- the same namespace Keystone uses for
 the same reason, its stock check being part of the order service. ``customer_id`` is the
-dealer's NTW account number and is collected with the feed login. Every other live-inventory
+dealer's NTW account number and lives on that same order account -- not with the feed login,
+which needs no account number to read a file. Every other live-inventory
 provider reads exactly one namespace, so this split is deliberate rather than an oversight.
 
 Missing either one raises ValueError, which the registry turns into None, which the product page
@@ -72,12 +73,9 @@ class NtwLiveInventoryProvider(base.LiveInventoryProvider):
 
     def __init__(self, company_provider: src_models.CompanyProviders) -> None:
         base.LiveInventoryProvider.__init__(self, company_provider)
-        feed_credentials = credentials_helper.get_feed_credentials(company_provider)
         order_credentials = credentials_helper.get_order_credentials(company_provider)
         self._customer_id = (
-            order_credentials.get(constants.NTW_ORDER_CREDENTIALS_CUSTOMER_ID)
-            or feed_credentials.get(constants.NTW_CREDENTIALS_CUSTOMER_ID)
-            or ""
+            order_credentials.get(constants.NTW_ORDER_CREDENTIALS_CUSTOMER_ID) or ""
         ).strip()
         client_id = (order_credentials.get(constants.NTW_ORDER_CREDENTIALS_CLIENT_ID) or "").strip()
         client_secret = (order_credentials.get(constants.NTW_ORDER_CREDENTIALS_CLIENT_SECRET) or "").strip()

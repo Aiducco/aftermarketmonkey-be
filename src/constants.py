@@ -317,13 +317,12 @@ TIRERACK_CREDENTIALS_SFTP_PASSWORD = "sftp_password"
 # only the login -- same reasoning as Motor State, where host/port being fixed means two fields
 # instead of four and no typo'd hostnames in support tickets.
 #
-# ``customer_id`` is the dealer's NTW account number -- the 10-digit value zero-padded into the
-# feed filename (DELTI_0037746990_*.csv). It is not needed to READ the feed, but it identifies
-# the dealer to both TBC APIs and nothing else can stand in for it, so it is collected with the
-# login as a required field rather than left to be chased later.
+# The feed needs the login and nothing else. The dealer's NTW account number lives on the order
+# account (NTW_ORDER_CREDENTIALS_CUSTOMER_ID) because only the two APIs use it -- it was briefly
+# a required field here, which would have blocked a dealer who had their MOVEit login but not
+# yet their account number from connecting a feed that works without it.
 NTW_CREDENTIALS_SFTP_USER = "sftp_user"
 NTW_CREDENTIALS_SFTP_PASSWORD = "sftp_password"
-NTW_CREDENTIALS_CUSTOMER_ID = "customer_id"
 # Fixed transport, overridable per connection only for a migration or a test double.
 NTW_CREDENTIALS_SFTP_HOST = "sftp_host"
 NTW_CREDENTIALS_SFTP_PORT = "sftp_port"
@@ -2567,14 +2566,13 @@ PROVIDER_CATALOG = [
         "connection_required_fields": [
             NTW_CREDENTIALS_SFTP_USER,
             NTW_CREDENTIALS_SFTP_PASSWORD,
-            NTW_CREDENTIALS_CUSTOMER_ID,
         ],
         "order_connection_required_fields": [
             NTW_ORDER_CREDENTIALS_CLIENT_ID,
             NTW_ORDER_CREDENTIALS_CLIENT_SECRET,
+            NTW_ORDER_CREDENTIALS_CUSTOMER_ID,
         ],
         "order_connection_optional_fields": [
-            NTW_ORDER_CREDENTIALS_CUSTOMER_ID,
             NTW_ORDER_CREDENTIALS_DEALER_CODE,
             NTW_ORDER_CREDENTIALS_STORE_NUMBER,
         ],
@@ -2611,9 +2609,9 @@ PROVIDER_CATALOG = [
             "<a href=\"https://moveit.tbccorp.com\" target=\"_blank\" rel=\"noopener\">moveit.tbccorp.com</a> "
             "and accept their security notice &mdash; TBC asks every new account to do this, and "
             "automated collection cannot do it for you.</p>"
-            "<p>Then paste the <strong>username</strong>, <strong>password</strong> and your "
-            "<strong>NTW account number</strong> into the <strong>Product feed</strong> fields "
-            "below and click <strong>Save feed credentials</strong>. The card will show "
+            "<p>Then paste the <strong>username</strong> and <strong>password</strong> into the "
+            "<strong>Product feed</strong> fields below and click "
+            "<strong>Save feed credentials</strong>. The card will show "
             "<strong>Feed Connected</strong>, and your tires appear after the next file is "
             "collected. Paste rather than retype &mdash; a stray space is the most common reason "
             "a connection fails.</p>"
@@ -2645,9 +2643,11 @@ PROVIDER_CATALOG = [
             "style=\"max-width:100%;height:auto;\" /></p>"
             "<p>In AfterMarketScout, click <strong>+ Add account</strong> under "
             "<strong>Ordering</strong>, enter a label (for example &ldquo;Primary&rdquo;), paste "
-            "the <strong>Key</strong> and <strong>Secret</strong>, and click "
-            "<strong>Add Account</strong>. These credentials power <em>both</em> live stock "
-            "checks and ordering, even though they are entered under Ordering.</p>"
+            "the <strong>Key</strong> and <strong>Secret</strong>, add your "
+            "<strong>NTW account number</strong> (the 10-digit number from step 1), and click "
+            "<strong>Add Account</strong>. These three power <em>both</em> live stock checks and "
+            "ordering, even though they are entered under Ordering &mdash; the product feed "
+            "itself does not need them.</p>"
 
             "<p><strong>5. Subscribe your application to Inventory and Orders</strong></p>"
             "<p>Back in the portal, open <strong>InventoryService</strong>, click "
@@ -2679,7 +2679,8 @@ PROVIDER_CATALOG = [
             "unsubscribed application fails with &ldquo;Not registered to plan&rdquo;, which "
             "looks like a credential problem but is not.</li>"
             "<li><strong>Stock checks say the customer number is invalid?</strong> It is the "
-            "10-digit number NTW confirmed in step 1, not your MOVEit username.</li>"
+            "10-digit number NTW confirmed in step 1, not your MOVEit username. It belongs with "
+            "the API key and secret under Ordering, not with the feed login.</li>"
             "<li><strong>Feed connection fails?</strong> Re-paste the MOVEit login, and check the "
             "security notice in step 2 has been accepted. If it still fails, ask Tommy to confirm "
             "with TBC that the MOVEit account is active and has SFTP enabled.</li>"

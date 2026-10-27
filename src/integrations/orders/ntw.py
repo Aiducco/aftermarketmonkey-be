@@ -130,15 +130,13 @@ class NtwOrderAdapter(base.DistributorOrderAdapter):
     ) -> None:
         base.DistributorOrderAdapter.__init__(self, company_provider, order_account)
         order_credentials = credentials_helper.get_order_credentials(company_provider, order_account)
-        feed_credentials = credentials_helper.get_feed_credentials(company_provider)
 
-        # customer_id may have been entered once on the feed connection (the onboarding card asks
-        # for it there, since the dealer gets it from the same rep), so the order account's own
-        # value wins but the feed's is accepted. dealer_code and store_number are order-only.
+        # Everything the two TBC APIs need lives on the order account: the dealer's own
+        # application key/secret, their NTW account number, and optionally a dealer code and
+        # store number. The product feed holds only an SFTP login -- reading a file needs no
+        # account number, so requiring one there would block a feed that works without it.
         self._customer_id = (
-            order_credentials.get(constants.NTW_CREDENTIALS_CUSTOMER_ID)
-            or feed_credentials.get(constants.NTW_CREDENTIALS_CUSTOMER_ID)
-            or ""
+            order_credentials.get(constants.NTW_ORDER_CREDENTIALS_CUSTOMER_ID) or ""
         ).strip()
         self._dealer_code = (order_credentials.get(constants.NTW_ORDER_CREDENTIALS_DEALER_CODE) or "").strip()
         self._store_number = (order_credentials.get(constants.NTW_ORDER_CREDENTIALS_STORE_NUMBER) or "").strip()

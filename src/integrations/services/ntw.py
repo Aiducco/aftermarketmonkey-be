@@ -891,12 +891,12 @@ def sync_tire_specs_from_ntw_api(
             cp = src_models.CompanyProviders.objects.filter(id=company_provider_id).first()
         else:
             cp = _primary_ntw_company_provider()
-        creds = credentials_helper.get_feed_credentials(cp) if cp else {}
+        creds = credentials_helper.get_order_credentials(cp) if cp else {}
         customer_id = (creds.get("customer_id") or "").strip()
     if not customer_id:
         raise ValueError(
-            "No NTW customer_id. Pass one, or set it on the connection's feed credentials -- "
-            "TBC issues it separately from the MOVEit login."
+            "No NTW customer_id. Pass one, or set it on the connection's order account -- it "
+            "lives there with the dealer's TBC API key, not with the MOVEit feed login."
         )
 
     ntw_provider = src_models.Providers.objects.filter(
