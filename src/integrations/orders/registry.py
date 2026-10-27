@@ -10,6 +10,7 @@ is registered.
 import logging
 import typing
 
+from src import constants as src_constants
 from src import enums as src_enums
 from src import models as src_models
 from src.integrations import credentials as order_credentials
@@ -39,6 +40,27 @@ def supports_ordering(provider_kind: int) -> bool:
     usable, not just supported in the abstract.
     """
     return provider_kind in _ADAPTERS
+
+
+def supports_email_ordering(provider_kind: int) -> bool:
+    """
+    Whether this distributor can be ordered from by emailing a rep.
+
+    Read from PROVIDER_CATALOG rather than kept as a list here, so it cannot disagree with the
+    credential form the UI shows: a provider that offers no email fields is a provider that
+    offers no email channel. Rough Country is the first to withdraw it -- they told us in Oct
+    2026 that emailing a rep is no longer a supported way to place an order with them.
+
+    An account left on OrderMethod.EMAIL for such a provider is therefore NOT silently routed to
+    EmailOrderAdapter. It reports as unconfigured instead, which is the honest outcome: the
+    alternative is an order that looks placed and reaches someone who cannot act on it.
+    """
+    entry = src_constants.catalog_entry_for_kind(provider_kind)
+    if entry is None:
+        # Unknown kinds keep the historical behavior -- email worked for every provider before
+        # any of them withdrew it.
+        return True
+    return bool(entry.get("email_order_connection_required_fields"))
 
 
 def fulfillment_channel_for_kind(provider_kind: int) -> str:
@@ -90,6 +112,15 @@ def get_adapter(
     """
     account = order_account or order_credentials.get_default_order_account(company_provider)
     if account is not None and account.order_method == src_enums.OrderMethod.EMAIL.value:
+        if not supports_email_ordering(company_provider.provider.kind):
+            logger.info(
+                "Company_provider_id=%s is set to EMAIL ordering, but %s no longer supports it. "
+                "Reporting the connection as unconfigured rather than emailing a rep who cannot "
+                "action the order.",
+                company_provider.id,
+                company_provider.provider.kind_name,
+            )
+            return None
         try:
             return email_order.EmailOrderAdapter(company_provider, account)
         except ValueError:
@@ -128,6 +159,11 @@ def get_adapter_unavailable_reason(
     kind with no API adapter, when the actual account in use has Email configured just fine)."""
     account = order_account or order_credentials.get_default_order_account(company_provider)
     if account is not None and account.order_method == src_enums.OrderMethod.EMAIL.value:
+        if not supports_email_ordering(company_provider.provider.kind):
+            return (
+                "{} no longer accepts orders by email — this connection needs to be switched to "
+                "their ordering integration.".format(company_provider.provider.kind_name)
+            )
         return "Email ordering isn't fully configured for this connection yet — a rep email is required."
     if not supports_ordering(company_provider.provider.kind):
         return "{} does not support in-app ordering yet.".format(company_provider.provider.kind_name)

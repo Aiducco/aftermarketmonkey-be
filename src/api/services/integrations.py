@@ -1054,6 +1054,16 @@ def _validate_order_connection_for_method(
     _validate_order_connection lookup unchanged.
     """
     if order_method == src_enums.OrderMethod.EMAIL.value:
+        if not order_registry.supports_email_ordering(kind):
+            # Rough Country withdrew the channel in Oct 2026. Refused at the point of selection
+            # as well as at dispatch, so a connection cannot be saved into a state that will
+            # never place an order.
+            return (
+                False,
+                "This distributor no longer accepts orders by email. Use their ordering "
+                "integration instead.",
+                CONNECTION_ERROR_INVALID_INPUT,
+            )
         message, code = _validate_email_order_connection(credentials)
         if message:
             return False, message, code

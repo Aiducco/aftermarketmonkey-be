@@ -219,6 +219,36 @@ class AdapterCapabilityTests(RoughCountryEdiFixture):
         self.account.save(update_fields=["credentials"])
         self.assertIsNone(order_registry.get_adapter(self.company_provider, self.account))
 
+    def test_email_ordering_is_no_longer_offered_or_honoured(self):
+        """
+        Rough Country withdrew the email channel in Oct 2026. Three live connections were still
+        set to EMAIL when that happened, so the account staying on EMAIL has to fail VISIBLY --
+        quietly mailing a rep who cannot action the order is the worst outcome available, since
+        the shop sees a placed order and nothing ever ships.
+        """
+        self.assertFalse(order_registry.supports_email_ordering(self.provider.kind))
+
+        self.account.order_method = src_enums.OrderMethod.EMAIL.value
+        self.account.order_method_name = src_enums.OrderMethod.EMAIL.name
+        self.account.credentials = {"rep_email": "rep@roughcountry.com"}
+        self.account.save(update_fields=["order_method", "order_method_name", "credentials"])
+
+        self.assertIsNone(order_registry.get_adapter(self.company_provider, self.account))
+        self.assertIn(
+            "no longer accepts orders by email",
+            order_registry.get_adapter_unavailable_reason(self.company_provider, self.account),
+        )
+
+    def test_other_distributors_keep_email_ordering(self):
+        """The channel is withdrawn per distributor, read from the catalog, not switched off
+        globally."""
+        self.assertTrue(
+            order_registry.supports_email_ordering(src_enums.BrandProviderKind.KEYSTONE.value)
+        )
+        self.assertTrue(
+            order_registry.supports_email_ordering(src_enums.BrandProviderKind.TURN_14.value)
+        )
+
     def test_ftp_login_alone_is_saved_but_not_yet_order_ready(self):
         """
         A dealer enters only the FTP username and password -- the EDI trading-partner id is an

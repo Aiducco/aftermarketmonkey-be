@@ -668,28 +668,23 @@ PROVIDER_CATALOG = [
         # edi_environment is "test" (default) or "production", per company — one dealer can be
         # live while another is still testing. Anything but the exact word "production" is
         # treated as test, so a typo can never start placing real orders.
-        # Optional to the DEALER, required by the integration: both of these are ours to set
-        # once Alluvia has issued the mailbox, and neither is something a shop can know or
-        # should have to type.
+        # Deliberately no optional fields. The dealer enters their FTP login and nothing else.
         #
-        # edi_sender_id is the shop's own ISA06/GS02, which Alluvia assigns. Ordering stays
-        # unavailable until it is present -- edi_config raises ValueError without it, which
-        # orders.registry reports as "not configured yet" rather than crashing.
+        # edi_sender_id (their ISA06/GS02, which Alluvia assigns) and edi_environment are set by
+        # us with `manage.py set_rough_country_edi_identity`, not through this form: a dealer
+        # cannot know the first, has no reason to touch the second, and the front end renders
+        # every order-credential field as a masked password box, which is the worst possible
+        # input for an identifier someone is transcribing out of an email.
         #
-        # edi_environment defaults to PRODUCTION: the integration is proven, so a new dealer is
-        # live as soon as Alluvia has issued their mailbox. It is still a field rather than a
-        # constant because test mode has to remain reachable per dealer -- Trident is pinned to
-        # "test" while it is verified with Alluvia -- and because an unrecognised value raises
-        # rather than being guessed in either direction (see edi_config).
-        "order_connection_optional_fields": [
-            ROUGH_COUNTRY_EDI_CREDENTIALS_SENDER_ID,
-            ROUGH_COUNTRY_EDI_CREDENTIALS_ENVIRONMENT,
-        ],
-        # Email-channel ordering, kept as the fallback for dealers who are not set up on EDI
-        # yet: orders.registry is channel-first, so an account whose order_method is EMAIL
-        # still routes to EmailOrderAdapter even though a real adapter now exists for this kind.
-        "email_order_connection_required_fields": ["rep_email"],
-        "email_order_connection_optional_fields": ["account_number", "cc_email", "reply_to_email"],
+        # Because these keys are not listed here the connection API rejects them, which is the
+        # intent -- but note it does NOT clear them: _merge_namespace_credentials only touches
+        # keys present in the patch, so a dealer updating their password keeps their sender id.
+        # NO email-channel ordering. Rough Country told us (Oct 2026) that emailing a rep is not
+        # a supported way to place orders with them any more -- EDI is the only channel. The
+        # absence of these two keys is what withdraws the option: it removes the form in the UI
+        # AND stops orders.registry honouring the channel at all, so an account still set to
+        # EMAIL fails visibly as "not configured" instead of quietly mailing a rep who cannot
+        # act on it. See orders.registry.supports_email_ordering.
         "integration_time": "Data available within 1-2 hours",
         # Screenshots live in ``resources/uploads`` and are served from ``{_UPLOADS}`` — see the
         # matching note on Turn 14 above.
@@ -765,8 +760,8 @@ PROVIDER_CATALOG = [
             "are the only two things you need to enter &mdash; paste them into the ordering fields below and "
             "save.</p>"
             "<p>Their reply will also contain an <strong>EDI ID</strong> (they may call it your ISA ID, GS ID "
-            "or trading-partner ID) and confirmation of the IP allowlist. You don't need to do anything with "
-            "those &mdash; we're on the thread and we'll configure them. Leave the remaining fields blank.</p>"
+            "or trading-partner ID) and confirmation of the IP allowlist. There's nothing for you to do with "
+            "either &mdash; we're on the same thread and we configure those at our end.</p>"
             "<p><strong>3. You're live straight away</strong></p>"
             "<p>Once the FTP login is saved, ordering is live &mdash; the orders you place are real orders "
             "and Rough Country ships against them. There's no separate activation step and nothing further "
@@ -2652,6 +2647,23 @@ PROVIDER_CATALOG = [
         ),
     },
 ]
+
+
+def catalog_entry_for_kind(provider_kind: int) -> typing.Optional[typing.Dict[str, typing.Any]]:
+    """
+    The PROVIDER_CATALOG entry for a BrandProviderKind value, or None.
+
+    Exists so code outside the API layer can ask the catalog what a provider actually supports
+    -- the catalog is already the single source of truth for which credential forms a provider
+    shows, and anything deciding which ORDER CHANNELS it offers has to agree with that or the UI
+    and the dispatcher will disagree. See orders.registry.supports_email_ordering.
+    """
+    for entry in PROVIDER_CATALOG:
+        kind = entry.get("kind")
+        value = getattr(kind, "value", kind)
+        if value == provider_kind:
+            return entry
+    return None
 
 
 def visible_provider_catalog() -> typing.List[typing.Dict[str, typing.Any]]:
