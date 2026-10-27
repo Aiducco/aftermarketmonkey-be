@@ -450,6 +450,9 @@ def _sync_master_pricing(cp: src_models.CompanyProviders) -> None:
     elif kind == src_enums.BrandProviderKind.THOROUGHBRED_DIESEL.value:
         master_parts.sync_provider_pricing_from_thoroughbred_for_company(company_id)
 
+    elif kind == src_enums.BrandProviderKind.NTW.value:
+        master_parts.sync_provider_pricing_from_ntw_for_company(company_id)
+
     else:
         raise ValueError("Unsupported provider kind for master pricing sync: {}".format(kind))
 
