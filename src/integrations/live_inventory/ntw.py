@@ -5,11 +5,11 @@ this is for the moment a buyer is looking at one tire and wants to know now.
 
 Two things make this provider unlike every other one in this package.
 
-**It cannot look a part up by its part number.** ``searchType: "ByPartNumber"`` returns errorCd
-1006 for every identifier shape TBC's own docs list, so a single-SKU refresh has to ask for the
-whole tire SIZE and filter the response down to the part we wanted. That makes a refresh cost one
-size query -- fine for a user-triggered action on one part, and the reason nothing should ever
-loop this.
+**It looks a part up directly**, via ``searchType: "ByProductId"`` with the part's brand and
+number. An earlier version asked for the whole tire SIZE and filtered, because the non-existent
+``ByPartNumber`` made direct lookup look impossible; that detour also meant a part whose sidewall
+string does not parse -- commercial and farm sizes, ~4% of the feed -- could not be refreshed at
+all. Direct lookup has no such hole.
 
 **Its credentials come from two places.** The gateway client id/secret are account-level and live
 in settings; ``customer_id`` is per-dealer and lives on the connection. Every other live-inventory
@@ -35,6 +35,33 @@ logger = logging.getLogger(__name__)
 _LOG_PREFIX = "[NTW-LIVE-INVENTORY]"
 
 
+def _ship_to_for(company_provider: src_models.CompanyProviders) -> typing.Optional[typing.List[typing.Dict]]:
+    """
+    The company's own address as TBC's ``shipTo``. Documented mandatory; measured as not enforced
+    for a stock read, so this returns None rather than failing when a company has no location on
+    file -- a missing address must not block a product page from showing availability.
+    """
+    location = (
+        src_models.CompanyLocation.objects.filter(company_id=company_provider.company_id)
+        .order_by("-is_primary", "id")
+        .first()
+    )
+    if not location:
+        return None
+    return [{
+        "address": {
+            "name": location.name or "",
+            "address": location.address1 or "",
+            "address2": location.address2 or "",
+            "city": location.city or "",
+            "state": location.state or "",
+            "country": location.country or "US",
+            "zipCode": location.postal_code or "",
+        },
+        "phoneNumber": location.phone or "",
+    }]
+
+
 class NtwLiveInventoryProvider(base.LiveInventoryProvider):
     provider_kind = src_enums.BrandProviderKind.NTW.value
 
@@ -50,35 +77,16 @@ class NtwLiveInventoryProvider(base.LiveInventoryProvider):
                 "number for this dealer.".format(company_provider.id)
             )
         self._client = ntw_api.NtwApiClient()
+        self._ship_to = _ship_to_for(company_provider)
 
-    # -- size resolution -----------------------------------------------------
-
-    @staticmethod
-    def _tire_size_for(part: src_models.NtwParts) -> typing.Optional[typing.Dict[str, str]]:
-        """
-        The ``{width, ratio, diameter}`` TBC's API expects, taken from the feed's own three size
-        columns rather than from a parse of the sidewall string.
-
-        Using TBC's numbers to query TBC is the point: they are what their backend indexed the
-        tire under. A parse of "LT225/75R16" would also produce 225/75/16, but for the notations
-        where the two disagree -- numeric sizes like "11X4.00-5", where the first column is an
-        overall diameter and not a width -- the feed's values are what their API was built
-        around, and ours would be a guess about their schema.
-
-        Returns None when the row has no aspect ratio (commercial sizes like "10R22.5" leave
-        column 8 blank), because the API's size object has no way to express that.
-        """
-        width = (part.size_component_1 or "").strip()
-        ratio = (part.size_component_2 or "").strip()
-        diameter = (part.size_component_3 or "").strip()
-        if not width or not ratio or not diameter:
-            return None
-        return {"width": width, "ratio": ratio, "diameter": diameter}
+    # -- part resolution -----------------------------------------------------
 
     def _ntw_part_for(self, provider_part: src_models.ProviderPart) -> src_models.NtwParts:
         """
         Resolve our ProviderPart back to the feed row, via the composite
-        ``{ntw_brand_id}_{part_number}`` external id that master_parts writes.
+        ``{ntw_brand_id}_{part_number}`` external id that master_parts writes. The feed row is
+        what carries the brand label TBC expects -- ``brandName`` is required by the API, and
+        sending the part number alone makes their flow throw a 500.
         """
         external_id = provider_part.provider_external_id or ""
         brand_id, _, part_number = external_id.partition("_")
@@ -87,9 +95,11 @@ class NtwLiveInventoryProvider(base.LiveInventoryProvider):
                 "NTW provider_external_id {!r} is not in the expected "
                 "<ntw_brand_id>_<part_number> form.".format(external_id)
             )
-        part = src_models.NtwParts.objects.filter(
-            brand_id=int(brand_id), part_number=part_number
-        ).first()
+        part = (
+            src_models.NtwParts.objects.select_related("brand")
+            .filter(brand_id=int(brand_id), part_number=part_number)
+            .first()
+        )
         if not part:
             raise live_inventory_exceptions.LiveInventoryNotFoundError(
                 "No NtwParts row for brand {} part {}.".format(brand_id, part_number)
@@ -100,16 +110,10 @@ class NtwLiveInventoryProvider(base.LiveInventoryProvider):
 
     def refresh(self, provider_part: src_models.ProviderPart) -> src_models.ProviderPartInventory:
         part = self._ntw_part_for(provider_part)
-        tire_size = self._tire_size_for(part)
-        if not tire_size:
-            raise live_inventory_exceptions.LiveInventoryNotFoundError(
-                "NTW part {} has no complete metric size ({!r}), so TBC's size-keyed API cannot "
-                "be queried for it.".format(part.part_number, part.size_description)
-            )
 
         try:
             row = self._client.find_tire_by_part_number(
-                self._customer_id, part.part_number, tire_size
+                self._customer_id, part.part_number, part.brand.name, ship_to=self._ship_to
             )
         except ntw_exceptions.NtwApiNotConfiguredError as e:
             # Configuration, not transport. Surfaced as a transport error anyway so callers
@@ -126,12 +130,14 @@ class NtwLiveInventoryProvider(base.LiveInventoryProvider):
 
         now = timezone.now()
         if row is None:
-            # TBC listed the size but not this part: a real zero, not a failure. Writing it is
-            # the whole point -- it is the same "absent means gone" rule the feed's zero-out pass
-            # implements, applied to one part on demand.
+            # TBC does not list this part for this customer at all. Recorded as a real zero
+            # rather than left stale -- the same "absent means gone" rule the feed's zero-out
+            # pass applies, here for one part on demand. Note the lookup already asks with
+            # requestedQty=0, so an in-catalog part that is merely out of stock DOES come back
+            # with quantityAvailable 0; None means genuinely not carried.
             logger.info(
-                "{} TBC lists no stock for part {} in size {}; recording zero.".format(
-                    _LOG_PREFIX, part.part_number, part.size_description
+                "{} TBC does not list part {} for customer {}; recording zero.".format(
+                    _LOG_PREFIX, part.part_number, self._customer_id
                 )
             )
             return self._write(provider_part, total_qty=0, sources=[], now=now)

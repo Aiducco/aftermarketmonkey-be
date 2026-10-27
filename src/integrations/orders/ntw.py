@@ -21,11 +21,11 @@ Not supported, because TBC exposes no endpoint for it: cancel, an invoice feed, 
 method catalogue. The quote's ship options come from whatever the inventory response said rather
 than from a list we can enumerate.
 
-**Blocked on TBC.** Both order endpoints take an HMAC SHA-256 ``signature`` whose
-canonicalisation TBC has not documented (see ``api_client.NtwApiClient._signature``). Until they
-answer, a submit raises ``NtwApiNotConfiguredError`` rather than sending something unsigned --
-Rough Country taught us what an un-acknowledged order channel costs, and TBC publishes no
-997-equivalent either.
+No request signing. TBC's developer portal shows ``signature`` and ``timestamp`` as query
+parameters on these endpoints, and this adapter used to refuse to submit without a secret for
+them; the Order Service v1.0 spec states the API has no query parameters at all and
+authenticates with the same two headers as the inventory call. The portal page is wrong, or
+describes something retired.
 """
 import datetime
 import logging
@@ -55,8 +55,10 @@ _DELIVERY_CODES = {
     "10 days plus": "TEN_DAYS_PLUS",
 }
 
-_ORDER_TYPE_PICKUP = "PickUp"
-_ORDER_TYPE_SHIP = "Ship"
+# Order Service v1.0: "PickUp" (will-call from the warehouse) or "Delivery" (by truck). An
+# earlier version sent "Ship", which is not in TBC's enumeration.
+_ORDER_TYPE_PICKUP = ntw_api.ORDER_TYPE_PICKUP
+_ORDER_TYPE_DELIVERY = ntw_api.ORDER_TYPE_DELIVERY
 
 
 def _decimal(value: typing.Any) -> typing.Optional[Decimal]:
@@ -79,6 +81,24 @@ def _date(value: typing.Any) -> typing.Optional[datetime.date]:
         except ValueError:
             continue
     return None
+
+
+def _ship_to_payload(ship_to: base.ShipToAddress) -> typing.List[typing.Dict]:
+    """``ShipToAddress`` in TBC's ``shipTo`` shape (an array of one, with a nested address)."""
+    return [{
+        "address": {
+            "name": ship_to.name or "",
+            "address": ship_to.address1 or "",
+            "address2": ship_to.address2 or "",
+            "city": ship_to.city or "",
+            "state": ship_to.state or "",
+            "country": ship_to.country or "US",
+            "zipCode": ship_to.postal_code or "",
+        },
+        "email": ship_to.email or "",
+        "phoneNumber": ship_to.phone or "",
+        "extraInfo": "",
+    }]
 
 
 class NtwOrderAdapter(base.DistributorOrderAdapter):
@@ -174,43 +194,37 @@ class NtwOrderAdapter(base.DistributorOrderAdapter):
     ) -> base.ShippingQuoteResult:
         parts_by_line = self._ntw_parts_for(line_items)
 
-        criteria: typing.List[typing.Dict] = []
-        size_by_line: typing.Dict[int, typing.Dict[str, str]] = {}
+        pairs = []
         for item in line_items:
             part = parts_by_line.get(item.line_item_id)
-            if not part:
-                continue
-            size = self._tire_size_for(part)
-            if not size:
-                continue
-            size_by_line[item.line_item_id] = size
-            if size not in criteria_sizes(criteria):
-                # requestedQty is a FILTER on TBC's side, not a quantity -- asking for the
-                # buyer's quantity would hide every tire with less stock than that, which is
-                # the opposite of what a quote needs to discover. Always 1; the comparison
-                # against what the buyer wants happens below.
-                criteria.append({"tireSize": size, "requestedQty": ntw_api.STOCK_READ_QTY})
+            if part:
+                pairs.append((part.brand.name, part.part_number))
 
         request_payload = {
             "customerId": self._customer_id,
-            "criteria": criteria,
+            "searchType": ntw_api.SEARCH_BY_PRODUCT_ID,
+            "parts": [{"brandName": b, "partNo": pn} for b, pn in pairs],
             "isDropShip": not ship_to.is_shop_address,
         }
 
-        if not criteria:
+        if not pairs:
             raise order_exceptions.OrderValidationError(
-                "None of these lines has a complete metric tire size, so TBC's size-keyed "
-                "inventory API cannot quote them.",
+                "None of these lines resolves to an NTW catalog row, so TBC cannot be asked "
+                "about them.",
                 request_payload=request_payload,
             )
 
         try:
-            rows = self._client.get_tire_inventory(
+            # One call for the whole cart: ByProductId has no the two-entry truncation that
+            # ByTireSize does, and asks with requestedQty=0 so a line that is out of stock comes
+            # back as a real zero instead of vanishing.
+            found = self._client.get_inventory_by_parts(
                 self._customer_id,
-                criteria,
-                store_number=self._store_number or None,
+                pairs,
+                ship_to=_ship_to_payload(ship_to),
                 is_drop_ship=not ship_to.is_shop_address,
                 dealer_code=self._dealer_code or None,
+                store_number=self._store_number or None,
             )
         except ntw_exceptions.NtwApiBusinessError as e:
             raise order_exceptions.OrderValidationError(
@@ -219,11 +233,8 @@ class NtwOrderAdapter(base.DistributorOrderAdapter):
         except ntw_exceptions.NtwException as e:
             raise order_exceptions.OrderAdapterError(str(e)) from e
 
-        rows_by_part = {}
-        for row in rows:
-            key = str(row.get("partNo") or "").strip().upper()
-            if key:
-                rows_by_part.setdefault(key, row)
+        rows_by_part = {part_number.strip().upper(): row
+                        for (_brand, part_number), row in found.items()}
 
         lines: typing.List[base.ShippingQuoteLine] = []
         raw_by_line: typing.Dict[str, typing.Dict] = {}
@@ -361,7 +372,7 @@ class NtwOrderAdapter(base.DistributorOrderAdapter):
             "customerId": self._customer_id,
             "poNumber": base.resolve_po_number(purchase_order),
             "isDropShip": not ship_to.is_shop_address,
-            "type": _ORDER_TYPE_SHIP,
+            "type": _ORDER_TYPE_DELIVERY,
             "source": "AfterMarketScout",
             "address": {
                 "name": ship_to.name,
@@ -381,9 +392,9 @@ class NtwOrderAdapter(base.DistributorOrderAdapter):
         try:
             response = self._client.create_order(body)
         except ntw_exceptions.NtwApiNotConfiguredError as e:
-            # The signing secret. Deliberately not retried and not downgraded.
             raise order_exceptions.OrderAdapterNotImplementedError(str(e)) from e
         except ntw_exceptions.NtwApiBusinessError as e:
+            # TBC reports a shortfall this way: errorCd 1006 "Quantity can not be fulfilled".
             raise order_exceptions.OrderValidationError(str(e), request_payload=body) from e
         except ntw_exceptions.NtwException as e:
             raise order_exceptions.OrderAdapterError(str(e)) from e
@@ -452,8 +463,6 @@ class NtwOrderAdapter(base.DistributorOrderAdapter):
             order_number = distributor_order.distributor_order_number
             try:
                 payload = self._client.get_order(order_number)
-            except ntw_exceptions.NtwApiNotConfiguredError as e:
-                raise order_exceptions.OrderAdapterNotImplementedError(str(e)) from e
             except ntw_exceptions.NtwException as e:
                 logger.error(
                     "{} Status lookup failed for order {}: {}".format(_LOG_PREFIX, order_number, str(e))
@@ -485,19 +494,24 @@ class NtwOrderAdapter(base.DistributorOrderAdapter):
         return False
 
     def supports_shipping_method_selection(self) -> bool:
-        # TBC's items[] takes carrierServiceCode/SCAC, but there is no endpoint to enumerate
-        # valid values, so there is nothing to populate a picker with. The quote's own
-        # ship_options report whatever speed TBC quoted.
-        return False
+        return True
+
+    def list_shipping_methods(self) -> typing.List[base.ShippingMethod]:
+        """
+        TBC's published carrier/service enumeration (Order Service v1.0). A catalogue, not a
+        priced comparison -- they have no endpoint that costs these, so choosing one filters the
+        order rather than shopping it. Only honoured on a drop-ship order: TBC ignores
+        carrierServiceCode/SCAC when isDropShip is false.
+        """
+        return [
+            base.ShippingMethod(code=code, name=code.replace("_", " ").title(), carrier_name=scac)
+            for scac, code in ntw_api.CARRIER_SERVICE_CODES
+        ]
 
     def supports_invoices(self) -> bool:
         return False
 
 
-def criteria_sizes(criteria: typing.List[typing.Dict]) -> typing.List[typing.Dict]:
-    """The tire sizes already queued, so two lines of the same size cost one criteria slot --
-    which matters because the gateway honours only two per call."""
-    return [c.get("tireSize") for c in criteria]
 
 
 def _delivery_status(raw_status: str) -> typing.Optional[str]:

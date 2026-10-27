@@ -29,7 +29,6 @@ def _client(**overrides: typing.Any) -> ntw_api.NtwApiClient:
         "client_secret": "secret",
         "base_url": "https://example.test/api",
         "ca_bundle": "/tmp/bundle.pem",
-        "signing_secret": "signing",
     }
     kwargs.update(overrides)
     return ntw_api.NtwApiClient(**kwargs)
@@ -148,7 +147,7 @@ class TwoHundredWithErrorBodyTests(SimpleTestCase):
         self.assertEqual(len(rows), 1)
 
 
-class FindByPartNumberTests(SimpleTestCase):
+class ByProductIdLookupTests(SimpleTestCase):
     databases = []
 
     def setUp(self):
@@ -157,37 +156,55 @@ class FindByPartNumberTests(SimpleTestCase):
 
         def fake_request(method, path, body=None, params=None):
             self.sent.append(body)
-            return {"product": [_product("87266"), _product("50004"), _product("5540843")]}
+            wanted = {c["partNo"] for c in body.get("criteria", [])}
+            return {"product": [_product(pn) for pn in ("87266", "50004", "5540843") if pn in wanted]}
 
         self.client._request = fake_request
 
-    def test_it_filters_the_size_response_down_to_the_part(self):
-        row = self.client.find_tire_by_part_number(
-            "10062387", "50004", {"width": "225", "ratio": "55", "diameter": "16"}
-        )
+    def test_it_returns_the_requested_part(self):
+        row = self.client.find_tire_by_part_number("10062387", "50004", "BFGoodrich")
         self.assertIsNotNone(row)
         self.assertEqual(row["partNo"], "50004")
 
     def test_part_matching_ignores_case_and_padding(self):
-        row = self.client.find_tire_by_part_number(
-            "10062387", "  87266 ", {"width": "225", "ratio": "55", "diameter": "16"}
-        )
+        row = self.client.find_tire_by_part_number("10062387", "  87266 ", "Michelin")
         self.assertEqual(row["partNo"], "87266")
 
-    def test_a_part_the_size_query_did_not_return_is_none_not_an_error(self):
-        # Out of stock, which is an answer -- the caller records a zero.
-        row = self.client.find_tire_by_part_number(
-            "10062387", "NOPE", {"width": "225", "ratio": "55", "diameter": "16"}
-        )
+    def test_a_part_tbc_does_not_list_is_none_not_an_error(self):
+        row = self.client.find_tire_by_part_number("10062387", "NOPE", "Michelin")
         self.assertIsNone(row)
 
-    def test_a_stock_read_always_asks_for_quantity_one(self):
-        """requestedQty FILTERS on TBC's side: asking for 4 hides every tire with 3 in stock."""
-        self.client.find_tire_by_part_number(
-            "10062387", "87266", {"width": "225", "ratio": "55", "diameter": "16"}
+    def test_a_blank_part_number_is_never_sent(self):
+        """
+        A blank partNo is a silent BRAND WILDCARD on this API -- {"brandName": "Cooper",
+        "partNo": ""} returned Cooper's whole 131-product catalog, HTTP 200. One such row would
+        both inflate the response and break line matching, so it must never leave the client.
+        """
+        self.sent.clear()
+        found = self.client.get_inventory_by_parts(
+            "10062387", [("Cooper", ""), ("Michelin", "87266"), ("", "123")]
         )
-        self.assertEqual(self.sent[0]["criteria"][0]["requestedQty"], 1)
-        self.assertEqual(ntw_api.STOCK_READ_QTY, 1)
+        self.assertEqual(len(self.sent), 1)
+        sent_parts = [c["partNo"] for c in self.sent[0]["criteria"]]
+        self.assertEqual(sent_parts, ["87266"])
+        self.assertIn(("MICHELIN", "87266"), found)
+
+    def test_batches_are_split_but_not_capped_at_two(self):
+        """The two-entry cap is a ByTireSize behaviour; ByProductId took 286 in one call."""
+        self.sent.clear()
+        pairs = [("Michelin", str(90000 + i)) for i in range(250)]
+        self.client.get_inventory_by_parts("10062387", pairs, batch_size=200)
+        self.assertEqual([len(c["criteria"]) for c in self.sent], [200, 50])
+
+    def test_a_stock_read_asks_for_quantity_zero(self):
+        """
+        requestedQty FILTERS rather than requests. At 1 the gateway returns only what is in
+        stock, so an out-of-stock part looks unknown instead of empty; measured on 25 parts,
+        qty=1 returned 7 and qty=0 returned 11, the extra four being zero-stock rows.
+        """
+        self.client.find_tire_by_part_number("10062387", "87266", "Michelin")
+        self.assertEqual(self.sent[0]["criteria"][0]["requestedQty"], 0)
+        self.assertEqual(ntw_api.STOCK_READ_QTY, 0)
 
 
 class ConfigurationGuardTests(SimpleTestCase):
@@ -214,19 +231,27 @@ class ConfigurationGuardTests(SimpleTestCase):
             client._verify()
         self.assertIn("NTW_API_CA_BUNDLE", str(ctx.exception))
 
-    def test_signing_without_a_secret_refuses_rather_than_sending_unsigned(self):
-        client = _client(signing_secret="")
-        with self.assertRaises(ntw_exceptions.NtwApiNotConfiguredError):
-            client._signature({"a": 1}, "1700000000")
-
-    def test_signature_is_deterministic_and_covers_body_and_timestamp(self):
+    def test_the_order_endpoints_send_no_query_parameters(self):
+        """
+        TBC's portal advertises signature/timestamp query params on /v1/order; the Order Service
+        v1.0 spec says the API has no query parameters at all. This asserts we follow the spec,
+        because the earlier reading of the portal is what blocked ordering entirely.
+        """
         client = _client()
-        first = client._signature({"b": 2, "a": 1}, "1700000000")
-        # Key order in the dict must not change the signature.
-        self.assertEqual(first, client._signature({"a": 1, "b": 2}, "1700000000"))
-        self.assertNotEqual(first, client._signature({"a": 1, "b": 3}, "1700000000"))
-        self.assertNotEqual(first, client._signature({"b": 2, "a": 1}, "1700000001"))
-        self.assertEqual(len(first), 64)
+        seen = {}
+
+        def fake(method, path, body=None, params=None):
+            seen.update({"method": method, "path": path, "params": params})
+            return [{"id": "SAP_1", "items": []}]
+
+        client._request = fake
+        client.create_order({"customerId": "1", "items": []})
+        self.assertIsNone(seen["params"])
+        self.assertEqual(seen["path"], "/v1/order")
+
+        client.get_order("SAP_1")
+        self.assertIsNone(seen["params"])
+        self.assertEqual(seen["path"], "/v1/order/SAP_1")
 
 
 class OrderHelperTests(SimpleTestCase):
@@ -249,10 +274,14 @@ class OrderHelperTests(SimpleTestCase):
         self.assertEqual(ntw_orders._delivery_status("DELIVERED"), "delivered")
         self.assertEqual(ntw_orders._delivery_status("Cancelled"), "cancelled")
 
-    def test_criteria_sizes_lets_two_lines_of_one_size_share_a_slot(self):
-        size = {"width": "225", "ratio": "55", "diameter": "16"}
-        criteria = [{"tireSize": size, "requestedQty": 1}]
-        self.assertIn(size, ntw_orders.criteria_sizes(criteria))
+    def test_carrier_catalogue_matches_the_published_enumeration(self):
+        codes = dict((c, s) for s, c in ntw_api.CARRIER_SERVICE_CODES)
+        self.assertEqual(len(ntw_api.CARRIER_SERVICE_CODES), 20)
+        self.assertEqual(codes["FEDEX_GROUND"], "FEDX")
+        self.assertEqual(codes["UPS_GROUND"], "UPSN")
+        self.assertEqual(codes["WILL CALL"], "NTWL")
+        # Only sent on a drop-ship order -- TBC ignores them otherwise.
+        self.assertIn(("NTWL", "NTW_GROUND"), ntw_api.CARRIER_SERVICE_CODES)
         self.assertNotIn({"width": "235", "ratio": "65", "diameter": "17"},
                          ntw_orders.criteria_sizes(criteria))
 

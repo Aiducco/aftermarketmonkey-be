@@ -42,6 +42,7 @@ from src import models as src_models
 from src.integrations import credentials as credentials_helper
 from src.integrations.clients.ntw import exceptions as ntw_exceptions
 from src.integrations.clients.ntw import sftp_client as ntw_client
+from src.integrations.services import tire_reparse
 from src.integrations.utils.brand_matching import (
     best_fuzzy_brand_match,
     brands_by_compact_key,
@@ -720,3 +721,293 @@ def sync_ntw_company_pricing_for_company_provider(company_provider_id: int) -> N
             _LOG_PREFIX, cp.company_id, written, filename
         )
     )
+
+
+# -- tire specs from the inventory API ---------------------------------------
+
+# TBC's inventory response carries seven structured product attributes the MOVEit feed does not.
+# Which TireSpec tier each belongs to is NOT uniform, and that decides whether we may write it:
+#
+#   speedRating/loadRange/loadIndexRange -> the parser already derives these from the sidewall
+#       string, so NTW is a FALLBACK: written only where the column is still NULL.
+#   treadPattern -> tread_design, sideWall -> sidewall_style. Both sit in the block that
+#       src/models.py calls "from a manufacturer-grade catalog (SimpleTire)", whose comment says
+#       nothing below a catalog can supply them. NTW can, so that comment is now too narrow --
+#       but SimpleTire remains the better source, so these are filled only where NULL too.
+#   runFlat -> is_run_flat and lightTruck -> vehicle_class are LLM-owned identification fields.
+#       A distributor stating them outright beats a model inferring them, and filling them here
+#       is what removes them from the enrichment prompt's job.
+#
+# Nothing here ever overwrites a value that is already set. The precedence table in TireSpec's
+# docstring puts distributor fields first, but "first" is about who should own a field, not a
+# licence to clobber a catalog match that is already more specific than we are.
+_NTW_TREAD_DESIGNS = {"SYMMETRICAL": "Symmetrical", "ASYMMETRICAL": "Asymmetrical", "DIRECTIONAL": "Directional"}
+
+# Fields written on an existing row. Deliberately excludes the size block: a row that already
+# exists has a size from the parser or a catalog, and NTW's tireSize object is a coarser
+# three-field form that would be a downgrade.
+_NTW_SPEC_FILL_FIELDS = (
+    "speed_rating", "load_range", "load_index",
+    "tread_design", "sidewall_style", "is_run_flat", "vehicle_class",
+)
+
+
+def _ntw_yes_no(value: typing.Any) -> typing.Optional[bool]:
+    """``"Y"``/``"N"`` to a bool. Anything else is unknown -- never False, per TireSpec's rule
+    that a nullable boolean means unknown."""
+    text = (str(value or "")).strip().upper()
+    if text in ("Y", "YES", "TRUE"):
+        return True
+    if text in ("N", "NO", "FALSE"):
+        return False
+    return None
+
+
+def _ntw_tread_design(value: typing.Any) -> typing.Optional[str]:
+    """
+    TBC's enumeration is SYMMETRICAL / ASYMMETRICAL / DIRECTIONAL / ALL / NO. Only the first
+    three name a real tread design; "ALL" and "NO" are filter sentinels that mean "unspecified"
+    and must not be stored as if they were one.
+    """
+    return _NTW_TREAD_DESIGNS.get((str(value or "")).strip().upper())
+
+
+def _ntw_vehicle_class(light_truck: typing.Any) -> typing.Optional[str]:
+    """
+    ``lightTruck == "Y"`` is a positive statement and maps straight through. ``"N"`` is NOT
+    evidence of a passenger tire -- a 295/80R22.5 commercial truck tire and a farm implement tire
+    are both "N" -- so it yields unknown rather than a wrong class.
+    """
+    return src_models.TireSpec.VEHICLE_CLASS_LIGHT_TRUCK if _ntw_yes_no(light_truck) else None
+
+
+def _ntw_spec_values(row: typing.Dict) -> typing.Dict[str, typing.Any]:
+    """The TireSpec-shaped subset of one API product row; keys whose value is unknown are absent."""
+    load_index = _safe_int(row.get("loadIndexRange"))
+    values = {
+        "speed_rating": _clean(row.get("speedRating")),
+        "load_range": _clean(row.get("loadRange")),
+        "load_index": load_index if load_index and 0 < load_index < 1000 else None,
+        "tread_design": _ntw_tread_design(row.get("treadPattern")),
+        "sidewall_style": _clean(row.get("sideWall")),
+        "is_run_flat": _ntw_yes_no(row.get("runFlat")),
+        "vehicle_class": _ntw_vehicle_class(row.get("lightTruck")),
+    }
+    return {k: v for k, v in values.items() if v is not None}
+
+
+def fetch_ntw_product_attributes(
+    customer_id: str,
+    brand_part_pairs: typing.Sequence[typing.Tuple[str, str]],
+    batch_size: int = 200,
+) -> typing.Dict[typing.Tuple[str, str], typing.Dict]:
+    """
+    Look up ``(brandName, partNo)`` pairs through ByProductId and return the raw product rows,
+    keyed by ``(BRAND_UPPER, part_number)``.
+
+    ``requestedQty=0`` on purpose. That parameter filters rather than requests: at 1 the gateway
+    returns only what is in stock, so a tire NTW carries but is out of right now would silently
+    have no attributes to read. Measured on the same 25 parts, qty=1 returned 7 and qty=0
+    returned 11, the extra four being zero-stock rows. Omitting it entirely is not an option --
+    that returns errorCd 1006 for the whole call.
+
+    A pair whose part number is blank is dropped rather than sent: an empty ``partNo`` is a
+    silent brand wildcard on this API (``{"brandName": "Cooper", "partNo": ""}`` returned
+    Cooper's entire 131-product catalog, HTTP 200, no warning), which would both corrupt the
+    mapping and quietly inflate the response.
+    """
+    from src.integrations.clients.ntw import api_client as ntw_api
+
+    client = ntw_api.NtwApiClient()
+    pairs = [(b, pn) for b, pn in brand_part_pairs if (pn or "").strip() and (b or "").strip()]
+    dropped = len(brand_part_pairs) - len(pairs)
+    if dropped:
+        logger.warning(
+            "{} Skipped {} parts with a blank brand or part number (a blank partNo is a brand "
+            "wildcard on this API).".format(_LOG_PREFIX, dropped)
+        )
+
+    found: typing.Dict[typing.Tuple[str, str], typing.Dict] = {}
+    for i in range(0, len(pairs), batch_size):
+        chunk = pairs[i : i + batch_size]
+        criteria = [
+            {"brandName": brand, "partNo": part_number, "requestedQty": 0}
+            for brand, part_number in chunk
+        ]
+        rows = client.get_tire_inventory(customer_id, criteria)
+        for row in rows:
+            part_number = (str(row.get("partNo") or "")).strip()
+            brand = (str(row.get("brandName") or "")).strip().upper()
+            if part_number and brand:
+                found.setdefault((brand, part_number), row)
+        logger.info(
+            "{} Product attributes: batch {}/{} -- asked {}, matched {} so far.".format(
+                _LOG_PREFIX, (i // batch_size) + 1,
+                (len(pairs) + batch_size - 1) // batch_size, len(chunk), len(found),
+            )
+        )
+    return found
+
+
+def sync_tire_specs_from_ntw_api(
+    *,
+    customer_id: typing.Optional[str] = None,
+    company_provider_id: typing.Optional[int] = None,
+    brands: typing.Optional[typing.Sequence[str]] = None,
+    limit: typing.Optional[int] = None,
+    batch_size: int = 200,
+    apply_changes: bool = False,
+) -> typing.Dict[str, int]:
+    """
+    Fill TireSpec from TBC's inventory API for NTW's parts, creating a row where none exists.
+
+    This is the one NTW path that CREATES TireSpec rows, which the equivalent ATD sync
+    deliberately does not do. The reason the rule differs: ATD supplies only measured extras
+    (tread depth, UTQG, rim widths) and has nothing to build a row around, whereas every NTW part
+    arrives with a sidewall string in the feed, so ``src.domain.tire_size`` can own the size block
+    exactly as it does for an enrichment-built row. ``rim_diameter_in`` and ``size_display`` are
+    NOT NULL, so a part whose size will not parse is skipped rather than given a stub.
+
+    Creating a row moves a part from the enrichment pipeline's MODE_MISSING to MODE_INCOMPLETE.
+    That is not a dead end -- ``enrich_tire_specs --mode incomplete`` still reaches it for the
+    identification fields only the model can supply (model_name, season, tier, noise) -- but a
+    default enrichment run looks for missing rows, so anything created here needs that flag.
+
+    The lookup tier (max_load_lb, max_speed_mph, ply_rating) is left alone: those are derived
+    from the load index and load range by ``resolve_tire_derived_fields``, which is free and
+    idempotent, and duplicating it here would be a second place to get it wrong.
+
+    Nothing is written unless ``apply_changes`` is True.
+    """
+    logger.info(
+        "{} TireSpec sync from the NTW API{}.".format(_LOG_PREFIX, "" if apply_changes else " (dry run)")
+    )
+
+    from src.domain import tire_size as tire_size_domain
+
+    if not customer_id:
+        cp = None
+        if company_provider_id:
+            cp = src_models.CompanyProviders.objects.filter(id=company_provider_id).first()
+        else:
+            cp = _primary_ntw_company_provider()
+        creds = credentials_helper.get_feed_credentials(cp) if cp else {}
+        customer_id = (creds.get("customer_id") or "").strip()
+    if not customer_id:
+        raise ValueError(
+            "No NTW customer_id. Pass one, or set it on the connection's feed credentials -- "
+            "TBC issues it separately from the MOVEit login."
+        )
+
+    ntw_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.NTW.value
+    ).first()
+    if not ntw_provider:
+        logger.info("{} No NTW provider found.".format(_LOG_PREFIX))
+        return {}
+
+    rows = (
+        src_models.NtwParts.objects.select_related("brand")
+        .filter(brand__brand_mappings__isnull=False)
+        .values("part_number", "size_description", "brand__name", "brand__brand_mappings__brand_id")
+        .order_by("part_number")
+    )
+    if brands:
+        rows = rows.filter(brand__name__in=list(brands))
+    if limit:
+        rows = rows[:limit]
+    rows = list(rows)
+    if not rows:
+        logger.info("{} No mapped NTW parts to work on.".format(_LOG_PREFIX))
+        return {}
+
+    master_part_id_by_key = {
+        (r["brand_id"], r["part_number"]): r["id"]
+        for r in src_models.MasterPart.objects.filter(
+            brand_id__in={r["brand__brand_mappings__brand_id"] for r in rows},
+            part_number__in={r["part_number"] for r in rows},
+        ).values("id", "brand_id", "part_number")
+    }
+    existing_spec_ids = set(
+        src_models.TireSpec.objects.filter(
+            master_part_id__in=set(master_part_id_by_key.values())
+        ).values_list("master_part_id", flat=True)
+    )
+
+    attributes = fetch_ntw_product_attributes(
+        customer_id,
+        [(r["brand__name"], r["part_number"]) for r in rows],
+        batch_size=batch_size,
+    )
+
+    stats = {
+        "parts": len(rows), "matched_in_api": 0, "updated": 0, "created": 0,
+        "unchanged": 0, "unparseable_size": 0, "no_master_part": 0, "fields_written": 0,
+    }
+    to_update: typing.List[src_models.TireSpec] = []
+    to_create: typing.List[src_models.TireSpec] = []
+    specs_by_mp = {
+        s.master_part_id: s
+        for s in src_models.TireSpec.objects.filter(master_part_id__in=existing_spec_ids)
+    }
+
+    for r in rows:
+        master_part_id = master_part_id_by_key.get(
+            (r["brand__brand_mappings__brand_id"], r["part_number"])
+        )
+        if not master_part_id:
+            stats["no_master_part"] += 1
+            continue
+        row = attributes.get(((r["brand__name"] or "").strip().upper(), r["part_number"]))
+        if not row:
+            continue
+        stats["matched_in_api"] += 1
+        values = _ntw_spec_values(row)
+        if not values:
+            continue
+
+        spec = specs_by_mp.get(master_part_id)
+        if spec is not None:
+            changed = [f for f in _NTW_SPEC_FILL_FIELDS
+                       if f in values and getattr(spec, f) in (None, "")]
+            if not changed:
+                stats["unchanged"] += 1
+                continue
+            for f in changed:
+                setattr(spec, f, values[f])
+            stats["updated"] += 1
+            stats["fields_written"] += len(changed)
+            to_update.append(spec)
+            continue
+
+        parsed = tire_size_domain.parse(r["size_description"])
+        if not parsed:
+            # rim_diameter_in and size_display are NOT NULL -- no size, no row.
+            stats["unparseable_size"] += 1
+            continue
+        spec = src_models.TireSpec(master_part_id=master_part_id)
+        for field in tire_reparse.PARSER_FIELDS:
+            setattr(spec, field, getattr(parsed, field, None))
+        for field, value in values.items():
+            if getattr(spec, field, None) in (None, ""):
+                setattr(spec, field, value)
+        spec.spec_source = src_models.TireSpec.SPEC_SOURCE_PARSER
+        stats["created"] += 1
+        stats["fields_written"] += len(values)
+        to_create.append(spec)
+
+    if apply_changes:
+        if to_update:
+            now = timezone.now()
+            for spec in to_update:
+                spec.updated_at = now
+            src_models.TireSpec.objects.bulk_update(
+                to_update, list(_NTW_SPEC_FILL_FIELDS) + ["updated_at"], batch_size=500
+            )
+        if to_create:
+            src_models.TireSpec.objects.bulk_create(to_create, batch_size=500, ignore_conflicts=True)
+    else:
+        logger.info("{} Dry run -- nothing written.".format(_LOG_PREFIX))
+
+    logger.info("{} TireSpec from NTW API: {}".format(_LOG_PREFIX, stats))
+    return stats

@@ -34,11 +34,7 @@ for every identifier shape tried, including TBC's own documented sample and the 
 number that some feed rows carry in ``product_id``. A single-SKU lookup therefore goes by that
 SKU's tire size and filters the response, which is what ``find_tire_by_part_number`` does.
 """
-import hashlib
-import hmac
-import json
 import logging
-import time
 import typing
 
 import requests
@@ -58,7 +54,46 @@ STOCK_READ_QTY = 1
 DEFAULT_TIMEOUT_SECONDS = 45
 
 SEARCH_BY_TIRE_SIZE = "ByTireSize"
+# The ONLY other valid search type. There is no "ByPartNumber" -- asking for one returns
+# errorCd 1006, which is what made part lookup look broken until the v2.0 spec settled it.
+SEARCH_BY_PRODUCT_ID = "ByProductId"
 CUSTOMER_TYPE_EXTERNAL = "external"
+
+# requestedQty FILTERS rather than requests. At 1 the gateway returns only what is in stock, so
+# a part that exists but is out of stock vanishes from the response and looks unknown rather
+# than empty. 0 returns the zero-stock rows too, which is what both a stock read and a quote
+# actually want. Omitting it is not an option -- that returns errorCd 1006 for the whole call.
+STOCK_READ_QTY = 0
+
+# Carrier service codes, from the Order Service v1.0 spec. Sent only when isDropShip is true,
+# as (SCAC, carrierServiceCode). This is a published enumeration, not a quote -- TBC has no
+# endpoint that prices these, so selection filters the order rather than comparing costs.
+CARRIER_SERVICE_CODES = (
+    ("CUST", "THIRD_PARTY_EXPRESS"),
+    ("CUST", "THIRD_PARTY_PARCEL"),
+    ("CUST", "THIRD_PARTY_UPS_GROUND"),
+    ("FEDX", "GROUND_HOME_DELIVERY"),
+    ("FEDX", "FEDEX_2_DAY"),
+    ("FEDX", "FEDEX_2_DAY_AM"),
+    ("FEDX", "FEDEX_GROUND"),
+    ("FEDX", "FREIGHT ECONOMY"),
+    ("FEDX", "PRIORITY_OVERNIGHT"),
+    ("FEDX", "STANDARD_OVERNIGHT"),
+    ("FEDX", "ST_PARCEL_EXPRESS"),
+    ("NTWL", "LTL GROUND"),
+    ("NTWL", "NTW_GROUND"),
+    ("NTWL", "WILL CALL"),
+    ("ROADIE", "ST_ROADIE"),
+    ("UPSN", "UPS_2 DAY"),
+    ("UPSN", "UPS_EXPRESS SAVER"),
+    ("UPSN", "UPS_GROUND"),
+    ("UPSN", "UPS_PRIORITY OVERNIGHT"),
+    ("UPSN", "UPS_STANDARD OVERNIGHT"),
+)
+
+ORDER_TYPE_PICKUP = "PickUp"
+ORDER_TYPE_DELIVERY = "Delivery"
+ORDER_TYPE_RESERVE = "RESERVE"
 
 
 class NtwApiClient:
@@ -68,13 +103,11 @@ class NtwApiClient:
         client_secret: typing.Optional[str] = None,
         base_url: typing.Optional[str] = None,
         ca_bundle: typing.Optional[str] = None,
-        signing_secret: typing.Optional[str] = None,
     ) -> None:
         self.client_id = client_id or getattr(settings, "NTW_API_CLIENT_ID", "") or ""
         self.client_secret = client_secret or getattr(settings, "NTW_API_CLIENT_SECRET", "") or ""
         self.base_url = (base_url or getattr(settings, "NTW_API_BASE_URL", "") or "").rstrip("/")
         self.ca_bundle = ca_bundle or getattr(settings, "NTW_API_CA_BUNDLE", "") or ""
-        self.signing_secret = signing_secret or getattr(settings, "NTW_API_SIGNING_SECRET", "") or ""
 
         if not self.client_id or not self.client_secret:
             raise exceptions.NtwApiNotConfiguredError(
@@ -182,6 +215,26 @@ class NtwApiClient:
 
     # -- inventory (v2) ------------------------------------------------------
 
+    def _products_or_raise(self, payload: typing.Dict) -> typing.List[typing.Dict]:
+        """
+        The product list, or [] for a legitimately empty answer.
+
+        Failures on this API arrive as **HTTP 200** with an ``errorCd`` body and no ``product``
+        key, so branching on the status code turns one into "nothing in stock". errorCd 1006
+        ("Could not get any inventory from backend") IS the empty answer -- a size or part the
+        customer's catalog does not carry -- and anything else is raised.
+        """
+        if "product" not in payload:
+            code = str(payload.get("errorCd") or "")
+            message = self._error_message(payload) or "TBC returned no product list."
+            if code == "1006":
+                logger.info("{} Empty answer from TBC: {}".format(_LOG_PREFIX, message))
+                return []
+            raise exceptions.NtwApiBusinessError(message, status=200, payload=payload)
+        rows = payload.get("product") or []
+        return [rows] if isinstance(rows, dict) else list(rows)
+
+
     def get_tire_inventory(
         self,
         customer_id: str,
@@ -222,87 +275,102 @@ class NtwApiClient:
 
             payload = self._request("POST", "/v2/products/tires", body=body, params=params)
 
-            # HTTP 200 with an errorCd body and no product key. "Could not get any inventory from
-            # backend" (1006) is a legitimate empty answer for a size nobody stocks, so it is not
-            # raised -- anything else is.
-            if "product" not in payload:
-                code = str(payload.get("errorCd") or "")
-                message = self._error_message(payload) or "TBC returned no product list."
-                if code == "1006":
-                    logger.info("{} No inventory for criteria chunk: {}".format(_LOG_PREFIX, message))
-                    continue
-                raise exceptions.NtwApiBusinessError(message, status=200, payload=payload)
-
-            rows = payload.get("product") or []
-            if isinstance(rows, dict):
-                rows = [rows]
-            products.extend(rows)
+            products.extend(self._products_or_raise(payload))
 
         return products
+
+    def get_inventory_by_parts(
+        self,
+        customer_id: str,
+        brand_part_pairs: typing.Sequence[typing.Tuple[str, str]],
+        ship_to: typing.Optional[typing.List[typing.Dict]] = None,
+        is_drop_ship: bool = False,
+        dealer_code: typing.Optional[str] = None,
+        store_number: typing.Optional[str] = None,
+        batch_size: int = 200,
+    ) -> typing.Dict[typing.Tuple[str, str], typing.Dict]:
+        """
+        Live rows for specific SKUs via ``ByProductId``, keyed by ``(BRAND_UPPER, partNo)``.
+
+        This is the direct lookup, and it is good: 286 part numbers in one call came back 1:1 in
+        under two seconds, with none of the two-entry truncation ``ByTireSize`` suffers. Batching
+        is therefore about request size, not about working around a cap.
+
+        Two rules this method enforces so callers cannot get them wrong:
+
+        * ``brandName`` is REQUIRED. Without it TBC's flow raises a 500 SQL exception rather than
+          a validation error, so a pair with no brand is dropped here instead.
+        * A blank ``partNo`` is a silent BRAND WILDCARD -- ``{"brandName": "Cooper", "partNo": ""}``
+          returned Cooper's entire 131-product catalog, HTTP 200, no warning. One such row in a
+          batch both inflates the response and breaks line matching, so blanks are dropped too.
+        """
+        pairs = [
+            (str(b).strip(), str(pn).strip())
+            for b, pn in brand_part_pairs
+            if str(b or "").strip() and str(pn or "").strip()
+        ]
+        dropped = len(brand_part_pairs) - len(pairs)
+        if dropped:
+            logger.warning(
+                "{} Dropped {} lookup(s) missing a brand or part number -- a blank partNo is a "
+                "brand wildcard on this API.".format(_LOG_PREFIX, dropped)
+            )
+        if not pairs:
+            return {}
+
+        found: typing.Dict[typing.Tuple[str, str], typing.Dict] = {}
+        for i in range(0, len(pairs), batch_size):
+            chunk = pairs[i : i + batch_size]
+            body = {
+                "customerId": str(customer_id),
+                "customerType": CUSTOMER_TYPE_EXTERNAL,
+                "isDropShip": bool(is_drop_ship),
+                "searchType": SEARCH_BY_PRODUCT_ID,
+                "criteria": [
+                    {"brandName": brand, "partNo": part_number, "requestedQty": STOCK_READ_QTY}
+                    for brand, part_number in chunk
+                ],
+            }
+            if ship_to:
+                body["shipTo"] = ship_to
+            if store_number:
+                body["storeNumber"] = str(store_number)
+            params = {"dealerCode": dealer_code} if dealer_code else None
+
+            payload = self._request("POST", "/v2/products/tires", body=body, params=params)
+            rows = self._products_or_raise(payload)
+            for row in rows:
+                part_number = str(row.get("partNo") or "").strip()
+                brand = str(row.get("brandName") or "").strip().upper()
+                if part_number and brand:
+                    found.setdefault((brand, part_number), row)
+        return found
 
     def find_tire_by_part_number(
         self,
         customer_id: str,
         part_number: str,
-        tire_size: typing.Dict,
+        brand_name: str,
         **kwargs: typing.Any,
     ) -> typing.Optional[typing.Dict]:
-        """
-        One SKU's live row, looked up by its size and then filtered down by part number -- the
-        detour ``searchType: "ByPartNumber"`` would make unnecessary if it worked. Returns None
-        when TBC lists the size but not this part, which is the normal "out of stock" answer.
-        """
-        rows = self.get_tire_inventory(
-            customer_id,
-            [{"tireSize": tire_size, "requestedQty": STOCK_READ_QTY}],
-            **kwargs
-        )
-        wanted = (part_number or "").strip().upper()
-        for row in rows:
-            if str(row.get("partNo") or "").strip().upper() == wanted:
-                return row
-        return None
+        """One SKU's live row. None means TBC does not list it for this customer at all."""
+        found = self.get_inventory_by_parts(customer_id, [(brand_name, part_number)], **kwargs)
+        return found.get((str(brand_name or "").strip().upper(), str(part_number or "").strip()))
 
     # -- ordering (v1) -------------------------------------------------------
 
-    def _signature(self, body: typing.Optional[typing.Dict], timestamp: str) -> str:
-        """
-        HMAC SHA-256 for the order endpoints' ``signature`` query parameter.
-
-        **TBC has not documented what string is signed.** Their docs show ``timestamp`` and
-        ``signature`` as opaque query parameters with example values that are not derivable
-        (``"demiwiru"``). What is implemented here is the conventional construction --
-        ``timestamp`` followed by the exact request body, keyed with the shared secret -- and it
-        is isolated in this one method precisely so the canonicalisation can be corrected without
-        touching the adapter.
-
-        It fails loudly when no secret is configured rather than sending an unsigned order,
-        because the failure mode on the other side of a wrong signature is unknown: an order
-        that is silently accepted-but-unsigned, or rejected hours later with no 997-equivalent to
-        tell us, are both worse than not sending it.
-        """
-        if not self.signing_secret:
-            raise exceptions.NtwApiNotConfiguredError(
-                "NTW_API_SIGNING_SECRET is not set, and TBC's order endpoints require an HMAC "
-                "SHA-256 signature. Ask TBC for the signing key and the exact string it is "
-                "computed over before enabling NTW ordering."
-            )
-        message = timestamp + (json.dumps(body, separators=(",", ":"), sort_keys=True) if body else "")
-        return hmac.new(
-            self.signing_secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256
-        ).hexdigest()
-
     def create_order(self, body: typing.Dict) -> typing.Any:
         """
-        POST /v1/order. Returns TBC's response verbatim -- **an array** of
-        ``{id, items}`` objects, because one submit can yield several TBC order numbers.
+        POST /v1/order. Returns **an array** of ``{id, items, status, estDelivery, location,
+        pickUpPhone}`` -- one submit can yield several TBC order numbers.
+
+        No request signing. An earlier read of TBC's developer portal showed ``signature`` and
+        ``timestamp`` as query parameters and this client refused to submit without a secret;
+        the Order Service v1.0 spec states outright that the API has no query parameters, and
+        authentication is the same two headers as everywhere else.
         """
-        timestamp = str(int(time.time()))
-        params = {"signature": self._signature(body, timestamp), "timestamp": timestamp}
-        return self._request("POST", "/v1/order", body=body, params=params)
+        return self._request("POST", "/v1/order", body=body)
 
     def get_order(self, order_id: str) -> typing.Dict:
         """GET /v1/order/{orderId} -- status, estDelivery, location, pickUpPhone, trackingNumber."""
-        timestamp = str(int(time.time()))
-        params = {"signature": self._signature(None, timestamp), "timestamp": timestamp}
-        return self._request("GET", "/v1/order/{}".format(order_id), params=params)
+        return self._request("GET", "/v1/order/{}".format(order_id))
