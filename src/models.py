@@ -2617,6 +2617,49 @@ class BrandNtwBrandMapping(django_db_models.Model):
         unique_together = [["brand", "ntw_brand"]]
 
 
+class NtwLocation(django_db_models.Model):
+    """
+    TBC branch/warehouse decoded from a bare ``locationId``, the same role MeyerLocation plays
+    for Meyer -- so a product page can say "Miami Gardens, FL" instead of "3269".
+
+    Unlike every other location table here, there is no endpoint to load it from: TBC publishes
+    no locations API (``/v2/locations`` 404s). What they do give is the full address inline on
+    every ``availableSource`` of an inventory response, and a location object with a real
+    ``name`` on an order status. So this table is filled opportunistically from traffic we were
+    making anyway -- see ``src.integrations.services.ntw.record_ntw_locations``.
+
+    Two consequences of that, both deliberate:
+
+    * It is incomplete by construction. A branch nobody has queried yet is simply absent, and
+      callers fall back to showing the raw id rather than hiding the stock.
+    * ``name`` is usually empty. Inventory responses carry an address but no name; only order
+      statuses carry one ("RIVIERA BEACH FL2"). The display label therefore prefers ``name``
+      when we have it and falls back to "CITY, ST".
+    """
+
+    external_id = django_db_models.CharField(max_length=32)
+    name = django_db_models.CharField(max_length=255, blank=True)
+    street = django_db_models.CharField(max_length=255, blank=True)
+    city = django_db_models.CharField(max_length=255, blank=True)
+    state = django_db_models.CharField(max_length=64, blank=True)
+    country = django_db_models.CharField(max_length=64, blank=True)
+    zip_code = django_db_models.CharField(max_length=32, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "ntw_locations"
+        unique_together = ["external_id"]
+
+    def label(self) -> str:
+        """Human-readable form, falling back through name -> "CITY, ST" -> the bare id."""
+        if self.name:
+            return self.name
+        place = ", ".join(p for p in (self.city, self.state) if p)
+        return place or self.external_id
+
+
 class NtwParts(django_db_models.Model):
     """
     Row from NTW's MOVEit CSV feed. The file is **headerless** -- 14 positional columns, verified

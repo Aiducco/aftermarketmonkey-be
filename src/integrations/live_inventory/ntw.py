@@ -36,6 +36,7 @@ from src.integrations.clients.ntw import api_client as ntw_api
 from src.integrations.clients.ntw import exceptions as ntw_exceptions
 from src.integrations.live_inventory import base
 from src.integrations.live_inventory import exceptions as live_inventory_exceptions
+from src.integrations.services import ntw as ntw_services
 
 logger = logging.getLogger(__name__)
 _LOG_PREFIX = "[NTW-LIVE-INVENTORY]"
@@ -177,14 +178,23 @@ class NtwLiveInventoryProvider(base.LiveInventoryProvider):
         sources: typing.List[typing.Dict],
         now: typing.Any,
     ) -> src_models.ProviderPartInventory:
+        # Learn the branches first: TBC has no locations endpoint, and the address rides along
+        # on every availableSource, so this is the only place the decode table ever fills.
+        ntw_services.record_ntw_locations(sources)
+        labels = ntw_services.ntw_location_labels()
+
         warehouse_availability: typing.Dict[str, typing.Any] = {"available_on_hand": total_qty}
         for source in sources:
-            location_id = source.get("locationId")
+            location_id = str(source.get("locationId") or "")
             qty = source.get("quantityAvailable")
             if location_id and isinstance(qty, (int, float)):
-                # Per-branch detail the feed cannot carry: the file is one dealer's one
-                # warehouse, while the API answers across every location that can serve them.
-                warehouse_availability[str(location_id)] = int(qty)
+                # Keyed by the branch's readable name, the same convention Turn14 and Meyer use
+                # -- "MIAMI GARDENS, FL" rather than "3269". Falls back to the raw id for a
+                # branch we have not seen an address for yet, so stock is never hidden just
+                # because it cannot be named. Per-branch detail the feed cannot carry at all:
+                # the file is one dealer's one warehouse, while the API answers across every
+                # location that can serve them.
+                warehouse_availability[labels.get(location_id, location_id)] = int(qty)
 
         inventory, _ = src_models.ProviderPartInventory.objects.update_or_create(
             provider_part=provider_part,

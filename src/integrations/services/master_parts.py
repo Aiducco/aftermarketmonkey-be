@@ -21,6 +21,7 @@ from src import constants as src_constants
 from src import enums as src_enums
 from src import models as src_models
 from src.integrations import credentials as credentials_helper
+from src.integrations.services import ntw as ntw_services
 from src.integrations.services import wps as wps_services
 from src.integrations.utils import images as image_utils
 from src.integrations.utils import master_part_matching as mp_matching
@@ -12664,6 +12665,7 @@ def sync_provider_inventory_from_ntw() -> None:
         return
 
     ntw_brand_id_to_name = {m.ntw_brand_id: m.ntw_brand.name for m in mappings}
+    ntw_location_labels = ntw_services.ntw_location_labels()
 
     provider_parts = {
         row["provider_external_id"]: src_models.ProviderPart(id=row["id"])
@@ -12710,10 +12712,13 @@ def sync_provider_inventory_from_ntw() -> None:
                 except (TypeError, ValueError):
                     total_qty = 0
                     wh_avail = {"available_on_hand": None}
-                # Label the branch the quantity came from -- NTW serves each dealer from one
-                # location, so the code is the only way to tell later whose stock this was.
-                location_id = row.get("location_id")
+                # Label the branch the quantity came from. The feed carries only a bare id
+                # (column 2), so it is decoded against ntw_locations, which the API paths fill
+                # as they see addresses -- a branch nobody has queried yet still shows, just as
+                # its id.
+                location_id = str(row.get("location_id") or "")
                 if location_id:
+                    wh_avail[ntw_location_labels.get(location_id, location_id)] = total_qty
                     wh_avail["location_id"] = location_id
                 to_upsert.append(
                     src_models.ProviderPartInventory(

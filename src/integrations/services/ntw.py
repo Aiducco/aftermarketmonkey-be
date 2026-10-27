@@ -1011,3 +1011,74 @@ def sync_tire_specs_from_ntw_api(
 
     logger.info("{} TireSpec from NTW API: {}".format(_LOG_PREFIX, stats))
     return stats
+
+
+# -- branch decoding ---------------------------------------------------------
+
+
+def record_ntw_locations(rows: typing.Iterable[typing.Dict]) -> int:
+    """
+    Learn TBC branches from whatever an API response happened to carry.
+
+    TBC publishes no locations endpoint, so there is nothing to sync -- but every inventory
+    ``availableSource`` carries the branch's full address, and an order status carries a real
+    branch name. Recording them as they go past is the only way this table ever fills, and it
+    costs one upsert per branch seen rather than a call of its own.
+
+    ``name`` is only ever written when a response actually supplies one, so an inventory
+    response cannot blank a name an order status taught us earlier.
+    """
+    seen: typing.Dict[str, typing.Dict[str, str]] = {}
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        external_id = str(row.get("locationId") or row.get("id") or "").strip()
+        if not external_id:
+            continue
+        address = row.get("address") or {}
+        seen[external_id] = {
+            "name": _clean(row.get("name")) or "",
+            "street": _clean(address.get("streetName") or address.get("address")) or "",
+            "city": _clean(address.get("city")) or "",
+            "state": _clean(address.get("state")) or "",
+            "country": _clean(address.get("country")) or "",
+            "zip_code": _clean(address.get("zipCode") or address.get("postalCode")) or "",
+        }
+    if not seen:
+        return 0
+
+    existing = {
+        loc.external_id: loc
+        for loc in src_models.NtwLocation.objects.filter(external_id__in=list(seen))
+    }
+    to_create, to_update = [], []
+    for external_id, values in seen.items():
+        loc = existing.get(external_id)
+        if loc is None:
+            to_create.append(src_models.NtwLocation(external_id=external_id, **values))
+            continue
+        changed = False
+        for field, value in values.items():
+            # Never overwrite something we know with a blank this response did not carry.
+            if value and getattr(loc, field) != value:
+                setattr(loc, field, value)
+                changed = True
+        if changed:
+            to_update.append(loc)
+
+    if to_create:
+        src_models.NtwLocation.objects.bulk_create(to_create, ignore_conflicts=True)
+    if to_update:
+        src_models.NtwLocation.objects.bulk_update(
+            to_update, ["name", "street", "city", "state", "country", "zip_code", "updated_at"],
+            batch_size=200,
+        )
+    return len(to_create) + len(to_update)
+
+
+def ntw_location_labels() -> typing.Dict[str, str]:
+    """``locationId`` -> display label, for decoding bare branch ids off the feed."""
+    return {
+        loc.external_id: loc.label()
+        for loc in src_models.NtwLocation.objects.all()
+    }

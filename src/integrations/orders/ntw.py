@@ -41,6 +41,7 @@ from src.integrations.clients.ntw import api_client as ntw_api
 from src.integrations.clients.ntw import exceptions as ntw_exceptions
 from src.integrations.orders import base
 from src.integrations.orders import exceptions as order_exceptions
+from src.integrations.services import ntw as ntw_services
 
 logger = logging.getLogger(__name__)
 _LOG_PREFIX = "[NTW-ORDER-ADAPTER]"
@@ -257,6 +258,13 @@ class NtwOrderAdapter(base.DistributorOrderAdapter):
         rows_by_part = {part_number.strip().upper(): row
                         for (_brand, part_number), row in found.items()}
 
+        # Every availableSource carries the branch's address, and TBC has no locations
+        # endpoint, so this is where the decode table learns them.
+        ntw_services.record_ntw_locations(
+            [src for row in found.values() for src in (row.get("availableSource") or [])]
+        )
+        location_labels = ntw_services.ntw_location_labels()
+
         lines: typing.List[base.ShippingQuoteLine] = []
         raw_by_line: typing.Dict[str, typing.Dict] = {}
         distributor_total = Decimal("0")
@@ -315,9 +323,11 @@ class NtwOrderAdapter(base.DistributorOrderAdapter):
 
             location_id = str((best_location or {}).get("locationId") or "") or None
             address = (best_location or {}).get("address") or {}
-            warehouse_name = ", ".join(
-                [p for p in (address.get("city"), address.get("state")) if p]
-            ) or None
+            # Prefer the recorded branch name (order statuses supply real ones like
+            # "RIVIERA BEACH FL2"); fall back to this response's own city/state.
+            warehouse_name = location_labels.get(location_id or "") or (
+                ", ".join([p for p in (address.get("city"), address.get("state")) if p]) or None
+            )
 
             raw_by_line[str(item.line_item_id)] = {
                 "partNo": row.get("partNo"),
@@ -488,6 +498,9 @@ class NtwOrderAdapter(base.DistributorOrderAdapter):
                 )
                 raise order_exceptions.OrderAdapterError(str(e)) from e
 
+            # The only response shape that carries a branch name rather than just an address.
+            ntw_services.record_ntw_locations([payload.get("location") or {}])
+
             raw_status = str(payload.get("status") or "").strip()
             tracking = str(payload.get("trackingNumber") or "").strip()
             statuses.append(
@@ -577,6 +590,7 @@ class NtwOrderAdapter(base.DistributorOrderAdapter):
                 continue
 
             location = payload.get("location") or {}
+            ntw_services.record_ntw_locations([location])
             warehouse_code = str(location.get("id") or "") or None
             items = payload.get("items") or []
             if isinstance(items, dict):
