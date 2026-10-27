@@ -88,6 +88,9 @@ CONNECTION_ERROR_INVALID_INPUT = "invalid_input"
 CONNECTION_ERROR_INVALID_CREDENTIALS = "invalid_credentials"
 CONNECTION_ERROR_PERMISSION_DENIED = "permission_denied"
 CONNECTION_ERROR_CONNECTION_FAILED = "connection_failed"
+# The distributor does not offer this ordering channel at all (e.g. Rough Country withdrew
+# email ordering). Distinct from invalid_input: nothing the user typed is wrong.
+CONNECTION_ERROR_CHANNEL_UNAVAILABLE = "channel_unavailable"
 CONNECTION_ERROR_NOT_FOUND = "not_found"
 CONNECTION_ERROR_PLAN_LIMIT_REACHED = billing_services.PLAN_LIMIT_ERROR_CODE
 
@@ -1129,7 +1132,7 @@ def _validate_order_connection_for_method(
                 False,
                 "This distributor no longer accepts orders by email. Use their ordering "
                 "integration instead.",
-                CONNECTION_ERROR_INVALID_INPUT,
+                CONNECTION_ERROR_CHANNEL_UNAVAILABLE,
             )
         message, code = _validate_email_order_connection(credentials)
         if message:
@@ -1351,18 +1354,32 @@ def _order_connection_status_fields(
     }
 
 
+# Validator failures that mean "ordering is not set up on this connection", as opposed to "we
+# tried to use it and it did not work". These resolve to NO order status at all rather than
+# ERROR: a null order_status is already how this model says "ordering isn't configured", and
+# showing a red error to a shop that simply has not been onboarded onto a channel yet is both
+# alarming and untrue. ERROR is reserved for credentials that were supplied and rejected.
+_ORDER_NOT_CONFIGURED_CODES = frozenset(
+    {CONNECTION_ERROR_MISSING_FIELDS, CONNECTION_ERROR_CHANNEL_UNAVAILABLE}
+)
+
+
 def _resolve_order_status(
     order_validated: typing.Optional[bool],
     order_val_error: typing.Optional[str],
     feed_status_enum: typing.Optional["src_enums.CompanyProviderConnectionStatus"],
+    order_val_error_code: typing.Optional[str] = None,
 ) -> typing.Tuple[typing.Optional["src_enums.CompanyProviderOrderConnectionStatus"], typing.Optional[str]]:
     """
     Turn an order validator's result into an order status, gated on feed status: ordering can
     never be CONNECTED while the feed itself isn't — see CompanyProviderOrderConnectionStatus.
+      error code in _ORDER_NOT_CONFIGURED_CODES -> (None, None) — not set up, not broken.
       order_val_error set        -> ERROR, that message.
       order_validated True       -> CONNECTED if feed is CONNECTED, else WAITING.
       order_validated None       -> (None, None) — no validator for this kind; leave untouched.
     """
+    if order_val_error and order_val_error_code in _ORDER_NOT_CONFIGURED_CODES:
+        return None, None
     if order_val_error:
         return src_enums.CompanyProviderOrderConnectionStatus.ERROR, order_val_error
     if order_validated:

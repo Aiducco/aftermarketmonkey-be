@@ -310,9 +310,16 @@ class Command(BaseCommand):
                 order_validated=validated,
                 order_val_error=message,
                 feed_status_enum=feed_status_enum,
+                order_val_error_code=_code,
             )
             if status is not None:
                 integrations_services._set_order_account_status(account, status, reason)
+                any_updated = True
+            elif validated is not None:
+                # The validator ran and reported "not set up" rather than "broken". Clear the
+                # status instead of skipping, so a stale ERROR from a previous run does not
+                # linger on a connection that is merely un-onboarded.
+                integrations_services._set_order_account_status(account, None, None)
                 any_updated = True
         if any_updated:
             integrations_services._refresh_default_order_status(cp)

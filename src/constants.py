@@ -822,18 +822,47 @@ PROVIDER_CATALOG = [
     {
         "kind": enums.BrandProviderKind.WHEELPROS,
         "name": "Wheel Pros",
-        "description": "Access wheels, tires, and accessories inventory and pricing from Wheel Pros via SFTP.",
+        "description": (
+            "Access wheels, tires, and accessories catalog, inventory, and pricing from Wheel Pros — "
+            "catalog and MSRP sync automatically, you just pick how your cost is calculated."
+        ),
         "icon_url": "https://api.aftermarketscout.com/uploads/wheel_pros_logo.png",
         "category": "Distributors",
-        "connection_required_fields": [
-            "sftp_user",
-            "sftp_password",
-            "wheel_markup",
-            "tire_markup",
-            "accessories_markup",
+        # Catalog, inventory, and MSRP/MAP are shared/account-agnostic (one connection, already
+        # SFTP-fed -- see services/wheelpros.py:fetch_and_save_wheelpros) and never require
+        # anything from an individual company. Only COST is per-company, and a company picks
+        # ONE of two ways to get it -- see "feed_connection_modes" below. "pricing_mode" is the
+        # only field required unconditionally; which other fields are actually required depends
+        # on its value, enforced by _validate_wheelpros_connection, not by this list (same
+        # required=[]-plus-custom-validator pattern Meyer/Tri-State already use).
+        "connection_required_fields": ["pricing_mode"],
+        "connection_optional_fields": [
+            "wheel_markup", "tire_markup", "accessories_markup",
+            "api_username", "api_password",
+            # No longer read by either pricing mode (catalog/MSRP come from the shared primary
+            # connection, not a per-company SFTP login) -- kept only so a connection credentialed
+            # before this shipped keeps redacting/displaying correctly, never shown on a new one.
+            "sftp_user", "sftp_password", "sftp_path",
         ],
-        # Remote CSV path per feed (wheel/tire/accessories); defaults in settings if omitted
-        "connection_optional_fields": ["sftp_path"],
+        # Two mutually exclusive ways a company can be priced; the FE renders one form at a time
+        # based on the company's choice, submitting "pricing_mode" plus that mode's own fields
+        # under "feed". See _validate_wheelpros_connection and
+        # services/wheelpros.py:sync_wheelpros_company_pricing_for_company_provider for how each
+        # mode is actually validated/synced.
+        "feed_connection_modes": [
+            {
+                "mode": "markup",
+                "label": "Estimate cost from your markup % off MSRP",
+                "required": ["pricing_mode", "wheel_markup", "tire_markup", "accessories_markup"],
+                "optional": [],
+            },
+            {
+                "mode": "api",
+                "label": "WheelPros Pricing API (real dealer cost, no markup to guess)",
+                "required": ["pricing_mode", "api_username", "api_password"],
+                "optional": [],
+            },
+        ],
         # Order-placement credentials (Wheel Pros Orders API, https://api.wheelpros.com) — a
         # completely separate REST API/login from the SFTP feed above. "username"/"password" are
         # the Product Data Portal account credentials, exchanged for a short-lived (1hr) Bearer
@@ -851,19 +880,28 @@ PROVIDER_CATALOG = [
         # Screenshots live in ``resources/uploads`` and are served from ``{_UPLOADS}`` — see the
         # matching note on Turn 14 above.
         "installation_instructions_html": (
-            "<p><strong>Wheel Pros</strong> connects to AfterMarketScout in two parts, using different "
-            "credentials for each:</p>"
+            "<p><strong>Wheel Pros</strong> catalog, inventory, and MSRP sync automatically — there's "
+            "nothing to set up for those. You just choose how your own <strong>cost</strong> is "
+            "calculated, below:</p>"
             "<ul>"
-            "<li><strong>Product feed</strong> &mdash; inventory and pricing, delivered over SFTP "
-            "(SFTP username + password).</li>"
-            "<li><strong>Ordering</strong> &mdash; purchase orders through the Wheel Pros API.</li>"
+            "<li><strong>Markup %</strong> &mdash; tell us the percent off MSRP your agreement gives "
+            "you on wheels, tires, and accessories, and we estimate cost = MSRP &times; "
+            "(1 &minus; percent/100). Nothing to register for &mdash; just enter three numbers.</li>"
+            "<li><strong>Pricing API</strong> &mdash; connect your Wheel Pros Product Data Portal login "
+            "and we pull your real, per-SKU dealer cost directly from Wheel Pros instead of "
+            "estimating it.</li>"
             "</ul>"
-            "<p>Both are managed through Wheel Pros' Product Data Portal, but each is granted separately and by "
-            "a different contact. Ordering is optional.</p>"
-            "<p><strong>Multiple accounts?</strong> If you have more than one Wheel Pros dealer account "
-            "(brick-and-mortar, drop-ship, or separate locations), complete these steps for each one.</p>"
+            "<p>Ordering (placing purchase orders through AfterMarketScout) is a separate, optional "
+            "grant, covered in step 2 below &mdash; it works the same regardless of which pricing "
+            "option you pick.</p>"
 
-            "<p><strong>1. Register for the Product Data Portal</strong></p>"
+            "<p><strong>Option A &mdash; Markup %</strong></p>"
+            "<p>Select <strong>Markup %</strong> below, enter <strong>wheel_markup</strong>, "
+            "<strong>tire_markup</strong>, and <strong>accessories_markup</strong> (0&ndash;100, percent "
+            "off MSRP &mdash; enter <code>0</code> for a category you get no discount on), and click "
+            "<strong>Save</strong>. That's it.</p>"
+
+            "<p><strong>Option B &mdash; Pricing API</strong></p>"
             "<p>Skip this if you already sign in at <code>data.wheelpros.com</code>.</p>"
             "<ol>"
             "<li>Register at <a href=\"https://data.wheelpros.com/auth/register\" target=\"_blank\" "
@@ -873,60 +911,23 @@ PROVIDER_CATALOG = [
             "</ol>"
             + _CALLOUT_OPEN +
             "<p>We've registered for an account on data.wheelpros.com. Could you please grant us access to "
-            "allow FTP inventory data and API ordering?</p>"
+            "the Pricing API?</p>"
             "</div>"
+            "<p>Once approved, select <strong>Pricing API</strong> below and enter the "
+            "<strong>api_username</strong>/<strong>api_password</strong> you registered, then click "
+            "<strong>Save</strong>. This is the same Product Data Portal login used for Ordering "
+            "(step 2) if you set that up too &mdash; one registration covers both.</p>"
 
-            "<p><strong>2. Set your SFTP username</strong></p>"
-            "<p>The SFTP delivery option stays locked until a username exists on your account, so do this "
-            "before step 3.</p>"
-            "<ol>"
-            "<li>Sign in to the <a href=\"https://data.wheelpros.com/\" target=\"_blank\" "
-            "rel=\"noopener noreferrer\">Product Data Portal</a>.</li>"
-            "<li>Click the profile icon in the upper right corner, then click <strong>Profile</strong>.</li>"
-            "<li>Set your <strong>SFTP username</strong> and save.</li>"
-            "</ol>"
-            "<p>Note your SFTP username and password &mdash; you'll paste both into AfterMarketScout in "
-            "step 4.</p>"
+            "<p><strong>Multiple accounts?</strong> If you have more than one Wheel Pros dealer account "
+            "(brick-and-mortar, drop-ship, or separate locations), complete the option you chose for "
+            "each one.</p>"
 
-            "<p><strong>3. Turn on SFTP delivery</strong></p>"
-            "<ol>"
-            "<li>On the main menu, click <strong>DOWNLOADS</strong>.</li>"
-            "<li>On the side menu, under <strong>TECH GUIDE</strong>, click <strong>DELIVERY OPTIONS</strong>.</li>"
-            "<li>Switch the <strong>SFTP WHEELPROS</strong> toggle on.</li>"
-            "<li>Set <strong>Notification Frequency</strong> to <strong>DAILY</strong> and <strong>File "
-            "Format</strong> to <strong>CSV</strong>.</li>"
-            "<li>Click <strong>SAVE CHANGES</strong>.</li>"
-            "</ol>"
-            "<p><img src=\"https://api.aftermarketscout.com/uploads/wheelpros_step3_delivery_options.png\" "
-            "alt=\"Wheel Pros Product Data Portal, Delivery Options with the SFTP WHEELPROS toggle on\" "
-            "style=\"max-width:100%;height:auto;\" /></p>"
-            "<p>If the SFTP toggle won't turn on, the message beneath it tells you why: no SFTP username has "
-            "been set yet. Go back to step 2.</p>"
-            "<p>The <strong>EMAIL</strong> toggle above is a separate delivery method &mdash; it sends the file "
-            "to an inbox and isn't used by AfterMarketScout. Leave it as-is.</p>"
-
-            "<p><strong>4. Connect the feed in AfterMarketScout</strong></p>"
-            "<ol>"
-            "<li>Paste your <strong>SFTP Username</strong> and <strong>Password</strong> into the "
-            "<strong>Product feed</strong> fields below.</li>"
-            "<li>Enter <strong>wheel_markup</strong>, <strong>tire_markup</strong>, and "
-            "<strong>accessories_markup</strong> &mdash; the percent <em>off</em> list price (0&ndash;100) your "
-            "agreement gives you on each feed. We derive dealer <strong>cost</strong> from MSRP: "
-            "cost = MSRP &times; (1 &minus; percent/100). All three are required; enter <code>0</code> for a "
-            "feed you get no discount on.</li>"
-            "<li>If your agreement uses non-default remote paths, set the optional <strong>sftp_path</strong> "
-            "field.</li>"
-            "<li>Click <strong>Save feed credentials</strong>.</li>"
-            "</ol>"
-            "<p>Once validated, the Wheel Pros card shows <strong>Feed Connected</strong>. The first file "
-            "arrives on the next scheduled delivery, so data may not appear immediately.</p>"
-
-            "<p><strong>5. Optional &mdash; place orders through AfterMarketScout</strong></p>"
+            "<p><strong>2. Optional &mdash; place orders through AfterMarketScout</strong></p>"
             "<p>Skip this if you don't plan to send purchase orders from AfterMarketScout. API access is "
-            "granted separately from feed access, and by a different team:</p>"
+            "granted separately, and by a different team than pricing:</p>"
             "<ol>"
-            "<li>Email <a href=\"mailto:data@wheelpros.com\">data@wheelpros.com</a> to request API access, "
-            "referencing your dealer account.</li>"
+            "<li>Email <a href=\"mailto:data@wheelpros.com\">data@wheelpros.com</a> to request Orders API "
+            "access, referencing your dealer account.</li>"
             "<li>Once approved, you'll receive a welcome email confirming your account can make API calls.</li>"
             "<li>In the <strong>Ordering</strong> section below, click <strong>+ Add account</strong> and enter "
             "the <strong>username</strong> and <strong>password</strong> from that welcome email.</li>"
@@ -934,13 +935,11 @@ PROVIDER_CATALOG = [
 
             "<p><strong>Notes</strong></p>"
             "<ul>"
-            "<li><strong>Feed works but orders fail.</strong> Feed access and API access are two separate "
-            "grants. Confirm you received the API welcome email from "
-            "<a href=\"mailto:data@wheelpros.com\">data@wheelpros.com</a> &mdash; portal access alone doesn't "
-            "enable ordering.</li>"
-            "<li><strong>No data after connecting.</strong> Check that the SFTP toggle on Delivery Options is "
-            "still on and that <strong>SAVE CHANGES</strong> was clicked. The toggle reverts if the page is "
-            "left without saving.</li>"
+            "<li><strong>Pricing API says access denied.</strong> Pricing API access and Ordering API access "
+            "are separate grants, even though both use the same Product Data Portal login. Confirm you "
+            "received a welcome email specifically for the Pricing API.</li>"
+            "<li><strong>Switching from Markup % to Pricing API (or back).</strong> Just select the other "
+            "option and fill in its fields &mdash; nothing else to undo first.</li>"
             "<li><strong>Can't register for the portal?</strong> Registration requires an active Wheel Pros "
             "dealer account. Contact your Wheel Pros sales rep to open one.</li>"
             "</ul>"

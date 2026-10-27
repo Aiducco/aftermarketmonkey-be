@@ -481,3 +481,65 @@ class OrderStatusChannelDispatchTests(SimpleTestCase):
             )
         self.assertFalse(validated)
         self.assertIn("allowlisted", message)
+
+
+class OrderStatusNotConfiguredTests(SimpleTestCase):
+    """
+    "Not set up" and "broken" are different states and must not share a status.
+
+    ERROR is for credentials that were supplied and rejected. A shop that has simply never been
+    onboarded onto a channel -- the three still on Rough Country's withdrawn email ordering, or
+    anyone who has not entered an FTP login yet -- gets no order status at all, which is already
+    how this model says "ordering isn't configured". Showing them a red error is both alarming
+    and untrue.
+    """
+
+    def _resolve(self, code, message="something"):
+        from src import enums as src_enums
+        from src.api.services import integrations
+
+        return integrations._resolve_order_status(
+            order_validated=False,
+            order_val_error=message,
+            feed_status_enum=src_enums.CompanyProviderConnectionStatus.CONNECTED,
+            order_val_error_code=code,
+        )
+
+    def test_a_withdrawn_channel_is_not_configured_rather_than_an_error(self):
+        from src.api.services import integrations
+
+        status, reason = self._resolve(integrations.CONNECTION_ERROR_CHANNEL_UNAVAILABLE)
+        self.assertIsNone(status)
+        self.assertIsNone(reason)
+
+    def test_missing_credentials_are_not_configured_rather_than_an_error(self):
+        from src.api.services import integrations
+
+        status, _reason = self._resolve(integrations.CONNECTION_ERROR_MISSING_FIELDS)
+        self.assertIsNone(status)
+
+    def test_rejected_credentials_are_still_an_error(self):
+        from src import enums as src_enums
+        from src.api.services import integrations
+
+        status, reason = self._resolve(integrations.CONNECTION_ERROR_INVALID_CREDENTIALS)
+        self.assertEqual(status, src_enums.CompanyProviderOrderConnectionStatus.ERROR)
+        self.assertEqual(reason, "something")
+
+    def test_an_unreachable_host_is_still_an_error(self):
+        from src import enums as src_enums
+        from src.api.services import integrations
+
+        status, _reason = self._resolve(integrations.CONNECTION_ERROR_CONNECTION_FAILED)
+        self.assertEqual(status, src_enums.CompanyProviderOrderConnectionStatus.ERROR)
+
+    def test_valid_credentials_still_connect(self):
+        from src import enums as src_enums
+        from src.api.services import integrations
+
+        status, _reason = integrations._resolve_order_status(
+            order_validated=True,
+            order_val_error=None,
+            feed_status_enum=src_enums.CompanyProviderConnectionStatus.CONNECTED,
+        )
+        self.assertEqual(status, src_enums.CompanyProviderOrderConnectionStatus.CONNECTED)
