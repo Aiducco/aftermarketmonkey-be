@@ -14,6 +14,8 @@ No network and no database: ``_request`` is replaced, and the client takes its c
 constructor arguments so nothing reads settings.
 """
 import datetime
+import os
+import pathlib
 import typing
 
 from django.test import SimpleTestCase
@@ -231,16 +233,35 @@ class ConfigurationGuardTests(SimpleTestCase):
         self.assertTrue(client.base_url)
         self.assertFalse(client.base_url.endswith("/"))
 
-    def test_a_missing_ca_bundle_raises_instead_of_skipping_verification(self):
+    def test_no_configured_bundle_composes_one_rather_than_skipping_verification(self):
         """
-        TBC serves an incomplete chain, so a bundle is required. The failure mode this guards
-        against is a well-meant verify=False, which would post a dealer's cost and orders into
-        an unauthenticated connection.
+        TBC serves an incomplete chain, so the default trust store cannot verify them -- proven
+        from inside the app container, where both hosts raise SSLError. With nothing configured
+        the client composes certifi + the shipped TBC chain. What it must never do is hand
+        requests a falsy verify, which is how "make the SSL error go away" usually ends.
         """
-        client = _client(ca_bundle="")
-        with self.assertRaises(ntw_exceptions.NtwApiNotConfiguredError) as ctx:
-            client._verify()
-        self.assertIn("NTW_API_CA_BUNDLE", str(ctx.exception))
+        path = _client(ca_bundle="")._verify()
+        self.assertIsInstance(path, str)
+        self.assertTrue(path)
+        self.assertTrue(os.path.exists(path))
+
+        composed = pathlib.Path(path).read_text()
+        # certifi's roots plus the three certificates TBC's gateways omit.
+        self.assertGreater(composed.count("BEGIN CERTIFICATE"), 100)
+        for subject in (
+            "Go Daddy Secure Certificate Authority - G2",
+            "GoDaddy TLS Intermediate CA DV - R1v1",
+            "GoDaddy TLS Root CA - R1",
+        ):
+            self.assertIn(subject, composed, subject)
+
+    def test_an_explicit_bundle_wins(self):
+        self.assertEqual(_client(ca_bundle="/etc/ssl/custom.pem")._verify(), "/etc/ssl/custom.pem")
+
+    def test_the_shipped_chain_is_three_real_certificates(self):
+        chain = pathlib.Path(ntw_api.__file__).parent / ntw_api._TBC_CA_CHAIN_FILENAME
+        self.assertTrue(chain.exists())
+        self.assertEqual(chain.read_text().count("BEGIN CERTIFICATE"), 3)
 
     def test_the_order_endpoints_send_no_query_parameters(self):
         """
