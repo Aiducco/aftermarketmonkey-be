@@ -55,6 +55,11 @@ _DELIVERY_CODES = {
     "next truck": "NEXT_TRUCK",
     "2 day": "TWO_DAY",
     "10 days plus": "TEN_DAYS_PLUS",
+    # Observed only on drop-ship: the same tire that quotes "Same Day" to the shop's own branch
+    # comes back "Parcel" when it is going to an end customer.
+    "parcel": "PARCEL",
+    "will call": "WILL_CALL",
+    "ltl ground": "LTL_GROUND",
 }
 
 # Order Service v1.0: "PickUp" (will-call from the warehouse) or "Delivery" (by truck). An
@@ -100,6 +105,45 @@ def _date(value: typing.Any) -> typing.Optional[datetime.date]:
         except ValueError:
             continue
     return None
+
+
+def choose_source(
+    sources: typing.Sequence[typing.Dict], wanted_qty: int
+) -> typing.Tuple[typing.Optional[typing.Dict], int]:
+    """
+    Pick the one branch a line will ship from, and how much it has.
+
+    TBC's submit takes ONE locationId per line, so a split across branches cannot be expressed
+    and something has to choose. The rule differs by mode because TBC tells us different things:
+
+      drop-ship      availableSource carries ``distance`` in miles to the customer. The NEAREST
+                     branch that can cover the whole line wins -- it arrives sooner, and depth
+                     beyond what was ordered is worth nothing. Falls back to the deepest when no
+                     single branch can cover the line alone, so the shortfall is a real
+                     backorder rather than an arbitrary pick.
+      ship-to-shop   no distance is returned at all, so depth is the only signal there is.
+
+    Returns (source, quantity) with (None, 0) when nothing is available.
+    """
+    candidates = []
+    for source in sources or []:
+        if not isinstance(source, dict):
+            continue
+        qty = source.get("quantityAvailable")
+        qty = int(qty) if isinstance(qty, (int, float)) else 0
+        distance = source.get("distance")
+        distance = float(distance) if isinstance(distance, (int, float)) else None
+        candidates.append((source, qty, distance))
+
+    if not candidates:
+        return None, 0
+
+    covering = [c for c in candidates if c[1] >= wanted_qty and c[2] is not None]
+    if covering:
+        source, qty, _distance = min(covering, key=lambda c: c[2])
+        return source, qty
+    source, qty, _distance = max(candidates, key=lambda c: c[1])
+    return source, qty
 
 
 def _ship_to_payload(ship_to: base.ShipToAddress) -> typing.List[typing.Dict]:
@@ -268,6 +312,7 @@ class NtwOrderAdapter(base.DistributorOrderAdapter):
         lines: typing.List[base.ShippingQuoteLine] = []
         raw_by_line: typing.Dict[str, typing.Dict] = {}
         distributor_total = Decimal("0")
+        total_freight = Decimal("0")
         saw_price = False
 
         for item in line_items:
@@ -302,17 +347,16 @@ class NtwOrderAdapter(base.DistributorOrderAdapter):
             sources = row.get("availableSource") or []
             if isinstance(sources, dict):
                 sources = [sources]
-            # Pick the single branch that can serve the most of this line. TBC's submit takes one
-            # locationId per line, so a split across warehouses is not expressible -- choosing the
-            # deepest one maximises what ships now and leaves the rest as a real backorder.
-            best_location = None
-            best_qty = 0
-            for source in sources:
-                qty = source.get("quantityAvailable")
-                qty = int(qty) if isinstance(qty, (int, float)) else 0
-                if qty > best_qty:
-                    best_qty = qty
-                    best_location = source
+            # TBC's submit takes ONE locationId per line, so a split across branches cannot be
+            # expressed and we must choose. Two rules, because TBC gives different information
+            # in the two modes:
+            #
+            #   drop-ship      availableSource carries ``distance`` in miles to the customer, so
+            #                  the nearest branch that can cover the whole line wins -- it ships
+            #                  sooner and cheaper, and quantity beyond what was ordered is worth
+            #                  nothing. Falls back to the deepest if none can cover it alone.
+            #   ship-to-shop   no distance is returned at all, so depth is the only signal.
+            best_location, best_qty = choose_source(sources, item.quantity)
 
             available = min(best_qty, item.quantity)
             unit_price = _decimal((row.get("productCost") or {}).get("amount"))
@@ -320,6 +364,15 @@ class NtwOrderAdapter(base.DistributorOrderAdapter):
             if line_total is not None:
                 distributor_total += line_total
                 saw_price = True
+
+            # freightPerTire is a per-PRODUCT charge, not a carrier rate: measured identical
+            # whether drop-ship or not, flat per tire regardless of quantity, 20.55 on a
+            # commercial 10R22.5 and 0.00 on every passenger tire. TBC's own totalCost excludes
+            # it (4 x 300.63 = 1202.52, with 4 x 20.55 on top), so anything showing a landed
+            # cost has to add it.
+            freight_per_tire = _decimal(row.get("freightPerTire"))
+            if freight_per_tire and available:
+                total_freight += freight_per_tire * available
 
             location_id = str((best_location or {}).get("locationId") or "") or None
             address = (best_location or {}).get("address") or {}
@@ -336,6 +389,8 @@ class NtwOrderAdapter(base.DistributorOrderAdapter):
                 "quantityAvailable": best_qty,
                 "estimatedDelivery": row.get("estimatedDelivery"),
                 "productCost": row.get("productCost"),
+                "freightPerTire": row.get("freightPerTire"),
+                "distance": (best_location or {}).get("distance"),
             }
 
             lines.append(
@@ -353,8 +408,24 @@ class NtwOrderAdapter(base.DistributorOrderAdapter):
                 )
             )
 
+        # Surfaced as a fee rather than folded into a line total or a ship option. Not a line
+        # total, because distributor_line_total is documented as unit_price x quantity and
+        # breaking that invariant hides the charge. Not a ship option, because a shipment takes
+        # its options from whichever line created it, so a multi-line shipment would report one
+        # line's freight as the whole shipment's shipping cost.
+        fees = []
+        if total_freight:
+            fees.append(
+                base.LineFee(
+                    fee_type="freight",
+                    description="NTW freight (charged per tire on heavy items)",
+                    amount=total_freight,
+                )
+            )
+
         return base.ShippingQuoteResult(
             lines=lines,
+            fees=fees,
             # Keyed by line item id because submit_order needs the locationId back, and it has
             # no other way to recover which branch this quote chose.
             raw_response={"lines": raw_by_line, "customerId": self._customer_id},

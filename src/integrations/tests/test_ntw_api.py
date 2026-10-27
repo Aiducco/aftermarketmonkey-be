@@ -439,3 +439,79 @@ class InvoiceFromOrderStatusTests(SimpleTestCase):
         self.assertTrue(adapter.supports_invoices())
         self.assertFalse(adapter.supports_cancel())
         self.assertTrue(adapter.supports_shipping_method_selection())
+
+
+class SourceSelectionTests(SimpleTestCase):
+    """
+    TBC's submit takes one locationId per line, so a multi-branch line forces a choice. The
+    rule differs by mode because the two modes return different information -- drop-ship
+    carries ``distance``, ship-to-shop carries none at all (measured across eight states: the
+    branch never changed and no distance was ever present).
+    """
+    databases = []
+
+    @staticmethod
+    def _src(location, qty, distance=None):
+        s = {"locationId": location, "quantityAvailable": qty}
+        if distance is not None:
+            s["distance"] = distance
+        return s
+
+    def test_nearest_branch_that_can_cover_the_line_wins(self):
+        sources = [
+            self._src("3269", 500, distance=260),   # deepest but far
+            self._src("3021", 12, distance=44),     # nearest and sufficient
+            self._src("3238", 31, distance=69),
+        ]
+        source, qty = ntw_orders.choose_source(sources, wanted_qty=10)
+        self.assertEqual(source["locationId"], "3021")
+        self.assertEqual(qty, 12)
+
+    def test_depth_wins_when_no_single_branch_can_cover_it(self):
+        """The shortfall then becomes a real backorder rather than an arbitrary pick."""
+        sources = [self._src("3021", 4, distance=44), self._src("3269", 9, distance=260)]
+        source, qty = ntw_orders.choose_source(sources, wanted_qty=25)
+        self.assertEqual(source["locationId"], "3269")
+        self.assertEqual(qty, 9)
+
+    def test_without_distance_depth_is_the_only_signal(self):
+        # Ship-to-shop: TBC returns no distance on any source.
+        sources = [self._src("3021", 4), self._src("3269", 900)]
+        source, qty = ntw_orders.choose_source(sources, wanted_qty=2)
+        self.assertEqual(source["locationId"], "3269")
+        self.assertEqual(qty, 900)
+
+    def test_a_near_branch_without_distance_does_not_beat_a_far_one_with_it(self):
+        # Mixed payloads must not treat "no distance" as distance zero.
+        sources = [self._src("3021", 50), self._src("3269", 50, distance=5)]
+        source, _qty = ntw_orders.choose_source(sources, wanted_qty=10)
+        self.assertEqual(source["locationId"], "3269")
+
+    def test_no_sources_is_not_an_error(self):
+        self.assertEqual(ntw_orders.choose_source([], 5), (None, 0))
+        self.assertEqual(ntw_orders.choose_source(None, 5), (None, 0))
+
+    def test_junk_sources_are_skipped(self):
+        source, qty = ntw_orders.choose_source(
+            ["nonsense", {"locationId": "3021", "quantityAvailable": None},
+             self._src("3269", 7)], wanted_qty=3)
+        self.assertEqual(source["locationId"], "3269")
+        self.assertEqual(qty, 7)
+
+
+class DeliveryCodeTests(SimpleTestCase):
+    databases = []
+
+    def test_drop_ship_returns_parcel(self):
+        """
+        The same tire quotes "Same Day" to the shop's own branch and "Parcel" when drop-shipped,
+        measured live. Parcel was missing from the map and fell through to a generated code.
+        """
+        self.assertEqual(ntw_orders._DELIVERY_CODES["parcel"], "PARCEL")
+        self.assertEqual(ntw_orders._DELIVERY_CODES["same day"], "SAME_DAY")
+        self.assertEqual(ntw_orders._DELIVERY_CODES["10 days plus"], "TEN_DAYS_PLUS")
+
+    def test_freight_parses_from_tbcs_bare_float(self):
+        # freightPerTire arrives as a JSON number (20.55), unlike productCost which is a string.
+        self.assertEqual(ntw_orders._decimal(20.55), __import__("decimal").Decimal("20.55"))
+        self.assertFalse(ntw_orders._decimal(0.0))
