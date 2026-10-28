@@ -1,8 +1,9 @@
 """
 Fetch RANDYS vehicle fitment rows onto RandysPart.fitment_rows.
 
-One request per part (no batch endpoint exists), ~18 req/s at 8 workers with no throttling
-observed, so roughly 15 minutes for the catalogue. ``--only-missing`` resumes an interrupted run.
+One request per part (no batch endpoint exists). Convermax rate-limits on sustained volume, so
+this runs at 4 workers (~11 req/s, roughly 25 minutes for the catalogue) and backs off on 429.
+``--only-missing`` resumes an interrupted or rate-limited run.
 Decoding into MasterPartFitment is the separate sync_master_part_fitments_from_randys command.
 """
 from django.core.management.base import BaseCommand
@@ -24,7 +25,7 @@ class Command(BaseCommand):
             "--max-workers",
             type=int,
             default=None,
-            help="Concurrent requests. Defaults to settings.RANDYS_FITMENT_MAX_WORKERS (8).",
+            help="Concurrent requests. Defaults to settings.RANDYS_FITMENT_MAX_WORKERS (4). Higher values trip 429s.",
         )
 
     def handle(self, *args, **options):

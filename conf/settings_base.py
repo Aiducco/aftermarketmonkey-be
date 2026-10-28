@@ -686,10 +686,14 @@ DLG_INVENTORY_LOCAL_PATH = os.environ.get("DLG_INVENTORY_LOCAL_PATH", "/tmp/dlg_
 # our relay and the outlier is data, not code.
 RANDYS_CONVERMAX_BASE_URL = os.environ.get("RANDYS_CONVERMAX_BASE_URL", "")
 RANDYS_SHOPIFY_BASE_URL = os.environ.get("RANDYS_SHOPIFY_BASE_URL", "")
+# 4, not 8. Convermax rate-limits the fitment endpoint on SUSTAINED volume while short bursts
+# measure completely clean -- 8 workers looked fine over a few hundred requests and then returned
+# 429 for 622 of the first 1,500 parts of a real run. 4 workers held ~11 req/s with zero 429s, and
+# the client now backs off on 429 so a limit costs time rather than data.
 try:
-    RANDYS_FITMENT_MAX_WORKERS = int(os.environ.get("RANDYS_FITMENT_MAX_WORKERS", "8"))
+    RANDYS_FITMENT_MAX_WORKERS = int(os.environ.get("RANDYS_FITMENT_MAX_WORKERS", "4"))
 except ValueError:
-    RANDYS_FITMENT_MAX_WORKERS = 8
+    RANDYS_FITMENT_MAX_WORKERS = 4
 try:
     RANDYS_PARSE_PROGRESS_EVERY = int(os.environ.get("RANDYS_PARSE_PROGRESS_EVERY", "250000"))
 except ValueError:

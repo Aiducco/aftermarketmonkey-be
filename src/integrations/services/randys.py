@@ -439,16 +439,18 @@ def fetch_and_save_randys_fitment(
     Pull Year/Make/Model/Drive/Differential rows for every part that has any, storing them
     verbatim on ``RandysPart.fitment_rows``.
 
-    One request per part -- there is no batch endpoint -- which measured ~18 requests/second at 8
-    workers with no throttling, so roughly 15 minutes for the catalogue. ``only_missing`` skips
-    parts that already have rows, for resuming an interrupted run.
+    One request per part -- there is no batch endpoint. Convermax rate-limits this endpoint on
+    sustained volume even though short bursts measure clean, so the worker count is deliberately
+    modest (4 by default, ~11 req/s, roughly 25 minutes for the catalogue) and the client backs
+    off on 429 rather than retrying immediately. ``only_missing`` skips parts that already have
+    rows, which is how an interrupted or rate-limited run is resumed.
 
     Parts whose ``fitment_type`` says they have no vehicle data are not requested at all.
     """
     workers = int(
         max_workers
         if max_workers is not None
-        else getattr(settings, "RANDYS_FITMENT_MAX_WORKERS", 8) or 8
+        else getattr(settings, "RANDYS_FITMENT_MAX_WORKERS", 4) or 4
     )
     queryset = src_models.RandysPart.objects.exclude(fitment_type="No Fitment Data")
     if only_missing:
@@ -872,6 +874,30 @@ def sync_randys_company_pricing_for_company_provider(
 # --------------------------------------------------------------------------- brand mapping
 
 
+def _ampersand_compact_keys(name: str) -> typing.Set[str]:
+    """
+    Compact keys for ``name`` with "&" and "and" treated as the same word.
+
+    RANDYS are the reason this exists: their index carries "Yukon Gear and Axle" (4,887 parts) and
+    "Yukon Gear & Axle" (11) as two separate vendor strings for one brand, and our Brands table
+    already held it as "YUKON GEAR & AXLE". The shared compact key strips "&" to nothing, so
+    "YUKONGEARAXLE" and "YUKONGEARANDAXLE" never meet and the big vendor lands on a brand-new
+    duplicate brand -- measured: 4,866 master parts created under a second Yukon row rather than
+    matching the 10,968 already on the real one.
+
+    Deliberately local rather than a change to brand_matching.normalize_compact_key: that key is
+    the identity rung for every provider's brand resolution, and widening it would silently
+    re-point brands well outside RANDYS.
+    """
+    upper = (name or "").upper()
+    variants = {
+        upper,
+        upper.replace("&", " AND "),
+        re.sub(r"\bAND\b", " & ", upper),
+    }
+    return {k for k in (normalize_compact_key(v) for v in variants) if k}
+
+
 def sync_unmapped_randys_brands_to_brands(
     dry_run: bool = False,
 ) -> typing.List[src_models.RandysBrand]:
@@ -936,6 +962,20 @@ def sync_unmapped_randys_brands_to_brands(
                 resolved[rb.id] = brand
                 compact_matched.add(rb.id)
 
+    # "&" / "and" equivalence, before fuzzy -- see _ampersand_compact_keys for why this rung
+    # exists at all and why it is not in the shared normalizer.
+    ampersand_matched: typing.Set[int] = set()
+    still = [rb for rb in unmapped if rb.id not in resolved]
+    if still:
+        compact_index = brands_by_compact_key()
+        for rb in still:
+            for key in _ampersand_compact_keys(rb.name or ""):
+                brand = compact_index.get(key)
+                if brand:
+                    resolved[rb.id] = brand
+                    ampersand_matched.add(rb.id)
+                    break
+
     unresolved = [rb for rb in unmapped if rb.id not in resolved]
     brands_first_index = brands_by_first_token_upper() if unresolved else {}
     all_brands_fallback: typing.Optional[typing.List[src_models.Brands]] = None
@@ -964,6 +1004,7 @@ def sync_unmapped_randys_brands_to_brands(
             how = (
                 "exact" if rb.id in exact_matched
                 else "compact" if rb.id in compact_matched
+                else "ampersand" if rb.id in ampersand_matched
                 else "fuzzy"
             )
             logger.info(
@@ -972,10 +1013,10 @@ def sync_unmapped_randys_brands_to_brands(
             )
         would_create = [rb for rb in unmapped if rb.id not in resolved]
         logger.info(
-            "{} [dry-run] Summary: {} exact, {} compact, {} fuzzy, {} unmatched (would create "
-            "Brand). No writes performed.".format(
-                _LOG_PREFIX, len(exact_matched), len(compact_matched), len(fuzzy_matched),
-                len(would_create),
+            "{} [dry-run] Summary: {} exact, {} compact, {} ampersand, {} fuzzy, {} unmatched "
+            "(would create Brand). No writes performed.".format(
+                _LOG_PREFIX, len(exact_matched), len(compact_matched), len(ampersand_matched),
+                len(fuzzy_matched), len(would_create),
             )
         )
         return unmapped
@@ -1039,10 +1080,11 @@ def sync_unmapped_randys_brands_to_brands(
             created_brand_providers += 1
 
     logger.info(
-        "{} Sync complete. Brands created: {}, exact: {}, compact: {}, fuzzy: {}, mappings "
-        "upserted: {}, BrandProviders created: {}.".format(
+        "{} Sync complete. Brands created: {}, exact: {}, compact: {}, ampersand: {}, fuzzy: "
+        "{}, mappings upserted: {}, BrandProviders created: {}.".format(
             _LOG_PREFIX, created_brands, len(exact_matched), len(compact_matched),
-            len(fuzzy_matched), len(mapping_models), created_brand_providers,
+            len(ampersand_matched), len(fuzzy_matched), len(mapping_models),
+            created_brand_providers,
         )
     )
     return unmapped

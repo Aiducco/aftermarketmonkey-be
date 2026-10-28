@@ -27,6 +27,8 @@ sweep is paging-only and never sends ``query``, so nothing here has to strip hig
 add a search-backed path later, it does.
 """
 import logging
+import random
+import time
 import typing
 
 import requests
@@ -40,7 +42,9 @@ logger = logging.getLogger(__name__)
 _LOG_PREFIX = "[RANDYS-CLIENT]"
 
 DEFAULT_TIMEOUT_SECONDS = 60
-DEFAULT_MAX_RETRIES = 3
+DEFAULT_MAX_RETRIES = 5
+RETRY_BASE_DELAY_SECONDS = 2.0
+MAX_RETRY_DELAY_SECONDS = 30.0
 
 # Convermax 403s a bare urllib UA but is happy with a normal browser string. Shopify does not
 # care either way, so both use the same one.
@@ -73,24 +77,69 @@ class RandysClient:
         self.session.headers.update({"User-Agent": _USER_AGENT, "Accept": "application/json"})
 
     def _get_json(self, url: str, params: typing.Optional[typing.Dict] = None) -> typing.Any:
+        """
+        GET with exponential backoff and jitter.
+
+        The backoff is not decoration. Convermax rate-limits the fitment endpoint on *sustained*
+        volume -- short bursts measure clean, which is exactly what makes it easy to get wrong --
+        and an earlier version of this method retried with no delay at all, so a 429 burned all
+        three attempts inside a few milliseconds and the part was recorded as failed. That run
+        lost 622 of its first 1,500 parts. 429 (and 5xx) now wait, which turns a rate-limit into
+        a pause instead of a hole in the data.
+
+        ``Retry-After`` is honoured when present; Convermax does not currently send one, hence
+        the computed fallback.
+        """
         last_error: typing.Optional[Exception] = None
         for attempt in range(1, self.max_retries + 1):
             try:
                 response = self.session.get(url, params=params, timeout=self.timeout)
+                if response.status_code == 429 or response.status_code >= 500:
+                    retry_after = response.headers.get("Retry-After")
+                    if attempt < self.max_retries:
+                        delay = self._retry_delay(attempt, retry_after)
+                        logger.warning(
+                            "{} GET {} returned {}; backing off {:.1f}s (attempt {}/{}).".format(
+                                _LOG_PREFIX, url, response.status_code, delay, attempt,
+                                self.max_retries,
+                            )
+                        )
+                        time.sleep(delay)
+                        continue
                 response.raise_for_status()
                 return response.json()
             except Exception as e:
                 last_error = e
-                logger.warning(
-                    "{} GET {} attempt {}/{} failed: {}.".format(
-                        _LOG_PREFIX, url, attempt, self.max_retries, str(e)
+                if attempt < self.max_retries:
+                    delay = self._retry_delay(attempt, None)
+                    logger.warning(
+                        "{} GET {} attempt {}/{} failed: {}. Retrying in {:.1f}s.".format(
+                            _LOG_PREFIX, url, attempt, self.max_retries, str(e), delay
+                        )
                     )
-                )
+                    time.sleep(delay)
+                else:
+                    logger.warning(
+                        "{} GET {} attempt {}/{} failed: {}.".format(
+                            _LOG_PREFIX, url, attempt, self.max_retries, str(e)
+                        )
+                    )
         raise exceptions.RandysAPIError(
             "RANDYS request failed after {} attempts: {} ({})".format(
                 self.max_retries, url, str(last_error)
             )
         )
+
+    def _retry_delay(self, attempt: int, retry_after: typing.Optional[str]) -> float:
+        if retry_after:
+            try:
+                return min(float(retry_after), MAX_RETRY_DELAY_SECONDS)
+            except (TypeError, ValueError):
+                pass
+        # Jittered exponential backoff. The jitter matters more than the curve here: the fitment
+        # sweep runs several workers, and without it they all wake together and re-trip the limit.
+        base = min(RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1)), MAX_RETRY_DELAY_SECONDS)
+        return base * (0.5 + random.random())
 
     # ------------------------------------------------------------------ catalogue
 
