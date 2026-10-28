@@ -85,6 +85,13 @@ _PRICING_SYNC_KINDS = frozenset(
         # connected company sellable prices on day one. It becomes a real cost sync, with no
         # further wiring, the moment a pricing file lands.
         src_enums.BrandProviderKind.RANDYS_WORLDWIDE.value,
+        # XDP has no per-company file to download for the 241 brands it resells -- the pass
+        # computes cost from the company's own markup off XDP's public retail price, and reads
+        # their house-brand dealer CSV when the connection carries a feed_url. It still has to be
+        # here: this set gates BOTH the nightly enqueue and should_enqueue_pricing_sync (the
+        # on-connect gate), so leaving XDP out meant a company could save a markup and never get
+        # a pricing job at all -- which is exactly what happened to company 16.
+        src_enums.BrandProviderKind.XDP.value,
     }
 )
 
