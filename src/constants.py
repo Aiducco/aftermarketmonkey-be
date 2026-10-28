@@ -2520,7 +2520,7 @@ PROVIDER_CATALOG = [
     {
         "kind": enums.BrandProviderKind.ALLPRO_DISTRIBUTING,
         "name": "AllPro Distributing",
-        "description": "Access AllPro Distributing inventory and pricing via their FTP feed.",
+        "description": "Access AllPro Distributing inventory and pricing via their FTP feed, and order through MyShipZone.",
         "icon_url": "https://api.aftermarketscout.com/uploads/allpro_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["username", "password"],
@@ -2538,8 +2538,8 @@ PROVIDER_CATALOG = [
         "integration_time": "Data available within 1-2 days",
         "installation_instructions_html": (
             "<p><strong>AllPro Distributing</strong> connects with an FTP login for your inventory and "
-            "pricing. AllPro has no ordering API, so orders go to your rep as a PDF purchase order by email. "
-            "One email to AllPro sets up both.</p>"
+            "pricing, and a MyShipZone login for live stock checks and orders. One email to AllPro covers "
+            "both.</p>"
 
             "<p><strong>1. Email AllPro</strong></p>"
             "<p>Send the message below to "
@@ -2551,31 +2551,37 @@ PROVIDER_CATALOG = [
             "need two things set up for our AllPro account [your customer number]:</p>"
             "<ol>"
             "<li>FTP access. Please send us an FTP username and password for our inventory and pricing.</li>"
-            "<li>Purchase orders. Please confirm the email address we should send purchase orders to.</li>"
+            "<li>MyShipZone access. Please add us to "
+            "<a href=\"https://allpro.myshipzone.com/\">allpro.myshipzone.com</a> and send us the login, so "
+            "we can place orders through AfterMarketScout.</li>"
             "</ol>"
-            "<p>I've copied AfterMarketScout support "
+            "<p>I&rsquo;ve copied AfterMarketScout support "
             "(<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a>) in case you "
             "have any technical questions.</p>"
             "<p>Thanks!</p>"
             "</div>"
-            "<p>Include your AllPro customer number so the request can be matched to your account. AllPro "
-            "issues a login per customer rather than one shared one.</p>"
 
             "<p><strong>2. Connect the product feed</strong></p>"
-            "<p>Paste the <strong>username</strong> and <strong>password</strong> into the <strong>Product "
-            "feed</strong> fields below and click <strong>Save feed credentials</strong>. The card will show "
-            "<strong>Feed Connected</strong>.</p>"
+            "<p>Paste the FTP username and password into the <strong>Product feed</strong> fields below and "
+            "click <strong>Save feed credentials</strong>. The card will show <strong>Feed "
+            "Connected</strong>.</p>"
 
-            "<p><strong>3. Set up ordering</strong></p>"
-            "<p>Enter the purchase-order email AllPro confirmed below. You can also add an internal "
-            "<strong>CC</strong> so your team gets a copy of every order. Click <strong>Save</strong>.</p>"
-            "<p>Orders go out as PDF emails, so confirmations and tracking come back from your rep directly "
-            "rather than into AfterMarketScout.</p>"
+            "<p><strong>3. Add an ordering account</strong></p>"
+            "<p>When Andrew sends your MyShipZone login, click <strong>+ Add account</strong> under "
+            "<strong>Ordering</strong>. Enter a label (e.g. &ldquo;Primary&rdquo;) and your MyShipZone "
+            "username and password, then click <strong>Add Account</strong>. The card will show "
+            "<strong>Ordering Connected</strong>.</p>"
 
             "<p><strong>Troubleshooting</strong></p>"
             "<ul>"
-            "<li><strong>Connection fails?</strong> Re-paste the password. If it still fails, ask Andrew to "
-            "confirm your FTP access is active.</li>"
+            "<li><strong>Feed connection fails?</strong> Re-paste the FTP password. If it still fails, ask "
+            "Andrew to confirm your FTP access is active.</li>"
+            "<li><strong>Orders fail?</strong> Sign in at "
+            "<a href=\"https://allpro.myshipzone.com/\">allpro.myshipzone.com</a> with the same login to "
+            "check it works, then re-paste it. If you can&rsquo;t sign in, ask Andrew to confirm your "
+            "MyShipZone account is active.</li>"
+            "<li><strong>More than one AllPro account?</strong> Each account has its own FTP and MyShipZone "
+            "logins. Add a separate ordering account for each one.</li>"
             "</ul>"
         ),
     },
