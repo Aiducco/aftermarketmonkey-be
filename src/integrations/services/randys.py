@@ -67,6 +67,7 @@ _LOG_PREFIX = "[RANDYS-SERVICES]"
 CATALOG_UPSERT_BATCH = 2000
 FITMENT_UPSERT_BATCH = 500
 INVENTORY_UPSERT_BATCH = 2000
+PRICING_UPSERT_BATCH = 2000
 BATCH_DELAY_SECONDS = 0.3
 
 # Inventory rows can be long once quoted; match the other feed parsers and lift the ceiling.
@@ -650,6 +651,219 @@ def apply_randys_inventory_file(
         "{} Inventory applied. Parts updated: {}, file rows: {}, file items matching no part: "
         "{}, parts with no stock line: {}.".format(
             _LOG_PREFIX, total, len(stock_by_item), unmatched_file_items, len(missing_codes)
+        )
+    )
+    return total
+
+
+# --------------------------------------------------------------------------- per-company pricing
+
+
+def _normalize_header(raw: typing.Any) -> str:
+    """Lower-case and strip spaces/underscores/hyphens so "Your Price" == "yourprice"."""
+    return re.sub(r"[\s_\-]+", "", str(raw or "")).strip().lower()
+
+
+def _map_pricing_columns(
+    fieldnames: typing.Sequence[str],
+) -> typing.Dict[str, typing.Optional[str]]:
+    """
+    Map a delivered pricing file's header onto the fields we store.
+
+    Header-driven rather than positional because RANDYS have not delivered a pricing file yet and
+    the column names are therefore unknown -- see src.constants. Whatever they call the cost
+    column, as long as it is one of the documented candidates the file is read; anything
+    unrecognised is reported by name so the candidate list can be extended in one place.
+    """
+    found: typing.Dict[str, typing.Optional[str]] = {
+        "item": None, "cost": None, "jobber_price": None, "map_price": None, "retail_price": None,
+    }
+    candidates = (
+        ("item", src_constants.RANDYS_PRICING_ITEM_COLUMNS),
+        ("cost", src_constants.RANDYS_PRICING_COST_COLUMNS),
+        ("jobber_price", src_constants.RANDYS_PRICING_JOBBER_COLUMNS),
+        ("map_price", src_constants.RANDYS_PRICING_MAP_COLUMNS),
+        ("retail_price", src_constants.RANDYS_PRICING_RETAIL_COLUMNS),
+    )
+    for name in (fieldnames or []):
+        normalized = _normalize_header(name)
+        for field, accepted in candidates:
+            if found[field] is None and normalized in accepted:
+                found[field] = name
+                break
+    return found
+
+
+def _iter_pricing_rows(
+    path: str,
+) -> typing.Iterator[typing.Tuple[str, typing.Dict[str, typing.Optional[Decimal]]]]:
+    """
+    Yield ``(item, {cost, jobber_price, map_price, retail_price})`` from a delivered pricing file.
+
+    Raises RandysDataValidationError if the header carries no recognisable item or cost column:
+    a pricing file we cannot read must fail loudly rather than quietly writing nulls over a
+    company's real costs.
+    """
+    with open(path, "r", encoding="utf-8-sig", errors="replace", newline="") as handle:
+        reader = csv.DictReader(handle)
+        columns = _map_pricing_columns(reader.fieldnames or [])
+        if not columns["item"] or not columns["cost"]:
+            raise randys_exceptions.RandysDataValidationError(
+                "RANDYS pricing file {} has no recognisable {} column. Header was: {}. Extend "
+                "the candidate lists in src.constants (RANDYS_PRICING_*_COLUMNS).".format(
+                    path,
+                    "item" if not columns["item"] else "cost",
+                    list(reader.fieldnames or []),
+                )
+            )
+        for row in reader:
+            item = _clean_text(row.get(columns["item"]))
+            if not item:
+                continue
+            yield item, {
+                field: (_dec(row.get(columns[field])) if columns[field] else None)
+                for field in ("cost", "jobber_price", "map_price", "retail_price")
+            }
+
+
+def sync_randys_company_pricing_for_company_provider(
+    company_provider_id: int,
+    force_download: bool = True,
+) -> int:
+    """
+    Populate RandysCompanyPricing for one connection -- the Phase A half of the standard
+    IntegrationPricingSyncJob, same position Meyer's and Keystone's pricing sync occupy.
+
+    Two things happen, and only the first of them works today:
+
+    1. Every catalogue part gets a row carrying RANDYS' **published retail** price, so a connected
+       company has a sellable price from the first sync.
+    2. If a per-company pricing file has landed, its dealer ``cost`` (plus jobber/MAP/retail if
+       present) is overlaid and ``cost_source`` is set to "feed".
+
+    No file yet is the expected state, and it is a logged no-op for cost: the row keeps its retail
+    and ``cost`` stays null. Nothing here derives a cost from retail. XDP and Thoroughbred do
+    exactly that -- legitimately, because those are retailers whose dealer terms are a flat markup
+    the company itself configures -- but RANDYS are a distributor quoting real per-dealer
+    wholesale, and inventing a number would be indistinguishable downstream from a quoted one.
+    A null cost is honest and visible; a guessed one is neither.
+    """
+    company_provider = (
+        src_models.CompanyProviders.objects.filter(
+            id=company_provider_id,
+            provider__kind=src_enums.BrandProviderKind.RANDYS_WORLDWIDE.value,
+            provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
+        )
+        .select_related("company", "provider")
+        .first()
+    )
+    if not company_provider:
+        logger.warning(
+            "{} No active RANDYS CompanyProviders id={}. Skipping.".format(
+                _LOG_PREFIX, company_provider_id
+            )
+        )
+        return 0
+
+    company_id = company_provider.company_id
+
+    # ---- the pricing file, if there is one ----
+    pricing_by_item: typing.Dict[str, typing.Dict[str, typing.Optional[Decimal]]] = {}
+    feed_credentials = dict(credentials_helper.get_feed_credentials(company_provider))
+    try:
+        client = randys_sftp_client.RandysSFTPClient(credentials=feed_credentials)
+    except ValueError as e:
+        # No relay login on this connection: retail-only pricing still goes ahead below, since it
+        # needs nothing from RANDYS.
+        logger.warning("{} company_id={}: {}".format(_LOG_PREFIX, company_id, str(e)))
+        client = None
+
+    if client is not None:
+        try:
+            pricing_path = client.download_pricing_file(force_download=force_download)
+            for item, values in _iter_pricing_rows(pricing_path):
+                pricing_by_item[item] = values
+            logger.info(
+                "{} Read {} pricing rows for company_id={} from {}.".format(
+                    _LOG_PREFIX, len(pricing_by_item), company_id, pricing_path
+                )
+            )
+        except randys_exceptions.RandysFileNotFoundError:
+            logger.info(
+                "{} No RANDYS pricing file for company_id={} yet; writing published retail only "
+                "and leaving cost null.".format(_LOG_PREFIX, company_id)
+            )
+        except randys_exceptions.RandysSFTPConnectionError as e:
+            # Cost is unavailable this run, but the retail pass below needs no connection, so a
+            # relay outage must not leave a company with no prices at all.
+            logger.error(
+                "{} RANDYS pricing download failed for company_id={}: {}. Continuing with "
+                "published retail only.".format(_LOG_PREFIX, company_id, str(e))
+            )
+
+    pricing_by_item_upper = {k.upper(): v for k, v in pricing_by_item.items()}
+
+    # ---- upsert one row per catalogue part ----
+    now = timezone.now()
+    total = 0
+    matched_items: typing.Set[str] = set()
+    last_id = 0
+    while True:
+        rows = list(
+            src_models.RandysPart.objects.filter(id__gt=last_id)
+            .order_by("id")
+            .values("id", "sku", "price", "compare_at_price")[:PRICING_UPSERT_BATCH]
+        )
+        if not rows:
+            break
+        last_id = rows[-1]["id"]
+
+        to_upsert = []
+        for row in rows:
+            sku = row.get("sku")
+            values: typing.Dict[str, typing.Optional[Decimal]] = {}
+            if sku:
+                if sku in pricing_by_item:
+                    values = pricing_by_item[sku]
+                    matched_items.add(sku.upper())
+                elif sku.upper() in pricing_by_item_upper:
+                    values = pricing_by_item_upper[sku.upper()]
+                    matched_items.add(sku.upper())
+            cost = values.get("cost")
+            # compare_at_price is RANDYS' own was-price; it is the better MSRP when present.
+            retail = values.get("retail_price") or row.get("price")
+            to_upsert.append(
+                src_models.RandysCompanyPricing(
+                    part_id=row["id"],
+                    company_id=company_id,
+                    cost=cost,
+                    jobber_price=values.get("jobber_price"),
+                    map_price=values.get("map_price"),
+                    retail_price=retail,
+                    cost_source="feed" if cost is not None else None,
+                    updated_at=now,
+                )
+            )
+        if to_upsert:
+            pgbulk.upsert(
+                src_models.RandysCompanyPricing,
+                to_upsert,
+                unique_fields=["part", "company"],
+                update_fields=[
+                    "cost", "jobber_price", "map_price", "retail_price", "cost_source",
+                    "updated_at",
+                ],
+                returning=False,
+            )
+            total += len(to_upsert)
+        connection.close()
+        time.sleep(BATCH_DELAY_SECONDS)
+
+    unmatched = len({k.upper() for k in pricing_by_item}) - len(matched_items)
+    logger.info(
+        "{} RANDYS company pricing complete for company_id={}. Rows upserted: {}, with dealer "
+        "cost: {}, pricing-file items matching no part: {}.".format(
+            _LOG_PREFIX, company_id, total, len(matched_items), unmatched
         )
     )
     return total

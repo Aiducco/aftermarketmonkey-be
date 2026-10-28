@@ -124,6 +124,18 @@ class RandysSFTPClient:
 
         self.filename_prefix = src_constants.RANDYS_INVENTORY_FILENAME_PREFIX
         self.filename_suffix = src_constants.RANDYS_INVENTORY_FILENAME_SUFFIX
+        # Pricing name is a placeholder until RANDYS deliver one -- see src.constants. Overridable
+        # per connection so the real name can be set the moment the rep confirms it.
+        self.pricing_filename_prefix = _coalesce_nonempty_str(
+            creds.get("pricing_filename_prefix"),
+            getattr(settings, "RANDYS_PRICING_FILENAME_PREFIX", None),
+            src_constants.RANDYS_PRICING_FILENAME_PREFIX,
+        )
+        self.pricing_filename_suffix = _coalesce_nonempty_str(
+            creds.get("pricing_filename_suffix"),
+            getattr(settings, "RANDYS_PRICING_FILENAME_SUFFIX", None),
+            src_constants.RANDYS_PRICING_FILENAME_SUFFIX,
+        )
 
         self.sftp_user = _coalesce_nonempty_str(
             creds.get("sftp_user"),
@@ -186,30 +198,54 @@ class RandysSFTPClient:
             self._sftp = None
             self._transport = None
 
-    def _matches_inventory_name(self, filename: str) -> bool:
+    @staticmethod
+    def _matches_name(filename: str, prefix: str, suffix: str) -> bool:
         lowered = (filename or "").lower()
-        return lowered.startswith(self.filename_prefix.lower()) and lowered.endswith(
-            self.filename_suffix.lower()
+        return lowered.startswith((prefix or "").lower()) and lowered.endswith(
+            (suffix or "").lower()
         )
 
-    def _newest_inventory_remote_file(self) -> typing.Optional[typing.Tuple[str, float]]:
+    def _matches_inventory_name(self, filename: str) -> bool:
+        return self._matches_name(filename, self.filename_prefix, self.filename_suffix)
+
+    def _matches_pricing_name(self, filename: str) -> bool:
+        return self._matches_name(
+            filename, self.pricing_filename_prefix, self.pricing_filename_suffix
+        )
+
+    def _newest_remote_file(
+        self, prefix: str, suffix: str
+    ) -> typing.Optional[typing.Tuple[str, float]]:
         """
-        Newest ``Inventory_RWW_*.csv`` in the folder as ``(filename, mtime)``, or None.
+        Newest ``<prefix>*<suffix>`` in the folder as ``(filename, mtime)``, or None.
 
         Ordered by mtime rather than by the timestamp embedded in the name: the name's stamp is
-        RANDYS' own clock and a re-sent or corrected file would sort wrongly by it.
+        RANDYS' own clock, so a re-sent or corrected file would sort wrongly by it.
+
+        The prefix+suffix match is specific on purpose. Every relay provider shares one
+        ``uploads/`` folder per company, so an "any file" check happily matches a different
+        distributor's drop -- that exact bug hit Crown on 2026-10-13 when it matched DLG's file.
+        It is also what keeps the inventory and pricing feeds apart here.
         """
         folder = _remote_join(self.sftp_directory, "")
         entries = self._sftp.listdir_attr(folder)
         newest: typing.Optional[typing.Tuple[str, float]] = None
         for entry in entries:
             name = getattr(entry, "filename", "") or ""
-            if not self._matches_inventory_name(name):
+            if not self._matches_name(name, prefix, suffix):
                 continue
             mtime = float(getattr(entry, "st_mtime", 0) or 0)
             if newest is None or mtime > newest[1]:
                 newest = (name, mtime)
         return newest
+
+    def _newest_inventory_remote_file(self) -> typing.Optional[typing.Tuple[str, float]]:
+        return self._newest_remote_file(self.filename_prefix, self.filename_suffix)
+
+    def _newest_pricing_remote_file(self) -> typing.Optional[typing.Tuple[str, float]]:
+        return self._newest_remote_file(
+            self.pricing_filename_prefix, self.pricing_filename_suffix
+        )
 
     def feed_present(self) -> bool:
         """
@@ -251,6 +287,9 @@ class RandysSFTPClient:
                     "matches_inventory_pattern": self._matches_inventory_name(
                         getattr(e, "filename", "") or ""
                     ),
+                    "matches_pricing_pattern": self._matches_pricing_name(
+                        getattr(e, "filename", "") or ""
+                    ),
                 }
                 for e in entries
             ]
@@ -263,28 +302,31 @@ class RandysSFTPClient:
             return True
         return (time.time() - os.path.getmtime(local_path)) > self.file_max_age
 
-    def download_inventory_file(self, force_download: bool = False) -> str:
+    def _download_newest(
+        self,
+        prefix: str,
+        suffix: str,
+        label: str,
+        force_download: bool,
+    ) -> str:
         """
-        Downloads the newest matching file and returns the local path.
+        Download the newest ``<prefix>*<suffix>`` and return the local path.
 
         The local name mirrors the remote one, so a new RANDYS push (new timestamp) is always a
-        cache miss and the 6-hour staleness window only ever suppresses re-downloading the *same*
-        file. Written to ``.tmp`` then ``os.replace``d, so a reader never sees a partial CSV.
+        cache miss and the staleness window only ever suppresses re-downloading the *same* file.
+        Written to ``.tmp`` then ``os.replace``d, so a reader never sees a partial CSV.
         """
         self._connect()
         try:
             try:
-                newest = self._newest_inventory_remote_file()
+                newest = self._newest_remote_file(prefix, suffix)
             except FileNotFoundError:
                 newest = None
             if newest is None:
-                msg = "No {}*{} found in {} on {}.".format(
-                    self.filename_prefix,
-                    self.filename_suffix,
-                    _remote_join(self.sftp_directory, ""),
-                    self.sftp_server,
+                msg = "No {}*{} ({}) found in {} on {}.".format(
+                    prefix, suffix, label, _remote_join(self.sftp_directory, ""), self.sftp_server,
                 )
-                logger.error("{} {}".format(_LOG_PREFIX, msg))
+                logger.warning("{} {}".format(_LOG_PREFIX, msg))
                 raise exceptions.RandysFileNotFoundError(msg)
 
             remote_filename, _mtime = newest
@@ -315,5 +357,34 @@ class RandysSFTPClient:
             msg = "RANDYS SFTP download failed: {}".format(str(e))
             logger.error("{} {}".format(_LOG_PREFIX, msg))
             raise exceptions.RandysSFTPConnectionError(msg)
+        finally:
+            self._disconnect()
+
+    def download_inventory_file(self, force_download: bool = False) -> str:
+        return self._download_newest(
+            self.filename_prefix, self.filename_suffix, "inventory", force_download
+        )
+
+    def download_pricing_file(self, force_download: bool = False) -> str:
+        """
+        Newest per-company pricing file. The name is a placeholder until RANDYS deliver one, so a
+        RandysFileNotFoundError here is the expected state today, not a fault -- callers treat it
+        as "no dealer cost yet" and leave cost null rather than guessing at one.
+        """
+        return self._download_newest(
+            self.pricing_filename_prefix, self.pricing_filename_suffix, "pricing", force_download
+        )
+
+    def pricing_feed_present(self) -> bool:
+        self._connect()
+        try:
+            try:
+                return self._newest_pricing_remote_file() is not None
+            except FileNotFoundError:
+                return False
+        except exceptions.RandysSFTPConnectionError:
+            raise
+        except IOError:
+            return False
         finally:
             self._disconnect()

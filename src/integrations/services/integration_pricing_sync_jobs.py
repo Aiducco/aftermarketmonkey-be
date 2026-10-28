@@ -49,6 +49,7 @@ from src.integrations.services import turn_14_sweeps
 from src.integrations.services import vossen as vossen_services
 from src.integrations.services import wheelpros as wheelpros_services
 from src.integrations.services import wps as wps_services
+from src.integrations.services import randys as randys_services
 from src.integrations.services import xdp as xdp_services
 
 logger = logging.getLogger(__name__)
@@ -79,6 +80,11 @@ _PRICING_SYNC_KINDS = frozenset(
         src_enums.BrandProviderKind.SB.value,
         src_enums.BrandProviderKind.ATD.value,
         src_enums.BrandProviderKind.THOROUGHBRED_DIESEL.value,
+        # RANDYS are here even though no dealer-cost file has been delivered yet: the pass
+        # also writes their published retail onto every part, which is what gives a newly
+        # connected company sellable prices on day one. It becomes a real cost sync, with no
+        # further wiring, the moment a pricing file lands.
+        src_enums.BrandProviderKind.RANDYS_WORLDWIDE.value,
     }
 )
 
@@ -294,6 +300,12 @@ def _fetch_raw_pricing(cp: src_models.CompanyProviders, use_delta_fetch: bool = 
     elif kind == src_enums.BrandProviderKind.MEYER.value:
         meyer_services.sync_meyer_company_pricing_for_company_provider(cp.id)
 
+    elif kind == src_enums.BrandProviderKind.RANDYS_WORLDWIDE.value:
+        # Writes published retail for every part, and overlays real dealer cost only where a
+        # per-company pricing file has actually been delivered -- no file is a logged no-op
+        # for cost, never a derived one. See services.randys for why.
+        randys_services.sync_randys_company_pricing_for_company_provider(cp.id)
+
     elif kind == src_enums.BrandProviderKind.ATECH.value:
         atech_services.sync_atech_company_pricing_for_company_provider(cp.id)
 
@@ -397,6 +409,9 @@ def _sync_master_pricing(cp: src_models.CompanyProviders) -> None:
 
     elif kind == src_enums.BrandProviderKind.MEYER.value:
         master_parts.sync_provider_pricing_from_meyer_for_company(company_id)
+
+    elif kind == src_enums.BrandProviderKind.RANDYS_WORLDWIDE.value:
+        master_parts.sync_provider_pricing_from_randys_for_company(company_id)
 
     elif kind == src_enums.BrandProviderKind.ATECH.value:
         master_parts.sync_provider_pricing_from_atech_for_company(company_id)

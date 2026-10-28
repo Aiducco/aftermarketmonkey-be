@@ -9810,3 +9810,47 @@ class RandysPart(django_db_models.Model):
         indexes = [
             django_db_models.Index(fields=["brand", "sku"], name="randys_brand_sku_idx"),
         ]
+
+
+class RandysCompanyPricing(django_db_models.Model):
+    """
+    Per-company RANDYS pricing for a catalog row (RandysPart). Same split Meyer and Keystone use:
+    catalog and the RANDYS-wide quantity live on RandysPart, and anything that differs by dealer
+    lives here.
+
+    ``cost`` is null until RANDYS deliver a per-company pricing file. That is the current state
+    for every connection -- their push carries ``Item,Stock`` and nothing else, and no wholesale
+    figure is reachable publicly. ``retail_price`` is populated from RANDYS' published retail
+    straight away, so a connected company has a sellable price immediately, and a null ``cost``
+    means exactly "no dealer cost delivered yet" rather than "free" or "unknown markup". Nothing
+    in this integration derives a cost from retail -- see
+    services.randys.sync_randys_company_pricing_for_company_provider for why that is deliberate.
+
+    ``cost_source`` records where a non-null cost came from, so a later markup-derived or
+    API-sourced cost can never be confused with one RANDYS actually quoted.
+    """
+
+    part = django_db_models.ForeignKey(
+        RandysPart, on_delete=django_db_models.CASCADE, related_name="company_pricing"
+    )
+    company = django_db_models.ForeignKey(
+        Company, on_delete=django_db_models.CASCADE, related_name="randys_company_pricing"
+    )
+    cost = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    jobber_price = django_db_models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True
+    )
+    map_price = django_db_models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True
+    )
+    retail_price = django_db_models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True
+    )
+    # "feed" once a real pricing file lands; null while cost is null.
+    cost_source = django_db_models.CharField(max_length=16, null=True, blank=True)
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "randys_company_pricing"
+        unique_together = [["part", "company"]]

@@ -3029,14 +3029,19 @@ def sync_derived_from_allpro(*, skip_master_parts: bool = False, skip_pricing: b
     """Propagate AllPro source data into MasterPart, ProviderPart, ProviderPartInventory.
     Per-company pricing is NOT looped over here -- it's fetched per-company by the standard
     IntegrationPricingSyncJob dispatch (see integration_pricing_sync_jobs._fetch_raw_pricing),
-    same as DLG/Keystone."""
-    logger.info("{} Starting AllPro-only derived sync.".format(_LOG_PREFIX))
+    same as DLG/Keystone.
+
+    Inventory runs regardless of ``skip_pricing`` -- see the matching note on
+    sync_derived_from_thoroughbred for why it used to be skipped on the nightly global path and
+    what that cost."""
+    logger.info("{} Starting AllPro-only derived sync ({}).".format(
+        _LOG_PREFIX, "inventory only" if skip_master_parts else "parts, inventory",
+    ))
     if not skip_master_parts:
         sync_master_parts_from_allpro()
         connection.close()
-    if not skip_pricing:
-        sync_provider_inventory_from_allpro()
-        connection.close()
+    sync_provider_inventory_from_allpro()
+    connection.close()
     logger.info("{} Completed AllPro-only derived sync.".format(_LOG_PREFIX))
 
 
@@ -3514,14 +3519,22 @@ def sync_derived_from_thoroughbred(*, skip_master_parts: bool = False, skip_pric
     per-company by the standard IntegrationPricingSyncJob dispatch (see
     integration_pricing_sync_jobs._fetch_raw_pricing), same as AllPro/DLG/Keystone. Fitment is
     ALSO not run here -- see sync_master_part_fitments_from_thoroughbred, a standalone pipeline
-    with its own management command, same as every other native fitment writer."""
-    logger.info("{} Starting Thoroughbred Diesel-only derived sync.".format(_LOG_PREFIX))
+    with its own management command, same as every other native fitment writer.
+
+    Inventory runs regardless of ``skip_pricing``, matching Keystone/Quadratec/NTW/SB/Motor State.
+    It used to sit behind that flag, which meant the nightly ``sync_all_master_parts_global()``
+    path -- the only place that passes ``skip_pricing=True`` -- never refreshed
+    ProviderPartInventory for Thoroughbred at all. Stock only moved on the separate incremental
+    pass, so a sold-out part could read as in stock for a full day. ``skip_pricing`` means skip
+    *pricing*; inventory is part of the catalog phase."""
+    logger.info("{} Starting Thoroughbred Diesel-only derived sync ({}).".format(
+        _LOG_PREFIX, "inventory only" if skip_master_parts else "parts, inventory",
+    ))
     if not skip_master_parts:
         sync_master_parts_from_thoroughbred()
         connection.close()
-    if not skip_pricing:
-        sync_provider_inventory_from_thoroughbred()
-        connection.close()
+    sync_provider_inventory_from_thoroughbred()
+    connection.close()
     logger.info("{} Completed Thoroughbred Diesel-only derived sync.".format(_LOG_PREFIX))
 
 
@@ -17917,3 +17930,96 @@ def sync_master_part_fitments_from_randys() -> None:
     logger.info(
         "{} Synced {} RANDYS MasterPartFitment rows total.".format(_LOG_PREFIX, total_upserted)
     )
+
+
+def sync_provider_pricing_from_randys_for_company(company_id: int) -> None:
+    """Propagate RandysCompanyPricing into ProviderPartCompanyPricing for one company.
+
+    RandysCompanyPricing itself is populated by
+    randys.sync_randys_company_pricing_for_company_provider, which writes RANDYS' published
+    retail for every part and overlays real dealer cost only where a per-company pricing file has
+    actually been delivered -- so a null ``cost`` here means "not quoted yet", never a derived
+    guess. See that function's docstring."""
+    logger.info("{} Syncing RANDYS provider pricing for company_id={}.".format(_LOG_PREFIX, company_id))
+
+    randys_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.RANDYS_WORLDWIDE.value,
+    ).first()
+    if not randys_provider:
+        logger.info("{} No RANDYS provider found.".format(_LOG_PREFIX))
+        return
+
+    provider_parts_by_key = {
+        row["provider_external_id"]: src_models.ProviderPart(id=row["id"])
+        for row in src_models.ProviderPart.objects.filter(provider=randys_provider).values(
+            "id", "provider_external_id"
+        )
+    }
+    if not provider_parts_by_key:
+        logger.info("{} No RANDYS ProviderPart rows yet. Nothing to price.".format(_LOG_PREFIX))
+        return
+
+    now = timezone.now()
+    sync_started_at = timezone.now()
+    company_provider = src_models.CompanyProviders.objects.filter(
+        company_id=company_id, provider=randys_provider,
+    ).first()
+    watermark = company_provider.pricing_propagation_watermark if company_provider else None
+
+    total_upserted = 0
+    batch_num = 0
+    last_id = 0
+    while True:
+        batch_num += 1
+        qs = src_models.RandysCompanyPricing.objects.filter(id__gt=last_id, company_id=company_id)
+        if watermark:
+            qs = qs.filter(updated_at__gte=watermark)
+        batch = list(
+            qs.order_by("id").values(
+                "id", "cost", "jobber_price", "map_price", "retail_price", "part__code",
+            )[:BATCH_SIZE_PRICING]
+        )
+        if not batch:
+            break
+        last_id = batch[-1]["id"]
+
+        to_upsert = []
+        for row in batch:
+            provider_part = provider_parts_by_key.get(row["part__code"])
+            if not provider_part:
+                continue
+            retail = row.get("retail_price")
+            to_upsert.append(
+                src_models.ProviderPartCompanyPricing(
+                    provider_part=provider_part,
+                    company_id=company_id,
+                    cost=row.get("cost"),
+                    jobber_price=row.get("jobber_price"),
+                    map_price=row.get("map_price"),
+                    msrp=retail,
+                    retail_price=retail,
+                    last_synced_at=now,
+                )
+            )
+        if to_upsert:
+            to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                to_upsert, context="RANDYS pricing company={} batch={}".format(company_id, batch_num)
+            )
+            pgbulk.upsert(
+                src_models.ProviderPartCompanyPricing,
+                to_upsert,
+                unique_fields=["provider_part", "company"],
+                update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
+            )
+            total_upserted += len(to_upsert)
+        connection.close()
+        if len(batch) == BATCH_SIZE_PRICING:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    logger.info("{} Synced {} RANDYS pricing records for company_id={}.".format(
+        _LOG_PREFIX, total_upserted, company_id,
+    ))
+
+    if company_provider:
+        company_provider.pricing_propagation_watermark = sync_started_at
+        company_provider.save(update_fields=["pricing_propagation_watermark"])

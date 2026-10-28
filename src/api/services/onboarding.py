@@ -536,14 +536,10 @@ def get_distributor_credentials_info() -> dict:
         },
         "xdp": {
             "required": ["markup"],
-            "optional": ["feed_url"],
             "description": (
                 "No account or login needed — XDP's catalog, pricing and fitment are public. "
-                "Enter your markup percentage (0–100) off XDP's retail price and your cost is "
-                "computed as retail * (1 - markup / 100). If you buy XDP's own brand wholesale, "
-                "you can also paste the dealer feed URL your rep gave you "
-                "(https://www.xtremediesel.com/feeds/....csv) and we'll use your real cost and "
-                "stock counts for XDP-brand parts instead of the markup estimate."
+                "The only input is your markup percentage (0–100) off XDP's retail price; your "
+                "cost is computed as retail * (1 - markup / 100)."
             ),
             "display_name": src_constants.PROVIDER_DISPLAY_NAMES.get("XDP", "XDP"),
             "icon_url": src_constants.PROVIDER_IMAGE_URLS.get("XDP") or None,

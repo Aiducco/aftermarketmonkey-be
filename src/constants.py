@@ -278,6 +278,24 @@ RANDYS_RELAY_SFTP_DIRECTORY = "uploads"
 RANDYS_INVENTORY_FILENAME_PREFIX = "Inventory_RWW_"
 RANDYS_INVENTORY_FILENAME_SUFFIX = ".csv"
 
+# Per-company dealer cost. RANDYS have not delivered a pricing file yet, so the prefix below is
+# our own guess, mirroring the inventory name they do send -- it is a PLACEHOLDER, and it is read
+# through a setting precisely so the real name can be set without a deploy the moment the rep
+# confirms it (same arrangement Tri-State's feed names are in, for the same reason).
+#
+# The parser is header-driven rather than positional for the same reason: whatever they call the
+# cost column, a file with a header will be read. Until one lands, the pricing pass is a logged
+# no-op and RandysCompanyPricing carries published retail with a null cost -- never a guess at
+# one. See services.randys.sync_randys_company_pricing_for_company_provider.
+RANDYS_PRICING_FILENAME_PREFIX = "Pricing_RWW_"
+RANDYS_PRICING_FILENAME_SUFFIX = ".csv"
+# Candidate header names, lower-cased and stripped of spaces/underscores before comparison.
+RANDYS_PRICING_ITEM_COLUMNS = ("item", "itemnumber", "sku", "partnumber", "part")
+RANDYS_PRICING_COST_COLUMNS = ("cost", "yourprice", "dealercost", "dealerprice", "net", "netprice")
+RANDYS_PRICING_JOBBER_COLUMNS = ("jobber", "jobberprice")
+RANDYS_PRICING_MAP_COLUMNS = ("map", "mapprice", "minimumadvertisedprice")
+RANDYS_PRICING_RETAIL_COLUMNS = ("retail", "retailprice", "msrp", "list", "listprice")
+
 SB_RELAY_SFTP_HOST = "5.161.121.143"
 SB_RELAY_SFTP_PORT = 22
 SB_RELAY_SFTP_DIRECTORY = "uploads"
@@ -2271,25 +2289,23 @@ PROVIDER_CATALOG = [
         "kind": enums.BrandProviderKind.XDP,
         "name": "XDP",
         "description": (
-            "Access XDP's full catalog, pricing and vehicle fitment with no login — plus real "
-            "dealer cost and stock on XDP's own brand if you have their dealer feed."
+            "Access XDP's full catalog, pricing and vehicle fitment with no login — just set "
+            "your markup."
         ),
         "icon_url": PROVIDER_IMAGE_URLS["XDP"],
         "category": "Distributors",
-        # Two credentials, and the split is the whole design:
+        # "markup" is the ONLY thing a company enters, and it is the cost basis for the whole
+        # catalog: XDP exposes no wholesale number anywhere reachable, exactly like Thoroughbred.
         #
-        # "markup" is REQUIRED because it is the only cost basis for the ~241 brands XDP resells.
-        # XDP exposes no wholesale number for those anywhere reachable, exactly like Thoroughbred.
-        #
-        # "feed_url" is OPTIONAL and covers XDP's OWN brand only -- a per-dealer CSV with real
-        # COST, MAP and a numeric IN-STOCK (449 parts). It is not needed for catalog coverage:
-        # every one of those parts is already in the public index, matched on both sku and mpn.
-        # What it buys is a real cost and a real quantity instead of a markup estimate. A company
-        # without it simply gets markup-derived cost across the whole catalog, house brand
-        # included -- which is the right answer for a dealer with no XDP wholesale account, not a
-        # degraded one. XdpCompanyPricing.cost_source records which source produced each row.
+        # XDP's own brand additionally has a per-dealer CSV with real COST/MAP/IN-STOCK, and the
+        # backend still reads it when a connection carries a "feed_url" (see
+        # xdp.fetch_and_save_xdp_dealer_feed and XdpCompanyPricing.cost_source) -- but it is
+        # deliberately NOT offered as a connect-flow field. It adds no catalog coverage (all 449
+        # of its parts are already in the public index, matched on both sku and mpn), so asking
+        # every dealer for a URL most of them do not have bought a second onboarding step for a
+        # pricing refinement. Set it out-of-band on the connection that has one.
         "connection_required_fields": [XDP_CREDENTIALS_MARKUP],
-        "connection_optional_fields": [XDP_CREDENTIALS_FEED_URL],
+        "connection_optional_fields": [],
         # XDP has no order API, so Email is the only ordering channel -- same shape as
         # AllPro/Rough Country/Thoroughbred.
         "email_order_connection_required_fields": ["rep_email"],
@@ -2297,29 +2313,22 @@ PROVIDER_CATALOG = [
         "integration_time": "Data available immediately — no account or approval needed",
         "installation_instructions_html": (
             "<p><strong>XDP</strong> publishes its catalog, prices and vehicle fitment publicly, "
-            "so there's no account needed to get started.</p>"
-            "<p><strong>1. Set your markup</strong></p>"
+            "so there's no account to set up and nothing to wait for.</p>"
+            "<p><strong>Set your markup</strong></p>"
             "<p>Enter a <strong>markup percentage</strong> (0-100) off XDP's retail price and "
             "click <strong>Save</strong>. We compute your cost as "
-            "<em>retail &times; (1 &minus; markup / 100)</em> for every brand XDP resells. "
-            "Catalog and fitment sync automatically after that.</p>"
-            "<p><strong>2. Optional: add your XDP dealer feed</strong></p>"
-            "<p>If you buy XDP's own brand wholesale, your rep can give you a dealer feed link "
-            "(it looks like <code>https://www.xtremediesel.com/feeds/&hellip;.csv</code>). Paste "
-            "it into <strong>Dealer feed URL</strong> and we'll use your real cost and real stock "
-            "counts for XDP-brand parts instead of the markup estimate. Everything else keeps "
-            "using your markup.</p>"
+            "<em>retail &times; (1 &minus; markup / 100)</em>. Catalog, pricing and fitment sync "
+            "automatically after that.</p>"
             "<p><strong>Ordering</strong></p>"
             "<p>XDP has no ordering API, so orders go to your rep as a PDF purchase order by "
             "email. Enter the purchase-order email your XDP rep gave you, plus an optional "
             "internal <strong>CC</strong> so your team gets a copy of every order.</p>"
             "<p><strong>Troubleshooting</strong></p>"
             "<ul>"
-            "<li><strong>Dealer feed rejected?</strong> The link must start with "
-            "<code>https://www.xtremediesel.com/feeds/</code>. XDP publishes one file per dealer, "
-            "so double-check the exact link your rep sent.</li>"
-            "<li><strong>No dealer feed?</strong> Leave it blank. Your catalog, fitment and "
-            "markup-based pricing all work without it.</li>"
+            "<li><strong>Markup rejected?</strong> It must be a number between 0 and 100 — enter "
+            "the percentage only, with no &percnt; sign.</li>"
+            "<li><strong>Cost looks like the retail price?</strong> That means no markup is saved "
+            "yet. Enter one and save; pricing refreshes on the next sync.</li>"
             "</ul>"
         ),
     },
