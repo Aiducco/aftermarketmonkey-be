@@ -331,9 +331,13 @@ def get_providers_catalog(company_id: int) -> typing.Dict:
         connected = bool(company_provider and (company_provider.credentials or {}).get("feed"))
 
         kind_name = provider.kind_name or ""
-        display_name = src_constants.PROVIDER_DISPLAY_NAMES.get(
-            kind_name, kind_name
-        ) or provider.name
+        # Fall through to the Providers row's own name, not to kind_name: a provider missing
+        # from PROVIDER_DISPLAY_NAMES used to render as its raw enum name, so a newly added
+        # distributor showed up in the UI as "RANDYS_WORLDWIDE" instead of "RANDYS Worldwide".
+        # The old default made that unreachable, since kind_name is always truthy.
+        display_name = (
+            src_constants.PROVIDER_DISPLAY_NAMES.get(kind_name) or provider.name or kind_name
+        )
 
         catalog.append({
             "id": provider.id,

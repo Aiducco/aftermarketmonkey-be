@@ -9818,16 +9818,18 @@ class RandysCompanyPricing(django_db_models.Model):
     catalog and the RANDYS-wide quantity live on RandysPart, and anything that differs by dealer
     lives here.
 
-    ``cost`` is null until RANDYS deliver a per-company pricing file. That is the current state
-    for every connection -- their push carries ``Item,Stock`` and nothing else, and no wholesale
-    figure is reachable publicly. ``retail_price`` is populated from RANDYS' published retail
-    straight away, so a connected company has a sellable price immediately, and a null ``cost``
-    means exactly "no dealer cost delivered yet" rather than "free" or "unknown markup". Nothing
-    in this integration derives a cost from retail -- see
-    services.randys.sync_randys_company_pricing_for_company_provider for why that is deliberate.
+    ``cost`` has two sources, and ``cost_source`` always says which:
 
-    ``cost_source`` records where a non-null cost came from, so a later markup-derived or
-    API-sourced cost can never be confused with one RANDYS actually quoted.
+    * ``"feed"`` -- real per-dealer cost from a pricing file RANDYS delivered.
+    * ``"markup"`` -- derived from the company's own markup off RANDYS' retail
+      (``cost = retail * (1 - markup/100)``), the same stand-in XDP and Thoroughbred use. RANDYS'
+      push carries ``Item,Stock`` only today and no wholesale figure is reachable publicly, so
+      this is what gives a connected company a cost basis in the meantime.
+
+    A company with neither gets no row at all. That is deliberate: writing retail with a null
+    cost would present RANDYS' own retail price as if it were the dealer's, which is worse than
+    having no price. ``retail_price``/``msrp`` are still carried as the published reference
+    alongside a real cost.
     """
 
     part = django_db_models.ForeignKey(
@@ -9846,7 +9848,12 @@ class RandysCompanyPricing(django_db_models.Model):
     retail_price = django_db_models.DecimalField(
         max_digits=12, decimal_places=2, null=True, blank=True
     )
-    # "feed" once a real pricing file lands; null while cost is null.
+    # Markup percent used when cost_source == "markup"; null when cost came from a feed.
+    markup_percent_applied = django_db_models.DecimalField(
+        max_digits=5, decimal_places=2, null=True, blank=True
+    )
+    # "feed" (real per-dealer cost RANDYS delivered) | "markup" (derived from the company's own
+    # markup off RANDYS' retail). Never null when cost is set, so the two can't be confused.
     cost_source = django_db_models.CharField(max_length=16, null=True, blank=True)
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)

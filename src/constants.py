@@ -41,6 +41,7 @@ PROVIDER_DISPLAY_NAMES = {
     "THOROUGHBRED_DIESEL": "Thoroughbred Diesel",
     "NTW": "NTW",
     "SB": "S&B Filters",
+    "RANDYS_WORLDWIDE": "RANDYS Worldwide",
 }
 
 # Provider kind_name -> image URL (used by parts API)
@@ -84,6 +85,7 @@ PROVIDER_IMAGE_URLS = {
     "THOROUGHBRED_DIESEL": "https://api.aftermarketscout.com/uploads/thoroughbred_diesel_logo.png",
     "NTW": "https://api.aftermarketscout.com/uploads/ntw_logo.png",
     "SB": "https://api.aftermarketscout.com/uploads/sb_logo.png",
+    "RANDYS_WORLDWIDE": "https://api.aftermarketscout.com/uploads/randys_logo.png",
 }
 
 # Public "open in distributor" links (parts API ``provider_go_to_link``); ``urllib.parse.quote`` at call sites.
@@ -287,6 +289,12 @@ RANDYS_INVENTORY_FILENAME_SUFFIX = ".csv"
 # cost column, a file with a header will be read. Until one lands, the pricing pass is a logged
 # no-op and RandysCompanyPricing carries published retail with a null cost -- never a guess at
 # one. See services.randys.sync_randys_company_pricing_for_company_provider.
+# Connect-flow credential key. Optional, unlike XDP's: RANDYS will deliver real per-dealer cost,
+# and until they do this markup is the stand-in so a connected company still has a cost basis
+# rather than being shown RANDYS' retail as if it were their own price. Feed cost always wins
+# once a file lands -- see services.randys.sync_randys_company_pricing_for_company_provider.
+RANDYS_CREDENTIALS_MARKUP = "markup"
+
 RANDYS_PRICING_FILENAME_PREFIX = "Pricing_RWW_"
 RANDYS_PRICING_FILENAME_SUFFIX = ".csv"
 # Candidate header names, lower-cased and stripped of spaces/underscores before comparison.
@@ -2878,7 +2886,11 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/randys_logo.png",
         "category": "Distributors",
         "connection_required_fields": [],
-        "connection_optional_fields": [],
+        # Optional, not required: cost comes from RANDYS' own pricing file once they deliver one,
+        # and this is only the stand-in until then. XDP requires its markup because that is its
+        # only cost basis; here a company that would rather wait for real costs can leave it
+        # blank and simply has no prices in the meantime.
+        "connection_optional_fields": [RANDYS_CREDENTIALS_MARKUP],
         "relay_provisioned": True,
         "relay_credential_fields": ("sftp_user", "sftp_password"),
         "integration_time": "Catalog is available immediately; stock within 1 business day",
@@ -2920,10 +2932,18 @@ PROVIDER_CATALOG = [
             "<p>Thanks!</p>"
             "</div>"
 
-            "<p><strong>2. Click Connect</strong></p>"
-            "<p>AfterMarketScout starts watching your folder. The catalog is available right away, "
-            "showing RANDYS&rsquo; retail prices. Your cost and stock appear after RANDYS&rsquo; first "
-            "delivery, which can take a few days depending on your rep.</p>"
+            "<p><strong>2. Click Connect, and set a markup if you want prices straight away</strong></p>"
+            "<p>AfterMarketScout starts watching your folder. The catalog is available right away. "
+            "Your real cost and stock appear after RANDYS&rsquo; first delivery, which can take a few "
+            "days depending on your rep.</p>"
+            "<p>If you don&rsquo;t want to wait, enter a <strong>markup percentage</strong> (0-100) "
+            "below. We&rsquo;ll work your cost back from RANDYS&rsquo; retail price "
+            "(<code>cost = retail &times; (1 &minus; markup / 100)</code>) so you can sell in the "
+            "meantime. The moment a real pricing file arrives it takes over automatically &mdash; you "
+            "don&rsquo;t have to change anything, and we never present RANDYS&rsquo; retail price as "
+            "though it were your cost.</p>"
+            "<p>Leave it blank if you&rsquo;d rather wait for real dealer pricing. RANDYS parts will "
+            "show in your catalog without a price until the file lands.</p>"
 
             "<p><strong>3. Set up ordering</strong></p>"
             "<p>Enter the purchase-order email your rep confirmed below. You can also add an internal "
@@ -2939,8 +2959,12 @@ PROVIDER_CATALOG = [
             "<li><strong>Stock or pricing looks out of date?</strong> We always use the newest file "
             "received. If updates have stopped, ask your rep to confirm RANDYS is still sending "
             "them.</li>"
-            "<li><strong>Still seeing retail prices?</strong> Your pricing file hasn&rsquo;t arrived "
-            "yet. Ask your rep to include dealer pricing in the delivery.</li>"
+            "<li><strong>No prices on RANDYS parts?</strong> Your pricing file hasn&rsquo;t arrived "
+            "yet and no markup is set. Either ask your rep to include dealer pricing in the "
+            "delivery, or set a markup percentage above to price them in the meantime.</li>"
+            "<li><strong>Prices look like a markup, not your real cost?</strong> That is the "
+            "fallback doing its job while you wait. Once RANDYS deliver a pricing file your actual "
+            "cost replaces it automatically.</li>"
             "<li><strong>More than one RANDYS account?</strong> Each account needs its own folder. "
             "Email <a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a> "
             "and we&rsquo;ll create another one.</li>"

@@ -17936,10 +17936,12 @@ def sync_provider_pricing_from_randys_for_company(company_id: int) -> None:
     """Propagate RandysCompanyPricing into ProviderPartCompanyPricing for one company.
 
     RandysCompanyPricing itself is populated by
-    randys.sync_randys_company_pricing_for_company_provider, which writes RANDYS' published
-    retail for every part and overlays real dealer cost only where a per-company pricing file has
-    actually been delivered -- so a null ``cost`` here means "not quoted yet", never a derived
-    guess. See that function's docstring."""
+    randys.sync_randys_company_pricing_for_company_provider, which sources cost either from a
+    pricing file RANDYS delivered (``cost_source="feed"``) or from the company's own markup off
+    RANDYS' retail (``cost_source="markup"``), and writes no row at all when it has neither. So
+    every row that reaches ProviderPartCompanyPricing carries a real cost basis -- RANDYS' retail
+    is never propagated as though it were the dealer's own price. See that function's
+    docstring."""
     logger.info("{} Syncing RANDYS provider pricing for company_id={}.".format(_LOG_PREFIX, company_id))
 
     randys_provider = src_models.Providers.objects.filter(

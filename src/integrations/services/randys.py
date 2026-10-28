@@ -36,7 +36,7 @@ import re
 import time
 import typing
 from concurrent.futures import ThreadPoolExecutor
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 import pgbulk
 
@@ -728,27 +728,73 @@ def _iter_pricing_rows(
             }
 
 
+def _parse_markup_percent(raw: typing.Any) -> typing.Optional[Decimal]:
+    if raw is None or raw == "":
+        return None
+    try:
+        value = Decimal(str(raw).strip())
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    if value < 0:
+        value = Decimal(0)
+    if value > 100:
+        value = Decimal(100)
+    return value
+
+
+def markup_percent_for_company(
+    credentials: typing.Optional[typing.Dict],
+) -> typing.Optional[Decimal]:
+    """
+    Markup percent (0-100) off RANDYS' retail, from
+    ``CompanyProviders.credentials["feed"]["markup"]``, or None when the company has not set one.
+
+    Returns None rather than XDP's defensive 0% precisely because this field is optional here:
+    XDP requires it at connect time, so a missing value there is corruption and 0% (cost ==
+    retail) is the safe reading. For RANDYS a missing value is the normal state of a company
+    waiting on a real pricing file, and silently pricing their cost at RANDYS' retail would be a
+    worse answer than declining to quote a cost at all.
+    """
+    return _parse_markup_percent((credentials or {}).get(src_constants.RANDYS_CREDENTIALS_MARKUP))
+
+
+def dealer_cost_from_retail(
+    price: typing.Optional[typing.Any],
+    markup_percent: typing.Optional[Decimal],
+) -> typing.Optional[Decimal]:
+    """``cost = price * (1 - markup / 100)``, or None if either input is missing/invalid."""
+    if price is None or markup_percent is None:
+        return None
+    try:
+        retail = price if isinstance(price, Decimal) else Decimal(str(price).strip())
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    if retail < 0:
+        retail = Decimal(0)
+    cost = retail * (Decimal(1) - (markup_percent / Decimal(100)))
+    return cost.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
 def sync_randys_company_pricing_for_company_provider(
     company_provider_id: int,
     force_download: bool = True,
 ) -> int:
     """
     Populate RandysCompanyPricing for one connection -- the Phase A half of the standard
-    IntegrationPricingSyncJob, same position Meyer's and Keystone's pricing sync occupy.
+    IntegrationPricingSyncJob, the same position Meyer's and Keystone's pricing sync occupy.
 
-    Two things happen, and only the first of them works today:
+    Cost comes from one of two places, and ``cost_source`` always records which:
 
-    1. Every catalogue part gets a row carrying RANDYS' **published retail** price, so a connected
-       company has a sellable price from the first sync.
-    2. If a per-company pricing file has landed, its dealer ``cost`` (plus jobber/MAP/retail if
-       present) is overlaid and ``cost_source`` is set to "feed".
+    1. ``"feed"`` -- a per-company pricing file RANDYS delivered. Always wins when present.
+    2. ``"markup"`` -- the company's own markup off RANDYS' published retail, the stand-in XDP
+       and Thoroughbred use. RANDYS' push carries ``Item,Stock`` only today, so until a pricing
+       file arrives this is what gives a connected company a real cost basis.
 
-    No file yet is the expected state, and it is a logged no-op for cost: the row keeps its retail
-    and ``cost`` stays null. Nothing here derives a cost from retail. XDP and Thoroughbred do
-    exactly that -- legitimately, because those are retailers whose dealer terms are a flat markup
-    the company itself configures -- but RANDYS are a distributor quoting real per-dealer
-    wholesale, and inventing a number would be indistinguishable downstream from a quoted one.
-    A null cost is honest and visible; a guessed one is neither.
+    A company with neither gets **no rows at all**, and that is the point of the design rather
+    than an oversight: writing retail with a null cost would put RANDYS' own retail price in
+    front of the dealer as though it were their cost, which is worse than showing no price.
+    ``retail_price``/``msrp`` are still carried as the published reference, but only alongside a
+    cost we can actually stand behind.
     """
     company_provider = (
         src_models.CompanyProviders.objects.filter(
@@ -768,15 +814,14 @@ def sync_randys_company_pricing_for_company_provider(
         return 0
 
     company_id = company_provider.company_id
+    feed_credentials = dict(credentials_helper.get_feed_credentials(company_provider))
+    markup_percent = markup_percent_for_company(feed_credentials)
 
     # ---- the pricing file, if there is one ----
     pricing_by_item: typing.Dict[str, typing.Dict[str, typing.Optional[Decimal]]] = {}
-    feed_credentials = dict(credentials_helper.get_feed_credentials(company_provider))
     try:
         client = randys_sftp_client.RandysSFTPClient(credentials=feed_credentials)
     except ValueError as e:
-        # No relay login on this connection: retail-only pricing still goes ahead below, since it
-        # needs nothing from RANDYS.
         logger.warning("{} company_id={}: {}".format(_LOG_PREFIX, company_id, str(e)))
         client = None
 
@@ -792,23 +837,36 @@ def sync_randys_company_pricing_for_company_provider(
             )
         except randys_exceptions.RandysFileNotFoundError:
             logger.info(
-                "{} No RANDYS pricing file for company_id={} yet; writing published retail only "
-                "and leaving cost null.".format(_LOG_PREFIX, company_id)
+                "{} No RANDYS pricing file for company_id={} yet.".format(_LOG_PREFIX, company_id)
             )
         except randys_exceptions.RandysSFTPConnectionError as e:
-            # Cost is unavailable this run, but the retail pass below needs no connection, so a
-            # relay outage must not leave a company with no prices at all.
+            # Falling back to markup for a transient relay outage would quietly replace real
+            # delivered costs with derived ones, so bail instead and keep the last good rows.
             logger.error(
-                "{} RANDYS pricing download failed for company_id={}: {}. Continuing with "
-                "published retail only.".format(_LOG_PREFIX, company_id, str(e))
+                "{} RANDYS pricing download failed for company_id={}: {}. Leaving existing "
+                "pricing untouched.".format(_LOG_PREFIX, company_id, str(e))
             )
+            return 0
+
+    if not pricing_by_item and markup_percent is None:
+        logger.warning(
+            "{} company_id={} has no RANDYS pricing file and no '{}' credential, so there is no "
+            "cost basis. Writing no pricing rows -- the company sees RANDYS parts with no price "
+            "rather than RANDYS' retail presented as their cost. Set a markup on the connection "
+            "to price them in the meantime.".format(
+                _LOG_PREFIX, company_id, src_constants.RANDYS_CREDENTIALS_MARKUP
+            )
+        )
+        return 0
 
     pricing_by_item_upper = {k.upper(): v for k, v in pricing_by_item.items()}
 
-    # ---- upsert one row per catalogue part ----
     now = timezone.now()
     total = 0
-    matched_items: typing.Set[str] = set()
+    from_feed = 0
+    from_markup = 0
+    skipped_no_cost = 0
+    matched_file_keys: typing.Set[str] = set()
     last_id = 0
     while True:
         rows = list(
@@ -827,13 +885,32 @@ def sync_randys_company_pricing_for_company_provider(
             if sku:
                 if sku in pricing_by_item:
                     values = pricing_by_item[sku]
-                    matched_items.add(sku.upper())
+                    matched_file_keys.add(sku.upper())
                 elif sku.upper() in pricing_by_item_upper:
                     values = pricing_by_item_upper[sku.upper()]
-                    matched_items.add(sku.upper())
-            cost = values.get("cost")
-            # compare_at_price is RANDYS' own was-price; it is the better MSRP when present.
+                    matched_file_keys.add(sku.upper())
+
             retail = values.get("retail_price") or row.get("price")
+            cost = values.get("cost")
+            cost_source = "feed" if cost is not None else None
+            markup_applied = None
+            if cost is None:
+                cost = dealer_cost_from_retail(retail, markup_percent)
+                if cost is not None:
+                    cost_source = "markup"
+                    markup_applied = markup_percent
+
+            if cost is None:
+                # No delivered cost and no usable retail to mark up -- skip rather than write a
+                # priceless row carrying RANDYS' retail.
+                skipped_no_cost += 1
+                continue
+
+            if cost_source == "feed":
+                from_feed += 1
+            else:
+                from_markup += 1
+
             to_upsert.append(
                 src_models.RandysCompanyPricing(
                     part_id=row["id"],
@@ -842,7 +919,8 @@ def sync_randys_company_pricing_for_company_provider(
                     jobber_price=values.get("jobber_price"),
                     map_price=values.get("map_price"),
                     retail_price=retail,
-                    cost_source="feed" if cost is not None else None,
+                    markup_percent_applied=markup_applied,
+                    cost_source=cost_source,
                     updated_at=now,
                 )
             )
@@ -852,8 +930,8 @@ def sync_randys_company_pricing_for_company_provider(
                 to_upsert,
                 unique_fields=["part", "company"],
                 update_fields=[
-                    "cost", "jobber_price", "map_price", "retail_price", "cost_source",
-                    "updated_at",
+                    "cost", "jobber_price", "map_price", "retail_price",
+                    "markup_percent_applied", "cost_source", "updated_at",
                 ],
                 returning=False,
             )
@@ -861,11 +939,12 @@ def sync_randys_company_pricing_for_company_provider(
         connection.close()
         time.sleep(BATCH_DELAY_SECONDS)
 
-    unmatched = len({k.upper() for k in pricing_by_item}) - len(matched_items)
+    unmatched = len({k.upper() for k in pricing_by_item}) - len(matched_file_keys)
     logger.info(
-        "{} RANDYS company pricing complete for company_id={}. Rows upserted: {}, with dealer "
-        "cost: {}, pricing-file items matching no part: {}.".format(
-            _LOG_PREFIX, company_id, total, len(matched_items), unmatched
+        "{} RANDYS company pricing complete for company_id={}. Rows upserted: {} "
+        "(feed cost: {}, markup-derived: {}), skipped for no cost basis: {}, pricing-file items "
+        "matching no part: {}.".format(
+            _LOG_PREFIX, company_id, total, from_feed, from_markup, skipped_no_cost, unmatched
         )
     )
     return total
