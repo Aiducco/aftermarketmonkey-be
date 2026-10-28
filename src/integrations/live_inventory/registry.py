@@ -61,6 +61,7 @@ def get_provider(
 from src.integrations.live_inventory import allpro as _allpro  # noqa: E402
 from src.integrations.live_inventory import atd as _atd  # noqa: E402
 from src.integrations.live_inventory import keystone as _keystone  # noqa: E402
+from src.integrations.live_inventory import motorstate as _motorstate  # noqa: E402
 from src.integrations.live_inventory import meyer as _meyer  # noqa: E402
 from src.integrations.live_inventory import ntw as _ntw  # noqa: E402
 from src.integrations.live_inventory import premier as _premier  # noqa: E402
@@ -83,3 +84,6 @@ register(src_enums.BrandProviderKind.ATD.value, _atd.ATDLiveInventoryProvider)
 # AllPro reads its FM order credentials (not the FTP feed's) -- same split as NTW, since the
 # live stock check is part of their ordering service.
 register(src_enums.BrandProviderKind.ALLPRO_DISTRIBUTING.value, _allpro.AllProLiveInventoryProvider)
+# Motor State has no stock endpoint at all, so the live check is a one-part OrderInquiry --
+# non-committal, and its QuantityAvailable is the live figure. See live_inventory/motorstate.py.
+register(src_enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING.value, _motorstate.MotorStateLiveInventoryProvider)

@@ -176,6 +176,7 @@ def get_adapter_unavailable_reason(
 from src.integrations.orders import allpro as _allpro  # noqa: E402
 from src.integrations.orders import atd as _atd  # noqa: E402
 from src.integrations.orders import keystone as _keystone  # noqa: E402
+from src.integrations.orders import motorstate as _motorstate  # noqa: E402
 from src.integrations.orders import meyer as _meyer  # noqa: E402
 from src.integrations.orders import ntw as _ntw  # noqa: E402
 from src.integrations.orders import premier as _premier  # noqa: E402
@@ -204,3 +205,7 @@ register(src_enums.BrandProviderKind.ATD.value, _atd.ATDOrderAdapter)
 # AllPro's Fulfillment Master API. Credentials are its own, NOT the FTP feed's. Cancel is
 # genuinely supported here; freight is not quotable before the order. See orders/allpro.py.
 register(src_enums.BrandProviderKind.ALLPRO_DISTRIBUTING.value, _allpro.AllProOrderAdapter)
+# Motor State. The only adapter so far that can price freight per shipping method before an
+# order (OrderInquiry returns the rates), so it is also the only one offering a real
+# shipping picker. Credentials are an API key, separate from the FTP feed's login.
+register(src_enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING.value, _motorstate.MotorStateOrderAdapter)

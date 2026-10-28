@@ -2455,7 +2455,7 @@ PROVIDER_CATALOG = [
     {
         "kind": enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING,
         "name": "Motor State Distributing",
-        "description": "Access Motor State Distributing inventory and pricing via their FTP feed.",
+        "description": "Access Motor State Distributing inventory and pricing via their FTP feed, with live stock checks and ordering through their API.",
         "icon_url": "https://api.aftermarketscout.com/uploads/motor_state_logo.png",
         "category": "Distributors",
         "connection_required_fields": [
@@ -2466,54 +2466,61 @@ PROVIDER_CATALOG = [
             MOTOR_STATE_CREDENTIALS_CONTENT_FTP_USER,
             MOTOR_STATE_CREDENTIALS_CONTENT_FTP_PASSWORD,
         ],
+        # API-channel ordering (stock check, shipping estimate, order placement, order status --
+        # see src.integrations.orders.motorstate). One key, issued with the FTP login on the
+        # same subscription, but a SEPARATE field: Motor State issues the key per dealer and
+        # some accounts are approved with FTP credentials only, so it cannot be assumed present
+        # just because the feed is connected.
+        "order_connection_required_fields": [MOTOR_STATE_CREDENTIALS_API_KEY],
         # Email-channel ordering — see the matching note on Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
         "email_order_connection_optional_fields": ["account_number", "cc_email", "reply_to_email"],
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
-            "<p><strong>Motor State Distributing</strong> connects with an FTP login for your daily inventory "
-            "and pricing file. Motor State has no ordering API, so orders go to your account manager as a PDF "
-            "purchase order by email. One email to them sets up both.</p>"
+            "<p><strong>Motor State Distributing</strong> connects with an FTP login for your "
+            "inventory and pricing, and an API key for live stock checks and ordering. Both come "
+            "from the same subscription.</p>"
 
-            "<p><strong>1. Email your Motor State account manager</strong></p>"
-            "<p>Send the message below to your Motor State account manager, with "
+            "<p><strong>1. Sign up for a subscription plan</strong></p>"
+            "<p>Sign in at <a href=\"https://pgp.motorstate.com/\">pgp.motorstate.com</a> and go to "
+            "<strong>Business Tools</strong> &rarr; "
+            "<a href=\"https://pgp.motorstate.com/DataExport\">Subscription Plans</a>. Sign up for a "
+            "plan; the Basic Plan is enough.</p>"
+            "<p>Once Motor State approves it, they email you your FTP login and API key.</p>"
+            "<p>No API key in the approval email? Email "
+            "<a href=\"mailto:pgpsupport@motorstate.com\">pgpsupport@motorstate.com</a>, with "
             "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a> on CC:</p>"
             + _CALLOUT_OPEN +
             "<p>Hi,</p>"
-            "<p>We use AfterMarketScout as our product information management (PIM) and ordering platform, and "
-            "need a few things set up for our Motor State account [your account number]:</p>"
-            "<ol>"
-            "<li>FTP feed access for our inventory and pricing</li>"
-            "<li>Product data (images, categories and long descriptions), if available for our account</li>"
-            "<li>Please confirm the email address we should send purchase orders to</li>"
-            "</ol>"
+            "<p>We use AfterMarketScout as our product information management (PIM) and ordering "
+            "platform. Our subscription for Motor State account [your account number] was approved "
+            "with FTP credentials only. Could you please also issue an API key, so we can check "
+            "stock on demand and place orders?</p>"
             "<p>Thanks!</p>"
             "</div>"
 
             "<p><strong>2. Connect the product feed</strong></p>"
-            "<p>Paste your FTP username (it looks like <code>123456@motorstateftp.com</code>) and password into "
-            "the <strong>Product feed</strong> fields below and click <strong>Save feed credentials</strong>. "
-            "The card will show <strong>Feed Connected</strong>.</p>"
-            "<p>If Motor State gave you a separate login for product data, enter it in the <strong>content "
-            "FTP</strong> fields too. Images, categories and descriptions then come from that login, while your "
-            "main login keeps driving stock and pricing.</p>"
+            "<p>Paste your FTP username (it looks like <code>123456@motorstateftp.com</code>) and "
+            "password into the <strong>Product feed</strong> fields below and click <strong>Save feed "
+            "credentials</strong>. The card will show <strong>Feed Connected</strong>.</p>"
+            "<p>If Motor State gave you a separate login for product data (images, categories and "
+            "descriptions), enter it in the content FTP fields too.</p>"
 
-            "<p><strong>3. Set up ordering</strong></p>"
-            "<p>Enter the purchase-order email your account manager confirmed below. You can also add an "
-            "internal <strong>CC</strong> so your team gets a copy of every order. Click "
-            "<strong>Save</strong>.</p>"
-            "<p>Orders go out as PDF emails, so confirmations and tracking come back from your account manager "
-            "directly rather than into AfterMarketScout.</p>"
+            "<p><strong>3. Add an ordering account</strong></p>"
+            "<p>Click <strong>+ Add account</strong> under <strong>Ordering</strong>. Enter a label "
+            "(e.g. &ldquo;Primary&rdquo;) and your API key, then click <strong>Add Account</strong>. "
+            "The card will show <strong>Ordering Connected</strong>.</p>"
 
             "<p><strong>Troubleshooting</strong></p>"
             "<ul>"
             "<li><strong>Connection fails?</strong> Check that the username includes "
-            "<code>@motorstateftp.com</code>, then re-paste the password. If it still fails, ask your account "
-            "manager to confirm FTP access is active.</li>"
-            "<li><strong>Connected but no data?</strong> Your login works, but Motor State hasn't set up a feed "
-            "file for your account yet. Ask them to enable it.</li>"
-            "<li><strong>Prices look out of date?</strong> The file is generated once a day, so changes made "
-            "during the day appear in the next one.</li>"
+            "<code>@motorstateftp.com</code>, then re-paste the password. If it still fails, ask "
+            "<a href=\"mailto:pgpsupport@motorstate.com\">pgpsupport@motorstate.com</a> to confirm FTP "
+            "access is active.</li>"
+            "<li><strong>Connected but no data?</strong> Your login works, but Motor State hasn&rsquo;t "
+            "set up a feed file yet. Ask pgpsupport to enable it.</li>"
+            "<li><strong>Stock checks or orders don&rsquo;t work?</strong> Check that you received and "
+            "entered an API key. If not, request one as in step 1.</li>"
             "</ul>"
         ),
     },

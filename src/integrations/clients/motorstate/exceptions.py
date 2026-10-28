@@ -18,6 +18,18 @@ class MotorStatePermissionError(MotorStateAPIBadResponseCodeError):
     """
 
 
+class MotorStateAPIConnectionError(MotorStateAPIException):
+    """
+    The API host was unreachable -- DNS, timeout, refused connection. Not a credentials problem
+    and not a business rejection.
+
+    Unlike MotorStateAPIBadResponseCodeError above, this passes its message up to Exception, so
+    ``str(e)`` carries it. (That sibling stores the text on ``.message`` and calls
+    ``Exception.__init__`` with no arguments, which leaves ``str(e)`` empty -- callers must read
+    ``.message``.)
+    """
+
+
 class MotorStateFTPException(Exception):
     """Base for the FTP feed client (separate from the ordering API's exception tree)."""
 

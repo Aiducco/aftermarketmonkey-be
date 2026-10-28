@@ -40,6 +40,7 @@ from src.integrations.clients.meyer import exceptions as meyer_exceptions
 from src.integrations.clients.meyer import order_client as meyer_order_client
 from src.integrations.clients.motorstate import ftp_client as motorstate_ftp_client
 from src.integrations.clients.motorstate import exceptions as motorstate_exceptions
+from src.integrations.clients.motorstate import order_client as motorstate_order_client
 from src.integrations.clients.premier import client as premier_client
 from src.integrations.clients.premier import exceptions as premier_exceptions
 from src.integrations.clients.premier import order_client as premier_order_client
@@ -1179,6 +1180,46 @@ def _validate_allpro_order_connection(credentials: typing.Dict[str, typing.Any])
     return None, None
 
 
+def _validate_motorstate_order_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
+    """
+    Checks the dealer's Motor State API key with GET /api/Ping -- the cheapest call that still
+    proves the key, and it reads nothing and changes nothing.
+
+    The key is issued alongside the FTP login on the same subscription but is a separate thing:
+    Motor State approves some accounts with FTP credentials only, so "the feed works" says
+    nothing about whether ordering will. Their 403 covers both an unknown key and a valid key
+    without access, which cannot be told apart from the response, so both report the same way.
+    """
+    api_key = (credentials.get(src_constants.MOTOR_STATE_CREDENTIALS_API_KEY) or "").strip()
+    if not api_key:
+        return (
+            "A Motor State API key is required. It comes with your subscription approval "
+            "email, alongside the FTP login -- if you only received FTP credentials, ask "
+            "pgpsupport@motorstate.com to issue a key.",
+            CONNECTION_ERROR_MISSING_FIELDS,
+        )
+    try:
+        client = motorstate_order_client.MotorStateOrderClient(credentials={"api_key": api_key})
+    except ValueError as e:
+        return str(e), CONNECTION_ERROR_INVALID_INPUT
+    try:
+        client.ping()
+    except motorstate_exceptions.MotorStatePermissionError:
+        return (
+            "Motor State rejected this API key. It is separate from your FTP feed login -- "
+            "check it against the key in your subscription approval email.",
+            CONNECTION_ERROR_INVALID_CREDENTIALS,
+        )
+    except motorstate_exceptions.MotorStateAPIConnectionError as e:
+        return "Could not reach Motor State: {}".format(str(e)), CONNECTION_ERROR_CONNECTION_FAILED
+    except motorstate_exceptions.MotorStateAPIException as e:
+        return (
+            getattr(e, "message", "") or "Motor State rejected the connection check.",
+            CONNECTION_ERROR_CONNECTION_FAILED,
+        )
+    return None, None
+
+
 _ORDER_CONNECTION_VALIDATORS: typing.Dict[int, typing.Callable[[typing.Dict[str, typing.Any]], _ValidatorResult]] = {
     src_enums.BrandProviderKind.TURN_14.value: _validate_turn14_order_connection,
     src_enums.BrandProviderKind.KEYSTONE.value: _validate_keystone_order_connection,
@@ -1189,6 +1230,7 @@ _ORDER_CONNECTION_VALIDATORS: typing.Dict[int, typing.Callable[[typing.Dict[str,
     src_enums.BrandProviderKind.ROUGH_COUNTRY.value: _validate_rough_country_order_connection,
     src_enums.BrandProviderKind.NTW.value: _validate_ntw_order_connection,
     src_enums.BrandProviderKind.ALLPRO_DISTRIBUTING.value: _validate_allpro_order_connection,
+    src_enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING.value: _validate_motorstate_order_connection,
 }
 
 
