@@ -282,6 +282,30 @@ def _primary_company_provider() -> typing.Optional[src_models.CompanyProviders]:
     return base.filter(primary=True).first() or base.first()
 
 
+def _content_company_provider() -> typing.Optional[src_models.CompanyProviders]:
+    """
+    The connection whose credentials reach the *content* feed -- preferring the primary, but
+    falling back to any active connection that carries content credentials.
+
+    Deliberately not just the primary. Motor State provisions the enriched columns on a
+    SEPARATE account (see :func:`_content_client_for`), and there is no reason that account
+    belongs to whichever dealer happens to be primary: in production the content credentials
+    sat on one connection while the dealer who owns the catalog FTP account sat on another, so
+    tying content to the primary silently dropped the image/category/long-description overlay
+    the moment the primary was corrected. Content is a distributor-wide overlay, so reading it
+    from whichever connection can actually reach it is both safe and what the old behaviour
+    did by accident.
+    """
+    base = _active_company_providers_queryset()
+    primary = base.filter(primary=True).first()
+    if primary is not None and _content_client_for(primary) is not None:
+        return primary
+    for cp in base:
+        if _content_client_for(cp) is not None:
+            return cp
+    return primary or base.first()
+
+
 def _client_for(
     company_provider: src_models.CompanyProviders,
     local_feed_path: typing.Optional[str] = None,
@@ -887,7 +911,7 @@ def sync_motorstate_content_from_feed(
     cp = (
         _active_company_providers_queryset().filter(id=company_provider_id).first()
         if company_provider_id is not None
-        else _primary_company_provider()
+        else _content_company_provider()
     )
     if not cp:
         logger.info("{} No active Motor State CompanyProviders. Skipping content.".format(_LOG_PREFIX))

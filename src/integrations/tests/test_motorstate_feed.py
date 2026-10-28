@@ -197,3 +197,82 @@ class DimensionBoundsTests(SimpleTestCase):
         self.assertEqual(str(motorstate_feed._to_dimension("24.50000")), "24.50000")
         self.assertEqual(str(motorstate_feed._to_dimension("9999999.99999")), "9999999.99999")
         self.assertIsNone(motorstate_feed._to_dimension(""))
+
+
+class ContentConnectionSelectionTests(SimpleTestCase):
+    """
+    Which connection the enriched-content overlay is read from.
+
+    Motor State provisions image / category / long-description on a SEPARATE account, so the
+    connection carrying content credentials is not necessarily the primary one. Production had
+    exactly that split -- the dealer who owns the catalog FTP account on one connection, the
+    content credentials on another -- and tying content to the primary silently dropped the
+    overlay the moment the primary was corrected to the right dealer.
+
+    These exercise the resolver against fake connections rather than the DB, so they stay in
+    this module's no-database style.
+    """
+    databases = []
+
+    class _CP:
+        def __init__(self, cp_id, primary, content):
+            self.id = cp_id
+            self.primary = primary
+            # credentials are namespaced -- get_feed_credentials reads credentials["feed"]
+            feed = {"ftp_user": "u", "ftp_password": "p"}
+            if content:
+                feed["content_ftp_user"] = "cu"
+                feed["content_ftp_password"] = "cp"
+            self.credentials = {"feed": feed}
+            self.company_id = cp_id
+
+    class _QS(list):
+        def filter(self, **kw):
+            return ContentConnectionSelectionTests._QS(
+                [c for c in self if all(getattr(c, k) == v for k, v in kw.items())]
+            )
+
+        def first(self):
+            return self[0] if self else None
+
+    def _patch(self, connections):
+        qs = self._QS(connections)
+        original = motorstate_feed._active_company_providers_queryset
+        motorstate_feed._active_company_providers_queryset = lambda: qs
+        self.addCleanup(
+            setattr, motorstate_feed, "_active_company_providers_queryset", original
+        )
+
+    def test_content_falls_back_to_whichever_connection_has_the_credentials(self):
+        primary = self._CP(132, primary=True, content=False)
+        other = self._CP(155, primary=False, content=True)
+        self._patch([other, primary])
+        self.assertEqual(motorstate_feed._primary_company_provider().id, 132)
+        self.assertEqual(motorstate_feed._content_company_provider().id, 155)
+
+    def test_the_primary_still_wins_when_it_carries_content_credentials(self):
+        primary = self._CP(132, primary=True, content=True)
+        other = self._CP(155, primary=False, content=True)
+        self._patch([other, primary])
+        self.assertEqual(motorstate_feed._content_company_provider().id, 132)
+
+    def test_catalog_and_content_can_be_different_connections(self):
+        """The whole point: the catalog dealer and the content account are independent."""
+        self._patch([self._CP(132, primary=True, content=False),
+                     self._CP(155, primary=False, content=True)])
+        self.assertNotEqual(
+            motorstate_feed._primary_company_provider().id,
+            motorstate_feed._content_company_provider().id,
+        )
+
+    def test_no_content_credentials_anywhere_returns_the_primary_so_the_caller_skips(self):
+        self._patch([self._CP(132, primary=True, content=False),
+                     self._CP(155, primary=False, content=False)])
+        cp = motorstate_feed._content_company_provider()
+        self.assertEqual(cp.id, 132)
+        # _content_client_for returns None for it, which is the caller's documented skip path.
+        self.assertIsNone(motorstate_feed._content_client_for(cp))
+
+    def test_no_active_connections_at_all_is_none_not_an_error(self):
+        self._patch([])
+        self.assertIsNone(motorstate_feed._content_company_provider())
