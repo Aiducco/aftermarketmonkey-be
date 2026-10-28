@@ -238,6 +238,18 @@ ATD_ORDERS_USE_SANDBOX = os.environ.get("ATD_ORDERS_USE_SANDBOX", "").strip().lo
     "1", "true", "yes",
 )
 
+# AllPro's "Fulfillment Master" API -- stock check, ordering, cancellation, tracking and billing
+# (see src.integrations.clients.allpro.order_client). Separate from the FTP catalog feed above in
+# host, protocol AND credentials: FM issues its own per-dealer account.
+#
+# Defaults to PRODUCTION so a dealer arriving with real credentials is validated against the host
+# those credentials belong to. Set ALLPRO_FM_USE_SANDBOX=true to point at
+# allpro-sandbox.myshipzone.com instead, or ALLPRO_FM_BASE_URL to override the host outright.
+ALLPRO_FM_BASE_URL = os.environ.get("ALLPRO_FM_BASE_URL", "")
+ALLPRO_FM_USE_SANDBOX = os.environ.get("ALLPRO_FM_USE_SANDBOX", "").strip().lower() in (
+    "1", "true", "yes",
+)
+
 # Helmet House price/stock feed (see src.integrations.clients.helmet_house). Plain FTP, port 21 --
 # their server offers no TLS at all, so this cannot be upgraded to FTPS like Keystone's. Host and
 # port are fixed here rather than collected per connection: dealers are given only a username and

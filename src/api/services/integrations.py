@@ -17,6 +17,7 @@ from src.api.services import billing as billing_services
 from src.integrations import credentials as credentials_helper
 from src.integrations.clients.allpro import client as allpro_client
 from src.integrations.clients.allpro import exceptions as allpro_exceptions
+from src.integrations.clients.allpro import order_client as allpro_order_client
 from src.integrations.clients.atd import client as atd_client
 from src.integrations.clients.atd import exceptions as atd_exceptions
 from src.integrations.clients.atech import client as atech_client
@@ -1116,6 +1117,68 @@ def _validate_ntw_order_connection(credentials: typing.Dict[str, typing.Any]) ->
     return None, None
 
 
+def _validate_allpro_order_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
+    """
+    Checks the dealer's Fulfillment Master account by using it -- one Get Tracking call for a PO
+    number that cannot exist.
+
+    Get Tracking rather than Stock Check, deliberately, and the choice is load-bearing:
+
+      * Stock Check is the obvious candidate and the wrong one. It authenticates the dealer
+        and THEN opens a session to AllPro's own upstream inventory system; when AllPro has not
+        provisioned that mapping it fails with "Invalid OW username/password" no matter what is
+        sent -- measured against their sandbox with a request containing no part at all.
+        Validating on it would reject correct credentials and tell the dealer to retype them.
+      * Billing cannot validate anything: it returns an empty array for a wrong password just as
+        readily as for a right one (also measured), so it fails open.
+      * Get Tracking authenticates cleanly in both directions -- bad credentials return
+        <error msg="Invalid username/password"/>, good ones return a success envelope with no
+        orders -- and reads nothing, changes nothing.
+
+    These credentials are NOT the FTP feed login; AllPro issues a separate Fulfillment Master
+    account, and a dealer reusing the feed's values is the likeliest failure, so the message
+    says so.
+    """
+    username = (credentials.get("username") or "").strip()
+    password = (credentials.get("password") or "").strip()
+    if not username or not password:
+        return (
+            "An AllPro Fulfillment Master username and password are required. These are issued "
+            "separately from the FTP feed login -- ask your AllPro rep for API credentials.",
+            CONNECTION_ERROR_MISSING_FIELDS,
+        )
+
+    try:
+        client = allpro_order_client.AllProFulfillmentClient(
+            credentials={"username": username, "password": password}
+        )
+    except ValueError as e:
+        return str(e), CONNECTION_ERROR_INVALID_INPUT
+
+    try:
+        client.get_tracking(["AMS-CONNECTION-TEST"])
+    except allpro_exceptions.AllProAPIAuthError:
+        return (
+            "AllPro rejected this username and password. Note these are the Fulfillment Master "
+            "API credentials, which are issued separately from your FTP feed login and are not "
+            "the same values.",
+            CONNECTION_ERROR_INVALID_CREDENTIALS,
+        )
+    except allpro_exceptions.AllProUpstreamNotProvisionedError as e:
+        # Should not reach here from Get Tracking, but if AllPro ever routes it through the same
+        # upstream, say what it actually is rather than blaming the dealer's typing.
+        return (
+            "AllPro accepted these credentials but their ordering system is not finished "
+            "connecting this account. Ask AllPro to provision it. ({})".format(str(e)),
+            CONNECTION_ERROR_PERMISSION_DENIED,
+        )
+    except allpro_exceptions.AllProAPIConnectionError as e:
+        return "Could not reach AllPro's API: {}".format(str(e)), CONNECTION_ERROR_CONNECTION_FAILED
+    except allpro_exceptions.AllProException as e:
+        return str(e), CONNECTION_ERROR_CONNECTION_FAILED
+    return None, None
+
+
 _ORDER_CONNECTION_VALIDATORS: typing.Dict[int, typing.Callable[[typing.Dict[str, typing.Any]], _ValidatorResult]] = {
     src_enums.BrandProviderKind.TURN_14.value: _validate_turn14_order_connection,
     src_enums.BrandProviderKind.KEYSTONE.value: _validate_keystone_order_connection,
@@ -1125,6 +1188,7 @@ _ORDER_CONNECTION_VALIDATORS: typing.Dict[int, typing.Callable[[typing.Dict[str,
     src_enums.BrandProviderKind.WHEELPROS.value: _validate_wheelpros_order_connection,
     src_enums.BrandProviderKind.ROUGH_COUNTRY.value: _validate_rough_country_order_connection,
     src_enums.BrandProviderKind.NTW.value: _validate_ntw_order_connection,
+    src_enums.BrandProviderKind.ALLPRO_DISTRIBUTING.value: _validate_allpro_order_connection,
 }
 
 

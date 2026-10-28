@@ -58,6 +58,7 @@ def get_provider(
 # Self-register each implemented provider. Imported here (rather than an AppConfig.ready()
 # hook, which this project doesn't use) so registration happens as soon as anything imports
 # this module.
+from src.integrations.live_inventory import allpro as _allpro  # noqa: E402
 from src.integrations.live_inventory import atd as _atd  # noqa: E402
 from src.integrations.live_inventory import keystone as _keystone  # noqa: E402
 from src.integrations.live_inventory import meyer as _meyer  # noqa: E402
@@ -79,3 +80,6 @@ register(src_enums.BrandProviderKind.NTW.value, _ntw.NtwLiveInventoryProvider)
 # live_inventory/atd.py on why the availability endpoint's response differs from the
 # catalog sweep's.
 register(src_enums.BrandProviderKind.ATD.value, _atd.ATDLiveInventoryProvider)
+# AllPro reads its FM order credentials (not the FTP feed's) -- same split as NTW, since the
+# live stock check is part of their ordering service.
+register(src_enums.BrandProviderKind.ALLPRO_DISTRIBUTING.value, _allpro.AllProLiveInventoryProvider)

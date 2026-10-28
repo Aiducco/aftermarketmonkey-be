@@ -173,6 +173,7 @@ def get_adapter_unavailable_reason(
 # Self-register each implemented adapter. Imported here (rather than via a Django
 # AppConfig.ready() hook, which this project doesn't use) so registration happens as soon as
 # anything imports this module.
+from src.integrations.orders import allpro as _allpro  # noqa: E402
 from src.integrations.orders import atd as _atd  # noqa: E402
 from src.integrations.orders import keystone as _keystone  # noqa: E402
 from src.integrations.orders import meyer as _meyer  # noqa: E402
@@ -200,3 +201,6 @@ register(src_enums.BrandProviderKind.NTW.value, _ntw.NtwOrderAdapter)
 # credentials, separate entitlement, so a connected feed does not imply ordering
 # works. See orders/atd.py.
 register(src_enums.BrandProviderKind.ATD.value, _atd.ATDOrderAdapter)
+# AllPro's Fulfillment Master API. Credentials are its own, NOT the FTP feed's. Cancel is
+# genuinely supported here; freight is not quotable before the order. See orders/allpro.py.
+register(src_enums.BrandProviderKind.ALLPRO_DISTRIBUTING.value, _allpro.AllProOrderAdapter)

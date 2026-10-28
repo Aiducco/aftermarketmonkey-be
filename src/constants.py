@@ -2524,6 +2524,14 @@ PROVIDER_CATALOG = [
         "icon_url": "https://api.aftermarketscout.com/uploads/allpro_logo.png",
         "category": "Distributors",
         "connection_required_fields": ["username", "password"],
+        # API-channel ordering, via AllPro's "Fulfillment Master" API (stock check, ordersend,
+        # cancel, tracking, billing -- see src.integrations.orders.allpro).
+        #
+        # Its own username/password on purpose: AllPro issues a SEPARATE Fulfillment Master
+        # account, and the FTP feed login above is rejected by that API outright (measured --
+        # "Invalid username/password"). This is Turn 14's arrangement, not ATD's, where one
+        # credential set covers everything.
+        "order_connection_required_fields": ["username", "password"],
         # Email-channel ordering — see the matching note on Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
         "email_order_connection_optional_fields": ["account_number", "cc_email", "reply_to_email"],
