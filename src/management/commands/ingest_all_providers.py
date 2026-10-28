@@ -67,9 +67,11 @@ from src.integrations.services import (
     tirerack,
     tristate,
     vossen,
+    randys,
     wheelpros,
     wheelpros_products,
     wps,
+    xdp,
 )
 from src.search.meilisearch_client import is_configured, reindex_all_master_parts_zero_downtime
 
@@ -167,6 +169,8 @@ class Command(BaseCommand):
             "ingest_all_providers_tristate",
             "ingest_all_providers_allpro",
             "ingest_all_providers_thoroughbred",
+            "ingest_all_providers_xdp",
+            "ingest_all_providers_randys",
             "ingest_all_providers_sb",
             "ingest_all_providers_sync_all_master_parts",
             "ingest_all_providers_enqueue_pricing_jobs",
@@ -214,6 +218,8 @@ class Command(BaseCommand):
                 ("sb",           self._run_sb),
                 ("atd",          self._run_atd),
                 ("thoroughbred", self._run_thoroughbred),
+                ("xdp",          self._run_xdp),
+                ("randys",       self._run_randys),
                 ("ntw",          self._run_ntw),
             ]
             for name, run_fn in phase1_providers:
@@ -493,6 +499,50 @@ class Command(BaseCommand):
             self._ingest_log("Thoroughbred: fetching public HawkSearch catalog + unmapped brand sync")
             thoroughbred.fetch_and_save_thoroughbred_catalog()
             thoroughbred.sync_unmapped_thoroughbred_brands_to_brands()
+
+    def _run_xdp(self) -> None:
+        with self._audited_step(
+            "ingest_all_providers_xdp",
+            "XDP public SearchSpring catalog sweep + Miva weight enrichment + house-brand "
+            "dealer feed + unmapped brand sync complete (derived in sync_all).",
+            continue_on_error=True,
+        ):
+            # The catalog needs no credentials -- it is swept from the public SearchSpring index
+            # brand by brand (the index enforces a 10,000-result window, so brand is the
+            # partition key; see services/xdp.py:fetch_and_save_xdp_catalog).
+            self._ingest_log("XDP: sweeping public SearchSpring catalog")
+            xdp.fetch_and_save_xdp_catalog()
+            self._ingest_log("XDP: enriching weights from Miva json.mvc")
+            xdp.enrich_xdp_catalog_from_json_mvc()
+            # Only XDP's own brand has a real dealer feed, and only the primary connection's
+            # copy fills the XDP-wide columns. No connection, or no feed_url on it, is a logged
+            # no-op -- the public catalog above is unaffected either way, and those parts simply
+            # get markup-derived cost like every resold brand.
+            self._ingest_log("XDP: reading primary connection's house-brand dealer feed")
+            xdp.fetch_and_save_xdp_dealer_feed()
+            self._ingest_log("XDP: unmapped brand sync")
+            xdp.sync_unmapped_xdp_brands_to_brands()
+
+    def _run_randys(self) -> None:
+        with self._audited_step(
+            "ingest_all_providers_randys",
+            "RANDYS public Convermax catalogue sweep + Shopify enrichment + inventory push + "
+            "unmapped brand sync complete (derived in sync_all).",
+            continue_on_error=True,
+        ):
+            # Catalogue and fitment need no credentials -- RANDYS' Convermax index answers
+            # without auth and its item count matches their Shopify catalogue exactly, so this
+            # runs whether or not anyone has connected RANDYS.
+            self._ingest_log("RANDYS: sweeping public Convermax catalogue")
+            randys.fetch_and_save_randys_catalog()
+            self._ingest_log("RANDYS: enriching descriptions/images/weights from Shopify")
+            randys.enrich_randys_catalog_from_shopify()
+            # Stock is the one part that needs a connection. No connection, or no file delivered
+            # yet, is a logged no-op -- the catalogue above is unaffected either way.
+            self._ingest_log("RANDYS: applying newest inventory push")
+            randys.apply_randys_inventory_file()
+            self._ingest_log("RANDYS: unmapped brand sync")
+            randys.sync_unmapped_randys_brands_to_brands()
 
     def _run_wheelpros(self) -> None:
         with self._audited_step(

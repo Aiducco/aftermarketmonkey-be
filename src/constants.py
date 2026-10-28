@@ -149,6 +149,12 @@ def dlg_b2b_search_keywords(dlg_brand_name: typing.Optional[str], part_number: s
 # CompanyProviders.credentials JSON key for Rough Country: jobber Excel URL (required per connection).
 ROUGH_COUNTRY_CREDENTIALS_FEED_URL = "feed_url"
 
+# XDP connect-flow credential keys. "markup" is the cost basis for every brand XDP resells;
+# "feed_url" is the optional per-dealer CSV covering XDP's own brand (real COST + numeric stock).
+# See integrations/services/xdp.py and _validate_xdp_connection in api/services/integrations.py.
+XDP_CREDENTIALS_MARKUP = "markup"
+XDP_CREDENTIALS_FEED_URL = "feed_url"
+
 # Rough Country ORDER credentials (EDI over Alluvia-hosted FTP) -- a separate namespace from the
 # jobber feed above, living on CompanyProviderOrderAccount like every other distributor's order
 # credentials. Alluvia issues each shop its own FTP login AND its own ISA/GS trading-partner id,
@@ -233,6 +239,45 @@ SB_INVENTORY_FORWARD_TO_EMAIL = "support@aftermarketscout.com"
 SB_INVENTORY_REQUEST_EMAIL = "sales@sbfilters.com"
 SB_INVENTORY_REQUEST_SUBJECT = "Live Inventory"
 # Same shared relay every relay-provisioned provider uses (see DLG above and the Crown client).
+# RANDYS Worldwide -- public Convermax search index (catalog + fitment of record).
+#
+# Hard-won endpoint facts, all verified against the live index on 2026-10-28. Each of the first
+# three fails by returning a plausible HTTP 200, so none of them is safe to "simplify":
+#   * ``page`` is 0-BASED. Looping 1..N silently drops the first page -- measured at 5,000 of
+#     17,314 products lost, with no error anywhere.
+#   * the text parameter is ``query``, NOT ``q``. ``q`` is accepted and ignored, returning the
+#     entire unfiltered catalog, which reads downstream as "this search matched everything".
+#   * ``pagesize`` caps at 10,000 AND the offset must stay inside the result set:
+#     pagesize=10000&page=1 is a 400, not a short final page. 5,000 x 4 pages covers the catalog.
+# Facets are indexed and lower-cased: facet.0.field=Year&facet.0.selection=2015&facet.1...
+# ``query`` also wraps matches in <b> tags *inside sku and title*, so the catalog sweep is
+# deliberately facet/paging only -- never query -- and needs no un-highlighting.
+RANDYS_CONVERMAX_BASE_URL = "https://randys-worldwide.myconvermax.com"
+RANDYS_CONVERMAX_SEARCH_PATH = "search.json"
+RANDYS_CONVERMAX_FITMENTS_PATH = "ymm/fitments.json"
+RANDYS_CONVERMAX_PAGE_SIZE = 5000
+RANDYS_CONVERMAX_MAX_PAGE_SIZE = 10000
+# ymm/fitments.json truncates at 1000 rows and honours no offset parameter whatsoever (count,
+# pageSize, limit, skip, from, page and offset were all confirmed ignored). Only "Many Fitments"
+# universals get anywhere near it -- the 15,803 Vehicle Specific parts average 17 rows -- so the
+# cap is recorded rather than worked around. A part that comes back exactly at the cap is logged.
+RANDYS_CONVERMAX_FITMENT_ROW_CAP = 1000
+
+# Shopify storefront, used only to enrich what Convermax does not carry: body_html, the full
+# image list, tags and per-variant grams. 250/page, ~70 pages.
+RANDYS_SHOPIFY_BASE_URL = "https://www.randysworldwide.com"
+RANDYS_SHOPIFY_PRODUCTS_PATH = "products.json"
+RANDYS_SHOPIFY_PAGE_SIZE = 250
+
+# Inventory push. The file name carries a YYMMDDHHMM stamp (Inventory_RWW_2610270310.csv), so the
+# client lists the folder and takes the newest match instead of a fixed name. Columns: Item,Stock
+# -- Item joins to RandysPart.sku exactly (verified: "AK R-J01" is a real catalog sku).
+RANDYS_RELAY_SFTP_HOST = "5.161.121.143"
+RANDYS_RELAY_SFTP_PORT = 22
+RANDYS_RELAY_SFTP_DIRECTORY = "uploads"
+RANDYS_INVENTORY_FILENAME_PREFIX = "Inventory_RWW_"
+RANDYS_INVENTORY_FILENAME_SUFFIX = ".csv"
+
 SB_RELAY_SFTP_HOST = "5.161.121.143"
 SB_RELAY_SFTP_PORT = 22
 SB_RELAY_SFTP_DIRECTORY = "uploads"
@@ -2217,12 +2262,67 @@ PROVIDER_CATALOG = [
             "</ul>"
         ),
     },
-    # XDP removed from the connectable catalog 2026-10-13: it was listed as "no account required"
-    # with no backend ever built -- no client, no fetch command, no data source confirmed. Two
-    # companies (Trident Motorsports, Recon Overland & Off Road) had already connected to it with
-    # nothing behind it. PROVIDER_NAMES/PROVIDER_IMAGE_URLS above still carry an "XDP" entry so
-    # those two existing (non-functional) CompanyProviders rows keep a name/icon to display rather
-    # than rendering blank -- only the catalog entry that offers it for a *new* connection is gone.
+    # XDP was removed from the connectable catalog 2026-10-13 because it was listed as "no account
+    # required" with nothing behind it -- no client, no fetch command, no confirmed data source --
+    # and two companies (Trident Motorsports, Recon Overland & Off Road) had connected to it
+    # anyway. Restored 2026-10-28, now that there is a real backend: see
+    # integrations/services/xdp.py and clients/xdp/client.py.
+    {
+        "kind": enums.BrandProviderKind.XDP,
+        "name": "XDP",
+        "description": (
+            "Access XDP's full catalog, pricing and vehicle fitment with no login — plus real "
+            "dealer cost and stock on XDP's own brand if you have their dealer feed."
+        ),
+        "icon_url": PROVIDER_IMAGE_URLS["XDP"],
+        "category": "Distributors",
+        # Two credentials, and the split is the whole design:
+        #
+        # "markup" is REQUIRED because it is the only cost basis for the ~241 brands XDP resells.
+        # XDP exposes no wholesale number for those anywhere reachable, exactly like Thoroughbred.
+        #
+        # "feed_url" is OPTIONAL and covers XDP's OWN brand only -- a per-dealer CSV with real
+        # COST, MAP and a numeric IN-STOCK (449 parts). It is not needed for catalog coverage:
+        # every one of those parts is already in the public index, matched on both sku and mpn.
+        # What it buys is a real cost and a real quantity instead of a markup estimate. A company
+        # without it simply gets markup-derived cost across the whole catalog, house brand
+        # included -- which is the right answer for a dealer with no XDP wholesale account, not a
+        # degraded one. XdpCompanyPricing.cost_source records which source produced each row.
+        "connection_required_fields": [XDP_CREDENTIALS_MARKUP],
+        "connection_optional_fields": [XDP_CREDENTIALS_FEED_URL],
+        # XDP has no order API, so Email is the only ordering channel -- same shape as
+        # AllPro/Rough Country/Thoroughbred.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["account_number", "cc_email", "reply_to_email"],
+        "integration_time": "Data available immediately — no account or approval needed",
+        "installation_instructions_html": (
+            "<p><strong>XDP</strong> publishes its catalog, prices and vehicle fitment publicly, "
+            "so there's no account needed to get started.</p>"
+            "<p><strong>1. Set your markup</strong></p>"
+            "<p>Enter a <strong>markup percentage</strong> (0-100) off XDP's retail price and "
+            "click <strong>Save</strong>. We compute your cost as "
+            "<em>retail &times; (1 &minus; markup / 100)</em> for every brand XDP resells. "
+            "Catalog and fitment sync automatically after that.</p>"
+            "<p><strong>2. Optional: add your XDP dealer feed</strong></p>"
+            "<p>If you buy XDP's own brand wholesale, your rep can give you a dealer feed link "
+            "(it looks like <code>https://www.xtremediesel.com/feeds/&hellip;.csv</code>). Paste "
+            "it into <strong>Dealer feed URL</strong> and we'll use your real cost and real stock "
+            "counts for XDP-brand parts instead of the markup estimate. Everything else keeps "
+            "using your markup.</p>"
+            "<p><strong>Ordering</strong></p>"
+            "<p>XDP has no ordering API, so orders go to your rep as a PDF purchase order by "
+            "email. Enter the purchase-order email your XDP rep gave you, plus an optional "
+            "internal <strong>CC</strong> so your team gets a copy of every order.</p>"
+            "<p><strong>Troubleshooting</strong></p>"
+            "<ul>"
+            "<li><strong>Dealer feed rejected?</strong> The link must start with "
+            "<code>https://www.xtremediesel.com/feeds/</code>. XDP publishes one file per dealer, "
+            "so double-check the exact link your rep sent.</li>"
+            "<li><strong>No dealer feed?</strong> Leave it blank. Your catalog, fitment and "
+            "markup-based pricing all work without it.</li>"
+            "</ul>"
+        ),
+    },
     {
         "kind": enums.BrandProviderKind.ATD,
         "name": "ATD",
@@ -2757,6 +2857,68 @@ PROVIDER_CATALOG = [
             "login and its own application. Repeat these steps for each.</li>"
             "</ul>"
         ),
+    },
+    {
+        "kind": enums.BrandProviderKind.RANDYS_WORLDWIDE,
+        "name": "RANDYS Worldwide",
+        "description": (
+            "RANDYS Worldwide pushes a stock file to AfterMarketScout over SFTP. The product "
+            "catalog and vehicle fitment are loaded automatically -- nothing to configure."
+        ),
+        "icon_url": "https://api.aftermarketscout.com/uploads/randys_logo.png",
+        "category": "Distributors",
+        "connection_required_fields": [],
+        "connection_optional_fields": [],
+        "relay_provisioned": True,
+        "relay_credential_fields": ("sftp_user", "sftp_password"),
+        "integration_time": "Catalog is available immediately; stock within 1 business day",
+        "installation_instructions_html": (
+            "<p><strong>RANDYS Worldwide</strong> is already loaded. Their catalogue &mdash; around "
+            "17,300 parts across Yukon Gear &amp; Axle, Zumbrota Drivetrain, USA Standard Gear, ICON "
+            "Vehicle Dynamics, Carli Suspension and the rest of their house brands &mdash; comes from "
+            "RANDYS' own published product data, together with vehicle fitment, so you get part "
+            "numbers, descriptions, images and year/make/model coverage without doing anything.</p>"
+            "<p>The one thing that has to come from RANDYS directly is <strong>live stock</strong>, "
+            "which they send us as a file. Below are the SFTP details to pass on to them.</p>"
+
+            "<p><strong>1. Send these details to your RANDYS rep</strong></p>"
+            "<ul>"
+            "<li><strong>Host:</strong> <code>5.161.121.143</code></li>"
+            "<li><strong>Port:</strong> 22</li>"
+            "<li><strong>Username:</strong> {{SFTP_USER}}</li>"
+            "<li><strong>Password:</strong> {{SFTP_PASSWORD}}</li>"
+            "<li><strong>Folder:</strong> uploads</li>"
+            "</ul>"
+            "<p>Ask them to drop their standard inventory file into the <strong>uploads</strong> "
+            "folder. They already produce it in the right shape &mdash; a two-column CSV of item "
+            "number and stock, named <code>Inventory_RWW_</code> plus a timestamp. We always read the "
+            "newest file in the folder, so they can keep sending updates to the same place and "
+            "nothing needs renaming or cleaning up.</p>"
+
+            "<p><strong>2. Nothing else to do</strong></p>"
+            "<p>Once the first file lands, stock appears against the RANDYS parts already in your "
+            "catalogue. Until then the parts are visible with no quantity, and this connection shows "
+            "as waiting.</p>"
+
+            "<p><strong>Notes</strong></p>"
+            "<ul>"
+            "<li><strong>Still waiting after a day?</strong> Ask your rep to confirm the file was "
+            "uploaded and that they used the username above. Each dealer has its own folder, so a "
+            "file sent to someone else's login will not show up here.</li>"
+            "<li><strong>Stock looks stale.</strong> Quantities reflect the newest file we have "
+            "received. If RANDYS have stopped sending, the file has stopped arriving on their side "
+            "&mdash; your rep can confirm.</li>"
+            "<li><strong>Prices.</strong> Your dealer cost is not in this file. Catalogue parts carry "
+            "RANDYS' published retail price until your own cost is set up.</li>"
+            "<li><strong>Ordering.</strong> RANDYS have no ordering API, so purchase orders are "
+            "emailed to your rep as a PDF. Add their email below if you want to send orders from "
+            "AfterMarketScout.</li>"
+            "</ul>"
+        ),
+        # Email-channel ordering -- RANDYS have no order API of their own; see the matching note
+        # on Turn 14 above.
+        "email_order_connection_required_fields": ["rep_email"],
+        "email_order_connection_optional_fields": ["account_number", "cc_email", "reply_to_email"],
     },
 ]
 

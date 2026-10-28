@@ -9529,3 +9529,284 @@ class ThoroughbredVehicle(django_db_models.Model):
 
     def __str__(self) -> str:
         return "{} {} {} (vid={})".format(self.year, self.make, self.model, self.vehicle_id)
+
+
+class XdpBrand(django_db_models.Model):
+    """One brand XDP sells, discovered from the SearchSpring index's ``manufacturer_name`` facet
+    (242 values covering 99.97% of the index as of 2026-10-28). The Miva catalog API carries no
+    brand field at all, so SearchSpring is the only source for this -- same situation as
+    ThoroughbredBrand, and likewise a bare name with no AAIA code anywhere in the schema.
+
+    XDP's own house brand is one row here, named "XDP", and is the only brand with a real dealer
+    cost feed behind it (see XdpCompanyPricing.cost_source)."""
+    name = django_db_models.CharField(max_length=255, unique=True)
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "xdp_brands"
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class BrandXdpBrandMapping(django_db_models.Model):
+    brand = django_db_models.ForeignKey(
+        Brands, on_delete=django_db_models.CASCADE, related_name="xdp_brand_mappings"
+    )
+    xdp_brand = django_db_models.ForeignKey(
+        XdpBrand, on_delete=django_db_models.CASCADE, related_name="brand_mappings"
+    )
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "brand_xdp_brand_mapping"
+        unique_together = [["brand", "xdp_brand"]]
+
+
+class XdpPart(django_db_models.Model):
+    """
+    One row per product in XDP's SearchSpring index -- the catalog source of record here, NOT the
+    Miva ``Runtime_ProductList_Load_Query`` dump. That matters: both sources exist and neither is
+    a superset, but SearchSpring is the better spine because it is already flat. XDP's wheel
+    products have size/finish variants, and in SearchSpring the children are their own indexed
+    rows carrying their own sku/mpn/price (1,887 of 1,888 measured on Fuel Off-Road); the Miva
+    dump, by contrast, both carries the non-sellable grouping rows AND is missing some children
+    outright (confirmed: variant code 15315 is absent from it).
+
+    ``code`` is Miva's own product code (SearchSpring ``uid``) and is the natural key: it is
+    present on every indexed row, including variant children, and is what ``provider_external_id``
+    is set to. ``product_id`` is Miva's numeric id (SearchSpring ``product_id``), kept because the
+    Miva side joins on it.
+
+    ``sku`` is XDP's own reseller SKU, usually brand-prefixed (e.g. "MHTD53818901750",
+    "ARX880563"). ``mpn`` is the clean manufacturer part number off the same row ("D53818901750",
+    "880563"). Unlike Thoroughbred -- which has no clean MPN at all and therefore has to use its
+    prefixed sku as MasterPart.part_number -- XDP gives us both, so part_number/sku on MasterPart
+    are set from ``mpn`` and match across providers properly. See
+    master_parts._ingest_xdp_parts_for_mapped_brands.
+
+    ``is_variant_parent`` marks a grouping row (no sku of its own, ``price`` is the minimum
+    variant price). Those are NOT sellable and are deliberately excluded from MasterPart
+    creation; they are stored only so the children-not-separately-indexed backstop has a
+    worklist. 2,879 of 60,539 rows (4.8%) are parents.
+
+    ``quantity`` is XDP-wide stock from the *primary* connection's dealer feed and covers the XDP
+    house brand only -- it is null for every resold brand, because XDP exposes no quantity for
+    those anywhere un-gated. ``in_stock`` (SearchSpring ``quickships``) is the only stock signal
+    that covers the whole catalog, and it is a boolean, not a count. Per-company quantity lives
+    on XdpCompanyPricing.quantity, same split NtwParts/NtwCompanyPricing uses.
+    """
+    brand = django_db_models.ForeignKey(
+        XdpBrand, on_delete=django_db_models.CASCADE, related_name="parts", null=True
+    )
+    code = django_db_models.CharField(max_length=64, unique=True)
+    product_id = django_db_models.CharField(max_length=64, null=True, blank=True, db_index=True)
+    sku = django_db_models.CharField(max_length=255, null=True, blank=True, db_index=True)
+    mpn = django_db_models.CharField(max_length=255, null=True, blank=True, db_index=True)
+    name = django_db_models.CharField(max_length=512, null=True, blank=True)
+    short_desc = django_db_models.TextField(null=True, blank=True)
+    url = django_db_models.TextField(null=True, blank=True)
+    image_url = django_db_models.TextField(null=True, blank=True)
+    # XDP's public retail price. For a variant parent this is the minimum variant price.
+    price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    # MAP from the house-brand dealer feed; null for resold brands.
+    map_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    # SearchSpring "quickships" -- in stock yes/no, the only catalog-wide stock signal.
+    in_stock = django_db_models.BooleanField(null=True, blank=True)
+    limited_stock = django_db_models.BooleanField(null=True, blank=True)
+    # Numeric stock, house brand only (primary connection's feed). See class docstring.
+    quantity = django_db_models.IntegerField(null=True, blank=True)
+    # What the feed literally said before clamping: negative means oversold/backordered (48 of
+    # 449 rows, as low as -133). Kept for audit so the clamp in `quantity` stays explainable.
+    quantity_raw = django_db_models.IntegerField(null=True, blank=True)
+    weight = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    width = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    length = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    height = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    application = django_db_models.TextField(null=True, blank=True)
+    product_type = django_db_models.CharField(max_length=255, null=True, blank=True)
+    is_variant_parent = django_db_models.BooleanField(default=False)
+    # Raw ">"-delimited fitment paths off SearchSpring's parts_finder_data hierarchy, e.g.
+    # ["2017>Ford>F-250 Super Duty>6.7 V8 DIESEL", ...]. Stored as a list on the part rather than
+    # in a junction table for the same reason ThoroughbredParts.vehicleid is: the fitment sync
+    # reads it directly, and the junction form would be ~1.5M narrow rows for no query benefit
+    # (Postgres is not the YMM query layer -- Meilisearch is).
+    #
+    # Written by the standalone tree walk, NOT by the catalog fetch -- see
+    # xdp.fetch_and_save_xdp_fitment_paths. Wildcard "All" nodes are filtered out at the client
+    # before they ever reach here; a path whose last segment is "All" would otherwise duplicate
+    # the whole catalog at that level of the tree.
+    fitment_paths = django_db_models.JSONField(null=True, blank=True)
+    raw_data = django_db_models.JSONField(null=True, blank=True)
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "xdp_parts"
+        indexes = [
+            django_db_models.Index(fields=["brand", "mpn"], name="xdp_brand_mpn_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return "{} ({})".format(self.sku or self.name or "?", self.code)
+
+
+class XdpCompanyPricing(django_db_models.Model):
+    """
+    Per-company XDP cost. Two different sources, and ``cost_source`` records which one produced
+    the row -- do not infer it from the numbers:
+
+    - ``feed``: XDP's own house brand, read from that company's own dealer CSV
+      (``credentials["feed_url"]``). This is a real wholesale cost. 449 parts in the measured
+      feed, every one joining to SearchSpring on sku and mpn alike.
+    - ``markup``: every resold brand, computed as ``price * (1 - markup/100)`` from
+      ``credentials["markup"]`` -- XDP publishes no wholesale number for these, so there is
+      nothing to reconcile against. ``markup_percent_applied`` is the audit trail of what
+      percentage produced the figure, same as ThoroughbredCompanyPricing.
+
+    A company that supplies a markup but no feed_url simply gets ``markup`` rows for everything,
+    house brand included. The reverse (feed but no markup) is not possible -- markup is required
+    at connect time.
+
+    ``quantity`` is this company's own feed quantity, already clamped at >= 0 (the feed reports
+    negatives for oversold lines). Null for resold brands.
+    """
+    part = django_db_models.ForeignKey(
+        XdpPart, on_delete=django_db_models.CASCADE, related_name="company_pricing"
+    )
+    company = django_db_models.ForeignKey(
+        Company, on_delete=django_db_models.CASCADE, related_name="xdp_company_pricing"
+    )
+    cost = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    map_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    retail_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    quantity = django_db_models.IntegerField(null=True, blank=True)
+    markup_percent_applied = django_db_models.DecimalField(
+        max_digits=5, decimal_places=2, null=True, blank=True
+    )
+    # "feed" | "markup" -- see class docstring.
+    cost_source = django_db_models.CharField(max_length=16, null=True, blank=True)
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "xdp_company_pricing"
+        unique_together = [["part", "company"]]
+
+
+class RandysBrand(django_db_models.Model):
+    """
+    One row per ``vendor`` string in RANDYS' Convermax index -- 14 of them, and every one is a
+    house or exclusively-distributed brand (Yukon Gear & Axle, Zumbrota Drivetrain, USA Standard
+    Gear, ICON Vehicle Dynamics, Carli Suspension, Van Compass, Dynatrac, BulletProof Hitches,
+    Adams Driveshaft, Cognito, ICON Alloys...).
+
+    ``name`` is the vendor string verbatim, which means near-duplicates are expected rather than
+    a bug to clean up on read: the index carries both "Yukon Gear and Axle" (4,887 parts) and
+    "Yukon Gear & Axle" (11). They are separate vendor values on RANDYS' side, so they get
+    separate rows here and the brand-mapping step is what collapses them onto one ``Brands`` row.
+    """
+    name = django_db_models.CharField(max_length=255, unique=True)
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "randys_brands"
+
+
+class BrandRandysBrandMapping(django_db_models.Model):
+    brand = django_db_models.ForeignKey(
+        Brands, on_delete=django_db_models.CASCADE, related_name="randys_brand_mappings"
+    )
+    randys_brand = django_db_models.ForeignKey(
+        RandysBrand, on_delete=django_db_models.CASCADE, related_name="brand_mappings"
+    )
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "brand_randys_brand_mapping"
+        unique_together = [["brand", "randys_brand"]]
+
+
+class RandysPart(django_db_models.Model):
+    """
+    One row per product in RANDYS' public Convermax index. 17,314 measured, which is exactly the
+    product count their Shopify ``/products.json`` pages out to -- the index is the whole catalog,
+    not a subset, which is why it is the catalog of record here.
+
+    ``code`` is the Shopify product id and is the natural key: unique across all 17,314 rows, and
+    what ``provider_external_id`` is set to. ``sku`` is deliberately NOT unique -- 71 skus are
+    shared by 2+ products (97 rows), so a sku-keyed table would silently drop them. That also
+    means the inventory join (Item -> sku) is one-to-many and applies a quantity to every part
+    carrying that sku; see services.randys.apply_randys_inventory_file.
+
+    ``price`` is RANDYS' published retail. There is no dealer cost anywhere in this integration
+    yet -- their stock push carries quantity only -- so nothing here is a wholesale figure. When
+    per-company cost arrives it lands in its own RandysCompanyPricing table alongside, the same
+    split every other distributor uses.
+
+    ``quantity`` is RANDYS-wide stock from the newest inventory file, not per-company: their
+    warehouse stock is the same number whichever dealer is asking. It is null until the first file
+    lands. ``in_stock`` comes from the index's own coarse stock facet and is the only signal that
+    covers the catalogue before then -- quantities are not published anywhere public (their
+    Storefront API token lacks the inventory scope, confirmed).
+
+    ``fitment_rows`` is the Year/Make/Model/Drive/Differential rows from ymm/fitments.json stored
+    verbatim. They arrive as real tuples, one object per vehicle, so no cross-producting of flat
+    make/model lists is involved at any point. ``Year`` inside them is a RANGE-AND-LIST string
+    ("1992 - 1994, 1996 - 1997, 1999, 2001 - 2003") and must be expanded, never parsed as an int;
+    services.randys.expand_randys_year_field is the only thing that should read it.
+    """
+    brand = django_db_models.ForeignKey(
+        RandysBrand, on_delete=django_db_models.CASCADE, related_name="parts", null=True
+    )
+    code = django_db_models.CharField(max_length=64, unique=True)
+    sku = django_db_models.CharField(max_length=255, null=True, blank=True, db_index=True)
+    title = django_db_models.CharField(max_length=512, null=True, blank=True)
+    handle = django_db_models.CharField(max_length=512, null=True, blank=True)
+    url = django_db_models.TextField(null=True, blank=True)
+    description = django_db_models.TextField(null=True, blank=True)
+    image_url = django_db_models.TextField(null=True, blank=True)
+    image_urls = django_db_models.JSONField(null=True, blank=True)
+    # RANDYS' published retail price -- NOT a dealer cost. See class docstring.
+    price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    compare_at_price = django_db_models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True
+    )
+    # Coarse catalogue-wide stock flag from the index; the only stock signal that exists publicly.
+    in_stock = django_db_models.BooleanField(null=True, blank=True)
+    # RANDYS-wide quantity from the SFTP inventory push. Null until the first file arrives.
+    quantity = django_db_models.IntegerField(null=True, blank=True)
+    inventory_synced_at = django_db_models.DateTimeField(null=True, blank=True)
+    weight_grams = django_db_models.IntegerField(null=True, blank=True)
+    category = django_db_models.CharField(max_length=255, null=True, blank=True)
+    sub_category = django_db_models.CharField(max_length=255, null=True, blank=True)
+    # "Vehicle Specific" | "Universal Fit" | "No Fitment Data" | "Wheel"
+    fitment_type = django_db_models.CharField(max_length=64, null=True, blank=True)
+    # Axle/diff codes the index exposes on 4,512 parts -- RANDYS' own differential taxonomy.
+    differential_codes = django_db_models.JSONField(null=True, blank=True)
+    differential_brands = django_db_models.JSONField(null=True, blank=True)
+    wheel_diameter = django_db_models.CharField(max_length=32, null=True, blank=True)
+    wheel_width = django_db_models.CharField(max_length=32, null=True, blank=True)
+    wheel_offset = django_db_models.CharField(max_length=32, null=True, blank=True)
+    wheel_bolt_pattern = django_db_models.CharField(max_length=64, null=True, blank=True)
+    tags = django_db_models.JSONField(null=True, blank=True)
+    # Verbatim ymm/fitments.json rows. Year is a range-and-list string -- see class docstring.
+    fitment_rows = django_db_models.JSONField(null=True, blank=True)
+    fitment_row_count = django_db_models.IntegerField(null=True, blank=True)
+    # True when fitments.json returned exactly its 1000-row cap, i.e. rows were almost certainly
+    # truncated. The endpoint supports no paging, so this records the loss instead of hiding it.
+    fitment_truncated = django_db_models.BooleanField(default=False)
+    fitment_synced_at = django_db_models.DateTimeField(null=True, blank=True)
+    raw_data = django_db_models.JSONField(null=True, blank=True)
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "randys_parts"
+        indexes = [
+            django_db_models.Index(fields=["brand", "sku"], name="randys_brand_sku_idx"),
+        ]

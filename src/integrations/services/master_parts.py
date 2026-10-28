@@ -22,6 +22,7 @@ from src import enums as src_enums
 from src import models as src_models
 from src.integrations import credentials as credentials_helper
 from src.integrations.services import ntw as ntw_services
+from src.integrations.services import randys as randys_services
 from src.integrations.services import wps as wps_services
 from src.integrations.utils import images as image_utils
 from src.integrations.utils import master_part_matching as mp_matching
@@ -15893,6 +15894,10 @@ def sync_all_master_parts_global() -> None:
     _reclaim_memory()
     sync_derived_from_thoroughbred(skip_pricing=True)
     _reclaim_memory()
+    sync_derived_from_xdp(skip_pricing=True)
+    _reclaim_memory()
+    sync_derived_from_randys(skip_pricing=True)
+    _reclaim_memory()
     sync_derived_from_ntw(skip_pricing=True)
 
     logger.info("{} Completed global master parts sync (catalog + inventory, no pricing).".format(_LOG_PREFIX))
@@ -16694,3 +16699,1221 @@ def sync_derived_from_atd(
             reindex_meilisearch=reindex_meilisearch, provider_label="ATD", continuation=_cont,
         )
     logger.info("{} Completed ATD-only derived sync.".format(_LOG_PREFIX))
+
+
+# ===========================================================================
+# XDP (Xtreme Diesel Performance)
+# ===========================================================================
+def _ingest_xdp_parts_for_mapped_brands(
+    mapped_catalog_brand_ids: typing.Set[int],
+    xdp_provider: src_models.Providers,
+    xdp_brand_to_brand: typing.Dict[int, src_models.Brands],
+    xdp_brand_to_aaia: typing.Dict[int, typing.Optional[str]],
+) -> typing.Tuple[int, int]:
+    """
+    Batch-ingest XdpPart rows for one disjoint set of XdpBrand catalog PKs.
+
+    Unlike Thoroughbred -- which has only a brand-prefixed reseller sku and therefore has to use
+    it as MasterPart.part_number -- XDP's index carries BOTH its own reseller sku
+    ("MHTD53818901750") and the clean manufacturer part number ("D53818901750") on the same row.
+    So ``MasterPart.part_number = MasterPart.sku = XdpPart.mpn``, which matches other providers
+    properly instead of stranding every row behind a prefix. XDP's own sku is kept on XdpPart and
+    surfaced in ProviderPart.product_details, since that is the number you actually order with.
+
+    Rows with no mpn fall back to the reseller sku rather than being dropped. Variant *parents*
+    are excluded entirely: they have no sku, their price is only the minimum variant price, and
+    nobody can buy one.
+
+    XDP has no GTIN/UPC anywhere in either source, so it is in GTIN_LESS_PROVIDER_KINDS and the
+    barcode rung of the matcher can never corroborate an XDP-only candidate.
+    """
+    if not mapped_catalog_brand_ids:
+        return 0, 0
+
+    total_master = 0
+    total_provider = 0
+    batch_num = 0
+    last_id = 0
+
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.XdpPart.objects.filter(
+                brand_id__in=mapped_catalog_brand_ids,
+                is_variant_parent=False,
+                id__gt=last_id,
+            )
+            .order_by("id")
+            .values("id", "brand_id", "code", "sku", "mpn", "name", "image_url", "updated_at")[
+                :BATCH_SIZE_MASTER_PARTS
+            ]
+        )
+        if not batch:
+            break
+
+        last_id = batch[-1]["id"]
+        seen = set()
+        master_parts_list = []
+        xdp_code_to_brand_part = {}
+
+        for row in batch:
+            brand = xdp_brand_to_brand.get(row["brand_id"])
+            if not brand:
+                continue
+            part_number = (row.get("mpn") or "").strip() or (row.get("sku") or "").strip()
+            if not part_number:
+                continue
+            key = (brand.id, part_number)
+            if key not in seen:
+                seen.add(key)
+                master_parts_list.append(
+                    src_models.MasterPart(
+                        brand=brand,
+                        part_number=part_number,
+                        sku=part_number,
+                        description=row.get("name"),
+                        aaia_code=xdp_brand_to_aaia.get(row["brand_id"]),
+                        image_url=image_utils.clean_image_url(row.get("image_url")),
+                    )
+                )
+            xdp_code_to_brand_part[row["code"]] = (brand.id, part_number)
+
+        if not master_parts_list:
+            connection.close()
+            if len(batch) == BATCH_SIZE_MASTER_PARTS:
+                time.sleep(BATCH_DELAY_SECONDS)
+            continue
+
+        pairs = list(seen)
+        # sku bridge first, then exact (brand_id, part_number) -- two separate queries per chunk
+        # (no OR) to stay clear of the PostgreSQL stack depth limit, same as Thoroughbred/Meyer.
+        existing_by_key = {}
+        id_to_mp = {}
+        existing_by_sku: typing.Dict[typing.Tuple[int, str], typing.List[typing.Tuple[int, str]]] = {}
+        existing_by_part = {}
+        for i in range(0, len(pairs), WHEELPROS_LOOKUP_CHUNK):
+            chunk = pairs[i : i + WHEELPROS_LOOKUP_CHUNK]
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number, sku FROM master_parts WHERE (brand_id, sku) IN %s",
+                    (tuple(chunk),),
+                )
+                for mp_id, b_id, p_num, sku_val in cur.fetchall():
+                    if mp_id not in id_to_mp:
+                        mp = src_models.MasterPart()
+                        mp.id = mp_id
+                        mp.brand_id = b_id
+                        mp.part_number = p_num
+                        id_to_mp[mp_id] = mp
+                    if sku_val is not None:
+                        existing_by_sku.setdefault((b_id, (sku_val or "").strip()), []).append(
+                            (mp_id, p_num)
+                        )
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(chunk),),
+                )
+                for mp_id, b_id, p_num in cur.fetchall():
+                    if mp_id not in id_to_mp:
+                        mp = src_models.MasterPart()
+                        mp.id = mp_id
+                        mp.brand_id = b_id
+                        mp.part_number = p_num
+                        id_to_mp[mp_id] = mp
+                    existing_by_part.setdefault((b_id, p_num), mp_id)
+        for (b_id, p_num) in pairs:
+            sku_candidates = existing_by_sku.get((b_id, p_num)) or []
+            sku_match = next((mp_id for mp_id, pn in sku_candidates if pn == p_num), None)
+            if sku_match is None and sku_candidates:
+                sku_match = sku_candidates[0][0]
+            existing_by_key[(b_id, p_num)] = sku_match or existing_by_part.get((b_id, p_num))
+
+        mp_matching.extend_with_normalized_matches(
+            existing_by_key,
+            pairs,
+            {(mp.brand_id, mp.part_number): mp.gtin for mp in master_parts_list},
+            provider_id=xdp_provider.id,
+            provider_kind=src_enums.BrandProviderKind.XDP.value,
+            sku_by_key={(mp.brand_id, mp.part_number): mp.sku for mp in master_parts_list},
+            external_id_by_key={v: k for k, v in xdp_code_to_brand_part.items()},
+        )
+
+        new_parts = [
+            mp for mp in master_parts_list
+            if existing_by_key.get((mp.brand_id, mp.part_number)) is None
+        ]
+        existing_keys = [k for k in pairs if existing_by_key.get(k) is not None]
+
+        # Insert-only for new parts: an existing matched row's sku/description/image_url is never
+        # overwritten (sku is the cross-provider matching key, set once at creation).
+        if new_parts:
+            new_parts = _dedupe_master_parts_for_upsert(
+                new_parts, context="XDP new_parts batch={}".format(batch_num)
+            )
+            pgbulk.upsert(
+                src_models.MasterPart,
+                new_parts,
+                unique_fields=["brand", "part_number"],
+                update_fields=[],
+            )
+            total_master += len(new_parts)
+
+        if existing_keys:
+            key_to_mp = {(mp.brand_id, mp.part_number): mp for mp in master_parts_list}
+            for i in range(0, len(existing_keys), WHEELPROS_LOOKUP_CHUNK):
+                chunk_keys = existing_keys[i : i + WHEELPROS_LOOKUP_CHUNK]
+                values = [(existing_by_key[k], key_to_mp[k].aaia_code) for k in chunk_keys]
+                placeholders = ", ".join(["(%s::bigint, %s)"] * len(values))
+                params = [x for row_vals in values for x in row_vals]
+                with connection.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE master_parts mp SET aaia_code = v.aaia_code
+                        FROM (VALUES {}) AS v(id, aaia_code)
+                        WHERE mp.id = v.id
+                        """.format(placeholders),
+                        params,
+                    )
+
+        brand_part_to_master = {}
+        for (b_id, p_num), mp_id in existing_by_key.items():
+            if mp_id is None:
+                continue
+            if mp_id in id_to_mp:
+                brand_part_to_master[(b_id, p_num)] = id_to_mp[mp_id]
+            else:
+                mp = src_models.MasterPart()
+                mp.id = mp_id
+                mp.brand_id = b_id
+                brand_part_to_master[(b_id, p_num)] = mp
+        new_pairs = [k for k in pairs if k not in brand_part_to_master]
+        if new_pairs:
+            for i in range(0, len(new_pairs), WHEELPROS_LOOKUP_CHUNK):
+                chunk = new_pairs[i : i + WHEELPROS_LOOKUP_CHUNK]
+                with connection.cursor() as cur:
+                    cur.execute(
+                        "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                        (tuple(chunk),),
+                    )
+                    for mp_id, b_id, p_num in cur.fetchall():
+                        mp = src_models.MasterPart()
+                        mp.id = mp_id
+                        mp.brand_id = b_id
+                        brand_part_to_master[(b_id, p_num)] = mp
+
+        provider_parts_by_key = {}
+        for row in batch:
+            brand = xdp_brand_to_brand.get(row["brand_id"])
+            if not brand:
+                continue
+            part_number = (row.get("mpn") or "").strip() or (row.get("sku") or "").strip()
+            if not part_number:
+                continue
+            master_part = brand_part_to_master.get((brand.id, part_number))
+            if not master_part:
+                continue
+            pp_key = (master_part.id, xdp_provider.id)
+            provider_parts_by_key[pp_key] = src_models.ProviderPart(
+                master_part=master_part,
+                provider=xdp_provider,
+                provider_external_id=row["code"],
+                distributor_refreshed_at=row.get("updated_at"),
+            )
+
+        provider_parts = list(provider_parts_by_key.values())
+        if provider_parts:
+            pgbulk.upsert(
+                src_models.ProviderPart,
+                provider_parts,
+                unique_fields=["master_part", "provider"],
+                update_fields=_PROVIDER_PART_SYNC_UPDATE_FIELDS,
+            )
+            total_provider += len(provider_parts)
+
+        logger.info("{} XDP batch {}: {} items -> {} master, {} provider (last_id={})".format(
+            _LOG_PREFIX, batch_num, len(batch), len(master_parts_list), len(provider_parts), last_id
+        ))
+        connection.close()
+        if len(batch) == BATCH_SIZE_MASTER_PARTS:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    return total_master, total_provider
+
+
+def sync_master_parts_from_xdp() -> None:
+    """Create/update MasterPart and ProviderPart from XdpPart. Only rows whose XdpBrand has a
+    BrandXdpBrandMapping are included. See _ingest_xdp_parts_for_mapped_brands for why
+    part_number comes from mpn rather than XDP's own sku."""
+    logger.info("{} Syncing master parts from XDP (batched, mpn as part_number).".format(_LOG_PREFIX))
+
+    xdp_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.XDP.value,
+    ).first()
+    if not xdp_provider:
+        logger.info("{} No XDP provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandXdpBrandMapping.objects.select_related("brand", "xdp_brand")
+    )
+    xdp_brand_to_brand = {m.xdp_brand_id: m.brand for m in mappings}
+    xdp_brand_to_aaia = {
+        m.xdp_brand_id: (m.brand.aaia_code if m.brand else None) for m in mappings
+    }
+    if not xdp_brand_to_brand:
+        logger.info("{} No BrandXdpBrandMapping found. Nothing to sync.".format(_LOG_PREFIX))
+        return
+
+    chunks = _partition_mapped_brands_for_parallel_ingest(mappings, MASTER_PARTS_SYNC_MAX_WORKERS)
+    total_master, total_provider = _run_parallel_master_parts_ingest(
+        chunks,
+        mappings,
+        "xdp_brand",
+        lambda cids: _ingest_xdp_parts_for_mapped_brands(
+            cids, xdp_provider, xdp_brand_to_brand, xdp_brand_to_aaia,
+        ),
+    )
+    logger.info("{} Synced {} master parts and {} provider parts from XDP total.".format(
+        _LOG_PREFIX, total_master, total_provider
+    ))
+
+
+def _xdp_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
+    """product_details for an XdpPart row. ``XDP SKU`` is deliberately surfaced: MasterPart's
+    part_number is the clean mpn, but XDP's own prefixed sku is the number an order has to
+    quote."""
+    return [
+        {"key": "xdp_sku", "label": "XDP SKU", "value": row.get("sku") or None},
+        {"key": "url", "label": "URL", "value": row.get("url") or None},
+        {"key": "short_desc", "label": "Summary", "value": row.get("short_desc") or None},
+        {"key": "application", "label": "Application", "value": row.get("application") or None},
+        {"key": "product_type", "label": "Product Type", "value": row.get("product_type") or None},
+    ]
+
+
+def _xdp_inventory_warehouse_availability(row: typing.Dict) -> typing.Dict[str, typing.Any]:
+    """
+    XDP-wide stock for one part. ``quantity`` is a real number ONLY for the house brand (it comes
+    from the dealer CSV); for every resold brand XDP exposes no count anywhere un-gated, so the
+    honest answer is the boolean ``in_stock`` and a null quantity -- which is why both are kept
+    here rather than collapsing them into one figure.
+
+    ``quantity_raw`` preserves the feed's negative values (oversold/backordered, as low as -133)
+    that ``quantity`` clamps to 0.
+    """
+    return {
+        "XDP": row.get("quantity"),
+        "in_stock": row.get("in_stock"),
+        "limited_stock": row.get("limited_stock"),
+        "quantity_raw": row.get("quantity_raw"),
+    }
+
+
+def sync_provider_inventory_from_xdp() -> None:
+    """
+    Sync ProviderPartInventory from XdpPart -- shared, XDP-wide stock (no per-warehouse
+    breakdown exists in either source).
+
+    ``warehouse_total_qty`` is 0 whenever no number is known, which is the case for every resold
+    brand. That is NOT the same as "out of stock": read ``warehouse_availability.in_stock`` for
+    the boolean that actually covers the whole catalog. Only the house brand (449 parts) has a
+    real count, and only via the primary connection's dealer feed.
+    """
+    logger.info("{} Syncing provider inventory from XDP.".format(_LOG_PREFIX))
+
+    xdp_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.XDP.value,
+    ).first()
+    if not xdp_provider:
+        logger.info("{} No XDP provider found.".format(_LOG_PREFIX))
+        return
+
+    provider_parts_by_key = {
+        row["provider_external_id"]: src_models.ProviderPart(id=row["id"])
+        for row in src_models.ProviderPart.objects.filter(provider=xdp_provider).values(
+            "id", "provider_external_id"
+        )
+    }
+
+    now = timezone.now()
+    total_upserted = 0
+    batch_num = 0
+    last_id = 0
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.XdpPart.objects.filter(id__gt=last_id, is_variant_parent=False)
+            .order_by("id")
+            .values(
+                "id", "code", "quantity", "quantity_raw", "in_stock", "limited_stock",
+                "sku", "url", "short_desc", "application", "product_type",
+            )[:BATCH_SIZE_INVENTORY]
+        )
+        if not batch:
+            break
+        last_id = batch[-1]["id"]
+
+        to_upsert = []
+        for row in batch:
+            provider_part = provider_parts_by_key.get(row["code"])
+            if not provider_part:
+                continue
+            to_upsert.append(
+                src_models.ProviderPartInventory(
+                    provider_part=provider_part,
+                    warehouse_total_qty=row.get("quantity") or 0,
+                    manufacturer_inventory=None,
+                    manufacturer_esd=None,
+                    warehouse_availability=_xdp_inventory_warehouse_availability(row),
+                    last_synced_at=now,
+                    updated_at=now,
+                )
+            )
+        if to_upsert:
+            to_upsert = _dedupe_provider_part_inventory_for_upsert(
+                to_upsert, context="XDP inventory batch={}".format(batch_num)
+            )
+            pgbulk.upsert(
+                src_models.ProviderPartInventory,
+                to_upsert,
+                unique_fields=["provider_part"],
+                update_fields=[
+                    "warehouse_total_qty", "manufacturer_inventory", "manufacturer_esd",
+                    "warehouse_availability", "last_synced_at", "updated_at",
+                ],
+            )
+            total_upserted += len(to_upsert)
+
+        pp_details_to_update = []
+        for row in batch:
+            pp = provider_parts_by_key.get(row["code"])
+            if pp:
+                pp.product_details = _xdp_product_details(row)
+                pp_details_to_update.append(pp)
+        if pp_details_to_update:
+            src_models.ProviderPart.objects.bulk_update(
+                pp_details_to_update, ["product_details"], batch_size=500
+            )
+
+        connection.close()
+        if len(batch) == BATCH_SIZE_INVENTORY:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    logger.info("{} Synced {} XDP inventory records total.".format(_LOG_PREFIX, total_upserted))
+
+
+def sync_provider_pricing_from_xdp_for_company(company_id: int) -> None:
+    """Propagate XdpCompanyPricing into ProviderPartCompanyPricing for one company.
+    XdpCompanyPricing itself is populated by
+    xdp.sync_xdp_company_pricing_for_company_provider, which mixes real dealer-feed cost (house
+    brand) with markup-derived cost (every resold brand) -- see its docstring."""
+    logger.info("{} Syncing XDP provider pricing for company_id={}.".format(_LOG_PREFIX, company_id))
+
+    xdp_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.XDP.value,
+    ).first()
+    if not xdp_provider:
+        logger.info("{} No XDP provider found.".format(_LOG_PREFIX))
+        return
+
+    provider_parts_by_key = {
+        row["provider_external_id"]: src_models.ProviderPart(id=row["id"])
+        for row in src_models.ProviderPart.objects.filter(provider=xdp_provider).values(
+            "id", "provider_external_id"
+        )
+    }
+    if not provider_parts_by_key:
+        logger.info("{} No XDP ProviderPart rows yet. Nothing to price.".format(_LOG_PREFIX))
+        return
+
+    now = timezone.now()
+    sync_started_at = timezone.now()
+    company_provider = src_models.CompanyProviders.objects.filter(
+        company_id=company_id, provider=xdp_provider,
+    ).first()
+    watermark = company_provider.pricing_propagation_watermark if company_provider else None
+
+    total_upserted = 0
+    batch_num = 0
+    last_id = 0
+    while True:
+        batch_num += 1
+        qs = src_models.XdpCompanyPricing.objects.filter(id__gt=last_id, company_id=company_id)
+        if watermark:
+            qs = qs.filter(updated_at__gte=watermark)
+        batch = list(
+            qs.order_by("id").values(
+                "id", "cost", "map_price", "retail_price", "part__code",
+            )[:BATCH_SIZE_PRICING]
+        )
+        if not batch:
+            break
+        last_id = batch[-1]["id"]
+
+        to_upsert = []
+        for row in batch:
+            pp = provider_parts_by_key.get(row["part__code"])
+            if not pp:
+                continue
+            retail = row.get("retail_price")
+            to_upsert.append(
+                src_models.ProviderPartCompanyPricing(
+                    provider_part=pp,
+                    company_id=company_id,
+                    cost=row.get("cost"),
+                    jobber_price=None,
+                    map_price=row.get("map_price"),
+                    msrp=retail,
+                    retail_price=retail,
+                    last_synced_at=now,
+                )
+            )
+        if to_upsert:
+            to_upsert = _dedupe_provider_part_company_pricing_for_upsert(
+                to_upsert, context="XDP pricing company={} batch={}".format(company_id, batch_num)
+            )
+            pgbulk.upsert(
+                src_models.ProviderPartCompanyPricing,
+                to_upsert,
+                unique_fields=["provider_part", "company"],
+                update_fields=["cost", "jobber_price", "map_price", "msrp", "retail_price", "last_synced_at"],
+            )
+            total_upserted += len(to_upsert)
+        connection.close()
+        if len(batch) == BATCH_SIZE_PRICING:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    logger.info("{} Synced {} XDP pricing records for company_id={}.".format(
+        _LOG_PREFIX, total_upserted, company_id,
+    ))
+
+    if company_provider:
+        company_provider.pricing_propagation_watermark = sync_started_at
+        company_provider.save(update_fields=["pricing_propagation_watermark"])
+
+
+def sync_derived_from_xdp(*, skip_master_parts: bool = False, skip_pricing: bool = False) -> None:
+    """Propagate XDP source data into MasterPart, ProviderPart, ProviderPartInventory.
+    Per-company pricing is NOT looped over here -- it is fetched per-company by the standard
+    IntegrationPricingSyncJob dispatch. Fitment is also separate -- see
+    sync_master_part_fitments_from_xdp, a standalone pipeline with its own command.
+
+    Pass ``skip_master_parts=True`` to run inventory only (fast incremental path).
+    Pass ``skip_pricing=True`` to run master parts + inventory (global catalog sync path) --
+    note inventory still runs, matching Keystone/Quadratec/NTW/SB/Motor State. Thoroughbred and
+    AllPro gate inventory behind ``skip_pricing`` instead, which means they never refresh
+    inventory on the nightly ``sync_all_master_parts_global`` path at all; that is a bug in those
+    two, not a convention to copy."""
+    logger.info("{} Starting XDP-only derived sync ({}).".format(
+        _LOG_PREFIX,
+        "inventory only" if skip_master_parts else "parts, inventory",
+    ))
+    if not skip_master_parts:
+        sync_master_parts_from_xdp()
+        connection.close()
+    sync_provider_inventory_from_xdp()
+    connection.close()
+    logger.info("{} Completed XDP-only derived sync.".format(_LOG_PREFIX))
+
+
+def _parse_xdp_fitment_path(path: str) -> typing.Optional[typing.Tuple[int, str, str, str]]:
+    """
+    ``"2017>Ford>F-250 Super Duty>6.7 V8 DIESEL"`` -> ``(2017, "Ford", "F-250 Super Duty",
+    "6.7 V8 DIESEL")``. A 3-segment path (model with no engine breakdown of its own) yields an
+    empty engine. Anything shorter, or with a non-numeric year, is unusable and returns None.
+
+    A path whose last segment is the ``All`` wildcard is rejected here as a second line of
+    defence: those nodes report their parent's own count, so letting one through would claim the
+    whole catalog fits that vehicle.
+    """
+    parts = [p.strip() for p in (path or "").split(">")]
+    if len(parts) < 3:
+        return None
+    if parts[-1] == "All":
+        return None
+    try:
+        year = int(parts[0])
+    except (TypeError, ValueError):
+        return None
+    make, model = parts[1], parts[2]
+    if not make or not model:
+        return None
+    engine = parts[3] if len(parts) > 3 else ""
+    return year, make, model, engine
+
+
+def sync_master_part_fitments_from_xdp() -> None:
+    """
+    Decode XdpPart.fitment_paths into MasterPartFitment, collapsing years into ranges.
+
+    Unlike Thoroughbred -- whose private vehicle-id scheme decodes only to year/make/model and
+    therefore always writes "" for submodel/engine/drive_type -- XDP's paths carry a real engine
+    ("6.7 V8 DIESEL"), so ``engine`` is populated. submodel and drive_type are still "" because
+    the hierarchy has no such level.
+
+    Requires xdp.fetch_and_save_xdp_fitment_paths and sync_master_parts_from_xdp to have run.
+    An unparseable path or a part with no resolvable MasterPart is counted, never raised.
+    """
+    logger.info("{} Starting XDP fitment sync.".format(_LOG_PREFIX))
+
+    xdp_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.XDP.value,
+    ).first()
+    if not xdp_provider:
+        logger.warning("{} No XDP provider found. Skipping.".format(_LOG_PREFIX))
+        return
+
+    master_part_id_by_code: typing.Dict[str, int] = {
+        row["provider_external_id"]: row["master_part_id"]
+        for row in src_models.ProviderPart.objects.filter(provider=xdp_provider).values(
+            "provider_external_id", "master_part_id"
+        )
+    }
+    if not master_part_id_by_code:
+        logger.warning(
+            "{} No XDP ProviderPart rows yet -- run sync_master_parts_from_xdp first. "
+            "Skipping.".format(_LOG_PREFIX)
+        )
+        return
+
+    skipped_unknown_item = 0
+    skipped_bad_path = 0
+    total_upserted = 0
+    batch_num = 0
+    last_id = 0
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.XdpPart.objects.exclude(fitment_paths__isnull=True)
+            .filter(id__gt=last_id)
+            .order_by("id")
+            .values("id", "code", "fitment_paths")[:FITMENT_ITEM_CHUNK_SIZE]
+        )
+        if not batch:
+            break
+        last_id = batch[-1]["id"]
+
+        to_upsert = []
+        for row in batch:
+            master_part_id = master_part_id_by_code.get(row["code"])
+            if not master_part_id:
+                skipped_unknown_item += 1
+                continue
+            years_by_key: typing.Dict[typing.Tuple[str, str, str], typing.Set[int]] = {}
+            for path in (row.get("fitment_paths") or []):
+                decoded = _parse_xdp_fitment_path(path)
+                if not decoded:
+                    skipped_bad_path += 1
+                    continue
+                year, make, model, engine = decoded
+                years_by_key.setdefault((make, model, engine), set()).add(year)
+
+            for (make, model, engine), years in years_by_key.items():
+                for year_start, year_end in _collapse_years_to_ranges(years):
+                    to_upsert.append(
+                        src_models.MasterPartFitment(
+                            master_part_id=master_part_id,
+                            year_start=year_start,
+                            year_end=year_end,
+                            make=make,
+                            model=model,
+                            submodel="",
+                            engine=engine,
+                            drive_type="",
+                            source_provider=xdp_provider,
+                        )
+                    )
+
+        if to_upsert:
+            to_upsert = _dedupe_master_part_fitments_for_upsert(
+                to_upsert, context="XDP fitment batch={}".format(batch_num)
+            )
+            pgbulk.upsert(
+                src_models.MasterPartFitment,
+                to_upsert,
+                unique_fields=[
+                    "master_part", "year_start", "year_end", "make", "model",
+                    "submodel", "engine", "drive_type",
+                ],
+                update_fields=["source_provider"],
+            )
+            total_upserted += len(to_upsert)
+
+        connection.close()
+        if len(batch) == FITMENT_ITEM_CHUNK_SIZE:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    if skipped_unknown_item or skipped_bad_path:
+        logger.warning(
+            "{} XDP fitment sync: skipped {} row(s) for items with no MasterPart, {} "
+            "unparseable path(s).".format(_LOG_PREFIX, skipped_unknown_item, skipped_bad_path)
+        )
+    logger.info(
+        "{} Synced {} XDP MasterPartFitment rows total.".format(_LOG_PREFIX, total_upserted)
+    )
+
+
+def _ingest_randys_parts_for_mapped_brands(
+    mapped_catalog_brand_ids: typing.Set[int],
+    randys_provider: src_models.Providers,
+    randys_brand_to_brand: typing.Dict[int, src_models.Brands],
+    randys_brand_to_aaia: typing.Dict[int, typing.Optional[str]],
+) -> typing.Tuple[int, int]:
+    """
+    Batch-ingest RandysPart rows for one disjoint set of RandysBrand catalog PKs.
+
+    ``MasterPart.part_number = MasterPart.sku = RandysPart.sku``, and unlike XDP that is not a
+    compromise: RANDYS' sku *is* the manufacturer part number for their catalogue. They own or
+    exclusively distribute every brand in it, so "YK D44", "YG GM8.5-373" and "YP KNCLKIT-SAM"
+    are genuine Yukon part numbers, and the resold lines use the maker's own number too (ICON
+    "58661", Carli "CS-FLTB-05"). There is no second, cleaner number to prefer -- neither source
+    carries an MPN field -- so no prefix-stripping is attempted; inventing one would break
+    cross-provider matching rather than help it.
+
+    ``provider_external_id`` is ``RandysPart.code`` (the Shopify product id), NOT the sku: 71 skus
+    are shared by two or more products, so a sku-keyed external id would collide. The code is
+    unique across all 17,314 rows.
+
+    RANDYS are in GTIN_LESS_PROVIDER_KINDS -- no barcode exists on either source -- so the
+    matcher's GTIN rung can never corroborate a RANDYS-only candidate.
+    """
+    if not mapped_catalog_brand_ids:
+        return 0, 0
+
+    total_master = 0
+    total_provider = 0
+    batch_num = 0
+    last_id = 0
+
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.RandysPart.objects.filter(
+                brand_id__in=mapped_catalog_brand_ids,
+                id__gt=last_id,
+            )
+            .order_by("id")
+            .values("id", "brand_id", "code", "sku", "title", "image_url", "updated_at")[
+                :BATCH_SIZE_MASTER_PARTS
+            ]
+        )
+        if not batch:
+            break
+
+        last_id = batch[-1]["id"]
+        seen = set()
+        master_parts_list = []
+        randys_code_to_brand_part = {}
+
+        for row in batch:
+            brand = randys_brand_to_brand.get(row["brand_id"])
+            if not brand:
+                continue
+            part_number = (row.get("sku") or "").strip()
+            if not part_number:
+                continue
+            key = (brand.id, part_number)
+            if key not in seen:
+                seen.add(key)
+                master_parts_list.append(
+                    src_models.MasterPart(
+                        brand=brand,
+                        part_number=part_number,
+                        sku=part_number,
+                        description=row.get("title"),
+                        aaia_code=randys_brand_to_aaia.get(row["brand_id"]),
+                        image_url=image_utils.clean_image_url(row.get("image_url")),
+                    )
+                )
+            randys_code_to_brand_part[row["code"]] = (brand.id, part_number)
+
+        if not master_parts_list:
+            connection.close()
+            if len(batch) == BATCH_SIZE_MASTER_PARTS:
+                time.sleep(BATCH_DELAY_SECONDS)
+            continue
+
+        pairs = list(seen)
+        # sku bridge first, then exact (brand_id, part_number) -- two separate queries per chunk
+        # (no OR) to stay clear of the PostgreSQL stack depth limit, same as XDP/Thoroughbred.
+        existing_by_key = {}
+        id_to_mp = {}
+        existing_by_sku: typing.Dict[typing.Tuple[int, str], typing.List[typing.Tuple[int, str]]] = {}
+        existing_by_part = {}
+        for i in range(0, len(pairs), WHEELPROS_LOOKUP_CHUNK):
+            chunk = pairs[i : i + WHEELPROS_LOOKUP_CHUNK]
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number, sku FROM master_parts WHERE (brand_id, sku) IN %s",
+                    (tuple(chunk),),
+                )
+                for mp_id, b_id, p_num, sku_val in cur.fetchall():
+                    if mp_id not in id_to_mp:
+                        mp = src_models.MasterPart()
+                        mp.id = mp_id
+                        mp.brand_id = b_id
+                        mp.part_number = p_num
+                        id_to_mp[mp_id] = mp
+                    if sku_val is not None:
+                        existing_by_sku.setdefault((b_id, (sku_val or "").strip()), []).append(
+                            (mp_id, p_num)
+                        )
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                    (tuple(chunk),),
+                )
+                for mp_id, b_id, p_num in cur.fetchall():
+                    if mp_id not in id_to_mp:
+                        mp = src_models.MasterPart()
+                        mp.id = mp_id
+                        mp.brand_id = b_id
+                        mp.part_number = p_num
+                        id_to_mp[mp_id] = mp
+                    existing_by_part.setdefault((b_id, p_num), mp_id)
+        for (b_id, p_num) in pairs:
+            sku_candidates = existing_by_sku.get((b_id, p_num)) or []
+            sku_match = next((mp_id for mp_id, pn in sku_candidates if pn == p_num), None)
+            if sku_match is None and sku_candidates:
+                sku_match = sku_candidates[0][0]
+            existing_by_key[(b_id, p_num)] = sku_match or existing_by_part.get((b_id, p_num))
+
+        mp_matching.extend_with_normalized_matches(
+            existing_by_key,
+            pairs,
+            {(mp.brand_id, mp.part_number): mp.gtin for mp in master_parts_list},
+            provider_id=randys_provider.id,
+            provider_kind=src_enums.BrandProviderKind.RANDYS_WORLDWIDE.value,
+            sku_by_key={(mp.brand_id, mp.part_number): mp.sku for mp in master_parts_list},
+            external_id_by_key={v: k for k, v in randys_code_to_brand_part.items()},
+        )
+
+        new_parts = [
+            mp for mp in master_parts_list
+            if existing_by_key.get((mp.brand_id, mp.part_number)) is None
+        ]
+        existing_keys = [k for k in pairs if existing_by_key.get(k) is not None]
+
+        # Insert-only for new parts: an existing matched row's sku/description/image_url is never
+        # overwritten (sku is the cross-provider matching key, set once at creation).
+        if new_parts:
+            new_parts = _dedupe_master_parts_for_upsert(
+                new_parts, context="RANDYS new_parts batch={}".format(batch_num)
+            )
+            pgbulk.upsert(
+                src_models.MasterPart,
+                new_parts,
+                unique_fields=["brand", "part_number"],
+                update_fields=[],
+            )
+            total_master += len(new_parts)
+
+        if existing_keys:
+            key_to_mp = {(mp.brand_id, mp.part_number): mp for mp in master_parts_list}
+            for i in range(0, len(existing_keys), WHEELPROS_LOOKUP_CHUNK):
+                chunk_keys = existing_keys[i : i + WHEELPROS_LOOKUP_CHUNK]
+                values = [(existing_by_key[k], key_to_mp[k].aaia_code) for k in chunk_keys]
+                placeholders = ", ".join(["(%s::bigint, %s)"] * len(values))
+                params = [x for row_vals in values for x in row_vals]
+                with connection.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE master_parts mp SET aaia_code = v.aaia_code
+                        FROM (VALUES {}) AS v(id, aaia_code)
+                        WHERE mp.id = v.id
+                        """.format(placeholders),
+                        params,
+                    )
+
+        brand_part_to_master = {}
+        for (b_id, p_num), mp_id in existing_by_key.items():
+            if mp_id is None:
+                continue
+            if mp_id in id_to_mp:
+                brand_part_to_master[(b_id, p_num)] = id_to_mp[mp_id]
+            else:
+                mp = src_models.MasterPart()
+                mp.id = mp_id
+                mp.brand_id = b_id
+                brand_part_to_master[(b_id, p_num)] = mp
+        new_pairs = [k for k in pairs if k not in brand_part_to_master]
+        if new_pairs:
+            for i in range(0, len(new_pairs), WHEELPROS_LOOKUP_CHUNK):
+                chunk = new_pairs[i : i + WHEELPROS_LOOKUP_CHUNK]
+                with connection.cursor() as cur:
+                    cur.execute(
+                        "SELECT id, brand_id, part_number FROM master_parts WHERE (brand_id, part_number) IN %s",
+                        (tuple(chunk),),
+                    )
+                    for mp_id, b_id, p_num in cur.fetchall():
+                        mp = src_models.MasterPart()
+                        mp.id = mp_id
+                        mp.brand_id = b_id
+                        brand_part_to_master[(b_id, p_num)] = mp
+
+        provider_parts_by_key = {}
+        for row in batch:
+            brand = randys_brand_to_brand.get(row["brand_id"])
+            if not brand:
+                continue
+            part_number = (row.get("sku") or "").strip()
+            if not part_number:
+                continue
+            master_part = brand_part_to_master.get((brand.id, part_number))
+            if not master_part:
+                continue
+            pp_key = (master_part.id, randys_provider.id)
+            provider_parts_by_key[pp_key] = src_models.ProviderPart(
+                master_part=master_part,
+                provider=randys_provider,
+                provider_external_id=row["code"],
+                distributor_refreshed_at=row.get("updated_at"),
+            )
+
+        provider_parts = list(provider_parts_by_key.values())
+        if provider_parts:
+            pgbulk.upsert(
+                src_models.ProviderPart,
+                provider_parts,
+                unique_fields=["master_part", "provider"],
+                update_fields=_PROVIDER_PART_SYNC_UPDATE_FIELDS,
+            )
+            total_provider += len(provider_parts)
+
+        logger.info("{} RANDYS batch {}: {} items -> {} master, {} provider (last_id={})".format(
+            _LOG_PREFIX, batch_num, len(batch), len(master_parts_list), len(provider_parts), last_id
+        ))
+        connection.close()
+        if len(batch) == BATCH_SIZE_MASTER_PARTS:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    return total_master, total_provider
+
+
+def sync_master_parts_from_randys() -> None:
+    """Create/update MasterPart and ProviderPart from RandysPart. Only rows whose RandysBrand has
+    a BrandRandysBrandMapping are included. See _ingest_randys_parts_for_mapped_brands for why the
+    sku is used as part_number and the Shopify id as provider_external_id."""
+    logger.info("{} Syncing master parts from RANDYS.".format(_LOG_PREFIX))
+
+    randys_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.RANDYS_WORLDWIDE.value,
+    ).first()
+    if not randys_provider:
+        logger.info("{} No RANDYS provider found.".format(_LOG_PREFIX))
+        return
+
+    mappings = list(
+        src_models.BrandRandysBrandMapping.objects.select_related("brand", "randys_brand")
+    )
+    randys_brand_to_brand = {m.randys_brand_id: m.brand for m in mappings}
+    randys_brand_to_aaia = {
+        m.randys_brand_id: (m.brand.aaia_code if m.brand else None) for m in mappings
+    }
+    if not randys_brand_to_brand:
+        logger.info("{} No BrandRandysBrandMapping found. Nothing to sync.".format(_LOG_PREFIX))
+        return
+
+    chunks = _partition_mapped_brands_for_parallel_ingest(mappings, MASTER_PARTS_SYNC_MAX_WORKERS)
+    total_master, total_provider = _run_parallel_master_parts_ingest(
+        chunks,
+        mappings,
+        "randys_brand",
+        lambda cids: _ingest_randys_parts_for_mapped_brands(
+            cids, randys_provider, randys_brand_to_brand, randys_brand_to_aaia,
+        ),
+    )
+    logger.info("{} Synced {} master parts and {} provider parts from RANDYS total.".format(
+        _LOG_PREFIX, total_master, total_provider
+    ))
+
+
+def _randys_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
+    """product_details for a RandysPart row. The differential fields are RANDYS' own axle
+    taxonomy and are the most useful thing they publish for this catalogue -- a ring-and-pinion
+    buyer picks by diff, not by vehicle trim."""
+    diff_brands = row.get("differential_brands") or []
+    return [
+        {"key": "url", "label": "URL", "value": row.get("url") or None},
+        {"key": "category", "label": "Category", "value": row.get("category") or None},
+        {"key": "sub_category", "label": "Sub-Category", "value": row.get("sub_category") or None},
+        {
+            "key": "differential_brands",
+            "label": "Differential Brands",
+            # De-duplicated: the index repeats a brand once per matching diff code.
+            "value": ", ".join(sorted(set(diff_brands))) or None,
+        },
+        {"key": "fitment_type", "label": "Fitment", "value": row.get("fitment_type") or None},
+    ]
+
+
+def _randys_inventory_warehouse_availability(row: typing.Dict) -> typing.Dict[str, typing.Any]:
+    """
+    RANDYS-wide stock for one part. There is no per-warehouse breakdown in either source: the
+    SFTP push is a flat ``Item,Stock`` pair, so the one bucket is all there is.
+
+    ``in_stock`` is kept alongside the number because it comes from a different source and is
+    available earlier: it is the index's own coarse flag, which covers the whole catalogue from
+    the first catalogue sweep, whereas ``quantity`` is null until an inventory file has landed.
+    A 0 in ``warehouse_total_qty`` therefore does not by itself mean out of stock -- check
+    ``quantity_known``.
+    """
+    quantity = row.get("quantity")
+    return {
+        "RANDYS": quantity,
+        "in_stock": row.get("in_stock"),
+        "quantity_known": quantity is not None,
+        "inventory_synced_at": (
+            row["inventory_synced_at"].isoformat() if row.get("inventory_synced_at") else None
+        ),
+    }
+
+
+def sync_provider_inventory_from_randys() -> None:
+    """
+    Sync ProviderPartInventory from RandysPart -- shared, RANDYS-wide stock.
+
+    Quantity is deliberately global rather than per-company: RANDYS' warehouse stock is the same
+    number whichever dealer asks, which is why the file is read once from the primary connection
+    (see services/randys.apply_randys_inventory_file) and lands here with no company column.
+
+    ``warehouse_total_qty`` is 0 when no file has arrived yet. That is NOT "out of stock" --
+    ``warehouse_availability.quantity_known`` distinguishes the two, and ``in_stock`` carries the
+    index's coarse flag in the meantime.
+    """
+    logger.info("{} Syncing provider inventory from RANDYS.".format(_LOG_PREFIX))
+
+    randys_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.RANDYS_WORLDWIDE.value,
+    ).first()
+    if not randys_provider:
+        logger.info("{} No RANDYS provider found.".format(_LOG_PREFIX))
+        return
+
+    provider_parts_by_key = {
+        row["provider_external_id"]: src_models.ProviderPart(id=row["id"])
+        for row in src_models.ProviderPart.objects.filter(provider=randys_provider).values(
+            "id", "provider_external_id"
+        )
+    }
+
+    now = timezone.now()
+    total_upserted = 0
+    batch_num = 0
+    last_id = 0
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.RandysPart.objects.filter(id__gt=last_id)
+            .order_by("id")
+            .values(
+                "id", "code", "quantity", "in_stock", "inventory_synced_at",
+                "url", "category", "sub_category", "differential_brands", "fitment_type",
+            )[:BATCH_SIZE_INVENTORY]
+        )
+        if not batch:
+            break
+        last_id = batch[-1]["id"]
+
+        to_upsert = []
+        for row in batch:
+            provider_part = provider_parts_by_key.get(row["code"])
+            if not provider_part:
+                continue
+            to_upsert.append(
+                src_models.ProviderPartInventory(
+                    provider_part=provider_part,
+                    warehouse_total_qty=row.get("quantity") or 0,
+                    manufacturer_inventory=None,
+                    manufacturer_esd=None,
+                    warehouse_availability=_randys_inventory_warehouse_availability(row),
+                    last_synced_at=now,
+                    updated_at=now,
+                )
+            )
+        if to_upsert:
+            to_upsert = _dedupe_provider_part_inventory_for_upsert(
+                to_upsert, context="RANDYS inventory batch={}".format(batch_num)
+            )
+            pgbulk.upsert(
+                src_models.ProviderPartInventory,
+                to_upsert,
+                unique_fields=["provider_part"],
+                update_fields=[
+                    "warehouse_total_qty", "manufacturer_inventory", "manufacturer_esd",
+                    "warehouse_availability", "last_synced_at", "updated_at",
+                ],
+            )
+            total_upserted += len(to_upsert)
+
+        pp_details_to_update = []
+        for row in batch:
+            pp = provider_parts_by_key.get(row["code"])
+            if pp:
+                pp.product_details = _randys_product_details(row)
+                pp_details_to_update.append(pp)
+        if pp_details_to_update:
+            src_models.ProviderPart.objects.bulk_update(
+                pp_details_to_update, ["product_details"], batch_size=500
+            )
+
+        connection.close()
+        if len(batch) == BATCH_SIZE_INVENTORY:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    logger.info("{} Synced {} RANDYS inventory records total.".format(_LOG_PREFIX, total_upserted))
+
+
+def sync_derived_from_randys(*, skip_master_parts: bool = False, skip_pricing: bool = False) -> None:
+    """Propagate RANDYS source data into MasterPart, ProviderPart, ProviderPartInventory.
+
+    There is no pricing step at all yet, and ``skip_pricing`` is accepted only so the signature
+    matches every other provider's: RANDYS' push carries quantity and nothing else, and no
+    wholesale figure is reachable publicly, so no per-company cost exists to propagate. When one
+    arrives it gets a RandysCompanyPricing table and a branch in the standard
+    IntegrationPricingSyncJob dispatch, like XDP's.
+
+    Fitment is separate -- see sync_master_part_fitments_from_randys, a standalone pipeline with
+    its own command, matching XDP and Thoroughbred.
+    """
+    logger.info("{} Starting RANDYS-only derived sync ({}).".format(
+        _LOG_PREFIX,
+        "inventory only" if skip_master_parts else "parts, inventory",
+    ))
+    if not skip_master_parts:
+        sync_master_parts_from_randys()
+        connection.close()
+    sync_provider_inventory_from_randys()
+    connection.close()
+    logger.info("{} Completed RANDYS-only derived sync.".format(_LOG_PREFIX))
+
+
+def sync_master_part_fitments_from_randys() -> None:
+    """
+    Decode RandysPart.fitment_rows into MasterPartFitment, collapsing years into ranges.
+
+    The rows arrive as real vehicle tuples, so nothing here cross-products flat make/model lists.
+    Two mappings are worth knowing about:
+
+    * ``Year`` is a range-and-list string ("1992 - 1994, 1996 - 1997, 1999, 2001 - 2003") and is
+      expanded by randys_services.expand_randys_year_field before being re-collapsed into the
+      contiguous ranges this table stores. Expanding then re-collapsing is not wasted work: the
+      source's own groupings are not contiguous, and merging two parts' overlapping lists is only
+      correct on individual years.
+
+    * ``Differential`` is written to ``submodel``. It is not a trim level, so this is a
+      deliberate re-use, and the alternative is worse: it is a genuine fitment qualifier ("Dana 44
+      Front, Standard Rotation"), a ring-and-pinion that needs it fits only the builds of that
+      vehicle that have that axle, and ``submodel`` is the only column in the unique key that can
+      keep two otherwise-identical diff-specific rows apart. Dropping it would silently merge them
+      and present an axle-specific part as fitting every build of the vehicle. ``Drive`` maps
+      cleanly to ``drive_type``; there is no engine in the source, so ``engine`` stays "".
+
+    Requires randys.fetch_and_save_randys_fitment and sync_master_parts_from_randys to have run.
+    A part with no resolvable MasterPart is counted, never raised.
+    """
+    logger.info("{} Starting RANDYS fitment sync.".format(_LOG_PREFIX))
+
+    randys_provider = src_models.Providers.objects.filter(
+        kind=src_enums.BrandProviderKind.RANDYS_WORLDWIDE.value,
+    ).first()
+    if not randys_provider:
+        logger.warning("{} No RANDYS provider found. Skipping.".format(_LOG_PREFIX))
+        return
+
+    master_part_id_by_code: typing.Dict[str, int] = {
+        row["provider_external_id"]: row["master_part_id"]
+        for row in src_models.ProviderPart.objects.filter(provider=randys_provider).values(
+            "provider_external_id", "master_part_id"
+        )
+    }
+    if not master_part_id_by_code:
+        logger.warning(
+            "{} No RANDYS ProviderPart rows yet -- run sync_master_parts_from_randys first. "
+            "Skipping.".format(_LOG_PREFIX)
+        )
+        return
+
+    skipped_unknown_item = 0
+    skipped_bad_row = 0
+    total_upserted = 0
+    batch_num = 0
+    last_id = 0
+    while True:
+        batch_num += 1
+        batch = list(
+            src_models.RandysPart.objects.exclude(fitment_rows__isnull=True)
+            .filter(id__gt=last_id)
+            .order_by("id")
+            .values("id", "code", "fitment_rows")[:FITMENT_ITEM_CHUNK_SIZE]
+        )
+        if not batch:
+            break
+        last_id = batch[-1]["id"]
+
+        to_upsert = []
+        for row in batch:
+            master_part_id = master_part_id_by_code.get(row["code"])
+            if not master_part_id:
+                skipped_unknown_item += 1
+                continue
+            years_by_key: typing.Dict[typing.Tuple[str, str, str, str], typing.Set[int]] = {}
+            for fitment in (row.get("fitment_rows") or []):
+                if not isinstance(fitment, dict):
+                    skipped_bad_row += 1
+                    continue
+                make = (fitment.get("Make") or "").strip()
+                model = (fitment.get("Model") or "").strip()
+                years = randys_services.expand_randys_year_field(fitment.get("Year"))
+                if not make or not model or not years:
+                    skipped_bad_row += 1
+                    continue
+                submodel = (fitment.get("Differential") or "").strip()[:255]
+                drive_type = (fitment.get("Drive") or "").strip()[:64]
+                key = (make[:128], model[:128], submodel, drive_type)
+                years_by_key.setdefault(key, set()).update(years)
+
+            for (make, model, submodel, drive_type), years in years_by_key.items():
+                for year_start, year_end in _collapse_years_to_ranges(years):
+                    to_upsert.append(
+                        src_models.MasterPartFitment(
+                            master_part_id=master_part_id,
+                            year_start=year_start,
+                            year_end=year_end,
+                            make=make,
+                            model=model,
+                            submodel=submodel,
+                            engine="",
+                            drive_type=drive_type,
+                            source_provider=randys_provider,
+                        )
+                    )
+
+        if to_upsert:
+            to_upsert = _dedupe_master_part_fitments_for_upsert(
+                to_upsert, context="RANDYS fitment batch={}".format(batch_num)
+            )
+            pgbulk.upsert(
+                src_models.MasterPartFitment,
+                to_upsert,
+                unique_fields=[
+                    "master_part", "year_start", "year_end", "make", "model",
+                    "submodel", "engine", "drive_type",
+                ],
+                update_fields=["source_provider"],
+            )
+            total_upserted += len(to_upsert)
+
+        connection.close()
+        if len(batch) == FITMENT_ITEM_CHUNK_SIZE:
+            time.sleep(BATCH_DELAY_SECONDS)
+
+    if skipped_unknown_item or skipped_bad_row:
+        logger.warning(
+            "{} RANDYS fitment sync: skipped {} row(s) for items with no MasterPart, {} "
+            "unusable fitment row(s).".format(_LOG_PREFIX, skipped_unknown_item, skipped_bad_row)
+        )
+    logger.info(
+        "{} Synced {} RANDYS MasterPartFitment rows total.".format(_LOG_PREFIX, total_upserted)
+    )

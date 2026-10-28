@@ -669,6 +669,39 @@ DLG_SFTP_DIRECTORY = os.environ.get("DLG_SFTP_DIRECTORY") or "uploads"
 DLG_INVENTORY_REMOTE_FILE = os.environ.get("DLG_INVENTORY_REMOTE_FILE") or "dlg_inventory.csv"
 DLG_INVENTORY_LOCAL_PATH = os.environ.get("DLG_INVENTORY_LOCAL_PATH", "/tmp/dlg_inventory.csv")
 
+# RANDYS Worldwide. Two unrelated halves, on purpose:
+#
+# 1. CATALOG + FITMENT are public. RANDYS' storefront is Shopify fronted by a Convermax search
+#    index that answers without auth, and its item count matches /products.json exactly, so it is
+#    the catalog of record here. Nothing below is needed to read it -- these are override knobs
+#    only (useful to point a staging box at a copy, or if RANDYS move hosts).
+# 2. INVENTORY arrives as an SFTP push. RANDYS drop `Inventory_RWW_<YYMMDDHHMM>.csv` -- a
+#    timestamped name, so the client picks the newest match rather than a fixed filename.
+#
+# The inventory host is deliberately NOT pinned here. The primary connection (company 16) is
+# served from RANDYS' own AWS box, whose `uploads/` sits under /home/sftpuser rather than in a
+# per-company chroot, while any later connection lands on our usual relay like Meyer. Both are
+# expressed per connection via credentials["feed"]["sftp_server"]/["sftp_directory"], same
+# mechanism DLG uses to keep its primary company on an older host -- so the default below stays
+# our relay and the outlier is data, not code.
+RANDYS_CONVERMAX_BASE_URL = os.environ.get("RANDYS_CONVERMAX_BASE_URL", "")
+RANDYS_SHOPIFY_BASE_URL = os.environ.get("RANDYS_SHOPIFY_BASE_URL", "")
+try:
+    RANDYS_FITMENT_MAX_WORKERS = int(os.environ.get("RANDYS_FITMENT_MAX_WORKERS", "8"))
+except ValueError:
+    RANDYS_FITMENT_MAX_WORKERS = 8
+try:
+    RANDYS_PARSE_PROGRESS_EVERY = int(os.environ.get("RANDYS_PARSE_PROGRESS_EVERY", "250000"))
+except ValueError:
+    RANDYS_PARSE_PROGRESS_EVERY = 250000
+
+# Relay SFTP for the inventory push. Host/port/directory default from ``src.constants`` and are
+# overridden per connection (see above); the app-level login is only the fallback for a
+# connection that has no relay account of its own, same as DLG/S&B.
+RANDYS_RELAY_SFTP_USER = os.environ.get("RANDYS_RELAY_SFTP_USER", "")
+RANDYS_RELAY_SFTP_PASSWORD = os.environ.get("RANDYS_RELAY_SFTP_PASSWORD", "")
+RANDYS_INVENTORY_LOCAL_DIR = os.environ.get("RANDYS_INVENTORY_LOCAL_DIR", "/tmp")
+
 # S&B Filters. The catalog, pricing and fitment workbooks are shared with S&B's whole dealer
 # network, so their URLs default from ``src.constants`` and these are overrides only -- useful for
 # pointing a staging box at a copy of the sheets, or if S&B move them. Set the full export URL,

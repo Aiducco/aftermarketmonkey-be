@@ -49,6 +49,7 @@ from src.integrations.services import turn_14_sweeps
 from src.integrations.services import vossen as vossen_services
 from src.integrations.services import wheelpros as wheelpros_services
 from src.integrations.services import wps as wps_services
+from src.integrations.services import xdp as xdp_services
 
 logger = logging.getLogger(__name__)
 
@@ -370,6 +371,12 @@ def _fetch_raw_pricing(cp: src_models.CompanyProviders, use_delta_fetch: bool = 
         # to Thoroughbred's public retail price (see services.thoroughbred.dealer_cost_from_retail).
         thoroughbred_services.sync_thoroughbred_company_pricing_for_company_provider(cp.id)
 
+    elif kind == src_enums.BrandProviderKind.XDP.value:
+        # Two cost sources in one pass: XDP's own brand comes from this company's dealer CSV
+        # (real wholesale COST), and every resold brand from their markup off XDP's public
+        # retail price. See services.xdp.sync_xdp_company_pricing_for_company_provider.
+        xdp_services.sync_xdp_company_pricing_for_company_provider(cp.id)
+
     else:
         raise ValueError("Unsupported provider kind for raw pricing fetch: {}".format(kind))
 
@@ -449,6 +456,9 @@ def _sync_master_pricing(cp: src_models.CompanyProviders) -> None:
 
     elif kind == src_enums.BrandProviderKind.THOROUGHBRED_DIESEL.value:
         master_parts.sync_provider_pricing_from_thoroughbred_for_company(company_id)
+
+    elif kind == src_enums.BrandProviderKind.XDP.value:
+        master_parts.sync_provider_pricing_from_xdp_for_company(company_id)
 
     elif kind == src_enums.BrandProviderKind.NTW.value:
         master_parts.sync_provider_pricing_from_ntw_for_company(company_id)

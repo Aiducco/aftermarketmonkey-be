@@ -103,6 +103,7 @@ class BrandProviderKind(enum.Enum):
     SB = 39
     THOROUGHBRED_DIESEL = 40
     NTW = 41
+    RANDYS_WORLDWIDE = 42
 
 class ProductType(enum.Enum):
     """

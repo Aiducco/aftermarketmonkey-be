@@ -26,6 +26,8 @@ from src.integrations.clients.crown import client as crown_client
 from src.integrations.clients.crown import exceptions as crown_exceptions
 from src.integrations.clients.dlg import client as dlg_client
 from src.integrations.clients.dlg import exceptions as dlg_exceptions
+from src.integrations.clients.randys import exceptions as randys_exceptions
+from src.integrations.clients.randys import sftp_client as randys_sftp_client
 from src.integrations.clients.sb import exceptions as sb_exceptions
 from src.integrations.clients.sb import relay as sb_relay
 from src.integrations.clients.elite_wheel import client as elite_wheel_client
@@ -70,7 +72,9 @@ from src.integrations.clients.wheelpros import exceptions as wheelpros_exception
 from src.integrations.clients.wheelpros import order_client as wheelpros_order_client
 from src.integrations.clients.wheelpros import pricing_client as wheelpros_pricing_client
 from src.integrations.orders import registry as order_registry
+from src.integrations.clients.xdp import client as xdp_client
 from src.integrations.services import integration_pricing_sync_jobs, relay_sftp_provisioning
+from src.integrations.services import xdp as xdp_services
 
 logger = logging.getLogger(__name__)
 
@@ -604,6 +608,48 @@ def _validate_thoroughbred_connection(credentials: typing.Dict[str, typing.Any])
     return None, None
 
 
+def _validate_xdp_markup_field(credentials: typing.Dict[str, typing.Any]) -> typing.Optional[str]:
+    """markup must be a numeric percentage in [0, 100]. It is required even when a dealer feed URL
+    is supplied: the feed only covers XDP's own brand (449 parts), so the other ~60k resold parts
+    still need a markup off XDP's public retail price to get any cost at all."""
+    raw = credentials.get(xdp_services.MARKUP_CREDENTIAL_KEY)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return "markup must be a number between 0 and 100."
+    if not (0 <= value <= 100):
+        return "markup must be between 0 and 100 (got {}).".format(raw)
+    return None
+
+
+def _validate_xdp_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
+    """
+    No login exists anywhere for XDP's catalog, so there is nothing to authenticate. Two things
+    are checked:
+
+    - ``markup`` (required) -- the only cost basis for the ~241 brands XDP resells.
+    - ``feed_url`` (optional) -- a dealer's own house-brand CSV. When present it IS live-tested,
+      because a wrong URL here silently downgrades 449 parts from real wholesale cost to a markup
+      guess, and a 404 is the normal failure mode (XDP publishes one file per dealer).
+    """
+    markup_error = _validate_xdp_markup_field(credentials)
+    if markup_error:
+        return markup_error, CONNECTION_ERROR_INVALID_INPUT
+
+    feed_url = (credentials.get(xdp_services.FEED_URL_CREDENTIAL_KEY) or "").strip()
+    if not feed_url:
+        return None, None
+    try:
+        client = xdp_client.XdpDealerFeedClient(feed_url=feed_url)
+    except ValueError as e:
+        return str(e), CONNECTION_ERROR_INVALID_INPUT
+    try:
+        client.test_connection()
+    except xdp_client.XdpApiError as e:
+        return str(e), CONNECTION_ERROR_CONNECTION_FAILED
+    return None, None
+
+
 def _validate_rough_country_connection(credentials: typing.Dict[str, typing.Any]) -> _ValidatorResult:
     url = credentials.get(src_constants.ROUGH_COUNTRY_CREDENTIALS_FEED_URL)
     try:
@@ -843,6 +889,7 @@ _CONNECTION_VALIDATORS: typing.Dict[int, typing.Callable[[typing.Dict[str, typin
     src_enums.BrandProviderKind.ALLPRO_DISTRIBUTING.value: _validate_allpro_connection,
     src_enums.BrandProviderKind.ATD.value: _validate_atd_connection,
     src_enums.BrandProviderKind.THOROUGHBRED_DIESEL.value: _validate_thoroughbred_connection,
+    src_enums.BrandProviderKind.XDP.value: _validate_xdp_connection,
     src_enums.BrandProviderKind.NTW.value: _validate_ntw_connection,
 }
 
@@ -1310,6 +1357,9 @@ _RELAY_FEED_CHECK_KINDS = {
     # to check for. A WAITING S&B connection therefore means "no stock yet", not "no data yet" --
     # pricing, fitment and product data are already live. See the SB entry in PROVIDER_CATALOG.
     src_enums.BrandProviderKind.SB.value,
+    # Same shape as S&B: RANDYS' catalogue and fitment are public and already live, so a
+    # WAITING RANDYS connection means "no stock file yet", not "no data yet".
+    src_enums.BrandProviderKind.RANDYS_WORLDWIDE.value,
 }
 
 # kind -> (client class, exception base) for every relay kind whose check is a plain
@@ -1331,6 +1381,10 @@ _RELAY_FEED_PRESENT_CLIENTS: typing.Dict[int, typing.Tuple[typing.Any, typing.An
     src_enums.BrandProviderKind.CROWN_AUTOMOTIVE.value: (crown_client.CrownSFTPClient, crown_exceptions.CrownException),
     src_enums.BrandProviderKind.DLG.value: (dlg_client.DlgSFTPClient, dlg_exceptions.DlgException),
     src_enums.BrandProviderKind.SB.value: (sb_relay.SbRelayClient, sb_exceptions.SbException),
+    src_enums.BrandProviderKind.RANDYS_WORLDWIDE.value: (
+        randys_sftp_client.RandysSFTPClient,
+        randys_exceptions.RandysException,
+    ),
 }
 
 

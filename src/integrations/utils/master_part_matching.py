@@ -63,6 +63,15 @@ GTIN_LESS_PROVIDER_KINDS = frozenset({
     src_enums.BrandProviderKind.MOTOR_STATE_DISTRIBUTING.value,
     # HawkSearch's 36-field schema has no gtin/upc field at all (confirmed live, 2026-10-26).
     src_enums.BrandProviderKind.THOROUGHBRED_DIESEL.value,
+    # Neither XDP source carries a barcode: the SearchSpring index has no gtin/upc field, and
+    # Miva's Runtime_ProductList_Load_Query has a fixed field template that ignores
+    # ondemandcolumns, so there is no way to ask for one (confirmed live, 2026-10-28).
+    src_enums.BrandProviderKind.XDP.value,
+    # RANDYS expose no barcode on either source: the Convermax index has no gtin/upc
+    # field in its 45-field schema, and Shopify's products.json omits variant barcode
+    # entirely (both confirmed live, 2026-10-28). Their Storefront API would not help
+    # either -- barcode is not a Storefront-readable field.
+    src_enums.BrandProviderKind.RANDYS_WORLDWIDE.value,
 })
 
 _LOOKUP_CHUNK = 2000
