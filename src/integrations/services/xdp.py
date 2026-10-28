@@ -44,6 +44,11 @@ _LOG_PREFIX = "[XDP-SERVICES]"
 
 CATALOG_UPSERT_BATCH = 2000
 PRICING_UPSERT_BATCH = 5000
+# Leaves between fitment checkpoints. The walk is ~6,500 leaves over tens of minutes against a
+# third-party index, so it WILL sometimes die part-way (a dropped connection is enough). Without
+# a checkpoint the whole accumulation lives in memory until the final write and a death loses
+# every leaf walked -- which is exactly what happened on the first production run.
+FITMENT_CHECKPOINT_LEAVES = 500
 
 # CompanyProviders.credentials keys a connecting company supplies at connect time -- see
 # PROVIDER_CATALOG's XDP entry in constants.py and _validate_xdp_connection in
@@ -699,11 +704,14 @@ def fetch_and_save_xdp_fitment_paths() -> int:
             if not code:
                 continue
             paths_by_code.setdefault(code, set()).add(leaf)
-        if leaves % 250 == 0:
+        if leaves % FITMENT_CHECKPOINT_LEAVES == 0:
+            # `paths_by_code` holds the complete union walked SO FAR, so writing it out is a
+            # plain overwrite, not a merge -- and it means a crash costs only the leaves since
+            # the last checkpoint instead of the entire run.
+            written = _write_fitment_paths(paths_by_code)
             logger.info(
-                "{} fitment walk: {} leaf node(s) done, {} product(s) with fitment so far.".format(
-                    _LOG_PREFIX, leaves, len(paths_by_code)
-                )
+                "{} fitment walk: {} leaf node(s) done, {} product(s) with fitment, "
+                "checkpointed {} row(s).".format(_LOG_PREFIX, leaves, len(paths_by_code), written)
             )
 
     if not paths_by_code:
@@ -715,7 +723,14 @@ def fetch_and_save_xdp_fitment_paths() -> int:
             _LOG_PREFIX, leaves, len(paths_by_code)
         )
     )
+    total = _write_fitment_paths(paths_by_code)
+    logger.info("{} Wrote fitment_paths on {} XdpPart row(s).".format(_LOG_PREFIX, total))
+    return total
 
+
+def _write_fitment_paths(paths_by_code: typing.Dict[str, typing.Set[str]]) -> int:
+    """Persist the accumulated walk onto XdpPart.fitment_paths. Called at each checkpoint and
+    once at the end; each call writes the full accumulation, so it is idempotent."""
     total = 0
     last_id = 0
     while True:
@@ -738,8 +753,6 @@ def fetch_and_save_xdp_fitment_paths() -> int:
         if to_update:
             src_models.XdpPart.objects.bulk_update(to_update, ["fitment_paths"], batch_size=500)
             total += len(to_update)
-
-    logger.info("{} Wrote fitment_paths on {} XdpPart row(s).".format(_LOG_PREFIX, total))
     return total
 
 
