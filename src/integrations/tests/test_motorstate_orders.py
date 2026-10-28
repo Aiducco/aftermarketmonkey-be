@@ -302,6 +302,48 @@ class QuoteTests(_AdapterHarness):
         self.assertNotIsInstance(ctx.exception, order_exceptions.OrderValidationError)
 
 
+class LineLevelErrorTests(_AdapterHarness):
+    """
+    Motor State puts some rejections on the LINE, not the header. The truck-freight case is the
+    one that matters: HeaderErrors empty, HasErrors unset, rate list empty, and the only
+    explanation on Lines[].Errors. Read only the header and the dealer sees a quote with no
+    shipping options and no reason.
+    """
+    TRUCK_ONLY = {
+        "InvoiceAmount": 119.9902348,
+        "Lines": [{
+            "LineNumber": 1, "PartNumber": "ALL22202", "QuantityShip": 1,
+            "QuantityBackOrder": 0, "QuantityAvailable": 100,
+            "Price": 119.9902348, "LineTotal": 119.9902348,
+            "Errors": [{"Code": 1, "Message": (
+                "The selected Shipping Method is not valid for the product ALL22202. Please "
+                "select an allowable shipping method for this order.")}],
+        }],
+        "AvailableShippingMethodRates": [],
+        "HeaderErrors": [],
+    }
+
+    def test_an_unshippable_cart_raises_with_motor_states_own_wording(self):
+        with self.assertRaises(order_exceptions.OrderValidationError) as ctx:
+            self.adapter(_Client(inquiry=self.TRUCK_ONLY)).get_shipping_quote(
+                [_line(11, "ALL22202", 1)], SHIP_TO)
+        self.assertIn("not valid for the product ALL22202", str(ctx.exception))
+
+    def test_line_errors_ride_on_the_line_when_shipping_is_still_possible(self):
+        """A warning on one line must not hide a cart the rest of which can ship."""
+        payload = dict(self.TRUCK_ONLY, AvailableShippingMethodRates=[
+            {"ShippingMethodCode": "tkpp", "Description": "Truck Freight", "Rate": 229.28}])
+        result = self.adapter(_Client(inquiry=payload)).get_shipping_quote(
+            [_line(11, "ALL22202", 1)], SHIP_TO)
+        self.assertEqual(result.lines[0].ship_options[0].service_level_code, "tkpp")
+        self.assertIn("not valid for the product ALL22202", result.lines[0].flags[0])
+
+    def test_a_clean_line_carries_no_flags(self):
+        result = self.adapter(_Client()).get_shipping_quote(
+            [_line(11, "MAH4065MS-112-1", 1)], SHIP_TO)
+        self.assertEqual(result.lines[0].flags, [])
+
+
 class DropShipTests(_AdapterHarness):
     def test_shipping_to_the_shop_sends_no_drop_ship_address(self):
         """

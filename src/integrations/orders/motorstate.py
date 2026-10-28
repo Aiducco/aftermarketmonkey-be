@@ -85,10 +85,28 @@ def _error_text(e: Exception) -> str:
 
 
 def _header_errors(payload: typing.Dict) -> typing.List[str]:
-    """Motor State's business rejections, e.g. 'COD payment is not available for drop shipment
+    """Motor State's order-level rejections, e.g. 'COD payment is not available for drop shipment
     orders.' (code 17). Returned on HTTP 422 alongside HasErrors."""
     out = []
     for err in (payload or {}).get("HeaderErrors") or []:
+        message = (err or {}).get("Message")
+        if message:
+            out.append(str(message).strip())
+    return out
+
+
+def _line_errors(line: typing.Dict) -> typing.List[str]:
+    """
+    Per-line rejections, which arrive in ``Lines[].Errors`` and NOT in HeaderErrors.
+
+    Easy to miss and silent when missed: a truck-freight-only item quoted under a parcel method
+    returns HeaderErrors empty, HasErrors unset, and an EMPTY rate list, with the only
+    explanation sitting on the line -- "The selected Shipping Method is not valid for the
+    product ALL22202." Without reading these, the dealer gets a quote with no shipping options
+    and no reason for it. (Naming tkpp on the same cart rates it fine.)
+    """
+    out = []
+    for err in (line or {}).get("Errors") or []:
         message = (err or {}).get("Message")
         if message:
             out.append(str(message).strip())
@@ -281,12 +299,15 @@ class MotorStateOrderAdapter(base.DistributorOrderAdapter):
 
         ship_options = self._ship_options(result)
         lines: typing.List[base.ShippingQuoteLine] = []
+        all_line_errors: typing.List[str] = []
         for line in result.get("Lines") or []:
             part_number = str(line.get("PartNumber") or "").strip()
             line_item_id = index.get(part_number.upper())
             if line_item_id is None:
                 continue
             shipped = _int(line.get("QuantityShip"))
+            line_errors = _line_errors(line)
+            all_line_errors.extend(line_errors)
             lines.append(base.ShippingQuoteLine(
                 line_item_id=line_item_id,
                 provider_external_id=part_number,
@@ -297,7 +318,16 @@ class MotorStateOrderAdapter(base.DistributorOrderAdapter):
                 # Every line shares the order-level freight options: Motor State rates the
                 # shipment, not the line.
                 ship_options=ship_options,
+                flags=line_errors,
             ))
+
+        if all_line_errors and not ship_options:
+            # Priced, but with nothing that can carry it -- which is not a quote a dealer can
+            # act on. Motor State's own wording says what to do ("select an allowable shipping
+            # method"), so it is raised rather than returned as an empty picker.
+            raise order_exceptions.OrderValidationError(
+                "; ".join(dict.fromkeys(all_line_errors)), request_payload=request_payload
+            )
 
         fees: typing.List[base.LineFee] = []
         for label, key in (
