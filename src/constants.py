@@ -2871,8 +2871,9 @@ PROVIDER_CATALOG = [
         "kind": enums.BrandProviderKind.RANDYS_WORLDWIDE,
         "name": "RANDYS Worldwide",
         "description": (
-            "RANDYS Worldwide pushes a stock file to AfterMarketScout over SFTP. The product "
-            "catalog and vehicle fitment are loaded automatically -- nothing to configure."
+            "RANDYS Worldwide's catalog, images and vehicle fitment are already loaded. Connecting "
+            "adds your own dealer pricing and stock, which RANDYS deliver to a private SFTP folder "
+            "we create for your company."
         ),
         "icon_url": "https://api.aftermarketscout.com/uploads/randys_logo.png",
         "category": "Distributors",
@@ -2881,47 +2882,68 @@ PROVIDER_CATALOG = [
         "relay_provisioned": True,
         "relay_credential_fields": ("sftp_user", "sftp_password"),
         "integration_time": "Catalog is available immediately; stock within 1 business day",
+        # The connection details in the rep-email block are the company's own auto-provisioned
+        # relay credentials, substituted per company by _render_relay_instructions_html. They are
+        # placeholders here on purpose: a literal username/password baked into this file would
+        # hand every company the same folder, and show one dealer another dealer's credentials.
         "installation_instructions_html": (
-            "<p><strong>RANDYS Worldwide</strong> is already loaded. Their catalogue &mdash; around "
-            "17,300 parts across Yukon Gear &amp; Axle, Zumbrota Drivetrain, USA Standard Gear, ICON "
-            "Vehicle Dynamics, Carli Suspension and the rest of their house brands &mdash; comes from "
-            "RANDYS' own published product data, together with vehicle fitment, so you get part "
-            "numbers, descriptions, images and year/make/model coverage without doing anything.</p>"
-            "<p>The one thing that has to come from RANDYS directly is <strong>live stock</strong>, "
-            "which they send us as a file. Below are the SFTP details to pass on to them.</p>"
+            "<p><strong>RANDYS Worldwide</strong>'s catalog of around 17,300 parts is already in "
+            "AfterMarketScout, with descriptions, images and vehicle fitment for Yukon, Zumbrota, "
+            "USA Standard Gear, ICON, Carli and their other brands. Connecting adds your own dealer "
+            "pricing and stock, which RANDYS delivers to a private SFTP folder we&rsquo;ve created "
+            "for your company. Orders go to your rep as a PDF purchase order by email. One email to "
+            "your rep sets up both.</p>"
 
-            "<p><strong>1. Send these details to your RANDYS rep</strong></p>"
+            "<p><strong>1. Email your RANDYS rep</strong></p>"
+            "<p>Copy the message below and send it to your RANDYS rep, with "
+            "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a> on CC. "
+            "The connection details are unique to your company and already filled in. Keep them "
+            "private, because anyone who has them can write to your feed folder.</p>"
+            + _CALLOUT_OPEN +
+            "<p>Hi,</p>"
+            "<p>We use AfterMarketScout as our product information management (PIM) and ordering "
+            "platform, and need two things set up for our RANDYS account:</p>"
+            "<p><strong>1. SFTP feed delivery.</strong> Please deliver our dealer pricing and "
+            "inventory files to AfterMarketScout&rsquo;s server:</p>"
             "<ul>"
-            "<li><strong>Host:</strong> <code>5.161.121.143</code></li>"
-            "<li><strong>Port:</strong> 22</li>"
-            "<li><strong>Username:</strong> {{SFTP_USER}}</li>"
-            "<li><strong>Password:</strong> {{SFTP_PASSWORD}}</li>"
-            "<li><strong>Folder:</strong> uploads</li>"
+            "<li>Host: <code>" + RANDYS_RELAY_SFTP_HOST + "</code></li>"
+            "<li>Port: <code>" + str(RANDYS_RELAY_SFTP_PORT) + "</code></li>"
+            "<li>Username: <code>{{SFTP_USER}}</code></li>"
+            "<li>Password: <code>{{SFTP_PASSWORD}}</code></li>"
+            "<li>Folder: <code>" + RANDYS_RELAY_SFTP_DIRECTORY + "</code></li>"
             "</ul>"
-            "<p>Ask them to drop their standard inventory file into the <strong>uploads</strong> "
-            "folder. They already produce it in the right shape &mdash; a two-column CSV of item "
-            "number and stock, named <code>Inventory_RWW_</code> plus a timestamp. We always read the "
-            "newest file in the folder, so they can keep sending updates to the same place and "
-            "nothing needs renaming or cleaning up.</p>"
+            "<p><strong>2. Purchase orders.</strong> Please confirm the email address we should send "
+            "purchase orders to.</p>"
+            "<p>I&rsquo;ve copied AfterMarketScout support "
+            "(<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a>) in "
+            "case you have any technical questions.</p>"
+            "<p>Thanks!</p>"
+            "</div>"
 
-            "<p><strong>2. Nothing else to do</strong></p>"
-            "<p>Once the first file lands, stock appears against the RANDYS parts already in your "
-            "catalogue. Until then the parts are visible with no quantity, and this connection shows "
-            "as waiting.</p>"
+            "<p><strong>2. Click Connect</strong></p>"
+            "<p>AfterMarketScout starts watching your folder. The catalog is available right away, "
+            "showing RANDYS&rsquo; retail prices. Your cost and stock appear after RANDYS&rsquo; first "
+            "delivery, which can take a few days depending on your rep.</p>"
 
-            "<p><strong>Notes</strong></p>"
+            "<p><strong>3. Set up ordering</strong></p>"
+            "<p>Enter the purchase-order email your rep confirmed below. You can also add an internal "
+            "CC so your team gets a copy of every order. Click <strong>Save</strong>.</p>"
+            "<p>Orders go out as PDF emails, so confirmations and tracking come back from your rep "
+            "directly rather than into AfterMarketScout.</p>"
+
+            "<p><strong>Troubleshooting</strong></p>"
             "<ul>"
-            "<li><strong>Still waiting after a day?</strong> Ask your rep to confirm the file was "
-            "uploaded and that they used the username above. Each dealer has its own folder, so a "
-            "file sent to someone else's login will not show up here.</li>"
-            "<li><strong>Stock looks stale.</strong> Quantities reflect the newest file we have "
-            "received. If RANDYS have stopped sending, the file has stopped arriving on their side "
-            "&mdash; your rep can confirm.</li>"
-            "<li><strong>Prices.</strong> Your dealer cost is not in this file. Catalogue parts carry "
-            "RANDYS' published retail price until your own cost is set up.</li>"
-            "<li><strong>Ordering.</strong> RANDYS have no ordering API, so purchase orders are "
-            "emailed to your rep as a PDF. Add their email below if you want to send orders from "
-            "AfterMarketScout.</li>"
+            "<li><strong>No files after a few days?</strong> Ask your rep to confirm the files went to "
+            "the <code>" + RANDYS_RELAY_SFTP_DIRECTORY + "</code> folder using the username above. A "
+            "file sent to another dealer&rsquo;s login won&rsquo;t show up here.</li>"
+            "<li><strong>Stock or pricing looks out of date?</strong> We always use the newest file "
+            "received. If updates have stopped, ask your rep to confirm RANDYS is still sending "
+            "them.</li>"
+            "<li><strong>Still seeing retail prices?</strong> Your pricing file hasn&rsquo;t arrived "
+            "yet. Ask your rep to include dealer pricing in the delivery.</li>"
+            "<li><strong>More than one RANDYS account?</strong> Each account needs its own folder. "
+            "Email <a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a> "
+            "and we&rsquo;ll create another one.</li>"
             "</ul>"
         ),
         # Email-channel ordering -- RANDYS have no order API of their own; see the matching note
