@@ -4401,19 +4401,17 @@ class PurchaseOrderJob(django_db_models.Model):
 # ---------------------------------------------------------------------------
 # Motor State Distributing (kind=MOTOR_STATE_DISTRIBUTING) raw feed tables.
 #
-# Motor State's API has no bulk product export. Raw ingest is built from three
-# endpoints (see src.integrations.services.motorstate):
-#   * GET /api/Brands                    -> MotorStateBrand   (global catalog)
-#   * GET /api/ProductAvailabilityChange -> MotorStateAvailability (per-company
-#       stock/status feed; also the part-number spine, since a per-brand pass
-#       with fromDateTime=epoch is the only way to enumerate every part number)
-#   * GET /api/Product (<=15 part numbers) -> MotorStateProduct (per-company
-#       detail + account pricing)
-# The catalog, stock and pricing tables are now filled from the FTP feed instead
-# (src/integrations/services/motorstate_feed.py) — one CSV per dealer account.
-# MotorStateAvailability is the one table the feed does not write: it belonged to
-# the retired ProductAvailabilityChange poll, and stock now rides on
-# MotorStateProduct.quantity / status_type. The API client stays for ordering.
+# Catalog, stock and per-company pricing all come from the FTP feed -- one CSV
+# per dealer account (src/integrations/services/motorstate_feed.py). Brands still
+# come from GET /api/Brands.
+#
+# There was a third table here, MotorStateAvailability, fed by a
+# GET /api/ProductAvailabilityChange poll that doubled as a part-number "spine"
+# because the API has no bulk product export. The feed removed the need for it --
+# brand resolves from the part number's own three-character prefix -- and it was
+# dropped in migration 0235 after sitting frozen for two months while still being
+# read as though it were current. Stock rides on MotorStateProduct.quantity /
+# status_type. The API client stays, for ordering.
 # ---------------------------------------------------------------------------
 class MotorStateBrand(django_db_models.Model):
     """A Motor State brand from GET /api/Brands. Global — brand catalog is not
@@ -4434,41 +4432,6 @@ class MotorStateBrand(django_db_models.Model):
     class Meta:
         db_table = "motorstate_brands"
         unique_together = ["code"]
-
-
-class MotorStateAvailability(django_db_models.Model):
-    """
-    One row per Motor State part number from GET /api/ProductAvailabilityChange. Doubles as the
-    catalog spine (initial per-brand epoch pass) and the live stock/status feed (periodic
-    fromDateTime=watermark polling).
-
-    Distributor-wide, not per company: stock and status are the same whichever dealer's API key
-    asks, so this is maintained once from the primary connection (like every other provider's
-    shared catalog/inventory tables) and read by every company. Only price is account-specific
-    -- see MotorStateCompanyPricing.
-
-    ``source_updated_on`` is Motor State's own UpdatedOn timestamp and is the high-water mark
-    for incremental polling. ``brand_code`` is the brand the row was fetched under during the
-    spine pass (null for rows first seen via an unfiltered incremental poll).
-    """
-
-    part_number = django_db_models.CharField(max_length=128, unique=True)
-    brand_code = django_db_models.CharField(max_length=32, null=True)
-    # Motor State StatusType: S=stocking, O=order-as-needed, X=discontinued (raw, as returned).
-    status_type = django_db_models.CharField(max_length=8, null=True)
-    quantity_available = django_db_models.IntegerField(null=True)
-    # Motor State "UpdatedOn" for this part; the incremental-poll high-water mark.
-    source_updated_on = django_db_models.DateTimeField(null=True)
-
-    created_at = django_db_models.DateTimeField(auto_now_add=True)
-    updated_at = django_db_models.DateTimeField(auto_now=True)
-
-    class Meta:
-        db_table = "motorstate_availability"
-        indexes = [
-            django_db_models.Index(fields=["source_updated_on"], name="ms_avail_updated_on_idx"),
-            django_db_models.Index(fields=["brand_code"], name="ms_avail_brand_code_idx"),
-        ]
 
 
 class MotorStateProduct(django_db_models.Model):

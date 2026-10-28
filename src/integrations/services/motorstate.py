@@ -1,54 +1,39 @@
 """
-Motor State Distributing API ingest — retired for catalog/pricing, kept for brand mapping.
+Motor State Distributing API — brand mapping, and the client the ordering path uses.
 
-The catalog, stock and per-company pricing now come from the FTP feed; see
+Catalog, stock and per-company pricing all come from the FTP feed; see
 ``src.integrations.services.motorstate_feed``. One CSV per dealer account carries the whole
 catalog plus fields the API has none of (UPC, dimensions, weight, MAP, MSRP, manufacturer part
 number, shipping flags, and on enriched accounts an image URL, a three-level category taxonomy
 and a full-length description).
 
-Still live here:
+What lives here:
+  * ``fetch_and_save_motorstate_brands`` — GET /api/Brands -> MotorStateBrand.
   * ``sync_unmapped_motorstate_brands_to_brands`` — maps MotorStateBrand to Brands; called by
     the nightly ingest after the feed pass.
   * ``sync_motorstate_company_pricing_for_company_provider`` — the name the pricing-job queue
     dispatches on, now a thin delegate to the feed.
-  * ``MotorStateApiClient`` itself, which the ordering work will use.
 
-Everything below is the API ingest path. It is no longer wired into ``ingest_all_providers``
-and is kept for one-off backfills and for reference while ordering is built out; running it
-will still write MotorStateAvailability / MotorStateProduct rows.
-
-Flow:
-  * ``fetch_and_save_motorstate_brands`` — GET /api/Brands -> MotorStateBrand.
-  * ``fetch_and_save_motorstate_availability_full`` — one epoch-dated
-    ProductAvailabilityChange pass per brand builds the full part-number spine
-    (the only way to enumerate every part number, since there is no product
-    export). Brands whose part count exceeds the 5000-row cap are recovered by
-    walking a fromDateTime ladder and unioning.
-  * ``fetch_and_save_motorstate_availability_updates`` — periodic incremental
-    poll from the stored high-water mark (max source_updated_on); the Turn14
-    inventory-updates analog.
-  * ``fetch_and_save_motorstate_products`` — parallel /api/Product lookups
-    (<=15 part numbers each) over the spine, for detail + account pricing.
+The API catalog path that used to live below this line -- an epoch-dated
+ProductAvailabilityChange sweep building a part-number spine, an incremental poll off its
+high-water mark, and a parallel /api/Product hydrate over it -- has been removed along with
+the MotorStateAvailability table it wrote. The feed replaced all three: brand comes from the
+part number's own three-character prefix rather than the spine, and the dealer file carries
+detail and pricing in one pass. It was last run manually on 2026-08-08, was never scheduled,
+and MotorStateAvailability had been frozen since 2026-09-02 while still being read as a
+"shared availability spine" that no longer reflected anything.
 """
 import decimal
 import logging
-import time
 import typing
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import timedelta
 
 import pgbulk
-from django.utils import timezone
-from django.utils.dateparse import parse_datetime
-
 from django.db.models.functions import Upper
 
 from src import enums as src_enums
 from src import models as src_models
 from src.integrations import credentials as credentials_helper
 from src.integrations.clients.motorstate import client as motorstate_client
-from src.integrations.clients.motorstate import exceptions as motorstate_exceptions
 from src.integrations.utils.brand_matching import (
     best_fuzzy_brand_match,
     brands_by_compact_key,
@@ -62,52 +47,8 @@ logger = logging.getLogger(__name__)
 _LOG_PREFIX = "[MOTOR-STATE-SERVICES]"
 
 # Epoch date that dumps the whole catalog through the availability endpoint.
-_EPOCH_FROM_DATE = "1900-01-01"
 
-# fromDateTime ladder for brands that exceed the 5000-row availability cap. Only
-# brands large enough to truncate ever trigger this (a single call otherwise),
-# so the extra requests are spent only where they are actually needed.
-_AVAILABILITY_DATE_LADDER = [
-    "1900-01-01", "2015-01-01", "2018-01-01", "2019-06-01",
-    "2020-01-01", "2020-07-01", "2021-01-01", "2021-07-01",
-    "2022-01-01", "2022-07-01", "2023-01-01", "2023-07-01",
-    "2024-01-01", "2024-07-01", "2025-01-01", "2025-04-01",
-    "2025-07-01", "2025-10-01", "2026-01-01", "2026-03-01",
-    "2026-05-01", "2026-06-01", "2026-07-01", "2026-08-01",
-]
 
-# Re-poll a small window before the last-seen change to tolerate clock skew and
-# rows sharing a timestamp boundary; upserts make the overlap harmless.
-_INCREMENTAL_OVERLAP = timedelta(minutes=30)
-
-_DEFAULT_PRODUCT_WORKERS = 5
-
-# Rows buffered on the main thread before a single bulk upsert (~9 chunks' worth).
-_PRODUCT_FLUSH_SIZE = 2000
-
-_AVAILABILITY_UPDATE_FIELDS_SPINE = [
-    "brand_code", "status_type", "quantity_available", "source_updated_on", "updated_at",
-]
-# Incremental polls carry no brand filter, so brand_code is left untouched to
-# avoid clobbering the brand recorded during the spine pass.
-_AVAILABILITY_UPDATE_FIELDS_INCREMENTAL = [
-    "status_type", "quantity_available", "source_updated_on", "updated_at",
-]
-
-# Catalog columns (global MotorStateProduct row).
-_PRODUCT_UPDATE_FIELDS = [
-    "brand", "brand_code", "found", "vendor_part_number", "supersede_part_number",
-    "short_description", "status", "is_stocking", "quantity",
-    "can_special_order", "can_drop_ship", "can_regular_back_order",
-    "data", "updated_at",
-]
-
-# Price columns (per-company MotorStateCompanyPricing row).
-_COMPANY_PRICING_UPDATE_FIELDS = [
-    "customer_price", "customer_price_non_promotional", "base_price", "list_price",
-    "map_price", "is_map_restricted", "special_order_charge", "drop_ship_charge",
-    "updated_at",
-]
 
 
 # ---------------------------------------------------------------------------
@@ -151,16 +92,6 @@ def _json_safe(value: typing.Any) -> typing.Any:
     return value
 
 
-def _parse_source_updated_on(value: typing.Optional[str]):
-    """Motor State 'UpdatedOn' (naive ISO, treated as UTC) -> aware datetime, or None."""
-    if not value:
-        return None
-    parsed = parse_datetime(str(value))
-    if parsed is None:
-        return None
-    if timezone.is_naive(parsed):
-        parsed = timezone.make_aware(parsed, timezone.utc)
-    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -206,392 +137,6 @@ def _transform_brands(brands_data: typing.List[typing.Dict]) -> typing.List[src_
             )
         )
     return instances
-
-
-# ---------------------------------------------------------------------------
-# Availability (spine + incremental) — GET /api/ProductAvailabilityChange
-# ---------------------------------------------------------------------------
-def fetch_and_save_motorstate_availability_full(
-    company_provider_id: typing.Optional[int] = None,
-) -> None:
-    """Rebuild the full part-number spine, one brand at a time. Requires brands to
-    have been fetched first (reads MotorStateBrand for the brand code list)."""
-    logger.info("{} Started full Motor State availability (spine) sync.".format(_LOG_PREFIX))
-    company_provider = _resolve_company_provider(company_provider_id)
-    if not company_provider:
-        logger.info("{} No active Motor State provider found.".format(_LOG_PREFIX))
-        return
-
-    client = _build_client(company_provider)
-
-    brand_codes = list(
-        src_models.MotorStateBrand.objects.order_by("code").values_list("code", flat=True)
-    )
-    if not brand_codes:
-        logger.warning(
-            "{} No Motor State brands stored — run fetch_and_save_motorstate_brands first.".format(
-                _LOG_PREFIX
-            )
-        )
-        return
-
-    started = time.monotonic()
-    total_rows = 0
-    for idx, brand_code in enumerate(brand_codes, start=1):
-        rows = _collect_brand_availability(client, brand_code)
-        instances = _transform_availability_rows(rows, brand_code=brand_code)
-        if instances:
-            _upsert_availability(instances, update_fields=_AVAILABILITY_UPDATE_FIELDS_SPINE)
-            total_rows += len(instances)
-        if idx % 25 == 0 or idx == len(brand_codes):
-            logger.info(
-                "{} Availability spine: {}/{} brands, {} rows in {:.1f}s.".format(
-                    _LOG_PREFIX, idx, len(brand_codes), total_rows, time.monotonic() - started
-                )
-            )
-    logger.info("{} Full availability sync done: {} rows.".format(_LOG_PREFIX, total_rows))
-
-
-def _collect_brand_availability(
-    client: motorstate_client.MotorStateApiClient,
-    brand_code: str,
-) -> typing.List[typing.Dict]:
-    """All availability rows for a brand. One epoch call unless it hits the 5000-row
-    cap, in which case walk the fromDateTime ladder and union by part number."""
-    rows = client.get_product_availability_changes(from_date_time=_EPOCH_FROM_DATE, brand=brand_code)
-    if len(rows) < motorstate_client.MAX_AVAILABILITY_RECORDS:
-        return rows
-
-    logger.info(
-        "{} Brand {} hit the {}-row cap; recovering via date ladder.".format(
-            _LOG_PREFIX, brand_code, motorstate_client.MAX_AVAILABILITY_RECORDS
-        )
-    )
-    by_part: typing.Dict[str, typing.Dict] = {}
-    for from_date in _AVAILABILITY_DATE_LADDER:
-        ladder_rows = client.get_product_availability_changes(from_date_time=from_date, brand=brand_code)
-        for row in ladder_rows:
-            part_number = (row.get("PartNumber") or "").strip()
-            if part_number:
-                by_part[part_number] = row
-    return list(by_part.values())
-
-
-def fetch_and_save_motorstate_availability_updates(
-    company_provider_id: typing.Optional[int] = None,
-) -> None:
-    """Incremental poll from the stored high-water mark (max source_updated_on for
-    this company). Unfiltered by brand — a single paged-by-date sweep of recent
-    changes. Falls back to the epoch date when nothing has been ingested yet."""
-    logger.info("{} Started Motor State availability updates.".format(_LOG_PREFIX))
-    company_provider = _resolve_company_provider(company_provider_id)
-    if not company_provider:
-        logger.info("{} No active Motor State provider found.".format(_LOG_PREFIX))
-        return
-
-    client = _build_client(company_provider)
-
-    from_date_time = _incremental_from_date_time()
-    logger.info("{} Availability updates fromDateTime={}.".format(_LOG_PREFIX, from_date_time))
-
-    rows = client.get_product_availability_changes(from_date_time=from_date_time)
-    if len(rows) >= motorstate_client.MAX_AVAILABILITY_RECORDS:
-        # More than one page of changes in the window; walk forward from the newest
-        # row's timestamp until a call comes back under the cap.
-        rows = _drain_incremental(client, seed_rows=rows)
-
-    instances = _transform_availability_rows(rows, brand_code=None)
-    if instances:
-        _upsert_availability(instances, update_fields=_AVAILABILITY_UPDATE_FIELDS_INCREMENTAL)
-    logger.info("{} Availability updates done: {} rows.".format(_LOG_PREFIX, len(instances)))
-
-
-def _incremental_from_date_time() -> str:
-    latest = (
-        src_models.MotorStateAvailability.objects
-        .exclude(source_updated_on__isnull=True)
-        .order_by("-source_updated_on")
-        .values_list("source_updated_on", flat=True)
-        .first()
-    )
-    if not latest:
-        return _EPOCH_FROM_DATE
-    return (latest - _INCREMENTAL_OVERLAP).strftime("%Y-%m-%dT%H:%M:%S")
-
-
-def _drain_incremental(
-    client: motorstate_client.MotorStateApiClient,
-    seed_rows: typing.List[typing.Dict],
-) -> typing.List[typing.Dict]:
-    """Advance fromDateTime past the newest seen change until a page is under the
-    cap, unioning by part number. Bounded so a stuck timestamp cannot loop forever."""
-    by_part: typing.Dict[str, typing.Dict] = {}
-
-    def _absorb(rows: typing.List[typing.Dict]) -> typing.Optional[str]:
-        newest: typing.Optional[str] = None
-        for row in rows:
-            part_number = (row.get("PartNumber") or "").strip()
-            if part_number:
-                by_part[part_number] = row
-            updated_on = row.get("UpdatedOn")
-            if updated_on and (newest is None or str(updated_on) > newest):
-                newest = str(updated_on)
-        return newest
-
-    newest_seen = _absorb(seed_rows)
-    for _ in range(len(_AVAILABILITY_DATE_LADDER)):
-        if not newest_seen:
-            break
-        next_rows = client.get_product_availability_changes(from_date_time=newest_seen)
-        prev_newest = newest_seen
-        newest_seen = _absorb(next_rows)
-        under_cap = len(next_rows) < motorstate_client.MAX_AVAILABILITY_RECORDS
-        if under_cap or newest_seen == prev_newest:
-            break
-    return list(by_part.values())
-
-
-def _transform_availability_rows(
-    rows: typing.List[typing.Dict],
-    brand_code: typing.Optional[str],
-) -> typing.List[src_models.MotorStateAvailability]:
-    # Dedupe within the batch — pgbulk rejects duplicate unique keys in one call.
-    by_part: typing.Dict[str, src_models.MotorStateAvailability] = {}
-    for row in rows:
-        part_number = (row.get("PartNumber") or "").strip()
-        if not part_number:
-            continue
-        by_part[part_number] = src_models.MotorStateAvailability(
-            part_number=part_number,
-            brand_code=brand_code,
-            status_type=row.get("StatusType"),
-            quantity_available=row.get("QuantityAvailable"),
-            source_updated_on=_parse_source_updated_on(row.get("UpdatedOn")),
-        )
-    return list(by_part.values())
-
-
-def _upsert_availability(
-    instances: typing.List[src_models.MotorStateAvailability],
-    update_fields: typing.List[str],
-) -> None:
-    pgbulk.upsert(
-        src_models.MotorStateAvailability,
-        instances,
-        unique_fields=["part_number"],
-        update_fields=update_fields,
-        returning=False,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Products (detail + pricing) — GET /api/Product, parallel 15-part batches
-# ---------------------------------------------------------------------------
-def fetch_and_save_motorstate_products(
-    company_provider_id: typing.Optional[int] = None,
-    part_numbers: typing.Optional[typing.List[str]] = None,
-    workers: int = _DEFAULT_PRODUCT_WORKERS,
-    include_discontinued: bool = False,
-    flush_size: int = _PRODUCT_FLUSH_SIZE,
-    write_catalog: bool = True,
-) -> None:
-    """Hydrate detail + pricing for ``part_numbers`` (default: the shared spine,
-    minus discontinued parts — Motor State returns Found=false with no data for
-    StatusType X, so hydrating them just burns API calls; pass include_discontinued
-    to force them).
-
-    ``write_catalog=False`` writes only this company's MotorStateCompanyPricing rows and
-    leaves the shared MotorStateProduct catalog untouched -- what the per-company pricing
-    job uses, since catalog and inventory are distributor-wide and maintained once from the
-    primary connection. Parts absent from the shared catalog are skipped in that mode
-    (nothing to hang a price on until the next catalog sync picks them up).
-
-    Worker threads do HTTP only (shared keep-alive session); the main thread buffers
-    the parsed rows and flushes them with a single bulk upsert every ``flush_size``
-    rows. Keeping all DB writes on one thread avoids per-chunk connection churn against
-    the remote database (the earlier stall) while still landing data progressively."""
-    logger.info("{} Started Motor State product hydrate.".format(_LOG_PREFIX))
-    company_provider = _resolve_company_provider(company_provider_id)
-    if not company_provider:
-        logger.info("{} No active Motor State provider found.".format(_LOG_PREFIX))
-        return
-
-    company = company_provider.company
-    client = _build_client(company_provider)
-
-    # Motor State's /api/Product carries no brand, so resolve each part's brand from
-    # the availability spine up front: part_number -> (MotorStateBrand id, brand code).
-    brand_by_part = _build_part_brand_map()
-
-    if part_numbers is None:
-        availability = src_models.MotorStateAvailability.objects.all()
-        if not include_discontinued:
-            # StatusType X/x = discontinued; /api/Product has no detail for these.
-            availability = availability.exclude(status_type__iexact="X")
-        part_numbers = list(availability.order_by("part_number").values_list("part_number", flat=True))
-    part_numbers = [str(pn).strip() for pn in part_numbers if str(pn).strip()]
-    if not part_numbers:
-        logger.warning("{} No part numbers to hydrate.".format(_LOG_PREFIX))
-        return
-
-    chunks = [
-        part_numbers[i : i + motorstate_client.MAX_PRODUCT_BATCH]
-        for i in range(0, len(part_numbers), motorstate_client.MAX_PRODUCT_BATCH)
-    ]
-    logger.info(
-        "{} Hydrating {} part numbers in {} chunks, {} workers (discontinued={}, "
-        "mode={}).".format(
-            _LOG_PREFIX, len(part_numbers), len(chunks), workers, include_discontinued,
-            "catalog+pricing" if write_catalog else "pricing only",
-        )
-    )
-
-    started = time.monotonic()
-    processed = 0
-    buffer: typing.List[typing.Tuple[src_models.MotorStateProduct, typing.Dict]] = []
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = [executor.submit(_fetch_product_chunk_rows, client, chunk) for chunk in chunks]
-        for done, future in enumerate(as_completed(futures), start=1):
-            for row in future.result():
-                pair = _transform_product_row(row, brand_by_part=brand_by_part)
-                if pair is not None:
-                    buffer.append(pair)
-            if len(buffer) >= flush_size:
-                processed += _flush_product_buffer(buffer, company, write_catalog)
-                buffer = []
-            if done % 200 == 0 or done == len(chunks):
-                logger.info(
-                    "{} Products: {}/{} chunks, {} rows in {:.1f}s.".format(
-                        _LOG_PREFIX, done, len(chunks), processed, time.monotonic() - started
-                    )
-                )
-    processed += _flush_product_buffer(buffer, company, write_catalog)
-    logger.info("{} Product hydrate done: {} rows.".format(_LOG_PREFIX, processed))
-
-
-def _build_part_brand_map() -> typing.Dict[str, typing.Tuple[typing.Optional[int], typing.Optional[str]]]:
-    """part_number -> (MotorStateBrand id, brand code) from the shared availability spine.
-    Brand id is None for a code with no matching MotorStateBrand row."""
-    brand_id_by_code = dict(src_models.MotorStateBrand.objects.values_list("code", "id"))
-    mapping: typing.Dict[str, typing.Tuple[typing.Optional[int], typing.Optional[str]]] = {}
-    for part_number, brand_code in (
-        src_models.MotorStateAvailability.objects
-        .values_list("part_number", "brand_code")
-        .iterator()
-    ):
-        mapping[part_number] = (brand_id_by_code.get(brand_code) if brand_code else None, brand_code)
-    return mapping
-
-
-def _fetch_product_chunk_rows(
-    client: motorstate_client.MotorStateApiClient,
-    chunk: typing.List[str],
-) -> typing.List[typing.Dict]:
-    """Network-only worker: fetch one <=15-part batch, no DB access. A failed batch
-    is logged and dropped so it can't sink the whole run."""
-    try:
-        return client.get_products(chunk)
-    except motorstate_exceptions.MotorStateAPIException as e:
-        logger.error("{} Product chunk failed ({}): {}".format(_LOG_PREFIX, chunk, str(e)))
-        return []
-
-
-def _flush_product_buffer(
-    buffer: typing.List[typing.Tuple[src_models.MotorStateProduct, typing.Dict]],
-    company: src_models.Company,
-    write_catalog: bool = True,
-) -> int:
-    """
-    Bulk-upsert one buffer (main thread only): the shared catalog rows first when
-    ``write_catalog``, then this company's price rows keyed to them. Returns rows written.
-    """
-    if not buffer:
-        return 0
-
-    # Same part number can repeat across chunks; last one wins (pgbulk rejects dupes in a batch).
-    by_part: typing.Dict[str, typing.Tuple[src_models.MotorStateProduct, typing.Dict]] = {}
-    for product, price_kwargs in buffer:
-        by_part[product.part_number] = (product, price_kwargs)
-
-    products = [p for p, _ in by_part.values()]
-    if write_catalog:
-        pgbulk.upsert(
-            src_models.MotorStateProduct,
-            products,
-            unique_fields=["part_number"],
-            update_fields=_PRODUCT_UPDATE_FIELDS,
-            returning=False,
-        )
-
-    # Re-read ids: pgbulk doesn't populate pks on the instances it upserts. In pricing-only
-    # mode this also filters out parts the shared catalog doesn't carry yet.
-    product_ids = dict(
-        src_models.MotorStateProduct.objects.filter(
-            part_number__in=list(by_part.keys())
-        ).values_list("part_number", "id")
-    )
-    pricing_rows = [
-        src_models.MotorStateCompanyPricing(
-            product_id=product_ids[part_number], company=company, **price_kwargs
-        )
-        for part_number, (_, price_kwargs) in by_part.items()
-        if part_number in product_ids
-    ]
-    if pricing_rows:
-        pgbulk.upsert(
-            src_models.MotorStateCompanyPricing,
-            pricing_rows,
-            unique_fields=["product", "company"],
-            update_fields=_COMPANY_PRICING_UPDATE_FIELDS,
-            returning=False,
-        )
-
-    return len(products) if write_catalog else len(pricing_rows)
-
-
-def _transform_product_row(
-    row: typing.Dict,
-    brand_by_part: typing.Dict[str, typing.Tuple[typing.Optional[int], typing.Optional[str]]],
-) -> typing.Optional[typing.Tuple[src_models.MotorStateProduct, typing.Dict]]:
-    """
-    Split one /api/Product row into its global catalog row and the account-specific price
-    values. Returns ``(product, price_kwargs)``; the caller attaches ``price_kwargs`` to a
-    MotorStateCompanyPricing row once the product's id is known.
-    """
-    part_number = (row.get("PartNumber") or "").strip()
-    if not part_number:
-        return None
-    found = bool(row.get("Found", False))
-    product = row.get("Product") or {}
-    brand_id, brand_code = brand_by_part.get(part_number, (None, None))
-
-    catalog = src_models.MotorStateProduct(
-        part_number=part_number,
-        brand_id=brand_id,
-        brand_code=brand_code,
-        found=found,
-        vendor_part_number=product.get("VendorPartNumber"),
-        supersede_part_number=product.get("SupersedePartNumber"),
-        short_description=product.get("ShortDescription"),
-        status=product.get("Status"),
-        is_stocking=bool(product.get("IsStocking", False)),
-        quantity=product.get("Quantity"),
-        can_special_order=bool(product.get("CanSpecialOrder", False)),
-        can_drop_ship=bool(product.get("CanDropShip", False)),
-        can_regular_back_order=bool(product.get("CanRegularBackOrder", False)),
-        data=_json_safe(product) or None,
-    )
-    price_kwargs = {
-        "customer_price": product.get("CustomerPrice"),
-        "customer_price_non_promotional": product.get("CustomerPriceNonPromotional"),
-        "base_price": product.get("BasePrice"),
-        "list_price": product.get("ListPrice"),
-        "map_price": product.get("MapPrice"),
-        "is_map_restricted": bool(product.get("IsMapRestricted", False)),
-        "special_order_charge": product.get("SpecialOrderCharge"),
-        "drop_ship_charge": product.get("DropShipCharge"),
-    }
-    return catalog, price_kwargs
 
 
 # ---------------------------------------------------------------------------

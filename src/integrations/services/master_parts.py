@@ -6323,8 +6323,8 @@ def sync_provider_inventory_from_motorstate() -> None:
     Also refreshes ProviderPart.product_details from the same row.
 
     Stock comes from the daily FTP feed. The incremental ProductAvailabilityChange poll that
-    used to supply a fresher number is retired along with the rest of the API ingest, so
-    MotorStateAvailability is no longer read here.
+    used to supply a fresher number was retired along with the rest of the API ingest, and the
+    table it wrote was dropped in migration 0235.
     """
     logger.info("{} Syncing provider inventory from Motor State.".format(_LOG_PREFIX))
 
