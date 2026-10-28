@@ -157,8 +157,16 @@ class PaymentMethodTests(SimpleTestCase):
 
 
 class _ProviderPart:
-    def __init__(self, external_id, pk=1):
-        self.provider_external_id = external_id
+    """
+    ``provider_external_id`` is "{motorstate_brand_id}_{part_number}", NOT the part number --
+    see master_parts._motorstate_provider_external_id. The fakes build it that way on purpose:
+    an earlier version of these tests passed a bare part number and so happily passed while the
+    adapter was sending "322_MAH4065MS-112-1" to Motor State as a part number.
+    """
+    def __init__(self, part_number, pk=1, brand_id=322, external_id=None):
+        self.provider_external_id = (
+            external_id if external_id is not None else "{}_{}".format(brand_id, part_number)
+        )
         self.id = pk
 
 
@@ -398,6 +406,38 @@ class StatusAndInvoiceTests(_AdapterHarness):
         a = self.adapter(_Client(orders=[{"Found": True, "Order": dict(
             ORDER_RESULT, InvoiceDate=None, InvoiceAmount=None)}]))
         self.assertEqual(a.get_invoices(_PO()), [])
+
+
+class PartNumberUnpackingTests(SimpleTestCase):
+    """
+    The single most dangerous field in this adapter. ``provider_external_id`` carries the
+    Motor State brand row id joined to the part number, and sending it unsplit means every
+    order line names a part that does not exist.
+    """
+    databases = []
+
+    def _unpack(self, external_id):
+        return ms_orders.MotorStateOrderAdapter.motorstate_part_number(
+            _ProviderPart(None, external_id=external_id))
+
+    def test_the_brand_id_prefix_is_stripped(self):
+        self.assertEqual(self._unpack("322_MAH4065MS-112-1"), "MAH4065MS-112-1")
+
+    def test_only_the_first_underscore_splits(self):
+        """Motor State part numbers contain underscores and hyphens of their own."""
+        self.assertEqual(self._unpack("322_ABC_123-X"), "ABC_123-X")
+
+    def test_a_bare_part_number_is_passed_through_unchanged(self):
+        """No digit prefix means nothing to unpack -- quote it rather than fail."""
+        self.assertEqual(self._unpack("MAH4065MS-112-1"), "MAH4065MS-112-1")
+        self.assertEqual(self._unpack("ABC-123"), "ABC-123")
+
+    def test_the_cart_sends_the_unpacked_number(self):
+        lines, index = ms_orders.MotorStateOrderAdapter._cart_lines(
+            [_line(11, "MAH4065MS-112-1", 1), _line(12, "AAA00004", 2)])
+        self.assertEqual([l["part_number"] for l in lines], ["MAH4065MS-112-1", "AAA00004"])
+        self.assertEqual(index["MAH4065MS-112-1"], 11)
+        self.assertNotIn("322_MAH4065MS-112-1", index)
 
 
 class CapabilityTests(_AdapterHarness):

@@ -50,7 +50,13 @@ class MotorStateLiveInventoryProvider(base.LiveInventoryProvider):
         )
 
     def refresh(self, provider_part: src_models.ProviderPart) -> src_models.ProviderPartInventory:
-        part_number = (provider_part.provider_external_id or "").strip()
+        # provider_external_id is "{motorstate_brand_id}_{part_number}" (master_parts'
+        # _motorstate_provider_external_id), not the part number itself -- the same compound
+        # shape NTW and AllPro use. Matching on it directly finds nothing, every time.
+        external_id = (provider_part.provider_external_id or "").strip()
+        brand_id, _, part_number = external_id.partition("_")
+        if not (brand_id.isdigit() and part_number):
+            part_number = external_id
         if not part_number:
             raise live_exceptions.LiveInventoryNotFoundError(
                 "ProviderPart {} has no Motor State part number.".format(provider_part.id)

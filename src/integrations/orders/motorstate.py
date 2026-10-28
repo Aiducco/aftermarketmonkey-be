@@ -134,6 +134,28 @@ class MotorStateOrderAdapter(base.DistributorOrderAdapter):
         return self._payment
 
     @staticmethod
+    def motorstate_part_number(provider_part: src_models.ProviderPart) -> str:
+        """
+        Motor State's own part number, unpacked from ``provider_external_id``.
+
+        That field is NOT the part number: master_parts keys it as
+        ``"{motorstate_brand_id}_{part_number}"`` (see _motorstate_provider_external_id), the
+        same compound shape NTW and AllPro use. Sending it verbatim would put
+        "322_MAH4065MS-112-1" in the Lines array and the order would be rejected -- or worse,
+        silently match nothing.
+
+        Split on the FIRST underscore only: the brand id is digits, and Motor State's own part
+        numbers contain hyphens and underscores of their own.
+        """
+        external_id = (provider_part.provider_external_id or "").strip()
+        brand_id, _, part_number = external_id.partition("_")
+        if brand_id.isdigit() and part_number:
+            return part_number
+        # Nothing to unpack -- treat the whole value as the part number rather than failing,
+        # so a row written by a different path still quotes.
+        return external_id
+
+    @staticmethod
     def _cart_lines(
         line_items: typing.Sequence[base.OrderLineItemRequest],
     ) -> typing.Tuple[typing.List[typing.Dict], typing.Dict[str, int]]:
@@ -145,7 +167,7 @@ class MotorStateOrderAdapter(base.DistributorOrderAdapter):
         lines: typing.List[typing.Dict] = []
         index: typing.Dict[str, int] = {}
         for position, item in enumerate(line_items, start=1):
-            part_number = (item.provider_part.provider_external_id or "").strip()
+            part_number = MotorStateOrderAdapter.motorstate_part_number(item.provider_part)
             if not part_number:
                 raise order_exceptions.OrderValidationError(
                     "ProviderPart {} has no Motor State part number.".format(item.provider_part.id)
