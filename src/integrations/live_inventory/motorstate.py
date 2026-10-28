@@ -127,11 +127,12 @@ class MotorStateLiveInventoryProvider(base.LiveInventoryProvider):
                 "warehouse_total_qty": quantity,
                 "manufacturer_inventory": None,
                 "manufacturer_esd": None,
-                # Motor State publishes no per-warehouse split -- the feed sync puts the status
-                # here instead, and this matches it rather than inventing a location.
-                "warehouse_availability": (
-                    {"status": product.status_type} if product.status_type else None
-                ),
+                # None, matching the feed sync: Motor State publishes no per-warehouse split,
+                # and the part-detail endpoint renders whatever is here as warehouse rows. An
+                # earlier version of this wrote {"status": ...}, which both disagreed with the
+                # feed's own shape AND dropped the quantity, so a refresh replaced a real number
+                # with a phantom warehouse.
+                "warehouse_availability": None,
                 "last_synced_at": now,
             },
         )

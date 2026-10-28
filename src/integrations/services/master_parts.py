@@ -6045,6 +6045,14 @@ def _motorstate_master_part_number(
     return v if v else (part_number or "").strip()
 
 
+_MOTORSTATE_STATUS_LABELS = {
+    "S": "Stock",
+    "O": "Special order",
+    "X": "Discontinued",
+    "D": "Dealer direct",
+}
+
+
 def _motorstate_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
     """product_details for a MotorStateProduct row (shown on ProviderPart)."""
     return [
@@ -6054,6 +6062,11 @@ def _motorstate_product_details(row: typing.Dict) -> typing.List[typing.Dict]:
         {"key": "long_description", "label": "Long Description", "value": row.get("long_description") or None},
         {"key": "upc", "label": "UPC", "value": row.get("upc") or None},
         {"key": "supersede", "label": "Superseded By", "value": row.get("supersede_part_number") or None},
+        # Where the feed's StatusType lives now that warehouse_availability no longer carries
+        # it. S is stock, O is special order, X is discontinued, D is a dealer-direct item.
+        {"key": "status", "label": "Stock Status", "value": _MOTORSTATE_STATUS_LABELS.get(
+            (row.get("status_type") or "").strip().upper()
+        ) or (row.get("status_type") or None)},
     ]
 
 
@@ -6391,7 +6404,15 @@ def sync_provider_inventory_from_motorstate() -> None:
                         warehouse_total_qty=qty or 0,
                         manufacturer_inventory=None,
                         manufacturer_esd=None,
-                        warehouse_availability={"status_type": status_type, "total": qty or 0},
+                        # None, not a dict: Motor State publishes NO per-warehouse breakdown --
+                        # QtyAvail is one distributor-wide number, which is exactly what
+                        # warehouse_total_qty above already carries. This field used to hold
+                        # {"status_type": ..., "total": ...}, and since the part-detail endpoint
+                        # applies no mapper for this kind it handed that straight to the UI,
+                        # which renders every key as a warehouse row -- so each Motor State part
+                        # showed phantom warehouses called "total" and "status_type". The status
+                        # itself is not lost; it moves to product_details below.
+                        warehouse_availability=None,
                         last_synced_at=now,
                         updated_at=now,
                     )
