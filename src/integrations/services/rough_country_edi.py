@@ -260,7 +260,9 @@ def _lines_by_part_number(
     for line_item in queryset:
         if line_item.provider_part_id is None:
             continue
-        key = (line_item.provider_part.provider_external_id or "").strip().upper()
+        # Keyed on Rough Country's own SKU, because that is what their 855/856/810 echo back.
+        # provider_external_id is "{rc_brand_id}_{sku}" and would never match.
+        key = rough_country_edi.rough_country_sku(line_item.provider_part).upper()
         grouped.setdefault(key, []).append(line_item)
     return grouped
 

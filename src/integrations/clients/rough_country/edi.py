@@ -290,6 +290,36 @@ class RoughCountryEdiClient:
         return results
 
 
+def rough_country_sku(provider_part: src_models.ProviderPart) -> str:
+    """
+    Rough Country's real SKU for a ProviderPart -- NOT ``provider_external_id``.
+
+    That column is a composite ``"{rc_brand_id}_{sku}"`` key (see
+    ``master_parts._rough_country_provider_external_id``), needed only for our own uniqueness
+    because the same SKU can recur under different Rough Country brands. A real part is stored as
+    ``8_50120580`` while Rough Country calls it ``50120580``.
+
+    Sending the composite key would break the integration in both directions, and did: the 850's
+    ``VC`` element is how Rough Country identifies the item, and their 855/856/810 echo their own
+    number back, so matching an inbound document to a PO line compares against this too.
+
+    Same resolution order as ``premier._premier_item_number``, which has the identical composite-
+    key problem: ``product_details``' "sku" entry carries the raw number directly (see
+    master_parts' Rough Country sync), and splitting ``provider_external_id`` on its FIRST
+    underscore is the fallback if that is ever missing or stale. First underscore, not last --
+    Rough Country SKUs contain underscores of their own (``501065_C`` is a real part) and the
+    brand-id prefix is always purely numeric.
+    """
+    for entry in provider_part.product_details or []:
+        if isinstance(entry, dict) and entry.get("key") == "sku" and entry.get("value"):
+            return str(entry["value"]).strip()
+    external_id = (provider_part.provider_external_id or "").strip()
+    prefix, separator, remainder = external_id.partition("_")
+    if separator and prefix.isdigit() and remainder:
+        return remainder.strip()
+    return external_id
+
+
 def _assert_complete(payload: str, remote_path: str) -> None:
     """
     Refuse to archive anything that isn't a whole interchange.

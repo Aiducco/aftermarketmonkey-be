@@ -219,6 +219,37 @@ class AdapterCapabilityTests(RoughCountryEdiFixture):
         self.account.save(update_fields=["credentials"])
         self.assertIsNone(order_registry.get_adapter(self.company_provider, self.account))
 
+    def test_the_850_carries_rough_countrys_sku_not_our_composite_key(self):
+        """
+        ProviderPart.provider_external_id is "{rc_brand_id}_{sku}" -- a real part is stored as
+        8_50120580 while Rough Country calls it 50120580. Sending the composite key put an
+        unrecognisable part number in VC on two real customer orders (POs 165/167, 28 Oct 2026),
+        so neither could be matched on their side.
+        """
+        self.provider_part.provider_external_id = "8_50120580"
+        self.provider_part.product_details = [{"key": "sku", "value": "50120580"}]
+        self.provider_part.save(update_fields=["provider_external_id", "product_details"])
+
+        adapter = self.adapter()
+        ship_to = order_base.ShipToAddress("A", "1 Main", "Dallas", "TX", "75201", "US")
+        items = [order_base.OrderLineItemRequest(self.line_item.id, self.provider_part, 1)]
+        with mock.patch.object(
+            rough_country_edi.RoughCountryEdiClient, "send_document", return_value="/Inbound/850/x"
+        ) as send:
+            adapter.submit_order(self.po, items, ship_to)
+        po1 = x12.parse_interchange(send.call_args[0][2]).transactions()[0].find("PO1")
+        self.assertEqual(po1.get(7), "50120580")  # VC -- theirs
+        self.assertNotIn("8_", po1.get(7))
+
+    def test_the_sku_falls_back_to_the_prefix_split_when_product_details_is_stale(self):
+        from src.integrations.clients.rough_country import edi as rc_edi
+
+        self.provider_part.provider_external_id = "8_501065_C"
+        self.provider_part.product_details = []
+        self.provider_part.save(update_fields=["provider_external_id", "product_details"])
+        # First underscore only: Rough Country SKUs contain their own.
+        self.assertEqual(rc_edi.rough_country_sku(self.provider_part), "501065_C")
+
     def test_email_ordering_is_no_longer_offered_or_honoured(self):
         """
         Rough Country withdrew the email channel in Oct 2026. Three live connections were still
@@ -420,6 +451,21 @@ class ApplyInboundTests(RoughCountryEdiFixture):
         self.assertEqual(self.line_item.quantity_backordered, 0)
         self.assertEqual(self.line_item.status, src_enums.PurchaseOrderLineItemStatus.CONFIRMED.value)
         self.assertEqual(document.purchase_order_id, self.po.id)
+
+    def test_an_inbound_document_matches_on_rough_countrys_sku(self):
+        """The other half of the same bug: their 855 echoes 50120580, so a matcher keyed on
+        8_50120580 would leave every line unconfirmed."""
+        self.provider_part.provider_external_id = "8_50120580"
+        self.provider_part.product_details = [{"key": "sku", "value": "50120580"}]
+        self.provider_part.save(update_fields=["provider_external_id", "product_details"])
+
+        document, _, applied = self._apply(_855(part="50120580"), "855")
+        self.assertTrue(applied)
+        self.line_item.refresh_from_db()
+        self.assertEqual(self.line_item.quantity_confirmed, 1)
+        self.assertEqual(
+            self.line_item.status, src_enums.PurchaseOrderLineItemStatus.CONFIRMED.value
+        )
 
     def test_a_replayed_855_is_recognised_and_not_applied_twice(self):
         """FTP delivery is at-least-once: the same file reappears whenever archiving failed."""

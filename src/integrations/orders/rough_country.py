@@ -234,7 +234,10 @@ class RoughCountryEdiOrderAdapter(base.DistributorOrderAdapter):
                 po_850.Po850Line(
                     line_number=position,
                     quantity=item.quantity,
-                    rough_country_part_number=provider_part.provider_external_id,
+                    # Rough Country's own SKU, NOT provider_external_id -- that column is a
+                    # composite "{rc_brand_id}_{sku}" their translator cannot match. See
+                    # rough_country_edi.rough_country_sku.
+                    rough_country_part_number=rough_country_edi.rough_country_sku(provider_part),
                     # Our own item code, the SK qualifier. Same precedent as the PO PDF: the
                     # master part number where we have one, else the distributor's own id.
                     our_part_number=(master_part.part_number if master_part else provider_part.provider_external_id),
