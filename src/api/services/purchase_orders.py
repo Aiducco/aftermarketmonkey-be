@@ -1046,7 +1046,9 @@ def _serialize_confirmed_distributor_order(
 
 
 def _emailed_distributor_order_line_item(
-    li: src_models.PurchaseOrderLineItem, shipments_by_id: typing.Dict[str, typing.Dict]
+    li: src_models.PurchaseOrderLineItem,
+    shipments_by_id: typing.Dict[str, typing.Dict],
+    include_line_status: bool = False,
 ) -> typing.Dict:
     """One PO line item in the same standardized shape the raw_response parsers emit (see
     turn_14._parse_order_lines), so the confirmed-order view renders an emailed order through
@@ -1054,9 +1056,15 @@ def _emailed_distributor_order_line_item(
     _serialize_line_item (distributor quote wins over the catalog snapshot when one exists),
     which for an email account is just the catalog snapshot — no quote ever runs there.
 
-    ``status`` stays None rather than borrowing "confirmed": the distributor hasn't told us
-    anything about this line, only that a PDF was emailed. Keystone already emits None for a
-    line whose status code it can't map, so None is an established value here, not a new one.
+    ``status`` stays None for the email channel rather than borrowing "confirmed": the
+    distributor hasn't told us anything about this line, only that a PDF was emailed. Keystone
+    already emits None for a line whose status code it can't map, so None is an established
+    value here, not a new one.
+
+    EDI is the exception, and ``include_line_status`` is how it says so. There the distributor
+    HAS spoken per line -- our status is written straight from their 855's ACK code and their
+    856's shipped quantities (see services.rough_country_edi) -- so reporting it is their word,
+    not ours.
     """
     return {
         "part_number": li.provider_part.master_part.part_number if li.provider_part.master_part else None,
@@ -1067,24 +1075,48 @@ def _emailed_distributor_order_line_item(
         "line_total": _decimal_to_float(purchase_order_jobs.effective_line_total(li)),
         "warehouse_code": li.warehouse_code,
         "warehouse_name": _single_shipment_warehouse_name(li, shipments_by_id),
-        "status": None,
+        "status": li.status_name.lower() if include_line_status and li.status_name else None,
     }
 
 
-def _serialize_emailed_distributor_orders(po: src_models.PurchaseOrder) -> typing.List[typing.Dict]:
+def _local_order_freight(po: src_models.PurchaseOrder) -> typing.Optional[decimal.Decimal]:
     """
-    Email-channel stand-in for _serialize_confirmed_distributor_order. There's no distributor
-    API behind an emailed PO, so its PurchaseOrderDistributorOrder.raw_response holds only the
-    delivery envelope ({channel, to, cc, sent_at} — see email_order.EmailOrderAdapter.
-    submit_order), no order body: parsing it yields the all-null/empty shape, which renders as a
-    blank confirmed-order screen. Fill the same fields from what we do know — our own line items
-    and computed totals, i.e. exactly what was printed on the PDF the rep received — so the FE
-    can show the order it placed.
+    Freight for a channel with no parseable distributor body.
 
-    Everything here is ours, not the distributor's, and the response says so: fulfillment_channel
-    is "email" at the top level, distributor_status/tracking/invoice ids stay null/empty (nobody
-    has confirmed, shipped or billed anything yet), and per-line status stays None. Only the
-    order contents and pricing are filled in.
+    Prefers an invoice's actual freight over our own estimate, because on EDI the estimate does
+    not exist: Rough Country has no quote document, so po.estimated_shipping is None until their
+    810 arrives and tells us what the shipping really cost. Falls back to the estimate, which is
+    what the email channel has.
+    """
+    for invoice in po.invoices.all():
+        if invoice.freight is not None:
+            return invoice.freight
+    return po.estimated_shipping
+
+
+def _serialize_local_distributor_orders(
+    po: src_models.PurchaseOrder, fulfillment_channel: str
+) -> typing.List[typing.Dict]:
+    """
+    Stand-in for _serialize_confirmed_distributor_order on the channels whose
+    PurchaseOrderDistributorOrder.raw_response is not a parseable distributor order body, so
+    raw_response_parsers.parse returns the all-null/empty shape and the confirmed-order screen
+    renders blank. Fill the same fields from what we do know instead.
+
+    Two channels land here for different reasons:
+
+    * **email** — there is no distributor API at all. raw_response holds only the delivery
+      envelope ({channel, to, cc, sent_at} — see email_order.EmailOrderAdapter.submit_order).
+      Nothing has been confirmed, shipped or billed, so distributor_status, tracking, invoice
+      ids and per-line status all stay null/empty; only the order contents and pricing are
+      filled, i.e. exactly what was printed on the PDF the rep received.
+    * **edi** — there IS a distributor, and it has answered; its answers just arrive as X12
+      documents applied onto our own rows rather than as a response body to parse. raw_response
+      holds the decoded 855 (see services.rough_country_edi), which carries no pricing, so
+      contents and prices come from our records the same way — but distributor_status, tracking,
+      invoice ids and per-line status are genuinely theirs and ARE reported. Omitting them would
+      hide a confirmed order's real state behind a blank screen, which is what this function
+      exists to prevent.
 
     Lines are attached to whichever distributor order they were placed on
     (PurchaseOrderLineItem.distributor_order), falling back to the sole distributor order when
@@ -1095,12 +1127,18 @@ def _serialize_emailed_distributor_orders(po: src_models.PurchaseOrder) -> typin
     if not pdos:
         return []
 
+    # EDI is the one channel here whose distributor has actually told us something.
+    distributor_has_spoken = fulfillment_channel == "edi"
+
     shipments_by_id = {s["id"]: s for s in (po.shipments or [])}
     lines_by_pdo_id: typing.Dict[typing.Optional[int], typing.List[typing.Dict]] = {}
     for li in po.line_items.select_related("provider_part__master_part").order_by("id"):
         lines_by_pdo_id.setdefault(li.distributor_order_id, []).append(
-            _emailed_distributor_order_line_item(li, shipments_by_id)
+            _emailed_distributor_order_line_item(li, shipments_by_id, include_line_status=distributor_has_spoken)
         )
+    invoice_numbers = (
+        [inv.invoice_number for inv in po.invoices.all() if inv.invoice_number] if distributor_has_spoken else []
+    )
 
     unassigned = lines_by_pdo_id.pop(None, []) if len(pdos) == 1 else []
 
@@ -1113,14 +1151,25 @@ def _serialize_emailed_distributor_orders(po: src_models.PurchaseOrder) -> typin
         # Only lend them to the single-order case (every emailed PO today); otherwise the
         # summed line totals above stand on their own.
         single_order = len(pdos) == 1
+        # Tracking in the same shape the raw_response parsers emit (see turn_14), so the FE
+        # renders it through one code path. Rough Country's carrier code is their own private
+        # value -- "99" appeared against a published list of 55/58/78/79 -- so it is passed
+        # through verbatim rather than mapped.
+        tracking = (
+            [{"tracking_number": number, "method": pdo.carrier} for number in (pdo.tracking_numbers or [])]
+            if distributor_has_spoken
+            else []
+        )
         serialized.append(
             {
                 "distributor_order_number": pdo.distributor_order_number,
-                "distributor_status": None,
-                "distributor_invoice_ids": [],
-                "tracking": [],
+                "distributor_status": (
+                    (pdo.distributor_order_status_name or pdo.status_name) if distributor_has_spoken else None
+                ),
+                "distributor_invoice_ids": invoice_numbers if single_order else [],
+                "tracking": tracking,
                 "total": _decimal_to_float(po.total) if single_order else None,
-                "freight": _decimal_to_float(po.estimated_shipping) if single_order else None,
+                "freight": _decimal_to_float(_local_order_freight(po)) if single_order else None,
                 "discount": None,
                 "subtotal": _decimal_to_float(po.subtotal) if single_order and po.subtotal is not None else subtotal,
                 "line_items": line_items,
@@ -1171,12 +1220,13 @@ def get_confirmed_purchase_order_detail(company_id: int, purchase_order_id: int)
         "recent_order": bool(
             po.submitted_at and (django_timezone.now() - po.submitted_at) <= _RECENT_ORDER_WINDOW
         ),
-        # API orders keep reading straight off the distributor's stored raw_response; an emailed
-        # PO has no such response to read, so its contents come from our own line items instead
-        # — see _serialize_emailed_distributor_orders.
+        # API orders keep reading straight off the distributor's stored raw_response. 'email'
+        # and 'edi' have no parseable order body there, so parsing yields an empty order and a
+        # blank screen; both are served from our own line items instead -- see
+        # _serialize_local_distributor_orders for how the two channels differ.
         "distributor_orders": (
-            _serialize_emailed_distributor_orders(po)
-            if fulfillment_channel == "email"
+            _serialize_local_distributor_orders(po, fulfillment_channel)
+            if fulfillment_channel in ("email", "edi")
             else [_serialize_confirmed_distributor_order(pdo, provider_kind) for pdo in po.distributor_orders.all()]
         ),
     }

@@ -219,6 +219,9 @@ class RoughCountryEdiFixture(TestCase):
             provider_part=self.provider_part,
             quantity=1,
             unit_cost=decimal.Decimal("33.22"),
+            # Set on every real line at add-to-cart time; the confirmed view's line_total comes
+            # from here via effective_line_total.
+            line_total=decimal.Decimal("33.22"),
             status=src_enums.PurchaseOrderLineItemStatus.PENDING.value,
             status_name=src_enums.PurchaseOrderLineItemStatus.PENDING.name,
         )
@@ -695,3 +698,92 @@ class ApplyInboundTests(RoughCountryEdiFixture):
         self._apply(_855(), "855")
         self.po.refresh_from_db()
         self.assertEqual(self.po.status, src_enums.PurchaseOrderStatus.CANCELLED.value)
+
+
+class ConfirmedOrderViewTests(RoughCountryEdiFixture):
+    """
+    The confirmed-order screen for an EDI purchase order.
+
+    It renders from PurchaseOrderDistributorOrder.raw_response via raw_response_parsers, which
+    has no Rough Country entry -- so it returned the empty shape and AMS-000167 showed a
+    confirmed order with no parts, no prices and no totals. Only the status was right.
+    """
+
+    def _confirmed(self):
+        from src.api.services import purchase_orders as po_services
+
+        return po_services._serialize_local_distributor_orders(self.po, "edi")
+
+    def test_line_items_are_populated_for_an_edi_order(self):
+        src_models.PurchaseOrderDistributorOrder.objects.create(
+            purchase_order=self.po,
+            distributor_order_number=_PO_NUMBER,
+            status=src_enums.PurchaseOrderDistributorOrderStatus.CONFIRMED.value,
+            status_name=src_enums.PurchaseOrderDistributorOrderStatus.CONFIRMED.name,
+        )
+        order = self._confirmed()[0]
+        self.assertEqual(len(order["line_items"]), 1, "an EDI order must not render with no lines")
+        line = order["line_items"][0]
+        self.assertEqual(line["part_number"], self.master_part.part_number)
+        self.assertEqual(line["quantity"], 1)
+        self.assertIsNotNone(line["unit_price"])
+        self.assertIsNotNone(line["line_total"])
+
+    def test_the_distributors_own_answers_are_reported(self):
+        """Unlike the email channel, Rough Country HAS spoken: per-line state comes from their
+        855's ACK and their 856's quantities, so hiding it would be wrong."""
+        self.line_item.status = src_enums.PurchaseOrderLineItemStatus.CONFIRMED.value
+        self.line_item.status_name = src_enums.PurchaseOrderLineItemStatus.CONFIRMED.name
+        self.line_item.save(update_fields=["status", "status_name"])
+        pdo = src_models.PurchaseOrderDistributorOrder.objects.create(
+            purchase_order=self.po,
+            distributor_order_number=_PO_NUMBER,
+            status=src_enums.PurchaseOrderDistributorOrderStatus.CONFIRMED.value,
+            status_name=src_enums.PurchaseOrderDistributorOrderStatus.CONFIRMED.name,
+            tracking_numbers=["546558395139"],
+            carrier="99",
+        )
+        self.line_item.distributor_order = pdo
+        self.line_item.save(update_fields=["distributor_order"])
+
+        order = [o for o in self._confirmed() if o["distributor_order_number"] == _PO_NUMBER][0]
+        self.assertEqual(order["distributor_status"], "CONFIRMED")
+        self.assertEqual(order["tracking"], [{"tracking_number": "546558395139", "method": "99"}])
+        self.assertEqual(order["line_items"][0]["status"], "confirmed")
+
+    def test_the_email_channel_still_reports_nothing_from_the_distributor(self):
+        """Email has no distributor behind it; borrowing a status there would be a lie."""
+        from src.api.services import purchase_orders as po_services
+
+        src_models.PurchaseOrderDistributorOrder.objects.create(
+            purchase_order=self.po,
+            distributor_order_number=_PO_NUMBER,
+            status=src_enums.PurchaseOrderDistributorOrderStatus.SUBMITTED.value,
+            status_name=src_enums.PurchaseOrderDistributorOrderStatus.SUBMITTED.name,
+            tracking_numbers=["SHOULD-NOT-APPEAR"],
+        )
+        order = po_services._serialize_local_distributor_orders(self.po, "email")[0]
+        self.assertIsNone(order["distributor_status"])
+        self.assertEqual(order["tracking"], [])
+        self.assertEqual(order["distributor_invoice_ids"], [])
+        self.assertIsNone(order["line_items"][0]["status"])
+        # but the contents are still filled in, which is the point of the email path
+        self.assertEqual(len(order["line_items"]), 1)
+
+    def test_invoice_freight_wins_over_our_estimate(self):
+        """Rough Country has no quote document, so estimated_shipping is None until their 810
+        says what shipping actually cost."""
+        from src.api.services import purchase_orders as po_services
+
+        src_models.PurchaseOrderDistributorOrder.objects.create(
+            purchase_order=self.po,
+            distributor_order_number=_PO_NUMBER,
+            status=src_enums.PurchaseOrderDistributorOrderStatus.CONFIRMED.value,
+            status_name=src_enums.PurchaseOrderDistributorOrderStatus.CONFIRMED.name,
+        )
+        src_models.PurchaseOrderInvoice.objects.create(
+            purchase_order=self.po, invoice_number="12484183", freight=decimal.Decimal("8.95")
+        )
+        order = po_services._serialize_local_distributor_orders(self.po, "edi")[0]
+        self.assertEqual(order["freight"], 8.95)
+        self.assertEqual(order["distributor_invoice_ids"], ["12484183"])
