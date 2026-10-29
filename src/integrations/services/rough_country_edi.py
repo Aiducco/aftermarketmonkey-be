@@ -175,9 +175,12 @@ def apply_document(document: src_models.EdiDocument) -> bool:
 
     try:
         interchange = x12.parse_interchange(document.raw_payload)
-        transaction_set = interchange.transactions()[0]
-    except (edi_exceptions.EdiParseError, IndexError) as e:
+        transaction_sets = interchange.transactions()
+    except edi_exceptions.EdiParseError as e:
         _mark(document, src_enums.EdiDocumentStatus.ERROR, str(e))
+        return False
+    if not transaction_sets:
+        _mark(document, src_enums.EdiDocumentStatus.ERROR, "Interchange carries no transaction sets.")
         return False
 
     handlers = {
@@ -185,22 +188,57 @@ def apply_document(document: src_models.EdiDocument) -> bool:
         "856": _apply_856,
         "810": _apply_810,
     }
-    handler = handlers.get(transaction_set.transaction_set_code)
-    if handler is None:
+    unknown = sorted({t.transaction_set_code for t in transaction_sets if t.transaction_set_code not in handlers})
+    if unknown:
         _mark(
             document,
             src_enums.EdiDocumentStatus.ERROR,
-            "No handler for transaction set {}.".format(transaction_set.transaction_set_code),
+            "No handler for transaction set(s) {}.".format(", ".join(unknown)),
         )
         return False
 
+    # EVERY transaction set, not just the first. Rough Country batches acknowledgments: on
+    # 29 Oct 2026 one interchange carried two 855s (GE*2), one per order, and reading only
+    # transactions()[0] silently discarded the second -- PO 165's acknowledgment arrived and was
+    # thrown away, leaving a real customer order unconfirmed with nothing to indicate why.
+    #
+    # One atomic block for the whole interchange: either all of it applies or none does, so a
+    # failure half way through cannot leave a document marked applied with work missing. The
+    # file is re-collected and re-applied, which is safe because each apply is idempotent.
+    # Each handler returns (matched PurchaseOrder or None, parsed payload, the PO number it named).
+    results: typing.List[typing.Tuple[typing.Optional[src_models.PurchaseOrder], typing.Dict, str]] = []
     try:
         with transaction.atomic():
-            handler(document, transaction_set)
+            for transaction_set in transaction_sets:
+                results.append(handlers[transaction_set.transaction_set_code](document, transaction_set))
     except Exception as e:
         logger.exception("%s Failed applying document id=%s.", _LOG_PREFIX, document.id)
         _mark(document, src_enums.EdiDocumentStatus.ERROR, str(e))
         return False
+
+    payloads = [parsed for _po, parsed, _ref in results]
+    document.parsed_payload = payloads[0] if len(payloads) == 1 else payloads
+    # The FK holds one PO; an interchange can name several. First match keeps the common
+    # single-transaction case useful, and parsed_payload carries every reference either way.
+    document.purchase_order = next((po for po, _p, _ref in results if po is not None), None)
+    document.save(update_fields=["parsed_payload", "purchase_order", "updated_at"])
+
+    unmatched_refs = [ref for po, _p, ref in results if po is None]
+    if unmatched_refs:
+        logger.error(
+            "%s Document id=%s named %s purchase order(s) we do not have: %s. Stored as UNMATCHED.",
+            _LOG_PREFIX,
+            document.id,
+            len(unmatched_refs),
+            ", ".join(repr(r) for r in unmatched_refs),
+        )
+        _mark(
+            document,
+            src_enums.EdiDocumentStatus.UNMATCHED,
+            "No purchase order matches {}.".format(", ".join(repr(r) for r in unmatched_refs)),
+        )
+    else:
+        _mark(document, src_enums.EdiDocumentStatus.APPLIED)
     return True
 
 
@@ -214,21 +252,6 @@ def _mark(
     if error_message is not None:
         document.error_message = error_message[:4000]
     document.save(update_fields=["status", "status_name", "error_message", "updated_at"])
-
-
-def _unmatched(document: src_models.EdiDocument, po_number: str) -> None:
-    logger.error(
-        "%s %s names PO %r, which does not exist for company_provider_id=%s. Stored as " "UNMATCHED for investigation.",
-        _LOG_PREFIX,
-        document.doc_type,
-        po_number,
-        document.company_provider_id,
-    )
-    _mark(
-        document,
-        src_enums.EdiDocumentStatus.UNMATCHED,
-        "No purchase order matches {!r}.".format(po_number),
-    )
 
 
 def _distributor_order(
@@ -313,10 +336,12 @@ def _advance_po(purchase_order: src_models.PurchaseOrder, status: src_enums.Purc
 # -- 855 -------------------------------------------------------------------------------------
 
 
-def _apply_855(document: src_models.EdiDocument, transaction_set: x12.Transaction) -> None:
+def _apply_855(
+    document: src_models.EdiDocument, transaction_set: x12.Transaction
+) -> typing.Tuple[typing.Optional[src_models.PurchaseOrder], typing.Dict, str]:
     ack = inbound.parse_855(transaction_set)
     purchase_order = match_purchase_order(document.company_provider, ack.po_number)
-    document.parsed_payload = {
+    parsed = {
         "po_number": ack.po_number,
         "ack_type_code": ack.ack_type_code,
         "ack_date": ack.ack_date.isoformat() if ack.ack_date else None,
@@ -333,9 +358,7 @@ def _apply_855(document: src_models.EdiDocument, transaction_set: x12.Transactio
         ],
     }
     if purchase_order is None:
-        document.save(update_fields=["parsed_payload", "updated_at"])
-        _unmatched(document, ack.po_number)
-        return
+        return None, parsed, ack.po_number
 
     distributor_order = _distributor_order(purchase_order, ack.po_number)
     grouped = _lines_by_part_number(purchase_order)
@@ -388,11 +411,9 @@ def _apply_855(document: src_models.EdiDocument, transaction_set: x12.Transactio
 
     distributor_order.status = src_enums.PurchaseOrderDistributorOrderStatus.CONFIRMED.value
     distributor_order.status_name = src_enums.PurchaseOrderDistributorOrderStatus.CONFIRMED.name
-    distributor_order.raw_response = document.parsed_payload
+    distributor_order.raw_response = parsed
     distributor_order.save(update_fields=["status", "status_name", "raw_response", "updated_at"])
 
-    document.purchase_order = purchase_order
-    document.save(update_fields=["purchase_order", "parsed_payload", "updated_at"])
     if accepted_total or not rejected_total:
         _advance_po(purchase_order, src_enums.PurchaseOrderStatus.CONFIRMED)
     else:
@@ -401,16 +422,18 @@ def _apply_855(document: src_models.EdiDocument, transaction_set: x12.Transactio
         purchase_order.status_name = src_enums.PurchaseOrderStatus.FAILED.name
         purchase_order.error_message = "Rough Country rejected every line on this order."
         purchase_order.save(update_fields=["status", "status_name", "error_message", "updated_at"])
-    _mark(document, src_enums.EdiDocumentStatus.APPLIED)
+    return purchase_order, parsed, ack.po_number
 
 
 # -- 856 -------------------------------------------------------------------------------------
 
 
-def _apply_856(document: src_models.EdiDocument, transaction_set: x12.Transaction) -> None:
+def _apply_856(
+    document: src_models.EdiDocument, transaction_set: x12.Transaction
+) -> typing.Tuple[typing.Optional[src_models.PurchaseOrder], typing.Dict, str]:
     asn = inbound.parse_856(transaction_set)
     purchase_order = match_purchase_order(document.company_provider, asn.po_number)
-    document.parsed_payload = {
+    parsed = {
         "shipment_id": asn.shipment_id,
         "po_number": asn.po_number,
         "ship_date": asn.ship_date.isoformat() if asn.ship_date else None,
@@ -429,9 +452,7 @@ def _apply_856(document: src_models.EdiDocument, transaction_set: x12.Transactio
         ],
     }
     if purchase_order is None:
-        document.save(update_fields=["parsed_payload", "updated_at"])
-        _unmatched(document, asn.po_number)
-        return
+        return None, parsed, asn.po_number
 
     distributor_order = _distributor_order(purchase_order, asn.po_number)
     # Union rather than replace: a multi-shipment order produces several ASNs and each carries
@@ -489,22 +510,22 @@ def _apply_856(document: src_models.EdiDocument, transaction_set: x12.Transactio
     distributor_order.status_name = src_enums.PurchaseOrderDistributorOrderStatus(distributor_order.status).name
     distributor_order.save()
 
-    document.purchase_order = purchase_order
-    document.save(update_fields=["purchase_order", "parsed_payload", "updated_at"])
     _advance_po(
         purchase_order,
         src_enums.PurchaseOrderStatus.FULFILLED if fully_shipped else src_enums.PurchaseOrderStatus.PARTIALLY_FULFILLED,
     )
-    _mark(document, src_enums.EdiDocumentStatus.APPLIED)
+    return purchase_order, parsed, asn.po_number
 
 
 # -- 810 -------------------------------------------------------------------------------------
 
 
-def _apply_810(document: src_models.EdiDocument, transaction_set: x12.Transaction) -> None:
+def _apply_810(
+    document: src_models.EdiDocument, transaction_set: x12.Transaction
+) -> typing.Tuple[typing.Optional[src_models.PurchaseOrder], typing.Dict, str]:
     invoice = inbound.parse_810(transaction_set)
     purchase_order = match_purchase_order(document.company_provider, invoice.po_number)
-    document.parsed_payload = {
+    parsed = {
         "invoice_number": invoice.invoice_number,
         "invoice_date": invoice.invoice_date.isoformat() if invoice.invoice_date else None,
         "po_number": invoice.po_number,
@@ -517,13 +538,10 @@ def _apply_810(document: src_models.EdiDocument, transaction_set: x12.Transactio
         "lines": [_invoice_line_json(line) for line in invoice.lines],
     }
     if purchase_order is None:
-        document.save(update_fields=["parsed_payload", "updated_at"])
-        _unmatched(document, invoice.po_number)
-        return
+        return None, parsed, invoice.po_number
 
     if not invoice.invoice_number:
-        _mark(document, src_enums.EdiDocumentStatus.ERROR, "810 carries no invoice number (BIG02).")
-        return
+        raise ValueError("810 for {} carries no invoice number (BIG02).".format(invoice.po_number))
 
     # Keyed on (purchase_order, invoice_number) so a replayed 810 updates rather than duplicates.
     row, created = src_models.PurchaseOrderInvoice.objects.get_or_create(
@@ -539,12 +557,10 @@ def _apply_810(document: src_models.EdiDocument, transaction_set: x12.Transactio
     # but the one real invoice we have excluded its freight entirely and carried none, so
     # whether total + freight or total alone is owed is genuinely unknown. Showing a confident
     # wrong number on a bill is worse than showing none.
-    row.line_items = document.parsed_payload["lines"]
-    row.raw_response = document.parsed_payload
+    row.line_items = parsed["lines"]
+    row.raw_response = parsed
     row.save()
 
-    document.purchase_order = purchase_order
-    document.save(update_fields=["purchase_order", "parsed_payload", "updated_at"])
     logger.info(
         "%s %s invoice %s on PO %s (total %s, freight %s).",
         _LOG_PREFIX,
@@ -554,7 +570,7 @@ def _apply_810(document: src_models.EdiDocument, transaction_set: x12.Transactio
         invoice.total_amount,
         invoice.freight,
     )
-    _mark(document, src_enums.EdiDocumentStatus.APPLIED)
+    return purchase_order, parsed, invoice.po_number
 
 
 def _invoice_line_json(line: inbound.Invoice810Line) -> typing.Dict:

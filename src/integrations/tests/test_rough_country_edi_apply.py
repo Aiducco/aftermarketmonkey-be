@@ -102,6 +102,32 @@ def _810(po_number=_PO_NUMBER, part=_PART, qty=1, unit="33.2168", control_number
     )
 
 
+def _855_batched(first_po, second_po, part=_PART, control_number="434594956"):
+    """One interchange, two 855 transaction sets -- exactly what Rough Country sent on
+    29 Oct 2026 when two orders were acknowledged together (GE*2)."""
+    body = [
+        x12.segment("BAK", "00", "AD", first_po, "20261029"),
+        x12.segment("PO1", "1", "1", "EA", "33.22", "", "VC", part, "SK", "RC-922"),
+        x12.segment("ACK", "IA", "1", "EA"),
+        x12.segment("CTT", "1"),
+    ]
+    body2 = [
+        x12.segment("BAK", "00", "AD", second_po, "20261029"),
+        x12.segment("PO1", "1", "1", "EA", "33.22", "", "VC", part, "SK", "RC-922"),
+        x12.segment("ACK", "IA", "1", "EA"),
+        x12.segment("CTT", "1"),
+    ]
+    return x12.build_interchange(
+        sender_id="64ROUGHC",
+        receiver_id="TRIDENT",
+        interchange_control_number=control_number,
+        group_control_number=control_number,
+        functional_id_code="PR",
+        transactions=[("855", "165621334", body), ("855", "165621350", body2)],
+        usage_indicator="P",
+    )
+
+
 class Ack997Tests(SimpleTestCase):
     def test_acknowledges_the_group_and_each_transaction_set(self):
         payload = ack_997.build_997(
@@ -466,6 +492,61 @@ class ApplyInboundTests(RoughCountryEdiFixture):
         self.assertEqual(
             self.line_item.status, src_enums.PurchaseOrderLineItemStatus.CONFIRMED.value
         )
+
+    def test_a_batched_interchange_applies_every_transaction_set(self):
+        """
+        The regression that left a real order unconfirmed. Rough Country acknowledged POs 165
+        and 167 in ONE interchange with two 855s; reading only transactions()[0] applied the
+        first and silently discarded the second, so PO 165 sat SUBMITTED with its
+        acknowledgment already received and thrown away.
+        """
+        second_po = src_models.PurchaseOrder.objects.create(
+            company=self.company,
+            company_provider=self.company_provider,
+            po_number="SECOND-PO",
+            status=src_enums.PurchaseOrderStatus.SUBMITTED.value,
+            status_name=src_enums.PurchaseOrderStatus.SUBMITTED.name,
+            source=src_enums.PurchaseOrderSource.STAFF_MANUAL.value,
+            source_name=src_enums.PurchaseOrderSource.STAFF_MANUAL.name,
+        )
+        second_line = src_models.PurchaseOrderLineItem.objects.create(
+            purchase_order=second_po,
+            provider_part=self.provider_part,
+            quantity=1,
+            status=src_enums.PurchaseOrderLineItemStatus.PENDING.value,
+            status_name=src_enums.PurchaseOrderLineItemStatus.PENDING.name,
+        )
+
+        document, _, applied = self._apply(_855_batched(_PO_NUMBER, "SECOND-PO"), "855")
+        self.assertTrue(applied)
+        self.assertEqual(document.status, src_enums.EdiDocumentStatus.APPLIED.value)
+
+        self.po.refresh_from_db()
+        second_po.refresh_from_db()
+        self.assertEqual(self.po.status, src_enums.PurchaseOrderStatus.CONFIRMED.value)
+        self.assertEqual(
+            second_po.status,
+            src_enums.PurchaseOrderStatus.CONFIRMED.value,
+            "the second transaction set must be applied too",
+        )
+        self.line_item.refresh_from_db()
+        second_line.refresh_from_db()
+        self.assertEqual(self.line_item.quantity_confirmed, 1)
+        self.assertEqual(second_line.quantity_confirmed, 1)
+        # Both payloads kept, since one FK cannot hold two POs.
+        self.assertIsInstance(document.parsed_payload, list)
+        self.assertEqual(len(document.parsed_payload), 2)
+
+    def test_a_batch_naming_one_unknown_po_still_applies_the_known_one(self):
+        """Partial match must not discard the half that did match, and must still surface."""
+        document, _, applied = self._apply(
+            _855_batched(_PO_NUMBER, "NOT-OUR-PO", control_number="434594957"), "855"
+        )
+        self.assertTrue(applied)
+        self.po.refresh_from_db()
+        self.assertEqual(self.po.status, src_enums.PurchaseOrderStatus.CONFIRMED.value)
+        self.assertEqual(document.status, src_enums.EdiDocumentStatus.UNMATCHED.value)
+        self.assertIn("NOT-OUR-PO", document.error_message)
 
     def test_a_replayed_855_is_recognised_and_not_applied_twice(self):
         """FTP delivery is at-least-once: the same file reappears whenever archiving failed."""
