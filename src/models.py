@@ -383,6 +383,14 @@ class CompanyFeatureFlags(django_db_models.Model):
 # distributor directly, which is what makes this safe to offer per-company instead of bespoke
 # per-client tooling. See src.integrations.services.shopmonkey_sync for the sync logic itself.
 #
+# Multi-vendor: a brand is routinely carried by several of a company's connected distributors
+# (we build MasterPart *from* distributors, unlike the old tool which assumed one distributor per
+# brand), so a ShopMonkeySyncBrand now sums availability across a *set* of vendors rather than
+# exactly one. ``ShopMonkeySyncBrand.vendor`` stays the primary vendor (pricing + binLocation,
+# with a priority fallback -- see ShopMonkeySyncBrandVendor below); ShopMonkeySyncPart is keyed on
+# MasterPart, not ProviderPart, so one ShopMonkey part always represents one master part no matter
+# how many of the chosen vendors carry it.
+#
 # Gated behind CompanyFeatureFlags (FEATURE_SHOPMONKEY_INVENTORY_SYNC in
 # src.api.services.feature_flags) -- Trident Motorsports only while this is being proven out.
 
@@ -394,6 +402,13 @@ class ShopMonkeySyncVendor(django_db_models.Model):
     tool's single global vendor list. ``shopmonkey_external_id`` is created once (POST vendor)
     the first time any brand under this vendor is synced, then reused for every part pushed
     under it.
+
+    ``bin_name`` is the ShopMonkey ``binLocation`` code this vendor's distributor is marked with
+    on every part it contributes -- carried over from the old standalone tool's own codes
+    (``T14``/``KST``/``WHE``/``ROU``/``MEY``) so Phase 6's later import of that tool's ~88K parts
+    reconciles against the same codes ShopMonkey already has, rather than silently starting a
+    second, different code for the same distributor. Set once at creation (see
+    src.integrations.services.shopmonkey_sync._bin_name_for_provider), never overwritten.
     """
 
     company = django_db_models.ForeignKey(
@@ -403,6 +418,7 @@ class ShopMonkeySyncVendor(django_db_models.Model):
         Providers, on_delete=django_db_models.CASCADE, related_name="shopmonkey_sync_vendors"
     )
     shopmonkey_external_id = django_db_models.CharField(max_length=255, null=True, blank=True)
+    bin_name = django_db_models.CharField(max_length=16, null=True, blank=True)
 
     # See src.enums.ShopMonkeySyncStatus -- ACTIVE once created on ShopMonkey, INACTIVE until then.
     status = django_db_models.PositiveSmallIntegerField()
@@ -419,15 +435,19 @@ class ShopMonkeySyncVendor(django_db_models.Model):
 class ShopMonkeySyncBrand(django_db_models.Model):
     """
     One row per (company, brand) the company has enabled for ShopMonkey sync -- mirrors the old
-    tool's InventoryBrand. ``vendor`` picks which of the company's connected providers sources
-    this brand's parts when more than one of them carries it (see
-    src.integrations.services.shopmonkey_sync.available_brands_for_company for how that choice
-    set is computed). ``shopmonkey_external_id`` is this brand's id on ShopMonkey, created once
-    (POST brand) and reused on every subsequent update.
+    tool's InventoryBrand. ``vendor`` is the *primary* vendor: it sources pricing and
+    ``binLocation`` for every part this brand pushes, falling down to the additional vendors (see
+    ShopMonkeySyncBrandVendor) in priority order only for a master part the primary doesn't
+    itself carry. Availability (quantity) is summed across the primary plus every additional
+    vendor -- see src.integrations.services.shopmonkey_sync.available_brands_for_company for how
+    the company's choice set of connectable providers is computed, and configure_sync_brand for
+    how this row plus its ShopMonkeySyncBrandVendor rows are written together.
+    ``shopmonkey_external_id`` is this brand's id on ShopMonkey, created once (POST brand) and
+    reused on every subsequent update.
 
-    ``entity`` is always "Tire" on creation, matching the old tool's own create_brand call exactly
-    (preserved deliberately, not derived from our own product_type classification -- see the
-    shopmonkey_sync module docstring for why).
+    ``entity`` defaults to "Part" -- the old tool's own create_brand call hardcoded "Tire", which
+    is wrong for every one of the 69 brands confirmed live on the real ShopMonkey account (all
+    "Part"); see migration 0241 for the one-row backfill.
     """
 
     company = django_db_models.ForeignKey(
@@ -440,7 +460,7 @@ class ShopMonkeySyncBrand(django_db_models.Model):
         ShopMonkeySyncVendor, on_delete=django_db_models.CASCADE, related_name="sync_brands"
     )
     shopmonkey_external_id = django_db_models.CharField(max_length=255, null=True, blank=True)
-    entity = django_db_models.CharField(max_length=32, default="Tire")
+    entity = django_db_models.CharField(max_length=32, default="Part")
 
     enabled = django_db_models.BooleanField(default=True)
 
@@ -456,35 +476,91 @@ class ShopMonkeySyncBrand(django_db_models.Model):
         unique_together = ["company", "brand"]
 
 
+class ShopMonkeySyncBrandVendor(django_db_models.Model):
+    """
+    One row per additional (non-primary) vendor a ShopMonkeySyncBrand sums availability from.
+    The primary vendor (pricing + binLocation unless it doesn't carry a given master part) is
+    still ShopMonkeySyncBrand.vendor -- never duplicated into this table. configure_sync_brand
+    is the only writer and replaces this table's rows wholesale on every call, so there is no
+    path that lets a provider_id appear here AND as the brand's own ``vendor_id`` at the same
+    time; nothing else enforces that invariant at the DB level.
+    """
+
+    sync_brand = django_db_models.ForeignKey(
+        ShopMonkeySyncBrand, on_delete=django_db_models.CASCADE, related_name="additional_vendors"
+    )
+    vendor = django_db_models.ForeignKey(
+        ShopMonkeySyncVendor, on_delete=django_db_models.CASCADE, related_name="brand_assignments"
+    )
+    # Lower runs first in the pricing fallback order -- same convention as TireBrandSource.priority.
+    # The primary vendor is implicitly priority 0; these start at 1.
+    priority = django_db_models.PositiveSmallIntegerField(default=1)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "shopmonkey_sync_brand_vendor"
+        unique_together = ["sync_brand", "vendor"]
+        # Default ordering, not a convenience: the API contract promises every `providers` /
+        # `current_provider_ids` list comes back primary-first then in priority order, and the
+        # frontend renders the pricing-fallback order from it. Without this, a plain
+        # ``additional_vendors.all()`` returns insertion order, so reordering a brand's vendors
+        # wrote correctly but kept serving the pre-reorder order on the next read.
+        ordering = ["priority"]
+
+
 class ShopMonkeySyncPart(django_db_models.Model):
     """
     One row per part actually pushed to ShopMonkey under a ShopMonkeySyncBrand -- mirrors the old
-    tool's InventoryPart. Points straight at the ``ProviderPart`` this came from (no re-fetch, no
-    separate raw-data cache the way the old tool needed one per distributor) and carries what was
-    last pushed so a sync run only calls ShopMonkey again when something actually changed, exactly
+    tool's InventoryPart. Keyed on ``master_part``, not ``provider_part``: multi-vendor means a
+    single master part can be carried by several of this brand's chosen vendors at once, and
+    ShopMonkey must only ever see one inventory part for it, with availability summed and pricing
+    taken from whichever vendor sourced it (see ``sourced_from_vendor``). Carries what was last
+    pushed so a sync run only calls ShopMonkey again when something actually changed, exactly
     like the old tool's own diff.
 
     ``status`` ACTIVE/INACTIVE/ERROR mirrors the old tool's InventoryPartStatus one-for-one,
     including the same "[OBSOLETE] " / "[ERROR UPDATING PART] " name-prefix convention when a
     part disappears from our own data or fails to push -- see
-    src.integrations.services.shopmonkey_sync for where those are applied.
+    src.integrations.services.shopmonkey_sync for where those are applied. ``last_error`` carries
+    the human-readable reason for the most recent ERROR status, so a failure is visible per part
+    in the UI, not just in the execution-level log.
     """
 
     sync_brand = django_db_models.ForeignKey(
         ShopMonkeySyncBrand, on_delete=django_db_models.CASCADE, related_name="sync_parts"
     )
-    provider_part = django_db_models.ForeignKey(
-        "ProviderPart", on_delete=django_db_models.CASCADE, related_name="shopmonkey_sync_parts"
+    master_part = django_db_models.ForeignKey(
+        "MasterPart", on_delete=django_db_models.CASCADE, related_name="shopmonkey_sync_parts"
     )
     shopmonkey_external_id = django_db_models.CharField(max_length=255, null=True, blank=True)
 
     last_pushed_name = django_db_models.CharField(max_length=255, null=True, blank=True)
+    # The SKU last pushed -- not re-derived from master_part on every sync, so a part ported from
+    # the old tool (Phase 6, out of scope here) keeps that tool's own SKU rather than being
+    # silently renumbered the first time this platform syncs it.
+    last_pushed_sku = django_db_models.CharField(max_length=255, null=True, blank=True)
     last_pushed_retail_cost_cents = django_db_models.DecimalField(
         max_digits=28, decimal_places=8, null=True, blank=True
     )
     last_pushed_wholesale_cost_cents = django_db_models.DecimalField(
         max_digits=28, decimal_places=8, null=True, blank=True
     )
+    last_pushed_quantity = django_db_models.IntegerField(null=True, blank=True)
+    last_pushed_bin_location = django_db_models.CharField(max_length=16, null=True, blank=True)
+    # Which vendor's price (and bin_name) this part's last push actually used -- the primary
+    # vendor unless it didn't carry this master part, in which case the priority fallback.
+    # SET_NULL, not CASCADE: dropping a distributor connection (deleting its ShopMonkeySyncVendor)
+    # must not cascade-delete every part it ever priced, just blank the attribution.
+    sourced_from_vendor = django_db_models.ForeignKey(
+        ShopMonkeySyncVendor,
+        on_delete=django_db_models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="sourced_sync_parts",
+    )
+    last_error = django_db_models.TextField(null=True, blank=True)
 
     # See src.enums.ShopMonkeySyncPartStatus.
     status = django_db_models.PositiveSmallIntegerField()
@@ -495,7 +571,7 @@ class ShopMonkeySyncPart(django_db_models.Model):
 
     class Meta:
         db_table = "shopmonkey_sync_part"
-        unique_together = ["sync_brand", "provider_part"]
+        unique_together = ["sync_brand", "master_part"]
         indexes = [
             django_db_models.Index(fields=["sync_brand", "status"], name="smsp_sync_brand_status_idx"),
         ]

@@ -19,6 +19,12 @@ ERROR_FEATURE_NOT_AVAILABLE = "feature_not_available"
 ERROR_NOT_FOUND = "not_found"
 ERROR_INVALID_INPUT = "invalid_input"
 
+# Paging ceilings -- same shape as list_part_detail_audit_history (src/api/services/parts.py).
+_PARTS_MAX_LIMIT = 500
+_PARTS_DEFAULT_LIMIT = 100
+_EXECUTIONS_MAX_LIMIT = 200
+_EXECUTIONS_DEFAULT_LIMIT = 50
+
 
 def _feature_enabled(company_id: int) -> bool:
     return feature_flags_services.company_has_feature(
@@ -26,7 +32,9 @@ def _feature_enabled(company_id: int) -> bool:
     )
 
 
-def get_available_brands(company_id: int) -> typing.Tuple[typing.Optional[typing.List[typing.Dict]], typing.Optional[str]]:
+def get_available_brands(
+    company_id: int,
+) -> typing.Tuple[typing.Optional[typing.List[typing.Dict]], typing.Optional[str]]:
     """Returns (data, error_code)."""
     if not _feature_enabled(company_id):
         return None, ERROR_FEATURE_NOT_AVAILABLE
@@ -34,17 +42,37 @@ def get_available_brands(company_id: int) -> typing.Tuple[typing.Optional[typing
 
 
 def _sync_brand_row(sync_brand: src_models.ShopMonkeySyncBrand) -> typing.Dict[str, typing.Any]:
+    """Per contract.md Decision 1: ``providers`` is a list of {provider_id, provider_kind_name}
+    objects, never bare ids -- the single-brand GET's whole purpose is to let the FE label its
+    vendor chips without a second fetch of available-brands. Primary vendor is always first;
+    ``primary_provider_id`` is carried explicitly too so nothing depends on list ordering."""
+    providers = []
+    primary_provider_id = None
+    if sync_brand.vendor_id:
+        primary_provider_id = sync_brand.vendor.provider_id
+        providers.append(
+            {
+                "provider_id": sync_brand.vendor.provider_id,
+                "provider_kind_name": sync_brand.vendor.provider.kind_name if sync_brand.vendor.provider_id else None,
+            }
+        )
+    for link in sync_brand.additional_vendors.all():
+        providers.append(
+            {
+                "provider_id": link.vendor.provider_id,
+                "provider_kind_name": link.vendor.provider.kind_name if link.vendor.provider_id else None,
+            }
+        )
     return {
         "id": sync_brand.id,
         "company_id": sync_brand.company_id,
         "brand_id": sync_brand.brand_id,
         "brand_name": sync_brand.brand.name if sync_brand.brand_id else None,
-        "provider_id": sync_brand.vendor.provider_id if sync_brand.vendor_id else None,
-        "provider_kind_name": (
-            sync_brand.vendor.provider.kind_name if sync_brand.vendor_id and sync_brand.vendor.provider_id else None
-        ),
+        "providers": providers,
+        "primary_provider_id": primary_provider_id,
         "enabled": sync_brand.enabled,
         "shopmonkey_external_id": sync_brand.shopmonkey_external_id,
+        "entity": sync_brand.entity,
         "status": sync_brand.status,
         "status_name": sync_brand.status_name,
         "part_count": src_models.ShopMonkeySyncPart.objects.filter(sync_brand=sync_brand).count(),
@@ -53,58 +81,118 @@ def _sync_brand_row(sync_brand: src_models.ShopMonkeySyncBrand) -> typing.Dict[s
     }
 
 
+def _sync_brand_queryset():
+    return src_models.ShopMonkeySyncBrand.objects.select_related(
+        "brand", "vendor", "vendor__provider"
+    ).prefetch_related("additional_vendors__vendor__provider")
+
+
 def list_sync_brands(company_id: int) -> typing.Tuple[typing.Optional[typing.List[typing.Dict]], typing.Optional[str]]:
     if not _feature_enabled(company_id):
         return None, ERROR_FEATURE_NOT_AVAILABLE
-    rows = src_models.ShopMonkeySyncBrand.objects.filter(company_id=company_id).select_related(
-        "brand", "vendor", "vendor__provider"
-    )
+    rows = _sync_brand_queryset().filter(company_id=company_id)
     return [_sync_brand_row(r) for r in rows], None
 
 
+def get_sync_brand(
+    company_id: int, sync_brand_id: int
+) -> typing.Tuple[typing.Optional[typing.Dict], typing.Optional[str]]:
+    """GET .../sync-brands/<id>/ -- the new single-brand lookup (Phase 3), so the FE detail page
+    stops fetching every brand just to find one. A brand belonging to another company is 404,
+    never 403 -- same not-found-vs-forbidden handling as every other per-id lookup here."""
+    if not _feature_enabled(company_id):
+        return None, ERROR_FEATURE_NOT_AVAILABLE
+    sync_brand = _sync_brand_queryset().filter(id=sync_brand_id, company_id=company_id).first()
+    if not sync_brand:
+        return None, ERROR_NOT_FOUND
+    return _sync_brand_row(sync_brand), None
+
+
+def _validate_provider_ids(
+    company_id: int, provider_ids: typing.List[int], primary_provider_id: int
+) -> typing.Optional[str]:
+    if not provider_ids:
+        return ERROR_INVALID_INPUT
+    if primary_provider_id not in provider_ids:
+        return ERROR_INVALID_INPUT
+    connected = shopmonkey_sync_services.company_connected_provider_ids(company_id)
+    if any(pid not in connected for pid in provider_ids):
+        return ERROR_INVALID_INPUT
+    return None
+
+
 def create_sync_brand(
-    company_id: int, brand_id: int, provider_id: int
+    company_id: int, brand_id: int, provider_ids: typing.List[int], primary_provider_id: int
 ) -> typing.Tuple[typing.Optional[typing.Dict], typing.Optional[str]]:
     if not _feature_enabled(company_id):
         return None, ERROR_FEATURE_NOT_AVAILABLE
     if not src_models.Brands.objects.filter(id=brand_id).exists():
         return None, ERROR_NOT_FOUND
-    if provider_id not in shopmonkey_sync_services.company_connected_provider_ids(company_id):
-        return None, ERROR_INVALID_INPUT
-    sync_brand = shopmonkey_sync_services.add_sync_brand(company_id, brand_id, provider_id)
-    sync_brand.refresh_from_db()
-    return _sync_brand_row(
-        src_models.ShopMonkeySyncBrand.objects.select_related("brand", "vendor", "vendor__provider").get(
-            id=sync_brand.id
-        )
-    ), None
+    error_code = _validate_provider_ids(company_id, provider_ids, primary_provider_id)
+    if error_code:
+        return None, error_code
+    sync_brand = shopmonkey_sync_services.configure_sync_brand(
+        company_id=company_id,
+        brand_id=brand_id,
+        provider_ids=provider_ids,
+        primary_provider_id=primary_provider_id,
+        enabled=True,
+    )
+    return get_sync_brand(company_id, sync_brand.id)
 
 
 def update_sync_brand(
-    company_id: int, sync_brand_id: int, enabled: typing.Optional[bool]
+    company_id: int,
+    sync_brand_id: int,
+    enabled: typing.Optional[bool],
+    provider_ids: typing.Optional[typing.List[int]],
+    primary_provider_id: typing.Optional[int],
 ) -> typing.Tuple[typing.Optional[typing.Dict], typing.Optional[str]]:
+    """PATCH resolves any omitted field from the current row, then calls the same
+    configure_sync_brand() that POST calls -- there is no separate toggle-only write path. A body
+    of {"enabled": false} alone must leave the existing provider set untouched (contract.md)."""
     if not _feature_enabled(company_id):
         return None, ERROR_FEATURE_NOT_AVAILABLE
-    sync_brand = src_models.ShopMonkeySyncBrand.objects.filter(id=sync_brand_id, company_id=company_id).first()
+    sync_brand = _sync_brand_queryset().filter(id=sync_brand_id, company_id=company_id).first()
     if not sync_brand:
         return None, ERROR_NOT_FOUND
-    if enabled is not None:
-        shopmonkey_sync_services.set_sync_brand_enabled(sync_brand_id, company_id, enabled)
-    sync_brand = src_models.ShopMonkeySyncBrand.objects.select_related(
-        "brand", "vendor", "vendor__provider"
-    ).get(id=sync_brand_id)
-    return _sync_brand_row(sync_brand), None
+
+    if enabled is None:
+        enabled = sync_brand.enabled
+    if provider_ids is None:
+        provider_ids = [sync_brand.vendor.provider_id] + [
+            link.vendor.provider_id for link in sync_brand.additional_vendors.all()
+        ]
+    if primary_provider_id is None:
+        primary_provider_id = sync_brand.vendor.provider_id
+
+    error_code = _validate_provider_ids(company_id, provider_ids, primary_provider_id)
+    if error_code:
+        return None, error_code
+
+    shopmonkey_sync_services.configure_sync_brand(
+        company_id=company_id,
+        brand_id=sync_brand.brand_id,
+        provider_ids=provider_ids,
+        primary_provider_id=primary_provider_id,
+        enabled=enabled,
+    )
+    return get_sync_brand(company_id, sync_brand_id)
 
 
 def run_sync_brand_now(
     company_id: int, sync_brand_id: int
 ) -> typing.Tuple[typing.Optional[typing.Dict], typing.Optional[str]]:
+    """Enqueues a QUEUED execution and returns immediately (Phase 3) -- process_shopmonkey_sync_jobs
+    is what actually calls sync_brand_parts(). Never run the sync inline on the request thread."""
     if not _feature_enabled(company_id):
         return None, ERROR_FEATURE_NOT_AVAILABLE
     sync_brand = src_models.ShopMonkeySyncBrand.objects.filter(id=sync_brand_id, company_id=company_id).first()
     if not sync_brand:
         return None, ERROR_NOT_FOUND
-    execution = shopmonkey_sync_services.sync_brand_parts(sync_brand_id)
+    if not sync_brand.enabled:
+        return None, ERROR_INVALID_INPUT
+    execution = shopmonkey_sync_services.enqueue_sync_brand_run(company_id, sync_brand_id)
     return _execution_row(execution), None
 
 
@@ -125,8 +213,9 @@ def list_executions(
     company_id: int,
     sync_brand_id: typing.Optional[int] = None,
     status: typing.Optional[str] = None,
-    limit: int = 50,
-) -> typing.Tuple[typing.Optional[typing.List[typing.Dict]], typing.Optional[str]]:
+    limit: int = _EXECUTIONS_DEFAULT_LIMIT,
+    offset: int = 0,
+) -> typing.Tuple[typing.Optional[typing.Dict[str, typing.Any]], typing.Optional[str]]:
     if not _feature_enabled(company_id):
         return None, ERROR_FEATURE_NOT_AVAILABLE
     qs = src_models.ShopMonkeySyncExecution.objects.filter(company_id=company_id)
@@ -134,36 +223,87 @@ def list_executions(
         qs = qs.filter(sync_brand_id=sync_brand_id)
     if status:
         qs = qs.filter(status=status)
-    qs = qs.order_by("-created_at")[: max(1, min(limit, 200))]
-    return [_execution_row(e) for e in qs], None
+    qs = qs.order_by("-created_at")
+    total = qs.count()
+    limit = max(1, min(limit, _EXECUTIONS_MAX_LIMIT))
+    offset = max(0, offset)
+    page = qs[offset : offset + limit]
+    return {
+        "data": [_execution_row(e) for e in page],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }, None
 
 
 def list_sync_brand_parts(
-    company_id: int, sync_brand_id: int, limit: int = 100
-) -> typing.Tuple[typing.Optional[typing.List[typing.Dict]], typing.Optional[str]]:
+    company_id: int,
+    sync_brand_id: int,
+    limit: int = _PARTS_DEFAULT_LIMIT,
+    offset: int = 0,
+    status: typing.Optional[int] = None,
+) -> typing.Tuple[typing.Optional[typing.Dict[str, typing.Any]], typing.Optional[str]]:
     if not _feature_enabled(company_id):
         return None, ERROR_FEATURE_NOT_AVAILABLE
     sync_brand = src_models.ShopMonkeySyncBrand.objects.filter(id=sync_brand_id, company_id=company_id).first()
     if not sync_brand:
         return None, ERROR_NOT_FOUND
-    parts = (
-        src_models.ShopMonkeySyncPart.objects.filter(sync_brand=sync_brand)
-        .select_related("provider_part__master_part")
-        .order_by("-updated_at")[: max(1, min(limit, 500))]
+
+    qs = src_models.ShopMonkeySyncPart.objects.filter(sync_brand=sync_brand).select_related(
+        "master_part", "sourced_from_vendor__provider"
     )
+    if status is not None:
+        qs = qs.filter(status=status)
+    qs = qs.order_by("-updated_at")
+    total = qs.count()
+    limit = max(1, min(limit, _PARTS_MAX_LIMIT))
+    offset = max(0, offset)
+    page = qs[offset : offset + limit]
+
     data = []
-    for p in parts:
-        master_part = p.provider_part.master_part if p.provider_part_id else None
-        data.append({
-            "id": p.id,
-            "sku": master_part.sku if master_part else None,
-            "part_number": master_part.part_number if master_part else None,
-            "shopmonkey_external_id": p.shopmonkey_external_id,
-            "last_pushed_name": p.last_pushed_name,
-            "last_pushed_retail_cost_cents": p.last_pushed_retail_cost_cents,
-            "last_pushed_wholesale_cost_cents": p.last_pushed_wholesale_cost_cents,
-            "status": p.status,
-            "status_name": p.status_name,
-            "updated_at": p.updated_at.isoformat() if p.updated_at else None,
-        })
-    return data, None
+    for p in page:
+        master_part = p.master_part if p.master_part_id else None
+        vendor = p.sourced_from_vendor
+        data.append(
+            {
+                "id": p.id,
+                "master_part_id": p.master_part_id,
+                # MasterPart.sku is nullable and is null for a meaningful share of real
+                # distributor data, but the contract promises a non-null string here and the
+                # frontend's type is non-optional. Resolve it the same way the push path does:
+                # prefer what we actually sent upstream (last_pushed_sku), then the master part's
+                # own sku, then its part number -- never null for a part that has been synced.
+                "sku": (
+                    p.last_pushed_sku
+                    or (master_part.sku if master_part else None)
+                    or (master_part.part_number if master_part else "")
+                ),
+                "part_number": (master_part.part_number if master_part else ""),
+                "shopmonkey_external_id": p.shopmonkey_external_id,
+                # From sourced_from_vendor -- which vendor's price/binLocation this part's last push
+                # actually used, not a live recomputation.
+                "provider_kind_name": vendor.provider.kind_name if vendor and vendor.provider_id else None,
+                "quantity": p.last_pushed_quantity,
+                "bin_location": p.last_pushed_bin_location,
+                "last_pushed_name": p.last_pushed_name,
+                # Integer cents per contract -- the column is a DecimalField (shared with the
+                # pricing tables' own precision), so cast explicitly rather than let the FE receive
+                # a decimal-with-trailing-zeros value.
+                "last_pushed_retail_cost_cents": (
+                    int(p.last_pushed_retail_cost_cents) if p.last_pushed_retail_cost_cents is not None else None
+                ),
+                "last_pushed_wholesale_cost_cents": (
+                    int(p.last_pushed_wholesale_cost_cents) if p.last_pushed_wholesale_cost_cents is not None else None
+                ),
+                "status": p.status,
+                "status_name": p.status_name,
+                "last_error": p.last_error,
+                "updated_at": p.updated_at.isoformat() if p.updated_at else None,
+            }
+        )
+    return {
+        "data": data,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }, None

@@ -50,7 +50,12 @@ class ShopMonkeySyncPartStatus(enum.Enum):
 
 class ShopMonkeySyncExecutionStatus(enum.Enum):
     """Mirrors the old tool's ExecutionStatus (string-valued there too, not int) for
-    ShopMonkeySyncExecution."""
+    ShopMonkeySyncExecution. QUEUED is new (Phase 3): a "run now" request creates a QUEUED
+    execution and returns immediately; process_shopmonkey_sync_jobs claims it and flips it to
+    RUNNING before actually calling ShopMonkey. The scheduled (cron) sync still goes straight to
+    RUNNING, bypassing QUEUED entirely -- see sync_brand_parts."""
+
+    QUEUED = "QUEUED"
     RUNNING = "RUNNING"
     FINISHED = "FINISHED"
     FAILURE = "FAILURE"

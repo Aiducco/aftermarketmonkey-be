@@ -108,16 +108,22 @@ class ShopMonkeySyncBrandsView(views.View):
 
         try:
             brand_id = int(body.get("brand_id"))
-            provider_id = int(body.get("provider_id"))
+            provider_ids = [int(pid) for pid in (body.get("provider_ids") or [])]
+            primary_provider_id = int(body.get("primary_provider_id"))
         except (TypeError, ValueError):
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
-                content=simplejson.dumps({"message": "brand_id and provider_id are required integers"}),
+                content=simplejson.dumps(
+                    {"message": "brand_id, provider_ids (non-empty list of ints) and primary_provider_id are required"}
+                ),
                 status=400,
             )
 
         data, error_code = shopmonkey_inventory_services.create_sync_brand(
-            company_id=company_id, brand_id=brand_id, provider_id=provider_id
+            company_id=company_id,
+            brand_id=brand_id,
+            provider_ids=provider_ids,
+            primary_provider_id=primary_provider_id,
         )
         if error_code:
             return _error_response("Could not enable this brand for sync.", error_code)
@@ -129,8 +135,46 @@ class ShopMonkeySyncBrandsView(views.View):
 
 
 class ShopMonkeySyncBrandDetailView(views.View):
-    """PATCH /shopmonkey/inventory/sync-brands/<id>/ -- enable/disable (body: {enabled}).
+    """GET /shopmonkey/inventory/sync-brands/<id>/ -- single-brand lookup (Phase 3), same row
+    shape as the list view, so the detail page stops fetching every brand to find one.
+    PATCH /shopmonkey/inventory/sync-brands/<id>/ -- reconfigure (body: any subset of
+    {enabled, provider_ids, primary_provider_id}; omitted fields keep their current value).
     POST /shopmonkey/inventory/sync-brands/<id>/run/ is a separate view below."""
+
+    def get(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
+        if not request.user or not request.user.is_authenticated:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "User not authenticated"}),
+                status=401,
+            )
+        company_id = getattr(request, "company_id", None)
+        if not company_id:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "No company found in token"}),
+                status=400,
+            )
+
+        try:
+            sync_brand_id = int(kwargs.get("id"))
+        except (TypeError, ValueError):
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Invalid sync brand id"}),
+                status=400,
+            )
+
+        data, error_code = shopmonkey_inventory_services.get_sync_brand(
+            company_id=company_id, sync_brand_id=sync_brand_id
+        )
+        if error_code:
+            return _error_response("Could not fetch this sync brand.", error_code)
+        return http.HttpResponse(
+            headers={"Content-Type": "application/json"},
+            content=simplejson.dumps({"data": data}),
+            status=200,
+        )
 
     def patch(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
         if not request.user or not request.user.is_authenticated:
@@ -173,8 +217,34 @@ class ShopMonkeySyncBrandDetailView(views.View):
                 status=400,
             )
 
+        provider_ids = body.get("provider_ids")
+        if provider_ids is not None:
+            try:
+                provider_ids = [int(pid) for pid in provider_ids]
+            except (TypeError, ValueError):
+                return http.HttpResponse(
+                    headers={"Content-Type": "application/json"},
+                    content=simplejson.dumps({"message": "provider_ids must be a list of integers"}),
+                    status=400,
+                )
+
+        primary_provider_id = body.get("primary_provider_id")
+        if primary_provider_id is not None:
+            try:
+                primary_provider_id = int(primary_provider_id)
+            except (TypeError, ValueError):
+                return http.HttpResponse(
+                    headers={"Content-Type": "application/json"},
+                    content=simplejson.dumps({"message": "primary_provider_id must be an integer"}),
+                    status=400,
+                )
+
         data, error_code = shopmonkey_inventory_services.update_sync_brand(
-            company_id=company_id, sync_brand_id=sync_brand_id, enabled=enabled
+            company_id=company_id,
+            sync_brand_id=sync_brand_id,
+            enabled=enabled,
+            provider_ids=provider_ids,
+            primary_provider_id=primary_provider_id,
         )
         if error_code:
             return _error_response("Could not update this sync brand.", error_code)
@@ -186,7 +256,10 @@ class ShopMonkeySyncBrandDetailView(views.View):
 
 
 class ShopMonkeySyncBrandRunView(views.View):
-    """POST /shopmonkey/inventory/sync-brands/<id>/run/ -- sync this brand now, synchronously."""
+    """POST /shopmonkey/inventory/sync-brands/<id>/run/ -- queue a sync for this brand and return
+    immediately (Phase 3). Nothing has run when this returns 202; process_shopmonkey_sync_jobs
+    is what actually calls ShopMonkey. The caller polls GET .../executions/ until the row leaves
+    QUEUED/RUNNING."""
 
     def post(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
         if not request.user or not request.user.is_authenticated:
@@ -228,12 +301,13 @@ class ShopMonkeySyncBrandRunView(views.View):
         return http.HttpResponse(
             headers={"Content-Type": "application/json"},
             content=simplejson.dumps({"data": data}),
-            status=200,
+            status=202,
         )
 
 
 class ShopMonkeySyncBrandPartsView(views.View):
-    """GET /shopmonkey/inventory/sync-brands/<id>/parts/ -- drill-down parts list."""
+    """GET /shopmonkey/inventory/sync-brands/<id>/parts/?limit=&offset=&status= -- drill-down
+    parts list, server-side paged (Phase 3) with an optional ShopMonkeySyncPartStatus filter."""
 
     def get(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
         if not request.user or not request.user.is_authenticated:
@@ -265,14 +339,27 @@ class ShopMonkeySyncBrandPartsView(views.View):
         except (TypeError, ValueError):
             pass
 
-        data, error_code = shopmonkey_inventory_services.list_sync_brand_parts(
-            company_id=company_id, sync_brand_id=sync_brand_id, limit=limit
+        offset = 0
+        try:
+            offset = int(request.GET.get("offset", offset))
+        except (TypeError, ValueError):
+            pass
+
+        status_filter = None
+        if request.GET.get("status"):
+            try:
+                status_filter = int(request.GET["status"])
+            except (TypeError, ValueError):
+                status_filter = None
+
+        result, error_code = shopmonkey_inventory_services.list_sync_brand_parts(
+            company_id=company_id, sync_brand_id=sync_brand_id, limit=limit, offset=offset, status=status_filter
         )
         if error_code:
             return _error_response("Could not fetch parts for this sync brand.", error_code)
         return http.HttpResponse(
             headers={"Content-Type": "application/json"},
-            content=simplejson.dumps({"data": data}),
+            content=simplejson.dumps(result),
             status=200,
         )
 
@@ -310,13 +397,19 @@ class ShopMonkeySyncExecutionsView(views.View):
         except (TypeError, ValueError):
             pass
 
-        data, error_code = shopmonkey_inventory_services.list_executions(
-            company_id=company_id, sync_brand_id=sync_brand_id, status=status_filter, limit=limit
+        offset = 0
+        try:
+            offset = int(request.GET.get("offset", offset))
+        except (TypeError, ValueError):
+            pass
+
+        result, error_code = shopmonkey_inventory_services.list_executions(
+            company_id=company_id, sync_brand_id=sync_brand_id, status=status_filter, limit=limit, offset=offset
         )
         if error_code:
             return _error_response("Shop management inventory sync is not available for this company.", error_code)
         return http.HttpResponse(
             headers={"Content-Type": "application/json"},
-            content=simplejson.dumps({"data": data}),
+            content=simplejson.dumps(result),
             status=200,
         )

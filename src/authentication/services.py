@@ -1,23 +1,23 @@
-import logging
-import jwt
 import datetime
+import logging
 
+import jwt
 from django import http
 from django.conf import settings
-from django.contrib.auth import models as auth_models
 from django.contrib.auth import authenticate
+from django.contrib.auth import models as auth_models
 from django.contrib.auth.hashers import check_password
 
-
 from common import utils as common_utils
-from src.authentication import exceptions as authentication_exceptions
-from src import models as src_models
 from src import enums as src_enums
-
+from src import models as src_models
+from src.api.services import feature_flags as feature_flags_services
+from src.authentication import exceptions as authentication_exceptions
 
 _LOG_PREFIX = "[AUTHENTICATION-SERVICE]"
 
 logger = logging.getLogger(__name__)
+
 
 def decode_jwt_token(token: str) -> dict:
     try:
@@ -54,6 +54,14 @@ def create_jwt_token(user: auth_models.User) -> str:
             # Django's own platform-wide staff flag -- gates the staff-only admin panel on the
             # frontend. Independent of is_company_admin (per-company role) above.
             "is_staff": user.is_staff,
+            # ShopMonkey inventory sync's nav gate (contract.md Decision 7): router.beforeEach
+            # needs a synchronous read, same constraint is_company_admin/is_staff above already
+            # solve this way -- an endpoint would mean async-gating every navigation. Accepted
+            # consequence: flipping this flag needs a re-login within the 12-hour token life; the
+            # real backstop is the backend's own feature_not_available 403 on the API itself.
+            "has_shopmonkey_inventory_sync": feature_flags_services.company_has_feature(
+                company_id, feature_flags_services.FEATURE_SHOPMONKEY_INVENTORY_SYNC
+            ),
             "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=12),
         },
         key=settings.JWT_SECRET,

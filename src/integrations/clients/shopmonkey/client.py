@@ -146,9 +146,7 @@ class ShopMonkeyApiClient(object):
         )
 
     def delete_vendor(self, external_id: str) -> typing.Dict:
-        return self._request_data(
-            endpoint="vendor/{}".format(external_id), method=common_enums.HttpMethod.DELETE
-        )
+        return self._request_data(endpoint="vendor/{}".format(external_id), method=common_enums.HttpMethod.DELETE)
 
     # ------------------------------------------------------------------------------------
     # Brands
@@ -171,9 +169,7 @@ class ShopMonkeyApiClient(object):
         )
 
     def delete_brand(self, external_id: str) -> typing.Dict:
-        return self._request_data(
-            endpoint="brand/{}".format(external_id), method=common_enums.HttpMethod.DELETE
-        )
+        return self._request_data(endpoint="brand/{}".format(external_id), method=common_enums.HttpMethod.DELETE)
 
     # ------------------------------------------------------------------------------------
     # Inventory parts
@@ -188,11 +184,13 @@ class ShopMonkeyApiClient(object):
         retail_cost: int,
         wholesale_cost: int,
         vendor_bin_location: typing.Optional[str] = None,
+        quantity: typing.Optional[int] = None,
     ) -> typing.Dict:
         # vendor_id is accepted (and threaded through from the vendor we create) but deliberately
         # never sent — the old tool's own client always sent vendorId: null on both create and
         # update, and this mirrors that exactly rather than guessing it should be wired up. See
-        # the module docstring.
+        # the module docstring. Now doubly correct with multi-vendor: a part sourced from several
+        # of a company's distributors has no single vendorId that would be truthful to report.
         return self._request_data(
             endpoint="inventory_part",
             method=common_enums.HttpMethod.POST,
@@ -205,6 +203,7 @@ class ShopMonkeyApiClient(object):
                 "retailCostCents": retail_cost,
                 "wholesaleCostCents": wholesale_cost,
                 "binLocation": vendor_bin_location,
+                "quantity": quantity,
                 "showNote": False,
             },
         )
@@ -220,6 +219,7 @@ class ShopMonkeyApiClient(object):
         retail_cost: int,
         wholesale_cost: int,
         vendor_bin_location: typing.Optional[str] = None,
+        quantity: typing.Optional[int] = None,
     ) -> typing.Dict:
         return self._request_data(
             endpoint="inventory_part/{}".format(external_id),
@@ -233,14 +233,13 @@ class ShopMonkeyApiClient(object):
                 "retailCostCents": retail_cost,
                 "wholesaleCostCents": wholesale_cost,
                 "binLocation": vendor_bin_location,
+                "quantity": quantity,
                 "showNote": False,
             },
         )
 
     def get_inventory_part(self, external_id: str) -> typing.Dict:
-        return self._request_data(
-            endpoint="inventory_part/{}".format(external_id), method=common_enums.HttpMethod.GET
-        )
+        return self._request_data(endpoint="inventory_part/{}".format(external_id), method=common_enums.HttpMethod.GET)
 
     def delete_inventory_part(self, external_id: str) -> typing.Dict:
         """Soft-delete -- the old tool's client PATCHes .../delete rather than issuing a real
