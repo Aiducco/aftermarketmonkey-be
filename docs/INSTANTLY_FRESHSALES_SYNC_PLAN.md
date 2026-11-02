@@ -4,13 +4,28 @@ Status: **live in production.** Deployed 2026-10-05, cron installed, 73 tests pa
 `0205` applied. The backfill created **13 contacts, 13 sales accounts, 20 notes** and a re-run
 creates nothing.
 
-**Deals are created by hand** (changed 2026-10-05 at Gojko's request). `FRESHSALES_CREATE_DEALS`
-gates the deal pass and is **off by default**; the sync still records Instantly's label and still
-sets each contact's FreshSales status from it, so `Interested` is the queue to work from. The 6
-deals the original backfill created are still in the pipeline — §11 Q2.
+**Deals are created automatically** again as of 2026-11-02: `FRESHSALES_CREATE_DEALS=true` is set
+in `.env.app.production`, so each new positive reply opens a deal. The flag still defaults **off**
+in code — an auto-created deal in a shared pipeline is somebody else's forecast, so it stays an
+explicit per-environment choice.
 
-An auto-created deal in a shared pipeline is somebody else's forecast, which is why the flag
-defaults off rather than on.
+Between 2026-10-05 and 2026-11-02 deals were made by hand (changed 2026-10-05 at Gojko's request)
+and the sync wrote only accounts, contacts and notes. That lapsed around 2026-10-22: by 2026-10-30
+there were **20 shops labelled Interested with no deal**, visible only as `awaiting_manual_deal=N`
+in the run summary, which nobody reads. Three of them (replies from 2026-10-29/30) got deals via
+`--create-deals-for`; the other 17 were **retired** before the flag went on — `deal_created_at`
+stamped on all 30 of their replies, with `freshsales_deal_id` pointed at the hand-made open deal
+for the 12 shops that had one. Nothing was written to FreshSales for them. So the flag only ever
+acts on replies arriving after 2026-11-02.
+
+Five of those 17 had **no open deal** in FreshSales when they were retired and were stamped
+anyway, deliberately, because they are months cold: `jacoby@bucks4x4.com` (Sep 8),
+`garmantruck@gmail.com` (Sep 11) and `info.crushcustoms@gmail.com` (Oct 8) have no deal at all,
+and `frontlineoutfitter@gmail.com` (Closed Won) and `aftermathcustomauto1@gmail.com` (Closed Lost)
+have decided ones. Had they not been retired, enabling the flag would have opened a duplicate deal
+in the New Lead stage for the latter two, since `find_open_deal_for_contact` counts only stages
+whose `forecast_type` is still "Open". To revisit any of them, clear `deal_created_at` or run
+`--create-deals-for <address>`.
 
 Both vendors verified live, writes included. The question of whether that FreshSales key could
 write — open through the whole design phase because `GET /selector/owners` answers 403 — is

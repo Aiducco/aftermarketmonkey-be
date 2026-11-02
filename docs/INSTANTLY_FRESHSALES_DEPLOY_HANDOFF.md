@@ -2,9 +2,16 @@
 
 > **Superseded 2026-10-05: this deploy is done.** Code is on `main`, the keys are in
 > `.env.app.production`, migration `0205` is applied and the cron is installed. Kept as a record of
-> the steps, and as the runbook if the box is ever rebuilt. Note that deal creation is now off by
-> default (`FRESHSALES_CREATE_DEALS`), so the "6 deals" figures below describe the original
-> backfill, not what a fresh run would do.
+> the steps, and as the runbook if the box is ever rebuilt. The "6 deals" figures below describe
+> the original backfill, not what a fresh run would do.
+>
+> **Rebuilding the box:** `FRESHSALES_CREATE_DEALS=true` belongs in `.env.app.production` (set
+> 2026-11-02; the flag defaults off in code). It is read at container creation, so
+> `docker compose up -d --force-recreate app` is required — a `docker restart` keeps the old
+> environment. Before enabling it anywhere that already has an `instantly_reply` table, read the
+> retirement note at the top of INSTANTLY_FRESHSALES_SYNC_PLAN.md: every positive reply with a
+> null `deal_created_at` is in the queue, and a shop whose only deal is Closed Won/Lost gets a
+> second one.
 
 For whoever (or whatever) has SSH to production. Self-contained: you do not need the session that
 wrote this. Design notes are in [INSTANTLY_FRESHSALES_SYNC_PLAN.md](INSTANTLY_FRESHSALES_SYNC_PLAN.md);
