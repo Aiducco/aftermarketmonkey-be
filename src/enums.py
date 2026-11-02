@@ -246,13 +246,28 @@ class PurchaseOrderLineItemStatus(enum.Enum):
 class PurchaseOrderSource(enum.Enum):
     """Where a PurchaseOrder originated. Only STAFF_MANUAL is used today; the others are
     reserved for a future shop-management-system webhook / public API integration."""
+
     STAFF_MANUAL = 1
     SMS_WEBHOOK = 2
     API = 3
 
 
+class ExternalOrderOriginSignal(enum.Enum):
+    """Why src.integrations.services.external_order_sync decided a discovered order is
+    genuinely external (not one we placed through the app) -- kept for debugging a dedup false
+    positive/negative after the fact. See ExternalPurchaseOrder.origin_signal."""
+
+    # Meyer's own "API Order": "No" flag states the origin directly -- authoritative on its
+    # own, no PO-number cross-check needed.
+    MEYER_API_ORDER_NO = 1
+    # Every other distributor (Premier, Keystone, Turn 14): neither distributor_order_number
+    # nor customer_po_number matched anything of ours.
+    NO_MATCH = 2
+
+
 class PurchaseOrderOperation(enum.Enum):
     """Which DistributorOrderAdapter call a PurchaseOrderJob / PurchaseOrderSubmissionAttempt performs."""
+
     QUOTE = 1
     SUBMIT = 2
     STATUS_CHECK = 3

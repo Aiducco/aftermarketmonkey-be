@@ -4398,6 +4398,139 @@ class PurchaseOrderJob(django_db_models.Model):
         ordering = ["id"]
 
 
+class ExternalPurchaseOrder(django_db_models.Model):
+    """
+    A distributor-side order WE did not place through this app (phone order, or placed directly
+    on the distributor's own website/portal) -- discovered by polling that distributor's own
+    order-history API (see src.integrations.services.external_order_sync) and already confirmed,
+    at ingest time, not to match anything in purchase_orders/purchase_order_distributor_orders
+    (see external_order_sync._is_ours). Deliberately NOT a PurchaseOrder row -- see the Data
+    model section of docs/tasks/external-orders/research-be.md for why: PurchaseOrder's id space
+    is a write target for cancel/requote/discard/submit, its line items require a resolvable
+    ProviderPart, and its CONFIRMED-status sweep (confirmed_purchase_order_sync) would otherwise
+    try to status-check an order with no po_number/po_name to look it up by.
+
+    Read-only as far as this app is concerned: there is no submit/cancel/requote action on this
+    model at all, by design (see the task's absolute constraint against ever writing to a
+    distributor's order API for this feature).
+    """
+
+    company = django_db_models.ForeignKey(
+        Company, on_delete=django_db_models.CASCADE, related_name="external_purchase_orders"
+    )
+    company_provider = django_db_models.ForeignKey(
+        CompanyProviders, on_delete=django_db_models.CASCADE, related_name="external_purchase_orders"
+    )
+    # Which order account's credentials actually discovered this order -- required (unlike
+    # PurchaseOrder.order_account, which is nullable because it defaults to "whichever account
+    # is is_default"): every poll is explicitly scoped to one CompanyProviderOrderAccount
+    # (Keystone's 3 accounts included), so there is no "default" to fall back to here.
+    order_account = django_db_models.ForeignKey(
+        CompanyProviderOrderAccount, on_delete=django_db_models.CASCADE, related_name="external_purchase_orders"
+    )
+
+    # The distributor's own order/sales-order number, normalized per-distributor (see
+    # external_order_sync._normalize_order_number -- e.g. Premier's "SO-0009629695" has its
+    # "SO-" prefix stripped before being stored here, to match the bare-digits format
+    # PurchaseOrderDistributorOrder.distributor_order_number already stores for OUR Premier
+    # orders -- confirmed live, see contract.md's "Premier prefix mismatch is real").
+    distributor_order_number = django_db_models.CharField(max_length=128)
+    # The customer-PO-like value the distributor echoes back, when it has one (Keystone's
+    # EKORD#, Turn14's purchase_order_number, Premier's customerPurchaseOrderNumber) -- NOT
+    # necessarily one of our own po_number/po_name values; a phone order's PO field is whatever
+    # the distributor's own order-entry rep typed in, if anything. Null when the distributor has
+    # no such field, it was left blank on their side, or (Meyer) the listing endpoint used to
+    # discover this order doesn't carry one at all (see history_readers/meyer.py).
+    customer_po_number = django_db_models.CharField(max_length=128, null=True, blank=True)
+
+    # Why ingestion decided this row is genuinely external, for debugging a dedup false
+    # positive/negative after the fact -- see src.enums.ExternalOrderOriginSignal.
+    origin_signal = django_db_models.PositiveSmallIntegerField()
+    origin_signal_name = django_db_models.CharField(max_length=32)
+
+    # Distributor's own raw order status text, verbatim (e.g. Turn14's "Open"/"Closed", Meyer's
+    # "Open"/"Invoiced") -- deliberately NOT translated through our own PurchaseOrderStatus
+    # vocabulary, since we don't control this order's lifecycle and have no business implying
+    # we do.
+    distributor_status = django_db_models.CharField(max_length=64, null=True, blank=True)
+    # The distributor's own order/doc date (Meyer's DocDate, Turn14's date, ...) -- no time
+    # component on any of the four distributors' fields for this, hence DateField not
+    # DateTimeField.
+    order_date = django_db_models.DateField(null=True, blank=True)
+
+    # Ship-to, same column shape as PurchaseOrder.ship_to_* (not reusing that model -- this one
+    # has no group/cart semantics to inherit). Populated only as far as the discovering call
+    # actually returns it -- Turn14's bulk get_orders gives one opaque pre-formatted address
+    # string, not structured fields (see history_readers/turn_14.py and the contract's Gotchas),
+    # so ship_to_address1 alone is sometimes all that's populated.
+    ship_to_name = django_db_models.CharField(max_length=255, null=True, blank=True)
+    ship_to_address1 = django_db_models.CharField(max_length=255, null=True, blank=True)
+    ship_to_address2 = django_db_models.CharField(max_length=255, null=True, blank=True)
+    ship_to_city = django_db_models.CharField(max_length=128, null=True, blank=True)
+    ship_to_state = django_db_models.CharField(max_length=64, null=True, blank=True)
+    ship_to_postal_code = django_db_models.CharField(max_length=32, null=True, blank=True)
+    ship_to_country = django_db_models.CharField(max_length=64, null=True, blank=True)
+    ship_to_phone = django_db_models.CharField(max_length=32, null=True, blank=True)
+
+    subtotal = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    freight = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    total = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+
+    # [{part_number, description, quantity, unit_price, line_total, warehouse_code,
+    #   warehouse_name}] -- distributor-verbatim part_number, deliberately NOT a FK to
+    # ProviderPart/MasterPart (see the research dossier's Data model section, and its "Not
+    # doing"). Same JSON-blob-of-lines shape PurchaseOrderInvoice.line_items already uses for
+    # exactly the same reason ("empty for adapters whose invoice data is header-only") -- an
+    # external order is header-only-or-itemized in the same uneven way per distributor.
+    line_items = django_db_models.JSONField(default=list, blank=True, encoder=DjangoJSONEncoder)
+
+    raw_response = django_db_models.JSONField(null=True, blank=True, encoder=DjangoJSONEncoder)
+
+    discovered_at = django_db_models.DateTimeField(auto_now_add=True)
+    last_synced_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "external_purchase_orders"
+        # Scoped to order_account, not company_provider -- see external_order_sync's Dedup
+        # section for why a distributor_order_number collision across two of a company's
+        # accounts for the SAME distributor (Keystone's 3) must be treated as two different
+        # orders, not one.
+        unique_together = [["order_account", "distributor_order_number"]]
+        indexes = [
+            django_db_models.Index(fields=["company", "order_date"], name="ext_po_company_date_idx"),
+        ]
+
+
+class ExternalOrderSyncWatermark(django_db_models.Model):
+    """
+    Per-order-account polling checkpoint for sync_external_orders. One row per
+    CompanyProviderOrderAccount that has ever been polled for external orders -- NOT every
+    account has one (an account whose distributor kind has no registered
+    history_registry.OrderHistoryReader, or one that's never been due, simply has no row; see
+    history_registry.supports_order_discovery()).
+
+    last_synced_through is OUR clock, not the distributor's -- the timestamp as of which we last
+    completed a successful poll of this account, used as next run's window start (minus
+    external_order_sync.OVERLAP_DAYS) rather than "the newest order date we saw," since a
+    backdated order can appear with an order_date earlier than one we've already ingested.
+    """
+
+    order_account = django_db_models.OneToOneField(
+        CompanyProviderOrderAccount, on_delete=django_db_models.CASCADE, related_name="external_order_sync_watermark"
+    )
+
+    last_synced_through = django_db_models.DateTimeField(null=True, blank=True)
+    last_run_at = django_db_models.DateTimeField(null=True, blank=True)
+    last_run_ok = django_db_models.BooleanField(default=True)
+    last_error = django_db_models.TextField(null=True, blank=True)
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "external_order_sync_watermarks"
+
+
 # ---------------------------------------------------------------------------
 # Motor State Distributing (kind=MOTOR_STATE_DISTRIBUTING) raw feed tables.
 #

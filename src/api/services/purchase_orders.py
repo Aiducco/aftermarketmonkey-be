@@ -26,6 +26,7 @@ from src.api.services import address as address_services
 from src.api.services import billing as billing_services
 from src.integrations import credentials as credentials_helper
 from src.integrations.orders import base as order_base
+from src.integrations.orders import history_registry as order_history_registry
 from src.integrations.orders import raw_response_parsers
 from src.integrations.orders import registry as order_registry
 from src.integrations.services import confirmed_purchase_order_sync
@@ -1824,3 +1825,186 @@ def get_shipping_methods(company_id: int, company_provider_id: int) -> typing.Li
         {"code": m.code, "name": m.name, "carrier_name": m.carrier_name}
         for m in adapter.list_shipping_methods()
     ]
+
+
+# -- External (distributor-placed) orders -----------------------------------------------------
+#
+# GET /purchase-orders/external/ -- see docs/tasks/external-orders/contract.md (binding) and
+# research-be.md (design dossier) for the full shape/reasoning. A NEW endpoint, not a flag on
+# list_purchase_orders/PurchaseOrdersView above -- that one returns a bare List[Dict] today and
+# the FE's 141-row table depends on that envelope staying unchanged.
+
+
+def _iso_utc_z(value: typing.Optional[datetime.datetime]) -> typing.Optional[str]:
+    """ISO-8601 UTC with a trailing "Z" -- contract.md requires this exact form for
+    discovered_at/last_synced_at, unlike every other PO timestamp in this file (which uses plain
+    .isoformat(), producing a "+00:00"-less naive string instead) -- kept local to this section
+    rather than changing that shared convention for existing fields nothing here asked to
+    change. USE_TZ=False project-wide (see conf.settings_base), so ``value`` is always naive and
+    already represents UTC wall-clock time (same assumption every other DateTimeField in this
+    codebase already makes) -- formatted directly, never through .astimezone(), which would
+    wrongly reinterpret a naive value as the CALLING PROCESS's local timezone instead."""
+    if value is None:
+        return None
+    return value.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _build_external_order_recipient_line(order: src_models.ExternalPurchaseOrder) -> typing.Optional[str]:
+    """Same joined-line convention as _build_recipient_line above, over
+    ExternalPurchaseOrder's own ship_to_* columns."""
+    if not order.ship_to_address1:
+        return None
+    city_state_zip = " ".join(part for part in (order.ship_to_state, order.ship_to_postal_code) if part)
+    parts = [
+        order.ship_to_name,
+        order.ship_to_address1,
+        order.ship_to_address2,
+        ", ".join(part for part in (order.ship_to_city, city_state_zip) if part) or None,
+        order.ship_to_country,
+    ]
+    return ", ".join(part for part in parts if part)
+
+
+def _serialize_external_purchase_order(order: src_models.ExternalPurchaseOrder) -> typing.Dict:
+    has_ship_to = any(
+        [
+            order.ship_to_name,
+            order.ship_to_address1,
+            order.ship_to_address2,
+            order.ship_to_city,
+            order.ship_to_state,
+            order.ship_to_postal_code,
+            order.ship_to_country,
+            order.ship_to_phone,
+        ]
+    )
+    ship_to = (
+        {
+            "name": order.ship_to_name,
+            "address1": order.ship_to_address1,
+            "address2": order.ship_to_address2,
+            "city": order.ship_to_city,
+            "state": order.ship_to_state,
+            "postal_code": order.ship_to_postal_code,
+            "country": order.ship_to_country,
+            "phone": order.ship_to_phone,
+        }
+        if has_ship_to
+        else None
+    )
+
+    # "authoritative" only for Meyer's own "API Order": "No" flag -- every other distributor's
+    # row got here via a PO-number-match inference (see src.enums.ExternalOrderOriginSignal).
+    origin_confidence = (
+        "authoritative"
+        if order.origin_signal == src_enums.ExternalOrderOriginSignal.MEYER_API_ORDER_NO.value
+        else "inferred"
+    )
+
+    return {
+        "id": order.id,
+        "company_provider_id": order.company_provider_id,
+        "provider_kind_name": order.company_provider.provider.kind_name,
+        "provider_name": order.company_provider.provider.name,
+        "order_account_id": order.order_account_id,
+        "order_account_label": order.order_account.label,
+        "distributor_order_number": order.distributor_order_number,
+        "customer_po_number": order.customer_po_number,
+        "order_date": order.order_date.isoformat() if order.order_date else None,
+        "distributor_status": order.distributor_status,
+        "origin_confidence": origin_confidence,
+        "recipient": _build_external_order_recipient_line(order),
+        "ship_to": ship_to,
+        "subtotal": _decimal_to_float(order.subtotal),
+        "freight": _decimal_to_float(order.freight),
+        "total": _decimal_to_float(order.total),
+        "line_items": order.line_items or [],
+        "discovered_at": _iso_utc_z(order.discovered_at),
+        "last_synced_at": _iso_utc_z(order.last_synced_at),
+    }
+
+
+def _polled_connection_status(
+    supports_discovery: bool, watermark: typing.Optional[src_models.ExternalOrderSyncWatermark]
+) -> typing.Tuple[str, typing.Optional[str], typing.Optional[str]]:
+    """(status, last_synced_at_iso, error_message) for one PolledConnection row -- see
+    contract.md's PolledConnection table: error_message is non-null ONLY when status=="error"."""
+    if not supports_discovery:
+        return "not_supported", None, None
+    if watermark is None:
+        return "never_run", None, None
+    last_synced_at_iso = _iso_utc_z(watermark.last_run_at)
+    if watermark.last_run_ok:
+        return "ok", last_synced_at_iso, None
+    return "error", last_synced_at_iso, watermark.last_error
+
+
+def _polled_connections(company_id: int) -> typing.List[typing.Dict]:
+    """One row per ACTIVE order account on the company -- including ones that can't discover at
+    all (Motor State et al., status="not_supported") -- that's what lets the FE say "this
+    distributor can't report outside orders" instead of showing silence. See contract.md's
+    PolledConnection section."""
+    accounts = (
+        src_models.CompanyProviderOrderAccount.objects.filter(
+            company_provider__company_id=company_id, company_provider__active=True, active=True
+        )
+        .select_related("company_provider__provider")
+        .order_by("company_provider_id", "id")
+    )
+    watermarks_by_account_id = {
+        w.order_account_id: w for w in src_models.ExternalOrderSyncWatermark.objects.filter(order_account__in=accounts)
+    }
+
+    results = []
+    for account in accounts:
+        cp = account.company_provider
+        supports_discovery = order_history_registry.supports_order_discovery(cp.provider.kind)
+        status, last_synced_at, error_message = _polled_connection_status(
+            supports_discovery, watermarks_by_account_id.get(account.id)
+        )
+        results.append(
+            {
+                "company_provider_id": cp.id,
+                "provider_kind_name": cp.provider.kind_name,
+                "provider_name": cp.provider.name,
+                "order_account_id": account.id,
+                "order_account_label": account.label,
+                "supports_discovery": supports_discovery,
+                "last_synced_at": last_synced_at,
+                "status": status,
+                "error_message": error_message,
+            }
+        )
+    return results
+
+
+def list_external_purchase_orders(
+    company_id: int,
+    provider: typing.Optional[str] = None,
+    since: typing.Optional[str] = None,
+) -> typing.Dict:
+    """
+    GET /purchase-orders/external/'s result -- see contract.md for the full response shape.
+    ``provider`` (a BrandProviderKind name, e.g. "MEYER") and ``since`` ("YYYY-MM-DD") are both
+    optional filters on ``orders`` only; ``polled_connections`` always lists every active order
+    account regardless of either filter, since it describes connections, not individual orders.
+    """
+    qs = src_models.ExternalPurchaseOrder.objects.filter(company_id=company_id).select_related(
+        "company_provider__provider", "order_account"
+    )
+    if provider:
+        try:
+            provider_kind = src_enums.BrandProviderKind[provider.strip().upper()].value
+        except KeyError:
+            valid = ", ".join(m.name for m in src_enums.BrandProviderKind)
+            raise PurchaseOrderServiceError("Unknown provider '{}'. Valid values: {}".format(provider, valid))
+        qs = qs.filter(company_provider__provider__kind=provider_kind)
+    if since:
+        try:
+            since_date = datetime.date.fromisoformat(since)
+        except ValueError:
+            raise PurchaseOrderServiceError("Invalid 'since' date '{}'; expected YYYY-MM-DD.".format(since))
+        qs = qs.filter(order_date__gte=since_date)
+
+    orders = [_serialize_external_purchase_order(order) for order in qs.order_by("-discovered_at")]
+    return {"orders": orders, "polled_connections": _polled_connections(company_id)}

@@ -274,6 +274,20 @@ class PremierOrderApiClient(object):
         )
         return data if isinstance(data, list) else [data]
 
+    def get_tracking_by_date(self, start_date: str, end_date: typing.Optional[str] = None) -> typing.List[typing.Dict]:
+        """GET /tracking/date?startDate=&endDate= -- every sales order in the range (confirmed
+        live to return up to 1000 rows; see src.integrations.orders.history_readers.premier,
+        this client's only caller so far, for the discovery use case this exists for). Same
+        tracking-specific fields only as get_tracking_by_purchase_order_number above (no ship-to
+        address or line pricing at all) -- see get_sales_order for the full order, needed as a
+        follow-up call for a newly-discovered order. ``end_date`` is optional and defaults to
+        today per Premier's docs."""
+        params: typing.Dict[str, str] = {"startDate": start_date}
+        if end_date:
+            params["endDate"] = end_date
+        data = self._request(endpoint="tracking/date", method=common_enums.HttpMethod.GET, params=params)
+        return data if isinstance(data, list) else [data]
+
     def get_invoices(
         self,
         invoice_number: typing.Optional[str] = None,

@@ -272,6 +272,34 @@ class PurchaseOrdersView(views.View):
         return _json_response(result)
 
 
+class PurchaseOrdersExternalView(views.View):
+    """GET /purchase-orders/external/ -- distributor-placed orders we did NOT place through
+    this app, plus which order accounts were actually polled for them. Optional
+    ?provider=<BrandProviderKind name>&since=YYYY-MM-DD, both ignored if absent. A new endpoint,
+    not a flag on GET /purchase-orders/ above -- see contract.md decision 1."""
+
+    def get(self, request: http.HttpRequest, *args, **kwargs) -> http.HttpResponse:
+        company_id, _user_id, err = _require_auth(request)
+        if err:
+            return err
+
+        try:
+            result = purchase_orders_services.list_external_purchase_orders(
+                company_id=company_id,
+                provider=request.GET.get("provider"),
+                since=request.GET.get("since"),
+            )
+        except purchase_orders_services.PurchaseOrderServiceError as e:
+            return _error_response(str(e))
+        except Exception:
+            logger.exception(
+                "{} Error listing external purchase orders for company_id={}".format(_LOG_PREFIX, company_id)
+            )
+            return _error_response("Error listing external purchase orders", status=500)
+
+        return _json_response(result)
+
+
 class PurchaseOrderInvoicesView(views.View):
     """GET /purchase-orders/invoices/ — flat, cross-distributor invoice list. Optional
     ?company_provider_id=&start_date=&end_date= (dates: YYYY-MM-DD, filtered on invoice_date)."""

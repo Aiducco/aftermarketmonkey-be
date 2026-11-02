@@ -201,6 +201,35 @@ class MeyerOrderApiClient(object):
             params={"OrderNumber": order_number, "CustomerNumber": customer_number},
         )
 
+    # -- Order history / discovery (read-only -- see src.integrations.orders.history_readers.
+    # meyer, which uses these two to discover orders placed outside our app) ------------------
+
+    def get_sales_current(self, customer_number: str) -> typing.List[typing.Dict]:
+        """GET /SalesCurrent. All open (non-invoiced) orders for this customer — the only
+        parameter is CustomerNumber, no date range at all. One row per line item with header
+        fields (OrderNumber, "API Order", DocDate, ...) repeated — callers must group by
+        OrderNumber. The empty case is a dict (``{"Message": "There are currently no open sales
+        orders", "statusCode": 200}``), NOT an empty list like every other GET on this client —
+        guarded explicitly here rather than using the ``result if isinstance(result, list) else
+        [result]`` pattern every other method uses, since that would wrongly wrap this dict as a
+        single fake "order" row."""
+        result = self._request(
+            endpoint="SalesCurrent", method=common_enums.HttpMethod.GET, params={"CustomerNumber": customer_number}
+        )
+        return result if isinstance(result, list) else []
+
+    def get_sales_history(self, customer_number: str, start_date: str, end_date: str) -> typing.List[typing.Dict]:
+        """GET /SalesHistory. All invoiced orders whose DocDate falls within
+        [start_date, end_date] (both required, "YYYY-M-D"). Same one-row-per-line-item shape and
+        same empty-dict guard as get_sales_current (see its docstring) — Meyer's dict there reads
+        "There are currently no invoiced sales orders" instead, but the shape is identical."""
+        result = self._request(
+            endpoint="SalesHistory",
+            method=common_enums.HttpMethod.GET,
+            params={"CustomerNumber": customer_number, "StartDate": start_date, "EndDate": end_date},
+        )
+        return result if isinstance(result, list) else []
+
     # -- Status / tracking ----------------------------------------------------------------
 
     def get_sales_order_detail(self, order_number: str, customer_number: str) -> typing.List[typing.Dict]:
