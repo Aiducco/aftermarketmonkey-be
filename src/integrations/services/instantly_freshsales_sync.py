@@ -64,6 +64,11 @@ _LOG_PREFIX = "[INSTANTLY-FRESHSALES]"
 
 TASK_NAME = "sync_instantly_replies"
 
+# A hand-run deal catch-up (``--create-deals-for``) audits under its own name rather than
+# TASK_NAME: it creates deals in the CRM, so it must leave a record, but it is not the 15-minute
+# cron and counting it as one would corrupt that task's own run history.
+DEAL_CATCHUP_TASK_NAME = "sync_instantly_replies_deal_catchup"
+
 # Instantly's label -> the FreshSales contact status that says the same thing. Resolved to numeric
 # ids by name at runtime (see FreshsalesApiClient.resolve_contact_status_id), never configured.
 # All three live in the "Lead" lifecycle stage, so nothing here promotes a contact past where it
@@ -976,11 +981,44 @@ def provision_platform_account_for_reply(
     return account
 
 
+def deal_queue(
+    emails: typing.Optional[typing.Sequence[str]] = None,
+    max_attempts: int = 5,
+) -> "django_db_models.QuerySet":
+    """
+    The replies waiting for a deal: positive, not an auto-reply, no deal yet, still retriable.
+
+    Oldest reply first, which is why ``limit`` is not a way to pick particular shops -- it always
+    takes the front of this queue. ``emails`` is, and is matched case-insensitively because
+    ``lead_email`` holds the address as Instantly reported it rather than a normalised form; a
+    filter that silently matched nothing would be indistinguishable from "they all have deals".
+
+    Shared by :func:`create_deals` and the ``--create-deals-for`` catch-up, so the addresses the
+    command reports as ineligible are exactly the ones the pass would skip.
+    """
+    queryset = src_models.InstantlyReply.objects.filter(
+        is_positive=True,
+        deal_created_at__isnull=True,
+        is_auto_reply=False,
+        sync_attempts__lt=max_attempts,
+    ).order_by("email_timestamp")
+    if emails:
+        wanted = django_db_models.Q()
+        matched_any = False
+        for address in emails:
+            if address and address.strip():
+                wanted |= django_db_models.Q(lead_email__iexact=address.strip())
+                matched_any = True
+        queryset = queryset.filter(wanted) if matched_any else queryset.none()
+    return queryset
+
+
 def create_deals(
     crm: "freshsales_client.FreshsalesApiClient",
     instantly: "instantly_client.InstantlyApiClient",
     default_amount: typing.Union[int, float] = 0,
     limit: typing.Optional[int] = None,
+    emails: typing.Optional[typing.Sequence[str]] = None,
     max_calls: typing.Optional[int] = None,
     max_attempts: int = 5,
     settings_module: typing.Any = None,
@@ -1010,6 +1048,11 @@ def create_deals(
          AftermarketScout account for the company ("Day 0: create their account" from
          cf_next_step, automated rather than done by hand) and record it on the deal. See
          :func:`provision_platform_account_for_reply`.
+
+    ``emails`` restricts the pass to those addresses (case-insensitive). Note that ``limit`` cannot
+    stand in for it: the queue is ordered oldest-reply-first, so ``limit`` always takes the oldest
+    waiting shops. Catching up on specific shops -- the normal reason to run this by hand while
+    ``FRESHSALES_CREATE_DEALS`` is off -- needs the address, not a count.
     """
     from django.conf import settings as django_settings
 
@@ -1029,12 +1072,7 @@ def create_deals(
     # FreshSales call finding out that out.
     stage_types: typing.Optional[typing.Dict[int, str]] = None
 
-    queryset = src_models.InstantlyReply.objects.filter(
-        is_positive=True,
-        deal_created_at__isnull=True,
-        is_auto_reply=False,
-        sync_attempts__lt=max_attempts,
-    ).order_by("email_timestamp")
+    queryset = deal_queue(emails=emails, max_attempts=max_attempts)
     if limit:
         queryset = queryset[:limit]
 

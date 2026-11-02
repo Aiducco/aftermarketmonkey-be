@@ -64,6 +64,17 @@ class Command(BaseCommand):
             "Idempotent; creates nothing.",
         )
         parser.add_argument(
+            "--create-deals-for",
+            nargs="+",
+            default=None,
+            metavar="EMAIL",
+            help="Open deals for these reply addresses and stop -- the catch-up path for shops "
+            "whose replies were pushed as contacts while FRESHSALES_CREATE_DEALS was off. Runs "
+            "the deal pass only (ingest and the contact push already happened) and ignores that "
+            "setting, since naming addresses is the explicit decision the setting guards. Skips "
+            "any address that is not a positive reply, or already has a deal.",
+        )
+        parser.add_argument(
             "--max-attempts",
             type=int,
             default=5,
@@ -94,6 +105,13 @@ class Command(BaseCommand):
             for key in sorted(counts):
                 self.stdout.write("  {:<26} {}".format(key, counts[key]))
             self.stdout.write(self.style.SUCCESS("Notes rewritten."))
+            return
+
+        if options.get("create_deals_for"):
+            self._create_deals_for(
+                emails=options["create_deals_for"],
+                max_attempts=options.get("max_attempts"),
+            )
             return
 
         since = self._parse_since(options.get("since"))
@@ -136,6 +154,90 @@ class Command(BaseCommand):
                 )
             )
         self.stdout.write(self.style.SUCCESS("Instantly -> FreshSales sync finished."))
+
+    def _create_deals_for(self, emails, max_attempts):
+        """
+        The deal pass, restricted to named addresses, with FRESHSALES_CREATE_DEALS ignored.
+
+        Nothing is ingested and no contact is pushed: this exists for shops whose replies the cron
+        already turned into contacts, which is every shop reachable this way. Typing the addresses
+        is the deliberate per-shop decision that FRESHSALES_CREATE_DEALS otherwise guards, so the
+        setting is not consulted -- leaving the cron still not opening deals on its own.
+        """
+        from django.conf import settings
+
+        from src.integrations.clients.freshsales import client as freshsales_client
+
+        # Named up front rather than inferred from the counts afterwards: a shop with three
+        # replies contributes three to them, so "fewer counts than addresses" cannot tell a
+        # typo'd address from a chatty one. The queue filters on is_positive / is_auto_reply /
+        # deal_created_at, so an ineligible address otherwise just reports zeros and looks fine.
+        eligible = {
+            address.strip().lower()
+            for address in instantly_freshsales_sync.deal_queue(
+                emails=emails, max_attempts=max_attempts
+            ).values_list("lead_email", flat=True)
+        }
+        missing = [e for e in emails if e.strip().lower() not in eligible]
+        if missing:
+            self.stdout.write(
+                self.style.WARNING(
+                    "No waiting positive reply for: {}. Each is either not labelled Interested, "
+                    "already has a deal, or is an auto-reply -- check is_positive / "
+                    "freshsales_deal_id on instantly_reply. Continuing with the rest.".format(
+                        ", ".join(missing)
+                    )
+                )
+            )
+        if not eligible:
+            self.stdout.write(self.style.ERROR("Nothing to do -- no address matched. Stopping."))
+            return
+
+        crm = freshsales_client.FreshsalesApiClient()
+        instantly = instantly_client.InstantlyApiClient()
+
+        execution = audit_scheduled_tasks.start_scheduled_task_execution(
+            instantly_freshsales_sync.DEAL_CATCHUP_TASK_NAME
+        )
+        try:
+            counts = instantly_freshsales_sync.create_deals(
+                crm=crm,
+                instantly=instantly,
+                default_amount=settings.FRESHSALES_DEFAULT_DEAL_AMOUNT,
+                emails=emails,
+                max_calls=settings.FRESHSALES_MAX_CALLS_PER_RUN,
+                max_attempts=max_attempts,
+                provision_platform_accounts=settings.FRESHSALES_AUTO_PROVISION_PLATFORM_ACCOUNT,
+            )
+        except Exception as e:
+            message = common_utils.get_exception_message(exception=e)
+            audit_scheduled_tasks.mark_scheduled_task_failed(execution, error_message=message)
+            self.stdout.write(self.style.ERROR("Failed: {}".format(message)))
+            raise
+
+        message = "requested={}, {}".format(
+            " ".join(emails), ", ".join("{}={}".format(k, v) for k, v in sorted(counts.items()))
+        )
+        audit_scheduled_tasks.mark_scheduled_task_completed(execution, message=message)
+
+        for key in sorted(counts):
+            self.stdout.write("  {:<26} {}".format(key, counts[key]))
+        if counts["failed"]:
+            self.stdout.write(
+                self.style.WARNING(
+                    "{} repl(ies) failed -- read last_error on instantly_reply. A rejected "
+                    "dropdown value (FRESHSALES_DEAL_SOURCE / _RESCUE_STEP / _ASSIGNED_TO must "
+                    "match an existing FreshSales option exactly) looks like this.".format(counts["failed"])
+                )
+            )
+        if counts["campaign_removal_failed"]:
+            self.stdout.write(
+                self.style.WARNING(
+                    "{} lead(s) still sit in their Instantly campaign and will keep receiving the "
+                    "cold sequence -- remove them by hand.".format(counts["campaign_removal_failed"])
+                )
+            )
+        self.stdout.write(self.style.SUCCESS("Deal catch-up finished."))
 
     def _dry_run(self, since, campaign_id):
         from django.conf import settings
