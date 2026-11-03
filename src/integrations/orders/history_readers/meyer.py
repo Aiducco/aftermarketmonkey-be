@@ -19,8 +19,10 @@ machine to check, since both calls need a SOCKS5 proxy only production can reach
   - Line fields (``ItemNumber``/``Quantity``/``UnitPrice``/``ExtendedPrice``) come back from
     SalesHistory ONLY. SalesCurrent returns headers alone, though the PDF documents lines on
     both.
-  - Tracking is ``TrackingNumbers`` (a list) on SalesHistory but ``Tracking_Number`` (singular)
-    on SalesCurrent. Unused here -- ExternalOrderResult carries no tracking field.
+  - Tracking is ``TrackingNumbers`` (a LIST) on SalesHistory but ``Tracking_Number`` (singular)
+    on SalesCurrent. Both are read; one order really does ship in several packages.
+  - Neither listing carries an invoice number, freight, tax or a real order total. GET /Invoice
+    does, which is what enrich_new_order goes after.
 
 Believing the PDF cost 29 Meyer orders ingested as empty shells -- right order numbers and
 origin flags, every other field null -- before the first production run exposed it.
@@ -173,6 +175,26 @@ def _build_order_result(
     if not any(value for value in ship_to.values()):
         ship_to = None
 
+    # Tracking rides on the listing itself -- no extra call. SalesHistory names it
+    # "TrackingNumbers" and gives a LIST (one order genuinely ships in several packages:
+    # ['879615150664', '879615150675'] measured live); SalesCurrent names it "Tracking_Number"
+    # and gives a single string. Both shapes are read, and the carrier is the order's own
+    # ShipMethod, which Meyer gives as a plain name ("FEDEX HOME", "UPS GRND RES") rather than a
+    # code needing a lookup.
+    ship_method = (header.get("ShipMethod") or "").strip() or None
+    tracking = []
+    seen_tracking = set()
+    for row in rows:
+        numbers = row.get("TrackingNumbers")
+        if isinstance(numbers, str):
+            numbers = [numbers]
+        for candidate in list(numbers or []) + [row.get("Tracking_Number")]:
+            number = str(candidate or "").strip()
+            if not number or number in seen_tracking:
+                continue
+            seen_tracking.add(number)
+            tracking.append({"tracking_number": number, "carrier": ship_method})
+
     return history.ExternalOrderResult(
         distributor_order_number=order_number,
         customer_po_number=header.get("CustomerPO") or None,
@@ -180,11 +202,16 @@ def _build_order_result(
         status=status_label,
         ship_to=ship_to,
         subtotal=decimal.Decimal(str(subtotal)) if subtotal is not None else None,
+        # Neither listing carries freight or a real order total -- the subtotal stands in until
+        # enrich_new_order's GET /Invoice fills both in with Meyer's own figures.
         freight=None,
         total=decimal.Decimal(str(subtotal)) if subtotal is not None else None,
         line_items=line_items,
         raw_response={"rows": rows},
         api_order_flag=api_order_flag,
+        tracking=tracking,
+        ship_method_code=ship_method,
+        ship_method=ship_method,
     )
 
 
@@ -226,6 +253,49 @@ class MeyerOrderHistoryReader(history.OrderHistoryReader):
             _build_order_result(order_number, order_rows, "Invoiced", warehouse_names)
             for order_number, order_rows in _group_rows_by_order(rows).items()
         ]
+
+    def enrich_new_order(self, result: history.ExternalOrderResult) -> history.ExternalOrderResult:
+        """
+        One GET /Invoice per newly-discovered order, never on a refresh of one already stored.
+
+        SalesCurrent/SalesHistory carry no invoice number, no freight, no tax and no order total
+        -- the "total" a listing yields is just its own lines added up, which is short by
+        whatever Meyer charged to ship it. GET /Invoice carries Meyer's own figures: InvoiceNumber,
+        Freight, Tax, MiscCharge, TradeDiscount and Total.
+
+        Best-effort, like every other enrichment here. A 70202 ("No invoice found") is the normal
+        answer for an order that has not invoiced yet, not a failure -- the order keeps the
+        listing's own numbers and picks the invoice up on a later poll once it exists.
+        """
+        try:
+            invoices = self._client.get_invoice(result.distributor_order_number, self._client.customer_number)
+        except meyer_client_exceptions.MeyerException:
+            logger.info(
+                "{} no invoice yet for newly-discovered order {}; keeping listing totals.".format(
+                    _LOG_PREFIX, result.distributor_order_number
+                )
+            )
+            return result
+        if not invoices:
+            return result
+
+        invoice = invoices[0]
+        invoice_numbers = []
+        for entry in invoices:
+            number = str(entry.get("InvoiceNumber") or "").strip()
+            if number and number not in invoice_numbers:
+                invoice_numbers.append(number)
+
+        freight = _to_decimal(invoice.get("Freight"))
+        total = _to_decimal(invoice.get("Total"))
+        result.distributor_invoice_numbers = invoice_numbers
+        if freight is not None:
+            result.freight = freight
+        # Meyer's own Total already includes freight, tax and any trade discount, so it replaces
+        # the summed-lines figure outright rather than being added to it.
+        if total is not None:
+            result.total = total
+        return result
 
     def list_current_orders(self) -> typing.List[history.ExternalOrderResult]:
         """SalesCurrent -- ALL open (non-invoiced) orders, no date parameter at all. Called
