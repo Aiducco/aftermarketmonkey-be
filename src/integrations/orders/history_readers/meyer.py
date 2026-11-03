@@ -51,6 +51,20 @@ def _to_decimal(value: typing.Any) -> typing.Optional[decimal.Decimal]:
         return None
 
 
+def _quantity(value: typing.Any) -> typing.Optional[typing.Union[int, float]]:
+    """Meyer sends Quantity as a fixed-point STRING ("1.00000"), where the other three readers
+    send a real number. contract.md types ExternalOrderLine.quantity as a number, and the UI
+    renders it straight into a table cell -- so left alone it would read "1.00000" to a customer.
+    Whole values come back as int so the common case renders as "1", not "1.0"."""
+    if value is None or value == "":
+        return None
+    try:
+        number = decimal.Decimal(str(value))
+    except (decimal.InvalidOperation, ValueError):
+        return None
+    return int(number) if number == number.to_integral_value() else float(number)
+
+
 def _parse_create_date(value: typing.Optional[str]) -> typing.Optional[datetime.date]:
     """``CreateDate`` is an ISO datetime whose time component is always midnight -- only the date
     part is ever meaningful, matching ExternalPurchaseOrder.order_date's DateField.
@@ -131,7 +145,7 @@ def _build_order_result(
             {
                 "part_number": part_number,
                 "description": None,
-                "quantity": row.get("Quantity"),
+                "quantity": _quantity(row.get("Quantity")),
                 "unit_price": float(unit_price) if unit_price is not None else None,
                 "line_total": float(line_total) if line_total is not None else None,
                 "warehouse_code": warehouse_code,
