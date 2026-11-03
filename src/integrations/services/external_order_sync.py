@@ -125,48 +125,44 @@ def _is_ours(
     True if this incoming row is an order WE placed through the app. See
     ``_match_our_order_account_id`` for the two-identifier matching priority this follows.
 
-    Deliberately re-checks WHICH order_account the match was actually submitted through against
-    ``order_account`` (the account currently being polled) -- per research-be.md's "Collision
-    across a distributor's own multiple accounts" (Keystone's 3): a match against the SAME
-    account is suppressed as ours; a match against a DIFFERENT, specific account is NOT silently
-    suppressed -- logged as a warning and still treated as external here, since a loud, visible
-    duplicate-looking row is a safer failure mode than risking losing a genuinely external order
-    under a coincidental-looking match.
+    A match anywhere on the SAME ``company_provider`` counts as ours, whichever of that
+    connection's accounts the PurchaseOrder was submitted through. ``_match_our_order_account_id``
+    is already scoped to company_provider_id, so a match is never cross-distributor; within one
+    connection the accounts are just credential sets, and a distributor hands the same customer's
+    order history to all of them.
 
-    ``matched_order_account_id=None`` (the common case -- see PurchaseOrder.order_account, which
-    is nullable and means "whichever account was default at submit time") resolves to the
-    connection's CURRENT default, not to "any account". Treating it as any account would make a
-    genuinely external order discovered on a non-default account vanish whenever its identifier
-    happened to collide with one of our own null-account POs -- silent loss, which is exactly the
-    failure mode the specific-account branch below goes out of its way to avoid. The default may
-    of course have moved since submission; that only makes this the narrower, safer reading.
+    This used to additionally require the matched account to BE the account being polled, on the
+    reasoning that a visible duplicate beats silently losing a genuine external order. Trident's
+    real data says otherwise: 21 of its own Keystone orders were classed external purely because
+    the PO was submitted through the TRU account and rediscovered through the Trident one (or the
+    reverse) -- both see the same history. Every single cross-account match was ours; none was a
+    genuine external order.
+
+    The coincidence that reasoning feared cannot really happen here either, because the identifier
+    being matched is a PO number WE generated and sent at order placement. An order someone put in
+    by phone or on the distributor's own site carries whatever reference the rep typed, not one of
+    our numbers. The one genuinely risky case -- the same PO number reused against a DIFFERENT
+    distributor -- is already excluded by the company_provider scoping.
     """
     matched, matched_order_account_id = _match_our_order_account_id(
         company_provider_id, distributor_order_number, customer_po_number
     )
     if not matched:
         return False
-    if matched_order_account_id == order_account.id:
-        return True
-    if matched_order_account_id is None and order_account.is_default:
-        return True
-    logger.warning(
-        "{} distributor_order_number={} (or its customer_po_number) matched a PurchaseOrder "
-        "submitted through {}, but order_account_id={} (is_default={}) is the one currently "
-        "being polled (company_provider_id={}); not suppressing -- inserting as external.".format(
-            _LOG_PREFIX,
-            distributor_order_number,
-            (
-                "the connection's then-default account"
-                if matched_order_account_id is None
-                else "order_account_id={}".format(matched_order_account_id)
-            ),
-            order_account.id,
-            order_account.is_default,
-            company_provider_id,
+    if matched_order_account_id is not None and matched_order_account_id != order_account.id:
+        logger.info(
+            "{} distributor_order_number={} matched a PurchaseOrder submitted through "
+            "order_account_id={} while polling order_account_id={} on the same connection "
+            "(company_provider_id={}); suppressing as ours -- the accounts share one order "
+            "history.".format(
+                _LOG_PREFIX,
+                distributor_order_number,
+                matched_order_account_id,
+                order_account.id,
+                company_provider_id,
+            )
         )
-    )
-    return False
+    return True
 
 
 def _self_heal_existing_rows(
