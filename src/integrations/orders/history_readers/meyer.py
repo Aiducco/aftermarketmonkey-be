@@ -23,6 +23,9 @@ machine to check, since both calls need a SOCKS5 proxy only production can reach
     on SalesCurrent. Both are read; one order really does ship in several packages.
   - Neither listing carries an invoice number, freight, tax or a real order total. GET /Invoice
     does, which is what enrich_new_order goes after.
+  - SalesCurrent gives a header and nothing else, so an OPEN order has no lines until
+    GET /SalesOrderDetail is asked for them -- Items[] with ItemNumber, LineSequence, Quantity,
+    UnitPrice, TotalPrice and Kit.
 
 Believing the PDF cost 29 Meyer orders ingested as empty shells -- right order numbers and
 origin flags, every other field null -- before the first production run exposed it.
@@ -254,6 +257,60 @@ class MeyerOrderHistoryReader(history.OrderHistoryReader):
             for order_number, order_rows in _group_rows_by_order(rows).items()
         ]
 
+    def _fill_lines_from_detail(self, result: history.ExternalOrderResult) -> history.ExternalOrderResult:
+        """Lines, freight and a delivery ETA for an order SalesCurrent could only give a header
+        for. Best-effort: a failure leaves the order exactly as the listing described it."""
+        try:
+            details = self._client.get_sales_order_detail(result.distributor_order_number, self._client.customer_number)
+        except meyer_client_exceptions.MeyerException:
+            logger.info(
+                "{} get_sales_order_detail failed for newly-discovered order {}; no line items.".format(
+                    _LOG_PREFIX, result.distributor_order_number
+                )
+            )
+            return result
+        if not details:
+            return result
+
+        detail = details[0]
+        line_items = []
+        subtotal = decimal.Decimal("0")
+        for item in detail.get("Items") or []:
+            part_number = item.get("ItemNumber")
+            if not part_number:
+                continue
+            unit_price = _to_decimal(item.get("UnitPrice"))
+            line_total = _to_decimal(item.get("TotalPrice"))
+            if line_total is not None:
+                subtotal += line_total
+            line_items.append(
+                {
+                    "part_number": part_number,
+                    "description": None,
+                    "quantity": _quantity(item.get("Quantity")),
+                    "unit_price": float(unit_price) if unit_price is not None else None,
+                    "line_total": float(line_total) if line_total is not None else None,
+                    # SalesOrderDetail carries no warehouse either -- same LocationCode absence
+                    # as the listings (see this module's docstring).
+                    "warehouse_code": None,
+                    "warehouse_name": None,
+                }
+            )
+
+        if not line_items:
+            return result
+
+        result.line_items = line_items
+        if result.subtotal is None:
+            result.subtotal = subtotal
+        freight = _to_decimal(detail.get("Freight"))
+        if freight is not None:
+            result.freight = freight
+        if result.total is None:
+            result.total = subtotal + (freight or decimal.Decimal("0"))
+        result.raw_response = dict(result.raw_response or {}, sales_order_detail=detail)
+        return result
+
     def enrich_new_order(self, result: history.ExternalOrderResult) -> history.ExternalOrderResult:
         """
         One GET /Invoice per newly-discovered order, never on a refresh of one already stored.
@@ -267,6 +324,15 @@ class MeyerOrderHistoryReader(history.OrderHistoryReader):
         answer for an order that has not invoiced yet, not a failure -- the order keeps the
         listing's own numbers and picks the invoice up on a later poll once it exists.
         """
+        # SalesCurrent returns headers only -- no ItemNumber/Quantity/UnitPrice at all -- so an
+        # OPEN Meyer order arrives with an empty line list and the detail screen reads "No line
+        # items reported", which is true of the listing but not of the order. GET
+        # /SalesOrderDetail does carry Items[] (ItemNumber, LineSequence, Quantity, UnitPrice,
+        # TotalPrice, Kit), so it is fetched for exactly those orders. Invoiced orders already
+        # have their lines from SalesHistory and skip this.
+        if not result.line_items:
+            result = self._fill_lines_from_detail(result)
+
         try:
             invoices = self._client.get_invoice(result.distributor_order_number, self._client.customer_number)
         except meyer_client_exceptions.MeyerException:
