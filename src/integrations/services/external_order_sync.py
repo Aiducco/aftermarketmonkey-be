@@ -34,12 +34,19 @@ _LOG_PREFIX = "[EXTERNAL-ORDER-SYNC]"
 # comfortably covers a backdated order or a status flip that lands a day or two after the order
 # date.
 OVERLAP_DAYS = 3
-# First-ever run for an account (no watermark row yet) with no --since given.
-DEFAULT_BACKFILL_DAYS = 30
+# First-ever run for an account (no watermark row yet) with no --since given. Three months, so a
+# connection that has just been set up arrives with real history behind it rather than a near-empty
+# screen. Every later run is bounded by the watermark instead, so this cost is paid once.
+DEFAULT_BACKFILL_DAYS = 90
 # GET /tracking/date has no documented pagination and a hard 1000-row cap -- a window that
 # could plausibly return more than that must be split BEFORE calling, not detected after (see
 # research-be.md's "Premier's 1000-row cap").
 PREMIER_MAX_WINDOW_DAYS = 14
+# GetOrderHistory refuses a range wider than 120 days outright ("BadDate"), and its own SDK warns
+# that "a date range greater than 30 days may cause the function to timeout". 30 keeps every call
+# inside the range the vendor says is safe, so a 90-day backfill costs three calls instead of
+# risking one that dies and takes the whole backfill with it.
+KEYSTONE_MAX_WINDOW_DAYS = 30
 # The only observable signal /tracking/date gives that a window may have been truncated.
 _PREMIER_TRUNCATION_ROW_COUNT = 1000
 
@@ -218,16 +225,17 @@ def _window_for_account(
     return start, end
 
 
-def _premier_windows(
-    start: datetime.date, end: datetime.date
+def _chunk_windows(
+    start: datetime.date, end: datetime.date, max_days: int
 ) -> typing.List[typing.Tuple[datetime.date, datetime.date]]:
-    """Splits [start, end] into <=PREMIER_MAX_WINDOW_DAYS-wide sub-windows (see the module-level
-    PREMIER_MAX_WINDOW_DAYS constant's own docstring)."""
+    """Splits [start, end] into sub-windows no wider than ``max_days``, for the distributors
+    whose own API caps how much one call may ask for -- see PREMIER_MAX_WINDOW_DAYS and
+    KEYSTONE_MAX_WINDOW_DAYS for why each has the limit it does."""
     if start > end:
         return []
     windows = []
     window_start = start
-    step = datetime.timedelta(days=PREMIER_MAX_WINDOW_DAYS)
+    step = datetime.timedelta(days=max_days)
     while window_start <= end:
         window_end = min(window_start + step - datetime.timedelta(days=1), end)
         windows.append((window_start, window_end))
@@ -252,7 +260,7 @@ def _collect_results(
         results.extend(reader.list_current_orders())
         results.extend(reader.list_orders(start, end))
     elif kind == src_enums.BrandProviderKind.PREMIER_PERFORMANCE.value:
-        for window_start, window_end in _premier_windows(start, end):
+        for window_start, window_end in _chunk_windows(start, end, PREMIER_MAX_WINDOW_DAYS):
             window_results = reader.list_orders(window_start, window_end)
             if len(window_results) >= _PREMIER_TRUNCATION_ROW_COUNT:
                 logger.warning(
@@ -262,6 +270,21 @@ def _collect_results(
                     )
                 )
             results.extend(window_results)
+    elif kind == src_enums.BrandProviderKind.KEYSTONE.value:
+        # Walked in <=30-day steps so a 90-day first backfill cannot trip GetOrderHistory's
+        # documented timeout. A window that fails is logged and skipped rather than aborting the
+        # account: losing one month of a backfill beats losing all three, and the next run's
+        # watermark still covers the gap.
+        for window_start, window_end in _chunk_windows(start, end, KEYSTONE_MAX_WINDOW_DAYS):
+            try:
+                results.extend(reader.list_orders(window_start, window_end))
+            except Exception:
+                logger.exception(
+                    "{} Keystone get_order_history failed for window {}..{} (company_provider_id={}); "
+                    "skipping this window and continuing.".format(
+                        _LOG_PREFIX, window_start, window_end, company_provider.id
+                    )
+                )
     else:
         results.extend(reader.list_orders(start, end))
 
@@ -294,6 +317,11 @@ def _result_to_defaults(
         "freight": result.freight,
         "total": result.total,
         "line_items": result.line_items or [],
+        "distributor_invoice_numbers": result.distributor_invoice_numbers or [],
+        "tracking": result.tracking or [],
+        "ship_method_code": result.ship_method_code,
+        "ship_method": result.ship_method,
+        "status_history": result.status_history or [],
         "raw_response": result.raw_response,
     }
 

@@ -300,6 +300,35 @@ class PurchaseOrdersExternalView(views.View):
         return _json_response(result)
 
 
+class PurchaseOrderExternalDetailView(views.View):
+    """GET /purchase-orders/external/<id>/ — one distributor-placed order in full: everything the
+    list row carries plus the dated status progression. A route of its own rather than an id
+    handled by PurchaseOrderDetailView, which takes a PurchaseOrder id — overloading that path
+    would put two different id spaces behind one URL."""
+
+    def get(self, request: http.HttpRequest, *args, **kwargs) -> http.HttpResponse:
+        company_id, _user_id, err = _require_auth(request)
+        if err:
+            return err
+
+        try:
+            result = purchase_orders_services.get_external_purchase_order(
+                company_id=company_id,
+                external_order_id=kwargs["id"],
+            )
+        except purchase_orders_services.PurchaseOrderServiceError as e:
+            return _error_response(str(e), status=404)
+        except Exception:
+            logger.exception(
+                "{} Error loading external purchase order id={} for company_id={}".format(
+                    _LOG_PREFIX, kwargs.get("id"), company_id
+                )
+            )
+            return _error_response("Error loading external purchase order", status=500)
+
+        return _json_response(result)
+
+
 class PurchaseOrderInvoicesView(views.View):
     """GET /purchase-orders/invoices/ — flat, cross-distributor invoice list. Optional
     ?company_provider_id=&start_date=&end_date= (dates: YYYY-MM-DD, filtered on invoice_date)."""

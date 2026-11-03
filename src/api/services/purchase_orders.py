@@ -1865,6 +1865,15 @@ def _build_external_order_recipient_line(order: src_models.ExternalPurchaseOrder
     return ", ".join(part for part in parts if part)
 
 
+# Whether a distributor's order-discovery feed can report a recipient at all. Keystone's
+# GetOrderHistory has no name/street/city/postal/phone column and its Electronic Order Web Service
+# has no order-detail call to go and fetch one, so a Keystone order we did not place simply has no
+# knowable recipient. Absent from this map means "yes, expected to report one".
+_SHIP_TO_REPORTABLE_KINDS = {
+    src_enums.BrandProviderKind.KEYSTONE.value: False,
+}
+
+
 def _serialize_external_purchase_order(order: src_models.ExternalPurchaseOrder) -> typing.Dict:
     has_ship_to = any(
         [
@@ -1919,9 +1928,29 @@ def _serialize_external_purchase_order(order: src_models.ExternalPurchaseOrder) 
         "freight": _decimal_to_float(order.freight),
         "total": _decimal_to_float(order.total),
         "line_items": order.line_items or [],
+        "distributor_invoice_numbers": order.distributor_invoice_numbers or [],
+        "tracking": order.tracking or [],
+        "ship_method_code": order.ship_method_code,
+        "ship_method": order.ship_method,
+        # True when the distributor's own order feed cannot report a recipient at all, as opposed
+        # to us simply not having fetched one. Keystone's GetOrderHistory is the case this exists
+        # for: it carries no address fields and the service has no order-detail call, so the UI
+        # must say "not reported" rather than render a blank the user reads as a bug.
+        "ship_to_reportable": _SHIP_TO_REPORTABLE_KINDS.get(order.company_provider.provider.kind, True),
         "discovered_at": _iso_utc_z(order.discovered_at),
         "last_synced_at": _iso_utc_z(order.last_synced_at),
     }
+
+
+def _serialize_external_purchase_order_detail(order: src_models.ExternalPurchaseOrder) -> typing.Dict:
+    """The list row plus everything only the detail screen needs. Mirrors what
+    _serialize_confirmed_distributor_order gives an app-placed order, with one addition that has
+    no app-placed equivalent: status_history. A PurchaseOrder carries a single current status,
+    but Keystone returns one row per stage transition, so a discovered order can show its whole
+    dated progression (RCV ORD -> ORDER -> PICK -> PACKAGE -> INVOICE -> OUT4DLV -> DELIVRD)."""
+    detail = _serialize_external_purchase_order(order)
+    detail["status_history"] = order.status_history or []
+    return detail
 
 
 def _polled_connection_status(
@@ -2008,3 +2037,19 @@ def list_external_purchase_orders(
 
     orders = [_serialize_external_purchase_order(order) for order in qs.order_by("-discovered_at")]
     return {"orders": orders, "polled_connections": _polled_connections(company_id)}
+
+
+def get_external_purchase_order(company_id: int, external_order_id: int) -> typing.Dict:
+    """
+    GET /purchase-orders/external/<id>/. Scoped by company_id from the caller's token, never from
+    a request parameter -- an id belonging to another tenant reads as not found rather than
+    leaking its existence.
+    """
+    order = (
+        src_models.ExternalPurchaseOrder.objects.filter(company_id=company_id, id=external_order_id)
+        .select_related("company_provider__provider", "order_account")
+        .first()
+    )
+    if order is None:
+        raise PurchaseOrderServiceError("External order {} was not found.".format(external_order_id))
+    return _serialize_external_purchase_order_detail(order)

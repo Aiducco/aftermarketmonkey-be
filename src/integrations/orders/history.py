@@ -50,6 +50,21 @@ class ExternalOrderResult:
     # src.enums.ExternalOrderOriginSignal / external_order_sync._apply_results.
     api_order_flag: typing.Optional[bool] = None
 
+    # -- Detail parity with an app-placed order (see ExternalPurchaseOrder's own field comments
+    # and _serialize_confirmed_distributor_order, the shape these mirror). Every one defaults to
+    # empty so a reader that has no such data simply does not set it.
+
+    # Plain invoice-number strings; a list because one order can invoice more than once when its
+    # lines ship from different warehouses.
+    distributor_invoice_numbers: typing.List[str] = dataclasses.field(default_factory=list)
+    # [{tracking_number, carrier}] -- carrier None where only a number is given.
+    tracking: typing.List[typing.Dict] = dataclasses.field(default_factory=list)
+    # Raw code always; label only where the distributor publishes one for that code.
+    ship_method_code: typing.Optional[str] = None
+    ship_method: typing.Optional[str] = None
+    # [{status, occurred_at}] oldest first, in the distributor's own vocabulary.
+    status_history: typing.List[typing.Dict] = dataclasses.field(default_factory=list)
+
 
 class OrderHistoryReader(abc.ABC):
     """

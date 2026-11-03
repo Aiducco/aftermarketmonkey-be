@@ -94,6 +94,7 @@ from src.api.views.purchase_orders import (
     PurchaseOrderOrderAccountView,
     PurchaseOrdersView,
     PurchaseOrdersExternalView,
+    PurchaseOrderExternalDetailView,
     PurchaseOrderDetailView,
     PurchaseOrderConfirmedDetailView,
     PurchaseOrderPdfView,
@@ -448,6 +449,11 @@ urlpatterns = [
         "purchase-orders/external/",
         PurchaseOrdersExternalView.as_view(),
         name="purchase_orders_external",
+    ),
+    path(
+        "purchase-orders/external/<int:id>/",
+        PurchaseOrderExternalDetailView.as_view(),
+        name="purchase_orders_external_detail",
     ),
     path(
         "settings/profile/",

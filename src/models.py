@@ -4560,6 +4560,33 @@ class ExternalPurchaseOrder(django_db_models.Model):
     # external order is header-only-or-itemized in the same uneven way per distributor.
     line_items = django_db_models.JSONField(default=list, blank=True, encoder=DjangoJSONEncoder)
 
+    # Everything below brings a discovered order up to parity with what the confirmed-order screen
+    # shows for an order we placed ourselves (_serialize_confirmed_distributor_order) -- see
+    # docs/tasks/external-orders-full/TASK.md.
+
+    # Distributor invoice numbers, as plain strings. A list because one order can invoice more
+    # than once when its lines ship from different warehouses -- Keystone's EKINV#, which repeats
+    # per transaction row and is deduplicated on the way in.
+    distributor_invoice_numbers = django_db_models.JSONField(default=list, blank=True, encoder=DjangoJSONEncoder)
+
+    # [{tracking_number, carrier}] -- carrier is None where the distributor only gives a number.
+    # Keystone attaches tracking to PACKAGE/OUT4DLV/DELIVRD rows and never to INVOICE, so this is
+    # collected across ALL of an order's rows rather than read off the latest one.
+    tracking = django_db_models.JSONField(default=list, blank=True, encoder=DjangoJSONEncoder)
+
+    # The distributor's own raw ship-method code, plus a decoded label where we have one.
+    # Keystone returns undocumented EKSVIA values (4 and 5 observed live against a published list
+    # of 2/3/6/7/8/L), so the code is always stored and the label stays NULL rather than guessed.
+    ship_method_code = django_db_models.CharField(max_length=16, null=True, blank=True)
+    ship_method = django_db_models.CharField(max_length=64, null=True, blank=True)
+
+    # [{status, occurred_at}] in the distributor's own status vocabulary, oldest first. App-placed
+    # orders have no equivalent -- PurchaseOrder carries a single current status -- but Keystone's
+    # GetOrderHistory returns one row per stage transition, so the whole dated progression
+    # (RCV ORD -> ORDER -> PICK -> PACKAGE -> INVOICE -> OUT4DLV -> DELIVRD) is available and is
+    # the richest thing it gives us.
+    status_history = django_db_models.JSONField(default=list, blank=True, encoder=DjangoJSONEncoder)
+
     raw_response = django_db_models.JSONField(null=True, blank=True, encoder=DjangoJSONEncoder)
 
     discovered_at = django_db_models.DateTimeField(auto_now_add=True)

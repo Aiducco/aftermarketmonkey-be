@@ -40,6 +40,35 @@ _ORDER_HISTORY_ERROR_VALUES = {"NoData", "BadDate", "BadInDt"}
 # this filter existed.
 _NON_ORDER_PO_VALUES = {"SUBFEE"}
 
+# EKSWHS -> warehouse, from the SDK's own "List of Active Warehouses" glossary (p.70). Static and
+# small, with no table of its own in our DB -- unlike Meyer, whose warehouses come from a real
+# fetch (MeyerLocation). "0" is not a warehouse: the SDK says a line showing it was backordered
+# or transferred in from another warehouse.
+_WAREHOUSE_NAMES = {
+    "1": "East - Exeter, PA",
+    "14": "Midwest - Kansas City, KS",
+    "25": "California - Eastvale, CA",
+    "30": "Southeast - Atlanta, GA",
+    "45": "Pacific Northwest - Spokane, WA",
+    "50": "Texas - Flower Mound, TX",
+    "55": "TexasDFW - Dallas, TX",
+    "60": "Great Lakes - Brownstown, MI",
+    "70": "Florida - Ocoee, FL",
+}
+
+# EKSVIA -> carrier, from the SDK's "List of Common Shipping Service Levels" (p.70). The list is
+# explicitly not exhaustive, and live responses do return codes it omits (4 and 5 observed on
+# Trident's account), so an unknown code is left unlabelled rather than guessed -- the raw code is
+# stored either way.
+_SHIP_VIA_NAMES = {
+    "2": "FedEx",
+    "3": "UPS",
+    "6": "Keystone Truck Run",
+    "7": "Purolator",
+    "8": "USPS Priority Mail",
+    "L": "Freight LTL",
+}
+
 
 def _to_decimal(value: typing.Optional[str]) -> typing.Optional[decimal.Decimal]:
     if not value:
@@ -69,6 +98,24 @@ def _parse_ekdate(value: typing.Optional[str]) -> typing.Optional[datetime.date]
         return datetime.date(int(value[0:4]), int(value[4:6]), int(value[6:8]))
     except ValueError:
         return None
+
+
+def _parse_ekdatetime(
+    date_value: typing.Optional[str], time_value: typing.Optional[str]
+) -> typing.Optional[datetime.datetime]:
+    """EKDATE (YYYYMMDD) + EKTIME (HHMMSS) into one naive timestamp. The SDK notes EKTIME loses
+    its leading zero before 10 AM, so it is padded back to six digits first. Keystone states no
+    timezone anywhere, so this is left naive rather than asserting UTC it did not promise."""
+    date_part = _parse_ekdate(date_value)
+    if date_part is None:
+        return None
+    raw_time = (time_value or "").strip().zfill(6)
+    try:
+        return datetime.datetime(
+            date_part.year, date_part.month, date_part.day, int(raw_time[0:2]), int(raw_time[2:4]), int(raw_time[4:6])
+        )
+    except (ValueError, IndexError):
+        return datetime.datetime(date_part.year, date_part.month, date_part.day)
 
 
 def _normalize_po(value: typing.Optional[str]) -> str:
@@ -170,9 +217,51 @@ def _build_order_result(
             "unit_price": float(unit_price) if unit_price is not None else None,
             "line_total": float(line_total) if line_total is not None else None,
             "warehouse_code": warehouse_code,
-            "warehouse_name": None,
+            "warehouse_name": _WAREHOUSE_NAMES.get((warehouse_code or "").strip()),
         }
     line_items = list(merged.values())
+
+    # Invoice numbers repeat on every row of an invoiced line; "0"/blank means not invoiced yet.
+    # A list because one order can invoice more than once when its lines ship from two warehouses.
+    invoice_numbers = []
+    for row in rows:
+        inv = str(row.get("EKINV#") or "").strip()
+        if inv and inv != "0" and inv not in invoice_numbers:
+            invoice_numbers.append(inv)
+
+    # Tracking rides on PACKAGE/OUT4DLV/DELIVRD rows and never on INVOICE (measured live), so
+    # this sweeps every row rather than reading the most advanced one.
+    tracking = []
+    seen_tracking = set()
+    for row in rows:
+        number = (row.get("EKTRCK") or "").strip()
+        if not number or number in seen_tracking:
+            continue
+        seen_tracking.add(number)
+        tracking.append({"tracking_number": number, "carrier": _SHIP_VIA_NAMES.get((row.get("EKSVIA") or "").strip())})
+
+    # Raw EKSVIA always; the label only when the SDK publishes one for that code. Codes 4 and 5
+    # come back live and are documented nowhere, so they stay unlabelled rather than guessed.
+    ship_method_code = None
+    for row in reversed(rows):
+        if (row.get("EKSVIA") or "").strip():
+            ship_method_code = row["EKSVIA"].strip()
+            break
+
+    # One entry per distinct stage, oldest first. Keystone repeats a stage once per line item, so
+    # the same status at the same timestamp collapses to one entry.
+    status_history = []
+    seen_stage = set()
+    for row in sorted(rows, key=lambda r: ((r.get("EKDATE") or ""), (r.get("EKTIME") or "").zfill(6))):
+        stage = (row.get("EKSTAT") or "").strip()
+        if not stage:
+            continue
+        occurred_at = _parse_ekdatetime(row.get("EKDATE"), row.get("EKTIME"))
+        marker = (stage, occurred_at.isoformat() if occurred_at else None)
+        if marker in seen_stage:
+            continue
+        seen_stage.add(marker)
+        status_history.append({"status": stage, "occurred_at": occurred_at.isoformat() if occurred_at else None})
 
     line_totals = [li["line_total"] for li in line_items if li["line_total"] is not None]
     subtotal = round(sum(line_totals), 2) if line_totals else None
@@ -194,12 +283,21 @@ def _build_order_result(
         customer_po_number=customer_po_number,
         order_date=order_date,
         status=status,
-        ship_to=None,  # GetOrderHistory carries no ship-to address at all.
+        # GetOrderHistory carries no name, street, city, postal code or phone, and the Electronic
+        # Order Web Service has no order-detail call to go and fetch one (every method in the SDK
+        # was reviewed). For a Keystone order we did not place, the recipient is simply not
+        # knowable -- the UI says "not reported by this distributor" rather than showing a blank.
+        ship_to=None,
         subtotal=decimal.Decimal(str(subtotal)) if subtotal is not None else None,
         freight=freight,
         total=total,
         line_items=line_items,
         raw_response={"rows": rows},
+        distributor_invoice_numbers=invoice_numbers,
+        tracking=tracking,
+        ship_method_code=ship_method_code,
+        ship_method=_SHIP_VIA_NAMES.get(ship_method_code or ""),
+        status_history=status_history,
     )
 
 
