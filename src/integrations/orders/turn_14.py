@@ -105,7 +105,7 @@ def _sanitize_order_notes(raw: typing.Optional[str]) -> typing.Optional[str]:
     return collapsed.encode("ascii", "ignore").decode("ascii").strip() or None
 
 
-def _load_warehouse_names() -> typing.Dict[str, str]:
+def load_warehouse_names() -> typing.Dict[str, str]:
     """
     {external_id: "City, ST"} from Turn14Location (populated by fetch_turn14_locations from
     GET /v1/locations), so quote responses can show a real place instead of a bare code — this
@@ -298,7 +298,7 @@ def parse_order_raw_response(raw_response: typing.Optional[typing.Dict]) -> typi
     ]
 
     if entry.get("type") == "Invoice":
-        warehouse_names = _load_warehouse_names()
+        warehouse_names = load_warehouse_names()
         line_items = _parse_invoice_lines(attrs, warehouse_names)
         line_totals = [li["line_total"] for li in line_items if li["line_total"] is not None]
         subtotal = round(sum(line_totals), 2) if line_totals else None
@@ -327,7 +327,7 @@ def parse_order_raw_response(raw_response: typing.Optional[typing.Dict]) -> typi
         if invoice_id is not None and str(invoice_id) not in invoice_ids:
             invoice_ids.append(str(invoice_id))
 
-    warehouse_names = _load_warehouse_names()
+    warehouse_names = load_warehouse_names()
     line_items = (
         _parse_order_lines(attrs, warehouse_names)
         if "lines" in attrs
@@ -507,7 +507,7 @@ class Turn14OrderAdapter(base.DistributorOrderAdapter):
                 decimal.Decimal(str(attrs["total"])) if attrs.get("total") is not None else None
             )
 
-            warehouse_names = _load_warehouse_names()
+            warehouse_names = load_warehouse_names()
 
             lines: typing.List[base.ShippingQuoteLine] = []
             for shipment in attrs.get("shipment", []):
