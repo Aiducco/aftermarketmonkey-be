@@ -18,6 +18,7 @@ import typing
 
 from django.conf import settings
 from django.db import IntegrityError, transaction
+from django.db.models import F
 from django.utils import timezone as django_timezone
 
 from src import enums as src_enums
@@ -2035,7 +2036,14 @@ def list_external_purchase_orders(
             raise PurchaseOrderServiceError("Invalid 'since' date '{}'; expected YYYY-MM-DD.".format(since))
         qs = qs.filter(order_date__gte=since_date)
 
-    orders = [_serialize_external_purchase_order(order) for order in qs.order_by("-discovered_at")]
+    # Newest order first, by the date the distributor says it was placed -- which is what the
+    # "Placed" column shows and how the app-placed table is read. Nulls last, because an order
+    # the distributor has not dated yet (Premier before it invoices) is not the newest thing that
+    # happened; discovered_at breaks ties and orders the undated ones among themselves.
+    orders = [
+        _serialize_external_purchase_order(order)
+        for order in qs.order_by(F("order_date").desc(nulls_last=True), "-discovered_at")
+    ]
     return {"orders": orders, "polled_connections": _polled_connections(company_id)}
 
 
