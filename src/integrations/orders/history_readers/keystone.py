@@ -265,7 +265,13 @@ def _build_order_result(
 
     line_totals = [li["line_total"] for li in line_items if li["line_total"] is not None]
     subtotal = round(sum(line_totals), 2) if line_totals else None
-    freight = _to_decimal(rows[0].get("EKFRTD")) if rows else None
+    # EKFRTD is 0.00 on an order's early rows and only carries a real charge once Keystone has
+    # rated the shipment, so the FIRST row is the one row guaranteed not to have it: TRU107302
+    # invoiced $25.00 freight and was stored as 0.00. Largest value across the order's rows,
+    # which is also right for a split shipment -- the per-transaction figure is the order's
+    # freight repeated, not a per-line share to be summed.
+    freight_values = [value for value in (_to_decimal(row.get("EKFRTD")) for row in rows) if value is not None]
+    freight = max(freight_values) if freight_values else None
     total = (
         decimal.Decimal(str(subtotal)) + freight
         if subtotal is not None and freight is not None
