@@ -4594,11 +4594,18 @@ class ExternalPurchaseOrder(django_db_models.Model):
 
     class Meta:
         db_table = "external_purchase_orders"
-        # Scoped to order_account, not company_provider -- see external_order_sync's Dedup
-        # section for why a distributor_order_number collision across two of a company's
-        # accounts for the SAME distributor (Keystone's 3) must be treated as two different
-        # orders, not one.
-        unique_together = [["order_account", "distributor_order_number"]]
+        # Scoped to company_provider, not order_account: an order belongs to the CONNECTION, not
+        # to whichever credential set happened to find it. This was the other way round, on the
+        # theory that a number colliding across two of a company's accounts for one distributor
+        # meant two different orders. Trident's data says the opposite -- Keystone hands both its
+        # accounts the same customer's history, so all 32 of its orders were stored twice, once
+        # per account, and the screen showed every Keystone order as a pair.
+        #
+        # A collision really is the same order: these numbers are the distributor's own
+        # (Keystone's EKKEY#, Meyer's OrderNumber, Premier's salesOrderNumber), issued from one
+        # sequence per distributor rather than per customer account. ``order_account`` is still
+        # stored, as the account that discovered it.
+        unique_together = [["company_provider", "distributor_order_number"]]
         indexes = [
             django_db_models.Index(fields=["company", "order_date"], name="ext_po_company_date_idx"),
         ]

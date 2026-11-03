@@ -10,7 +10,7 @@ READ-ONLY against every distributor API -- no adapter/client write method is eve
 this module, only ``OrderHistoryReader.list_orders``/``list_current_orders``/``enrich_new_order``.
 
 Safe to run repeatedly: ``ExternalPurchaseOrder``'s
-``unique_together = ["order_account", "distributor_order_number"]`` makes every write here an
+``unique_together = ["company_provider", "distributor_order_number"]`` makes every write here an
 ``update_or_create``, so running this command three times in a row creates nothing new on the
 2nd/3rd run -- see ``_apply_results``.
 """
@@ -196,7 +196,9 @@ def _self_heal_existing_rows(
     query = Q(distributor_order_number__in=normalized_numbers) if normalized_numbers else Q(pk__in=[])
     if po_numbers:
         query |= Q(customer_po_number__in=po_numbers)
-    candidates = src_models.ExternalPurchaseOrder.objects.filter(order_account=order_account).filter(query)
+    # Connection-scoped, matching the row identity: a row discovered through a sibling
+    # account is the same order and must be re-checked too.
+    candidates = src_models.ExternalPurchaseOrder.objects.filter(company_provider_id=company_provider_id).filter(query)
 
     healed = 0
     for row in candidates:
@@ -412,8 +414,12 @@ def _apply_results(
             continue
 
         defaults = _result_to_defaults(result, company_provider, origin_signal)
+        # Keyed on the connection, not the account -- Keystone hands both of a company's accounts
+        # the same order history, so keying on the account stored every one of its orders twice.
+        # The account that found it is still recorded, as a plain attribute.
+        defaults["order_account"] = account
         _, created = src_models.ExternalPurchaseOrder.objects.update_or_create(
-            order_account=account,
+            company_provider=company_provider,
             distributor_order_number=normalized_number,
             defaults=defaults,
         )
