@@ -5,10 +5,25 @@ directly whether an order went through our API ("Yes") or not ("No"). See
 docs/tasks/external-orders/reference/meyer-order-reads.md for the vendor-doc spec this is built
 against.
 
-UNVERIFIED LIVE: SalesCurrent/SalesHistory both time out connecting through the required SOCKS5
-proxy from this dev machine (contract.md's "Verification blockers") -- every parsing decision
-below is justified from the vendor doc, not confirmed against a real response. Must be re-run
-from a host the proxy actually accepts connections from before this is trusted unattended.
+VERIFIED LIVE from the production host on 2026-11-03, which corrected four field names the
+vendor PDF gets wrong. Trust the list below over the PDF; the PDF cannot be reached from a dev
+machine to check, since both calls need a SOCKS5 proxy only production can reach.
+
+  - ``CreateDate``, not ``DocDate``. DocDate does not exist on either call.
+  - ``ExtendedPrice``, not ``ExtPrice``.
+  - ``CustomerPO`` IS returned by both calls; the PDF documents it only on
+    SalesOrderDetail/Invoice.
+  - A structured ship-to IS returned by both -- ``ShipToName``, ``Address1``, ``Address2``,
+    ``City``, ``State``, ``ZipCode``, ``Country``. The PDF lists none of them here.
+  - ``LocationCode`` is documented but absent from every live response observed.
+  - Line fields (``ItemNumber``/``Quantity``/``UnitPrice``/``ExtendedPrice``) come back from
+    SalesHistory ONLY. SalesCurrent returns headers alone, though the PDF documents lines on
+    both.
+  - Tracking is ``TrackingNumbers`` (a list) on SalesHistory but ``Tracking_Number`` (singular)
+    on SalesCurrent. Unused here -- ExternalOrderResult carries no tracking field.
+
+Believing the PDF cost 29 Meyer orders ingested as empty shells -- right order numbers and
+origin flags, every other field null -- before the first production run exposed it.
 """
 import datetime
 import decimal
@@ -36,10 +51,13 @@ def _to_decimal(value: typing.Any) -> typing.Optional[decimal.Decimal]:
         return None
 
 
-def _parse_doc_date(value: typing.Optional[str]) -> typing.Optional[datetime.date]:
-    """DocDate is an ISO datetime whose time component is always "00:00:00.000Z" per the vendor
-    doc -- only the date part is ever meaningful, matching
-    ExternalPurchaseOrder.order_date's DateField."""
+def _parse_create_date(value: typing.Optional[str]) -> typing.Optional[datetime.date]:
+    """``CreateDate`` is an ISO datetime whose time component is always midnight -- only the date
+    part is ever meaningful, matching ExternalPurchaseOrder.order_date's DateField.
+
+    The field is CreateDate, NOT the DocDate the vendor PDF documents: measured against the live
+    production API, SalesCurrent and SalesHistory both return CreateDate and no DocDate at all.
+    The PDF is wrong about several of these names -- see this module's docstring."""
     if not value:
         return None
     try:
@@ -88,18 +106,30 @@ def _build_order_result(
     # ExternalOrderOriginSignal / external_order_sync._apply_results).
     api_order_flag = (header.get("API Order") or "").strip().lower() == "yes"
 
-    # LineSequence, not ItemNumber, is the real per-line key -- the vendor doc notes the same
-    # item can appear twice on one order (e.g. split across two shipments), so this groups by
-    # OrderNumber only and keeps every row as its own line rather than merging same-ItemNumber
-    # rows together.
+    # LineSequence, not ItemNumber, is the real per-line key -- the same item can appear twice on
+    # one order (e.g. split across two shipments), so this groups by OrderNumber only and keeps
+    # every row as its own line rather than merging same-ItemNumber rows together.
+    #
+    # Only SalesHistory carries line fields. SalesCurrent (open orders) returns headers ONLY --
+    # no ItemNumber/Quantity/UnitPrice/ExtendedPrice at all, measured live, contrary to the
+    # vendor PDF which documents them on both. So a row with no ItemNumber is skipped rather
+    # than emitted as an all-null line: 29 Meyer orders shipped as rows of all-None line items
+    # the first time this ran, which is worse than an honestly empty list.
     line_items = []
     for row in rows:
+        part_number = row.get("ItemNumber")
+        if not part_number:
+            continue
         unit_price = _to_decimal(row.get("UnitPrice"))
-        line_total = _to_decimal(row.get("ExtPrice"))
+        # ExtendedPrice, not the vendor PDF's ExtPrice -- that key does not exist live.
+        line_total = _to_decimal(row.get("ExtendedPrice"))
+        # LocationCode is documented by the PDF but absent from every live response observed, so
+        # this is normally None; kept (and decoded when present) rather than dropped, since it
+        # costs one small query and starts working the moment Meyer includes it.
         warehouse_code = row.get("LocationCode")
         line_items.append(
             {
-                "part_number": row.get("ItemNumber"),
+                "part_number": part_number,
                 "description": None,
                 "quantity": row.get("Quantity"),
                 "unit_price": float(unit_price) if unit_price is not None else None,
@@ -112,16 +142,29 @@ def _build_order_result(
     line_totals = [li["line_total"] for li in line_items if li["line_total"] is not None]
     subtotal = round(sum(line_totals), 2) if line_totals else None
 
+    # Both endpoints DO carry the customer PO and a structured ship-to, contrary to the vendor
+    # PDF, which documents neither on these two calls. Meyer still never needs PO-matching for
+    # dedup ("API Order" is authoritative), but the PO is what a human recognises an order by --
+    # Trident's read real things like "TRU107550" and "FRIDAY DELIVERY".
+    ship_to = {
+        "name": header.get("ShipToName"),
+        "address1": header.get("Address1"),
+        "address2": header.get("Address2") or None,
+        "city": header.get("City"),
+        "state": header.get("State"),
+        "postal_code": header.get("ZipCode"),
+        "country": header.get("Country"),
+        "phone": None,
+    }
+    if not any(value for value in ship_to.values()):
+        ship_to = None
+
     return history.ExternalOrderResult(
         distributor_order_number=order_number,
-        # SalesCurrent/SalesHistory's row shape carries no CustPO field of its own (only
-        # SalesOrderDetail/Invoice do, per the vendor doc) -- left None rather than guessed.
-        # Meyer doesn't need PO-matching for dedup anyway, since "API Order" is authoritative.
-        customer_po_number=None,
-        order_date=_parse_doc_date(header.get("DocDate")),
+        customer_po_number=header.get("CustomerPO") or None,
+        order_date=_parse_create_date(header.get("CreateDate")),
         status=status_label,
-        # Neither endpoint's row shape carries a ship-to address at all.
-        ship_to=None,
+        ship_to=ship_to,
         subtotal=decimal.Decimal(str(subtotal)) if subtotal is not None else None,
         freight=None,
         total=decimal.Decimal(str(subtotal)) if subtotal is not None else None,
