@@ -90,6 +90,24 @@ def _parse_ekdatetime(
         return datetime.datetime(date_part.year, date_part.month, date_part.day)
 
 
+def _carrier_name(eksvia: typing.Optional[str]) -> typing.Optional[str]:
+    """A carrier NAME for a tracking entry, or None when Keystone sends a ship-via code it
+    publishes no name for (4 and 5 are live, against a documented list of 2/3/6/7/8/L).
+
+    decode_ship_method returns the bare code in that case, which is right for the order's own
+    ship-method field -- the code is still information -- but wrong here: labelling a tracking
+    number "Tracking - 5" asserts a carrier called 5. The UI falls back to a plain "Carrier"
+    label when this is None.
+    """
+    code = (eksvia or "").strip()
+    if not code:
+        return None
+    decoded = keystone_orders.decode_ship_method(code)
+    # decode_ship_method gives back "<code> - <name>" when it knows the code, and the bare code
+    # when it does not -- so an unchanged value means there is no name to show.
+    return decoded if decoded and decoded != code else None
+
+
 def _normalize_po(value: typing.Optional[str]) -> str:
     """EKORD# comes back with a stray leading "#" on some rows (12 of them across Trident's two
     accounts, Aug-Nov, all for one PO). Stripping it is what lets that order dedup against our
@@ -212,12 +230,7 @@ def _build_order_result(
         if not number or number in seen_tracking:
             continue
         seen_tracking.add(number)
-        tracking.append(
-            {
-                "tracking_number": number,
-                "carrier": keystone_orders.decode_ship_method((row.get("EKSVIA") or "").strip() or None),
-            }
-        )
+        tracking.append({"tracking_number": number, "carrier": _carrier_name(row.get("EKSVIA"))})
 
     # Raw EKSVIA always; the label only when the SDK publishes one for that code. Codes 4 and 5
     # come back live and are documented nowhere, so they stay unlabelled rather than guessed.
