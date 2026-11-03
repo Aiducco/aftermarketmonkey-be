@@ -1938,6 +1938,9 @@ def _serialize_external_purchase_order(order: src_models.ExternalPurchaseOrder) 
         # for: it carries no address fields and the service has no order-detail call, so the UI
         # must say "not reported" rather than render a blank the user reads as a bug.
         "ship_to_reportable": _SHIP_TO_REPORTABLE_KINDS.get(order.company_provider.provider.kind, True),
+        "estimated_delivery_date": (
+            order.estimated_delivery_date.isoformat() if order.estimated_delivery_date else None
+        ),
         "discovered_at": _iso_utc_z(order.discovered_at),
         "last_synced_at": _iso_utc_z(order.last_synced_at),
     }

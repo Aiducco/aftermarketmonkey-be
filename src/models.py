@@ -4587,6 +4587,12 @@ class ExternalPurchaseOrder(django_db_models.Model):
     # the richest thing it gives us.
     status_history = django_db_models.JSONField(default=list, blank=True, encoder=DjangoJSONEncoder)
 
+    # When the distributor says the order should arrive. Meyer is the one that reports it today
+    # (SalesOrderDetail.DeliveryETA, which is a date, a business-day range, or the literal
+    # "Delivered"); NULL everywhere else, and NULL for a Meyer order already delivered, where the
+    # arrival is a fact in distributor_status rather than an estimate.
+    estimated_delivery_date = django_db_models.DateField(null=True, blank=True)
+
     raw_response = django_db_models.JSONField(null=True, blank=True, encoder=DjangoJSONEncoder)
 
     discovered_at = django_db_models.DateTimeField(auto_now_add=True)

@@ -42,6 +42,7 @@ from src.integrations import credentials as credentials_helper
 from src.integrations.clients.meyer import exceptions as meyer_client_exceptions
 from src.integrations.clients.meyer.order_client import MeyerOrderApiClient
 from src.integrations.orders import history
+from src.integrations.orders import meyer as meyer_orders
 
 logger = logging.getLogger(__name__)
 _LOG_PREFIX = "[MEYER-ORDER-HISTORY]"
@@ -257,9 +258,19 @@ class MeyerOrderHistoryReader(history.OrderHistoryReader):
             for order_number, order_rows in _group_rows_by_order(rows).items()
         ]
 
-    def _fill_lines_from_detail(self, result: history.ExternalOrderResult) -> history.ExternalOrderResult:
-        """Lines, freight and a delivery ETA for an order SalesCurrent could only give a header
-        for. Best-effort: a failure leaves the order exactly as the listing described it."""
+    def _apply_order_detail(self, result: history.ExternalOrderResult) -> history.ExternalOrderResult:
+        """Status, delivery estimate, and -- for an order SalesCurrent could only give a header
+        for -- its line items and freight.
+
+        Meyer has no order-status field. The listing can only say which endpoint found the order:
+        SalesHistory means invoiced, SalesCurrent means open. SalesOrderDetail's DeliveryETA says
+        something better, and says it for almost every order: the literal "Delivered", or a date,
+        or a business-day range, or "Unavailable" for a non-Meyer shipment it cannot see.
+
+        So status becomes Delivered where Meyer says so, and falls back to the listing's own
+        Invoiced/Open otherwise -- a billing fact, which is all there is to say until it arrives.
+
+        Best-effort: a failure leaves the order exactly as the listing described it."""
         try:
             details = self._client.get_sales_order_detail(result.distributor_order_number, self._client.customer_number)
         except meyer_client_exceptions.MeyerException:
@@ -297,6 +308,21 @@ class MeyerOrderHistoryReader(history.OrderHistoryReader):
                 }
             )
 
+        # Status and ETA apply whether or not this order needed lines.
+        eta_raw = (detail.get("DeliveryETA") or "").strip()
+        if eta_raw.lower() == "delivered":
+            result.status = "Delivered"
+        elif (detail.get("Invoiced") or "").strip().lower() == "yes":
+            result.status = "Invoiced"
+        elif detail.get("Invoiced"):
+            result.status = "Open"
+        if eta_raw and eta_raw.lower() not in ("delivered", "unavailable"):
+            # Reuses the write-side parser, which already handles both shapes Meyer sends here --
+            # a literal date and an "N-M Business Days" range.
+            estimated, _days = meyer_orders._parse_meyer_delivery(eta_raw)
+            result.estimated_delivery_date = estimated
+        result.raw_response = dict(result.raw_response or {}, sales_order_detail=detail)
+
         if not line_items:
             return result
 
@@ -308,7 +334,6 @@ class MeyerOrderHistoryReader(history.OrderHistoryReader):
             result.freight = freight
         if result.total is None:
             result.total = subtotal + (freight or decimal.Decimal("0"))
-        result.raw_response = dict(result.raw_response or {}, sales_order_detail=detail)
         return result
 
     def enrich_new_order(self, result: history.ExternalOrderResult) -> history.ExternalOrderResult:
@@ -324,14 +349,12 @@ class MeyerOrderHistoryReader(history.OrderHistoryReader):
         answer for an order that has not invoiced yet, not a failure -- the order keeps the
         listing's own numbers and picks the invoice up on a later poll once it exists.
         """
-        # SalesCurrent returns headers only -- no ItemNumber/Quantity/UnitPrice at all -- so an
-        # OPEN Meyer order arrives with an empty line list and the detail screen reads "No line
-        # items reported", which is true of the listing but not of the order. GET
-        # /SalesOrderDetail does carry Items[] (ItemNumber, LineSequence, Quantity, UnitPrice,
-        # TotalPrice, Kit), so it is fetched for exactly those orders. Invoiced orders already
-        # have their lines from SalesHistory and skip this.
-        if not result.line_items:
-            result = self._fill_lines_from_detail(result)
+        # GET /SalesOrderDetail is called for every newly-discovered order, not just the
+        # line-less ones. It is the only place Meyer reports DeliveryETA, and that turns out to
+        # be the status worth showing: measured across all 28 of Trident's Meyer orders, 27 read
+        # "Delivered" while the listing could only say "Invoiced". It also carries Items[] for an
+        # open order, whose listing gives a header and nothing else.
+        result = self._apply_order_detail(result)
 
         try:
             invoices = self._client.get_invoice(result.distributor_order_number, self._client.customer_number)

@@ -64,6 +64,8 @@ class ExternalOrderResult:
     ship_method: typing.Optional[str] = None
     # [{status, occurred_at}] oldest first, in the distributor's own vocabulary.
     status_history: typing.List[typing.Dict] = dataclasses.field(default_factory=list)
+    # Distributor's own estimate of arrival, where it gives one.
+    estimated_delivery_date: typing.Optional[datetime.date] = None
 
 
 class OrderHistoryReader(abc.ABC):

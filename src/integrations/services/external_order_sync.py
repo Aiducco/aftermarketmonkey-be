@@ -324,6 +324,7 @@ def _result_to_defaults(
         "ship_method_code": result.ship_method_code,
         "ship_method": result.ship_method,
         "status_history": result.status_history or [],
+        "estimated_delivery_date": result.estimated_delivery_date,
         "raw_response": result.raw_response,
     }
 
