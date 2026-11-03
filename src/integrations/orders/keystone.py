@@ -131,6 +131,12 @@ _EKSTAT_DESCRIPTIONS = {
     "OUT4DLV": "Product has been physically placed in a KAO cube van, en route for delivery",
     "INVOICE": "Invoice has been generated",
     "CANCEL": "Order has been cancelled",
+    # Undocumented by the SDK, whose status lists stop at INVOICE/CANCEL -- but real:
+    # measured on 8 live rows across Trident's two accounts, Aug-Nov 2026. Description
+    # only; deliberately NOT added to _EKSTAT_OPEN_STAGES/_EKSTAT_TERMINAL_STAGES or
+    # _EKSTAT_DELIVERY_STATUS, since those drive the order-status logic for orders we
+    # placed and changing them is a separate decision from naming the stage.
+    "DELIVRD": "Delivered",
 }
 
 # Keystone's sentinel for "no estimate available" (seen on LTL quotes) — .NET's DateTime.MinValue
@@ -256,7 +262,14 @@ def _none_if_zero(value: typing.Optional[str]) -> typing.Optional[str]:
     return None if value in (None, "", "0") else value
 
 
-def _decode_warehouse(code: typing.Optional[str]) -> typing.Optional[str]:
+# -- Shared with the discovery side ---------------------------------------------------------
+# decode_warehouse/decode_ship_method/decode_status are public because
+# src.integrations.orders.history_readers.keystone needs the SAME decoding for orders we did
+# NOT place. A Keystone order has to read identically whichever way it reached us, and a second
+# copy of these tables is how the two screens start disagreeing about what "PACKAGE" means.
+
+
+def decode_warehouse(code: typing.Optional[str]) -> typing.Optional[str]:
     if not code:
         return None
     region = _WAREHOUSE_REGION_NAMES.get(code)
@@ -266,14 +279,14 @@ def _decode_warehouse(code: typing.Optional[str]) -> typing.Optional[str]:
     return "{} - {}".format(code, city_state) if city_state else code
 
 
-def _decode_ship_method(code: typing.Optional[str]) -> typing.Optional[str]:
+def decode_ship_method(code: typing.Optional[str]) -> typing.Optional[str]:
     if not code:
         return None
     name = _SHIP_VIA_NAMES.get(code)
     return "{} - {}".format(code, name) if name else code
 
 
-def _decode_status(code: typing.Optional[str]) -> typing.Optional[str]:
+def decode_status(code: typing.Optional[str]) -> typing.Optional[str]:
     if not code:
         return None
     description = _EKSTAT_DESCRIPTIONS.get(code)
@@ -305,10 +318,10 @@ def _decode_order_history_row(row: typing.Dict[str, str]) -> typing.Dict[str, ty
         "quantity": _parse_int(row.get("EKXQTY")),
         "extended_price": _parse_decimal(row.get("EKEXTD")),
         "freight_charge": _parse_decimal(row.get("EKFRTD")),
-        "warehouse": _decode_warehouse(row.get("EKSWHS")),
-        "ship_method": _decode_ship_method(row.get("EKSVIA")),
+        "warehouse": decode_warehouse(row.get("EKSWHS")),
+        "ship_method": decode_ship_method(row.get("EKSVIA")),
         "tracking_number": row.get("EKTRCK") or None,
-        "status": _decode_status(row.get("EKSTAT")),
+        "status": decode_status(row.get("EKSTAT")),
         "unit_price": _parse_decimal(row.get("EKPRIC")),
         "internal_order_number": _none_if_zero(row.get("EKKEY#")),
         "invoice_number": _none_if_zero(row.get("EKINV#")),
@@ -371,7 +384,7 @@ def _to_float(value: typing.Any) -> typing.Optional[float]:
 
 def _ekstat_code(decoded_status: typing.Optional[str]) -> typing.Optional[str]:
     """processed_order's "status" is already the human-readable "{code} - {description}" string
-    built by _decode_status -- this pulls the raw EKSTAT code back out of it so it can be run
+    built by decode_status -- this pulls the raw EKSTAT code back out of it so it can be run
     back through translate_order_status/_EKSTAT_* lookups."""
     if not decoded_status:
         return None
@@ -590,9 +603,7 @@ class KeystoneOrderAdapter(base.DistributorOrderAdapter):
                 cached = cache.get(cache_key)
             except Exception:
                 logger.warning(
-                    "{} Cache unavailable reading price for vcpn={}; will re-fetch live.".format(
-                        _LOG_PREFIX, vcpn
-                    )
+                    "{} Cache unavailable reading price for vcpn={}; will re-fetch live.".format(_LOG_PREFIX, vcpn)
                 )
                 cached = None
             if cached is not None:
@@ -621,9 +632,7 @@ class KeystoneOrderAdapter(base.DistributorOrderAdapter):
                     continue
                 prices[vcpn] = price
                 try:
-                    cache.set(
-                        _PRICE_CACHE_KEY.format(self.company_provider.id, vcpn), price, _PRICE_CACHE_TTL_SECONDS
-                    )
+                    cache.set(_PRICE_CACHE_KEY.format(self.company_provider.id, vcpn), price, _PRICE_CACHE_TTL_SECONDS)
                 except Exception:
                     logger.warning(
                         "{} Cache unavailable writing price for vcpn={}; will re-fetch live "
@@ -745,9 +754,7 @@ class KeystoneOrderAdapter(base.DistributorOrderAdapter):
 
             if not lines:
                 raise order_exceptions.OrderValidationError(
-                    "Unexpected/empty quote response shape from Keystone. Raw tables: {}".format(
-                        repr(tables)[:2000]
-                    ),
+                    "Unexpected/empty quote response shape from Keystone. Raw tables: {}".format(repr(tables)[:2000]),
                     request_payload=data,
                 )
         except (AttributeError, TypeError, KeyError, IndexError) as e:
@@ -955,9 +962,7 @@ class KeystoneOrderAdapter(base.DistributorOrderAdapter):
             for invoice_number, inv_rows in by_invoice.items():
                 line_items = [
                     base.InvoiceLineItem(
-                        part_number="{}{}".format(
-                            (r.get("EKVEND") or "").strip(), (r.get("EKPART") or "").strip()
-                        ),
+                        part_number="{}{}".format((r.get("EKVEND") or "").strip(), (r.get("EKPART") or "").strip()),
                         quantity=_parse_int(r.get("EKXQTY")),
                         unit_price=_parse_decimal(r.get("EKPRIC")),
                         total_price=_parse_decimal(r.get("EKEXTD")),

@@ -25,6 +25,7 @@ from src.integrations import credentials as credentials_helper
 from src.integrations.clients.keystone import exceptions as keystone_client_exceptions
 from src.integrations.clients.keystone.order_client import KeystoneOrderApiClient
 from src.integrations.orders import history
+from src.integrations.orders import keystone as keystone_orders
 
 logger = logging.getLogger(__name__)
 _LOG_PREFIX = "[KEYSTONE-ORDER-HISTORY]"
@@ -39,35 +40,6 @@ _ORDER_HISTORY_ERROR_VALUES = {"NoData", "BadDate", "BadInDt"}
 # not an order. It reached the purchase-orders screen as "order SUBFEE, total $800.00" before
 # this filter existed.
 _NON_ORDER_PO_VALUES = {"SUBFEE"}
-
-# EKSWHS -> warehouse, from the SDK's own "List of Active Warehouses" glossary (p.70). Static and
-# small, with no table of its own in our DB -- unlike Meyer, whose warehouses come from a real
-# fetch (MeyerLocation). "0" is not a warehouse: the SDK says a line showing it was backordered
-# or transferred in from another warehouse.
-_WAREHOUSE_NAMES = {
-    "1": "East - Exeter, PA",
-    "14": "Midwest - Kansas City, KS",
-    "25": "California - Eastvale, CA",
-    "30": "Southeast - Atlanta, GA",
-    "45": "Pacific Northwest - Spokane, WA",
-    "50": "Texas - Flower Mound, TX",
-    "55": "TexasDFW - Dallas, TX",
-    "60": "Great Lakes - Brownstown, MI",
-    "70": "Florida - Ocoee, FL",
-}
-
-# EKSVIA -> carrier, from the SDK's "List of Common Shipping Service Levels" (p.70). The list is
-# explicitly not exhaustive, and live responses do return codes it omits (4 and 5 observed on
-# Trident's account), so an unknown code is left unlabelled rather than guessed -- the raw code is
-# stored either way.
-_SHIP_VIA_NAMES = {
-    "2": "FedEx",
-    "3": "UPS",
-    "6": "Keystone Truck Run",
-    "7": "Purolator",
-    "8": "USPS Priority Mail",
-    "L": "Freight LTL",
-}
 
 
 def _to_decimal(value: typing.Optional[str]) -> typing.Optional[decimal.Decimal]:
@@ -186,10 +158,12 @@ def _build_order_result(
     # is this order's current raw status; unlike Turn14/Meyer, Keystone has no single
     # order-level status field, so this is a best-effort "most advanced stage seen" rather than
     # a literal field read.
+    # Decoded through the write-side module's own decode_status, so "PACKAGE" reads the same
+    # here as it does on an order we placed ourselves.
     status = None
     for row in reversed(rows):
         if row.get("EKSTAT"):
-            status = row["EKSTAT"]
+            status = keystone_orders.decode_status(row["EKSTAT"].strip())
             break
 
     # One row per (line item, status transition), so the SAME line repeats once for every stage
@@ -217,7 +191,7 @@ def _build_order_result(
             "unit_price": float(unit_price) if unit_price is not None else None,
             "line_total": float(line_total) if line_total is not None else None,
             "warehouse_code": warehouse_code,
-            "warehouse_name": _WAREHOUSE_NAMES.get((warehouse_code or "").strip()),
+            "warehouse_name": keystone_orders.decode_warehouse((warehouse_code or "").strip() or None),
         }
     line_items = list(merged.values())
 
@@ -238,7 +212,12 @@ def _build_order_result(
         if not number or number in seen_tracking:
             continue
         seen_tracking.add(number)
-        tracking.append({"tracking_number": number, "carrier": _SHIP_VIA_NAMES.get((row.get("EKSVIA") or "").strip())})
+        tracking.append(
+            {
+                "tracking_number": number,
+                "carrier": keystone_orders.decode_ship_method((row.get("EKSVIA") or "").strip() or None),
+            }
+        )
 
     # Raw EKSVIA always; the label only when the SDK publishes one for that code. Codes 4 and 5
     # come back live and are documented nowhere, so they stay unlabelled rather than guessed.
@@ -261,7 +240,12 @@ def _build_order_result(
         if marker in seen_stage:
             continue
         seen_stage.add(marker)
-        status_history.append({"status": stage, "occurred_at": occurred_at.isoformat() if occurred_at else None})
+        status_history.append(
+            {
+                "status": keystone_orders.decode_status(stage),
+                "occurred_at": occurred_at.isoformat() if occurred_at else None,
+            }
+        )
 
     line_totals = [li["line_total"] for li in line_items if li["line_total"] is not None]
     subtotal = round(sum(line_totals), 2) if line_totals else None
@@ -302,7 +286,7 @@ def _build_order_result(
         distributor_invoice_numbers=invoice_numbers,
         tracking=tracking,
         ship_method_code=ship_method_code,
-        ship_method=_SHIP_VIA_NAMES.get(ship_method_code or ""),
+        ship_method=keystone_orders.decode_ship_method(ship_method_code),
         status_history=status_history,
     )
 
