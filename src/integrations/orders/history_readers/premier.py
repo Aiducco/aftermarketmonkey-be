@@ -123,7 +123,12 @@ def _build_from_invoices(sales_order_number: str, invoices: typing.List[typing.D
     for invoice in invoices:
         for line in invoice.get("lines") or []:
             item = line.get("item") or {}
-            descriptions = item.get("descriptions") or {}
+            # item.descriptions is a LIST of {longDescription, shortDescription} objects, not a
+            # single object -- confirmed live. One entry per line in practice; the first wins.
+            descriptions_raw = item.get("descriptions") or []
+            descriptions = descriptions_raw[0] if isinstance(descriptions_raw, list) and descriptions_raw else {}
+            if not isinstance(descriptions, dict):
+                descriptions = {}
             line_items.append(
                 {
                     "part_number": item.get("itemNumber"),
