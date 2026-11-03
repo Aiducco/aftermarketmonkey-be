@@ -68,19 +68,92 @@ _WAREHOUSE_NAMES = {
 # Verbatim from Premier's docs (https://developer.premierwd.com/#sales-orders) — a mix of named
 # and numeric carrier service codes, no carrier/name breakdown given for the numeric ones.
 _SHIP_METHOD_CODES = [
-    "GROUND", "2ND DAY", "2ND DAY AM", "2ND DAY LETTER", "3 DAY SELECT", "FEDEX 2ND DAY",
-    "FEDEX 3 DAY", "FEDEX GROUND", "FEDEX INT 1 DAY", "FEDEX INT 3 DAY", "FEDEX PRIORITY",
-    "FEDEX STD OVRNT", "NEXT DAY", "NEXT DAY AM", "NEXT DAY LETTER", "NEXT DAY SAT",
-    "NEXT DAY SAVER", "ONTRAC", "P-UP", "Priority Mail", "Express Mail", "EXPRESS INT",
-    "PRIORITY INT", "EXPEDITED INT", "STANDARD INT", "EXPRESS INT PLS", "EXPRESS INT SVR",
-    "FIRST OVERNIGHT", "EXPRESS SAVER", "HOME DELIVERY", "PARCEL POST", "Global Express",
-    "Exp Mail Inter.", "1st Class Int.", "1st Class",
-    "20101", "20501", "20102", "20103", "20104", "20105", "20106", "20107", "20108", "20109",
-    "20201", "20202", "20203", "20204", "20205", "20401", "20402", "20403", "20404", "20405",
-    "20406", "20407", "20408", "20801", "20802", "20803", "20804", "20805", "20806", "20206",
-    "FEDEX 2 DAY AM", "20207", "20208", "20209", "20210", "FEDEX INT ECON", "FEDEX INT FIRST",
-    "20211", "20212", "ONTRAC SUNRISE", "ONTRAC GOLD",
+    "GROUND",
+    "2ND DAY",
+    "2ND DAY AM",
+    "2ND DAY LETTER",
+    "3 DAY SELECT",
+    "FEDEX 2ND DAY",
+    "FEDEX 3 DAY",
+    "FEDEX GROUND",
+    "FEDEX INT 1 DAY",
+    "FEDEX INT 3 DAY",
+    "FEDEX PRIORITY",
+    "FEDEX STD OVRNT",
+    "NEXT DAY",
+    "NEXT DAY AM",
+    "NEXT DAY LETTER",
+    "NEXT DAY SAT",
+    "NEXT DAY SAVER",
+    "ONTRAC",
+    "P-UP",
+    "Priority Mail",
+    "Express Mail",
+    "EXPRESS INT",
+    "PRIORITY INT",
+    "EXPEDITED INT",
+    "STANDARD INT",
+    "EXPRESS INT PLS",
+    "EXPRESS INT SVR",
+    "FIRST OVERNIGHT",
+    "EXPRESS SAVER",
+    "HOME DELIVERY",
+    "PARCEL POST",
+    "Global Express",
+    "Exp Mail Inter.",
+    "1st Class Int.",
+    "1st Class",
+    "20101",
+    "20501",
+    "20102",
+    "20103",
+    "20104",
+    "20105",
+    "20106",
+    "20107",
+    "20108",
+    "20109",
+    "20201",
+    "20202",
+    "20203",
+    "20204",
+    "20205",
+    "20401",
+    "20402",
+    "20403",
+    "20404",
+    "20405",
+    "20406",
+    "20407",
+    "20408",
+    "20801",
+    "20802",
+    "20803",
+    "20804",
+    "20805",
+    "20806",
+    "20206",
+    "FEDEX 2 DAY AM",
+    "20207",
+    "20208",
+    "20209",
+    "20210",
+    "FEDEX INT ECON",
+    "FEDEX INT FIRST",
+    "20211",
+    "20212",
+    "ONTRAC SUNRISE",
+    "ONTRAC GOLD",
 ]
+
+
+def decode_warehouse(code: typing.Optional[str]) -> typing.Optional[str]:
+    """Public because src.integrations.orders.history_readers.premier needs the SAME warehouse
+    naming for orders we did NOT place -- a Premier order has to read identically whichever way
+    it reached us, and a second copy of this table is how the two screens start disagreeing."""
+    if not code:
+        return None
+    return _WAREHOUSE_NAMES.get(code)
 
 
 def _to_decimal(value: typing.Optional[typing.Any]) -> typing.Optional[decimal.Decimal]:
@@ -155,7 +228,9 @@ def extract_po_reference(raw_response: typing.Optional[typing.Dict]) -> typing.O
     return raw_response.get("customerPurchaseOrderNumber") or None
 
 
-def _best_candidate_warehouse(inventory_rows: typing.List[typing.Dict], country: typing.Optional[str]) -> typing.Optional[str]:
+def _best_candidate_warehouse(
+    inventory_rows: typing.List[typing.Dict], country: typing.Optional[str]
+) -> typing.Optional[str]:
     """Best-effort fulfillment-warehouse guess for display at quote time: the matching-country
     warehouse (codes end "-US"/"-CA") with the most available stock. Premier's own "Warehouse
     Auto-selection" (docs: closest domestic warehouse with inventory) depends on geocoding we
@@ -387,13 +462,11 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
                         quantity_available=quantity_available,
                         quantity_backordered=max(requested - total_available, 0),
                         warehouse_code=warehouse_code,
-                        warehouse_name=_WAREHOUSE_NAMES.get(warehouse_code) if warehouse_code else None,
+                        warehouse_name=decode_warehouse(warehouse_code),
                         ship_options=ship_options,
                         flags=[] if total_available >= requested else ["backorder"],
                         distributor_unit_price=unit_price,
-                        distributor_line_total=(
-                            unit_price * quantity_available if unit_price is not None else None
-                        ),
+                        distributor_line_total=(unit_price * quantity_available if unit_price is not None else None),
                     )
                 )
 
@@ -448,8 +521,7 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
                 "phone": phone_digits,
             },
             "salesOrderLines": [
-                {"itemNumber": _premier_item_number(li.provider_part), "quantity": li.quantity}
-                for li in line_items
+                {"itemNumber": _premier_item_number(li.provider_part), "quantity": li.quantity} for li in line_items
             ],
         }
         if purchase_order.ship_method:
@@ -481,8 +553,7 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
             # signal, no per-line pricing) — see module docstring. Fall back to our own request
             # data if the response is missing/malformed rather than failing a placed order.
             response_lines = response.get("salesOrderLines") or [
-                {"itemNumber": _premier_item_number(li.provider_part), "quantity": li.quantity}
-                for li in line_items
+                {"itemNumber": _premier_item_number(li.provider_part), "quantity": li.quantity} for li in line_items
             ]
             for line in response_lines:
                 external_id = line.get("itemNumber", "")
@@ -581,9 +652,7 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
     def supports_invoices(self) -> bool:
         return True
 
-    def get_invoices_by_sales_order_number(
-        self, sales_order_number: str
-    ) -> typing.List[base.DistributorInvoice]:
+    def get_invoices_by_sales_order_number(self, sales_order_number: str) -> typing.List[base.DistributorInvoice]:
         """
         Fetches invoices directly by Premier's real salesOrderNumber (confirmed a valid GET
         /invoices filter against https://developer.premierwd.com/#invoice) -- one call, no
@@ -684,9 +753,7 @@ class PremierOrderAdapter(base.DistributorOrderAdapter):
             )
 
     def cancel_order(self, purchase_order: src_models.PurchaseOrder) -> bool:
-        raise order_exceptions.OrderNotSupportedError(
-            "Premier's Order API does not expose a cancel-order endpoint."
-        )
+        raise order_exceptions.OrderNotSupportedError("Premier's Order API does not expose a cancel-order endpoint.")
 
     def supports_cancel(self) -> bool:
         return False
