@@ -364,7 +364,10 @@ class PremierOrderHistoryReader(history.OrderHistoryReader):
                         "unit_price": float(unit_price) if unit_price is not None else None,
                         "line_total": float(line_total) if line_total is not None else None,
                         "warehouse_code": line.get("warehouseCode"),
-                        "warehouse_name": None,
+                        # Decoded the same way the invoice path does -- left as None here, the
+                        # identical KY-1-US read "Kentucky Warehouse" on an invoiced order and
+                        # blank on one that had only shipped.
+                        "warehouse_name": premier_orders.decode_warehouse(line.get("warehouseCode")),
                     }
                 )
             line_items = built_lines

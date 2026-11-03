@@ -65,6 +65,11 @@ _WAREHOUSE_NAMES = {
     "NV-1-US": "Nevada Warehouse",
 }
 
+# Codes seen live that this table does not name. Deliberately NOT guessed from the prefix: the
+# table above already maps ID-1-US to "Utah Warehouse", so a code's two-letter prefix is not a
+# reliable statement of where the warehouse is. An unnamed code surfaces raw (e.g. "KY-2-US"),
+# which is honest, rather than inventing a location. Seen so far: KY-2-US.
+
 # Verbatim from Premier's docs (https://developer.premierwd.com/#sales-orders) — a mix of named
 # and numeric carrier service codes, no carrier/name breakdown given for the numeric ones.
 _SHIP_METHOD_CODES = [
