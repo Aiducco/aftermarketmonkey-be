@@ -598,6 +598,7 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
                 ),
             },
             "is_discontinued": pp.is_discontinued,
+            "is_special_order": pp.is_special_order,
             "inventory": None,
             "pricing": None,
             "product_details": None,

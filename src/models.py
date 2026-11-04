@@ -1351,6 +1351,16 @@ class KeystoneParts(django_db_models.Model):
     is_kit = django_db_models.BooleanField(default=False)
     raw_data = django_db_models.JSONField(null=True)
 
+    # Keystone's own feed has no status column at all -- this is inferred, not read off a row.
+    # Every VCPN actually present in a given catalog fetch gets upserted with this False (see
+    # keystone.py's KEYSTONE_PARTS_UPDATE_FIELDS); after the fetch completes, any existing row
+    # NOT touched this run (updated_at still before the run started) gets flipped True -- it
+    # dropped out of Keystone's current feed. Flips back to False automatically if the VCPN
+    # ever reappears in a later feed. Named "special order" rather than "discontinued" since
+    # Keystone's feed can't actually distinguish the two -- both look identical to us (simply
+    # absent from today's file) -- see ProviderPart.is_special_order, which this propagates to.
+    is_special_order = django_db_models.BooleanField(default=False)
+
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
 
@@ -3173,6 +3183,14 @@ class ProviderPart(django_db_models.Model):
     subcategory = django_db_models.CharField(max_length=255, null=True, blank=True)
     product_details = django_db_models.JSONField(null=True)
     is_discontinued = django_db_models.BooleanField(default=False)
+    # Distinct from is_discontinued above: for a distributor whose feed has no explicit status
+    # of its own (e.g. Keystone), a part simply going absent from the current feed can't be told
+    # apart from "temporarily special-order only" vs. "discontinued for good" -- this flag is
+    # that inferred "not in the current feed" signal, kept separate from is_discontinued (which
+    # a distributor's own explicit discontinued flag still sets, where one exists) rather than
+    # overloading one field with two different confidence levels. See KeystoneParts.is_special_order
+    # for how it's computed on the feed side.
+    is_special_order = django_db_models.BooleanField(default=False)
     # True when the distributor's own feed flags this as a kit (e.g. Keystone's IsKit) --
     # denormalized here so cart/quote code can check kit-ness without joining
     # kit_components. See ProviderPartKitComponent for the actual component breakdown; this

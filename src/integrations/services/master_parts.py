@@ -10297,6 +10297,12 @@ KEYSTONE_WAREHOUSE_DISPLAY_NAMES = {
 
 
 def _keystone_warehouse_availability(row: typing.Dict) -> typing.Optional[typing.Dict]:
+    # A special-order row's regional quantities are whatever Keystone last reported before the
+    # VCPN dropped out of the feed -- stale, not current stock -- so report no availability at
+    # all rather than numbers that look live. Matches warehouse_total_qty being forced to 0 for
+    # the same row below.
+    if row.get("is_special_order"):
+        return None
     if any(row.get(f) for f in KEYSTONE_WAREHOUSE_QTY_FIELDS):
         return {
             KEYSTONE_WAREHOUSE_DISPLAY_NAMES[field]: row.get(field)
@@ -10402,7 +10408,7 @@ def sync_provider_inventory_from_keystone() -> None:
                     "upsable", "ups_ground_assessorial", "us_ltl",
                     "is_non_returnable", "is_hazmat",
                     "length", "width", "height", "weight",
-                    "is_kit", "kit_components",
+                    "is_kit", "kit_components", "is_special_order",
                 )[:BATCH_SIZE_INVENTORY]
             )
             if not batch:
@@ -10412,7 +10418,10 @@ def sync_provider_inventory_from_keystone() -> None:
             to_upsert = [
                 src_models.ProviderPartInventory(
                     provider_part=provider_parts[kp["vcpn"]],
-                    warehouse_total_qty=kp.get("total_qty") or 0,
+                    # Special-order: VCPN dropped out of the feed, so total_qty here is whatever
+                    # was last reported, not current stock -- force to 0 rather than show stale
+                    # (possibly nonzero) quantity for a part we can no longer confirm is stocked.
+                    warehouse_total_qty=0 if kp.get("is_special_order") else (kp.get("total_qty") or 0),
                     manufacturer_inventory=None,
                     manufacturer_esd=None,
                     warehouse_availability=_keystone_warehouse_availability(kp),
@@ -10441,16 +10450,20 @@ def sync_provider_inventory_from_keystone() -> None:
                     ],
                 )
 
-            # Update product_details on ProviderPart (product metadata, not inventory)
+            # Update product_details and is_special_order on ProviderPart (not inventory) --
+            # is_special_order mirrors KeystoneParts.is_special_order, which the fetch side
+            # computes from feed absence (Keystone's own feed has no such column) -- see
+            # KeystoneParts.is_special_order's docstring.
             pp_details_to_update = []
             for kp in batch:
                 if kp["vcpn"] in provider_parts:
                     pp = provider_parts[kp["vcpn"]]
                     pp.product_details = _keystone_product_details(kp, brand_name=keystone_brand_id_to_name.get(kp.get("brand_id")))
+                    pp.is_special_order = bool(kp.get("is_special_order"))
                     pp_details_to_update.append(pp)
             if pp_details_to_update:
                 src_models.ProviderPart.objects.bulk_update(
-                    pp_details_to_update, ["product_details"], batch_size=500
+                    pp_details_to_update, ["product_details", "is_special_order"], batch_size=500
                 )
                 total_upserted += len(to_upsert)
 

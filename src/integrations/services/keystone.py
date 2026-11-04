@@ -473,7 +473,7 @@ KEYSTONE_PARTS_UPDATE_FIELDS = [
     "ups_ground_assessorial", "us_ltl", "east_qty", "midwest_qty",
     "california_qty", "southeast_qty", "pacific_nw_qty", "texas_qty",
     "great_lakes_qty", "florida_qty", "total_qty", "kit_components",
-    "is_kit", "raw_data", "updated_at",
+    "is_kit", "raw_data", "is_special_order", "updated_at",
 ]
 
 
@@ -581,6 +581,11 @@ def fetch_and_save_all_keystone_brand_parts() -> None:
     (legacy behaviour).
     """
     logger.info("{} Fetching all Keystone brand parts.".format(_LOG_PREFIX))
+
+    # Captured before anything is fetched: any existing KeystoneParts row not touched by this
+    # run (updated_at still older than this) is, by definition, missing from today's feed --
+    # see the stale-row sweep at the end of this function.
+    run_started_at = timezone.now()
 
     # Prefer provider by id=4, fallback to kind=KEYSTONE
     keystone_provider = src_models.Providers.objects.filter(id=KEYSTONE_PROVIDER_ID).first()
@@ -745,6 +750,29 @@ def fetch_and_save_all_keystone_brand_parts() -> None:
             _LOG_PREFIX, total_parts,
         )
     )
+
+    # Stale-row sweep: any existing KeystoneParts row for a brand this run actually covers,
+    # whose updated_at is still older than run_started_at, was not touched by this fetch at
+    # all -- its VCPN dropped out of Keystone's current feed. Only guarded by total_parts > 0
+    # so a failed/empty run (e.g. FTP auth error raised before any batch upserted) can never
+    # mark every existing row special-order. Scoped to this run's own mapped brand ids so a
+    # brand that's simply unmapped on our side (never fetched at all, not even skipped-this-run)
+    # isn't swept here -- see fetch_and_save_all_keystone_brand_parts' module-level filtering.
+    if total_parts > 0:
+        mapped_brand_ids = {kb.id for kb in brand_mappings.values()}
+        newly_special_order = (
+            src_models.KeystoneParts.objects.filter(
+                brand_id__in=mapped_brand_ids,
+                is_special_order=False,
+                updated_at__lt=run_started_at,
+            )
+            .update(is_special_order=True)
+        )
+        logger.info(
+            "{} Marked {} existing Keystone part(s) special-order (absent from this fetch).".format(
+                _LOG_PREFIX, newly_special_order,
+            )
+        )
 
 
 def fetch_and_save_all_keystone_brands_and_parts() -> None:
@@ -974,6 +1002,10 @@ def _transform_single_keystone_row(
             total_qty=_safe_int(row.get("TotalQty")),
             kit_components=_clean_csv_value(row.get("KitComponents")),
             is_kit=_safe_bool(row.get("IsKit")),
+            # Present in this fetch at all => not special-order (see KeystoneParts.is_special_order
+            # docstring) -- the stale-row sweep in fetch_and_save_all_keystone_brand_parts is what
+            # flips a VCPN back to True once it actually drops out of a later feed.
+            is_special_order=False,
             raw_data={
                 k: (None if (v is None or (isinstance(v, float) and pd.isna(v))) else v)
                 for k, v in row.items()
