@@ -20,6 +20,7 @@ import pgbulk
 from src import constants as src_constants
 from src import enums as src_enums
 from src import models as src_models
+from src.audit import scheduled_tasks as audit_scheduled_tasks
 from src.integrations import credentials as credentials_helper
 from src.integrations.services import ntw as ntw_services
 from src.integrations.services import randys as randys_services
@@ -15862,56 +15863,54 @@ def sync_all_master_parts_global() -> None:
     - Turn14 always runs **first** (other providers may shadow Turn14 data; Turn14 must settle first).
     - All remaining providers run sequentially with ``_reclaim_memory()`` between each to prevent
       cumulative RSS growth across the multi-hour sync window.
+
+    Each provider's propagation is wrapped in its own ``audited_step`` — one
+    ``ScheduledTaskExecution`` row per provider (``sync_all_master_parts_<provider>``), the same
+    per-provider audit shape ``ingest_all_providers``'s Phase 1 source-fetch loop already uses —
+    instead of one row bundling all 24 providers together with no way to tell which one actually
+    ran or failed. ``continue_on_error=True`` means one provider's exception no longer aborts
+    every provider after it in this same run (confirmed this was previously a real gap: a bare
+    sequential call list with no per-call try/except at all).
     """
     logger.info("{} Starting global master parts sync (catalog + inventory, no pricing).".format(_LOG_PREFIX))
 
-    sync_derived_from_turn14(skip_pricing=True)
-    _reclaim_memory()
-    sync_derived_from_keystone(skip_pricing=True)
-    _reclaim_memory()
-    sync_derived_from_meyer(skip_pricing=True)
-    _reclaim_memory()
-    sync_derived_from_atech(skip_pricing=True)
-    _reclaim_memory()
-    sync_derived_from_rough_country(skip_pricing=True)
-    _reclaim_memory()
-    sync_derived_from_dlg(skip_pricing=True)
-    _reclaim_memory()
-    sync_derived_from_wheelpros(skip_pricing=True)
-    _reclaim_memory()
-    sync_derived_from_premier(skip_pricing=True)
-    _reclaim_memory()
-    sync_derived_from_vossen(skip_pricing=True)
-    _reclaim_memory()
-    sync_derived_from_tirerack(skip_pricing=True)
-    _reclaim_memory()
-    sync_derived_from_quadratec(skip_pricing=True)
-    _reclaim_memory()
-    sync_derived_from_elite_wheel(skip_pricing=True)
-    _reclaim_memory()
-    sync_derived_from_motorstate(skip_pricing=True)
-    _reclaim_memory()
-    sync_derived_from_wps(skip_pricing=True)
-    _reclaim_memory()
-    sync_derived_from_helmet_house(skip_pricing=True)
-    _reclaim_memory()
-    sync_derived_from_the_wheel_group(skip_pricing=True)
-    _reclaim_memory()
-    sync_derived_from_tristate(skip_pricing=True)
-    _reclaim_memory()
-    sync_derived_from_allpro(skip_pricing=True)
-    _reclaim_memory()
-    sync_derived_from_sb(skip_pricing=True)
-    _reclaim_memory()
-    sync_derived_from_atd(skip_pricing=True)
-    _reclaim_memory()
-    sync_derived_from_thoroughbred(skip_pricing=True)
-    _reclaim_memory()
-    sync_derived_from_xdp(skip_pricing=True)
-    _reclaim_memory()
-    sync_derived_from_randys(skip_pricing=True)
-    _reclaim_memory()
-    sync_derived_from_ntw(skip_pricing=True)
+    # Turn14 first (other providers may shadow Turn14 data; order matters), then every other
+    # provider in the same order ingest_all_providers' own Phase 1 fetch list uses.
+    providers: typing.List[typing.Tuple[str, typing.Callable[[], None]]] = [
+        ("turn14", lambda: sync_derived_from_turn14(skip_pricing=True)),
+        ("keystone", lambda: sync_derived_from_keystone(skip_pricing=True)),
+        ("meyer", lambda: sync_derived_from_meyer(skip_pricing=True)),
+        ("atech", lambda: sync_derived_from_atech(skip_pricing=True)),
+        ("rough_country", lambda: sync_derived_from_rough_country(skip_pricing=True)),
+        ("dlg", lambda: sync_derived_from_dlg(skip_pricing=True)),
+        ("wheelpros", lambda: sync_derived_from_wheelpros(skip_pricing=True)),
+        ("premier", lambda: sync_derived_from_premier(skip_pricing=True)),
+        ("vossen", lambda: sync_derived_from_vossen(skip_pricing=True)),
+        ("tirerack", lambda: sync_derived_from_tirerack(skip_pricing=True)),
+        ("quadratec", lambda: sync_derived_from_quadratec(skip_pricing=True)),
+        ("elite_wheel", lambda: sync_derived_from_elite_wheel(skip_pricing=True)),
+        ("motorstate", lambda: sync_derived_from_motorstate(skip_pricing=True)),
+        ("wps", lambda: sync_derived_from_wps(skip_pricing=True)),
+        ("helmet_house", lambda: sync_derived_from_helmet_house(skip_pricing=True)),
+        ("the_wheel_group", lambda: sync_derived_from_the_wheel_group(skip_pricing=True)),
+        ("tristate", lambda: sync_derived_from_tristate(skip_pricing=True)),
+        ("allpro", lambda: sync_derived_from_allpro(skip_pricing=True)),
+        ("sb", lambda: sync_derived_from_sb(skip_pricing=True)),
+        ("atd", lambda: sync_derived_from_atd(skip_pricing=True)),
+        ("thoroughbred", lambda: sync_derived_from_thoroughbred(skip_pricing=True)),
+        ("xdp", lambda: sync_derived_from_xdp(skip_pricing=True)),
+        ("randys", lambda: sync_derived_from_randys(skip_pricing=True)),
+        ("ntw", lambda: sync_derived_from_ntw(skip_pricing=True)),
+    ]
+
+    for provider_name, run_fn in providers:
+        with audit_scheduled_tasks.audited_step(
+            "sync_all_master_parts_{}".format(provider_name),
+            "{} master/provider parts, inventory sync complete.".format(provider_name),
+            continue_on_error=True,
+        ):
+            run_fn()
+        _reclaim_memory()
 
     logger.info("{} Completed global master parts sync (catalog + inventory, no pricing).".format(_LOG_PREFIX))
 

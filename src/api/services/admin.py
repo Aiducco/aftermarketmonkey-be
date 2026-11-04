@@ -413,3 +413,68 @@ def extend_company_trial(
         "subscription_status": company.subscription_status,
         "subscription_period_end": company.subscription_period_end.isoformat(),
     }, None
+
+
+# -- Ingestion data-quality audit (ScheduledTaskExecution) -------------------------------------
+#
+# Surfaces the ScheduledTaskExecution rows every distributor sync / cron command already writes
+# (see src.audit.scheduled_tasks) — not a new audit mechanism, just the first place that reads it
+# back. "FAILED" here includes a provider's raw staging-table fetch (ingest_all_providers_<provider>)
+# and, since the per-provider audit added to sync_all_master_parts_global, that provider's
+# propagation into MasterPart/ProviderPart/ProviderPartInventory (sync_all_master_parts_<provider>).
+
+
+def _serialize_scheduled_task_execution(row: src_models.ScheduledTaskExecution) -> typing.Dict:
+    return {
+        "id": row.id,
+        "name": row.name,
+        "status": row.status,
+        "status_name": row.status_name,
+        "message": row.message,
+        "error_message": row.error_message,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        "completed_at": row.completed_at.isoformat() if row.completed_at else None,
+    }
+
+
+def get_ingestion_audit_overview() -> typing.List[typing.Dict]:
+    """
+    One row per distinct ScheduledTaskExecution.name, showing only that name's most recent run —
+    "what's healthy, what's failing, when did it last run" at a glance, instead of scrolling raw
+    rows. Uses Postgres ``DISTINCT ON (name)`` (``order_by("name", "-created_at").distinct("name")``)
+    to get the latest row per name in one query — confirmed live the table is small (tens of
+    thousands of rows total), so a full scan here is trivial; no new index needed.
+
+    FAILED and still-STARTED (in progress, or stuck — see cleanup_stale_started_executions) rows
+    are sorted first so a failing pipeline can't get buried under a long alphabetical list.
+    """
+    logger.info("{} Fetching ingestion audit overview.".format(_LOG_PREFIX))
+
+    latest_per_name = (
+        src_models.ScheduledTaskExecution.objects.order_by("name", "-created_at").distinct("name")
+    )
+    data = [_serialize_scheduled_task_execution(row) for row in latest_per_name]
+    data.sort(key=lambda row: (row["status_name"] not in ("FAILED", "STARTED"), row["name"]))
+
+    logger.info("{} Found {} distinct task name(s).".format(_LOG_PREFIX, len(data)))
+    return data
+
+
+_INGESTION_AUDIT_HISTORY_LIMIT = 50
+
+
+def get_ingestion_audit_history(task_name: str) -> typing.List[typing.Dict]:
+    """Most recent ScheduledTaskExecution rows for one task name, newest first — the drill-in
+    view for one provider/stage's run history. Empty list (not an error) for an unknown name,
+    same "no data" shape a typo'd query param should get."""
+    logger.info("{} Fetching ingestion audit history for task_name={}.".format(_LOG_PREFIX, task_name))
+
+    rows = (
+        src_models.ScheduledTaskExecution.objects.filter(name=task_name)
+        .order_by("-created_at")[:_INGESTION_AUDIT_HISTORY_LIMIT]
+    )
+    data = [_serialize_scheduled_task_execution(row) for row in rows]
+
+    logger.info("{} Found {} row(s) for task_name={}.".format(_LOG_PREFIX, len(data), task_name))
+    return data

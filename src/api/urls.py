@@ -13,6 +13,8 @@ from src.api.views.admin import (
     AdminCreateCompanyView,
     AdminResetUserPasswordView,
     AdminExtendTrialView,
+    AdminIngestionAuditHistoryView,
+    AdminIngestionAuditView,
     AdminProvidersView,
     AdminProviderDetailView,
 )
@@ -594,6 +596,16 @@ urlpatterns = [
         "admin/providers/<int:id>/",
         AdminProviderDetailView.as_view(),
         name="admin_provider_detail",
+    ),
+    path(
+        "admin/ingestion-audit/",
+        AdminIngestionAuditView.as_view(),
+        name="admin_ingestion_audit",
+    ),
+    path(
+        "admin/ingestion-audit/<str:name>/",
+        AdminIngestionAuditHistoryView.as_view(),
+        name="admin_ingestion_audit_history",
     ),
     path(
         "apollo/phone-webhook/",

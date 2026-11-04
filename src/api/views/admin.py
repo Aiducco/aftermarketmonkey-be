@@ -230,6 +230,60 @@ class AdminProvidersView(views.View):
         )
 
 
+class AdminIngestionAuditView(views.View):
+    """GET /admin/ingestion-audit/ - Every distributor sync/cron task's most recent run (status,
+    message, error), one row per task name — failing/in-progress rows sorted first. Staff only."""
+
+    def get(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
+        denied = _require_staff(request)
+        if denied:
+            return denied
+
+        try:
+            data = admin_services.get_ingestion_audit_overview()
+        except Exception as e:
+            logger.error("{} Error fetching ingestion audit overview. Error: {}".format(_LOG_PREFIX, str(e)))
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Error fetching ingestion audit overview"}),
+                status=500,
+            )
+
+        return http.HttpResponse(
+            headers={"Content-Type": "application/json"},
+            content=simplejson.dumps({"data": data}),
+            status=200,
+        )
+
+
+class AdminIngestionAuditHistoryView(views.View):
+    """GET /admin/ingestion-audit/<name>/ - Recent run history (last 50) for one task name,
+    newest first. Staff only."""
+
+    def get(self, request: http.HttpRequest, name: str, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
+        denied = _require_staff(request)
+        if denied:
+            return denied
+
+        try:
+            data = admin_services.get_ingestion_audit_history(task_name=name)
+        except Exception as e:
+            logger.error(
+                "{} Error fetching ingestion audit history for name={}. Error: {}".format(_LOG_PREFIX, name, str(e))
+            )
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Error fetching ingestion audit history"}),
+                status=500,
+            )
+
+        return http.HttpResponse(
+            headers={"Content-Type": "application/json"},
+            content=simplejson.dumps({"data": data}),
+            status=200,
+        )
+
+
 class AdminProviderDetailView(views.View):
     """GET /admin/providers/<id>/ - One provider's summary plus every company connected to it. Staff only."""
 

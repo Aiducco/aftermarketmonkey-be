@@ -2,7 +2,9 @@
 Helpers for recording scheduled task / cron execution in ScheduledTaskExecution audit table.
 Use from management commands or any caller that runs tasks on a schedule.
 """
+import contextlib
 import logging
+import typing
 from datetime import timedelta
 
 from django.utils import timezone
@@ -44,6 +46,34 @@ def mark_scheduled_task_failed(
     execution.error_message = error_message
     execution.completed_at = timezone.now()
     execution.save(update_fields=["status", "status_name", "error_message", "completed_at", "updated_at"])
+
+
+@contextlib.contextmanager
+def audited_step(
+    task_name: str,
+    success_message: str,
+    continue_on_error: bool = False,
+) -> typing.Iterator[None]:
+    """
+    Wrap one sub-step of a larger job in its own ScheduledTaskExecution row:
+    start_scheduled_task_execution on entry, mark_scheduled_task_completed/failed on exit.
+
+    Extracted from ingest_all_providers.Command._audited_step (which now delegates here, adding
+    only its own cron-log lines) so callers outside that one command -- e.g. a per-provider loop
+    in a service module -- get the same per-step audit record instead of one bundled row for the
+    whole loop. ``str(e) or repr(e)`` guards against an exception whose __str__ is empty (seen
+    live: an NTW failure left error_message as "", making a found row useless) -- repr() always
+    has at least the exception's class name.
+    """
+    execution = start_scheduled_task_execution(task_name)
+    try:
+        yield
+    except Exception as e:
+        mark_scheduled_task_failed(execution, error_message=str(e) or repr(e))
+        if not continue_on_error:
+            raise
+        return
+    mark_scheduled_task_completed(execution, message=success_message)
 
 
 def cleanup_stale_started_executions(

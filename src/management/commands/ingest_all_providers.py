@@ -127,6 +127,11 @@ class Command(BaseCommand):
 
         If ``continue_on_error=True`` the exception is swallowed after being recorded so the
         parent run can continue with the next provider.
+
+        This command's own version (rather than delegating to the simpler
+        audit_scheduled_tasks.audited_step, added alongside this for master_parts.
+        sync_all_master_parts_global's per-provider steps) because of the extra cron-log lines
+        and optional UsageMeter support below, neither of which the shared primitive needs.
         """
         ex = audit_scheduled_tasks.start_scheduled_task_execution(task_name)
         self._ingest_log("subtask started | task_name={}".format(task_name))
@@ -137,7 +142,7 @@ class Command(BaseCommand):
             else:
                 yield
         except Exception as e:
-            audit_scheduled_tasks.mark_scheduled_task_failed(ex, error_message=str(e))
+            audit_scheduled_tasks.mark_scheduled_task_failed(ex, error_message=str(e) or repr(e))
             self._ingest_log("subtask failed | task_name={} | error={!s}".format(task_name, e))
             if not continue_on_error:
                 raise
@@ -175,6 +180,33 @@ class Command(BaseCommand):
             "ingest_all_providers_sync_all_master_parts",
             "ingest_all_providers_enqueue_pricing_jobs",
             "ingest_all_providers_meilisearch_reindex",
+            # One per-provider row each, now that sync_all_master_parts_global's Phase 2 audits
+            # each provider's propagation into MasterPart/ProviderPart/inventory individually
+            # instead of bundling all 24 into the single "sync_all_master_parts" row above.
+            "sync_all_master_parts_turn14",
+            "sync_all_master_parts_keystone",
+            "sync_all_master_parts_meyer",
+            "sync_all_master_parts_atech",
+            "sync_all_master_parts_rough_country",
+            "sync_all_master_parts_dlg",
+            "sync_all_master_parts_wheelpros",
+            "sync_all_master_parts_premier",
+            "sync_all_master_parts_vossen",
+            "sync_all_master_parts_tirerack",
+            "sync_all_master_parts_quadratec",
+            "sync_all_master_parts_elite_wheel",
+            "sync_all_master_parts_motorstate",
+            "sync_all_master_parts_wps",
+            "sync_all_master_parts_helmet_house",
+            "sync_all_master_parts_the_wheel_group",
+            "sync_all_master_parts_tristate",
+            "sync_all_master_parts_allpro",
+            "sync_all_master_parts_sb",
+            "sync_all_master_parts_atd",
+            "sync_all_master_parts_thoroughbred",
+            "sync_all_master_parts_xdp",
+            "sync_all_master_parts_randys",
+            "sync_all_master_parts_ntw",
         ])
         self._ingest_log("start")
         execution = audit_scheduled_tasks.start_scheduled_task_execution(_TASK_NAME)
