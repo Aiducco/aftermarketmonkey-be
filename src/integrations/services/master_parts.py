@@ -4814,10 +4814,43 @@ def sync_provider_inventory_from_atech() -> None:
     logger.info("{} Synced {} A-Tech inventory records total.".format(_LOG_PREFIX, total_upserted))
 
 
+def _rough_country_provider_pricing(row: typing.Dict[str, typing.Any]) -> typing.Dict[str, typing.Any]:
+    """
+    ProviderPartCompanyPricing fields for one RoughCountryCompanyPricing row, for a US shop.
+
+    What the JOBBER feed actually carries, per part (verified against the file itself, 7,745 rows):
+      price       US retail -- always present
+      cost        this company's dealer cost: price less its ``discount`` column (30-33.5%)
+      sale_price  a dated special, on ~3% of rows (start/end dates in other columns)
+      cnd_map     the CANADIAN MAP, in Canadian dollars -- a constant ~1.51x the US price
+      mex_map     the MEXICAN MAP, in pesos -- ~19.8x the US price
+    There is no US MAP column, and no ``cnd_price`` column at all.
+
+    The mapping this replaces took ``cnd_map`` for BOTH jobber and MAP, and ``cnd_price`` (a column the
+    file does not have, so always empty) for msrp and retail. A US shop was therefore shown a Canadian
+    price list as its MAP and jobber, and no retail or msrp at all -- on all 8,159 Rough Country rows for
+    Trident, MAP and jobber populated and retail and msrp on none. It also took cost from
+    ``cost or price or sale_price``, so a part with no cost quietly got its retail price as its cost.
+
+    Now: ``price`` is the jobber, msrp and retail (it is the manufacturer's own list price, and what the
+    standalone ShopMonkey tool pushed as retail); MAP is left empty because there is no US MAP to hold; and
+    cost is ``cost`` alone, so a missing cost is missing rather than a plausible-looking wrong number.
+    ``sale_price`` is a promotion, not a standing price, and is not used.
+    """
+    price = row.get("price")
+    return {
+        "cost": row.get("cost"),
+        "jobber_price": price,
+        "map_price": None,
+        "msrp": price,
+        "retail_price": price,
+    }
+
+
 def sync_provider_pricing_from_rough_country() -> None:
     """
     Sync ProviderPartCompanyPricing from RoughCountryCompanyPricing (per-company rows).
-    Mapping: cost=cost or price or sale_price (first available), jobber/map=cnd_map, msrp/retail=cnd_price.
+    Mapping: see _rough_country_provider_pricing -- cost=cost, jobber/msrp/retail=price, MAP empty.
     """
     logger.info("{} Syncing provider pricing from Rough Country.".format(_LOG_PREFIX))
 
@@ -4856,9 +4889,6 @@ def sync_provider_pricing_from_rough_country() -> None:
                     "company_id",
                     "cost",
                     "price",
-                    "sale_price",
-                    "cnd_map",
-                    "cnd_price",
                     "part__brand_id",
                     "part__sku",
                 )[:BATCH_SIZE_PRICING]
@@ -4905,19 +4935,12 @@ def sync_provider_pricing_from_rough_country() -> None:
                 company = companies_by_id.get(row.get("company_id"))
                 if not company:
                     continue
-                cost = row.get("cost") or row.get("price") or row.get("sale_price")
-                cnd_map = row.get("cnd_map")
-                cnd_price = row.get("cnd_price")
                 to_upsert.append(
                     src_models.ProviderPartCompanyPricing(
                         provider_part=provider_part,
                         company=company,
-                        cost=cost,
-                        jobber_price=cnd_map,
-                        map_price=cnd_map,
-                        msrp=cnd_price,
-                        retail_price=cnd_price,
                         last_synced_at=now,
+                        **_rough_country_provider_pricing(row),
                     )
                 )
 
@@ -9634,9 +9657,6 @@ def sync_provider_pricing_from_rough_country_for_company(company_id: int) -> Non
                     "company_id",
                     "cost",
                     "price",
-                    "sale_price",
-                    "cnd_map",
-                    "cnd_price",
                     "part__brand_id",
                     "part__sku",
                 )[:BATCH_SIZE_PRICING]
@@ -9683,19 +9703,12 @@ def sync_provider_pricing_from_rough_country_for_company(company_id: int) -> Non
                 company = companies_by_id.get(row.get("company_id"))
                 if not company:
                     continue
-                cost = row.get("cost") or row.get("price") or row.get("sale_price")
-                cnd_map = row.get("cnd_map")
-                cnd_price = row.get("cnd_price")
                 to_upsert.append(
                     src_models.ProviderPartCompanyPricing(
                         provider_part=provider_part,
                         company=company,
-                        cost=cost,
-                        jobber_price=cnd_map,
-                        map_price=cnd_map,
-                        msrp=cnd_price,
-                        retail_price=cnd_price,
                         last_synced_at=now,
+                        **_rough_country_provider_pricing(row),
                     )
                 )
 
