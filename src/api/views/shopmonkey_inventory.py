@@ -5,6 +5,7 @@ import typing
 import simplejson
 from django import http, views
 
+from src import enums as src_enums
 from src.api.services import shopmonkey_inventory as shopmonkey_inventory_services
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,24 @@ def _error_response(message: str, error_code: typing.Optional[str]) -> http.Http
         content=simplejson.dumps({"message": message, "error_code": error_code}),
         status=_ERROR_STATUS.get(error_code, 400),
     )
+
+
+def _parse_part_status(raw: typing.Optional[str]) -> typing.Tuple[typing.Optional[int], bool]:
+    """
+    The parts filter as a ShopMonkeySyncPartStatus value, from either form a caller sends: the integer
+    (1/2/3) the contract documents, or the status name ("ACTIVE"/"INACTIVE"/"ERROR") the page actually
+    sends. Returns (value, ok). Nothing sent is (None, True); a value that is neither is (None, False) and
+    the caller must reject it -- silently treating an unreadable filter as "no filter" is what let the page's
+    status chips return every part for as long as they did.
+    """
+    if raw is None or raw == "":
+        return None, True
+    raw = raw.strip()
+    if raw.isdigit():
+        value = int(raw)
+        return (value, True) if value in {s.value for s in src_enums.ShopMonkeySyncPartStatus} else (None, False)
+    member = src_enums.ShopMonkeySyncPartStatus.__members__.get(raw.upper())
+    return (member.value, True) if member else (None, False)
 
 
 class ShopMonkeyAvailableBrandsView(views.View):
@@ -345,12 +364,11 @@ class ShopMonkeySyncBrandPartsView(views.View):
         except (TypeError, ValueError):
             pass
 
-        status_filter = None
-        if request.GET.get("status"):
-            try:
-                status_filter = int(request.GET["status"])
-            except (TypeError, ValueError):
-                status_filter = None
+        status_filter, status_ok = _parse_part_status(request.GET.get("status"))
+        if not status_ok:
+            return _error_response(
+                "status must be 1, 2, 3 or ACTIVE, INACTIVE, ERROR.", shopmonkey_inventory_services.ERROR_INVALID_INPUT
+            )
 
         result, error_code = shopmonkey_inventory_services.list_sync_brand_parts(
             company_id=company_id, sync_brand_id=sync_brand_id, limit=limit, offset=offset, status=status_filter
