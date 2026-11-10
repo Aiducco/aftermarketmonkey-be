@@ -36,6 +36,7 @@ Status model, mapped from signals we already have instead of the old tool's prov
     _mark_missing_parts_as_error). Counted separately from a push-attempt failure in the
     execution metadata (see sync_brand_parts), even though both set the same per-part status.
 """
+import decimal
 import logging
 import typing
 
@@ -361,10 +362,18 @@ def _ensure_brand_created_on_shopmonkey(
 # Part-level sync
 # --------------------------------------------------------------------------------------
 def _clean_part_name(name: str) -> str:
-    for prefix in (_OBSOLETE_PREFIX, _ERROR_PREFIX):
-        if name.startswith(prefix):
-            return name[len(prefix) :]
-    return name
+    """
+    Strip a status prefix the way the old tool does: match the bare tag, then trim whitespace,
+    applied to each tag in turn. Matching the bare tag rather than the tag plus a trailing space
+    matters because we inherit ~94K names already in ShopMonkey -- one hand-edited to
+    "[OBSOLETE]Foo", or with doubled spaces, would otherwise keep its prefix and get a second one
+    stacked on top of it on the next status flip.
+    """
+    clean = name
+    for tag in (_OBSOLETE_PREFIX.strip(), _ERROR_PREFIX.strip()):
+        if clean.startswith(tag):
+            clean = clean[len(tag) :].strip()
+    return clean
 
 
 def _part_name_for_status(name: str, status: int) -> str:
@@ -380,6 +389,47 @@ def _cents(value: typing.Optional[typing.Any]) -> int:
     if value is None:
         return 0
     return int(round(float(value) * 100))
+
+
+# The old tool never had a single pricing rule -- each distributor's own client built retail and
+# wholesale from that feed's columns, and three of the six then applied the same 20% floor by
+# hand (Turn 14, Meyer, Wheel Pros -- between them ~71K of its ~88K parts). We don't need the
+# per-distributor half of that: ingestion has already normalised every feed into
+# ProviderPartCompanyPricing, so what's left to reproduce is the shared part, which is the
+# priority order and the floor:
+#
+#   retail = first non-null of (MAP, jobber, retail, msrp), else cost * 1.2
+#   retail = max(retail, cost * 1.2)
+#   wholesale = cost
+#
+# Applying the floor to every distributor rather than three also fixes the two odd ones out:
+# Keystone hardcoded retail to 0 ("As specified"), and Rough Country passed the feed's price
+# straight through unfloored. Both now land on cost * 1.2 or better instead of shipping at or
+# below cost.
+_RETAIL_MINIMUM_MARKUP = decimal.Decimal("1.2")
+
+
+def _retail_and_wholesale_cents(
+    pricing: typing.Optional["src_models.ProviderPartCompanyPricing"],
+) -> typing.Tuple[int, int]:
+    """Returns (retail_cents, wholesale_cents). See the rule above."""
+    if pricing is None:
+        return 0, 0
+
+    cost = decimal.Decimal(str(pricing.cost)) if pricing.cost is not None else decimal.Decimal("0")
+    floor = cost * _RETAIL_MINIMUM_MARKUP
+
+    retail = None
+    for candidate in (pricing.map_price, pricing.jobber_price, pricing.retail_price, pricing.msrp):
+        if candidate is not None:
+            retail = decimal.Decimal(str(candidate))
+            break
+    if retail is None:
+        retail = floor
+    if retail < floor:
+        retail = floor
+
+    return _cents(retail), _cents(cost)
 
 
 def _master_parts_for_sync_brand(
@@ -462,10 +512,7 @@ def _sync_one_part(
             break
 
     pricing = pricing_by_provider_part_id.get(sourced_provider_part.id)
-    retail_cost = (pricing.retail_price if pricing.retail_price is not None else pricing.msrp) if pricing else None
-    wholesale_cost = pricing.cost if pricing else None
-    retail_cost_cents = _cents(retail_cost)
-    wholesale_cost_cents = _cents(wholesale_cost)
+    retail_cost_cents, wholesale_cost_cents = _retail_and_wholesale_cents(pricing)
 
     # INACTIVE only when EVERY contributing ProviderPart is discontinued -- a part carried by two
     # vendors where only one has discontinued it stays ACTIVE, since the other can still supply it.
