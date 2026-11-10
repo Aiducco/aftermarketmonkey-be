@@ -466,6 +466,25 @@ def _master_parts_for_sync_brand(
             yield mp, by_master_part[mp.id]
 
 
+def _base_part_name(sync_brand: src_models.ShopMonkeySyncBrand, master_part: src_models.MasterPart, sku: str) -> str:
+    """
+    "<brand> <description>", without doubling the brand when the description already starts with it.
+
+    The old tool had no single naming rule -- each distributor's client built its own -- but the three
+    that prefix the manufacturer or brand (Meyer, Wheel Pros, Rough Country) are ~54K of its ~88K parts,
+    and it is what staff searching ShopMonkey need: a distributor's bare description is often a fragment
+    ("BLOCK FILL SHORT") that means nothing without the brand beside it. Turn 14 and Keystone sent the
+    bare description; those names are not reproduced, since there is nothing to gain by being worse.
+    """
+    description = (master_part.description or "").strip()
+    brand_name = (sync_brand.brand.name or "").strip()
+    if not description:
+        return "{} {}".format(brand_name, sku).strip()
+    if brand_name and description.upper().startswith(brand_name.upper()):
+        return description
+    return "{} {}".format(brand_name, description).strip()
+
+
 def _sync_one_part(
     sync_brand: src_models.ShopMonkeySyncBrand,
     master_part: src_models.MasterPart,
@@ -529,7 +548,7 @@ def _sync_one_part(
         if existing_sync_part and existing_sync_part.last_pushed_sku
         else (master_part.sku or master_part.part_number)
     )
-    name = _part_name_for_status(master_part.description or sku, status)
+    name = _part_name_for_status(_base_part_name(sync_brand, master_part, sku), status)
     bin_location = sourced_vendor.bin_name
     number = master_part.part_number
 
