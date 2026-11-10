@@ -52,6 +52,13 @@ _OLD_PROVIDER_TO_KIND: typing.Dict[int, typing.Optional[int]] = {
     6: src_enums.BrandProviderKind.MEYER.value,
 }
 
+# Our provider kind -> the name its vendor already carries in the live ShopMonkey account, where that
+# differs from anything we call it. Confirmed by hand, never inferred: Premier Performance is
+# APG Wholesale, and the account's vendor is just "APG".
+_LIVE_VENDOR_ALIASES: typing.Dict[int, str] = {
+    src_enums.BrandProviderKind.PREMIER_PERFORMANCE.value: "APG",
+}
+
 _DEFAULT_OLD_REPO = "~/Documents/code/shopmonkey"
 
 
@@ -151,7 +158,9 @@ def _plan(
             bin_name = shopmonkey_sync_services._bin_name_for_provider(provider)
             matches = list(
                 dict.fromkeys(
-                    live_by_name.get(_norm(provider.kind_name), []) + live_by_name.get(_norm(provider.name), [])
+                    live_by_name.get(_norm(provider.kind_name), [])
+                    + live_by_name.get(_norm(provider.name), [])
+                    + live_by_name.get(_norm(_LIVE_VENDOR_ALIASES.get(kind)), [])
                 )
             )
             if len(matches) == 1:
