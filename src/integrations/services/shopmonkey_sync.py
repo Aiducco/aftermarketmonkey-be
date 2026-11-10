@@ -548,7 +548,18 @@ def _sync_one_part(
         if existing_sync_part and existing_sync_part.last_pushed_sku
         else (master_part.sku or master_part.part_number)
     )
-    name = _part_name_for_status(_base_part_name(sync_brand, master_part, sku), status)
+    # A part already in ShopMonkey keeps the name it has; only its status tag follows the status.
+    # Same policy as the SKU just above, for the same reason, and for the parts migrated from the old
+    # tool it is not just churn-avoidance but quality: its names carry the fitment ("Titan Fuel Tanks
+    # 11-19 Ford F-350/F-450 Narrow...") where the description we hold can be a placeholder
+    # ("TITAN Fuel Tanks 0301290000"), so recomputing would downgrade ~every migrated name. The
+    # cost is that a distributor rewording a description no longer renames the part; a new part
+    # is named from "<brand> <description>" once, when it is created.
+    if existing_sync_part and existing_sync_part.last_pushed_name:
+        base_name = existing_sync_part.last_pushed_name
+    else:
+        base_name = _base_part_name(sync_brand, master_part, sku)
+    name = _part_name_for_status(base_name, status)
     bin_location = sourced_vendor.bin_name
     number = master_part.part_number
 
