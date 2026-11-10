@@ -223,6 +223,12 @@ class Command(BaseCommand):
         parser.add_argument("--company-id", type=int, required=True)
         parser.add_argument("--old-repo", default=_DEFAULT_OLD_REPO, help="Path to the old standalone tool.")
         parser.add_argument("--apply", action="store_true", help="Write. Without it nothing is written.")
+        parser.add_argument(
+            "--create-on-shopmonkey",
+            action="store_true",
+            help="Also create, in the live ShopMonkey account, every vendor that does not exist there yet. "
+            "This is the only thing in this command that writes to ShopMonkey.",
+        )
 
     def handle(self, *args, **options):
         company_id = options["company_id"]
@@ -268,6 +274,18 @@ class Command(BaseCommand):
             "\ncreate={create} update={update} unchanged={unchanged} conflicts={c}".format(c=conflicts, **counts)
         )
 
+        pending_names = [
+            r["provider"].kind_name
+            for r in rows
+            if not r["sm_id"] and not (r["existing"] is not None and r["existing"].shopmonkey_external_id)
+        ]
+        if options["create_on_shopmonkey"]:
+            self.stdout.write(
+                "{} vendor(s) to create in ShopMonkey: {}".format(
+                    len(pending_names), ", ".join(pending_names) or "none"
+                )
+            )
+
         if not options["apply"]:
             self.stdout.write(self.style.WARNING("DRY RUN -- nothing written. Re-run with --apply."))
             return
@@ -290,3 +308,31 @@ class Command(BaseCommand):
                     r["existing"].save()
         logger.info("{} Applied for company_id={}: {}".format(_LOG_PREFIX, company_id, counts))
         self.stdout.write(self.style.SUCCESS("Applied."))
+
+        if options["create_on_shopmonkey"]:
+            self._create_missing_on_shopmonkey(company_id)
+
+    def _create_missing_on_shopmonkey(self, company_id: int) -> None:
+        """
+        Goes through the sync path's own _ensure_vendor_created_on_shopmonkey rather than a second
+        create implementation, so a vendor is created by exactly one piece of code, named the same
+        way (the provider's kind_name, matching the old tool's enum names), and recorded the same way.
+        Each vendor is independent: one failure is reported and the rest still go ahead.
+        """
+        client = shopmonkey_sync_services._client_for_company(company_id)
+        pending = src_models.ShopMonkeySyncVendor.objects.filter(
+            company_id=company_id, shopmonkey_external_id__isnull=True
+        ).select_related("provider")
+        created = failed = 0
+        for vendor in pending:
+            try:
+                shopmonkey_sync_services._ensure_vendor_created_on_shopmonkey(vendor, client)
+                created += 1
+                self.stdout.write(
+                    "  created {:<26} -> {}".format(vendor.provider.kind_name, vendor.shopmonkey_external_id)
+                )
+            except Exception as e:
+                failed += 1
+                logger.exception("{} Could not create vendor {}".format(_LOG_PREFIX, vendor.provider.kind_name))
+                self.stdout.write(self.style.ERROR("  FAILED  {}: {}".format(vendor.provider.kind_name, e)))
+        self.stdout.write("ShopMonkey vendors created={} failed={}".format(created, failed))
