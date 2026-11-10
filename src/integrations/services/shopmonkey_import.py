@@ -99,6 +99,7 @@ class BrandImportPlan:
     unresolved: typing.List[Part] = dataclasses.field(default_factory=list)
     ambiguous: typing.List[Part] = dataclasses.field(default_factory=list)
     collisions: typing.List[Part] = dataclasses.field(default_factory=list)
+    gone: typing.List[Part] = dataclasses.field(default_factory=list)
     already_imported: int = 0
     problems: typing.List[str] = dataclasses.field(default_factory=list)
 
@@ -109,6 +110,7 @@ def plan_brand_import(
     our_brand_id: int,
     old_repo: str = DEFAULT_OLD_REPO,
     old_vendor_name: typing.Optional[str] = None,
+    live_index: typing.Optional[typing.Dict[str, str]] = None,
 ) -> BrandImportPlan:
     connection = connect_old_db(old_repo)
     try:
@@ -199,6 +201,17 @@ def plan_brand_import(
             src_models.ShopMonkeySyncPart.objects.filter(sync_brand=existing).values_list("master_part_id", flat=True)
         )
 
+    if live_index is not None:
+        elsewhere = [
+            part["sku"]
+            for part in old_parts
+            if part["external_id"] in live_index and live_index[part["external_id"]] != old_brand["sm_brand_id"]
+        ]
+        if elsewhere:
+            plan.problems.append(
+                "{} part(s) live under another brand: {}".format(len(elsewhere), ", ".join(elsewhere[:5]))
+            )
+
     claimed: typing.Set[int] = set()
     for part in old_parts:
         candidates = by_number.get(_norm(part["number"]), [])
@@ -217,6 +230,13 @@ def plan_brand_import(
         claimed.add(mp.id)
         if mp.id in already:
             plan.already_imported += 1
+        elif live_index is not None and part["external_id"] not in live_index:
+            # The part no longer exists in ShopMonkey (a GET returns 404): it was deleted after the old tool
+            # last tracked it. It cannot be updated, so it is not linked -- and it is kept out of the plan
+            # rather than holding up the brand. Note what that means for the first sync: if the vendor still
+            # carries the master part, the sync will create it again, as a new part. Whether a deletion was
+            # deliberate is something only the shop can say, so these are reported, never decided here.
+            plan.gone.append(part)
         elif mp.id in carried:
             plan.linkable.append((part, mp))
         else:
