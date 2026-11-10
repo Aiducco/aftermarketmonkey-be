@@ -428,7 +428,16 @@ def _sync_one_part(
     """Returns one of "created"/"updated"/"unchanged"/"obsoleted" for the caller's metadata
     counts. Raises shopmonkey_exceptions.ShopMonkeyException on a failed API call -- the caller
     persists last_error, this function never swallows it."""
-    # quantity: sum across every contributing ProviderPart's own inventory row.
+    # Summed availability across every contributing ProviderPart's own inventory row.
+    #
+    # This is recorded and shown in our own UI; it is deliberately NOT sent to ShopMonkey. Their
+    # `quantity` field means "units this shop has on hand", and distributor availability is not
+    # that -- writing 73 there because two distributors between them stock 73 tells ShopMonkey
+    # the shop owns parts it does not, lets staff add them to a repair order as in-stock, and
+    # makes the account's own inventory valuation (totalCost/totalValue) fiction. The standalone
+    # tool this was ported from never sent quantity either, across ~88K parts and several years;
+    # we match it on the wire. See the payload in src.integrations.clients.shopmonkey.client.
+    #
     # ProviderPartInventory is a reverse OneToOne (related_name="inventory") -- absent for a part
     # never inventory-synced, and accessing pp.inventory directly raises DoesNotExist in that
     # case (the FK lives on ProviderPartInventory pointing at ProviderPart, not the other way),
@@ -492,7 +501,6 @@ def _sync_one_part(
             sku=sku,
             retail_cost=retail_cost_cents,
             wholesale_cost=wholesale_cost_cents,
-            quantity=quantity,
             vendor_bin_location=bin_location,
         )
         if existing_sync_part:
@@ -545,7 +553,6 @@ def _sync_one_part(
         or existing_sync_part.last_pushed_sku != sku
         or existing_sync_part.last_pushed_retail_cost_cents != retail_cost_cents
         or existing_sync_part.last_pushed_wholesale_cost_cents != wholesale_cost_cents
-        or existing_sync_part.last_pushed_quantity != quantity
         or existing_sync_part.last_pushed_bin_location != bin_location
         or existing_sync_part.status != status
     )
@@ -562,7 +569,6 @@ def _sync_one_part(
         sku=sku,
         retail_cost=retail_cost_cents,
         wholesale_cost=wholesale_cost_cents,
-        quantity=quantity,
         vendor_bin_location=bin_location,
     )
     existing_sync_part.shopmonkey_external_id = shopmonkey_part.get("id", existing_sync_part.shopmonkey_external_id)
@@ -642,7 +648,6 @@ def _mark_sync_part_unmanaged(
         sku=sync_part.last_pushed_sku or (master_part.sku or master_part.part_number),
         retail_cost=int(sync_part.last_pushed_retail_cost_cents or 0),
         wholesale_cost=int(sync_part.last_pushed_wholesale_cost_cents or 0),
-        quantity=0,
         vendor_bin_location=sync_part.last_pushed_bin_location,
     )
     sync_part.last_pushed_name = name

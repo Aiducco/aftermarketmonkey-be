@@ -19,6 +19,7 @@ but never actually attaches one to a part) -- preserved deliberately rather than
 explicit instruction when porting this. Response envelope there is ``{"success": bool, "data":
 ...}``; ``_request`` unwraps ``data`` the same way.
 """
+import datetime
 import decimal
 import time
 import typing
@@ -34,6 +35,15 @@ from src.integrations.clients.shopmonkey import exceptions
 REQUEST_TIMEOUT_SECONDS = 30
 # Matches the old tool's own retry ceiling for 429s.
 MAX_RATE_LIMIT_RETRIES = 5
+
+
+def _updated_at_note() -> str:
+    """
+    The note the old tool stamps on every part it writes, reproduced verbatim -- live parts in
+    Trident's account carry e.g. "Updated at: 2026-10-01 16:09:58". Paired with showNote: False,
+    so it is a provenance record readable on the part rather than something surfaced to staff.
+    """
+    return "Updated at: {}".format(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
 
 class ShopMonkeyApiClient(object):
@@ -184,7 +194,6 @@ class ShopMonkeyApiClient(object):
         retail_cost: int,
         wholesale_cost: int,
         vendor_bin_location: typing.Optional[str] = None,
-        quantity: typing.Optional[int] = None,
     ) -> typing.Dict:
         # vendor_id is accepted (and threaded through from the vendor we create) but deliberately
         # never sent — the old tool's own client always sent vendorId: null on both create and
@@ -203,7 +212,7 @@ class ShopMonkeyApiClient(object):
                 "retailCostCents": retail_cost,
                 "wholesaleCostCents": wholesale_cost,
                 "binLocation": vendor_bin_location,
-                "quantity": quantity,
+                "note": _updated_at_note(),
                 "showNote": False,
             },
         )
@@ -219,7 +228,6 @@ class ShopMonkeyApiClient(object):
         retail_cost: int,
         wholesale_cost: int,
         vendor_bin_location: typing.Optional[str] = None,
-        quantity: typing.Optional[int] = None,
     ) -> typing.Dict:
         return self._request_data(
             endpoint="inventory_part/{}".format(external_id),
@@ -233,7 +241,7 @@ class ShopMonkeyApiClient(object):
                 "retailCostCents": retail_cost,
                 "wholesaleCostCents": wholesale_cost,
                 "binLocation": vendor_bin_location,
-                "quantity": quantity,
+                "note": _updated_at_note(),
                 "showNote": False,
             },
         )

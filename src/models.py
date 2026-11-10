@@ -547,6 +547,11 @@ class ShopMonkeySyncPart(django_db_models.Model):
     last_pushed_wholesale_cost_cents = django_db_models.DecimalField(
         max_digits=28, decimal_places=8, null=True, blank=True
     )
+    # Summed distributor availability across this part's contributing vendors at the last sync.
+    # Despite the "last_pushed_" prefix it shares with its neighbours, this one is NOT sent to
+    # ShopMonkey -- their `quantity` means units the shop holds, and distributor stock is not
+    # that. Recorded so our own UI can show where a part can be sourced from. See the payload in
+    # src.integrations.clients.shopmonkey.client, which matches the old tool's key for key.
     last_pushed_quantity = django_db_models.IntegerField(null=True, blank=True)
     last_pushed_bin_location = django_db_models.CharField(max_length=16, null=True, blank=True)
     # Which vendor's price (and bin_name) this part's last push actually used -- the primary
