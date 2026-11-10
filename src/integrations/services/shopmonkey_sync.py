@@ -532,6 +532,17 @@ def _sync_one_part(
 
     pricing = pricing_by_provider_part_id.get(sourced_provider_part.id)
     retail_cost_cents, wholesale_cost_cents = _retail_and_wholesale_cents(pricing)
+    # No cost for this company means we do not KNOW the price, which is not the same as the price being
+    # zero. The old tool treats them the same and pushes 0/0 over whatever was there; copying that would
+    # blank a live price in the shop because a feed row is missing on our side. Found by rehearsing the
+    # first real migrated brand: three Titan Fuel Tanks parts at ~$1,247 retail would have been set to $0.
+    # So a part already in ShopMonkey keeps the prices last pushed for it, and a new part with no price
+    # is still created at 0/0, as the old tool does.
+    if (pricing is None or pricing.cost is None) and existing_sync_part is not None:
+        if existing_sync_part.last_pushed_retail_cost_cents is not None:
+            retail_cost_cents = int(existing_sync_part.last_pushed_retail_cost_cents)
+        if existing_sync_part.last_pushed_wholesale_cost_cents is not None:
+            wholesale_cost_cents = int(existing_sync_part.last_pushed_wholesale_cost_cents)
 
     # INACTIVE only when EVERY contributing ProviderPart is discontinued -- a part carried by two
     # vendors where only one has discontinued it stays ACTIVE, since the other can still supply it.
