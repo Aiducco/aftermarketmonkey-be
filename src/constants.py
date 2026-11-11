@@ -2936,22 +2936,22 @@ PROVIDER_CATALOG = [
         "email_order_connection_optional_fields": ["account_number", "cc_email", "reply_to_email"],
     },
     # TEMPORARY: Holley Performance has no integration yet. This entry only collects the dealer's
-    # portal login (email + password) so we can see who has an account. To revert, delete this
+    # B2B portal login (username + password) so we can see who has an account. To revert, delete this
     # entry and restore Holley to COMING_SOON_PROVIDERS below.
     {
         "kind": enums.BrandProviderKind.HOLLEY_PERFORMANCE,
         "name": "Holley Performance",
-        "description": "Connect your Holley Performance dealer account.",
+        "description": "Connect your Holley Performance B2B account.",
         "icon_url": "https://api.aftermarketscout.com/uploads/holley_logo.png",
         "category": "Distributors",
-        "connection_required_fields": ["email", "password"],
+        "connection_required_fields": ["username", "password"],
         "integration_time": "We'll set up your connection and confirm by email",
         "installation_instructions_html": (
             "<p><strong>Holley Performance</strong> pricing and inventory are tied to your dealer account on "
-            "the Holley dealer portal.</p>"
+            "the Holley B2B portal.</p>"
             "<ol>"
-            "<li>Enter the <strong>email</strong> and <strong>password</strong> you use to sign in to your "
-            "Holley dealer account at <a href=\"https://www.holley.com/\">holley.com</a>.</li>"
+            "<li>Enter the <strong>username</strong> and <strong>password</strong> you use to sign in to the "
+            "Holley B2B portal at <a href=\"https://b2b.holley.com\">b2b.holley.com</a>.</li>"
             "<li>Save the connection.</li>"
             "</ol>"
         ),
