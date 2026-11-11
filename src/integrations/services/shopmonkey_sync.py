@@ -38,6 +38,7 @@ Status model, mapped from signals we already have instead of the old tool's prov
 """
 import decimal
 import logging
+import re
 import typing
 
 from django.core.cache import cache
@@ -491,6 +492,44 @@ def _base_part_name(sync_brand: src_models.ShopMonkeySyncBrand, master_part: src
     return "{} {}".format(brand_name, description).strip()
 
 
+def _sku_key(sku: typing.Optional[str]) -> str:
+    """A SKU compared the way a person would: case, spaces and punctuation ignored."""
+    return re.sub(r"[^A-Z0-9]", "", (sku or "").upper())
+
+
+def _record_duplicate_sku_skip(
+    sync_brand: src_models.ShopMonkeySyncBrand,
+    master_part: src_models.MasterPart,
+    existing_sync_part: typing.Optional[src_models.ShopMonkeySyncPart],
+    sku: str,
+    sourced_vendor: src_models.ShopMonkeySyncVendor,
+) -> None:
+    """
+    Keep a part out because creating it would put a second part with the same SKU into the shop.
+
+    Our own catalog can hold two master parts for one real part -- the same SKU written with and without a
+    distributor prefix, say -- and a master part is the unit the sync pushes. Both reaching ShopMonkey would
+    give the shop two parts with one SKU. The first one wins; this one is recorded as SKIPPED with the reason,
+    so it is visible in the Parts table and never retried.
+    """
+    reason = "Not created: another part in this brand already has the SKU {!r}, and a second one would be a duplicate.".format(
+        sku
+    )
+    fields = {
+        "last_pushed_sku": sku,
+        "sourced_from_vendor": sourced_vendor,
+        "status": src_enums.ShopMonkeySyncPartStatus.SKIPPED.value,
+        "status_name": src_enums.ShopMonkeySyncPartStatus.SKIPPED.name,
+        "last_error": reason,
+    }
+    if existing_sync_part is not None:
+        for key, value in fields.items():
+            setattr(existing_sync_part, key, value)
+        existing_sync_part.save(update_fields=list(fields) + ["updated_at"])
+    else:
+        src_models.ShopMonkeySyncPart.objects.create(sync_brand=sync_brand, master_part=master_part, **fields)
+
+
 def _sync_one_part(
     sync_brand: src_models.ShopMonkeySyncBrand,
     master_part: src_models.MasterPart,
@@ -499,6 +538,7 @@ def _sync_one_part(
     pricing_by_provider_part_id: typing.Dict[int, src_models.ProviderPartCompanyPricing],
     client: shopmonkey_client.ShopMonkeyApiClient,
     existing_sync_part: typing.Optional[src_models.ShopMonkeySyncPart],
+    used_skus: typing.Optional[typing.Set[str]] = None,
 ) -> str:
     """Returns one of "created"/"updated"/"unchanged"/"obsoleted"/"skipped" for the caller's metadata
     counts. Raises shopmonkey_exceptions.ShopMonkeyException on a failed API call -- the caller
@@ -598,6 +638,12 @@ def _sync_one_part(
     # bug, not a cosmetic one, since it would never succeed.
     needs_create = not existing_sync_part or not existing_sync_part.shopmonkey_external_id
     if needs_create:
+        if used_skus is not None:
+            sku_key = _sku_key(sku)
+            if sku_key in used_skus:
+                _record_duplicate_sku_skip(sync_brand, master_part, existing_sync_part, sku, sourced_vendor)
+                return "skipped"
+            used_skus.add(sku_key)
         shopmonkey_part = client.create_inventory_part(
             name=name,
             vendor_id=sourced_vendor.shopmonkey_external_id,
@@ -834,6 +880,15 @@ def sync_brand_parts(
         for sp in src_models.ShopMonkeySyncPart.objects.filter(sync_brand=sync_brand).select_related("master_part")
     }
     seen_master_part_ids = set()
+    # SKUs this brand already has in ShopMonkey (and, as the loop creates parts, the ones it just made), so a
+    # second master part with the same SKU is recognised instead of being pushed as a duplicate.
+    used_skus = {
+        _sku_key(sp.last_pushed_sku)
+        for sp in existing_sync_parts.values()
+        if sp.last_pushed_sku
+        and sp.shopmonkey_external_id
+        and sp.status != src_enums.ShopMonkeySyncPartStatus.SKIPPED.value
+    }
     counts = {"created": 0, "updated": 0, "unchanged": 0, "obsoleted": 0, "failed": 0, "unmanaged": 0, "skipped": 0}
     vendor_contrib: typing.Dict[int, typing.Dict[str, typing.Any]] = {
         v.provider_id: {
@@ -873,6 +928,7 @@ def sync_brand_parts(
                 pricing_by_pp_id,
                 client,
                 existing_sync_parts.get(master_part.id),
+                used_skus,
             )
             counts[bucket] += 1
             if bucket not in ("obsoleted", "skipped"):

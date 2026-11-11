@@ -283,9 +283,21 @@ def plan_brand_import(
 
     claimed: typing.Set[int] = set()
     for part in old_parts:
-        candidates = by_number.get(_norm(part["number"]), [])
-        if not candidates:
-            candidates = by_sku.get(_norm(part["sku"]), [])
+        # The old tool's number and sku, against our part number and sku, in every pairing. A distributor's own
+        # SKU usually carries a brand prefix ("BFG99506") that its part number lacks ("99506"), and which of our
+        # fields holds which form varies by distributor -- so matching number-to-number and sku-to-sku alone left
+        # parts unlinked in ShopMonkey while the sync created a second copy of each. First pairing with any hit wins;
+        # more than one hit within it is ambiguous and never guessed.
+        candidates = []
+        for index, key in (
+            (by_number, part["number"]),
+            (by_sku, part["number"]),
+            (by_number, part["sku"]),
+            (by_sku, part["sku"]),
+        ):
+            candidates = index.get(_norm(key), [])
+            if candidates:
+                break
         if len(candidates) > 1:
             plan.ambiguous.append(part)
             continue
@@ -400,3 +412,102 @@ def apply_brand_import(plan: BrandImportPlan) -> typing.Dict[str, int]:
         "parts_created": len(rows),
         "parts_skipped": len(skipped),
     }
+
+
+def _status_from_live_name(name: typing.Optional[str]) -> src_enums.ShopMonkeySyncPartStatus:
+    name = name or ""
+    if name.startswith("[ERROR UPDATING PART]"):
+        return src_enums.ShopMonkeySyncPartStatus.ERROR
+    if name.startswith("[OBSOLETE]"):
+        return src_enums.ShopMonkeySyncPartStatus.INACTIVE
+    return src_enums.ShopMonkeySyncPartStatus.ACTIVE
+
+
+def _sku_key(sku: typing.Optional[str]) -> str:
+    return re.sub(r"[^A-Z0-9]", "", (sku or "").upper())
+
+
+def adopt_untracked_live_parts(
+    sync_brand: src_models.ShopMonkeySyncBrand, live_records: typing.List[typing.Dict[str, typing.Any]]
+) -> typing.Dict[str, int]:
+    """
+    Link, instead of duplicate, the parts ShopMonkey already holds that no sync part points at.
+
+    The old tool's database does not track every part in the account (about 6,400 were never recorded, and it keeps
+    adding more), so a master part we would create may already exist upstream with the same SKU. Creating it would
+    give the shop a second one. Where a part with that SKU already exists under THIS brand's ShopMonkey brand and
+    nothing else is linked to it, we record the link and what it holds today, and from then on the sync updates it.
+
+    Only the same ShopMonkey brand counts: the same SKU under a different brand is reported but never adopted, and a
+    SKU that appears twice in the brand is ambiguous and left for a person. ``live_records`` is the account listing
+    ({id, sku, brandId, name, retailCostCents, wholesaleCostCents, binLocation}); the caller owns how fresh it is.
+    """
+    vendors = [sync_brand.vendor] + [
+        link.vendor
+        for link in src_models.ShopMonkeySyncBrandVendor.objects.filter(sync_brand=sync_brand)
+        .select_related("vendor")
+        .order_by("priority")
+    ]
+    provider_ids = [v.provider_id for v in vendors]
+    master_parts = {mp.id: mp for mp in src_models.MasterPart.objects.filter(brand_id=sync_brand.brand_id)}
+    ids = list(master_parts)
+    carriers: typing.Dict[int, typing.Set[int]] = collections.defaultdict(set)
+    for i in range(0, len(ids), _CHUNK):
+        for mp_id, prov_id in src_models.ProviderPart.objects.filter(
+            master_part_id__in=ids[i : i + _CHUNK], provider_id__in=provider_ids
+        ).values_list("master_part_id", "provider_id"):
+            carriers[mp_id].add(prov_id)
+    linked = set(
+        src_models.ShopMonkeySyncPart.objects.filter(sync_brand=sync_brand).values_list("master_part_id", flat=True)
+    )
+    tracked_ids = set(
+        src_models.ShopMonkeySyncPart.objects.exclude(shopmonkey_external_id=None).values_list(
+            "shopmonkey_external_id", flat=True
+        )
+    )
+
+    live_by_sku: typing.Dict[str, typing.List[typing.Dict[str, typing.Any]]] = collections.defaultdict(list)
+    for rec in live_records:
+        if rec.get("brandId") == sync_brand.shopmonkey_external_id and _sku_key(rec.get("sku")):
+            live_by_sku[_sku_key(rec["sku"])].append(rec)
+
+    rows, ambiguous, already_tracked = [], 0, 0
+    for mp_id, provs in carriers.items():
+        if mp_id in linked:
+            continue
+        master_part = master_parts[mp_id]
+        recs = live_by_sku.get(_sku_key(master_part.sku or master_part.part_number), [])
+        if not recs:
+            continue
+        if len(recs) > 1:
+            ambiguous += 1
+            continue
+        rec = recs[0]
+        if rec["id"] in tracked_ids:
+            already_tracked += 1
+            continue
+        tracked_ids.add(rec["id"])
+        status = _status_from_live_name(rec.get("name"))
+        rows.append(
+            src_models.ShopMonkeySyncPart(
+                sync_brand=sync_brand,
+                master_part=master_part,
+                shopmonkey_external_id=rec["id"],
+                last_pushed_name=rec.get("name"),
+                last_pushed_sku=rec.get("sku"),
+                last_pushed_retail_cost_cents=rec.get("retailCostCents"),
+                last_pushed_wholesale_cost_cents=rec.get("wholesaleCostCents"),
+                last_pushed_bin_location=rec.get("binLocation"),
+                sourced_from_vendor=next(v for v in vendors if v.provider_id in provs),
+                status=status.value,
+                status_name=status.name,
+            )
+        )
+    with transaction.atomic():
+        src_models.ShopMonkeySyncPart.objects.bulk_create(rows, batch_size=_CHUNK)
+    logger.info(
+        "{} Adopted {} live part(s) for sync_brand_id={} ({} ambiguous, {} already linked elsewhere).".format(
+            _LOG_PREFIX, len(rows), sync_brand.id, ambiguous, already_tracked
+        )
+    )
+    return {"adopted": len(rows), "ambiguous": ambiguous, "already_tracked": already_tracked}
