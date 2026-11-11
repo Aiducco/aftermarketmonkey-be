@@ -293,6 +293,18 @@ def _collect_results(
     return results
 
 
+def _clip(value: typing.Any, max_length: int) -> typing.Any:
+    """
+    Fit a distributor-supplied string into its column. Keystone's order statuses run to ~90
+    characters ("PACKAGE - Label for 3rd party carrier printed and placed on the box ...") against
+    a 64-character column, and one over-long value used to raise a DataError that aborted the whole
+    sync run. The full, unclipped text is still kept in raw_response.
+    """
+    if isinstance(value, str) and len(value) > max_length:
+        return value[:max_length]
+    return value
+
+
 def _result_to_defaults(
     result: history.ExternalOrderResult,
     company_provider: src_models.CompanyProviders,
@@ -302,27 +314,27 @@ def _result_to_defaults(
     return {
         "company": company_provider.company,
         "company_provider": company_provider,
-        "customer_po_number": result.customer_po_number or None,
+        "customer_po_number": _clip(result.customer_po_number or None, 128),
         "origin_signal": origin_signal.value,
         "origin_signal_name": origin_signal.name,
-        "distributor_status": result.status,
+        "distributor_status": _clip(result.status, 64),
         "order_date": result.order_date,
-        "ship_to_name": ship_to.get("name"),
-        "ship_to_address1": ship_to.get("address1"),
-        "ship_to_address2": ship_to.get("address2"),
-        "ship_to_city": ship_to.get("city"),
-        "ship_to_state": ship_to.get("state"),
-        "ship_to_postal_code": ship_to.get("postal_code"),
-        "ship_to_country": ship_to.get("country"),
-        "ship_to_phone": ship_to.get("phone"),
+        "ship_to_name": _clip(ship_to.get("name"), 255),
+        "ship_to_address1": _clip(ship_to.get("address1"), 255),
+        "ship_to_address2": _clip(ship_to.get("address2"), 255),
+        "ship_to_city": _clip(ship_to.get("city"), 128),
+        "ship_to_state": _clip(ship_to.get("state"), 64),
+        "ship_to_postal_code": _clip(ship_to.get("postal_code"), 32),
+        "ship_to_country": _clip(ship_to.get("country"), 64),
+        "ship_to_phone": _clip(ship_to.get("phone"), 32),
         "subtotal": result.subtotal,
         "freight": result.freight,
         "total": result.total,
         "line_items": result.line_items or [],
         "distributor_invoice_numbers": result.distributor_invoice_numbers or [],
         "tracking": result.tracking or [],
-        "ship_method_code": result.ship_method_code,
-        "ship_method": result.ship_method,
+        "ship_method_code": _clip(result.ship_method_code, 16),
+        "ship_method": _clip(result.ship_method, 64),
         "status_history": result.status_history or [],
         "estimated_delivery_date": result.estimated_delivery_date,
         "raw_response": result.raw_response,
@@ -547,7 +559,21 @@ def sync_external_orders(
                 _record_watermark_failure(account, now, str(e))
             continue
 
-        discovered, updated, healed = _apply_results(company_provider, account, reader, results, dry_run)
+        try:
+            discovered, updated, healed = _apply_results(company_provider, account, reader, results, dry_run)
+        except Exception as e:
+            # A bad row for one account (e.g. a value that doesn't fit its column) used to raise
+            # straight out of the command, leaving every later account unpolled with no watermark
+            # recorded. Treat it like a failed poll instead: record it and carry on.
+            logger.exception(
+                "{} Applying results failed for company_provider_id={} order_account_id={}.".format(
+                    _LOG_PREFIX, company_provider.id, account.id
+                )
+            )
+            stats["accounts_failed"] += 1
+            if not dry_run:
+                _record_watermark_failure(account, now, str(e))
+            continue
         stats["orders_discovered"] += discovered
         stats["orders_updated"] += updated
         stats["orders_healed"] += healed
