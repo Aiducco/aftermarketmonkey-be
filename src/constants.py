@@ -872,25 +872,23 @@ PROVIDER_CATALOG = [
         "description": "Access catalog, per-company pricing, and inventory from Quadratec via two downloadable feeds.",
         "icon_url": "https://api.aftermarketscout.com/uploads/quadratec_logo.png",
         "category": "Distributors",
-        "connection_required_fields": [
-            QUADRATEC_CREDENTIALS_CATALOG_FEED_URL,
-            QUADRATEC_CREDENTIALS_PRICING_FEED_URL,
-        ],
+        # TEMPORARY: collecting the Quadratec wholesale portal login (email + password) instead of
+        # the two feed URLs. To revert, restore [QUADRATEC_CREDENTIALS_CATALOG_FEED_URL,
+        # QUADRATEC_CREDENTIALS_PRICING_FEED_URL] as the required fields and the original
+        # installation_instructions_html (see git history of this block).
+        "connection_required_fields": ["email", "password"],
         # Email-channel ordering — Quadratec has no order API of its own (same pattern as Rough
         # Country / Vossen), so this is the only way to place orders through AfterMarketScout for it.
         "email_order_connection_required_fields": ["rep_email"],
         "email_order_connection_optional_fields": ["account_number", "cc_email", "reply_to_email"],
         "integration_time": "Data available within 1-2 hours",
         "installation_instructions_html": (
-            "<p><strong>Quadratec</strong> provides two downloadable dealer feeds — a catalog/pricing "
-            "sheet and a wholesale cost + inventory file. Both are per dealer account.</p>"
+            "<p><strong>Quadratec</strong> pricing and inventory are tied to your dealer account on the "
+            "Quadratec wholesale portal.</p>"
             "<ol>"
-            "<li>In your Quadratec dealer portal, locate your <strong>catalog/pricing feed</strong> "
-            "(Quadratec PN, MPN, description, UPC, brand, retail &amp; wholesale price). Copy its full "
-            "HTTPS URL and paste it into <strong>catalog_feed_url</strong> below.</li>"
-            "<li>Locate your <strong>wholesale cost &amp; inventory feed</strong> (Quadratec Part No, "
-            "part no, brand, per-warehouse and total inventory, cost, UPC, MAP). Copy its full HTTPS URL "
-            "and paste it into <strong>pricing_feed_url</strong> below.</li>"
+            "<li>Enter the <strong>email</strong> and <strong>password</strong> you use to sign in at "
+            "<a href=\"https://www.quadratecwholesale.com/customer/account/login\">"
+            "quadratecwholesale.com</a>.</li>"
             "<li>Save the connection.</li>"
             "</ol>"
             "<p><strong>Optional: place orders through AfterMarketScout</strong></p>"
@@ -1566,65 +1564,27 @@ PROVIDER_CATALOG = [
         "description": "Access Crown Automotive inventory and pricing via FTP relay.",
         "icon_url": "https://api.aftermarketscout.com/uploads/crown_automotive_logo.png",
         "category": "Distributors",
-        "connection_required_fields": [],
-        "relay_provisioned": True,
-        "relay_credential_fields": ("ftp_user", "ftp_password"),
+        # TEMPORARY: collecting the Crown dealer portal login (email + password) instead of the
+        # SFTP relay. To revert, restore `"connection_required_fields": []`,
+        # `"relay_provisioned": True`, `"relay_credential_fields": ("ftp_user", "ftp_password")` and
+        # the original installation_instructions_html (see git history of this block).
+        "connection_required_fields": ["email", "password"],
         # Email-channel ordering — see the matching note on Turn 14 above.
         "email_order_connection_required_fields": ["rep_email"],
         "email_order_connection_optional_fields": ["account_number", "cc_email", "reply_to_email"],
         "integration_time": "Data available within 1-2 days",
-        # {{SFTP_USER}}/{{SFTP_PASSWORD}} are substituted per company by
-        # _render_relay_instructions_html — see the matching note on Meyer above.
         "installation_instructions_html": (
-            "<p><strong>Crown</strong> works differently: there are no feed credentials to enter. We've already "
-            "created a private SFTP folder for your company, and Crown delivers your stock and pricing files to "
-            "it. Orders go to your Crown rep as a PDF purchase order by email. One email to your rep sets up "
-            "both.</p>"
-
-            "<p><strong>1. Email your Crown rep</strong></p>"
-            "<p>Copy the message below and send it to your Crown rep, with "
-            "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a> on CC. The "
-            "connection details are unique to your company and already filled in. Keep them private, because "
-            "anyone who has them can write to your feed folder.</p>"
-            + _CALLOUT_OPEN +
-            "<p>Hi,</p>"
-            "<p>We use AfterMarketScout as our product information management (PIM) and ordering platform, and "
-            "need two things set up for our Crown account:</p>"
-            "<p><strong>1. SFTP feed delivery.</strong> Please deliver our stock and pricing files to "
-            "AfterMarketScout's server:</p>"
-            "<p>"
-            "Host: <code>5.161.121.143</code><br />"
-            "Port: <code>22</code><br />"
-            "Username: <code>{{SFTP_USER}}</code><br />"
-            "Password: <code>{{SFTP_PASSWORD}}</code><br />"
-            "Folder: <code>uploads</code>"
-            "</p>"
-            "<p><strong>2. Purchase orders.</strong> Please confirm the email address we should send purchase "
-            "orders to.</p>"
-            "<p>I've copied AfterMarketScout support "
-            "(<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a>) in case you "
-            "have any technical questions.</p>"
-            "<p>Thanks!</p>"
-            "</div>"
-
-            "<p><strong>2. Click Connect</strong></p>"
-            "<p>AfterMarketScout starts watching your folder. Data appears after Crown's first delivery, which "
-            "can take a few days depending on your rep.</p>"
-
-            "<p><strong>3. Set up ordering</strong></p>"
-            "<p>Enter the purchase-order email your rep confirmed below. You can also add an internal "
-            "<strong>CC</strong> so your team gets a copy of every order. Click <strong>Save</strong>.</p>"
-            "<p>Orders go out as PDF emails, so confirmations and tracking come back from your rep directly "
-            "rather than into AfterMarketScout.</p>"
-
-            "<p><strong>Troubleshooting</strong></p>"
-            "<ul>"
-            "<li><strong>No files after a few days?</strong> Ask your rep to confirm the host and that the "
-            "files are going to the <code>uploads</code> folder.</li>"
-            "<li><strong>More than one Crown account?</strong> Each account needs its own folder. Email "
-            "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a> and we'll create "
-            "another one.</li>"
-            "</ul>"
+            "<p><strong>Crown Automotive</strong> pricing and inventory are tied to your dealer account on the "
+            "Crown dealer portal.</p>"
+            "<ol>"
+            "<li>Enter the <strong>email</strong> and <strong>password</strong> you use to sign in at "
+            "<a href=\"https://www.crownautomotive.net/customer-login.html?Order=0&amp;CA=\">"
+            "crownautomotive.net</a>.</li>"
+            "<li>Save the connection.</li>"
+            "</ol>"
+            "<p><strong>Optional: place orders through AfterMarketScout</strong></p>"
+            "<p>Orders go to your Crown rep as a PDF purchase order by email. Enter your rep's "
+            "<strong>email</strong> below (and an optional internal <strong>CC</strong> address) and save.</p>"
         ),
     },
     {
@@ -2975,6 +2935,27 @@ PROVIDER_CATALOG = [
         "email_order_connection_required_fields": ["rep_email"],
         "email_order_connection_optional_fields": ["account_number", "cc_email", "reply_to_email"],
     },
+    # TEMPORARY: Holley Performance has no integration yet. This entry only collects the dealer's
+    # portal login (email + password) so we can see who has an account. To revert, delete this
+    # entry and restore Holley to COMING_SOON_PROVIDERS below.
+    {
+        "kind": enums.BrandProviderKind.HOLLEY_PERFORMANCE,
+        "name": "Holley Performance",
+        "description": "Connect your Holley Performance dealer account.",
+        "icon_url": "https://api.aftermarketscout.com/uploads/holley_logo.png",
+        "category": "Distributors",
+        "connection_required_fields": ["email", "password"],
+        "integration_time": "We'll set up your connection and confirm by email",
+        "installation_instructions_html": (
+            "<p><strong>Holley Performance</strong> pricing and inventory are tied to your dealer account on "
+            "the Holley dealer portal.</p>"
+            "<ol>"
+            "<li>Enter the <strong>email</strong> and <strong>password</strong> you use to sign in to your "
+            "Holley dealer account at <a href=\"https://www.holley.com/\">holley.com</a>.</li>"
+            "<li>Save the connection.</li>"
+            "</ol>"
+        ),
+    },
 ]
 
 
@@ -3007,9 +2988,9 @@ def visible_provider_catalog() -> typing.List[typing.Dict[str, typing.Any]]:
 
 _UPLOADS = "https://api.aftermarketscout.com/uploads"
 
-COMING_SOON_PROVIDERS = [
-    {"kind": enums.BrandProviderKind.HOLLEY_PERFORMANCE,      "name": "Holley Performance",         "category": "Distributors", "icon_url": f"{_UPLOADS}/holley_logo.png"},
-]
+# Holley Performance was the only entry here; it is temporarily a connectable PROVIDER_CATALOG entry
+# (email + password) -- see the note on that entry. Restore it here when reverting.
+COMING_SOON_PROVIDERS = []
 
 """
 Shop-management provider catalog: list of connectable shop-management systems for the
