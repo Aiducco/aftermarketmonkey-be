@@ -428,7 +428,9 @@ def _sku_key(sku: typing.Optional[str]) -> str:
 
 
 def adopt_untracked_live_parts(
-    sync_brand: src_models.ShopMonkeySyncBrand, live_records: typing.List[typing.Dict[str, typing.Any]]
+    sync_brand: src_models.ShopMonkeySyncBrand,
+    live_records: typing.List[typing.Dict[str, typing.Any]],
+    dry_run: bool = False,
 ) -> typing.Dict[str, int]:
     """
     Link, instead of duplicate, the parts ShopMonkey already holds that no sync part points at.
@@ -503,8 +505,9 @@ def adopt_untracked_live_parts(
                 status_name=status.name,
             )
         )
-    with transaction.atomic():
-        src_models.ShopMonkeySyncPart.objects.bulk_create(rows, batch_size=_CHUNK)
+    if not dry_run:
+        with transaction.atomic():
+            src_models.ShopMonkeySyncPart.objects.bulk_create(rows, batch_size=_CHUNK)
     logger.info(
         "{} Adopted {} live part(s) for sync_brand_id={} ({} ambiguous, {} already linked elsewhere).".format(
             _LOG_PREFIX, len(rows), sync_brand.id, ambiguous, already_tracked
