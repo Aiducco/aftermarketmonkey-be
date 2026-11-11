@@ -30,6 +30,8 @@ from dotenv import dotenv_values
 
 from src import enums as src_enums
 from src import models as src_models
+from src.integrations.clients.shopmonkey import exceptions as shopmonkey_exceptions
+from src.integrations.services import shopmonkey_sync as shopmonkey_sync_services
 
 logger = logging.getLogger(__name__)
 _LOG_PREFIX = "[SHOPMONKEY-IMPORT]"
@@ -75,6 +77,31 @@ def connect_old_db(old_repo: str):
     return connection
 
 
+def build_live_index(client, old_parts: typing.List[Part]) -> typing.Dict[str, str]:
+    """
+    {ShopMonkey part id -> its brand id} for every old part that still exists in the account, by asking for each.
+
+    Only a 404 means "deleted". Anything else -- a timeout, a 500, a rejected key -- is re-raised and aborts the
+    plan: a part wrongly classified as deleted would be recorded as SKIPPED and quietly never synced, which is a
+    much worse failure than not finishing.
+    """
+    index: typing.Dict[str, str] = {}
+    for part in old_parts:
+        part_id = part.get("external_id")
+        if not part_id:
+            continue
+        try:
+            live = client.get_inventory_part(part_id)
+        except shopmonkey_exceptions.ShopMonkeyValidationError as e:
+            if e.code == "404":
+                continue
+            raise
+        live = live.get("data", live) if isinstance(live, dict) and "data" in live else live
+        if live and not live.get("deleted"):
+            index[part_id] = live.get("brandId")
+    return index
+
+
 def _norm(value: typing.Optional[str]) -> str:
     return re.sub(r"\s+", "", (value or "")).upper()
 
@@ -94,12 +121,19 @@ class BrandImportPlan:
     provider: src_models.Providers
     vendor: src_models.ShopMonkeySyncVendor
     existing_sync_brand: typing.Optional[src_models.ShopMonkeySyncBrand]
-    linkable: typing.List[typing.Tuple[Part, src_models.MasterPart]] = dataclasses.field(default_factory=list)
+    # Every vendor this brand will draw from, in priority order. vendors[0] is the primary (== `vendor`). More than
+    # one only for a brand that came from SDC -- SDC is a catalog, not a distributor of ours, so such a brand has to
+    # be re-homed onto real ones. Everything else is exactly one vendor, as in the old tool.
+    vendors: typing.List[src_models.ShopMonkeySyncVendor] = dataclasses.field(default_factory=list)
+    # (old part, master part, the vendor that will source it: the first in priority order that carries it)
+    linkable: typing.List[
+        typing.Tuple[Part, src_models.MasterPart, src_models.ShopMonkeySyncVendor]
+    ] = dataclasses.field(default_factory=list)
     not_carried: typing.List[typing.Tuple[Part, src_models.MasterPart]] = dataclasses.field(default_factory=list)
     unresolved: typing.List[Part] = dataclasses.field(default_factory=list)
     ambiguous: typing.List[Part] = dataclasses.field(default_factory=list)
     collisions: typing.List[Part] = dataclasses.field(default_factory=list)
-    gone: typing.List[Part] = dataclasses.field(default_factory=list)
+    gone: typing.List[typing.Tuple[Part, src_models.MasterPart]] = dataclasses.field(default_factory=list)
     already_imported: int = 0
     problems: typing.List[str] = dataclasses.field(default_factory=list)
 
@@ -111,6 +145,8 @@ def plan_brand_import(
     old_repo: str = DEFAULT_OLD_REPO,
     old_vendor_name: typing.Optional[str] = None,
     live_index: typing.Optional[typing.Dict[str, str]] = None,
+    provider_kinds: typing.Optional[typing.List[str]] = None,
+    live_client=None,
 ) -> BrandImportPlan:
     connection = connect_old_db(old_repo)
     try:
@@ -142,16 +178,42 @@ def plan_brand_import(
     finally:
         connection.close()
 
+    if live_index is None and live_client is not None:
+        live_index = build_live_index(live_client, old_parts)
+
     kind = OLD_PROVIDER_TO_KIND.get(old_brand["provider"])
-    if kind is None:
-        raise CommandError("Old vendor {} has no equivalent distributor here.".format(old_brand["provider_name"]))
-    provider = src_models.Providers.objects.get(kind=kind)
     our_brand = src_models.Brands.objects.filter(id=our_brand_id).first()
     if not our_brand:
         raise CommandError("No brand with id {}.".format(our_brand_id))
-    vendor = src_models.ShopMonkeySyncVendor.objects.filter(company_id=company_id, provider=provider).first()
-    if not vendor or not vendor.shopmonkey_external_id:
-        raise CommandError("No linked vendor for {} -- run import_shopmonkey_vendors first.".format(provider.kind_name))
+    if kind is None:
+        # SDC. There is no matching distributor, so the caller must say which ones (first = primary).
+        if not provider_kinds:
+            raise CommandError(
+                "Old vendor {} has no equivalent distributor here -- pass --provider (first is primary).".format(
+                    old_brand["provider_name"]
+                )
+            )
+        providers = []
+        for kind_name in provider_kinds:
+            found = src_models.Providers.objects.filter(kind_name=kind_name).first()
+            if not found:
+                raise CommandError("No provider named {!r}.".format(kind_name))
+            providers.append(found)
+    else:
+        if provider_kinds:
+            raise CommandError(
+                "Several vendors for one brand are only for brands that came from SDC; {!r} came from {}.".format(
+                    old_brand["name"], old_brand["provider_name"]
+                )
+            )
+        providers = [src_models.Providers.objects.get(kind=kind)]
+    vendors = []
+    for prov in providers:
+        v = src_models.ShopMonkeySyncVendor.objects.filter(company_id=company_id, provider=prov).first()
+        if not v or not v.shopmonkey_external_id:
+            raise CommandError("No linked vendor for {} -- run import_shopmonkey_vendors first.".format(prov.kind_name))
+        vendors.append(v)
+    provider, vendor = providers[0], vendors[0]
 
     existing = src_models.ShopMonkeySyncBrand.objects.filter(company_id=company_id, brand=our_brand).first()
     plan = BrandImportPlan(
@@ -160,10 +222,12 @@ def plan_brand_import(
         our_brand=our_brand,
         provider=provider,
         vendor=vendor,
+        vendors=vendors,
         existing_sync_brand=existing,
     )
 
-    if vendor.shopmonkey_external_id != old_brand["sm_vendor_id"]:
+    # An SDC brand's old vendor id is SDC's, which no vendor of ours carries, so there is nothing to compare.
+    if kind is not None and vendor.shopmonkey_external_id != old_brand["sm_vendor_id"]:
         plan.problems.append(
             "vendor id differs: ours {} vs old {}".format(vendor.shopmonkey_external_id, old_brand["sm_vendor_id"])
         )
@@ -186,14 +250,19 @@ def plan_brand_import(
         if mp.sku:
             by_sku[_norm(mp.sku)].append(mp)
 
-    carried: typing.Set[int] = set()
+    # master part -> the first vendor, in priority order, that carries it. Indexed path only:
+    # provider_parts by (master_part_id, provider_id).
+    carriers: typing.Dict[int, typing.Set[int]] = collections.defaultdict(set)
+    provider_ids = [v.provider_id for v in vendors]
     ids = [mp.id for mp in master_parts]
     for i in range(0, len(ids), _CHUNK):
-        carried.update(
-            src_models.ProviderPart.objects.filter(
-                master_part_id__in=ids[i : i + _CHUNK], provider=provider
-            ).values_list("master_part_id", flat=True)
-        )
+        for mp_id, prov_id in src_models.ProviderPart.objects.filter(
+            master_part_id__in=ids[i : i + _CHUNK], provider_id__in=provider_ids
+        ).values_list("master_part_id", "provider_id"):
+            carriers[mp_id].add(prov_id)
+    carried_by: typing.Dict[int, src_models.ShopMonkeySyncVendor] = {}
+    for mp_id, provs in carriers.items():
+        carried_by[mp_id] = next(v for v in vendors if v.provider_id in provs)
 
     already: typing.Set[int] = set()
     if existing:
@@ -232,13 +301,12 @@ def plan_brand_import(
             plan.already_imported += 1
         elif live_index is not None and part["external_id"] not in live_index:
             # The part no longer exists in ShopMonkey (a GET returns 404): it was deleted after the old tool
-            # last tracked it. It cannot be updated, so it is not linked -- and it is kept out of the plan
-            # rather than holding up the brand. Note what that means for the first sync: if the vendor still
-            # carries the master part, the sync will create it again, as a new part. Whether a deletion was
-            # deliberate is something only the shop can say, so these are reported, never decided here.
-            plan.gone.append(part)
-        elif mp.id in carried:
-            plan.linkable.append((part, mp))
+            # last tracked it. It cannot be updated, so it is not linked. And because the shop asked for such
+            # parts to stay deleted, it is recorded as SKIPPED (see apply_brand_import): without that row the
+            # sync would see a carried master part with no sync part and create it again.
+            plan.gone.append((part, mp))
+        elif mp.id in carried_by:
+            plan.linkable.append((part, mp, carried_by[mp.id]))
         else:
             plan.not_carried.append((part, mp))
     return plan
@@ -255,16 +323,19 @@ def apply_brand_import(plan: BrandImportPlan) -> typing.Dict[str, int]:
         sync_brand = plan.existing_sync_brand
         created_brand = False
         if sync_brand is None:
-            sync_brand = src_models.ShopMonkeySyncBrand.objects.create(
+            # configure_sync_brand is the ONLY function that writes a brand's vendor set; the importer uses it
+            # too, rather than a second way to create one, so the brand it writes is the brand the UI would.
+            sync_brand = shopmonkey_sync_services.configure_sync_brand(
                 company_id=plan.company_id,
-                brand=plan.our_brand,
-                vendor=plan.vendor,
-                shopmonkey_external_id=old_brand["sm_brand_id"],
-                entity="Part",
+                brand_id=plan.our_brand.id,
+                provider_ids=[v.provider_id for v in plan.vendors],
+                primary_provider_id=plan.vendors[0].provider_id,
                 enabled=False,
-                status=src_enums.ShopMonkeySyncStatus.ACTIVE.value,
-                status_name=src_enums.ShopMonkeySyncStatus.ACTIVE.name,
             )
+            sync_brand.shopmonkey_external_id = old_brand["sm_brand_id"]
+            sync_brand.status = src_enums.ShopMonkeySyncStatus.ACTIVE.value
+            sync_brand.status_name = src_enums.ShopMonkeySyncStatus.ACTIVE.name
+            sync_brand.save(update_fields=["shopmonkey_external_id", "status", "status_name", "updated_at"])
             created_brand = True
         elif not sync_brand.shopmonkey_external_id:
             sync_brand.shopmonkey_external_id = old_brand["sm_brand_id"]
@@ -273,7 +344,7 @@ def apply_brand_import(plan: BrandImportPlan) -> typing.Dict[str, int]:
             sync_brand.save(update_fields=["shopmonkey_external_id", "status", "status_name", "updated_at"])
 
         rows = []
-        for part, mp in plan.linkable:
+        for part, mp, sourced_vendor in plan.linkable:
             status = src_enums.ShopMonkeySyncPartStatus[part["status_name"]]
             rows.append(
                 src_models.ShopMonkeySyncPart(
@@ -285,16 +356,47 @@ def apply_brand_import(plan: BrandImportPlan) -> typing.Dict[str, int]:
                     last_pushed_retail_cost_cents=part["retail_cost_in_cents"],
                     last_pushed_wholesale_cost_cents=part["wholesale_cost_in_cents"],
                     last_pushed_bin_location=old_brand["vendor_bin_name"],
-                    sourced_from_vendor=plan.vendor,
+                    sourced_from_vendor=sourced_vendor,
                     status=status.value,
                     status_name=status.name,
                 )
             )
         src_models.ShopMonkeySyncPart.objects.bulk_create(rows, batch_size=_CHUNK)
 
+        # Parts deleted in ShopMonkey after the old tool last tracked them, which the shop asked to keep out.
+        # Recorded as SKIPPED so the sync never re-creates, updates or marks them; the dead id and the reason
+        # stay on the row so the Parts table shows why it is there.
+        skipped = []
+        for part, mp in plan.gone:
+            skipped.append(
+                src_models.ShopMonkeySyncPart(
+                    sync_brand=sync_brand,
+                    master_part=mp,
+                    shopmonkey_external_id=part["external_id"],
+                    last_pushed_name=part["name"],
+                    last_pushed_sku=part["sku"],
+                    last_pushed_retail_cost_cents=part["retail_cost_in_cents"],
+                    last_pushed_wholesale_cost_cents=part["wholesale_cost_in_cents"],
+                    last_pushed_bin_location=old_brand["vendor_bin_name"],
+                    sourced_from_vendor=None,
+                    status=src_enums.ShopMonkeySyncPartStatus.SKIPPED.value,
+                    status_name=src_enums.ShopMonkeySyncPartStatus.SKIPPED.name,
+                    last_error=(
+                        "Deleted in ShopMonkey (a GET returns 404) after the old tool last tracked it. "
+                        "Kept out on request, so the sync will not re-create it."
+                    ),
+                )
+            )
+        src_models.ShopMonkeySyncPart.objects.bulk_create(skipped, batch_size=_CHUNK)
+
     logger.info(
-        "{} Imported brand {!r} for company_id={}: sync_brand_id={} created_brand={} parts={}".format(
-            _LOG_PREFIX, old_brand["name"], plan.company_id, sync_brand.id, created_brand, len(rows)
+        "{} Imported brand {!r} for company_id={}: sync_brand_id={} created_brand={} parts={} skipped={}".format(
+            _LOG_PREFIX, old_brand["name"], plan.company_id, sync_brand.id, created_brand, len(rows), len(skipped)
         )
     )
-    return {"sync_brand_id": sync_brand.id, "created_brand": int(created_brand), "parts_created": len(rows)}
+    return {
+        "sync_brand_id": sync_brand.id,
+        "created_brand": int(created_brand),
+        "parts_created": len(rows),
+        "parts_skipped": len(skipped),
+    }
