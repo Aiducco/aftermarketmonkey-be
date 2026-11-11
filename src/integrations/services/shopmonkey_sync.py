@@ -65,6 +65,12 @@ _AVAILABLE_BRANDS_CACHE_KEY_FMT = "shopmonkey:available_brands_base:{company_id}
 _AVAILABLE_BRANDS_CACHE_TTL_SECONDS = 6 * 60 * 60
 
 _OBSOLETE_PREFIX = "[OBSOLETE] "
+
+# Distributors whose "discontinued" flag is NOT turned into an [OBSOLETE] tag. The standalone tool never tagged
+# a Wheel Pros part obsolete (it had no discontinued signal for them -- only Rough Country had a sheet), and
+# Wheel Pros flags a lot of its catalog: ~37% of a Fuel 1PC sample, which would have tagged thousands of
+# parts in the shop overnight. Kept out on request. The part stays ACTIVE and keeps syncing normally.
+_OBSOLETE_FLAG_IGNORED_KINDS = {src_enums.BrandProviderKind.WHEELPROS.value}
 _ERROR_PREFIX = "[ERROR UPDATING PART] "
 
 # Bounds how many per-run failures the execution metadata keeps inline -- unbounded failure lists
@@ -494,9 +500,16 @@ def _sync_one_part(
     client: shopmonkey_client.ShopMonkeyApiClient,
     existing_sync_part: typing.Optional[src_models.ShopMonkeySyncPart],
 ) -> str:
-    """Returns one of "created"/"updated"/"unchanged"/"obsoleted" for the caller's metadata
+    """Returns one of "created"/"updated"/"unchanged"/"obsoleted"/"skipped" for the caller's metadata
     counts. Raises shopmonkey_exceptions.ShopMonkeyException on a failed API call -- the caller
     persists last_error, this function never swallows it."""
+    # A part deliberately kept out of ShopMonkey (see ShopMonkeySyncPartStatus.SKIPPED). It was deleted in the
+    # shop after the old tool last tracked it, and the shop asked for it to stay deleted -- so no create, no
+    # update, no API call. Without this row the sync would see a carried master part with no sync part and
+    # create it again.
+    if existing_sync_part is not None and existing_sync_part.status == src_enums.ShopMonkeySyncPartStatus.SKIPPED.value:
+        return "skipped"
+
     # Summed availability across every contributing ProviderPart's own inventory row.
     #
     # This is recorded and shown in our own UI; it is deliberately NOT sent to ShopMonkey. Their
@@ -546,7 +559,11 @@ def _sync_one_part(
 
     # INACTIVE only when EVERY contributing ProviderPart is discontinued -- a part carried by two
     # vendors where only one has discontinued it stays ACTIVE, since the other can still supply it.
-    all_discontinued = all(pp.is_discontinued for pp in provider_parts_by_provider.values())
+    # A discontinued flag from a distributor in _OBSOLETE_FLAG_IGNORED_KINDS counts as "still available".
+    flag_ignored = {v.provider_id for v in ordered_vendors if v.provider.kind in _OBSOLETE_FLAG_IGNORED_KINDS}
+    all_discontinued = all(
+        pp.is_discontinued and provider_id not in flag_ignored for provider_id, pp in provider_parts_by_provider.items()
+    )
     status = (
         src_enums.ShopMonkeySyncPartStatus.INACTIVE.value
         if all_discontinued
@@ -817,7 +834,7 @@ def sync_brand_parts(
         for sp in src_models.ShopMonkeySyncPart.objects.filter(sync_brand=sync_brand).select_related("master_part")
     }
     seen_master_part_ids = set()
-    counts = {"created": 0, "updated": 0, "unchanged": 0, "obsoleted": 0, "failed": 0, "unmanaged": 0}
+    counts = {"created": 0, "updated": 0, "unchanged": 0, "obsoleted": 0, "failed": 0, "unmanaged": 0, "skipped": 0}
     vendor_contrib: typing.Dict[int, typing.Dict[str, typing.Any]] = {
         v.provider_id: {
             "provider_id": v.provider_id,
@@ -858,7 +875,7 @@ def sync_brand_parts(
                 existing_sync_parts.get(master_part.id),
             )
             counts[bucket] += 1
-            if bucket != "obsoleted":
+            if bucket not in ("obsoleted", "skipped"):
                 quantity_total += part_quantity
         except shopmonkey_exceptions.ShopMonkeyException as e:
             counts["failed"] += 1
@@ -868,7 +885,12 @@ def sync_brand_parts(
             _record_sync_part_failure(sync_brand, master_part, existing_sync_parts.get(master_part.id), e)
             logger.exception("{} Failed syncing part (master_part_id={}): {}".format(_LOG_PREFIX, master_part.id, e))
 
-    missing_sync_parts = [sp for mp_id, sp in existing_sync_parts.items() if mp_id not in seen_master_part_ids]
+    # A SKIPPED part is not "missing": it has no live ShopMonkey part to mark, and must not be touched.
+    missing_sync_parts = [
+        sp
+        for mp_id, sp in existing_sync_parts.items()
+        if mp_id not in seen_master_part_ids and sp.status != src_enums.ShopMonkeySyncPartStatus.SKIPPED.value
+    ]
     for sp in missing_sync_parts:
         try:
             _mark_sync_part_unmanaged(sp, client)

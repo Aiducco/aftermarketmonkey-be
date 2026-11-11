@@ -46,6 +46,10 @@ class ShopMonkeySyncPartStatus(enum.Enum):
     ACTIVE = 1
     INACTIVE = 2
     ERROR = 3
+    # Deliberately kept out of ShopMonkey: the part was deleted in the shop after the old tool last tracked it, and
+    # the shop asked for it to stay deleted. The sync never creates, updates or marks it. Stored as a plain
+    # number in an existing integer column, so it needs no migration.
+    SKIPPED = 4
 
 
 class ShopMonkeySyncExecutionStatus(enum.Enum):

@@ -8,6 +8,7 @@ src.api.services.shop_management gates the whole Shop Management category.
 import logging
 import typing
 
+from src import enums as src_enums
 from src import models as src_models
 from src.api.services import feature_flags as feature_flags_services
 from src.integrations.services import shopmonkey_sync as shopmonkey_sync_services
@@ -75,7 +76,10 @@ def _sync_brand_row(sync_brand: src_models.ShopMonkeySyncBrand) -> typing.Dict[s
         "entity": sync_brand.entity,
         "status": sync_brand.status,
         "status_name": sync_brand.status_name,
-        "part_count": src_models.ShopMonkeySyncPart.objects.filter(sync_brand=sync_brand).count(),
+        # Parts actually pushed -- a SKIPPED part is one we deliberately did not push.
+        "part_count": src_models.ShopMonkeySyncPart.objects.filter(sync_brand=sync_brand)
+        .exclude(status=src_enums.ShopMonkeySyncPartStatus.SKIPPED.value)
+        .count(),
         "created_at": sync_brand.created_at.isoformat() if sync_brand.created_at else None,
         "updated_at": sync_brand.updated_at.isoformat() if sync_brand.updated_at else None,
     }
