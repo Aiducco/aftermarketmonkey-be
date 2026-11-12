@@ -3009,10 +3009,10 @@ SHOP_MANAGEMENT_PROVIDER_CATALOG = [
         "installation_instructions_html": (
             "<p><strong>ShopMonkey</strong> connections use an API key issued from your ShopMonkey account.</p>"
             "<ol>"
-            "<li>Sign in to ShopMonkey and open your account's API settings.</li>"
-            "<li>Generate (or copy your existing) <strong>API key</strong>.</li>"
-            "<li>Paste it into the field below and save. AfterMarketScout uses it only to call "
-            "ShopMonkey on your behalf.</li>"
+            '<li>Go to <a href="https://app.shopmonkey.cloud/settings/api" target="_blank" '
+            'rel="noopener noreferrer">app.shopmonkey.cloud/settings/api</a>.</li>'
+            "<li>Press <strong>New API key</strong>.</li>"
+            "<li>Copy the key and paste it into the field below.</li>"
             "</ol>"
         ),
     },
