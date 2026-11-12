@@ -403,6 +403,10 @@ PLANS = {
             # Stubs — not wired into any enforcement yet; future code reads these once the
             # underlying features exist.
             "sms_integration": False,
+            # Inventory Management (ShopMonkey inventory sync). Off on every plan on purpose until a customer's
+            # first enable is safe on an account that already holds parts (adopt scan + preview). Turn it on for
+            # hunter/pack to open it up; trident is let in meanwhile by its FEATURE_SHOPMONKEY_INVENTORY_SYNC flag.
+            "inventory_management": False,
             "saved_parts_lists": False,
             "spend_reporting": False,
         },
@@ -423,6 +427,10 @@ PLANS = {
             "po_checkout_allowed": False,
             "multi_warehouse_visibility": True,
             "sms_integration": False,
+            # Inventory Management (ShopMonkey inventory sync). Off on every plan on purpose until a customer's
+            # first enable is safe on an account that already holds parts (adopt scan + preview). Turn it on for
+            # hunter/pack to open it up; trident is let in meanwhile by its FEATURE_SHOPMONKEY_INVENTORY_SYNC flag.
+            "inventory_management": False,
             "saved_parts_lists": False,
             "spend_reporting": False,
         },
@@ -443,6 +451,10 @@ PLANS = {
             "po_checkout_allowed": True,
             "multi_warehouse_visibility": True,
             "sms_integration": False,
+            # Inventory Management (ShopMonkey inventory sync). Off on every plan on purpose until a customer's
+            # first enable is safe on an account that already holds parts (adopt scan + preview). Turn it on for
+            # hunter/pack to open it up; trident is let in meanwhile by its FEATURE_SHOPMONKEY_INVENTORY_SYNC flag.
+            "inventory_management": False,
             "saved_parts_lists": False,
             "spend_reporting": False,
         },
@@ -468,6 +480,10 @@ PLANS = {
             "po_checkout_allowed": True,
             "multi_warehouse_visibility": True,
             "sms_integration": False,
+            # Inventory Management (ShopMonkey inventory sync). Off on every plan on purpose until a customer's
+            # first enable is safe on an account that already holds parts (adopt scan + preview). Turn it on for
+            # hunter/pack to open it up; trident is let in meanwhile by its FEATURE_SHOPMONKEY_INVENTORY_SYNC flag.
+            "inventory_management": False,
             "saved_parts_lists": False,
             "spend_reporting": False,
         },

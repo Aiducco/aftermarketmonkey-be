@@ -49,7 +49,7 @@ from django.utils import timezone
 
 from src import enums as src_enums
 from src import models as src_models
-from src.api.services import feature_flags as feature_flags_services
+from src.api.services import inventory_access as inventory_access_services
 from src.integrations.clients.shopmonkey import client as shopmonkey_client
 from src.integrations.clients.shopmonkey import exceptions as shopmonkey_exceptions
 
@@ -986,18 +986,20 @@ def sync_brand_parts(
 
 def sync_all_enabled_brands() -> None:
     """Entry point for the scheduled (every 4 hours) sync -- every enabled ShopMonkeySyncBrand
-    across every company that has FEATURE_SHOPMONKEY_INVENTORY_SYNC on (Trident Motorsports only
-    today). Calls sync_brand_parts() directly and synchronously, same as always -- only the
+    across every company with Inventory Management access (plan or per-company flag, see
+    src.api.services.inventory_access). Calls sync_brand_parts() directly and synchronously, same as always -- only the
     user-triggered "run now" HTTP action goes through the QUEUED queue (see
     enqueue_sync_brand_run / process_shopmonkey_sync_jobs); keeping these two call paths distinct
     is what avoids needing a second sync function."""
-    sync_brand_ids = list(
-        src_models.ShopMonkeySyncBrand.objects.filter(
-            enabled=True,
-            company__feature_flags__feature=feature_flags_services.FEATURE_SHOPMONKEY_INVENTORY_SYNC,
-            company__feature_flags__enabled=True,
-        ).values_list("id", flat=True)
-    )
+    access_by_company: typing.Dict[int, bool] = {}
+    sync_brand_ids = []
+    for sync_brand_id, company_id in (
+        src_models.ShopMonkeySyncBrand.objects.filter(enabled=True).order_by("id").values_list("id", "company_id")
+    ):
+        if company_id not in access_by_company:
+            access_by_company[company_id] = inventory_access_services.company_has_inventory_access(company_id)
+        if access_by_company[company_id]:
+            sync_brand_ids.append(sync_brand_id)
     logger.info("{} Starting sync for {} enabled brand(s).".format(_LOG_PREFIX, len(sync_brand_ids)))
     for sync_brand_id in sync_brand_ids:
         try:

@@ -9,8 +9,9 @@ import logging
 import typing
 
 from src import enums as src_enums
+from src import constants as src_constants
 from src import models as src_models
-from src.api.services import feature_flags as feature_flags_services
+from src.api.services import inventory_access as inventory_access_services
 from src.integrations.services import shopmonkey_sync as shopmonkey_sync_services
 
 logger = logging.getLogger(__name__)
@@ -29,9 +30,72 @@ _EXECUTIONS_DEFAULT_LIMIT = 50
 
 
 def _feature_enabled(company_id: int) -> bool:
-    return feature_flags_services.company_has_feature(
-        company_id, feature_flags_services.FEATURE_SHOPMONKEY_INVENTORY_SYNC
+    return inventory_access_services.company_has_inventory_access(company_id)
+
+
+# Shop-management systems the inventory sync can actually push to. The catalog may list more (they can be connected for
+# other features); only these get a working page.
+_INVENTORY_SUPPORTED_KINDS = {src_enums.ShopManagementProviderKind.SHOPMONKEY.value}
+
+STATE_NOT_CONNECTED = "NOT_CONNECTED"
+STATE_CONNECTION_FAILING = "CONNECTION_FAILING"
+STATE_NO_DISTRIBUTORS = "NO_DISTRIBUTORS"
+STATE_NOT_SUPPORTED = "NOT_SUPPORTED"
+STATE_READY = "READY"
+
+
+def get_inventory_state(company_id: int) -> typing.Tuple[typing.Optional[typing.Dict], typing.Optional[str]]:
+    """GET .../inventory/state/ -- what the Inventory Management page should show before it loads anything.
+    One row per shop-management system in the catalog, each with the state the page needs: not connected (send the
+    user to connect it), connection failing (reconnect), no distributors connected (nothing to sync from), not
+    supported (listed, but no inventory sync for it yet) or ready. The page's selector is built from ``systems``;
+    ``default_kind`` is the system to preselect (the first ready one, else the first connected one)."""
+    if not _feature_enabled(company_id):
+        return None, ERROR_FEATURE_NOT_AVAILABLE
+    connections = {
+        c.provider_id: c
+        for c in src_models.CompanyShopManagementProviders.objects.filter(company_id=company_id, active=True)
+    }
+    providers_by_kind = {p.kind: p for p in src_models.ShopManagementProviders.objects.all()}
+    has_distributors = bool(shopmonkey_sync_services.company_connected_provider_ids(company_id))
+
+    systems = []
+    for entry in src_constants.SHOP_MANAGEMENT_PROVIDER_CATALOG:
+        kind = entry["kind"].value
+        provider = providers_by_kind.get(kind)
+        if not provider:
+            continue
+        connection = connections.get(provider.id)
+        if kind not in _INVENTORY_SUPPORTED_KINDS:
+            state = STATE_NOT_SUPPORTED
+        elif not connection:
+            state = STATE_NOT_CONNECTED
+        elif connection.status == src_enums.ShopManagementConnectionStatus.FAILING.value:
+            state = STATE_CONNECTION_FAILING
+        elif not has_distributors:
+            state = STATE_NO_DISTRIBUTORS
+        else:
+            state = STATE_READY
+        systems.append(
+            {
+                "kind": kind,
+                "kind_name": provider.kind_name or "",
+                "name": provider.name,
+                "icon_url": entry.get("icon_url") or None,
+                "coming_soon": bool(provider.coming_soon),
+                "inventory_supported": kind in _INVENTORY_SUPPORTED_KINDS,
+                "connected": connection is not None,
+                "state": state,
+                "status_reason": connection.status_reason if connection else None,
+            }
+        )
+
+    default = next((s for s in systems if s["state"] == STATE_READY), None) or next(
+        (s for s in systems if s["connected"] and s["inventory_supported"]), None
     )
+    if default is None and systems:
+        default = next((s for s in systems if s["inventory_supported"]), systems[0])
+    return {"systems": systems, "default_kind": default["kind"] if default else None}, None
 
 
 def get_available_brands(

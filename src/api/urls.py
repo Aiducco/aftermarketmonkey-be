@@ -56,6 +56,7 @@ from src.api.views.shop_management import (
 )
 from src.api.views.shopmonkey_inventory import (
     ShopMonkeyAvailableBrandsView,
+    ShopMonkeyInventoryStateView,
     ShopMonkeySyncBrandsView,
     ShopMonkeySyncBrandDetailView,
     ShopMonkeySyncBrandRunView,
@@ -236,6 +237,11 @@ urlpatterns = [
         "company-shop-management-providers/<int:id>/",
         CompanyShopManagementProviderDetailView.as_view(),
         name="company_shop_management_provider_detail",
+    ),
+    path(
+        "shopmonkey/inventory/state/",
+        ShopMonkeyInventoryStateView.as_view(),
+        name="shopmonkey_inventory_state",
     ),
     path(
         "shopmonkey/inventory/available-brands/",

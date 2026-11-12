@@ -588,6 +588,20 @@ def has_multi_warehouse_visibility(company_id: Optional[int]) -> bool:
     return bool(_plan_features(plan_key).get("multi_warehouse_visibility", False))
 
 
+def has_inventory_management(company_id: Optional[int]) -> bool:
+    """Whether this company's plan includes Inventory Management (the ShopMonkey inventory sync). A binary plan
+    gate; never raises. Callers wanting "may this company use it at all" should use
+    src.api.services.inventory_access.company_has_inventory_access, which also honours the per-company flag."""
+    if company_id is None:
+        return False
+    company = src_models.Company.objects.filter(id=company_id).only(
+        "subscription_plan", "subscription_status",
+    ).first()
+    if not company:
+        return False
+    return bool(_plan_features(_plan_key(company)).get("inventory_management", False))
+
+
 # ---------------------------------------------------------------------------
 # Webhook event handlers
 # ---------------------------------------------------------------------------

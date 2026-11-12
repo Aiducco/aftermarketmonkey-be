@@ -11,7 +11,7 @@ from django.contrib.auth.hashers import check_password
 from common import utils as common_utils
 from src import enums as src_enums
 from src import models as src_models
-from src.api.services import feature_flags as feature_flags_services
+from src.api.services import inventory_access as inventory_access_services
 from src.authentication import exceptions as authentication_exceptions
 
 _LOG_PREFIX = "[AUTHENTICATION-SERVICE]"
@@ -59,9 +59,8 @@ def create_jwt_token(user: auth_models.User) -> str:
             # solve this way -- an endpoint would mean async-gating every navigation. Accepted
             # consequence: flipping this flag needs a re-login within the 12-hour token life; the
             # real backstop is the backend's own feature_not_available 403 on the API itself.
-            "has_shopmonkey_inventory_sync": feature_flags_services.company_has_feature(
-                company_id, feature_flags_services.FEATURE_SHOPMONKEY_INVENTORY_SYNC
-            ),
+            # Plan (Inventory Management) or the per-company flag -- see inventory_access.
+            "has_shopmonkey_inventory_sync": inventory_access_services.company_has_inventory_access(company_id),
             "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=12),
         },
         key=settings.JWT_SECRET,

@@ -45,6 +45,34 @@ def _parse_part_status(raw: typing.Optional[str]) -> typing.Tuple[typing.Optiona
     return (member.value, True) if member else (None, False)
 
 
+class ShopMonkeyInventoryStateView(views.View):
+    """GET /shopmonkey/inventory/state/ -- the shop-management systems this company could use for inventory sync, each
+    with the state the page should show (not connected / connection failing / no distributors / ready)."""
+
+    def get(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
+        if not request.user or not request.user.is_authenticated:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "User not authenticated"}),
+                status=401,
+            )
+        company_id = getattr(request, "company_id", None)
+        if not company_id:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "No company found in token"}),
+                status=400,
+            )
+        data, error_code = shopmonkey_inventory_services.get_inventory_state(company_id=company_id)
+        if error_code:
+            return _error_response("Inventory management is not available for this company.", error_code)
+        return http.HttpResponse(
+            headers={"Content-Type": "application/json"},
+            content=simplejson.dumps({"data": data}),
+            status=200,
+        )
+
+
 class ShopMonkeyAvailableBrandsView(views.View):
     """GET /shopmonkey/inventory/available-brands/ -- brands this company could sync, and
     which of its connected providers carry each one."""
