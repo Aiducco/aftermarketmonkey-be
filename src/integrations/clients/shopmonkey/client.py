@@ -250,8 +250,12 @@ class ShopMonkeyApiClient(object):
         return self._request_data(endpoint="inventory_part/{}".format(external_id), method=common_enums.HttpMethod.GET)
 
     def delete_inventory_part(self, external_id: str) -> typing.Dict:
-        """Soft-delete -- the old tool's client PATCHes .../delete rather than issuing a real
-        DELETE; mirrored as-is."""
+        """Soft-delete -- the old tool's client PATCHes .../delete rather than issuing a real DELETE.
+        The body is not optional: the request carries Content-Type: application/json, and ShopMonkey answers a
+        bodiless one with 400 "Body cannot be empty" before it even looks the part up, so an empty object is
+        sent (a missing part then answers 404, which callers treat as already deleted)."""
         return self._request_data(
-            endpoint="inventory_part/{}/delete".format(external_id), method=common_enums.HttpMethod.PATCH
+            endpoint="inventory_part/{}/delete".format(external_id),
+            method=common_enums.HttpMethod.PATCH,
+            json_body={},
         )

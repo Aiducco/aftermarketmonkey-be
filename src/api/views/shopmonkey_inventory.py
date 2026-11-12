@@ -15,6 +15,7 @@ _ERROR_STATUS = {
     shopmonkey_inventory_services.ERROR_FEATURE_NOT_AVAILABLE: 403,
     shopmonkey_inventory_services.ERROR_NOT_FOUND: 404,
     shopmonkey_inventory_services.ERROR_INVALID_INPUT: 400,
+    shopmonkey_inventory_services.ERROR_CONFLICT: 409,
 }
 
 
@@ -271,6 +272,61 @@ class ShopMonkeySyncBrandDetailView(views.View):
             headers={"Content-Type": "application/json"},
             content=simplejson.dumps({"data": data}),
             status=200,
+        )
+
+    def delete(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
+        """DELETE /shopmonkey/inventory/sync-brands/<id>/ -- body {"confirm_brand_name": "<the brand's name>"}.
+        Queues the removal of the brand's parts from ShopMonkey and then of the brand's sync config; returns 202
+        with the QUEUED execution (kind DELETE_BRAND). 400 without the right confirmation, 409 if the brand has a
+        sync or a delete queued/running."""
+        if not request.user or not request.user.is_authenticated:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "User not authenticated"}),
+                status=401,
+            )
+        company_id = getattr(request, "company_id", None)
+        if not company_id:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "No company found in token"}),
+                status=400,
+            )
+        try:
+            sync_brand_id = int(kwargs.get("id"))
+        except (TypeError, ValueError):
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Invalid sync brand id"}),
+                status=400,
+            )
+        try:
+            body = json.loads(request.body) if request.body else {}
+        except json.JSONDecodeError:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Invalid JSON body"}),
+                status=400,
+            )
+        confirm = body.get("confirm_brand_name") if isinstance(body, dict) else None
+
+        data, error_code = shopmonkey_inventory_services.delete_sync_brand(
+            company_id=company_id,
+            sync_brand_id=sync_brand_id,
+            confirm_brand_name=confirm if isinstance(confirm, str) else None,
+        )
+        if error_code == shopmonkey_inventory_services.ERROR_CONFLICT:
+            return _error_response(
+                "This brand has a sync or delete in progress. Try again when it finishes.", error_code
+            )
+        if error_code == shopmonkey_inventory_services.ERROR_INVALID_INPUT:
+            return _error_response("Send confirm_brand_name equal to the brand's name to delete it.", error_code)
+        if error_code:
+            return _error_response("Could not delete this brand.", error_code)
+        return http.HttpResponse(
+            headers={"Content-Type": "application/json"},
+            content=simplejson.dumps({"data": data}),
+            status=202,
         )
 
 

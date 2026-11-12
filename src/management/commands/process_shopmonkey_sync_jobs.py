@@ -56,11 +56,18 @@ class Command(BaseCommand):
             audit_scheduled_tasks.cleanup_stale_started_executions(_TASK_NAME, max_age_minutes=60)
             task_execution = audit_scheduled_tasks.start_scheduled_task_execution(_TASK_NAME)
             processed = 0
+            # A delete that runs out of its time slice goes back to QUEUED with the lowest id; without this it
+            # would be claimed again straight away and starve every sync queued behind it.
+            handled_ids = set()
             for _ in range(limit):
-                execution = shopmonkey_sync_services.claim_next_queued_execution()
+                execution = shopmonkey_sync_services.claim_next_queued_execution(exclude_ids=handled_ids)
                 if not execution:
                     break
-                shopmonkey_sync_services.sync_brand_parts(execution.sync_brand_id, execution=execution)
+                handled_ids.add(execution.id)
+                if (execution.metadata or {}).get("kind") == shopmonkey_sync_services.EXECUTION_KIND_DELETE_BRAND:
+                    shopmonkey_sync_services.run_brand_delete(execution)
+                else:
+                    shopmonkey_sync_services.sync_brand_parts(execution.sync_brand_id, execution=execution)
                 processed += 1
             message = "Processed {} execution(s).".format(processed)
             self.stdout.write(self.style.SUCCESS(message))

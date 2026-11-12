@@ -36,9 +36,11 @@ Status model, mapped from signals we already have instead of the old tool's prov
     _mark_missing_parts_as_error). Counted separately from a push-attempt failure in the
     execution metadata (see sync_brand_parts), even though both set the same per-part status.
 """
+import datetime
 import decimal
 import logging
 import re
+import time
 import typing
 
 from django.core.cache import cache
@@ -1021,7 +1023,9 @@ def enqueue_sync_brand_run(company_id: int, sync_brand_id: int) -> src_models.Sh
     )
 
 
-def claim_next_queued_execution() -> typing.Optional[src_models.ShopMonkeySyncExecution]:
+def claim_next_queued_execution(
+    exclude_ids: typing.Optional[typing.Collection[int]] = None,
+) -> typing.Optional[src_models.ShopMonkeySyncExecution]:
     """Atomically mark one QUEUED execution as RUNNING. Returns None if none available. Mirrors
     claim_next_open_job (src.integrations.services.purchase_order_jobs) -- same
     transaction.atomic() + select_for_update(skip_locked=True) + order_by("id").first() + status
@@ -1031,6 +1035,7 @@ def claim_next_queued_execution() -> typing.Optional[src_models.ShopMonkeySyncEx
         execution = (
             src_models.ShopMonkeySyncExecution.objects.select_for_update(skip_locked=True)
             .filter(status=src_enums.ShopMonkeySyncExecutionStatus.QUEUED.value)
+            .exclude(id__in=list(exclude_ids or []))
             .order_by("id")
             .first()
         )
@@ -1040,3 +1045,189 @@ def claim_next_queued_execution() -> typing.Optional[src_models.ShopMonkeySyncEx
         execution.message = "Claimed by process_shopmonkey_sync_jobs."
         execution.save(update_fields=["status", "message", "updated_at"])
         return execution
+
+
+# --------------------------------------------------------------------------------------
+# Deleting a brand: soft-delete its parts on ShopMonkey, then drop the brand's sync config
+# --------------------------------------------------------------------------------------
+# A delete is a QUEUED execution whose metadata["kind"] is this value, drained by the same
+# process_shopmonkey_sync_jobs as a sync -- no new model, and the sync log shows it like any other run.
+EXECUTION_KIND_DELETE_BRAND = "DELETE_BRAND"
+# ShopMonkey costs ~0.5s a call, so a big brand (17k parts) is hours of work. One invocation of the processor
+# therefore only works for this long, puts the execution back in the queue and lets the next cron cycle carry on.
+# Progress is simply "which part rows are left": a part's row is removed the moment ShopMonkey confirms it.
+_DELETE_SLICE_SECONDS = 240
+_DELETE_FAILURES_KEPT = 100
+# A RUNNING delete older than this was killed mid-slice (a slice is minutes) and no longer blocks anything.
+_DELETE_STALE_AFTER = datetime.timedelta(hours=1)
+
+
+def active_delete_executions(sync_brand_ids: typing.Optional[typing.Collection[int]] = None):
+    """QUEUED/RUNNING delete executions (stale RUNNING ones excluded), optionally for given sync brands."""
+    qs = src_models.ShopMonkeySyncExecution.objects.filter(
+        metadata__kind=EXECUTION_KIND_DELETE_BRAND,
+        status__in=[
+            src_enums.ShopMonkeySyncExecutionStatus.QUEUED.value,
+            src_enums.ShopMonkeySyncExecutionStatus.RUNNING.value,
+        ],
+    ).exclude(
+        status=src_enums.ShopMonkeySyncExecutionStatus.RUNNING.value,
+        updated_at__lt=timezone.now() - _DELETE_STALE_AFTER,
+    )
+    if sync_brand_ids is not None:
+        qs = qs.filter(sync_brand_id__in=list(sync_brand_ids))
+    return qs
+
+
+def enqueue_brand_delete(company_id: int, sync_brand_id: int) -> typing.Optional[src_models.ShopMonkeySyncExecution]:
+    """Queues the deletion of one brand's parts from ShopMonkey and, once every part is gone, of the brand's sync
+    config. Returns None when the brand has a sync or a delete queued or running (never two at once on one brand).
+    The brand is switched off at once, so the 4-hourly cron cannot push to it while its parts are being removed."""
+    with transaction.atomic():
+        sync_brand = (
+            src_models.ShopMonkeySyncBrand.objects.select_for_update()
+            .select_related("brand")
+            .get(id=sync_brand_id, company_id=company_id)
+        )
+        busy = src_models.ShopMonkeySyncExecution.objects.filter(
+            sync_brand=sync_brand,
+            status__in=[
+                src_enums.ShopMonkeySyncExecutionStatus.QUEUED.value,
+                src_enums.ShopMonkeySyncExecutionStatus.RUNNING.value,
+            ],
+        ).exclude(
+            status=src_enums.ShopMonkeySyncExecutionStatus.RUNNING.value,
+            updated_at__lt=timezone.now() - _DELETE_STALE_AFTER,
+        )
+        if busy.exists():
+            return None
+        sync_brand.enabled = False
+        sync_brand.save(update_fields=["enabled", "updated_at"])
+        total = (
+            src_models.ShopMonkeySyncPart.objects.filter(sync_brand=sync_brand)
+            .exclude(status=src_enums.ShopMonkeySyncPartStatus.SKIPPED.value)
+            .count()
+        )
+        return src_models.ShopMonkeySyncExecution.objects.create(
+            company_id=company_id,
+            sync_brand=sync_brand,
+            status=src_enums.ShopMonkeySyncExecutionStatus.QUEUED.value,
+            message="Queued: delete brand {!r} and its {} part(s) from ShopMonkey.".format(
+                sync_brand.brand.name, total
+            ),
+            metadata={
+                "kind": EXECUTION_KIND_DELETE_BRAND,
+                "brand_name": sync_brand.brand.name,
+                "sync_brand_id": sync_brand.id,
+                "total": total,
+                "deleted": 0,
+                "already_gone": 0,
+                "failed": 0,
+                "failures": [],
+            },
+        )
+
+
+def run_brand_delete(
+    execution: src_models.ShopMonkeySyncExecution, slice_seconds: float = _DELETE_SLICE_SECONDS
+) -> src_models.ShopMonkeySyncExecution:
+    """Works one slice of a claimed (RUNNING) delete execution. Ends in one of three places:
+      - time ran out with parts left  -> back to QUEUED, the next cron cycle continues;
+      - every part gone               -> FINISHED, and the brand's sync config is removed;
+      - some parts could not be deleted -> FAILURE, those part rows and the (disabled) brand are kept, so the
+        delete can simply be run again.
+    Soft-delete only (PATCH .../delete, what the old tool used). A part ShopMonkey says is already gone (404)
+    counts as deleted. A part whose row is SKIPPED, or that never got a ShopMonkey id, has nothing to delete upstream.
+    The brand record on ShopMonkey itself is left alone: it may hold parts this sync never tracked."""
+    meta = dict(execution.metadata or {})
+    sync_brand = (
+        src_models.ShopMonkeySyncBrand.objects.select_related("brand").filter(id=meta.get("sync_brand_id")).first()
+    )
+    if not sync_brand:
+        return _fail_execution(execution, "The brand no longer exists; nothing to delete.")
+    try:
+        client = _client_for_company(sync_brand.company_id)
+    except ValueError as e:
+        return _fail_execution(execution, str(e))
+
+    deadline = time.monotonic() + slice_seconds
+    failures = list(meta.get("failures") or [])
+    # Rows that failed in an earlier slice are not retried within this delete: walk the ids upward.
+    last_id = int(meta.get("last_id") or 0)
+    timed_out = False
+    while True:
+        batch = list(
+            src_models.ShopMonkeySyncPart.objects.filter(sync_brand=sync_brand, id__gt=last_id)
+            .order_by("id")
+            .values_list("id", "shopmonkey_external_id", "status", "last_pushed_sku")[:100]
+        )
+        if not batch:
+            break
+        for part_id, external_id, status, sku in batch:
+            if time.monotonic() >= deadline:
+                timed_out = True
+                break
+            prev_id, last_id = last_id, part_id
+            if external_id and status != src_enums.ShopMonkeySyncPartStatus.SKIPPED.value:
+                try:
+                    client.delete_inventory_part(external_id)
+                    meta["deleted"] = int(meta.get("deleted", 0)) + 1
+                except shopmonkey_exceptions.ShopMonkeyAuthError as e:
+                    # The credential is bad for every remaining part -- stop rather than fail them one by one.
+                    meta.update(last_id=prev_id, failures=failures)
+                    execution.metadata = meta
+                    return _fail_execution(execution, "ShopMonkey rejected the credentials: {}".format(e))
+                except shopmonkey_exceptions.ShopMonkeyValidationError as e:
+                    if e.code == "404":
+                        meta["already_gone"] = int(meta.get("already_gone", 0)) + 1
+                    else:
+                        meta["failed"] = int(meta.get("failed", 0)) + 1
+                        if len(failures) < _DELETE_FAILURES_KEPT:
+                            failures.append({"sku": sku, "reason": str(e)[:300]})
+                        src_models.ShopMonkeySyncPart.objects.filter(id=part_id).update(
+                            last_error="Delete failed: {}".format(str(e)[:3900])
+                        )
+                        continue
+                except shopmonkey_exceptions.ShopMonkeyException as e:
+                    meta["failed"] = int(meta.get("failed", 0)) + 1
+                    if len(failures) < _DELETE_FAILURES_KEPT:
+                        failures.append({"sku": sku, "reason": str(e)[:300]})
+                    src_models.ShopMonkeySyncPart.objects.filter(id=part_id).update(
+                        last_error="Delete failed: {}".format(str(e)[:3900])
+                    )
+                    continue
+            # Only reached once ShopMonkey no longer has the part (or never did).
+            src_models.ShopMonkeySyncPart.objects.filter(id=part_id).delete()
+        if timed_out:
+            break
+
+    meta.update(last_id=last_id, failures=failures)
+    execution.metadata = meta
+    done = int(meta.get("deleted", 0)) + int(meta.get("already_gone", 0))
+    if timed_out:
+        execution.status = src_enums.ShopMonkeySyncExecutionStatus.QUEUED.value
+        execution.message = "Deleting {!r}: {} of {} part(s) removed from ShopMonkey so far.".format(
+            sync_brand.brand.name, done, meta.get("total", "?")
+        )
+        execution.save(update_fields=["status", "message", "metadata", "updated_at"])
+        return execution
+
+    if int(meta.get("failed", 0)):
+        return _fail_execution(
+            execution,
+            "Deleted {} part(s) of {!r}, but {} could not be deleted. The brand was kept (disabled); "
+            "run the delete again to retry them.".format(done, sync_brand.brand.name, meta["failed"]),
+        )
+
+    # Every part is gone from ShopMonkey. Detach this execution first: the brand's other rows (and its
+    # earlier executions) are removed with it, and this one is the record that the delete happened.
+    brand_name = sync_brand.brand.name
+    execution.sync_brand = None
+    execution.status = src_enums.ShopMonkeySyncExecutionStatus.FINISHED.value
+    execution.message = "Deleted brand {!r}: {} part(s) removed from ShopMonkey ({} were already gone).".format(
+        brand_name, done, meta.get("already_gone", 0)
+    )
+    execution.save(update_fields=["sync_brand", "status", "message", "metadata", "updated_at"])
+    sync_brand.delete()
+    logger.info("{} {}".format(_LOG_PREFIX, execution.message))
+    return execution

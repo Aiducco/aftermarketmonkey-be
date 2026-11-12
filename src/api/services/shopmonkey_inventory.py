@@ -19,6 +19,7 @@ _LOG_PREFIX = "[SHOPMONKEY-INVENTORY-API]"
 ERROR_FEATURE_NOT_AVAILABLE = "feature_not_available"
 ERROR_NOT_FOUND = "not_found"
 ERROR_INVALID_INPUT = "invalid_input"
+ERROR_CONFLICT = "conflict"
 
 # Paging ceilings -- same shape as list_part_detail_audit_history (src/api/services/parts.py).
 _PARTS_MAX_LIMIT = 500
@@ -42,7 +43,9 @@ def get_available_brands(
     return shopmonkey_sync_services.available_brands_for_company(company_id), None
 
 
-def _sync_brand_row(sync_brand: src_models.ShopMonkeySyncBrand) -> typing.Dict[str, typing.Any]:
+def _sync_brand_row(
+    sync_brand: src_models.ShopMonkeySyncBrand, deleting: typing.Optional[bool] = None
+) -> typing.Dict[str, typing.Any]:
     """Per contract.md Decision 1: ``providers`` is a list of {provider_id, provider_kind_name}
     objects, never bare ids -- the single-brand GET's whole purpose is to let the FE label its
     vendor chips without a second fetch of available-brands. Primary vendor is always first;
@@ -72,6 +75,13 @@ def _sync_brand_row(sync_brand: src_models.ShopMonkeySyncBrand) -> typing.Dict[s
         "providers": providers,
         "primary_provider_id": primary_provider_id,
         "enabled": sync_brand.enabled,
+        # True while a delete of this brand is queued or running: the page locks the row, and the API refuses
+        # to re-enable or sync it.
+        "deleting": (
+            shopmonkey_sync_services.active_delete_executions([sync_brand.id]).exists()
+            if deleting is None
+            else deleting
+        ),
         "shopmonkey_external_id": sync_brand.shopmonkey_external_id,
         "entity": sync_brand.entity,
         "status": sync_brand.status,
@@ -94,8 +104,11 @@ def _sync_brand_queryset():
 def list_sync_brands(company_id: int) -> typing.Tuple[typing.Optional[typing.List[typing.Dict]], typing.Optional[str]]:
     if not _feature_enabled(company_id):
         return None, ERROR_FEATURE_NOT_AVAILABLE
-    rows = _sync_brand_queryset().filter(company_id=company_id)
-    return [_sync_brand_row(r) for r in rows], None
+    rows = list(_sync_brand_queryset().filter(company_id=company_id))
+    deleting_ids = set(
+        shopmonkey_sync_services.active_delete_executions([r.id for r in rows]).values_list("sync_brand_id", flat=True)
+    )
+    return [_sync_brand_row(r, deleting=r.id in deleting_ids) for r in rows], None
 
 
 def get_sync_brand(
@@ -160,6 +173,8 @@ def update_sync_brand(
     sync_brand = _sync_brand_queryset().filter(id=sync_brand_id, company_id=company_id).first()
     if not sync_brand:
         return None, ERROR_NOT_FOUND
+    if shopmonkey_sync_services.active_delete_executions([sync_brand.id]).exists():
+        return None, ERROR_CONFLICT
 
     if enabled is None:
         enabled = sync_brand.enabled
@@ -197,6 +212,30 @@ def run_sync_brand_now(
     if not sync_brand.enabled:
         return None, ERROR_INVALID_INPUT
     execution = shopmonkey_sync_services.enqueue_sync_brand_run(company_id, sync_brand_id)
+    return _execution_row(execution), None
+
+
+def delete_sync_brand(
+    company_id: int, sync_brand_id: int, confirm_brand_name: typing.Optional[str]
+) -> typing.Tuple[typing.Optional[typing.Dict], typing.Optional[str]]:
+    """Queues the deletion of a configured brand: its parts are soft-deleted on ShopMonkey (by process_shopmonkey_sync_jobs,
+    in slices) and then the brand's sync config is removed. Destructive and not undoable on ShopMonkey's side, so the
+    caller must send the brand's own name back as confirmation -- a stray DELETE with no body does nothing. Returns the
+    QUEUED execution. A brand with a sync or delete already queued/running is a conflict (409)."""
+    if not _feature_enabled(company_id):
+        return None, ERROR_FEATURE_NOT_AVAILABLE
+    sync_brand = (
+        src_models.ShopMonkeySyncBrand.objects.select_related("brand")
+        .filter(id=sync_brand_id, company_id=company_id)
+        .first()
+    )
+    if not sync_brand:
+        return None, ERROR_NOT_FOUND
+    if (confirm_brand_name or "").strip().casefold() != sync_brand.brand.name.strip().casefold():
+        return None, ERROR_INVALID_INPUT
+    execution = shopmonkey_sync_services.enqueue_brand_delete(company_id, sync_brand_id)
+    if execution is None:
+        return None, ERROR_CONFLICT
     return _execution_row(execution), None
 
 
