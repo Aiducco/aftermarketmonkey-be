@@ -224,3 +224,124 @@ def send_purchase_order_email(
         provider_message_id=message_id,
     )
     return message_id
+
+
+# --- Plan expiry / downgrade lifecycle emails (see src.api.services.plan_lifecycle) -----------
+#
+# Four emails: the day-7 and day-1 trial warnings, the day-0 "your trial has ended" summary and
+# the "everything's back on" upgrade confirmation. plan_lifecycle builds the context (it owns the
+# kept/paused/suspended numbers) and decides *when* to send; this module only renders, delivers
+# and audits.
+_LIFECYCLE_EMAILS = {
+    src_enums.NotificationEmailType.TRIAL_ENDING_7D: (
+        "trial_ending_7d_email",
+        "Your {trial_plan_name} trial ends in {days_left_label}",
+    ),
+    src_enums.NotificationEmailType.TRIAL_ENDING_1D: (
+        "trial_ending_1d_email",
+        "Your trial ends tomorrow: choose what to keep",
+    ),
+    src_enums.NotificationEmailType.TRIAL_ENDED: (
+        "trial_ended_email",
+        "Your trial has ended: here's what changed",
+    ),
+    src_enums.NotificationEmailType.PLAN_RESTORED: (
+        "plan_restored_email",
+        "Everything's back on",
+    ),
+}
+
+
+def _company_active_admin_emails(company: src_models.Company) -> list[str]:
+    """Every admin who can still sign in -- a suspended admin cannot act on these emails."""
+    profiles = src_models.UserProfile.objects.filter(
+        company=company, is_company_admin=True, suspended_at__isnull=True
+    ).select_related("user")
+    emails = []
+    for profile in profiles.order_by("created_at", "id"):
+        email = (profile.user.email or "").strip()
+        if email and email not in emails:
+            emails.append(email)
+    return emails
+
+
+def send_plan_lifecycle_email(
+    *,
+    company: src_models.Company,
+    email_type: src_enums.NotificationEmailType,
+    context: dict,
+) -> bool:
+    """
+    Sends one plan-lifecycle email to every active admin of ``company`` and returns True when it
+    should be recorded as sent (Resend accepted it, or there is nobody to send to), False when the
+    send failed and should be retried by a later cron run.
+
+    Fire-and-forget like send_first_sync_completed_email -- it never raises, because a Resend
+    outage must not abort the downgrade or the Stripe webhook that called it. The caller stamps
+    Company.warning_emails_sent only on True, which is what makes a failed send retry and a
+    successful one never repeat.
+
+    "Nobody to send to" counts as sent: a company with no admin email cannot be emailed by
+    retrying either, and returning False would make the hourly cron log the same warning for
+    every remaining hour of the send window.
+    """
+    template_base, subject_template = _LIFECYCLE_EMAILS[email_type]
+    to_emails = _company_active_admin_emails(company)
+    if not to_emails:
+        logger.warning(
+            "Skipping %s email for company_id=%s: no active company admin email found.",
+            email_type.name,
+            company.id,
+        )
+        return True
+
+    from_email = settings.NOTIFICATIONS_FROM_EMAIL
+    subject = subject_template.format(**context)
+    # The log column is a single address; a multi-admin send is one row listing every recipient.
+    logged_to = ", ".join(to_emails)[:255]
+
+    try:
+        response = requests.post(
+            RESEND_API_URL,
+            headers={"Authorization": "Bearer {}".format(settings.RESEND_API_KEY)},
+            json={
+                "from": from_email,
+                "to": to_emails,
+                "subject": subject,
+                "html": render_to_string("{}.html".format(template_base), context),
+                "text": render_to_string("{}.txt".format(template_base), context),
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+    except Exception as e:
+        logger.exception("Failed to send %s email for company_id=%s.", email_type.name, company.id)
+        _log_email(
+            email_type=email_type,
+            to_email=logged_to,
+            from_email=from_email,
+            subject=subject,
+            company=company,
+            company_provider=None,
+            status=src_enums.NotificationEmailStatus.FAILED,
+            error_message=str(e)[:4000],
+        )
+        return False
+
+    # Resend has accepted the email: from here on this must return True whatever happens, because the
+    # caller stamps Company.warning_emails_sent on True and a False would make the next cron run send
+    # the same email again. An unreadable response body or a failed audit-log write is only logged.
+    try:
+        _log_email(
+            email_type=email_type,
+            to_email=logged_to,
+            from_email=from_email,
+            subject=subject,
+            company=company,
+            company_provider=None,
+            status=src_enums.NotificationEmailStatus.SENT,
+            provider_message_id=response.json().get("id"),
+        )
+    except Exception:
+        logger.exception("Sent %s email for company_id=%s but could not audit-log it.", email_type.name, company.id)
+    return True

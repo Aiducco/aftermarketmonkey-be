@@ -1,0 +1,20 @@
+Everything's back on
+
+Thanks for upgrading {{ company_name }} to {{ restored_plan_name }}. Everything that was paused when
+your trial ended is back on.
+
+Plan: {{ restored_plan_name }}
+Distributors: all active again{% if restored_distributors %} ({{ restored_distributors }}){% endif %}
+Team members: all active again{% if restored_members %} ({{ restored_members }}){% endif %}
+Ordering: {% if ordering_enabled %}on{% else %}not included in your plan{% endif %}
+
+{% if resyncing %}Some distributors were paused for a while, so their data is syncing again and may take up
+to 24 hours to be fully fresh.{% else %}Your distributors' pricing and inventory are already up to date.{% endif %}
+
+Go to AftermarketScout: {{ app_url }}
+
+Questions? Reach us at support@aftermarketscout.com.
+
+--
+AftermarketScout
+You're receiving this because your plan was upgraded.

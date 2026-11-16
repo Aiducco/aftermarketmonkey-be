@@ -265,7 +265,14 @@ class PartDetailView(views.View):
         if not allowed:
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
-                content=simplejson.dumps({"message": reason, "upgrade_required": True}),
+                content=simplejson.dumps(
+                    {
+                        "message": reason,
+                        "upgrade_required": True,
+                        "error_code": billing_services.PLAN_LIMIT_ERROR_CODE,
+                        "limit_type": "detail_views",
+                    }
+                ),
                 status=402,
             )
 
@@ -328,9 +335,12 @@ class PartProviderRefreshInventoryView(views.View):
                 master_part_id=part_id, provider_id=provider_id, company_id=company_id
             )
         except parts_services.PartsServiceError as e:
+            body = {"message": e.message}
+            if e.error_code:
+                body.update({"error_code": e.error_code, "upgrade_required": True})
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
-                content=simplejson.dumps({"message": e.message}),
+                content=simplejson.dumps(body),
                 status=e.status,
             )
         except Exception as e:

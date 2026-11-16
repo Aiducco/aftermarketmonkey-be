@@ -7,9 +7,11 @@ from src.api.views.address import (
 )
 from src.api.views.apollo import ApolloPhoneWebhookView
 from src.api.views.authentication import LoginView, ChangePasswordView
+from src.api.views.account import DowngradeAcknowledgeView, KeptIntegrationsView, PlanStatusView
 from src.api.views.admin import (
     AdminCompaniesView,
     AdminCompanyDetailView,
+    AdminCompanyKeptIntegrationsView,
     AdminCreateCompanyView,
     AdminResetUserPasswordView,
     AdminExtendTrialView,
@@ -17,6 +19,7 @@ from src.api.views.admin import (
     AdminIngestionAuditView,
     AdminProvidersView,
     AdminProviderDetailView,
+    AdminUnpauseIntegrationView,
 )
 from src.api.views.company import CompanyDestinationsView
 from src.api.views.company_locations import CompanyLocationsView, CompanyLocationDetailView
@@ -539,6 +542,21 @@ urlpatterns = [
         name="billing_webhook",
     ),
     path(
+        "account/plan-status/",
+        PlanStatusView.as_view(),
+        name="account_plan_status",
+    ),
+    path(
+        "account/kept-integrations/",
+        KeptIntegrationsView.as_view(),
+        name="account_kept_integrations",
+    ),
+    path(
+        "account/downgrade-acknowledge/",
+        DowngradeAcknowledgeView.as_view(),
+        name="account_downgrade_acknowledge",
+    ),
+    path(
         "support/tickets/",
         SupportTicketsView.as_view(),
         name="support_tickets",
@@ -592,6 +610,16 @@ urlpatterns = [
         "admin/companies/<int:company_id>/extend-trial/",
         AdminExtendTrialView.as_view(),
         name="admin_extend_trial",
+    ),
+    path(
+        "admin/companies/<int:company_id>/kept-integrations/",
+        AdminCompanyKeptIntegrationsView.as_view(),
+        name="admin_company_kept_integrations",
+    ),
+    path(
+        "admin/companies/<int:company_id>/integrations/<int:company_provider_id>/unpause/",
+        AdminUnpauseIntegrationView.as_view(),
+        name="admin_unpause_integration",
     ),
     path(
         "admin/providers/",

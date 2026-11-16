@@ -26,10 +26,13 @@ logger = logging.getLogger(__name__)
 class PartsServiceError(Exception):
     """Raised for any client-correctable error (not connected, not supported, not found)."""
 
-    def __init__(self, message: str, status: int = 400) -> None:
+    def __init__(self, message: str, status: int = 400, error_code: typing.Optional[str] = None) -> None:
         Exception.__init__(self, message)
         self.message = message
         self.status = status
+        # Set only for plan-limit style errors the frontend branches on (e.g. "integration_paused");
+        # the view then also adds upgrade_required to the body.
+        self.error_code = error_code
 
 
 # Turn14 warehouse keys may be "01", "02" or "wh 01", "wh 02" - normalize to external_id
@@ -424,9 +427,24 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
     # be disconnected (credentials.feed cleared to {}) while the row survives because Ordering is
     # still configured -- company_provider_objs/company_provider_map above intentionally still
     # include those rows (can_order_in_app below needs them), only this set is feed-specific.
-    connected_provider_ids: typing.Set[int] = {
-        provider_id for provider_id, cp in company_provider_objs.items() if (cp.credentials or {}).get("feed")
+    #
+    # A connection paused for plan limits (CompanyProviders.paused_at, see plan_lifecycle) is NOT
+    # connected here, so pricing/inventory/product_details stay null for it -- but the row is still
+    # returned, flagged ``locked``, so the UI can say "Keystone carries this, upgrade to see
+    # pricing". The row sinks to the bottom of the sort below and can never become a best-cost pick.
+    paused_provider_ids: typing.Set[int] = {
+        provider_id
+        for provider_id, cp in company_provider_objs.items()
+        if cp.paused_at is not None and (cp.credentials or {}).get("feed")
     }
+    connected_provider_ids: typing.Set[int] = {
+        provider_id
+        for provider_id, cp in company_provider_objs.items()
+        if (cp.credentials or {}).get("feed") and cp.paused_at is None
+    }
+    # Ordering is a plan feature (off on Scout, so also off for a downgraded company); computed once
+    # rather than per distributor row.
+    ordering_enabled = company_id is not None and billing_services.check_po_checkout_allowed(company_id)[0]
 
     # Provider-kind -> catalog entry, precomputed once rather than scanning PROVIDER_CATALOG
     # per row below. Used to answer "does this provider support ordering at all" independent of
@@ -538,9 +556,12 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
             # `integrated` (which is feed-specific as of the fix above), else an Ordering-only
             # company would wrongly lose "Add to PO" the moment we started requiring feed
             # credentials for `integrated`.
+            # Also off for a paused connection and whenever the plan has no ordering (Scout).
             "can_order_in_app": bool(
                 pp.provider_id
                 and pp.provider_id in company_provider_objs
+                and pp.provider_id not in paused_provider_ids
+                and ordering_enabled
                 and order_registry.get_adapter(company_provider_objs[pp.provider_id])
             ),
             # Which channel this connection currently places orders through -- see
@@ -572,8 +593,12 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
             "can_refresh_live_inventory": bool(
                 pp.provider_id
                 and pp.provider_id in company_provider_objs
+                and pp.provider_id not in paused_provider_ids
                 and live_inventory_registry.get_provider(company_provider_objs[pp.provider_id])
             ),
+            # True when this distributor carries the part but the company's connection to it is
+            # paused for plan limits: no price, stock or product details are returned for it.
+            "locked": pp.provider_id in paused_provider_ids,
             "company_integration": {
                 # connected/initial_sync_completed/status/status_name are feed-specific (see
                 # `integrated` above). order_status/order_status_name are NOT -- Ordering has its
@@ -581,6 +606,7 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
                 # gated on the row existing at all, else an Ordering-only company's real
                 # order_status would wrongly read as null.
                 "connected": integrated,
+                "paused": pp.provider_id in paused_provider_ids,
                 "initial_sync_completed": (
                     company_provider_map[pp.provider_id]["initial_sync_completed"] if integrated else None
                 ),
@@ -731,14 +757,20 @@ def get_parts_bulk_pricing(
     # feed can be disconnected (credentials.feed cleared to {}) while the row survives because
     # Ordering is still configured, leaving stale ProviderPartCompanyPricing/ProviderPartInventory
     # rows from before the disconnect that must not be shown as this company's current pricing.
-    connected_provider_ids = set(
-        cp.provider_id
-        for cp in src_models.CompanyProviders.objects.filter(
-            company_id=company_id,
-            provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
-        ).only("provider_id", "credentials")
-        if (cp.credentials or {}).get("feed")
-    )
+    #
+    # Connections paused for plan limits (paused_at set, see plan_lifecycle) are split out: they are
+    # not "connected" (no cost, never a best-cost pick) and their rows come back ``locked`` with no
+    # cost, stock or quantity at all -- unlike a never-connected row, whose stock stays visible --
+    # because a paused distributor must not leak data the plan no longer includes.
+    connected_provider_ids = set()
+    paused_provider_ids = set()
+    for cp in src_models.CompanyProviders.objects.filter(
+        company_id=company_id,
+        provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
+    ).only("provider_id", "credentials", "paused_at"):
+        if not (cp.credentials or {}).get("feed"):
+            continue
+        (paused_provider_ids if cp.paused_at is not None else connected_provider_ids).add(cp.provider_id)
 
     provider_parts = list(
         src_models.ProviderPart.objects.filter(master_part_id__in=ids).values(
@@ -775,6 +807,7 @@ def get_parts_bulk_pricing(
     for pp in provider_parts:
         mpid = pp["master_part_id"]
         connected = pp["provider_id"] in connected_provider_ids
+        locked = pp["provider_id"] in paused_provider_ids
         cost = cost_by_provider_part_id.get(pp["id"]) if connected else None
         qty, wh_avail = qty_by_provider_part_id.get(pp["id"]) or (0, None)
         qty = qty or 0
@@ -789,9 +822,10 @@ def get_parts_bulk_pricing(
                 "provider_name": pp["provider__name"],
                 "provider_kind_name": pp["provider__kind_name"],
                 "connected": connected,
+                "locked": locked,
                 "cost": float(cost) if cost is not None else None,
-                "in_stock": in_stock,
-                "warehouse_total_qty": qty,
+                "in_stock": None if locked else in_stock,
+                "warehouse_total_qty": None if locked else qty,
             }
         )
         if cost is None:
@@ -841,6 +875,15 @@ def refresh_provider_live_inventory(
     )
     if company_provider is None:
         raise PartsServiceError("Not connected to this distributor.", status=400)
+    if company_provider.paused_at is not None:
+        # Paused for plan limits (see plan_lifecycle). 402 so the frontend's upgrade dialog opens.
+        # Deliberately checked before live_inventory_registry.get_provider: this company must not use a
+        # paused connection's credentials to see stock its plan no longer includes.
+        raise PartsServiceError(
+            "This distributor is paused on your plan. Upgrade to reactivate it.",
+            status=402,
+            error_code="integration_paused",
+        )
 
     provider = live_inventory_registry.get_provider(company_provider)
     if provider is None:

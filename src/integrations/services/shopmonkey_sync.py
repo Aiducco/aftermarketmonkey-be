@@ -106,10 +106,15 @@ def company_connected_provider_ids(company_id: int) -> typing.Set[int]:
     Provider ids this company has an active connection to, with real feed credentials -- the
     same "connected" definition used by the distributor integrations catalog (see
     src.api.services.integrations.get_providers_catalog's own "connected" comment).
+
+    Excludes connections paused for plan limits (CompanyProviders.paused_at, see
+    src.api.services.plan_lifecycle). Used by available_brands_for_company (what can be configured)
+    and by sync_brand_parts, which intersects each brand's configured vendors with this set so a
+    downgraded company does not keep pushing a paused distributor's prices and stock into ShopMonkey.
     """
     return {
         cp.provider_id
-        for cp in src_models.CompanyProviders.objects.filter(company_id=company_id, active=True)
+        for cp in src_models.CompanyProviders.objects.filter(company_id=company_id, active=True, paused_at__isnull=True)
         if (cp.credentials or {}).get("feed")
     }
 
@@ -874,7 +879,20 @@ def sync_brand_parts(
         except shopmonkey_exceptions.ShopMonkeyException as e:
             return _fail_execution(execution, "Could not ensure vendor on ShopMonkey: {}".format(e))
 
-    ordered_vendors = [sync_brand.vendor] + [link.vendor for link in additional]
+    # Only vendors whose distributor this company is still actively connected to may feed the sync: a
+    # distributor paused for plan limits (CompanyProviders.paused_at, see plan_lifecycle) must not keep
+    # pushing its price/stock into the shop's inventory. The configured vendors themselves are left
+    # untouched, so an upgrade resumes them with no reconfiguration.
+    connected_provider_ids = company_connected_provider_ids(sync_brand.company_id)
+    ordered_vendors = [
+        v for v in [sync_brand.vendor] + [link.vendor for link in additional] if v.provider_id in connected_provider_ids
+    ]
+    if not ordered_vendors:
+        # Failing the run, rather than syncing nothing, is deliberate: with no vendor left every existing
+        # part would fall into the "no longer carried" pass below and be marked unmanaged in ShopMonkey.
+        return _fail_execution(
+            execution, "None of this brand's distributors are currently active on your plan; nothing was synced."
+        )
     provider_ids = [v.provider_id for v in ordered_vendors]
 
     existing_sync_parts = {

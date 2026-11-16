@@ -1,4 +1,4 @@
-from marshmallow import Schema, fields, validate
+from marshmallow import Schema, ValidationError, fields, validate, validates_schema
 
 
 class AdminCreateCompanySchema(Schema):
@@ -21,3 +21,15 @@ class AdminResetUserPasswordSchema(Schema):
 class AdminExtendTrialSchema(Schema):
     days = fields.Integer(required=True, validate=validate.Range(min=1, max=365))
     plan = fields.String(required=False, allow_none=True, validate=validate.Length(max=64))
+
+
+class AdminKeptIntegrationsSchema(Schema):
+    # CompanyProviders ids. Both keys are optional but at least one is required: ``ids`` sets the
+    # kept distributors, ``unlock`` reopens the customer's one post-expiry change.
+    ids = fields.List(fields.Integer(), required=False, validate=validate.Length(min=1, max=50))
+    unlock = fields.Boolean(required=False)
+
+    @validates_schema
+    def _require_ids_or_unlock(self, data, **kwargs):
+        if "ids" not in data and not data.get("unlock"):
+            raise ValidationError("Provide ids and/or unlock.")

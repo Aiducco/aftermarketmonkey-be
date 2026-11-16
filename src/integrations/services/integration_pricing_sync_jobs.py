@@ -16,6 +16,7 @@ import datetime
 import logging
 import typing
 
+from django.conf import settings
 from django.db import connection, models as django_db_models, transaction
 from django.utils import timezone
 
@@ -137,6 +138,19 @@ def should_enqueue_pricing_sync(provider_kind: int) -> bool:
     return provider_kind in _PRICING_SYNC_KINDS
 
 
+def _paused_sync_cutoff() -> datetime.datetime:
+    """
+    A connection paused for plan limits (CompanyProviders.paused_at, see plan_lifecycle) keeps
+    syncing nightly for PAUSED_INTEGRATION_SYNC_DAYS so an upgrade brings back fresh data
+    instantly. Non-primary rows whose paused_at is OLDER than this cutoff are skipped by the two
+    recurring per-company enqueues below (and plan_lifecycle.restore_company queues one immediate sync for
+    them on upgrade). Only these per-company enqueues skip, and never for a ``primary`` row: the
+    shared catalog feeds are driven by the ``primary`` connection and must never stop because the
+    company holding it was downgraded.
+    """
+    return timezone.now() - datetime.timedelta(days=settings.PAUSED_INTEGRATION_SYNC_DAYS)
+
+
 def enqueue_all_active_company_provider_pricing_jobs() -> int:
     """
     Enqueue a pricing sync job for every active ``CompanyProviders`` row whose provider
@@ -167,6 +181,9 @@ def enqueue_all_active_company_provider_pricing_jobs() -> int:
     qs = (
         src_models.CompanyProviders.objects.select_related("provider")
         .filter(provider__kind__in=recurring_kinds, active=True)
+        # exclude(paused_at__lt=..., primary=False) keeps NULL (never paused) rows, and never skips a
+        # primary=True row: Django emits NOT (paused_at < cutoff AND paused_at IS NOT NULL AND NOT primary).
+        .exclude(paused_at__lt=_paused_sync_cutoff(), primary=False)
         .values_list("id", "provider__kind")
     )
     enqueued = 0
@@ -214,9 +231,9 @@ def enqueue_all_active_turn14_pricing_jobs() -> int:
     # comment on the same fix; this function had the identical gap.
     turn14_kind = src_enums.BrandProviderKind.TURN_14.value
     cp_ids = list(
-        src_models.CompanyProviders.objects.filter(provider__kind=turn14_kind, active=True).values_list(
-            "id", flat=True
-        )
+        src_models.CompanyProviders.objects.filter(provider__kind=turn14_kind, active=True)
+        .exclude(paused_at__lt=_paused_sync_cutoff(), primary=False)
+        .values_list("id", flat=True)
     )
     enqueued = 0
     for cp_id in cp_ids:

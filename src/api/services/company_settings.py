@@ -162,6 +162,10 @@ def list_company_users(company_id: int, user) -> list | None:
             "first_name": p.user.first_name,
             "last_name": p.user.last_name,
             "is_company_admin": p.is_company_admin,
+            # Plan-limit suspension (see plan_lifecycle): a suspended member can still sign in but
+            # every other route answers "account needs upgrade"; the Members page badges them.
+            "state": "suspended" if p.suspended_at else "active",
+            "suspended_at": p.suspended_at.strftime("%Y-%m-%dT%H:%M:%SZ") if p.suspended_at else None,
             "created_at": p.created_at.isoformat() if p.created_at else None,
         }
         for p in profiles

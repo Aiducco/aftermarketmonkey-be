@@ -79,6 +79,10 @@ def _sync_company_subscription(company: src_models.Company, sub: dict) -> None:
     if period_end_ts:
         period_end = datetime.fromtimestamp(period_end_ts, tz=timezone.utc)
 
+    # Captured BEFORE the overwrite below: it is how the restore hook tells "this payment just
+    # upgraded a downgraded / comp'd-trial company" from "an ordinary renewal".
+    previous_status = company.subscription_status
+
     company.subscription_id = sub.get("id")
     company.subscription_plan = plan_id
     company.subscription_status = sub.get("status")
@@ -90,6 +94,31 @@ def _sync_company_subscription(company: src_models.Company, sub: dict) -> None:
         "subscription_id", "subscription_plan",
         "subscription_status", "subscription_period_end", "manual_trial_granted_at",
     ])
+
+    # Upgrade restore (see plan_lifecycle): a real subscription un-pauses every paused distributor
+    # and suspended member. invoice.payment_succeeded re-syncs on EVERY renewal, so the guard keeps
+    # the common case a no-op: only a company that was downgraded, was on a comp'd trial, or still
+    # carries a kept-distributors choice has anything to restore (restore clears that choice, so
+    # the guard goes false right after).
+    if company.subscription_status in ACTIVE_STATUSES and (
+        previous_status in ("downgraded", "trialing") or company.keep_integration_ids is not None
+    ):
+        # Imported here: plan_lifecycle imports this module for the plan limits.
+        from src.api.services import plan_lifecycle
+
+        try:
+            plan_lifecycle.restore_company(company.id, notify_upgrade=previous_status == "downgraded")
+        except Exception:
+            # The subscription state above is already saved; a failed restore must not fail the
+            # webhook (Stripe would retry a 500 against state that is already correct). The next
+            # payment event or an admin override re-runs it -- restore_company is idempotent.
+            logger.exception("Plan restore failed after subscription sync for company_id=%s", company.id)
+
+
+def _is_comp_downgraded(company: src_models.Company) -> bool:
+    """A company downgraded from a comp'd trial (plan_lifecycle): status "downgraded" and never had a
+    Stripe subscription. Stripe's failure/deletion events must not overwrite that state."""
+    return company.subscription_status == "downgraded" and not company.subscription_id
 
 
 def _clear_company_subscription(company: src_models.Company) -> None:
@@ -410,17 +439,30 @@ def _period_start(company: src_models.Company):
 
 
 def _connected_distributor_count(company_id: int) -> int:
-    """Count CompanyProviders rows whose credentials carry a truthy "feed" namespace — the same
+    """Count ACTIVE CompanyProviders rows whose credentials carry a truthy "feed" namespace — the same
     "connected" convention used at integrations.py:282,1553 and parts.py:275,581. Order-only rows
-    (feed empty) don't count."""
+    (feed empty) don't count, and neither do connections paused for plan limits (paused_at set, see
+    plan_lifecycle): a downgraded company with 9 paused connections and 2 active ones is at 2/2, so
+    it is blocked from connecting more and is not shown as permanently over its cap."""
     creds_list = src_models.CompanyProviders.objects.filter(
-        company_id=company_id
+        company_id=company_id, paused_at__isnull=True
+    ).values_list("credentials", flat=True)
+    return sum(1 for c in creds_list if (c or {}).get("feed"))
+
+
+def _paused_distributor_count(company_id: int) -> int:
+    """Feed-connected CompanyProviders rows paused for plan limits (see plan_lifecycle)."""
+    creds_list = src_models.CompanyProviders.objects.filter(
+        company_id=company_id, paused_at__isnull=False
     ).values_list("credentials", flat=True)
     return sum(1 for c in creds_list if (c or {}).get("feed"))
 
 
 def _seat_count(company_id: int) -> int:
-    return src_models.UserProfile.objects.filter(company_id=company_id).count()
+    """Active members only: a member suspended for plan limits (suspended_at set) does not count
+    against the cap, so a downgraded Scout company with one active admin and five suspended members
+    is 1/1 -- full, so a new invite is still blocked -- instead of 6/1."""
+    return src_models.UserProfile.objects.filter(company_id=company_id, suspended_at__isnull=True).count()
 
 
 def get_usage(company_id: int) -> dict:
@@ -512,6 +554,16 @@ def check_distributor_connection_limit(company_id: int) -> tuple[bool, str]:
 
     plan_key = _plan_key(company)
     limit = _plan_features(plan_key).get("distributor_connections", 0)
+
+    # No swapping after a downgrade: a downgraded company that has ANY paused connection has already
+    # used its slots (the choice of which to keep is final, see plan_lifecycle), so disconnecting an
+    # active distributor must not free a slot for a different one. Disconnecting itself stays allowed.
+    if company.subscription_status == "downgraded" and _paused_distributor_count(company_id) > 0:
+        return False, (
+            "Your other distributors are paused on the {} plan, so connections can't be swapped. "
+            "Upgrade to reactivate them or connect more distributors.".format(_plan_name(plan_key))
+        )
+
     if limit == -1:
         return True, ""
 
@@ -720,6 +772,11 @@ def _handle_subscription_deleted(obj: dict, api_key: str) -> None:
     if not company:
         logger.warning("subscription.deleted: no company for customer %s", customer_id)
         return
+    if _is_comp_downgraded(company):
+        # A downgraded comp-trial company has no Stripe subscription to clear; a stray event (e.g. an old
+        # subscription of the same customer) must not rewrite its "downgraded" state to "canceled".
+        logger.info("subscription.deleted: ignored for downgraded company %s (no subscription).", company.id)
+        return
     _clear_company_subscription(company)
     logger.info("subscription.deleted: cleared subscription for company %s", company.id)
 
@@ -741,6 +798,9 @@ def _handle_invoice_payment_failed(obj: dict, api_key: str) -> None:
     customer_id = obj.get("customer")
     company = _company_by_customer(customer_id)
     if not company:
+        return
+    if _is_comp_downgraded(company):
+        # Same reasoning as _handle_subscription_deleted: nothing to be past due on.
         return
     if company.subscription_status not in (None, "canceled"):
         company.subscription_status = "past_due"

@@ -40,6 +40,37 @@ class Company(django_db_models.Model):
     # real Stripe subscription is synced onto this company (see billing._sync_company_subscription).
     manual_trial_granted_at = django_db_models.DateTimeField(null=True, blank=True)
 
+    # Plan expiry / downgrade (see src.api.services.plan_lifecycle). When a comp'd trial ends the
+    # company is downgraded to Scout limits: subscription_status becomes "downgraded" (which
+    # billing._plan_key already resolves to "scout" because it is not an active status) and the
+    # distributors/members over the Scout caps are paused/suspended -- never deleted -- so an
+    # upgrade can restore them instantly. subscription_period_end doubles as the trial end date
+    # and is deliberately NOT nulled at downgrade (it records when the trial ended).
+    #
+    # The distributors the admin chose to keep (CompanyProviders.id list). NULL == never picked,
+    # in which case the downgrade auto-picks the top Scout-limit rows by plan_lifecycle's ranking.
+    # After a downgrade it holds the ids that were actually left active.
+    keep_integration_ids = django_db_models.JSONField(null=True, blank=True)
+    # "user" (the admin picked) or "auto" (we picked at expiry). Only an "auto" pick may be
+    # changed once after expiry; NULL until a pick exists or when nothing needed picking.
+    keep_integration_ids_source = django_db_models.CharField(max_length=8, null=True, blank=True)
+    # When the choice became final. NULL while it can still change (trial still running, or an
+    # auto-pick the admin has not yet used their one post-expiry change on).
+    connections_locked_at = django_db_models.DateTimeField(null=True, blank=True)
+    # History: set when the company was downgraded, deliberately NOT cleared on upgrade so we
+    # can still tell a company once lapsed. downgraded_from_plan is the plan the trial was on
+    # ("hunter"), used for the "Your Hunter trial ..." copy and to re-apply that plan when an
+    # admin extends the trial. subscription_plan itself is set to NULL at downgrade, not "scout":
+    # the extend path only re-applies a trial plan when subscription_plan is empty.
+    downgraded_at = django_db_models.DateTimeField(null=True, blank=True)
+    downgraded_from_plan = django_db_models.CharField(max_length=32, null=True, blank=True)
+    # When an admin dismissed the post-expiry modal; NULL == still to be shown.
+    downgrade_acknowledged_at = django_db_models.DateTimeField(null=True, blank=True)
+    # Which lifecycle emails already went out, {"d7": iso, "d1": iso, "d0": iso, "upgrade": iso},
+    # stamped only after Resend accepted the send so a cron re-run never emails twice and a
+    # failed send is retried. Reset to {} when an admin extends the trial (re-arms d7/d1/d0).
+    warning_emails_sent = django_db_models.JSONField(default=dict, blank=True)
+
     # Dedicated SFTP relay account (one per company) — auto-provisioned in the background so
     # relay-based distributors (Meyer, A-Tech, etc.) can be connected with one click instead of
     # the company emailing support for credentials.
@@ -170,6 +201,16 @@ class CompanyProviders(django_db_models.Model):
 
     primary = django_db_models.BooleanField(default=False)
     active = django_db_models.BooleanField(default=True)
+
+    # Plan-limit pause (see src.api.services.plan_lifecycle): NOT NULL means the connection is
+    # paused -- hidden from the company's search/pricing and not usable for orders -- because the
+    # company's plan allows fewer connections than it has. Credentials and config are untouched
+    # so an upgrade just clears these. Deliberately NOT ``active``: that flag means "row is live"
+    # and is filtered on by the pricing-sync enqueue and connectivity checks, and a paused
+    # connection must keep syncing for PAUSED_INTEGRATION_SYNC_DAYS so an upgrade brings back
+    # fresh data (the enqueue skips it only once paused_at is older than that).
+    paused_at = django_db_models.DateTimeField(null=True, blank=True)
+    paused_reason = django_db_models.CharField(max_length=32, null=True, blank=True)  # "plan_limit"
 
     # Set to True once the first successful pricing sync completes for this connection.
     # False means the initial data ingest is still pending or in progress — the frontend
@@ -822,6 +863,11 @@ class UserProfile(django_db_models.Model):
     # Job function within the company (owner, parts_manager, service_advisor, technician, other).
     # Free CharField; allowed values enforced at the schema layer (see onboarding.USER_ROLES).
     role = django_db_models.CharField(max_length=32, null=True, blank=True)
+    # Plan-limit suspension (see src.api.services.plan_lifecycle): NOT NULL means the member is
+    # suspended -- can still log in, but every other /api route answers "account needs upgrade"
+    # (authentication.middleware.SuspendedMemberMiddleware). Never deleted; an upgrade clears it.
+    suspended_at = django_db_models.DateTimeField(null=True, blank=True)
+    suspended_reason = django_db_models.CharField(max_length=32, null=True, blank=True)  # "plan_limit"
 
     # CRM mirror (FreshSales) -- one contact per user, attached to the company's sales account.
     # See Company.freshsales_account_id for why these are nullable and nothing reads them.

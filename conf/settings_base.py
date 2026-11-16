@@ -50,6 +50,7 @@ MIDDLEWARE = [
     #"django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "src.authentication.middleware.JWTAuthenticationMiddleware",
+    "src.authentication.middleware.SuspendedMemberMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
@@ -392,9 +393,7 @@ PLANS = {
         "amount_annual": 0,
         "currency": "usd",
         "features": {
-            # TEMPORARY: lowered from 50 to 10 so the limit-reached screen can be checked on the SunCoast
-            # account. Restore to 50.
-            "detail_views_per_month": 10,
+            "detail_views_per_month": 50,
             "distributor_connections": 2,
             "seats": 1,
             "po_checkout_allowed": False,
@@ -508,6 +507,14 @@ PACK_LOCATION_MAX_QUANTITY = 20
 # subscription by then. See src/api/services/onboarding.py:register_user.
 NEW_SIGNUP_TRIAL_PLAN = "hunter"
 NEW_SIGNUP_TRIAL_DAYS = 30
+
+# Plan expiry / downgrade (src/api/services/plan_lifecycle.py). A trial is "ending" -- banner and
+# the day-7 warning email -- once it is this many days from its end.
+TRIAL_WARNING_DAYS = 7
+# A distributor paused for plan limits keeps syncing nightly for this long after paused_at, so an
+# upgrade soon after a downgrade brings back fresh data instantly; past it the per-company pricing
+# enqueue skips the row until the company upgrades (restore_company then enqueues an immediate sync).
+PAUSED_INTEGRATION_SYNC_DAYS = 60
 
 # WheelPros SFTP: host/port for all connections (override via env). Per-company user/password in
 # CompanyProviders.credentials; optional WHEELPROS_SFTP_USER/PASSWORD for local/dev sync only.

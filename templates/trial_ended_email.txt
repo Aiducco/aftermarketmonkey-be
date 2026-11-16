@@ -1,0 +1,23 @@
+Your trial has ended
+
+{{ company_name }}'s {{ trial_plan_name }} trial has ended and your account is now on Scout (free).
+Here's what changed.
+
+Active: {% if kept_names %}{{ kept_names|join:", " }}{% else %}none{% endif %}
+Paused: {% if paused_names %}{{ paused_names|join:", " }}{% else %}none{% endif %}
+Ordering: off
+Team members suspended: {{ suspended_count }}
+
+Nothing was deleted. Paused distributors and suspended team members keep all their settings, and
+upgrading turns them back on instantly.{% if can_change %} Because we picked your active distributors for
+you, you can change them once.
+
+Change my distributors (one time): {{ picker_url }}{% endif %}
+
+Upgrade to restore everything: {{ upgrade_url }}
+
+Questions? Reach us at support@aftermarketscout.com.
+
+--
+AftermarketScout
+You're receiving this because your trial ended.

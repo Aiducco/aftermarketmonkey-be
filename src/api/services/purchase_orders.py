@@ -482,6 +482,12 @@ def _get_company_provider(company_id: int, provider_id: int) -> src_models.Compa
     )
     if not cp:
         raise PurchaseOrderServiceError("This distributor isn't connected for your company.")
+    if cp.paused_at is not None:
+        # Paused for plan limits (see plan_lifecycle): reuse the plan-limit 402 mapping.
+        raise PurchaseOrderServiceError(
+            "This distributor is paused on your plan. Upgrade to reactivate it.",
+            error_code=billing_services.PLAN_LIMIT_ERROR_CODE,
+        )
     return cp
 
 
@@ -882,6 +888,13 @@ def review_cart(
     doesn't call /validate at all (or a ship-to taken from a saved location) keeps working
     unchanged.
     """
+    # Ordering is off for the plan (Scout, so also a downgraded company) -- same 402 gate as
+    # add_cart_item / submit_purchase_order. Quoting and shipping selection call the distributor, so
+    # they are refused up front; reading order history and the cart stays open.
+    allowed, plan_reason = billing_services.check_po_checkout_allowed(company_id)
+    if not allowed:
+        raise PurchaseOrderServiceError(plan_reason, error_code=billing_services.PLAN_LIMIT_ERROR_CODE)
+
     ship_to = dict(ship_to or {})
     if not ship_to.get("address1") and ship_to.get("address"):
         ship_to["address1"] = ship_to["address"]
@@ -1559,6 +1572,13 @@ def select_shipping_options(
     takes a single "service_level" argument, not one per warehouse), so there's no meaningful
     finer-grained choice to preserve for them.
     """
+    # Ordering is off for the plan (Scout, so also a downgraded company) -- same 402 gate as
+    # add_cart_item / submit_purchase_order. Quoting and shipping selection call the distributor, so
+    # they are refused up front; reading order history and the cart stays open.
+    allowed, plan_reason = billing_services.check_po_checkout_allowed(company_id)
+    if not allowed:
+        raise PurchaseOrderServiceError(plan_reason, error_code=billing_services.PLAN_LIMIT_ERROR_CODE)
+
     po = src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id).first()
     if not po:
         raise PurchaseOrderServiceError("Purchase order not found.")
@@ -1595,6 +1615,13 @@ def select_shipping_options(
 def requote_purchase_order(company_id: int, purchase_order_id: int) -> typing.Dict:
     """Re-runs the quote for an already-reviewed PO (stale QUOTED, or a FAILED quote attempt)
     without rebuilding the cart — reuses the ship-to/ship-method already stored on it."""
+    # Ordering is off for the plan (Scout, so also a downgraded company) -- same 402 gate as
+    # add_cart_item / submit_purchase_order. Quoting and shipping selection call the distributor, so
+    # they are refused up front; reading order history and the cart stays open.
+    allowed, plan_reason = billing_services.check_po_checkout_allowed(company_id)
+    if not allowed:
+        raise PurchaseOrderServiceError(plan_reason, error_code=billing_services.PLAN_LIMIT_ERROR_CODE)
+
     po = src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id).first()
     if not po:
         raise PurchaseOrderServiceError("Purchase order not found.")
@@ -1643,6 +1670,11 @@ def submit_purchase_order_group(
     function, discarding the results of every PO that already succeeded earlier in this same
     call and turning a partial success into a total error response.
     """
+    # Checked here as well as in submit_purchase_order so a group on a plan without ordering fails
+    # up front, instead of raising on the first PO inside the per-PO wrapper below.
+    allowed, plan_reason = billing_services.check_po_checkout_allowed(company_id)
+    if not allowed:
+        raise PurchaseOrderServiceError(plan_reason, error_code=billing_services.PLAN_LIMIT_ERROR_CODE)
     group = src_models.PurchaseOrderGroup.objects.filter(id=group_id, company_id=company_id).first()
     if not group:
         raise PurchaseOrderServiceError("Purchase order group not found.")
@@ -1769,6 +1801,7 @@ def get_order_capabilities(company_id: int) -> typing.List[typing.Dict]:
     company_providers = src_models.CompanyProviders.objects.filter(
         company_id=company_id, active=True
     ).select_related("provider")
+    ordering_enabled = billing_services.check_po_checkout_allowed(company_id)[0]
     results = []
     for cp in company_providers:
         # get_adapter() itself is the source of truth for "can THIS connection order right
@@ -1786,7 +1819,11 @@ def get_order_capabilities(company_id: int) -> typing.List[typing.Dict]:
                 "provider_id": cp.provider_id,
                 "provider_kind_name": cp.provider.kind_name,
                 "provider_name": cp.provider.name,
-                "can_order_in_app": bool(adapter),
+                # False while this connection is paused for plan limits or the plan has no
+                # ordering at all (Scout) -- "paused" / "ordering_enabled" say which.
+                "can_order_in_app": bool(adapter) and cp.paused_at is None and ordering_enabled,
+                "paused": cp.paused_at is not None,
+                "ordering_enabled": ordering_enabled,
                 # 'api' | 'email' | 'edi' | None — see base.DistributorOrderAdapter.fulfillment_channel.
                 # Lets the FE show an "Emailed to distributor" style tag without hardcoding
                 # which provider kinds are email-based (that's a per-order-account choice now,

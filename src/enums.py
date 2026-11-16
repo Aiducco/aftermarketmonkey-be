@@ -211,6 +211,11 @@ class NotificationEmailType(enum.Enum):
     """Kind of transactional notification email logged in NotificationEmailLog."""
     FIRST_SYNC_COMPLETED = 1
     PURCHASE_ORDER_EMAILED = 2
+    # Plan expiry / downgrade lifecycle (src.api.services.plan_lifecycle).
+    TRIAL_ENDING_7D = 3
+    TRIAL_ENDING_1D = 4
+    TRIAL_ENDED = 5
+    PLAN_RESTORED = 6
 
 
 class NotificationEmailStatus(enum.Enum):

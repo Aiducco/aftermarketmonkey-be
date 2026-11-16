@@ -9,8 +9,10 @@ from django.utils.decorators import method_decorator
 
 from common import exceptions as common_exceptions
 from common import utils as common_utils
+from src import models as src_models
 from src.api.schemas import admin as admin_schema
 from src.api.services import admin as admin_services
+from src.api.services import plan_lifecycle as plan_lifecycle_services
 
 logger = logging.getLogger(__name__)
 _LOG_PREFIX = "[ADMIN]"
@@ -203,6 +205,59 @@ class AdminExtendTrialView(views.View):
             return _json_response({"message": err}, status=404)
 
         return _json_response({"data": data}, status=200)
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class AdminCompanyKeptIntegrationsView(views.View):
+    """POST /admin/companies/<company_id>/kept-integrations/ - Staff override of which distributors a
+    company keeps on Scout: ``ids`` (CompanyProviders ids) sets them (applied immediately if the company
+    is already downgraded), ``unlock`` reopens the customer's one post-expiry change. Returns the
+    company's plan-status object. Staff only."""
+
+    def post(self, request: http.HttpRequest, company_id: int, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
+        denied = _require_staff(request)
+        if denied:
+            return denied
+
+        validated, err_response = _parse_body(request, admin_schema.AdminKeptIntegrationsSchema())
+        if err_response:
+            return err_response
+
+        try:
+            data = plan_lifecycle_services.admin_set_kept_integrations(
+                company_id, request.user, ids=validated.get("ids"), unlock=bool(validated.get("unlock"))
+            )
+        except plan_lifecycle_services.PlanLifecycleError as e:
+            return _json_response({"message": e.message, "error_code": e.error_code}, status=e.status_code)
+        if data is None:
+            return _json_response({"message": "Company not found"}, status=404)
+
+        return _json_response({"data": data}, status=200)
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class AdminUnpauseIntegrationView(views.View):
+    """POST /admin/companies/<company_id>/integrations/<company_provider_id>/unpause/ - Staff exception:
+    force one paused distributor connection back to active. Staff only."""
+
+    def post(
+        self,
+        request: http.HttpRequest,
+        company_id: int,
+        company_provider_id: int,
+        *args: typing.Any,
+        **kwargs: typing.Any,
+    ) -> http.HttpResponse:
+        denied = _require_staff(request)
+        if denied:
+            return denied
+
+        if not src_models.Company.objects.filter(id=company_id).exists():
+            return _json_response({"message": "Company not found"}, status=404)
+        if not plan_lifecycle_services.admin_unpause_integration(company_id, company_provider_id):
+            return _json_response({"message": "Integration not found"}, status=404)
+
+        return _json_response({"data": {"id": company_provider_id, "state": "active"}}, status=200)
 
 
 class AdminProvidersView(views.View):

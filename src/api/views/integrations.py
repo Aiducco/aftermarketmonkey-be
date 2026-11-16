@@ -105,7 +105,12 @@ class ProviderConnectView(views.View):
             company_provider_id=(data or {}).get("id") if err is None else None,
         )
         if err:
-            is_plan_limit = error_code == integrations_services.CONNECTION_ERROR_PLAN_LIMIT_REACHED
+            # A paused connection is answered like a plan limit: 402 + upgrade_required, which is
+            # what makes the frontend open its upgrade dialog.
+            is_plan_limit = error_code in (
+                integrations_services.CONNECTION_ERROR_PLAN_LIMIT_REACHED,
+                integrations_services.CONNECTION_ERROR_INTEGRATION_PAUSED,
+            )
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
                 content=simplejson.dumps({
@@ -237,6 +242,12 @@ class ProviderConnectionView(views.View):
             error_message=err,
         )
         if err:
+            if error_code == integrations_services.CONNECTION_ERROR_INTEGRATION_PAUSED:
+                return http.HttpResponse(
+                    headers={"Content-Type": "application/json"},
+                    content=simplejson.dumps({"message": err, "error_code": error_code, "upgrade_required": True}),
+                    status=402,
+                )
             status = 404 if error_code == integrations_services.CONNECTION_ERROR_NOT_FOUND else 400
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
@@ -420,6 +431,12 @@ class OrderAccountsView(views.View):
             order_method=body.get("order_method"),
         )
         if err:
+            if error_code == integrations_services.CONNECTION_ERROR_INTEGRATION_PAUSED:
+                return http.HttpResponse(
+                    headers={"Content-Type": "application/json"},
+                    content=simplejson.dumps({"message": err, "error_code": error_code, "upgrade_required": True}),
+                    status=402,
+                )
             status = 404 if error_code == integrations_services.CONNECTION_ERROR_NOT_FOUND else 400
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
@@ -496,6 +513,12 @@ class OrderAccountDetailView(views.View):
             order_method=body.get("order_method"),
         )
         if err:
+            if error_code == integrations_services.CONNECTION_ERROR_INTEGRATION_PAUSED:
+                return http.HttpResponse(
+                    headers={"Content-Type": "application/json"},
+                    content=simplejson.dumps({"message": err, "error_code": error_code, "upgrade_required": True}),
+                    status=402,
+                )
             status = 404 if error_code == integrations_services.CONNECTION_ERROR_NOT_FOUND else 400
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
@@ -537,6 +560,18 @@ class OrderAccountDetailView(views.View):
 
         success, err = integrations_services.delete_order_account(company_id=company_id, order_account_id=oai)
         if not success:
+            if err == integrations_services.INTEGRATION_PAUSED_MESSAGE:
+                return http.HttpResponse(
+                    headers={"Content-Type": "application/json"},
+                    content=simplejson.dumps(
+                        {
+                            "message": err,
+                            "error_code": integrations_services.CONNECTION_ERROR_INTEGRATION_PAUSED,
+                            "upgrade_required": True,
+                        }
+                    ),
+                    status=402,
+                )
             status = 404 if err == "Order account not found" else 400
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},

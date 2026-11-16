@@ -99,6 +99,11 @@ CONNECTION_ERROR_CONNECTION_FAILED = "connection_failed"
 CONNECTION_ERROR_CHANNEL_UNAVAILABLE = "channel_unavailable"
 CONNECTION_ERROR_NOT_FOUND = "not_found"
 CONNECTION_ERROR_PLAN_LIMIT_REACHED = billing_services.PLAN_LIMIT_ERROR_CODE
+# The connection is paused for plan limits (CompanyProviders.paused_at, see plan_lifecycle): its
+# credentials are kept, but it cannot be edited or used until the company upgrades. Like the plan
+# limit above, the views answer it with 402 + upgrade_required.
+CONNECTION_ERROR_INTEGRATION_PAUSED = "integration_paused"
+INTEGRATION_PAUSED_MESSAGE = "This distributor is paused on your plan. Upgrade to reactivate it."
 
 
 def _render_relay_instructions_html(
@@ -286,6 +291,20 @@ def _provider_ui_metadata(provider: src_models.Providers) -> typing.Dict[str, ty
     }
 
 
+def _paused_fields(company_provider: typing.Optional[src_models.CompanyProviders]) -> typing.Dict[str, typing.Any]:
+    """
+    Plan-limit pause state for a connection, merged into every listing/detail payload so the
+    frontend can badge it and swap "Manage" for "Upgrade to reactivate" (see plan_lifecycle).
+    ``paused_at`` is "YYYY-MM-DDTHH:MM:SSZ" (naive UTC) like the account API's timestamps.
+    """
+    paused_at = company_provider.paused_at if company_provider else None
+    return {
+        "paused": paused_at is not None,
+        "paused_at": paused_at.strftime("%Y-%m-%dT%H:%M:%SZ") if paused_at else None,
+        "paused_reason": company_provider.paused_reason if paused_at else None,
+    }
+
+
 def get_providers_catalog(company_id: int) -> typing.Dict:
     """
     Get integrations catalog: all providers with connection status for the company.
@@ -362,6 +381,9 @@ def get_providers_catalog(company_id: int) -> typing.Dict:
             "relay_provisioned": bool(entry.get("relay_provisioned")),
             "connected": connected,
             "company_provider_id": company_provider.id if company_provider else None,
+            # "connected" above stays true for a paused connection (its feed credentials are kept);
+            # "paused" is what tells the card to show a Paused badge instead of Manage.
+            **_paused_fields(company_provider),
             "kind": kind_value,
             "kind_name": kind_name,
             "coming_soon": False,
@@ -1743,6 +1765,10 @@ def connect_provider(
         company_id=company_id,
         provider_id=provider_id,
     ).first()
+    if existing and existing.paused_at is not None:
+        # Re-submitting credentials for a paused connection would otherwise skip the connection cap
+        # below (it already "has a feed") and effectively edit a connection the plan has paused.
+        return None, INTEGRATION_PAUSED_MESSAGE, CONNECTION_ERROR_INTEGRATION_PAUSED
     # existing.credentials never carries "order" (see CompanyProviderOrderAccount) — seed the
     # merge/relay baseline below from this connection's actual default account instead, so a
     # feed-only request still correctly carries forward whatever order credentials already exist.
@@ -1941,6 +1967,7 @@ def connect_provider(
         "provider_id": cp.provider_id,
         "provider_name": provider.name,
         "primary": cp.primary,
+        **_paused_fields(cp),
         "connection_validated": validated,
         "order_connection_validated": order_validated,
         "status": cp.status,
@@ -1980,6 +2007,8 @@ def update_connection(
     ).select_related("provider", "company").first()
     if not cp or not cp.provider:
         return None, "Connection not found", CONNECTION_ERROR_NOT_FOUND
+    if cp.paused_at is not None:
+        return None, INTEGRATION_PAUSED_MESSAGE, CONNECTION_ERROR_INTEGRATION_PAUSED
 
     catalog_entry = _get_catalog_entry_for_provider(cp.provider_id)
     if not catalog_entry:
@@ -2106,6 +2135,7 @@ def update_connection(
         "provider_id": cp.provider_id,
         "provider_name": cp.provider.name,
         "primary": cp.primary,
+        **_paused_fields(cp),
         "connection_validated": validated,
         "order_connection_validated": order_validated,
         "status": cp.status,
@@ -2448,6 +2478,8 @@ def create_order_account(
     )
     if not cp or not cp.provider:
         return None, "Connection not found", CONNECTION_ERROR_NOT_FOUND
+    if cp.paused_at is not None:
+        return None, INTEGRATION_PAUSED_MESSAGE, CONNECTION_ERROR_INTEGRATION_PAUSED
 
     catalog_entry = _get_catalog_entry_for_provider(cp.provider_id)
     if not catalog_entry:
@@ -2546,6 +2578,8 @@ def update_order_account(
         return None, "Order account not found", CONNECTION_ERROR_NOT_FOUND
 
     cp = account.company_provider
+    if cp.paused_at is not None:
+        return None, INTEGRATION_PAUSED_MESSAGE, CONNECTION_ERROR_INTEGRATION_PAUSED
     catalog_entry = _get_catalog_entry_for_provider(cp.provider_id)
     if not catalog_entry:
         return None, "Provider not found in catalog", CONNECTION_ERROR_NOT_FOUND
@@ -2662,6 +2696,8 @@ def delete_order_account(company_id: int, order_account_id: int) -> typing.Tuple
     if not account:
         return False, "Order account not found"
     cp = account.company_provider
+    if cp.paused_at is not None:
+        return False, INTEGRATION_PAUSED_MESSAGE
     was_default = account.is_default
     try:
         account.delete()
@@ -2707,6 +2743,7 @@ def get_company_providers(company_id: int) -> typing.List[typing.Dict]:
             "provider_kind": provider.kind if provider else None,
             "provider_kind_name": provider.kind_name if provider else None,
             "primary": cp.primary,
+            **_paused_fields(cp),
             "created_at": cp.created_at.isoformat() if cp.created_at else None,
             "updated_at": cp.updated_at.isoformat() if cp.updated_at else None,
         }
@@ -2779,6 +2816,7 @@ def get_company_provider_by_id(company_id: int, provider_id: int) -> typing.Opti
             "provider_kind": provider.kind if provider else None,
             "provider_kind_name": provider.kind_name if provider else None,
             "primary": company_provider.primary,
+            **_paused_fields(company_provider),
             "connection_required_fields": list(catalog_entry.get("connection_required_fields") or []),
             "connection_optional_fields": list(catalog_entry.get("connection_optional_fields") or []),
             "feed_connection_modes": list(catalog_entry.get("feed_connection_modes") or []),
@@ -2947,6 +2985,7 @@ def get_company_provider_connection_detail(
         "provider_kind": provider.kind,
         "provider_kind_name": provider.kind_name,
         "primary": company_provider.primary,
+        **_paused_fields(company_provider),
         "status": company_provider.status,
         "status_name": company_provider.status_name,
         "status_reason": company_provider.status_reason,

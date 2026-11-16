@@ -12,6 +12,7 @@ from django.utils import timezone
 
 from src import enums as src_enums
 from src import models as src_models
+from src.api.services import plan_lifecycle as plan_lifecycle_services
 
 _LOG_PREFIX = "[ADMIN-SERVICE]"
 
@@ -32,6 +33,22 @@ def _generate_password() -> str:
 ADMIN_COMPANY_SLUG = "aftermarketscout"
 
 
+def _plan_lifecycle_fields(company: src_models.Company) -> typing.Dict:
+    """Plan expiry / downgrade state for the staff views (``company`` must carry the
+    ``paused_providers_count`` annotation); see plan_lifecycle."""
+    state = plan_lifecycle_services.plan_state(company)
+    return {
+        "plan_state": state,
+        "trial_ends_at": (
+            plan_lifecycle_services.iso_utc(company.subscription_period_end)
+            if state in (plan_lifecycle_services.STATE_TRIALING, plan_lifecycle_services.STATE_DOWNGRADED)
+            else None
+        ),
+        "downgraded_at": plan_lifecycle_services.iso_utc(company.downgraded_at),
+        "paused_integrations_count": company.paused_providers_count,
+    }
+
+
 def list_all_companies_for_admin() -> typing.List[typing.Dict]:
     """
     Every company (excluding the internal admin company itself) with its subscription state and
@@ -46,6 +63,9 @@ def list_all_companies_for_admin() -> typing.List[typing.Dict]:
             total_providers_count=Count("company_providers"),
             connected_providers_count=Count(
                 "company_providers", filter=Q(company_providers__status_name="CONNECTED")
+            ),
+            paused_providers_count=Count(
+                "company_providers", filter=Q(company_providers__paused_at__isnull=False)
             ),
         )
         .order_by("-created_at")
@@ -69,6 +89,7 @@ def list_all_companies_for_admin() -> typing.List[typing.Dict]:
                 "created_at": company.created_at.isoformat() if company.created_at else None,
                 "connected_providers_count": company.connected_providers_count,
                 "total_providers_count": company.total_providers_count,
+                **_plan_lifecycle_fields(company),
             }
         )
 
@@ -86,6 +107,9 @@ def get_admin_company_detail(company_id: int) -> typing.Optional[typing.Dict]:
             total_providers_count=Count("company_providers"),
             connected_providers_count=Count(
                 "company_providers", filter=Q(company_providers__status_name="CONNECTED")
+            ),
+            paused_providers_count=Count(
+                "company_providers", filter=Q(company_providers__paused_at__isnull=False)
             ),
         )
         .first()
@@ -114,6 +138,9 @@ def get_admin_company_detail(company_id: int) -> typing.Optional[typing.Dict]:
                 "order_status_name": cp.order_status_name,
                 "active": cp.active,
                 "initial_sync_completed": cp.initial_sync_completed,
+                "state": "paused" if cp.paused_at else "active",
+                "paused_at": plan_lifecycle_services.iso_utc(cp.paused_at),
+                "paused_reason": cp.paused_reason,
                 "created_at": cp.created_at.isoformat() if cp.created_at else None,
             }
         )
@@ -131,6 +158,8 @@ def get_admin_company_detail(company_id: int) -> typing.Optional[typing.Dict]:
             "is_staff": p.user.is_staff,
             "is_active": p.user.is_active,
             "last_login": p.user.last_login.isoformat() if p.user.last_login else None,
+            "state": "suspended" if p.suspended_at else "active",
+            "suspended_at": plan_lifecycle_services.iso_utc(p.suspended_at),
             "created_at": p.created_at.isoformat() if p.created_at else None,
         }
         for p in profiles
@@ -151,6 +180,7 @@ def get_admin_company_detail(company_id: int) -> typing.Optional[typing.Dict]:
         "created_at": company.created_at.isoformat() if company.created_at else None,
         "connected_providers_count": company.connected_providers_count,
         "total_providers_count": company.total_providers_count,
+        **_plan_lifecycle_fields(company),
         "providers": providers,
         "users": users,
     }
@@ -381,25 +411,45 @@ def extend_company_trial(
     blocked here; it is an unusual admin action (comp some extra time on top of a paid plan) but
     not a wrong one, and the subscription_plan passed in (or kept as-is) reflects that choice.
 
+    Plan expiry / downgrade (see plan_lifecycle): extending a DOWNGRADED company puts it back on a
+    trial -- status trialing, the plan it was downgraded from (unless ``plan`` is given), and
+    everything paused/suspended at the downgrade restored (plan_lifecycle.restore_company, which also
+    queues a sync for connections paused longer than the 60-day window). Extending any company also
+    resets warning_emails_sent, re-arming the day-7 / day-1 / day-0 emails for the new end date; the
+    in-app banner needs nothing, it is derived from the end date.
+
     Returns (result, error) -- result is None on failure (company not found), with error set.
     """
-    try:
-        company = src_models.Company.objects.get(id=company_id)
-    except src_models.Company.DoesNotExist:
-        return None, "Company not found"
+    with transaction.atomic():
+        company = src_models.Company.objects.select_for_update().filter(id=company_id).first()
+        if company is None:
+            return None, "Company not found"
 
-    now = timezone.now()
-    base = max(now, company.subscription_period_end) if company.subscription_period_end else now
-    company.subscription_period_end = base + datetime.timedelta(days=days)
-    company.subscription_status = "trialing"
-    company.manual_trial_granted_at = now
-    if plan:
-        company.subscription_plan = plan
-    elif not company.subscription_plan:
-        company.subscription_plan = getattr(settings, "NEW_SIGNUP_TRIAL_PLAN", "hunter")
-    company.save(
-        update_fields=["subscription_period_end", "subscription_status", "manual_trial_granted_at", "subscription_plan"]
-    )
+        was_downgraded = plan_lifecycle_services.plan_state(company) == plan_lifecycle_services.STATE_DOWNGRADED
+        now = timezone.now()
+        base = max(now, company.subscription_period_end) if company.subscription_period_end else now
+        company.subscription_period_end = base + datetime.timedelta(days=days)
+        company.subscription_status = "trialing"
+        company.manual_trial_granted_at = now
+        company.warning_emails_sent = {}
+        if plan:
+            company.subscription_plan = plan
+        elif was_downgraded and company.downgraded_from_plan:
+            # subscription_plan was cleared at the downgrade; put back the trial plan it was on.
+            company.subscription_plan = company.downgraded_from_plan
+        elif not company.subscription_plan:
+            company.subscription_plan = getattr(settings, "NEW_SIGNUP_TRIAL_PLAN", "hunter")
+        company.save(
+            update_fields=[
+                "subscription_period_end",
+                "subscription_status",
+                "manual_trial_granted_at",
+                "subscription_plan",
+                "warning_emails_sent",
+            ]
+        )
+        if was_downgraded:
+            plan_lifecycle_services.restore_company(company_id)
 
     logger.info(
         "{} Extended trial for company_id={} by {} day(s), now ending {}.".format(
@@ -412,6 +462,7 @@ def extend_company_trial(
         "subscription_plan": company.subscription_plan,
         "subscription_status": company.subscription_status,
         "subscription_period_end": company.subscription_period_end.isoformat(),
+        "status": plan_lifecycle_services.plan_state(company),
     }, None
 
 

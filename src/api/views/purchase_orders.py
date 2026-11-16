@@ -207,7 +207,7 @@ class CartReviewView(views.View):
                 shipping_method_id=body.get("shipping_method_id"),
             )
         except purchase_orders_services.PurchaseOrderServiceError as e:
-            return _error_response(str(e))
+            return _error_response_for(e)
         except Exception:
             logger.exception("{} Error reviewing cart for company_id={}".format(_LOG_PREFIX, company_id))
             return _error_response("Error reviewing cart", status=500)
@@ -541,7 +541,7 @@ class PurchaseOrderShippingSelectionView(views.View):
                 company_id=company_id, purchase_order_id=po_id, selections=selections
             )
         except purchase_orders_services.PurchaseOrderServiceError as e:
-            return _error_response(str(e))
+            return _error_response_for(e)
         except Exception:
             logger.exception("{} Error selecting shipping options for purchase order id={}".format(_LOG_PREFIX, po_id))
             return _error_response("Error selecting shipping options", status=500)
@@ -629,7 +629,7 @@ class PurchaseOrderRequoteView(views.View):
         try:
             result = purchase_orders_services.requote_purchase_order(company_id=company_id, purchase_order_id=po_id)
         except purchase_orders_services.PurchaseOrderServiceError as e:
-            return _error_response(str(e))
+            return _error_response_for(e)
         except Exception:
             logger.exception("{} Error re-quoting purchase order id={}".format(_LOG_PREFIX, po_id))
             return _error_response("Error re-quoting purchase order", status=500)
@@ -703,7 +703,7 @@ class PurchaseOrderGroupSubmitView(views.View):
                 company_id=company_id, group_id=group_id, ship_methods=body.get("ship_methods")
             )
         except purchase_orders_services.PurchaseOrderServiceError as e:
-            return _error_response(str(e))
+            return _error_response_for(e)
         except Exception:
             logger.exception("{} Error submitting purchase order group id={}".format(_LOG_PREFIX, group_id))
             return _error_response("Error submitting purchase order group", status=500)

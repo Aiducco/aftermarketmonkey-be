@@ -1,0 +1,27 @@
+Your trial ends tomorrow
+
+{{ company_name }}'s {{ trial_plan_name }} trial ends tomorrow ({{ trial_ends_at }}). After that
+your account moves to Scout.
+
+What changes on Scout (free):
+- {{ scout_max_connections }} active distributors (the rest are paused, not deleted)
+- {{ scout_max_seats }} team seat
+- No ordering through AftermarketScout (order history stays readable)
+- {{ scout_detail_views }} part detail views per month
+{% if kept_names %}
+You'll keep: {{ kept_names|join:", " }}
+{% endif %}
+{% if needs_choice %}This is your last day to choose which {{ scout_max_connections }} distributors stay
+active. If you don't choose, we'll keep your most used ones and pause the rest -- you'll get one chance to
+change that afterwards. Upgrading restores everything instantly.
+
+Choose distributors to keep: {{ picker_url }}
+{% else %}Upgrade any time to keep ordering, more seats and unlimited detail views.
+{% endif %}
+Upgrade: {{ upgrade_url }}
+
+Questions? Reach us at support@aftermarketscout.com.
+
+--
+AftermarketScout
+You're receiving this because your trial ends tomorrow.
