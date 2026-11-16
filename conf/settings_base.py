@@ -392,7 +392,9 @@ PLANS = {
         "amount_annual": 0,
         "currency": "usd",
         "features": {
-            "detail_views_per_month": 50,
+            # TEMPORARY: lowered from 50 to 10 so the limit-reached screen can be checked on the SunCoast
+            # account. Restore to 50.
+            "detail_views_per_month": 10,
             "distributor_connections": 2,
             "seats": 1,
             "po_checkout_allowed": False,
