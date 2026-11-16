@@ -7,7 +7,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("src", "0248_live_inventory_house_account_audit"),
+        ("src", "0247_provider_part_special_order_db_default"),
     ]
 
     operations = [
