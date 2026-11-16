@@ -972,9 +972,9 @@ def _email_context(company: src_models.Company, now: typing.Optional[datetime.da
         "scout_detail_views": scout["detail_views_per_month"],
         "ordering_enabled": plan_limits(plan_key)["ordering_enabled"],
         "restored_plan_name": billing_services._plan_name(plan_key),
-        # /integrations?choose_distributor=1 opens the picker (contract decision 12); /plans is upgrade.
+        # /integrations?choose_distributor=1 opens the picker (contract decision 12); /billing is upgrade.
         "picker_url": _frontend_url("/integrations?choose_distributor=1"),
-        "upgrade_url": _frontend_url("/plans"),
+        "upgrade_url": _frontend_url("/billing"),
         "app_url": _frontend_url("/parts"),
     }
 
