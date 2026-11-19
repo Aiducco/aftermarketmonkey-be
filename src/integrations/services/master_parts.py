@@ -6,12 +6,13 @@ and Vossen provider data.
 import ctypes
 import gc
 import logging
+import os
 import time
 import typing
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 
-from django.db import close_old_connections, connection
+from django.db import close_old_connections, connection, connections
 from django.db.models import Max, Min, Q
 from django.utils import timezone
 
@@ -15874,6 +15875,54 @@ def sync_all_master_parts() -> None:
     logger.info("{} Completed full master parts sync.".format(_LOG_PREFIX))
 
 
+# How many times one provider's master-parts sync is retried when Postgres reports a deadlock. Providers
+# share MasterPart rows (the same brand + part number is carried by several distributors), so two syncs
+# touching the same rows in a different order can deadlock; Postgres aborts one, and a retry nearly
+# always succeeds once the other has moved on.
+MASTER_SYNC_DEADLOCK_RETRIES = 2
+
+# Heaviest providers first when several run at once, so the long ones start immediately instead of
+# queueing behind the many that finish in a minute or two (measured: A-Tech 40-115 min, Meyer 22-53,
+# Premier ~28, Tristate ~9, everything else under 5).
+_MASTER_SYNC_HEAVY_FIRST = ("atech", "meyer", "premier", "keystone", "tristate", "allpro")
+
+
+def _run_master_sync_provider(provider_name: str, run_fn: typing.Callable[[], None]) -> bool:
+    """
+    One provider's catalog + inventory propagation, wrapped in its own ScheduledTaskExecution row and
+    retried on a Postgres deadlock. Never raises: returns True on success and False when the provider
+    still failed (the audit row has the error), so one provider cannot abort the others.
+    """
+    task_name = "sync_all_master_parts_{}".format(provider_name)
+    message = "{} master/provider parts, inventory sync complete.".format(provider_name)
+    for attempt in range(MASTER_SYNC_DEADLOCK_RETRIES + 1):
+        try:
+            with audit_scheduled_tasks.audited_step(task_name, message, continue_on_error=False):
+                run_fn()
+            return True
+        except Exception as e:
+            if "deadlock detected" in str(e).lower() and attempt < MASTER_SYNC_DEADLOCK_RETRIES:
+                logger.warning(
+                    "{} {}: deadlock detected, retrying ({}/{}).".format(
+                        _LOG_PREFIX, provider_name, attempt + 1, MASTER_SYNC_DEADLOCK_RETRIES
+                    )
+                )
+                close_old_connections()
+                time.sleep(5 * (attempt + 1))
+                continue
+            logger.exception("{} {}: master parts sync failed.".format(_LOG_PREFIX, provider_name))
+            return False
+    return False
+
+
+def _master_sync_worker_count() -> int:
+    """MASTER_PARTS_SYNC_WORKERS from the real environment (1 = sequential, the original behaviour)."""
+    try:
+        return max(1, int(os.environ.get("MASTER_PARTS_SYNC_WORKERS") or 1))
+    except ValueError:
+        return 1
+
+
 def sync_all_master_parts_global() -> None:
     """
     Global catalog + inventory sync — **no per-company pricing**.
@@ -15929,14 +15978,37 @@ def sync_all_master_parts_global() -> None:
         ("ntw", lambda: sync_derived_from_ntw(skip_pricing=True)),
     ]
 
-    for provider_name, run_fn in providers:
-        with audit_scheduled_tasks.audited_step(
-            "sync_all_master_parts_{}".format(provider_name),
-            "{} master/provider parts, inventory sync complete.".format(provider_name),
-            continue_on_error=True,
-        ):
-            run_fn()
+    workers = _master_sync_worker_count()
+    if workers <= 1:
+        for provider_name, run_fn in providers:
+            _run_master_sync_provider(provider_name, run_fn)
+            _reclaim_memory()
+    else:
+        # Turn14 still goes first and alone (others may shadow its data). The rest run `workers` at a
+        # time, heaviest first. Anything that still fails (e.g. a deadlock that outlasted its retries)
+        # is re-run on its own afterwards, which is exactly the sequential behaviour.
+        first, rest = providers[0], providers[1:]
+        _run_master_sync_provider(*first)
         _reclaim_memory()
+        rank = {name: i for i, name in enumerate(_MASTER_SYNC_HEAVY_FIRST)}
+        rest.sort(key=lambda item: rank.get(item[0], len(rank)))
+
+        def _parallel_step(item: typing.Tuple[str, typing.Callable[[], None]]) -> typing.Tuple[str, bool]:
+            try:
+                return item[0], _run_master_sync_provider(*item)
+            finally:
+                connections.close_all()
+
+        logger.info("{} Running {} providers in parallel, {} at a time.".format(_LOG_PREFIX, len(rest), workers))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            results = list(ex.map(_parallel_step, rest))
+        _reclaim_memory()
+        failed = {name for name, ok in results if not ok}
+        for provider_name, run_fn in rest:
+            if provider_name in failed:
+                logger.warning("{} {}: re-running sequentially after a parallel failure.".format(_LOG_PREFIX, provider_name))
+                _run_master_sync_provider(provider_name, run_fn)
+                _reclaim_memory()
 
     logger.info("{} Completed global master parts sync (catalog + inventory, no pricing).".format(_LOG_PREFIX))
 
