@@ -3,24 +3,17 @@ name: Deploy
 on:
   push:
     branches:
-      - main        # → production
-      - develop     # → development
+      - main        # → production (the only branch that deploys here; staging has deploy-staging.yml)
 
 jobs:
   deploy:
     name: Deploy to server
     runs-on: ubuntu-latest
 
-    steps:
-      - name: Determine environment
-        id: env
-        run: |
-          if [ "${{ github.ref_name }}" = "main" ]; then
-            echo "DEPLOY_ENV=production" >> $GITHUB_OUTPUT
-          else
-            echo "DEPLOY_ENV=development" >> $GITHUB_OUTPUT
-          fi
+    # Guard: even if the trigger above is edited, only main may touch the production host.
+    if: github.ref == 'refs/heads/main'
 
+    steps:
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -30,15 +23,15 @@ jobs:
           port: 22
           script_stop: true
           script: |
-            export DEPLOY_ENV=${{ steps.env.outputs.DEPLOY_ENV }}
+            export DEPLOY_ENV=production
             echo "==> Deploying env=$DEPLOY_ENV"
 
             cd ~/aftermarketmonkey-be
 
             echo "==> git pull"
             git fetch origin
-            git checkout ${{ github.ref_name }}
-            git reset --hard origin/${{ github.ref_name }}
+            git checkout main
+            git reset --hard origin/main
 
             echo "==> docker compose build"
             DEPLOY_ENV=$DEPLOY_ENV docker compose build
