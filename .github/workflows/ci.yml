@@ -1,0 +1,35 @@
+name: CI
+
+# Runs on pull requests only. Pushes to main/develop are handled by deploy.yml (which deploys and migrates):
+# make this check required in branch protection so nothing reaches main without passing it.
+# Uses conf.settings_test (SQLite, no .env, never a real database).
+on:
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  checks:
+    name: Format, compile, Django check, existing tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - run: pip install -r requirements.txt
+      - name: Black on changed files (src/constants.py is known not black-clean)
+        run: |
+          files=$(git diff --name-only --diff-filter=AM "${{ github.event.pull_request.base.sha }}"...HEAD -- '*.py' | grep -v '^src/constants.py$' || true)
+          [ -z "$files" ] || black --check --line-length=120 $files
+      - name: Compile all Python
+        run: python -m compileall -q src conf common
+      - name: Django system check
+        run: python manage.py check --settings=conf.settings_test
+      - name: Existing test modules
+        # List = modules that pass on SQLite today (src.integrations.tests.test_rate_limit needs Postgres NOW() and is excluded).
+        # Add a module here when it is made to pass; never delete one to get green.
+        run: python manage.py test $(cat .github/ci-test-modules.txt | tr '\n' ' ') --settings=conf.settings_test
