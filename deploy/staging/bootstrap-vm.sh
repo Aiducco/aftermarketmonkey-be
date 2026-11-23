@@ -25,8 +25,15 @@ gen() { openssl rand -hex 32; }
 system_phase() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -q
-  apt-get install -yq docker.io docker-compose-v2 nginx certbot python3-certbot-nginx git ufw curl jq unattended-upgrades
+  apt-get install -yq docker.io docker-compose-v2 nginx certbot python3-certbot-nginx git ufw curl jq bind9-dnsutils unattended-upgrades
   systemctl enable --now docker
+
+  # Small VMs (the first staging VM has 4 GB): swap so Postgres + Meilisearch + the fe build fit.
+  if [ "$(awk '/MemTotal/{print int($2/1048576)}' /proc/meminfo)" -lt 8 ] && ! swapon --show | grep -q /swapfile; then
+    fallocate -l 4G /swapfile && chmod 600 /swapfile && mkswap /swapfile >/dev/null && swapon /swapfile
+    grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    sysctl -q vm.swappiness=10 && echo 'vm.swappiness=10' > /etc/sysctl.d/99-staging-swap.conf
+  fi
 
   ufw allow OpenSSH
   ufw allow 'Nginx Full'
