@@ -77,10 +77,12 @@ class Command(BaseCommand):
             source = {k: v for k, v in conn.get_dsn_parameters().items() if k in ("host", "port", "dbname", "user")}
             self.stdout.write(f"Source: {source}")
             self._assert_read_only(cur)
+            # Never let one export query run away on the source (production) database.
+            cur.execute("SET statement_timeout = '20min'")
             self._check_columns(cur, tables)
             estimates = self._row_estimates(cur, tables)
             plan = subset.build_plan(tables, estimates, opts["whole_max"])
-            ids = self._select_ids(cur, tables, plan, opts["per_provider"])
+            ids = self._select_ids(cur, tables, plan, opts["per_provider"], estimates)
             manifest = self._write(cur, tables, plan, ids, out)
         finally:
             conn.rollback()
@@ -179,7 +181,7 @@ class Command(BaseCommand):
 
     # ---- selection ----------------------------------------------------------------------------------------------
 
-    def _select_ids(self, cur, tables, plan, per_provider):
+    def _select_ids(self, cur, tables, plan, per_provider, estimates):
         ids = {}
         for name in plan.order:
             mode = plan.mode[name]
@@ -199,44 +201,59 @@ class Command(BaseCommand):
                 filters = [fk for fk in t.fks if not fk.nullable and fk.parent in ids and fk.parent != name]
                 ids[name] = self._dependent_ids(cur, t, filters, ids)
             else:  # sampled
-                order = f"{_q(t.pk)} DESC"
-                if t.has_brand_id:
-                    sql = (
-                        f"SELECT pk FROM (SELECT {_q(t.pk)} AS pk, ROW_NUMBER() OVER (PARTITION BY brand_id "
-                        f"ORDER BY {order}) AS rn FROM {_q(name)}) s ORDER BY rn, pk DESC LIMIT %s"
-                    )
-                else:
-                    sql = f"SELECT {_q(t.pk)} FROM {_q(name)} ORDER BY {order} LIMIT %s"
-                cur.execute(sql, [per_provider])
-                ids[name] = [r[0] for r in cur.fetchall()]
+                ids[name] = self._sample_ids(cur, t, per_provider, estimates.get(name, 0))
             self.stdout.write(f"  {name:45} {mode:9} {len(ids[name]):>9} rows")
         return ids
 
     def _root_ids(self, cur, per_provider):
-        """provider_parts: per provider, spread across brands, in-stock and not discontinued first."""
-        cur.execute("SELECT DISTINCT provider_id FROM provider_parts ORDER BY 1")
-        provider_ids = [r[0] for r in cur.fetchall()]
-        chosen = []
-        for provider_id in provider_ids:
-            cur.execute(
-                """
-                SELECT id FROM (
-                    SELECT pp.id, ROW_NUMBER() OVER (
-                        PARTITION BY mp.brand_id
+        """provider_parts: per provider, spread across brands, in-stock and not discontinued first.
+
+        One pass over provider_parts for all providers (production has ~6.6M rows / 11 GB; a query per provider
+        would scan it once per provider). Within each (provider, brand) rows are ranked in-stock first; each
+        provider then takes rank 1 of every brand, then rank 2, ... up to per_provider rows.
+        """
+        cur.execute(
+            """
+            SELECT id, provider_id FROM (
+                SELECT id, provider_id, ROW_NUMBER() OVER (PARTITION BY provider_id ORDER BY brand_rank, id) AS n
+                FROM (
+                    SELECT pp.id, pp.provider_id, ROW_NUMBER() OVER (
+                        PARTITION BY pp.provider_id, mp.brand_id
                         ORDER BY (COALESCE(inv.warehouse_total_qty, 0) > 0) DESC, pp.is_discontinued, pp.id
-                    ) AS rn
+                    ) AS brand_rank
                     FROM provider_parts pp
                     JOIN master_parts mp ON mp.id = pp.master_part_id
                     LEFT JOIN provider_part_inventory inv ON inv.provider_part_id = pp.id
-                    WHERE pp.provider_id = %s
-                ) s ORDER BY rn, id LIMIT %s
-                """,
-                [provider_id, per_provider],
-            )
-            got = [r[0] for r in cur.fetchall()]
-            chosen.extend(got)
-            self.stdout.write(f"    provider {provider_id}: {len(got)} provider_parts")
+                ) ranked
+            ) numbered
+            WHERE n <= %s
+            """,
+            [per_provider],
+        )
+        chosen, per = [], {}
+        for pp_id, provider_id in cur.fetchall():
+            chosen.append(pp_id)
+            per[provider_id] = per.get(provider_id, 0) + 1
+        for provider_id in sorted(per):
+            self.stdout.write(f"    provider {provider_id}: {per[provider_id]} provider_parts")
         return sorted(chosen)
+
+    def _sample_ids(self, cur, t, n, estimate):
+        """n rows of a raw feed table, spread across brands. Big tables are read through TABLESAMPLE SYSTEM, which
+        touches only a few percent of the pages (raw feeds are 3-8 GB on production), instead of a full scan."""
+        source = _q(t.name)
+        if estimate > n * 20:
+            percent = min(100.0, round(n * 5 * 100.0 / estimate, 4))
+            source = f"{_q(t.name)} TABLESAMPLE SYSTEM ({percent}) REPEATABLE (42)"
+        if t.has_brand_id:
+            sql = (
+                f"SELECT pk FROM (SELECT {_q(t.pk)} AS pk, ROW_NUMBER() OVER (PARTITION BY brand_id "
+                f"ORDER BY {_q(t.pk)} DESC) AS rn FROM {source}) s ORDER BY rn, pk DESC LIMIT %s"
+            )
+        else:
+            sql = f"SELECT {_q(t.pk)} FROM {source} ORDER BY {_q(t.pk)} DESC LIMIT %s"
+        cur.execute(sql, [n])
+        return [r[0] for r in cur.fetchall()]
 
     def _dependent_ids(self, cur, t, filters, ids):
         first, rest = filters[0], filters[1:]

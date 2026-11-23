@@ -10,6 +10,6 @@ LOG=/home/deploy/logs
 # m  h  dom mon dow  command   (server time UTC)
 15 6 * * *  $DC exec -T app python manage.py index_parts_meilisearch     >> $LOG/index_parts.log 2>&1
 45 6 * * *  $DC exec -T app python manage.py index_vehicles_meilisearch  >> $LOG/index_vehicles.log 2>&1
-0  7 * * *  $DC exec -T app python manage.py index_tires_meilisearch     >> $LOG/index_tires.log 2>&1
-15 7 * * *  $DC exec -T app python manage.py index_wheels_meilisearch    >> $LOG/index_wheels.log 2>&1
+0  7 * * *  $DC exec -T app python manage.py index_tires_meilisearch --rebuild >> $LOG/index_tires.log 2>&1
+15 7 * * *  $DC exec -T app python manage.py index_wheels_meilisearch --rebuild >> $LOG/index_wheels.log 2>&1
 30 7 * * *  $DC exec -T app python manage.py demote_expired_trials       >> $LOG/demote_expired_trials.log 2>&1

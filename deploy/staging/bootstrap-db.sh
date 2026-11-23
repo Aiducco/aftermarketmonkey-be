@@ -31,5 +31,5 @@ manage seed_staging
 echo "==> search indexes"
 manage index_parts_meilisearch --setup
 manage index_vehicles_meilisearch
-manage index_tires_meilisearch --setup
-manage index_wheels_meilisearch --setup
+manage index_tires_meilisearch --rebuild
+manage index_wheels_meilisearch --rebuild

@@ -51,6 +51,7 @@ def _transient_meilisearch_error(exc: BaseException) -> bool:
     msg = str(exc).lower()
     return any(s in msg for s in _REINDEX_TRANSIENT_SUBSTRINGS)
 
+
 # Searchable: what the user types to find results (brand_name is on the document for filtering only)
 # Order is relevance order in Meilisearch: a match in an earlier attribute outranks a later one,
 # which is why part_aliases sits directly behind part_number -- an alias hit is still a
@@ -147,8 +148,16 @@ def setup_index() -> bool:
         index.update_pagination_settings({"maxTotalHits": PARTS_MAX_TOTAL_HITS})
         index.update_typo_tolerance({"disableOnAttributes": TYPO_DISABLED_ATTRIBUTES})
 
-        logger.info("Meilisearch index '%s' configured: searchable=%s, filterable=%s, sortable=%s, maxValuesPerFacet=%s, maxTotalHits=%s, typoDisabled=%s",
-                    INDEX_NAME, SEARCHABLE_ATTRIBUTES, FILTERABLE_ATTRIBUTES, SORTABLE_ATTRIBUTES, PARTS_MAX_VALUES_PER_FACET, PARTS_MAX_TOTAL_HITS, TYPO_DISABLED_ATTRIBUTES)
+        logger.info(
+            "Meilisearch index '%s' configured: searchable=%s, filterable=%s, sortable=%s, maxValuesPerFacet=%s, maxTotalHits=%s, typoDisabled=%s",
+            INDEX_NAME,
+            SEARCHABLE_ATTRIBUTES,
+            FILTERABLE_ATTRIBUTES,
+            SORTABLE_ATTRIBUTES,
+            PARTS_MAX_VALUES_PER_FACET,
+            PARTS_MAX_TOTAL_HITS,
+            TYPO_DISABLED_ATTRIBUTES,
+        )
         return True
     except Exception as e:
         logger.exception("Meilisearch setup failed: %s", str(e))
@@ -169,8 +178,12 @@ def setup_vehicles_index() -> bool:
         index = client.index(INDEX_NAME_VEHICLES)
         index.update_filterable_attributes(VEHICLES_FILTERABLE_ATTRIBUTES)
         index.update_faceting_settings({"maxValuesPerFacet": VEHICLES_MAX_VALUES_PER_FACET})
-        logger.info("Meilisearch index '%s' configured: filterable=%s, maxValuesPerFacet=%s",
-                    INDEX_NAME_VEHICLES, VEHICLES_FILTERABLE_ATTRIBUTES, VEHICLES_MAX_VALUES_PER_FACET)
+        logger.info(
+            "Meilisearch index '%s' configured: filterable=%s, maxValuesPerFacet=%s",
+            INDEX_NAME_VEHICLES,
+            VEHICLES_FILTERABLE_ATTRIBUTES,
+            VEHICLES_MAX_VALUES_PER_FACET,
+        )
         return True
     except Exception as e:
         logger.exception("Meilisearch vehicles setup failed: %s", str(e))
@@ -227,8 +240,7 @@ def _bulk_category_map_for_ids(
         return result
     seen: typing.Set[int] = set()
     qs = (
-        ProviderPart.objects
-        .filter(master_part_id__in=master_part_ids)
+        ProviderPart.objects.filter(master_part_id__in=master_part_ids)
         .exclude(category__isnull=True)
         .exclude(category="")
         .order_by("master_part_id", "id")
@@ -264,8 +276,7 @@ def _bulk_distributors_map_for_ids(
         return result
     seen: typing.Dict[int, typing.Set[int]] = {}
     qs = (
-        ProviderPart.objects
-        .filter(master_part_id__in=master_part_ids)
+        ProviderPart.objects.filter(master_part_id__in=master_part_ids)
         .order_by("master_part_id")
         .values("master_part_id", "provider_id", "provider__name")
         .distinct()
@@ -296,9 +307,9 @@ def _bulk_image_fallback_map_for_ids(master_part_ids: typing.List[int]) -> typin
     result: typing.Dict[int, str] = {}
     if not master_part_ids:
         return result
-    qs = MasterPartData.objects.filter(
-        master_part_id__in=master_part_ids, images__isnull=False
-    ).values("master_part_id", "images")
+    qs = MasterPartData.objects.filter(master_part_id__in=master_part_ids, images__isnull=False).values(
+        "master_part_id", "images"
+    )
     for row in qs:
         images = row["images"]
         if isinstance(images, list) and images:
@@ -346,13 +357,25 @@ def _bulk_fitment_keys_map_for_ids(
     if not master_part_ids:
         return {}
     qs = MasterPartFitment.objects.filter(master_part_id__in=master_part_ids).values(
-        "master_part_id", "year_start", "year_end", "make", "model", "submodel", "drive_type", "engine",
+        "master_part_id",
+        "year_start",
+        "year_end",
+        "make",
+        "model",
+        "submodel",
+        "drive_type",
+        "engine",
     )
     for row in qs:
         mpid = row["master_part_id"]
         keys = _fitment_keys_for_row(
-            row["year_start"], row["year_end"], row["make"], row["model"],
-            row["submodel"], row["drive_type"], row["engine"],
+            row["year_start"],
+            row["year_end"],
+            row["make"],
+            row["model"],
+            row["submodel"],
+            row["drive_type"],
+            row["engine"],
         )
         result.setdefault(mpid, set()).update(keys)
     return {mpid: sorted(keys) for mpid, keys in result.items()}
@@ -362,9 +385,7 @@ def _build_docs_for_batch(
     parts: typing.List,
     cat_map: typing.Dict[int, typing.Tuple[str, str]],
     fitment_map: typing.Optional[typing.Dict[int, typing.List[str]]] = None,
-    distributors_map: typing.Optional[
-        typing.Dict[int, typing.Tuple[typing.List[int], typing.List[str]]]
-    ] = None,
+    distributors_map: typing.Optional[typing.Dict[int, typing.Tuple[typing.List[int], typing.List[str]]]] = None,
     image_fallback_map: typing.Optional[typing.Dict[int, str]] = None,
 ) -> typing.List[typing.Dict]:
     """
@@ -383,26 +404,28 @@ def _build_docs_for_batch(
         brand_name = _get_brand_name(part)
         category, overview_category = cat_map.get(part.id, ("", ""))
         distributor_ids, distributor_names = distributors_map.get(part.id, ([], []))
-        docs.append({
-            "id": part.id,
-            "brand_id": part.brand_id,
-            "brand_name": brand_name or "",
-            "part_number": part.part_number or "",
-            "part_aliases": part.part_aliases or [],
-            "sku": part.sku or "",
-            "description": (part.description or "")[:10000],
-            "aaia_code": part.aaia_code or "",
-            "image_url": part.image_url or image_fallback_map.get(part.id) or "",
-            "gtin": part.gtin or "",
-            "category": category,
-            "overview_category": overview_category,
-            "fitment_keys": fitment_map.get(part.id, []),
-            "distributor_ids": distributor_ids,
-            "distributor_names": distributor_names,
-            "distributor_count": len(distributor_ids),
-            "created_at": part.created_at.isoformat() if part.created_at else None,
-            "updated_at": part.updated_at.isoformat() if part.updated_at else None,
-        })
+        docs.append(
+            {
+                "id": part.id,
+                "brand_id": part.brand_id,
+                "brand_name": brand_name or "",
+                "part_number": part.part_number or "",
+                "part_aliases": part.part_aliases or [],
+                "sku": part.sku or "",
+                "description": (part.description or "")[:10000],
+                "aaia_code": part.aaia_code or "",
+                "image_url": part.image_url or image_fallback_map.get(part.id) or "",
+                "gtin": part.gtin or "",
+                "category": category,
+                "overview_category": overview_category,
+                "fitment_keys": fitment_map.get(part.id, []),
+                "distributor_ids": distributor_ids,
+                "distributor_names": distributor_names,
+                "distributor_count": len(distributor_ids),
+                "created_at": part.created_at.isoformat() if part.created_at else None,
+                "updated_at": part.updated_at.isoformat() if part.updated_at else None,
+            }
+        )
     return docs
 
 
@@ -417,7 +440,8 @@ def _estimate_docs_bytes(docs: typing.List[typing.Dict]) -> int:
 
 
 def _split_docs_by_bytes(
-    docs: typing.List[typing.Dict], max_bytes: int = _MAX_UPLOAD_BATCH_BYTES,
+    docs: typing.List[typing.Dict],
+    max_bytes: int = _MAX_UPLOAD_BATCH_BYTES,
 ) -> typing.List[typing.List[typing.Dict]]:
     """
     Greedily group ``docs`` into chunks whose estimated JSON size stays under ``max_bytes``.
@@ -465,7 +489,10 @@ def _upload_one_chunk_raw(
                     logger.error(
                         "Meilisearch _upload_raw_docs: task did not succeed | index=%s len=%s "
                         "task_uid=%s status=%s error=%s",
-                        index_name, len(docs), task.task_uid, result.status,
+                        index_name,
+                        len(docs),
+                        task.task_uid,
+                        result.status,
                         getattr(result, "error", None),
                     )
                     return False
@@ -473,18 +500,26 @@ def _upload_one_chunk_raw(
         except Exception as e:
             last_err = e
             if attempt < _REINDEX_ADD_RETRIES - 1 and _transient_meilisearch_error(e):
-                wait_s = min(30.0, 2.0 ** attempt)
+                wait_s = min(30.0, 2.0**attempt)
                 logger.warning(
                     "Meilisearch _upload_raw_docs: transient error (retry) | index=%s len=%s attempt=%s/%s "
                     "wait_s=%.1f err_type=%s err=%s",
-                    index_name, len(docs), attempt + 1, _REINDEX_ADD_RETRIES,
-                    wait_s, type(e).__name__, e,
+                    index_name,
+                    len(docs),
+                    attempt + 1,
+                    _REINDEX_ADD_RETRIES,
+                    wait_s,
+                    type(e).__name__,
+                    e,
                 )
                 time.sleep(wait_s)
                 continue
             logger.exception(
                 "Meilisearch _upload_raw_docs: failed | index=%s len=%s attempt=%s err_type=%s",
-                index_name, len(docs), attempt + 1, type(e).__name__,
+                index_name,
+                len(docs),
+                attempt + 1,
+                type(e).__name__,
             )
             return False
     if last_err:
@@ -521,9 +556,11 @@ def _upload_raw_docs(
     chunks = _split_docs_by_bytes(docs)
     if len(chunks) > 1:
         logger.info(
-            "Meilisearch _upload_raw_docs: split oversized batch | index=%s total_docs=%s "
-            "total_bytes=%s chunks=%s",
-            index_name, len(docs), _estimate_docs_bytes(docs), len(chunks),
+            "Meilisearch _upload_raw_docs: split oversized batch | index=%s total_docs=%s " "total_bytes=%s chunks=%s",
+            index_name,
+            len(docs),
+            _estimate_docs_bytes(docs),
+            len(chunks),
         )
     return all(_upload_one_chunk_raw(chunk, index_name, wait_for_completion) for chunk in chunks)
 
@@ -599,7 +636,7 @@ def add_documents(parts: typing.List) -> bool:
         except Exception as e:
             last_err = e
             if attempt < _REINDEX_ADD_RETRIES - 1 and _transient_meilisearch_error(e):
-                wait_s = min(30.0, 2.0 ** attempt)
+                wait_s = min(30.0, 2.0**attempt)
                 logger.warning(
                     "Meilisearch add_documents: transient error (will retry) | len=%s attempt=%s/%s "
                     "wait_s=%.1f err_type=%s err=%s",
@@ -639,7 +676,7 @@ def _batches(queryset, batch_size: int, ids: typing.Optional[typing.List[int]] =
     """
     if ids is not None:
         for i in range(0, len(ids), batch_size):
-            chunk = ids[i:i + batch_size]
+            chunk = ids[i : i + batch_size]
             batch = list(queryset.filter(id__in=chunk).order_by("id"))
             if batch:
                 yield batch
@@ -734,8 +771,7 @@ def add_documents_in_batches(
                 elapsed = now - loop_t0
                 rate = total_ok / elapsed if elapsed > 0 else 0.0
                 logger.info(
-                    "Meilisearch bulk index: heartbeat | elapsed_s=%.0f total_ok=%s total_fail=%s "
-                    "overall_dps=%.0f",
+                    "Meilisearch bulk index: heartbeat | elapsed_s=%.0f total_ok=%s total_fail=%s " "overall_dps=%.0f",
                     elapsed,
                     total_ok,
                     total_fail,
@@ -757,9 +793,7 @@ def add_documents_in_batches(
         return total_ok, total_fail
 
     if ids is not None:
-        return _add_documents_parallel_by_ids(
-            queryset, ids, batch_size, max_upload_workers, target_index_name
-        )
+        return _add_documents_parallel_by_ids(queryset, ids, batch_size, max_upload_workers, target_index_name)
 
     total_ok = 0
     total_fail = 0
@@ -770,8 +804,7 @@ def add_documents_in_batches(
     last_par_heartbeat = par_t0
 
     logger.info(
-        "Meilisearch bulk index: started (parallel) | index=%s batch_size=%s max_upload_workers=%s "
-        "max_in_flight=%s",
+        "Meilisearch bulk index: started (parallel) | index=%s batch_size=%s max_upload_workers=%s " "max_in_flight=%s",
         target_index_name,
         batch_size,
         max_upload_workers,
@@ -789,9 +822,7 @@ def add_documents_in_batches(
             image_fallback_map = _bulk_image_fallback_map_for_ids([p.id for p in batch])
             docs = _build_docs_for_batch(batch, cat_map, fitment_map, distributors_map, image_fallback_map)
             in_flight.append(
-                executor.submit(
-                    _upload_docs_with_retries, docs, target_index_name, batch_index, id_first, id_last
-                )
+                executor.submit(_upload_docs_with_retries, docs, target_index_name, batch_index, id_first, id_last)
             )
             while len(in_flight) >= max_in_flight:
                 done, _ = wait(in_flight, return_when=FIRST_COMPLETED)
@@ -880,7 +911,7 @@ def _upload_one_chunk_with_retries(
         except Exception as e:
             last_err = e
             if attempt < _REINDEX_ADD_RETRIES - 1 and _transient_meilisearch_error(e):
-                wait_s = min(30.0, 2.0 ** attempt)
+                wait_s = min(30.0, 2.0**attempt)
                 logger.warning(
                     "Meilisearch parallel batch: transient (will retry) | batch=%s id_range=%s..%s "
                     "size=%s attempt=%s/%s wait_s=%.1f err_type=%s err=%s",
@@ -942,14 +973,23 @@ def _upload_docs_with_retries(
     logger.info(
         "Meilisearch parallel batch: split oversized batch | batch=%s id_range=%s..%s total_docs=%s "
         "total_bytes=%s chunks=%s",
-        batch_index, id_first, id_last, len(docs), _estimate_docs_bytes(docs), len(chunks),
+        batch_index,
+        id_first,
+        id_last,
+        len(docs),
+        _estimate_docs_bytes(docs),
+        len(chunks),
     )
     total_ok = 0
     total_fail = 0
     for i, chunk in enumerate(chunks, start=1):
         chunk_label = "{}.{}/{}".format(batch_index, i, len(chunks))
         ok, fail = _upload_one_chunk_with_retries(
-            chunk, target_index_name, chunk_label, chunk[0]["id"], chunk[-1]["id"],
+            chunk,
+            target_index_name,
+            chunk_label,
+            chunk[0]["id"],
+            chunk[-1]["id"],
         )
         total_ok += ok
         total_fail += fail
@@ -1001,7 +1041,7 @@ def _add_documents_parallel_by_ids(
     batch_index = 0
     par_t0 = time.monotonic()
     last_par_heartbeat = par_t0
-    chunks = [ids[i:i + batch_size] for i in range(0, len(ids), batch_size)]
+    chunks = [ids[i : i + batch_size] for i in range(0, len(ids), batch_size)]
 
     logger.info(
         "Meilisearch bulk index: started (parallel, db-side) | index=%s batch_size=%s "
@@ -1087,9 +1127,7 @@ def reindex_master_parts_with_fitment(
 
     from src.models import MasterPart, MasterPartFitment
 
-    fitment_part_ids = list(
-        MasterPartFitment.objects.order_by().values_list("master_part_id", flat=True).distinct()
-    )
+    fitment_part_ids = list(MasterPartFitment.objects.order_by().values_list("master_part_id", flat=True).distinct())
     logger.info(
         "Meilisearch fitment-only reindex: %s MasterPart(s) with fitment data (of the full catalog).",
         len(fitment_part_ids),
@@ -1129,7 +1167,13 @@ def reindex_vehicles_index(batch_size: int = 5000) -> typing.Tuple[int, int]:
     t0 = time.monotonic()
     combos = list(
         MasterPartFitment.objects.values(
-            "year_start", "year_end", "make", "model", "submodel", "drive_type", "engine",
+            "year_start",
+            "year_end",
+            "make",
+            "model",
+            "submodel",
+            "drive_type",
+            "engine",
         ).distinct()
     )
 
@@ -1142,7 +1186,12 @@ def reindex_vehicles_index(batch_size: int = 5000) -> typing.Tuple[int, int]:
             # of using it directly as the id. year/make/model/etc. stay as separate filterable
             # fields below, which is all the FE's facet queries actually need.
             natural_key = "{}|{}|{}|{}|{}|{}".format(
-                year, row["make"], row["model"], row["submodel"], row["drive_type"], row["engine"],
+                year,
+                row["make"],
+                row["model"],
+                row["submodel"],
+                row["drive_type"],
+                row["engine"],
             )
             doc_id = hashlib.sha1(natural_key.encode("utf-8")).hexdigest()
             if doc_id not in docs_by_id:
@@ -1166,7 +1215,7 @@ def reindex_vehicles_index(batch_size: int = 5000) -> typing.Tuple[int, int]:
     total_ok = 0
     total_fail = 0
     for i in range(0, len(docs), batch_size):
-        chunk = docs[i:i + batch_size]
+        chunk = docs[i : i + batch_size]
         # wait_for_completion=True: small index, worth the wait to catch real failures instead
         # of just an "enqueued OK" false positive (exactly what went wrong before this fix).
         ok = _upload_raw_docs(chunk, index_name=INDEX_NAME_VEHICLES, wait_for_completion=True)
@@ -1181,7 +1230,8 @@ def reindex_vehicles_index(batch_size: int = 5000) -> typing.Tuple[int, int]:
         if actual_count != total_ok:
             logger.error(
                 "Meilisearch vehicles reindex: MISMATCH - uploaded %s ok but index reports %s documents.",
-                total_ok, actual_count,
+                total_ok,
+                actual_count,
             )
     except Exception:
         logger.exception("Meilisearch vehicles reindex: failed to fetch index stats for sanity check.")
@@ -1328,9 +1378,11 @@ def reindex_all_master_parts_zero_downtime(
         # And again for typo tolerance: a fresh index allows typos on every attribute, which
         # would make every part-number search approximate the moment this index went live.
         staging.update_typo_tolerance({"disableOnAttributes": TYPO_DISABLED_ATTRIBUTES})
-        logger.info("Meilisearch zero-downtime reindex: staging index configured "
-                    "(searchable=%s, typoDisabled=%s)",
-                    SEARCHABLE_ATTRIBUTES, TYPO_DISABLED_ATTRIBUTES)
+        logger.info(
+            "Meilisearch zero-downtime reindex: staging index configured " "(searchable=%s, typoDisabled=%s)",
+            SEARCHABLE_ATTRIBUTES,
+            TYPO_DISABLED_ATTRIBUTES,
+        )
 
         # --- Step 2: delete any stale docs in staging (from previous failed run) ---
         try:
@@ -1338,9 +1390,7 @@ def reindex_all_master_parts_zero_downtime(
             client.wait_for_task(del_task.task_uid, timeout_in_ms=300_000)
             logger.info("Meilisearch zero-downtime reindex: staging cleared")
         except Exception as del_exc:
-            logger.info(
-                "Meilisearch zero-downtime reindex: staging clear failed (may be empty): %s", del_exc
-            )
+            logger.info("Meilisearch zero-downtime reindex: staging clear failed (may be empty): %s", del_exc)
 
         # --- Step 3: index all parts into staging ---
         queryset = MasterPart.objects.select_related("brand").order_by("id")
@@ -1375,8 +1425,19 @@ def reindex_all_master_parts_zero_downtime(
         # swap actually completed successfully well under this window both times, but the old
         # 60_000 (1 min) timeout was too short to observe it, so the job logged a false error and
         # skipped its own cleanup (Step 5) despite the swap having genuinely gone through.
+        # swap_indexes needs both indexes to exist. On a fresh Meilisearch (a new environment) the live index
+        # does not exist yet: create it empty so the swap can go through (found on staging 2026-11-23, where the
+        # failed swap was logged as done and the only copy of the data was then deleted in Step 5).
+        try:
+            client.get_index(INDEX_NAME)
+        except Exception:
+            create_live = client.create_index(INDEX_NAME, {"primaryKey": "id"})
+            client.wait_for_task(create_live.task_uid, timeout_in_ms=120_000)
+            logger.info("Meilisearch zero-downtime reindex: live index '%s' did not exist; created it", INDEX_NAME)
         swap_task = client.swap_indexes([{"indexes": [INDEX_NAME, staging_name]}])
-        client.wait_for_task(swap_task.task_uid, timeout_in_ms=1_200_000)
+        swap_result = client.wait_for_task(swap_task.task_uid, timeout_in_ms=1_200_000)
+        if getattr(swap_result, "status", "succeeded") != "succeeded":
+            raise RuntimeError(f"swap_indexes task {swap_task.task_uid} {swap_result.status}: {swap_result.error}")
         logger.info(
             "Meilisearch zero-downtime reindex: swap_indexes done | %s now live, %s has old data",
             INDEX_NAME,
@@ -1389,9 +1450,7 @@ def reindex_all_master_parts_zero_downtime(
             client.wait_for_task(del_task2.task_uid, timeout_in_ms=120_000)
             logger.info("Meilisearch zero-downtime reindex: staging index deleted")
         except Exception as cleanup_exc:
-            logger.warning(
-                "Meilisearch zero-downtime reindex: staging cleanup failed (non-fatal): %s", cleanup_exc
-            )
+            logger.warning("Meilisearch zero-downtime reindex: staging cleanup failed (non-fatal): %s", cleanup_exc)
 
         total_elapsed = time.monotonic() - pipeline_t0
         logger.info(
