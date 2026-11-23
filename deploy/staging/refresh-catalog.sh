@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Refresh staging's catalog from production, read-only (tasks S-3/S-4). Run as deploy in ~/aftermarketmonkey-be on
 # the staging VM, off-peak. Needs the staging_export role on prod (export_catalog_subset --print-grants) and a
-# pg_hba entry for this VM. The password is asked for interactively and never written to disk.
+# pg_hba entry for this VM (both in place since 2026-11-23).
 #
 #   bash deploy/staging/refresh-catalog.sh [per_provider]      # default 5000
 set -euo pipefail
@@ -11,9 +11,15 @@ DC="docker compose -f docker-compose.staging.yml --env-file .env.app.staging"
 manage() { $DC exec -T "$@"; }
 
 df -h /srv | tail -1
-read -r -s -p "staging_export password for the production database: " PW; echo
-# Exported (not passed on the command line) so the password never shows up in `ps`.
-export CATALOG_SOURCE_DSN="host=5.161.121.143 port=5432 dbname=aftermarketmonkey-db user=staging_export password=$PW sslmode=prefer application_name=staging_refresh"
+# Password: ~/.config/staging-export.pw (mode 600, for unattended runs) or asked for interactively.
+PWFILE=${STAGING_EXPORT_PASSWORD_FILE:-$HOME/.config/staging-export.pw}
+if [ -r "$PWFILE" ]; then
+  PW=$(cat "$PWFILE")
+else
+  read -r -s -p "staging_export password for the production database: " PW; echo
+fi
+# Exported (not passed on the command line) so the password never shows up in `ps`. SSL is required by prod's pg_hba.
+export CATALOG_SOURCE_DSN="host=5.161.121.143 port=5432 dbname=aftermarketmonkey-db user=staging_export password=$PW sslmode=require application_name=staging_refresh"
 unset PW
 
 rm -rf "${OUT:?}/current.new"
