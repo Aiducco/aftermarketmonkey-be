@@ -8,7 +8,13 @@
       "Bash(git status*)",
       "Bash(git diff *)",
       "Bash(git log *)",
-      "Bash(git show *)"
+      "Bash(git show *)",
+"Bash(git show *)",
+"Bash(git add *)",
+"Bash(git commit *)",
+"Bash(./venv/bin/python -m py_compile *)",
+"Bash(curl -s http://localhost:*)",
+"Bash(curl -s -X * http://localhost:*)"
     ],
     "deny": [
       "Read(**/.env)",
