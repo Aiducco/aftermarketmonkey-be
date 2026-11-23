@@ -34,7 +34,9 @@ rm -rf "$OUT/previous"; [ -d "$OUT/current" ] && mv "$OUT/current" "$OUT/previou
 echo "==> import into the staging database (replaces the catalog, then re-seeds the test companies)"
 manage app python manage.py import_catalog_subset /data/catalog-subset/current --replace --settings=conf.settings_staging
 manage app python manage.py seed_staging --settings=conf.settings_staging
-for c in index_parts_meilisearch index_vehicles_meilisearch index_tires_meilisearch index_wheels_meilisearch; do
-  manage app python manage.py "$c" --settings=conf.settings_staging
+# tires/wheels only index with --rebuild (without a flag they do nothing and exit with an error).
+for c in index_parts_meilisearch index_vehicles_meilisearch "index_tires_meilisearch --rebuild" "index_wheels_meilisearch --rebuild"; do
+  # shellcheck disable=SC2086  # $c is a command plus its flag
+  manage app python manage.py $c --settings=conf.settings_staging
 done
 echo "==> done"
