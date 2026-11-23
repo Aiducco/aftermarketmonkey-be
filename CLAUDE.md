@@ -2,7 +2,9 @@
 
 Django 4.1 + plain `django.views.View` JSON endpoints (no DRF, no OpenAPI) on Python 3.12,
 Postgres, Redis cache, Meilisearch. Single Django app `src`. Deps: pip-tools. Deploys on push
-to `main` (production) and `develop` (dev) via GitHub Actions: never push.
+to `main` (production) and `staging` (stage.aftermarketscout.com) via GitHub Actions: never push.
+Branches are cut from `staging` and PRs target `staging`; `main` only moves by a promotion PR `staging` -> `main`
+(hotfix exception: `hotfix/<slug>` from `main`, then a back-merge PR into `staging`).
 
 ## Commands (always use ./venv/bin/python)
 - Run existing tests: ./venv/bin/python manage.py test <dotted.module> --settings=conf.settings_test
