@@ -170,3 +170,6 @@ data/
 # curl/libcurl cookie jars -- live session cookies for distributor portals.
 cookies.txt
 *_cookie.local.txt
+
+# Local verification stack (conf/settings_dev.py)
+.dev-data/
