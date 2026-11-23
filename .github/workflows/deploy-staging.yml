@@ -43,7 +43,7 @@ jobs:
           username: ${{ secrets.STAGING_SSH_USER }}
           key: ${{ secrets.STAGING_SSH_KEY }}
           port: 22
-          script_stop: true
+          # No script_stop: it aborts on any failing line, even a curl inside the retry loop; set -e below is enough.
           envs: DEPLOY_REF
           script: |
             set -euo pipefail
