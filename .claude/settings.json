@@ -15,6 +15,7 @@
       "Read(**/.env.*)",
       "Read(**/summit_racing_cookie.local.txt)",
       "Bash(git push*)",
+      "Bash(git * push*)",
       "Bash(gh pr merge*)",
       "Bash(git stash*)",
       "Bash(git reset*)",
