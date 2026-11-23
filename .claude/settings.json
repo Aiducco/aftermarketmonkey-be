@@ -9,38 +9,52 @@
       "Bash(git diff *)",
       "Bash(git log *)",
       "Bash(git show *)",
-"Bash(git show *)",
-"Bash(git add *)",
-"Bash(git commit *)",
-"Bash(./venv/bin/python -m py_compile *)",
-"Bash(curl -s http://localhost:*)",
-"Bash(curl -s -X * http://localhost:*)"
+      "Bash(git show *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(./venv/bin/python -m py_compile *)",
+      "Bash(curl -s http://localhost:*)",
+      "Bash(curl -s -X * http://localhost:*)"
     ],
     "deny": [
       "Read(**/.env)",
       "Read(**/.env.*)",
       "Read(**/summit_racing_cookie.local.txt)",
       "Bash(git push*)",
-      "Bash(git * push*)",
-      "Bash(gh pr merge*)",
-      "Bash(git stash*)",
-      "Bash(git reset*)",
-      "Bash(git clean*)",
-      "Bash(git checkout*)",
-      "Bash(*manage.py migrate*)",
-      "Bash(*manage.py flush*)"
+      "Bash(gh pr merge*)"
     ]
   },
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/guard-bash.py"
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Edit|Write",
-        "hooks": [{ "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/format.sh" }]
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/format.sh"
+          }
+        ]
       }
     ],
     "Stop": [
       {
-        "hooks": [{ "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/quick-check.sh" }]
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/quick-check.sh"
+          }
+        ]
       }
     ]
   }
