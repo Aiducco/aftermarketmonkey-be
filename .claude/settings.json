@@ -1,0 +1,40 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./venv/bin/python manage.py test * --settings=conf.settings_test*)",
+      "Bash(./venv/bin/python manage.py check --settings=conf.settings_test*)",
+      "Bash(./venv/bin/black *)",
+      "Bash(./venv/bin/isort *)",
+      "Bash(git status*)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git show *)"
+    ],
+    "deny": [
+      "Read(**/.env)",
+      "Read(**/.env.*)",
+      "Read(**/summit_racing_cookie.local.txt)",
+      "Bash(git push*)",
+      "Bash(gh pr merge*)",
+      "Bash(git stash*)",
+      "Bash(git reset*)",
+      "Bash(git clean*)",
+      "Bash(git checkout*)",
+      "Bash(*manage.py migrate*)",
+      "Bash(*manage.py flush*)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [{ "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/format.sh" }]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [{ "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/quick-check.sh" }]
+      }
+    ]
+  }
+}
