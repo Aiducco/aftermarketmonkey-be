@@ -1,0 +1,47 @@
+name: Promote staging to production
+
+# Opens (or refreshes) the release PR staging -> main. Merge it with a MERGE COMMIT (not squash) so the branches
+# stay in step; merging deploys production via deploy.yml. Run it from the Actions tab.
+# PRs opened with the default GITHUB_TOKEN do not trigger other workflows (CI would not run on the release PR), so
+# set the PROMOTE_TOKEN secret (fine-grained PAT: contents read, pull requests write) to get CI on it.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Open or update the release PR
+        env:
+          GH_TOKEN: ${{ secrets.PROMOTE_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git fetch origin main staging
+          ahead=$(git rev-list --count origin/main..origin/staging)
+          if [ "$ahead" = 0 ]; then echo "staging has nothing that main lacks; no release PR needed."; exit 0; fi
+          {
+            echo "Release: promote \`staging\` to \`main\` (production)."
+            echo
+            echo "Merge with a **merge commit** (not squash). Merging deploys production."
+            echo
+            echo "### Changes since the last promotion ($ahead commits)"
+            git log --first-parent --pretty='- %s (%h)' origin/main..origin/staging
+            echo
+            echo "### Before merging"
+            echo "- [ ] Validated on https://stage.aftermarketscout.com"
+            echo "- [ ] Migrations in this range reviewed (they already ran on staging)"
+          } > body.md
+          existing=$(gh pr list --base main --head staging --state open --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh pr edit "$existing" --body-file body.md
+            echo "Updated release PR #$existing"
+          else
+            gh pr create --base main --head staging --title "Release $(date -u +%Y-%m-%d): staging -> main" --body-file body.md
+          fi

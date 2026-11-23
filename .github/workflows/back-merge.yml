@@ -1,0 +1,44 @@
+name: Back-merge main into staging
+
+# After a hotfix lands on main, open a PR main -> staging so staging never lacks a production fix.
+# A normal promotion only adds a merge commit to main, so it is ignored (only non-merge commits are counted).
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  back-merge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Open a back-merge PR if main has commits staging lacks
+        env:
+          GH_TOKEN: ${{ secrets.PROMOTE_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! git ls-remote --exit-code --heads origin staging >/dev/null; then
+            echo "No staging branch yet; nothing to do."; exit 0
+          fi
+          git fetch origin main staging
+          missing=$(git rev-list --no-merges --count origin/staging..origin/main)
+          if [ "$missing" = 0 ]; then echo "staging already has everything on main."; exit 0; fi
+          {
+            echo "Back-merge: \`main\` has $missing commit(s) that \`staging\` lacks (usually a hotfix)."
+            echo
+            git log --no-merges --pretty='- %s (%h)' origin/staging..origin/main
+            echo
+            echo "If this conflicts, resolve it on a branch cut from staging; never commit to main directly."
+          } > body.md
+          existing=$(gh pr list --base staging --head main --state open --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh pr edit "$existing" --body-file body.md
+            echo "Updated back-merge PR #$existing"
+          else
+            gh pr create --base staging --head main --title "Back-merge main into staging" --body-file body.md
+          fi

@@ -1,11 +1,12 @@
 name: CI
 
-# Runs on pull requests only. Pushes to main/develop are handled by deploy.yml (which deploys and migrates):
-# make this check required in branch protection so nothing reaches main without passing it.
+# Runs on pull requests into staging (feature work) and main (promotion and hotfix PRs). Branch updates are
+# deployed by deploy-staging.yml (staging) and deploy.yml (main = production), which also migrate: make this check
+# required in branch protection so nothing reaches either branch without passing it.
 # Uses conf.settings_test (SQLite, no .env, never a real database).
 on:
   pull_request:
-    branches: [main, develop]
+    branches: [staging, main]
 
 jobs:
   checks:

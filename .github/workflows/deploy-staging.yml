@@ -1,0 +1,86 @@
+name: Deploy staging
+
+# Staging only: stage.aftermarketscout.com on its own VM (docs/plans/staging-environment.md in the workspace repo).
+# Production deploys stay in deploy.yml (main). Secrets: STAGING_SSH_HOST, STAGING_SSH_USER, STAGING_SSH_KEY.
+on:
+  push:
+    branches: [staging]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or commit SHA to deploy to staging (the next staging update puts it back to the branch head)"
+        required: true
+        default: staging
+
+# One staging deploy at a time; never cancel one mid-migration.
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to stage.aftermarketscout.com
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve ref
+        env:
+          INPUT_REF: ${{ github.event.inputs.ref || github.ref_name }}
+        run: |
+          # Only plain ref names reach the server's shell.
+          if ! printf '%s' "$INPUT_REF" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$'; then
+            echo "::error::refusing ref '$INPUT_REF'"; exit 1
+          fi
+          echo "DEPLOY_REF=$INPUT_REF" >> "$GITHUB_ENV"
+          echo "Deploying $INPUT_REF"
+
+      - name: Deploy via SSH (staging VM only)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.STAGING_SSH_HOST }}
+          username: ${{ secrets.STAGING_SSH_USER }}
+          key: ${{ secrets.STAGING_SSH_KEY }}
+          port: 22
+          script_stop: true
+          envs: DEPLOY_REF
+          script: |
+            set -euo pipefail
+            # Guard: this workflow must never run on the production host.
+            if hostname -I 2>/dev/null | tr ' ' '\n' | grep -qx '5.161.121.143'; then
+              echo "This is the PRODUCTION host. Refusing to deploy staging here."; exit 1
+            fi
+
+            cd ~/aftermarketmonkey-be
+            echo "==> fetch $DEPLOY_REF"
+            git fetch --prune origin "$DEPLOY_REF"
+            git -c advice.detachedHead=false checkout -f --detach FETCH_HEAD
+            git log --oneline -1
+
+            DC="docker compose -f docker-compose.staging.yml --env-file .env.app.staging"
+            echo "==> build"
+            $DC build app
+            echo "==> up"
+            $DC up -d --remove-orphans
+            echo "==> migrate (staging database)"
+            $DC exec -T app python manage.py migrate --no-input
+
+            echo "==> local smoke check"
+            for i in $(seq 1 30); do
+              if curl -fsS -o /dev/null http://127.0.0.1:8005/api/onboarding/distributor-credentials-info/; then
+                echo "api up"; break
+              fi
+              [ "$i" = 30 ] && { echo "api did not come up"; $DC logs --tail 80 app; exit 1; }
+              sleep 2
+            done
+            docker image prune -f >/dev/null
+
+      - name: Public smoke check
+        run: |
+          set -euo pipefail
+          base=https://stage.aftermarketscout.com
+          curl -fsS --retry 5 --retry-delay 3 --retry-all-errors -o /dev/null "$base/api/onboarding/distributor-credentials-info/"
+          curl -fsS -D - -o /dev/null "$base/api/onboarding/distributor-credentials-info/" | grep -iq '^x-robots-tag: noindex' \
+            || { echo "::error::X-Robots-Tag noindex header missing on staging"; exit 1; }
+          echo "staging api OK"
