@@ -1,0 +1,15 @@
+# Staging crontab (task S-7): the deploy user's crontab on the staging VM. Install: crontab deploy/staging/crontab
+# Only nightly search indexing and trial demotion. Deliberately NOT here: distributor syncs (Turn 14, ingest of all
+# providers, The Wheel Group, Shopmonkey, Rough Country EDI), purchase-order processing, CRM syncs
+# (sync_platform_signups, sync_instantly_replies). Staging has no credentials for any of them.
+SHELL=/bin/bash
+PATH=/usr/local/bin:/usr/bin:/bin
+DC="docker compose -f /home/deploy/aftermarketmonkey-be/docker-compose.staging.yml --env-file /home/deploy/aftermarketmonkey-be/.env.app.staging"
+LOG=/home/deploy/logs
+
+# m  h  dom mon dow  command   (server time UTC)
+15 6 * * *  $DC exec -T app python manage.py index_parts_meilisearch     >> $LOG/index_parts.log 2>&1
+45 6 * * *  $DC exec -T app python manage.py index_vehicles_meilisearch  >> $LOG/index_vehicles.log 2>&1
+0  7 * * *  $DC exec -T app python manage.py index_tires_meilisearch     >> $LOG/index_tires.log 2>&1
+15 7 * * *  $DC exec -T app python manage.py index_wheels_meilisearch    >> $LOG/index_wheels.log 2>&1
+30 7 * * *  $DC exec -T app python manage.py demote_expired_trials       >> $LOG/demote_expired_trials.log 2>&1
