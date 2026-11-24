@@ -138,6 +138,9 @@ class Command(BaseCommand):
             )
             # If profile already exists, update company
             UserProfile.objects.filter(user=user).update(company=new_company, is_company_admin=True)
+            # Space rows belong to the company the profile left.
+            for moved in UserProfile.objects.filter(user=user):
+                moved.spaces.clear()
             self.stdout.write(f"UserProfile linked.")
 
             # --- 3. Clone CompanyProviders (credentials) ---
@@ -194,9 +197,7 @@ class Command(BaseCommand):
                 _bulk_clone_pricing(
                     AtechCompanyPricing, "company", source, new_company, "AtechCompanyPricing", self.stdout
                 )
-                _bulk_clone_pricing(
-                    DlgCompanyPricing, "company", source, new_company, "DlgCompanyPricing", self.stdout
-                )
+                _bulk_clone_pricing(DlgCompanyPricing, "company", source, new_company, "DlgCompanyPricing", self.stdout)
                 _bulk_clone_pricing(
                     WheelProsCompanyPricing, "company", source, new_company, "WheelProsCompanyPricing", self.stdout
                 )
@@ -208,9 +209,7 @@ class Command(BaseCommand):
                     "RoughCountryCompanyPricing",
                     self.stdout,
                 )
-                _bulk_clone_pricing(
-                    SbCompanyPricing, "company", source, new_company, "SbCompanyPricing", self.stdout
-                )
+                _bulk_clone_pricing(SbCompanyPricing, "company", source, new_company, "SbCompanyPricing", self.stdout)
                 _bulk_clone_pricing(
                     ProviderPartCompanyPricing,
                     "company",
