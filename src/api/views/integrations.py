@@ -113,11 +113,13 @@ class ProviderConnectView(views.View):
             )
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
-                content=simplejson.dumps({
-                    "message": err,
-                    "error_code": error_code,
-                    **({"upgrade_required": True} if is_plan_limit else {}),
-                }),
+                content=simplejson.dumps(
+                    {
+                        "message": err,
+                        "error_code": error_code,
+                        **({"upgrade_required": True} if is_plan_limit else {}),
+                    }
+                ),
                 status=402 if is_plan_limit else 400,
             )
 
@@ -584,15 +586,12 @@ class OrderAccountDetailView(views.View):
 
 class CompanyProvidersView(views.View):
     def get(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
-
         # AUTH CHECK
         logger.info(
             f"{_LOG_PREFIX} Auth check - user: {request.user}, is_authenticated: {getattr(request.user, 'is_authenticated', False) if request.user else False}"
         )
         if not request.user or not request.user.is_authenticated:
-            logger.warning(
-                f"{_LOG_PREFIX} User not authenticated for {request.path}"
-            )
+            logger.warning(f"{_LOG_PREFIX} User not authenticated for {request.path}")
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
                 content=simplejson.dumps({"message": "User not authenticated"}),
@@ -629,15 +628,12 @@ class CompanyProvidersView(views.View):
 
 class CompanyProviderDetailView(views.View):
     def get(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
-
         # AUTH CHECK
         logger.info(
             f"{_LOG_PREFIX} Auth check - user: {request.user}, is_authenticated: {getattr(request.user, 'is_authenticated', False) if request.user else False}"
         )
         if not request.user or not request.user.is_authenticated:
-            logger.warning(
-                f"{_LOG_PREFIX} User not authenticated for {request.path}"
-            )
+            logger.warning(f"{_LOG_PREFIX} User not authenticated for {request.path}")
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
                 content=simplejson.dumps({"message": "User not authenticated"}),
@@ -653,7 +649,7 @@ class CompanyProviderDetailView(views.View):
                 status=400,
             )
 
-        provider_id = kwargs.get('id')
+        provider_id = kwargs.get("id")
         if not provider_id:
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
@@ -671,10 +667,7 @@ class CompanyProviderDetailView(views.View):
             )
 
         try:
-            data = integrations_services.get_company_provider_by_id(
-                company_id=company_id,
-                provider_id=provider_id_int
-            )
+            data = integrations_services.get_company_provider_by_id(company_id=company_id, provider_id=provider_id_int)
         except Exception as e:
             logger.error(
                 f"{_LOG_PREFIX} Error fetching company provider with id: {provider_id_int} for company_id: {company_id}. Error: {str(e)}"
@@ -701,15 +694,12 @@ class CompanyProviderDetailView(views.View):
 
 class BrandsWithProvidersView(views.View):
     def get(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
-
         # AUTH CHECK
         logger.info(
             f"{_LOG_PREFIX} Auth check - user: {request.user}, is_authenticated: {getattr(request.user, 'is_authenticated', False) if request.user else False}"
         )
         if not request.user or not request.user.is_authenticated:
-            logger.warning(
-                f"{_LOG_PREFIX} User not authenticated for {request.path}"
-            )
+            logger.warning(f"{_LOG_PREFIX} User not authenticated for {request.path}")
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
                 content=simplejson.dumps({"message": "User not authenticated"}),
@@ -719,9 +709,7 @@ class BrandsWithProvidersView(views.View):
         try:
             data = integrations_services.get_all_brands_with_providers()
         except Exception as e:
-            logger.error(
-                f"{_LOG_PREFIX} Error fetching brands with providers. Error: {str(e)}"
-            )
+            logger.error(f"{_LOG_PREFIX} Error fetching brands with providers. Error: {str(e)}")
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
                 content=simplejson.dumps({"message": "Error fetching brands with providers"}),
@@ -737,15 +725,12 @@ class BrandsWithProvidersView(views.View):
 
 class CompanyDestinationsWithBrandsView(views.View):
     def get(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
-
         # AUTH CHECK
         logger.info(
             f"{_LOG_PREFIX} Auth check - user: {request.user}, is_authenticated: {getattr(request.user, 'is_authenticated', False) if request.user else False}"
         )
         if not request.user or not request.user.is_authenticated:
-            logger.warning(
-                f"{_LOG_PREFIX} User not authenticated for {request.path}"
-            )
+            logger.warning(f"{_LOG_PREFIX} User not authenticated for {request.path}")
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
                 content=simplejson.dumps({"message": "User not authenticated"}),
@@ -782,15 +767,12 @@ class CompanyDestinationsWithBrandsView(views.View):
 
 class CompanyDestinationDetailView(views.View):
     def get(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
-
         # AUTH CHECK
         logger.info(
             f"{_LOG_PREFIX} Auth check - user: {request.user}, is_authenticated: {getattr(request.user, 'is_authenticated', False) if request.user else False}"
         )
         if not request.user or not request.user.is_authenticated:
-            logger.warning(
-                f"{_LOG_PREFIX} User not authenticated for {request.path}"
-            )
+            logger.warning(f"{_LOG_PREFIX} User not authenticated for {request.path}")
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
                 content=simplejson.dumps({"message": "User not authenticated"}),
@@ -806,7 +788,7 @@ class CompanyDestinationDetailView(views.View):
                 status=400,
             )
 
-        destination_id = kwargs.get('id')
+        destination_id = kwargs.get("id")
         if not destination_id:
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
@@ -825,8 +807,7 @@ class CompanyDestinationDetailView(views.View):
 
         try:
             data = integrations_services.get_company_destination_by_id(
-                company_id=company_id,
-                destination_id=destination_id_int
+                company_id=company_id, destination_id=destination_id_int
             )
         except Exception as e:
             logger.error(
@@ -854,15 +835,12 @@ class CompanyDestinationDetailView(views.View):
 
 class ExecutionRunsView(views.View):
     def get(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
-
         # AUTH CHECK
         logger.info(
             f"{_LOG_PREFIX} Auth check - user: {request.user}, is_authenticated: {getattr(request.user, 'is_authenticated', False) if request.user else False}"
         )
         if not request.user or not request.user.is_authenticated:
-            logger.warning(
-                f"{_LOG_PREFIX} User not authenticated for {request.path}"
-            )
+            logger.warning(f"{_LOG_PREFIX} User not authenticated for {request.path}")
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
                 content=simplejson.dumps({"message": "User not authenticated"}),
@@ -879,7 +857,7 @@ class ExecutionRunsView(views.View):
             )
 
         # Get destination_id from URL path (optional)
-        destination_id = kwargs.get('destination_id')
+        destination_id = kwargs.get("destination_id")
         if destination_id:
             try:
                 destination_id_int = int(destination_id)
@@ -894,12 +872,12 @@ class ExecutionRunsView(views.View):
 
         # Get pagination parameters from query string
         try:
-            page = int(request.GET.get('page', 1))
+            page = int(request.GET.get("page", 1))
         except (ValueError, TypeError):
             page = 1
 
         try:
-            page_size = int(request.GET.get('page_size', 20))
+            page_size = int(request.GET.get("page_size", 20))
             # Limit page_size to prevent abuse
             if page_size > 100:
                 page_size = 100
@@ -910,15 +888,10 @@ class ExecutionRunsView(views.View):
 
         try:
             result = integrations_services.get_company_execution_runs(
-                company_id=company_id,
-                destination_id=destination_id_int,
-                page=page,
-                page_size=page_size
+                company_id=company_id, destination_id=destination_id_int, page=page, page_size=page_size
             )
         except Exception as e:
-            logger.error(
-                f"{_LOG_PREFIX} Error fetching execution runs for company_id: {company_id}. Error: {str(e)}"
-            )
+            logger.error(f"{_LOG_PREFIX} Error fetching execution runs for company_id: {company_id}. Error: {str(e)}")
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
                 content=simplejson.dumps({"message": "Error fetching execution runs"}),
@@ -934,15 +907,12 @@ class ExecutionRunsView(views.View):
 
 class ExecutionRunPartsHistoryView(views.View):
     def get(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
-
         # AUTH CHECK
         logger.info(
             f"{_LOG_PREFIX} Auth check - user: {request.user}, is_authenticated: {getattr(request.user, 'is_authenticated', False) if request.user else False}"
         )
         if not request.user or not request.user.is_authenticated:
-            logger.warning(
-                f"{_LOG_PREFIX} User not authenticated for {request.path}"
-            )
+            logger.warning(f"{_LOG_PREFIX} User not authenticated for {request.path}")
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
                 content=simplejson.dumps({"message": "User not authenticated"}),
@@ -958,7 +928,7 @@ class ExecutionRunPartsHistoryView(views.View):
                 status=400,
             )
 
-        execution_run_id = kwargs.get('execution_run_id')
+        execution_run_id = kwargs.get("execution_run_id")
         if not execution_run_id:
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
@@ -977,12 +947,12 @@ class ExecutionRunPartsHistoryView(views.View):
 
         # Get pagination parameters from query string
         try:
-            page = int(request.GET.get('page', 1))
+            page = int(request.GET.get("page", 1))
         except (ValueError, TypeError):
             page = 1
 
         try:
-            page_size = int(request.GET.get('page_size', 20))
+            page_size = int(request.GET.get("page_size", 20))
             # Limit page_size to prevent abuse
             if page_size > 100:
                 page_size = 100
@@ -993,10 +963,7 @@ class ExecutionRunPartsHistoryView(views.View):
 
         try:
             result = integrations_services.get_execution_run_parts_history(
-                company_id=company_id,
-                execution_run_id=execution_run_id_int,
-                page=page,
-                page_size=page_size
+                company_id=company_id, execution_run_id=execution_run_id_int, page=page, page_size=page_size
             )
         except Exception as e:
             logger.error(
@@ -1169,4 +1136,3 @@ class CustomIntegrationRequestsView(views.View):
             content=simplejson.dumps({"status": "requested"}),
             status=200,
         )
-
