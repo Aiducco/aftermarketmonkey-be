@@ -761,7 +761,8 @@ def _accounts_to_remove(space: src_models.Space) -> typing.List[dict]:
 
 def delete_space(scope: SpaceScope, space_id: int) -> None:
     """Deletes a space and its one address. Refused while it is the main space, holds orders or carts, or is
-    the only space of a non-admin member or of an order account, or has its own distributor connections."""
+    the only space of a non-admin member or of an order account, or has its own distributor connections or a
+    shop-system connection."""
     require_admin(scope)
     try:
         _delete_space(scope, space_id)
@@ -788,6 +789,8 @@ def _delete_space(scope: SpaceScope, space_id: int) -> None:
             raise SpaceError(
                 "This space has its own distributor accounts. Disconnect them first.", ERROR_SPACE_NOT_EMPTY
             )
+        if src_models.CompanyShopManagementProviders.objects.filter(space=space).exists():
+            raise SpaceError("This space has a shop system connected. Disconnect it first.", ERROR_SPACE_NOT_EMPTY)
         users = _people_to_remove(space)
         if users:
             raise SpaceError(
