@@ -1955,6 +1955,13 @@ def get_order_capabilities(
             order_accounts = _accounts_for_scope(scope, cp)
         else:
             order_accounts = _serialize_order_accounts(cp)
+        # A connection the space uses none of the accounts of stays listed but cannot order for this space.
+        used_by_none = (
+            scope is not None
+            and scope.enabled
+            and not order_accounts
+            and cp.order_accounts.filter(active=True).exists()
+        )
         results.append(
             {
                 "company_provider_id": cp.id,
@@ -1963,7 +1970,7 @@ def get_order_capabilities(
                 "provider_name": cp.provider.name,
                 # False while this connection is paused for plan limits or the plan has no
                 # ordering at all (Scout) -- "paused" / "ordering_enabled" say which.
-                "can_order_in_app": bool(adapter) and cp.paused_at is None and ordering_enabled,
+                "can_order_in_app": bool(adapter) and cp.paused_at is None and ordering_enabled and not used_by_none,
                 "paused": cp.paused_at is not None,
                 "ordering_enabled": ordering_enabled,
                 # 'api' | 'email' | 'edi' | None — see base.DistributorOrderAdapter.fulfillment_channel.
