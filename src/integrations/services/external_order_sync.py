@@ -118,8 +118,39 @@ def _match_our_order_account_id(
         )
         if po is not None:
             return True, po.order_account_id
+        po = _match_prefixed_purchase_order(company_provider_id, customer_po_number)
+        if po is not None:
+            return True, po.order_account_id
 
     return False, None
+
+
+def _match_prefixed_purchase_order(
+    company_provider_id: int, customer_po_number: str
+) -> typing.Optional[src_models.PurchaseOrder]:
+    """The PO of this connection that was sent as ``customer_po_number`` with its space's prefix in front
+    (base.resolve_po_number), for an order whose distributor-order row was never recorded. The value must start
+    with a prefix of this connection's company; the rest is then matched against po_name / po_number of a PO
+    with that po_prefix. Nothing is stripped anywhere else."""
+    value = customer_po_number.strip()
+    prefixes = (
+        src_models.Space.objects.filter(company__company_providers__id=company_provider_id)
+        .exclude(prefix__isnull=True)
+        .exclude(prefix="")
+        .values_list("prefix", flat=True)
+    )
+    for prefix in prefixes:
+        if not value.upper().startswith(prefix.upper()) or len(value) == len(prefix):
+            continue
+        rest = value[len(prefix) :]
+        po = (
+            src_models.PurchaseOrder.objects.filter(company_provider_id=company_provider_id, po_prefix__iexact=prefix)
+            .filter(Q(po_name=rest) | Q(po_number=rest))
+            .first()
+        )
+        if po is not None:
+            return po
+    return None
 
 
 def _is_ours(
