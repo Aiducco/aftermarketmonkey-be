@@ -73,7 +73,7 @@ def _space_allowance_fields(company: src_models.Company) -> typing.Dict:
         "space_allowance": billing_services.space_allowance(company),
         "space_base": billing_services._space_base(company),
         "space_base_override": company.space_base_override,
-        "additional_spaces": company.additional_spaces,
+        "additional_spaces": company.additional_spaces or 0,
         # The main space counts before its row exists (billing.spaces_in_use).
         "spaces_used": max(1, company.spaces_count),
     }
