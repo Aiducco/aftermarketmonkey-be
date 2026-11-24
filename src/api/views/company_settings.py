@@ -179,7 +179,11 @@ class CompanyTeamView(views.View):
         seat_allowed, seat_reason = billing_services.check_seat_limit(company_id)
         if not seat_allowed:
             return _json_response(
-                {"message": seat_reason, "error_code": billing_services.PLAN_LIMIT_ERROR_CODE, "upgrade_required": True},
+                {
+                    "message": seat_reason,
+                    "error_code": billing_services.PLAN_LIMIT_ERROR_CODE,
+                    "upgrade_required": True,
+                },
                 status=402,
             )
 
