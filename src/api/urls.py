@@ -124,11 +124,7 @@ from src.api.views.purchase_orders import (
 )
 
 urlpatterns = [
-    path(
-        "auth/login/",
-        LoginView.as_view(),
-        name="login"
-    ),
+    path("auth/login/", LoginView.as_view(), name="login"),
     path(
         "onboarding/register/",
         RegisterView.as_view(),
@@ -154,11 +150,7 @@ urlpatterns = [
         DistributorCredentialsInfoView.as_view(),
         name="onboarding_distributor_credentials_info",
     ),
-    path(
-        "auth/change-password/",
-        ChangePasswordView.as_view(),
-        name="change_password"
-    ),
+    path("auth/change-password/", ChangePasswordView.as_view(), name="change_password"),
     path(
         "auth/company/destinations/",
         CompanyDestinationsView.as_view(),
