@@ -317,8 +317,8 @@ class ExternalOrderSorter:
 
 
 def external_order_sorter(company_id: int) -> typing.Optional[ExternalOrderSorter]:
-    """The sorter for a flagged company (the customer company, never a feed tenant); None for an unflagged one (its orders keep going to the main space with
-    no reason, exactly as before)."""
+    """The sorter for a flagged company (the customer company, never a feed tenant); None for an unflagged one
+    (its orders keep going to the main space with no reason, exactly as before)."""
     if not feature_flags_services.company_has_feature(company_id, feature_flags_services.FEATURE_MULTI_SPACES):
         return None
     return ExternalOrderSorter(company_id)
