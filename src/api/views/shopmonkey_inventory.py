@@ -7,6 +7,7 @@ from django import http, views
 
 from src import enums as src_enums
 from src.api.services import shopmonkey_inventory as shopmonkey_inventory_services
+from src.api.services import spaces as spaces_services
 
 logger = logging.getLogger(__name__)
 _LOG_PREFIX = "[SHOPMONKEY-INVENTORY]"
@@ -24,6 +25,15 @@ def _error_response(message: str, error_code: typing.Optional[str]) -> http.Http
         headers={"Content-Type": "application/json"},
         content=simplejson.dumps({"message": message, "error_code": error_code}),
         status=_ERROR_STATUS.get(error_code, 400),
+    )
+
+
+def _space_error_response(e: spaces_services.SpaceError) -> http.HttpResponse:
+    """A space rule's answer: status, message, ``error_code`` and any extra keys (``space``)."""
+    return http.HttpResponse(
+        headers={"Content-Type": "application/json"},
+        content=simplejson.dumps(e.body()),
+        status=e.status_code,
     )
 
 
@@ -63,7 +73,12 @@ class ShopMonkeyInventoryStateView(views.View):
                 content=simplejson.dumps({"message": "No company found in token"}),
                 status=400,
             )
-        data, error_code = shopmonkey_inventory_services.get_inventory_state(company_id=company_id)
+        try:
+            data, error_code = shopmonkey_inventory_services.get_inventory_state(
+                company_id=company_id, scope=spaces_services.resolve_scope(request)
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         if error_code:
             return _error_response("Inventory management is not available for this company.", error_code)
         return http.HttpResponse(
@@ -92,7 +107,12 @@ class ShopMonkeyAvailableBrandsView(views.View):
                 status=400,
             )
 
-        data, error_code = shopmonkey_inventory_services.get_available_brands(company_id=company_id)
+        try:
+            data, error_code = shopmonkey_inventory_services.get_available_brands(
+                company_id=company_id, scope=spaces_services.resolve_scope(request)
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         if error_code:
             return _error_response("Shop management inventory sync is not available for this company.", error_code)
         return http.HttpResponse(
@@ -121,7 +141,12 @@ class ShopMonkeySyncBrandsView(views.View):
                 status=400,
             )
 
-        data, error_code = shopmonkey_inventory_services.list_sync_brands(company_id=company_id)
+        try:
+            data, error_code = shopmonkey_inventory_services.list_sync_brands(
+                company_id=company_id, scope=spaces_services.resolve_scope(request)
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         if error_code:
             return _error_response("Shop management inventory sync is not available for this company.", error_code)
         return http.HttpResponse(
@@ -167,12 +192,16 @@ class ShopMonkeySyncBrandsView(views.View):
                 status=400,
             )
 
-        data, error_code = shopmonkey_inventory_services.create_sync_brand(
-            company_id=company_id,
-            brand_id=brand_id,
-            provider_ids=provider_ids,
-            primary_provider_id=primary_provider_id,
-        )
+        try:
+            data, error_code = shopmonkey_inventory_services.create_sync_brand(
+                company_id=company_id,
+                brand_id=brand_id,
+                provider_ids=provider_ids,
+                primary_provider_id=primary_provider_id,
+                scope=spaces_services.resolve_scope(request),
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         if error_code:
             return _error_response("Could not enable this brand for sync.", error_code)
         return http.HttpResponse(
@@ -213,9 +242,12 @@ class ShopMonkeySyncBrandDetailView(views.View):
                 status=400,
             )
 
-        data, error_code = shopmonkey_inventory_services.get_sync_brand(
-            company_id=company_id, sync_brand_id=sync_brand_id
-        )
+        try:
+            data, error_code = shopmonkey_inventory_services.get_sync_brand(
+                company_id=company_id, sync_brand_id=sync_brand_id, scope=spaces_services.resolve_scope(request)
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         if error_code:
             return _error_response("Could not fetch this sync brand.", error_code)
         return http.HttpResponse(
@@ -287,13 +319,17 @@ class ShopMonkeySyncBrandDetailView(views.View):
                     status=400,
                 )
 
-        data, error_code = shopmonkey_inventory_services.update_sync_brand(
-            company_id=company_id,
-            sync_brand_id=sync_brand_id,
-            enabled=enabled,
-            provider_ids=provider_ids,
-            primary_provider_id=primary_provider_id,
-        )
+        try:
+            data, error_code = shopmonkey_inventory_services.update_sync_brand(
+                company_id=company_id,
+                sync_brand_id=sync_brand_id,
+                enabled=enabled,
+                provider_ids=provider_ids,
+                primary_provider_id=primary_provider_id,
+                scope=spaces_services.resolve_scope(request),
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         if error_code:
             return _error_response("Could not update this sync brand.", error_code)
         return http.HttpResponse(
@@ -338,11 +374,15 @@ class ShopMonkeySyncBrandDetailView(views.View):
             )
         confirm = body.get("confirm_brand_name") if isinstance(body, dict) else None
 
-        data, error_code = shopmonkey_inventory_services.delete_sync_brand(
-            company_id=company_id,
-            sync_brand_id=sync_brand_id,
-            confirm_brand_name=confirm if isinstance(confirm, str) else None,
-        )
+        try:
+            data, error_code = shopmonkey_inventory_services.delete_sync_brand(
+                company_id=company_id,
+                sync_brand_id=sync_brand_id,
+                confirm_brand_name=confirm if isinstance(confirm, str) else None,
+                scope=spaces_services.resolve_scope(request),
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         if error_code == shopmonkey_inventory_services.ERROR_CONFLICT:
             return _error_response(
                 "This brand has a sync or delete in progress. Try again when it finishes.", error_code
@@ -390,8 +430,10 @@ class ShopMonkeySyncBrandRunView(views.View):
 
         try:
             data, error_code = shopmonkey_inventory_services.run_sync_brand_now(
-                company_id=company_id, sync_brand_id=sync_brand_id
+                company_id=company_id, sync_brand_id=sync_brand_id, scope=spaces_services.resolve_scope(request)
             )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except Exception as e:
             logger.error(f"{_LOG_PREFIX} Error running sync (sync_brand_id={sync_brand_id}): {e}")
             return http.HttpResponse(
@@ -454,9 +496,17 @@ class ShopMonkeySyncBrandPartsView(views.View):
                 "status must be 1, 2, 3 or ACTIVE, INACTIVE, ERROR.", shopmonkey_inventory_services.ERROR_INVALID_INPUT
             )
 
-        result, error_code = shopmonkey_inventory_services.list_sync_brand_parts(
-            company_id=company_id, sync_brand_id=sync_brand_id, limit=limit, offset=offset, status=status_filter
-        )
+        try:
+            result, error_code = shopmonkey_inventory_services.list_sync_brand_parts(
+                company_id=company_id,
+                sync_brand_id=sync_brand_id,
+                limit=limit,
+                offset=offset,
+                status=status_filter,
+                scope=spaces_services.resolve_scope(request),
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         if error_code:
             return _error_response("Could not fetch parts for this sync brand.", error_code)
         return http.HttpResponse(
@@ -505,9 +555,17 @@ class ShopMonkeySyncExecutionsView(views.View):
         except (TypeError, ValueError):
             pass
 
-        result, error_code = shopmonkey_inventory_services.list_executions(
-            company_id=company_id, sync_brand_id=sync_brand_id, status=status_filter, limit=limit, offset=offset
-        )
+        try:
+            result, error_code = shopmonkey_inventory_services.list_executions(
+                company_id=company_id,
+                sync_brand_id=sync_brand_id,
+                status=status_filter,
+                limit=limit,
+                offset=offset,
+                scope=spaces_services.resolve_scope(request),
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         if error_code:
             return _error_response("Shop management inventory sync is not available for this company.", error_code)
         return http.HttpResponse(

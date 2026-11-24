@@ -66,7 +66,7 @@ _LOG_PREFIX = "[SHOPMONKEY-SYNC]"
 # warm_shopmonkey_available_brands_cache management command (same cadence as
 # sync_shopmonkey_inventory) so a live request should always hit a warm cache; the TTL below is
 # just a safety net in case warming ever falls behind.
-_AVAILABLE_BRANDS_CACHE_KEY_FMT = "shopmonkey:available_brands_base:{company_id}"
+_AVAILABLE_BRANDS_CACHE_KEY_FMT = "shopmonkey:available_brands_base:{company_id}:{space_id}"
 _AVAILABLE_BRANDS_CACHE_TTL_SECONDS = 6 * 60 * 60
 
 _OBSOLETE_PREFIX = "[OBSOLETE] "
@@ -137,7 +137,9 @@ def company_connected_provider_ids(company_id: int, space_id: typing.Optional[in
     return set(connected_feeds(company_id, space_id))
 
 
-def _compute_available_brands_base(company_id: int) -> typing.List[typing.Dict[str, typing.Any]]:
+def _compute_available_brands_base(
+    company_id: int, space_id: typing.Optional[int] = None
+) -> typing.List[typing.Dict[str, typing.Any]]:
     """
     The expensive(-ish) part of available_brands_for_company: brand/provider/part_count, with
     none of this company's own sync-configuration state overlaid (that part is cheap and always
@@ -151,8 +153,10 @@ def _compute_available_brands_base(company_id: int) -> typing.List[typing.Dict[s
     enough by itself if what it's caching is still this expensive to *compute* on every warm
     cycle). part_count on BrandProviders is precomputed by refresh_brand_provider_part_counts,
     not live here -- see that field's own docstring in src/models.py.
+
+    ``space_id`` is the space whose connected distributors are offered (see connected_feeds).
     """
-    connected_provider_ids = company_connected_provider_ids(company_id)
+    connected_provider_ids = company_connected_provider_ids(company_id, space_id)
     if not connected_provider_ids:
         return []
 
@@ -209,14 +213,22 @@ def _cache_set(cache_key: str, value: typing.Any, ttl_seconds: int) -> None:
         )
 
 
-def refresh_available_brands_cache(company_id: int) -> int:
-    """Forces recomputation of the slow base list and overwrites the cache. Returns the brand count. Called by warm_shopmonkey_available_brands_cache; also safe to call ad hoc after a distributor catalog re-sync."""
-    base = _compute_available_brands_base(company_id)
-    _cache_set(_AVAILABLE_BRANDS_CACHE_KEY_FMT.format(company_id=company_id), base, _AVAILABLE_BRANDS_CACHE_TTL_SECONDS)
+def refresh_available_brands_cache(company_id: int, space_id: typing.Optional[int] = None) -> int:
+    """Forces recomputation of the slow base list of a space (the main space when unset) and overwrites the cache. Returns the brand count. Called by warm_shopmonkey_available_brands_cache; also safe to call ad hoc after a distributor catalog re-sync."""
+    if space_id is None:
+        space_id = src_models.Space.objects.main_for(company_id).id
+    base = _compute_available_brands_base(company_id, space_id)
+    _cache_set(
+        _AVAILABLE_BRANDS_CACHE_KEY_FMT.format(company_id=company_id, space_id=space_id),
+        base,
+        _AVAILABLE_BRANDS_CACHE_TTL_SECONDS,
+    )
     return len(base)
 
 
-def available_brands_for_company(company_id: int) -> typing.List[typing.Dict[str, typing.Any]]:
+def available_brands_for_company(
+    company_id: int, space_id: typing.Optional[int] = None
+) -> typing.List[typing.Dict[str, typing.Any]]:
     """
     Brands this company could sync to ShopMonkey, and which of its own connected providers carry
     each one -- the choice set the brand-picker UI needs. A fixed allowlist the way the old tool
@@ -229,14 +241,19 @@ def available_brands_for_company(company_id: int) -> typing.List[typing.Dict[str
     current_provider_ids/primary_provider_id) is NOT part of that cache -- it's a small, fast,
     per-company query, always run fresh here so toggling a brand on/off (or changing its vendor
     set) is reflected immediately rather than waiting on the cache TTL.
+
+    Per space: the cache, the connected distributors and the sync configuration are the space's own
+    (``space_id``; the main space when unset).
     """
-    cache_key = _AVAILABLE_BRANDS_CACHE_KEY_FMT.format(company_id=company_id)
+    if space_id is None:
+        space_id = src_models.Space.objects.main_for(company_id).id
+    cache_key = _AVAILABLE_BRANDS_CACHE_KEY_FMT.format(company_id=company_id, space_id=space_id)
     base = _cache_get(cache_key)
     if base is None:
         # Cache miss (not yet warmed, TTL lapsed with warming behind, or the cache itself is
         # unreachable) -- falls back to the slow live path rather than returning nothing or
         # failing the request, and populates the cache for next time.
-        base = _compute_available_brands_base(company_id)
+        base = _compute_available_brands_base(company_id, space_id)
         _cache_set(cache_key, base, _AVAILABLE_BRANDS_CACHE_TTL_SECONDS)
     if not base:
         return []
@@ -244,7 +261,9 @@ def available_brands_for_company(company_id: int) -> typing.List[typing.Dict[str
     brand_ids = [row["brand_id"] for row in base]
     existing_sync_brands = {
         sb.brand_id: sb
-        for sb in src_models.ShopMonkeySyncBrand.objects.filter(company_id=company_id, brand_id__in=brand_ids)
+        for sb in src_models.ShopMonkeySyncBrand.objects.filter(
+            company_id=company_id, space_id=space_id, brand_id__in=brand_ids
+        )
         .select_related("vendor")
         .prefetch_related("additional_vendors__vendor")
     }
