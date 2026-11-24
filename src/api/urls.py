@@ -14,6 +14,7 @@ from src.api.views.admin import (
     AdminCompanyKeptIntegrationsView,
     AdminCreateCompanyView,
     AdminResetUserPasswordView,
+    AdminSpaceAllowanceView,
     AdminExtendTrialView,
     AdminIngestionAuditHistoryView,
     AdminIngestionAuditView,
@@ -610,6 +611,11 @@ urlpatterns = [
         "admin/companies/<int:company_id>/extend-trial/",
         AdminExtendTrialView.as_view(),
         name="admin_extend_trial",
+    ),
+    path(
+        "admin/companies/<int:company_id>/space-allowance/",
+        AdminSpaceAllowanceView.as_view(),
+        name="admin_space_allowance",
     ),
     path(
         "admin/companies/<int:company_id>/kept-integrations/",

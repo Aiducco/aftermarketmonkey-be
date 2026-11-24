@@ -7,11 +7,13 @@ import typing
 from django.conf import settings
 from django.contrib.auth import models as auth_models
 from django.db import transaction
-from django.db.models import Count, Q
+from django.db.models import Count, IntegerField, OuterRef, Q, Subquery
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 
 from src import enums as src_enums
 from src import models as src_models
+from src.api.services import billing as billing_services
 from src.api.services import plan_lifecycle as plan_lifecycle_services
 
 _LOG_PREFIX = "[ADMIN-SERVICE]"
@@ -49,6 +51,49 @@ def _plan_lifecycle_fields(company: src_models.Company) -> typing.Dict:
     }
 
 
+def _spaces_used_annotation():
+    """Spaces per company as a correlated subquery: a second Count() join would multiply the provider
+    counts annotated next to it."""
+    return Coalesce(
+        Subquery(
+            src_models.Space.objects.filter(company_id=OuterRef("pk"))
+            .order_by()
+            .values("company_id")
+            .annotate(n=Count("id"))
+            .values("n"),
+            output_field=IntegerField(),
+        ),
+        0,
+    )
+
+
+def _space_allowance_fields(company: src_models.Company) -> typing.Dict:
+    """Space allowance for the staff views (``company`` must carry the ``spaces_count`` annotation)."""
+    return {
+        "space_allowance": billing_services.space_allowance(company),
+        "space_base": billing_services._space_base(company),
+        "space_base_override": company.space_base_override,
+        "additional_spaces": company.additional_spaces,
+        # The main space counts before its row exists (billing.spaces_in_use).
+        "spaces_used": max(1, company.spaces_count),
+    }
+
+
+def set_company_space_base(company_id: int, space_base: typing.Optional[int]) -> typing.Optional[typing.Dict]:
+    """Staff base for a company's space allowance (space_base_override): replaces the plan's base while set,
+    None clears it. The paid add-ons stay on top. Returns the allowance fields, or None if no such company."""
+    company = (
+        src_models.Company.objects.filter(id=company_id)
+        .annotate(spaces_count=_spaces_used_annotation())
+        .first()
+    )
+    if not company:
+        return None
+    company.space_base_override = space_base
+    company.save(update_fields=["space_base_override", "updated_at"])
+    return {"company_id": company.id, **_space_allowance_fields(company)}
+
+
 def list_all_companies_for_admin() -> typing.List[typing.Dict]:
     """
     Every company (excluding the internal admin company itself) with its subscription state and
@@ -67,6 +112,7 @@ def list_all_companies_for_admin() -> typing.List[typing.Dict]:
             paused_providers_count=Count(
                 "company_providers", filter=Q(company_providers__paused_at__isnull=False)
             ),
+            spaces_count=_spaces_used_annotation(),
         )
         .order_by("-created_at")
     )
@@ -90,6 +136,7 @@ def list_all_companies_for_admin() -> typing.List[typing.Dict]:
                 "connected_providers_count": company.connected_providers_count,
                 "total_providers_count": company.total_providers_count,
                 **_plan_lifecycle_fields(company),
+                **_space_allowance_fields(company),
             }
         )
 
@@ -111,6 +158,7 @@ def get_admin_company_detail(company_id: int) -> typing.Optional[typing.Dict]:
             paused_providers_count=Count(
                 "company_providers", filter=Q(company_providers__paused_at__isnull=False)
             ),
+            spaces_count=_spaces_used_annotation(),
         )
         .first()
     )
@@ -181,6 +229,7 @@ def get_admin_company_detail(company_id: int) -> typing.Optional[typing.Dict]:
         "connected_providers_count": company.connected_providers_count,
         "total_providers_count": company.total_providers_count,
         **_plan_lifecycle_fields(company),
+        **_space_allowance_fields(company),
         "providers": providers,
         "users": users,
     }

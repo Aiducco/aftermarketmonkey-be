@@ -33,3 +33,9 @@ class AdminKeptIntegrationsSchema(Schema):
     def _require_ids_or_unlock(self, data, **kwargs):
         if "ids" not in data and not data.get("unlock"):
             raise ValidationError("Provide ids and/or unlock.")
+
+
+class AdminSpaceAllowanceSchema(Schema):
+    # The staff base for the company's space allowance: an integer >= 1, or null to clear it. Required so
+    # an empty body cannot silently clear the base. The upper bound is the column's (smallint).
+    space_base = fields.Integer(required=True, allow_none=True, strict=True, validate=validate.Range(min=1, max=32767))

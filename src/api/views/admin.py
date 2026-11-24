@@ -208,6 +208,27 @@ class AdminExtendTrialView(views.View):
 
 
 @method_decorator(csrf_exempt, name="dispatch")
+class AdminSpaceAllowanceView(views.View):
+    """POST /admin/companies/<company_id>/space-allowance/ - Staff base for a company's space allowance
+    (``space_base`` >= 1, or null to clear). The paid add-ons stay on top. Staff only."""
+
+    def post(self, request: http.HttpRequest, company_id: int, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
+        denied = _require_staff(request)
+        if denied:
+            return denied
+
+        validated, err_response = _parse_body(request, admin_schema.AdminSpaceAllowanceSchema())
+        if err_response:
+            return err_response
+
+        data = admin_services.set_company_space_base(company_id, validated["space_base"])
+        if data is None:
+            return _json_response({"message": "Company not found"}, status=404)
+
+        return _json_response({"data": data}, status=200)
+
+
+@method_decorator(csrf_exempt, name="dispatch")
 class AdminCompanyKeptIntegrationsView(views.View):
     """POST /admin/companies/<company_id>/kept-integrations/ - Staff override of which distributors a
     company keeps on Scout: ``ids`` (CompanyProviders ids) sets them (applied immediately if the company
