@@ -86,7 +86,11 @@ def set_company_space_base(
 ) -> typing.Optional[typing.Dict]:
     """Staff base for a company's space allowance (space_base_override): replaces the plan's base while set,
     None clears it. The paid add-ons stay on top. Returns the allowance fields, or None if no such company."""
-    company = src_models.Company.objects.filter(id=company_id).annotate(spaces_count=_spaces_used_annotation()).first()
+    company = (
+        src_models.Company.objects.filter(id=company_id, parent_company__isnull=True)
+        .annotate(spaces_count=_spaces_used_annotation())
+        .first()
+    )
     if not company:
         return None
     old_base = company.space_base_override
@@ -473,7 +477,9 @@ def extend_company_trial(
     Returns (result, error) -- result is None on failure (company not found), with error set.
     """
     with transaction.atomic():
-        company = src_models.Company.objects.select_for_update().filter(id=company_id).first()
+        company = (
+            src_models.Company.objects.select_for_update().filter(id=company_id, parent_company__isnull=True).first()
+        )
         if company is None:
             return None, "Company not found"
 

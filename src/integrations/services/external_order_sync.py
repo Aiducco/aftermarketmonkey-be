@@ -131,11 +131,13 @@ def _match_prefixed_purchase_order(
 ) -> typing.Optional[src_models.PurchaseOrder]:
     """The PO of this connection that was sent as ``customer_po_number`` with its space's prefix in front
     (base.resolve_po_number), for an order whose distributor-order row was never recorded. The value must start
-    with a prefix of this connection's company; the rest is then matched against po_name / po_number of a PO
+    with a prefix of this connection's customer company; the rest is then matched against po_name / po_number of a PO
     with that po_prefix. Nothing is stripped anywhere else."""
     value = customer_po_number.strip()
+    company_provider = src_models.CompanyProviders.objects.select_related("company").get(id=company_provider_id)
     prefixes = (
-        src_models.Space.objects.filter(company__company_providers__id=company_provider_id)
+        # The customer company's spaces: a feed tenant's own connection has the real company's prefixes.
+        src_models.Space.objects.filter(company_id=company_provider.company.customer_company.id)
         .exclude(prefix__isnull=True)
         .exclude(prefix="")
         .values_list("prefix", flat=True)

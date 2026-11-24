@@ -8,6 +8,7 @@ the multi_spaces flag are not filtered at all and write to the main space, so th
 """
 import dataclasses
 import logging
+import secrets
 import typing
 
 from django.db import IntegrityError, transaction
@@ -24,6 +25,8 @@ from src.domain import space_prefix
 logger = logging.getLogger(__name__)
 
 SPACE_HEADER = "HTTP_X_SPACE_ID"
+
+_TENANT_SLUG_ATTEMPTS = 5
 
 ERROR_SPACE_ACCESS_DENIED = "space_access_denied"
 ERROR_SPACE_REQUIRED = "space_required"
@@ -220,35 +223,57 @@ def feeds_for(space: typing.Union[src_models.Space, int]) -> typing.Dict[int, sr
     return {row.provider_id: row.company_provider for row in rows}
 
 
-def pricing_company_for(space: typing.Union[src_models.Space, int], provider_id: int) -> typing.Optional[int]:
-    """The company whose price rows the space reads for a distributor: the used connection's ``company_id`` (the
-    real company, or a feed tenant for an own feed). None when the space uses no active connection for it."""
-    connection = feeds_for(space).get(provider_id)
-    return connection.company_id if connection is not None else None
-
-
 def ensure_feed_tenant(space: src_models.Space) -> src_models.Company:
     """The hidden child company that holds the space's own distributor connections, created on first use (ADR 0002).
-    Never created for the main space (its own feeds are the real company's). Locks the space row so two first
-    connects cannot create two tenants."""
+    Never created for the main space (its own feeds are the real company's). Call it on its own, outside any other
+    transaction and after the request is validated: it takes the space row lock for one short transaction (two
+    first connects cannot create two tenants) and does nothing slow while holding it. A caller whose connect then
+    fails removes a tenant it just created with ``delete_new_feed_tenant``."""
     with transaction.atomic():
         locked = src_models.Space.objects.select_for_update().get(id=space.id)
         if locked.feed_company_id:
+            space.feed_company = locked.feed_company
             return locked.feed_company
         parent = src_models.Company.objects.get(id=locked.company_id)
-        tenant = src_models.Company.objects.create(
-            name="{} - {} feeds".format(parent.name, locked.name)[:255],
-            slug="{}-space-{}-feeds".format(parent.slug, locked.id)[:255],
-            status=src_enums.CompanyStatus.ACTIVE.value,
-            status_name=src_enums.CompanyStatus.ACTIVE.name,
-            is_internal=True,
-            onboarding_step=None,
-            parent_company=parent,
-        )
+        name = "{} - {} feeds".format(parent.name, locked.name)[:255]
+        tenant = None
+        for attempt in range(_TENANT_SLUG_ATTEMPTS):
+            suffix = "" if attempt == 0 else "-{}".format(secrets.token_hex(3))
+            slug = "{}-space-{}-feeds{}".format(parent.slug[:200], locked.id, suffix)
+            try:
+                with transaction.atomic():
+                    tenant = src_models.Company.objects.create(
+                        name=name,
+                        slug=slug,
+                        status=parent.status,
+                        status_name=parent.status_name,
+                        is_internal=True,
+                        onboarding_step=None,
+                        parent_company=parent,
+                    )
+                break
+            except IntegrityError:
+                if attempt == _TENANT_SLUG_ATTEMPTS - 1:
+                    raise
         locked.feed_company = tenant
         locked.save(update_fields=["feed_company", "updated_at"])
         space.feed_company = tenant
         return tenant
+
+
+def delete_new_feed_tenant(tenant: src_models.Company) -> bool:
+    """Removes a feed tenant a connect just created and then failed to use. Safe: does nothing (returns False)
+    unless the tenant is a tenant and holds no connection at all, so it can never drop a feed or its prices. The
+    space's link to it is cleared first."""
+    with transaction.atomic():
+        locked = (
+            src_models.Company.objects.select_for_update().filter(id=tenant.id, parent_company__isnull=False).first()
+        )
+        if locked is None or src_models.CompanyProviders.objects.filter(company_id=locked.id).exists():
+            return False
+        src_models.Space.objects.filter(feed_company_id=locked.id).update(feed_company=None)
+        locked.delete()
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -263,11 +288,15 @@ def owner_space_id_of_connection(
     is that tenant (ADR 0002); every other connection is the company's own and belongs to its main space. Pass
     the scope's ``main_space_id`` to skip the main-space lookup (a read must not get-or-create per connection)."""
     company_id = company_provider.company_id
-    is_tenant = src_models.Company.objects.filter(id=company_id, parent_company_id__isnull=False).exists()
-    if is_tenant:
+    parent_id = src_models.Company.objects.filter(id=company_id).values_list("parent_company_id", flat=True).first()
+    if parent_id is not None:
         space_id = src_models.Space.objects.filter(feed_company_id=company_id).values_list("id", flat=True).first()
         if space_id is not None:
             return space_id
+        # An orphan tenant (no space points at it): the customer company's main space.
+        if main_space_id is not None:
+            return main_space_id
+        return src_models.Space.objects.main_for(parent_id).id
     if main_space_id is not None:
         return main_space_id
     return src_models.Space.objects.main_for(company_id).id
@@ -356,6 +385,8 @@ def stop_using_feed(scope: SpaceScope, space_id: int, provider_id: int) -> None:
     """DELETE /spaces/<id>/feeds/<provider_id>/: a space stops using a feed another space owns. Its
     ``SpaceProvider`` row and its Used-by rows on that connection's order accounts go; the feed, its owner and the
     other sharers are untouched. Admin only, flagged companies only."""
+    if not scope.enabled:
+        raise SpaceError("Spaces are not available for this company.", ERROR_FEATURE_NOT_AVAILABLE, status_code=403)
     require_admin(scope)
     with transaction.atomic():
         space = _get_space(scope.company_id, space_id)
@@ -752,7 +783,7 @@ def _delete_space(scope: SpaceScope, space_id: int) -> None:
             raise SpaceError("This space has orders or open carts, so it cannot be deleted.", ERROR_SPACE_NOT_EMPTY)
         if (
             space.feed_company_id
-            and src_models.CompanyProviders.objects.filter(company_id=space.feed_company_id, active=True).exists()
+            and src_models.CompanyProviders.objects.filter(company_id=space.feed_company_id).exists()
         ):
             raise SpaceError(
                 "This space has its own distributor accounts. Disconnect them first.", ERROR_SPACE_NOT_EMPTY

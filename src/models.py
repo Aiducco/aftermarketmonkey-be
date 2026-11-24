@@ -449,14 +449,15 @@ class CompanyProviders(django_db_models.Model):
 
     def _add_owner_space_row(self) -> None:
         """On create, record the owner space's use of this connection (ADR 0002): the main space for a real
-        company, the tenant's space for a tenant. Replaces a share row that space already had for the provider.
+        company, the tenant's space for a tenant. Only when that space has no row for the provider: an existing
+        row (a share, or the owner's own) is never replaced here, the connect path records the owner's use.
         bulk_create and queryset update() skip this: no code creates connections that way."""
         owner = Space.objects.filter(feed_company_id=self.company_id).first()
         if owner is None:
             if Company.objects.filter(id=self.company_id, parent_company__isnull=False).exists():
                 return  # a tenant that no space points at yet: the space claims it when it is linked
             owner = Space.objects.main_for(self.company_id)
-        SpaceProvider.objects.update_or_create(
+        SpaceProvider.objects.get_or_create(
             space=owner, provider_id=self.provider_id, defaults={"company_provider": self}
         )
 

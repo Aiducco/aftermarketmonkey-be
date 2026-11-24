@@ -962,7 +962,8 @@ def _email_context(company: src_models.Company, now: typing.Optional[datetime.da
         paused_names = []
     else:
         kept_names = [_display_name(cp) for cp in active]
-        paused_names = [_display_name(cp) for cp in paused]
+        # Names come from the family: a space's paused own feeds are named too. Usage counts stay parent-only (OQ-6).
+        paused_names = [_display_name(cp) for cp in family_feed_connected_providers(company.id) if is_paused(cp)]
     trial_plan = company.subscription_plan if state == STATE_TRIALING else company.downgraded_from_plan
     plan_key = billing_services._plan_key(company)
     return {
