@@ -187,6 +187,24 @@ def write_space(scope: SpaceScope) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Order accounts per space
+# ---------------------------------------------------------------------------
+
+
+def owner_space_id_of_connection(company_provider: src_models.CompanyProviders) -> int:
+    """The space that owns a connection: the company's main space (every connection is the company's own
+    until a space can have its own feed)."""
+    return src_models.Space.objects.main_for(company_provider.company_id).id
+
+
+def order_account_space_ids(account: src_models.CompanyProviderOrderAccount, owner_space_id: int) -> typing.List[int]:
+    """The spaces that use an order account: its Used-by rows, or the connection's owner space when it has
+    none (ADR 0001). Reads ``account.spaces.all()``, so a prefetch avoids a query per account."""
+    ids = sorted(space.id for space in account.spaces.all())
+    return ids or [owner_space_id]
+
+
+# ---------------------------------------------------------------------------
 # Serializing
 # ---------------------------------------------------------------------------
 

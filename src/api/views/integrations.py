@@ -6,6 +6,7 @@ import simplejson
 from django import http, views
 
 from src.api.services import integrations as integrations_services
+from src.api.services import spaces as spaces_services
 
 logger = logging.getLogger(__name__)
 _LOG_PREFIX = "[INTEGRATIONS]"
@@ -373,7 +374,9 @@ class OrderAccountsView(views.View):
                 status=400,
             )
 
-        data = integrations_services.list_order_accounts(company_id=company_id, company_provider_id=cpi)
+        data = integrations_services.list_order_accounts(
+            company_id=company_id, company_provider_id=cpi, scope=spaces_services.resolve_scope(request)
+        )
         if data is None:
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
@@ -1134,5 +1137,57 @@ class CustomIntegrationRequestsView(views.View):
         return http.HttpResponse(
             headers={"Content-Type": "application/json"},
             content=simplejson.dumps({"status": "requested"}),
+            status=200,
+        )
+
+
+class OrderAccountSpacesView(views.View):
+    """PUT /integrations/order-accounts/<order_account_id>/spaces/ - {space_ids: [int]}. Replaces the spaces
+    that use this order account (company admins of a company with the multi_spaces flag)."""
+
+    def put(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
+        if not request.user or not request.user.is_authenticated:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "User not authenticated"}),
+                status=401,
+            )
+
+        company_id = getattr(request, "company_id", None)
+        if not company_id:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "No company found in token"}),
+                status=400,
+            )
+
+        try:
+            body = json.loads(request.body) if request.body else {}
+        except json.JSONDecodeError:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Invalid JSON body"}),
+                status=400,
+            )
+        if not isinstance(body, dict):
+            body = {}
+
+        try:
+            data = integrations_services.set_order_account_spaces(
+                company_id=company_id,
+                scope=spaces_services.resolve_scope(request),
+                order_account_id=kwargs.get("order_account_id"),
+                space_ids=body.get("space_ids"),
+            )
+        except spaces_services.SpaceError as e:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps(e.body()),
+                status=e.status_code,
+            )
+
+        return http.HttpResponse(
+            headers={"Content-Type": "application/json"},
+            content=simplejson.dumps({"data": data}),
             status=200,
         )

@@ -61,6 +61,7 @@ from src.api.views.integrations import (
     ExecutionRunsView,
     IntegrationRequestsView,
     OrderAccountDetailView,
+    OrderAccountSpacesView,
     OrderAccountsView,
     ProviderConnectionDetailView,
     ProviderConnectionView,
@@ -203,6 +204,11 @@ urlpatterns = [
         "integrations/order-accounts/<int:order_account_id>/",
         OrderAccountDetailView.as_view(),
         name="order_account_detail",
+    ),
+    path(
+        "integrations/order-accounts/<int:order_account_id>/spaces/",
+        OrderAccountSpacesView.as_view(),
+        name="order_account_spaces",
     ),
     path(
         "company-providers/",

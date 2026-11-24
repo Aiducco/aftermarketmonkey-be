@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 _LOG_PREFIX = "[PURCHASE-ORDERS-API]"
 
 ERROR_MIXED_SPACES = "mixed_spaces"
+ERROR_ORDER_ACCOUNT_NOT_IN_SPACE = "order_account_not_in_space"
 
 _REQUIRED_SHIP_TO_FIELDS = ("name", "address1", "city", "state", "postal_code", "country")
 
@@ -532,6 +533,33 @@ def _resolve_order_account(
     return account
 
 
+def _ensure_account_in_space(
+    scope: spaces_services.SpaceScope,
+    cp: src_models.CompanyProviders,
+    order_account: typing.Optional[src_models.CompanyProviderOrderAccount],
+    space_id: int,
+) -> None:
+    """
+    Flagged companies only (AC-41): the account the order goes through must be used by the space. None means
+    the connection's implicit default account, which is held to the same rule; a connection with no default
+    account is used by its owner space only.
+    """
+    if not scope.enabled:
+        return
+    account = order_account or credentials_helper.get_default_order_account(cp)
+    owner_space_id = spaces_services.owner_space_id_of_connection(cp)
+    if account is None:
+        used_by = [owner_space_id]
+    else:
+        used_by = spaces_services.order_account_space_ids(account, owner_space_id)
+    if space_id not in used_by:
+        label = account.label if account else "the default account"
+        raise spaces_services.SpaceError(
+            "{} is not used by {}.".format(label, scope.space_names.get(space_id, "this space")),
+            ERROR_ORDER_ACCOUNT_NOT_IN_SPACE,
+        )
+
+
 def _serialize_order_accounts(cp: src_models.CompanyProviders) -> typing.List[typing.Dict]:
     """
     Every account this connection can order through, for the "choose which account" picker at
@@ -543,6 +571,28 @@ def _serialize_order_accounts(cp: src_models.CompanyProviders) -> typing.List[ty
     """
     accounts = cp.order_accounts.filter(active=True).order_by("-is_default", "created_at")
     return [{"id": account.id, "label": account.label, "is_default": account.is_default} for account in accounts]
+
+
+def _accounts_for_scope(scope: spaces_services.SpaceScope, cp: src_models.CompanyProviders) -> typing.List[typing.Dict]:
+    """_serialize_order_accounts limited to the accounts used by the scope's spaces, each + ``space_ids``
+    (the spaces that use it, among the ones the caller can see)."""
+    owner_space_id = spaces_services.owner_space_id_of_connection(cp)
+    shown = set(scope.list_space_ids)
+    visible = set(scope.visible_space_ids)
+    rows = []
+    accounts = cp.order_accounts.filter(active=True).prefetch_related("spaces").order_by("-is_default", "created_at")
+    for account in accounts:
+        used_by = spaces_services.order_account_space_ids(account, owner_space_id)
+        if shown.intersection(used_by):
+            rows.append(
+                {
+                    "id": account.id,
+                    "label": account.label,
+                    "is_default": account.is_default,
+                    "space_ids": [space_id for space_id in used_by if space_id in visible],
+                }
+            )
+    return rows
 
 
 def _cart_queryset(company_id: int, space_ids: typing.Optional[typing.List[int]]):
@@ -757,6 +807,7 @@ def add_cart_item(
 
     cp = _get_company_provider(company_id, provider_id)
     order_account = _resolve_order_account(cp, order_account_id)
+    _ensure_account_in_space(scope, cp, order_account, space_id)
     if order_registry.get_adapter(cp, order_account) is None:
         raise PurchaseOrderServiceError(order_registry.get_adapter_unavailable_reason(cp, order_account))
 
@@ -850,6 +901,7 @@ def set_cart_order_account(
     spaces_services.ensure_visible(scope, po.space_id)
 
     order_account = _resolve_order_account(po.company_provider, order_account_id)
+    _ensure_account_in_space(scope, po.company_provider, order_account, po.space_id)
     if order_account == po.order_account:
         return get_cart(company_id, scope)
 
@@ -1582,6 +1634,7 @@ def submit_purchase_order(
     if not po:
         raise PurchaseOrderServiceError("Purchase order not found.")
     spaces_services.ensure_visible(scope, po.space_id)
+    _ensure_account_in_space(scope, po.company_provider, po.order_account, po.space_id)
     if ship_method is not None:
         po.ship_method = ship_method
         po.save(update_fields=["ship_method", "updated_at"])
@@ -1741,8 +1794,10 @@ def submit_purchase_order_group(
     if not group:
         raise PurchaseOrderServiceError("Purchase order group not found.")
     # Every PO of the group must be visible before any is submitted (a group is one space, but check each).
-    for group_po in group.purchase_orders.all():
+    for group_po in group.purchase_orders.select_related("company_provider", "order_account"):
         spaces_services.ensure_visible(scope, group_po.space_id)
+        if group_po.status == src_enums.PurchaseOrderStatus.QUOTED.value:
+            _ensure_account_in_space(scope, group_po.company_provider, group_po.order_account, group_po.space_id)
     quoted_ids = list(
         group.purchase_orders.filter(status=src_enums.PurchaseOrderStatus.QUOTED.value)
         .order_by("id")
@@ -1874,7 +1929,14 @@ def refresh_purchase_order_status(
 # -- Capabilities ---------------------------------------------------------------------------
 
 
-def get_order_capabilities(company_id: int) -> typing.List[typing.Dict]:
+def get_order_capabilities(
+    company_id: int, scope: typing.Optional[spaces_services.SpaceScope] = None
+) -> typing.List[typing.Dict]:
+    """
+    Per connected distributor, whether it can order and through which accounts. For a company with the
+    multi_spaces flag (``scope.enabled``) the accounts are the ones the current space uses (every visible
+    space's in "all"), and each has ``space_ids``, limited to the spaces the caller can see.
+    """
     company_providers = src_models.CompanyProviders.objects.filter(company_id=company_id, active=True).select_related(
         "provider"
     )
@@ -1889,7 +1951,10 @@ def get_order_capabilities(company_id: int) -> typing.List[typing.Dict]:
         # abstract) would tell the FE ordering is available for connections that would
         # actually fail the moment a quote/order was attempted.
         adapter = order_registry.get_adapter(cp)
-        order_accounts = _serialize_order_accounts(cp)
+        if scope is not None and scope.enabled:
+            order_accounts = _accounts_for_scope(scope, cp)
+        else:
+            order_accounts = _serialize_order_accounts(cp)
         results.append(
             {
                 "company_provider_id": cp.id,

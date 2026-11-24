@@ -14,6 +14,7 @@ from src import constants as src_constants
 from src import enums as src_enums
 from src import models as src_models
 from src.api.services import billing as billing_services
+from src.api.services import spaces as spaces_services
 from src.integrations import credentials as credentials_helper
 from src.integrations.clients.allpro import client as allpro_client
 from src.integrations.clients.allpro import exceptions as allpro_exceptions
@@ -2423,13 +2424,19 @@ def _serialize_order_account(
     }
 
 
-def list_order_accounts(company_id: int, company_provider_id: int) -> typing.Optional[typing.List[typing.Dict]]:
+def list_order_accounts(
+    company_id: int, company_provider_id: int, scope: typing.Optional[spaces_services.SpaceScope] = None
+) -> typing.Optional[typing.List[typing.Dict]]:
     """
     Every order account for this connection, for the Settings > Integrations "Ordering
     accounts" management list — the default account (whatever was entered through the
     connection's normal "Ordering" section) first, then any additional named accounts, oldest
     first. Returns None if the connection doesn't exist for this company, or an empty list if
     order credentials have never been configured at all.
+
+    With a ``scope`` of a company that has the multi_spaces flag, each row also has ``space_ids``: the spaces
+    that use the account (the connection's owner space when none are set), limited to the spaces the caller
+    can see.
     """
     cp = (
         src_models.CompanyProviders.objects.filter(id=company_provider_id, company_id=company_id)
@@ -2439,8 +2446,43 @@ def list_order_accounts(company_id: int, company_provider_id: int) -> typing.Opt
     if not cp or not cp.provider:
         return None
     catalog_entry = _get_catalog_entry_for_provider(cp.provider_id) or {}
-    accounts = cp.order_accounts.order_by("-is_default", "created_at")
-    return [_serialize_order_account(catalog_entry, account) for account in accounts]
+    accounts = cp.order_accounts.prefetch_related("spaces").order_by("-is_default", "created_at")
+    rows = [_serialize_order_account(catalog_entry, account) for account in accounts]
+    if scope is not None and scope.enabled:
+        owner_space_id = spaces_services.owner_space_id_of_connection(cp)
+        for row, account in zip(rows, accounts):
+            space_ids = spaces_services.order_account_space_ids(account, owner_space_id)
+            row["space_ids"] = [space_id for space_id in space_ids if space_id in scope.visible_space_ids]
+    return rows
+
+
+def set_order_account_spaces(
+    company_id: int, scope: spaces_services.SpaceScope, order_account_id: int, space_ids: typing.Any
+) -> typing.Dict[str, typing.Any]:
+    """
+    PUT /integrations/order-accounts/<id>/spaces/: replaces the spaces that use an order account. Admin
+    only, flagged companies only. Raises SpaceError: 403, 404 account not found, 400 space_required (no
+    space) or space_not_found (not a space of this company). Before spaces can have their own feeds every
+    space uses every connection of the company, so space_not_on_feed cannot happen yet.
+    """
+    spaces_services.require_admin(scope)
+    if not isinstance(space_ids, list) or any(isinstance(i, bool) or not isinstance(i, int) for i in space_ids):
+        raise spaces_services.SpaceError("space_ids must be a list of space ids", "invalid_payload")
+    ids = sorted(set(space_ids))
+    if not ids:
+        raise spaces_services.SpaceError("Choose at least one space.", spaces_services.ERROR_SPACE_REQUIRED)
+    with transaction.atomic():
+        spaces_services._lock_company(company_id)  # same lock as delete_space, so a delete cannot race this
+        account = src_models.CompanyProviderOrderAccount.objects.filter(
+            id=order_account_id, company_provider__company_id=company_id
+        ).first()
+        if account is None:
+            raise spaces_services.SpaceError("Order account not found", "order_account_not_found", status_code=404)
+        found = set(src_models.Space.objects.filter(company_id=company_id, id__in=ids).values_list("id", flat=True))
+        if found != set(ids):
+            raise spaces_services.SpaceError("Space not found", spaces_services.ERROR_SPACE_NOT_FOUND)
+        account.spaces.set(ids)
+    return {"id": account.id, "space_ids": ids}
 
 
 def create_order_account(

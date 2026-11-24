@@ -826,7 +826,8 @@ class PurchaseOrderCapabilitiesView(views.View):
             return err
 
         try:
-            result = purchase_orders_services.get_order_capabilities(company_id=company_id)
+            scope = spaces_services.resolve_scope(request)
+            result = purchase_orders_services.get_order_capabilities(company_id=company_id, scope=scope)
         except Exception:
             logger.exception("{} Error fetching order capabilities for company_id={}".format(_LOG_PREFIX, company_id))
             return _error_response("Error fetching order capabilities", status=500)
