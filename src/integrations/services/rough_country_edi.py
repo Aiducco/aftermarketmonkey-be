@@ -45,6 +45,7 @@ from src.integrations.clients.rough_country import edi_config, inbound
 from src.integrations.edi import control_numbers
 from src.integrations.edi import exceptions as edi_exceptions
 from src.integrations.edi import x12
+from src.integrations.orders import base as order_base
 
 logger = logging.getLogger(__name__)
 
@@ -150,7 +151,7 @@ def match_purchase_order(
     reference = (po_number or "").strip()
     if not reference:
         return None
-    return (
+    candidates = list(
         src_models.PurchaseOrder.objects.filter(company_provider=company_provider)
         .filter(
             Q(po_name=reference)
@@ -160,8 +161,24 @@ def match_purchase_order(
         )
         .order_by("-id")
         .distinct()
-        .first()
     )
+    if len(candidates) < 2:
+        return candidates[0] if candidates else None
+    # Several POs match (a main-space "TRU555" and a TRU-space "555" both read TRU555). The PO sent as exactly
+    # this reference wins; among those a prefixed PO first (a distributor-side "TRU555" is that prefix at
+    # work), then the newest. Then the one whose distributor-order row recorded it, then the newest.
+    exact = [c for c in candidates if order_base.resolve_po_number(c) == reference]
+    if exact:
+        return next((c for c in exact if c.po_prefix), exact[0])
+    recorded = set(
+        src_models.PurchaseOrderDistributorOrder.objects.filter(
+            purchase_order_id__in=[c.id for c in candidates], po_number=reference
+        ).values_list("purchase_order_id", flat=True)
+    )
+    for candidate in candidates:
+        if candidate.id in recorded:
+            return candidate
+    return candidates[0]
 
 
 # -- applying --------------------------------------------------------------------------------
