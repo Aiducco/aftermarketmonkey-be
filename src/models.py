@@ -96,6 +96,12 @@ class Company(django_db_models.Model):
     # for the same person) rather than opening a second one.
     freshsales_deal_id = django_db_models.TextField(null=True, blank=True)
 
+    # Space allowance (see billing.space_allowance). additional_spaces is the paid "additional space"
+    # add-on quantity, written only by the Stripe subscription sync and cleared with the subscription;
+    # space_base_override is the base a staff member set (>= 1), replacing the plan's base while set.
+    additional_spaces = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+    space_base_override = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
 

@@ -496,6 +496,22 @@ EXTRA_SEAT_ADDON = {
     "currency": "usd",
 }
 
+# Space allowance (billing.space_allowance = base + paid add-ons). A company on a comp'd trial gets this many
+# spaces as its base; otherwise the base is 1 (the main space) unless staff set Company.space_base_override.
+COMPED_TRIAL_SPACE_ALLOWANCE = 5
+
+# "Additional space" add-on (Tracker/Hunter): monthly price on monthly subscriptions, yearly on annual ones.
+# Like EXTRA_SEAT_ADDON it is never a plan_id. The ids and amounts stay None until the human runs
+# `provision_stripe_billing_catalog` and pastes its output here; None means "not for sale yet".
+SPACE_ADDON = {
+    "stripe_product_id": None,
+    "stripe_price_id_monthly": None,
+    "stripe_price_id_annual": None,
+    "amount_monthly": None,
+    "amount_annual": None,
+    "currency": "usd",
+}
+
 # Pack is sold "per location" via Stripe Checkout's adjustable_quantity on its line item — see
 # billing.create_checkout_session. This caps how many units/locations a single checkout can
 # select; all units share ONE company account (no real per-location rollup/split exists yet).
