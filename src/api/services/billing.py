@@ -6,7 +6,6 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import stripe
-
 from django.conf import settings
 from django.utils import timezone as django_tz
 
@@ -381,6 +380,7 @@ def can_buy_space_addon(company: src_models.Company) -> bool:
         company.subscription_id
         and company.subscription_status in ACTIVE_STATUSES
         and _plan_key(company) in ("tracker", "hunter")
+        and getattr(settings, "SPACE_ADDON", {}).get("stripe_product_id")
         and feature_flags.company_has_feature(company.id, feature_flags.FEATURE_MULTI_SPACES)
     )
 
