@@ -33,7 +33,9 @@ class ProvidersCatalogView(views.View):
             )
 
         try:
-            result = integrations_services.get_providers_catalog(company_id=company_id)
+            result = integrations_services.get_providers_catalog(
+                company_id=company_id, scope=spaces_services.resolve_scope(request)
+            )
         except Exception as e:
             logger.error(
                 f"{_LOG_PREFIX} Error fetching providers catalog for company_id: {company_id}. Error: {str(e)}"
@@ -89,11 +91,26 @@ class ProviderConnectView(views.View):
             )
 
         credentials = body if isinstance(body, dict) else {}
-        data, err, error_code = integrations_services.connect_provider(
-            company_id=company_id,
-            provider_id=provider_id,
-            credentials=credentials,
-        )
+        share_company_provider_id = None
+        try:
+            scope = spaces_services.resolve_scope(request)
+            if scope.enabled:
+                # Read only for a company with the multi_spaces flag; it is not part of the credentials.
+                share_company_provider_id = credentials.get("share_company_provider_id")
+                credentials = {k: v for k, v in credentials.items() if k != "share_company_provider_id"}
+            data, err, error_code = integrations_services.connect_provider(
+                company_id=company_id,
+                provider_id=provider_id,
+                credentials=credentials,
+                scope=scope,
+                share_company_provider_id=share_company_provider_id,
+            )
+        except spaces_services.SpaceError as e:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps(e.body()),
+                status=e.status_code,
+            )
         integrations_services.log_connection_attempt(
             company_id=company_id,
             provider_id=provider_id,

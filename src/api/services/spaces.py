@@ -223,6 +223,30 @@ def pricing_company_for(space: typing.Union[src_models.Space, int], provider_id:
     return connection.company_id if connection is not None else None
 
 
+def ensure_feed_tenant(space: src_models.Space) -> src_models.Company:
+    """The hidden child company that holds the space's own distributor connections, created on first use (ADR 0002).
+    Never created for the main space (its own feeds are the real company's). Locks the space row so two first
+    connects cannot create two tenants."""
+    with transaction.atomic():
+        locked = src_models.Space.objects.select_for_update().get(id=space.id)
+        if locked.feed_company_id:
+            return locked.feed_company
+        parent = src_models.Company.objects.get(id=locked.company_id)
+        tenant = src_models.Company.objects.create(
+            name="{} - {} feeds".format(parent.name, locked.name)[:255],
+            slug="{}-space-{}-feeds".format(parent.slug, locked.id)[:255],
+            status=src_enums.CompanyStatus.ACTIVE.value,
+            status_name=src_enums.CompanyStatus.ACTIVE.name,
+            is_internal=True,
+            onboarding_step=None,
+            parent_company=parent,
+        )
+        locked.feed_company = tenant
+        locked.save(update_fields=["feed_company", "updated_at"])
+        space.feed_company = tenant
+        return tenant
+
+
 # ---------------------------------------------------------------------------
 # Order accounts per space
 # ---------------------------------------------------------------------------
@@ -606,7 +630,7 @@ def _accounts_to_remove(space: src_models.Space) -> typing.List[dict]:
 
 def delete_space(scope: SpaceScope, space_id: int) -> None:
     """Deletes a space and its one address. Refused while it is the main space, holds orders or carts, or is
-    the only space of a non-admin member or of an order account."""
+    the only space of a non-admin member or of an order account, or has its own distributor connections."""
     require_admin(scope)
     try:
         _delete_space(scope, space_id)
@@ -626,6 +650,13 @@ def _delete_space(scope: SpaceScope, space_id: int) -> None:
             or src_models.ExternalPurchaseOrder.objects.filter(space=space).exists()
         ):
             raise SpaceError("This space has orders or open carts, so it cannot be deleted.", ERROR_SPACE_NOT_EMPTY)
+        if (
+            space.feed_company_id
+            and src_models.CompanyProviders.objects.filter(company_id=space.feed_company_id, active=True).exists()
+        ):
+            raise SpaceError(
+                "This space has its own distributor accounts. Disconnect them first.", ERROR_SPACE_NOT_EMPTY
+            )
         users = _people_to_remove(space)
         if users:
             raise SpaceError(
