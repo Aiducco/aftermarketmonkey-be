@@ -6,7 +6,9 @@ from django import http, views
 
 from src.api.services import billing as billing_services
 from src.api.services import company_settings as company_settings_services
+from src.api.services import feature_flags as feature_flags_services
 from src.api.services import parts as parts_services
+from src.api.services import spaces as spaces_services
 from src.audit import parts as audit_parts
 
 logger = logging.getLogger(__name__)
@@ -26,6 +28,14 @@ def _auth_check(request: http.HttpRequest) -> typing.Tuple[typing.Optional[http.
         )
     company_id = getattr(request, "company_id", None)
     return None, company_id
+
+
+def _space_scope(request: http.HttpRequest, company_id: int) -> typing.Optional[spaces_services.SpaceScope]:
+    """The caller's space scope for a company with the multi_spaces flag, else None: an unflagged company is not
+    scoped at all (and no main space is created on a read), so its prices and stock are exactly as before."""
+    if not feature_flags_services.company_has_feature(company_id, feature_flags_services.FEATURE_MULTI_SPACES):
+        return None
+    return spaces_services.resolve_scope(request)
 
 
 class PartsSearchView(views.View):
@@ -221,7 +231,9 @@ class PartsBulkPricingView(views.View):
             )
 
         try:
-            data = parts_services.get_parts_bulk_pricing(master_part_ids=master_part_ids, company_id=company_id)
+            data = parts_services.get_parts_bulk_pricing(
+                master_part_ids=master_part_ids, company_id=company_id, scope=_space_scope(request, company_id)
+            )
         except parts_services.PartsServiceError as e:
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
@@ -275,7 +287,11 @@ class PartDetailView(views.View):
             )
 
         try:
-            data = parts_services.get_part_detail(master_part_id=part_id, company_id=company_id)
+            data = parts_services.get_part_detail(
+                master_part_id=part_id,
+                company_id=company_id,
+                scope=_space_scope(request, company_id) if company_id else None,
+            )
         except Exception as e:
             logger.exception("{} Part detail error: {}".format(_LOG_PREFIX, str(e)))
             return http.HttpResponse(
@@ -330,7 +346,10 @@ class PartProviderRefreshInventoryView(views.View):
 
         try:
             data = parts_services.refresh_provider_live_inventory(
-                master_part_id=part_id, provider_id=provider_id, company_id=company_id
+                master_part_id=part_id,
+                provider_id=provider_id,
+                company_id=company_id,
+                scope=_space_scope(request, company_id),
             )
         except parts_services.PartsServiceError as e:
             body = {"message": e.message}
