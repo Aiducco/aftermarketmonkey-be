@@ -6,8 +6,9 @@
 # the data and 0258 makes `space` NOT NULL (separate migrations: Postgres foreign keys are DEFERRABLE
 # INITIALLY DEFERRED, and an UPDATE followed by ALTER TABLE in one transaction fails with "pending trigger
 # events"). Fingerprints are NULL until 0257, and NULLs never collide in a unique, so the new unique holds.
-# Reverse: restores the company-wide uniques, which FAILS once non-main spaces have sync rows (two spaces can hold
-# the same brand). Rollback step 2's clean-up (delete the non-main spaces' sync rows) is a precondition.
+# Reverse: restores the company-wide uniques, which FAILS once non-main spaces have sync rows or shop connections
+# (two spaces can hold the same brand, or connections to the same system). Rollback step 2's clean-up is a
+# precondition: delete the non-main spaces' sync rows AND their shop connections (deactivating is not enough).
 import django.db.models.deletion
 from django.db import migrations, models
 
