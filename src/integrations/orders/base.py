@@ -40,6 +40,7 @@ class ShipToAddress:
 @dataclasses.dataclass
 class OrderLineItemRequest:
     """One line item to quote/order, keyed to our own PurchaseOrderLineItem."""
+
     line_item_id: int
     provider_part: src_models.ProviderPart
     quantity: int
@@ -80,6 +81,7 @@ class LinePromotion:
     PurchaseOrderLineItem.distributor_net_line_total, which IS what feeds po.subtotal (see
     compute_totals) — this never touches unit_cost/line_total themselves, which stay our
     frozen catalog pricing regardless."""
+
     description: str
     amount: typing.Optional[decimal.Decimal] = None
 
@@ -89,6 +91,7 @@ class LineFee:
     """A distributor-applied fee that isn't tied to any specific line item (e.g. Turn14's
     per-shipment dropship fee) — display-only, surfaced separately from per-line pricing and
     never fed into our own subtotal/total math (see ShippingQuoteResult.fees)."""
+
     fee_type: str
     description: str
     amount: typing.Optional[decimal.Decimal] = None
@@ -166,6 +169,7 @@ class DistributorOrderResult:
     the same way here: one or more distinct ``distributor_order_number`` values, each with
     its own PurchaseOrderDistributorOrder row.
     """
+
     distributor_order_numbers: typing.List[str]
     line_item_placements: typing.List[LineItemPlacement]
     raw_response: typing.Dict
@@ -208,6 +212,7 @@ class InvoiceTrackingEntry:
     """One tracking number on an invoice, paired with the ship method it actually went out on
     (an invoice can carry more than one package/tracking number — e.g. Turn14's own invoice
     dashboard lists each separately)."""
+
     ship_method: typing.Optional[str] = None
     tracking_number: typing.Optional[str] = None
 
@@ -217,6 +222,7 @@ class InvoiceLineItem:
     """One billed line on a DistributorInvoice — only populated by adapters whose invoice
     response actually itemizes lines (Turn14, Premier); left as an empty list by adapters that
     only have header-level invoice data (Keystone's synthesized invoice) or none at all."""
+
     part_number: typing.Optional[str] = None
     description: typing.Optional[str] = None
     quantity: typing.Optional[int] = None
@@ -234,6 +240,7 @@ class DistributorInvoice:
     returned by adapters where supports_invoices() is True (currently Turn14 — see
     GET /v1/invoices/po/{purchase_order_number}).
     """
+
     invoice_number: str
     invoice_date: typing.Optional[datetime.date] = None
     # The distributor's own order id this invoice was issued against, when the response states
@@ -261,6 +268,7 @@ class ShippingMethod:
     distributor APIs (Turn14 included) only compute an actual price for ONE method per
     quote call, so picking a method here is "filter the next quote to this carrier," not
     "compare live prices across methods in one call"."""
+
     code: str
     name: str
     carrier_name: typing.Optional[str] = None

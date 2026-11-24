@@ -22,9 +22,7 @@ RESEND_API_URL = "https://api.resend.com/emails"
 
 def _company_admin_email(company: src_models.Company) -> str | None:
     profile = (
-        src_models.UserProfile.objects.filter(company=company, is_company_admin=True)
-        .select_related("user")
-        .first()
+        src_models.UserProfile.objects.filter(company=company, is_company_admin=True).select_related("user").first()
     )
     return profile.user.email if profile and profile.user.email else None
 
@@ -92,9 +90,7 @@ def send_first_sync_completed_email(company_provider: src_models.CompanyProvider
         )
         response.raise_for_status()
     except Exception as e:
-        logger.exception(
-            "Failed to send first-sync email for company_provider_id=%s.", company_provider.id
-        )
+        logger.exception("Failed to send first-sync email for company_provider_id=%s.", company_provider.id)
         _log_email(
             email_type=src_enums.NotificationEmailType.FIRST_SYNC_COMPLETED,
             to_email=to_email,
@@ -195,9 +191,7 @@ def send_purchase_order_email(
         )
         response.raise_for_status()
     except Exception as e:
-        logger.exception(
-            "Failed to email purchase order id=%s to %s.", purchase_order.id, to_email
-        )
+        logger.exception("Failed to email purchase order id=%s to %s.", purchase_order.id, to_email)
         _log_email(
             email_type=src_enums.NotificationEmailType.PURCHASE_ORDER_EMAILED,
             to_email=to_email,
@@ -208,9 +202,7 @@ def send_purchase_order_email(
             status=src_enums.NotificationEmailStatus.FAILED,
             error_message=str(e)[:4000],
         )
-        raise order_exceptions.OrderValidationError(
-            "Failed to email the purchase order to {}: {}".format(to_email, e)
-        )
+        raise order_exceptions.OrderValidationError("Failed to email the purchase order to {}: {}".format(to_email, e))
 
     message_id = response.json().get("id")
     _log_email(

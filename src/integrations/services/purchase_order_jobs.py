@@ -53,9 +53,7 @@ def enqueue_cancel_job(purchase_order_id: int) -> src_models.PurchaseOrderJob:
     return _enqueue(purchase_order_id, src_enums.PurchaseOrderOperation.CANCEL)
 
 
-def _enqueue(
-    purchase_order_id: int, operation: src_enums.PurchaseOrderOperation
-) -> src_models.PurchaseOrderJob:
+def _enqueue(purchase_order_id: int, operation: src_enums.PurchaseOrderOperation) -> src_models.PurchaseOrderJob:
     job = src_models.PurchaseOrderJob.objects.create(
         purchase_order_id=purchase_order_id,
         operation=operation.value,
@@ -96,9 +94,7 @@ def claim_next_open_job(
         job.started_at = timezone.now()
         job.message = None
         job.error_message = None
-        job.save(
-            update_fields=["status", "status_name", "started_at", "message", "error_message", "updated_at"]
-        )
+        job.save(update_fields=["status", "status_name", "started_at", "message", "error_message", "updated_at"])
         return job
 
 
@@ -111,7 +107,14 @@ def _ensure_po_number(po: src_models.PurchaseOrder) -> None:
 def _ship_to_from_purchase_order(po: src_models.PurchaseOrder) -> order_base.ShipToAddress:
     missing = [
         field
-        for field in ("ship_to_name", "ship_to_address1", "ship_to_city", "ship_to_state", "ship_to_postal_code", "ship_to_country")
+        for field in (
+            "ship_to_name",
+            "ship_to_address1",
+            "ship_to_city",
+            "ship_to_state",
+            "ship_to_postal_code",
+            "ship_to_country",
+        )
         if not getattr(po, field)
     ]
     if missing:
@@ -136,9 +139,7 @@ def _ship_to_from_purchase_order(po: src_models.PurchaseOrder) -> order_base.Shi
 def _line_item_requests(po: src_models.PurchaseOrder) -> typing.List[order_base.OrderLineItemRequest]:
     line_items = list(po.line_items.select_related("provider_part").all())
     if not line_items:
-        raise order_exceptions.OrderValidationError(
-            "PurchaseOrder id={} has no line items.".format(po.id)
-        )
+        raise order_exceptions.OrderValidationError("PurchaseOrder id={} has no line items.".format(po.id))
     return [
         order_base.OrderLineItemRequest(
             line_item_id=li.id,
@@ -204,9 +205,7 @@ def _get_shipping_method_names(
     except order_exceptions.OrderAdapterError:
         logger.exception(
             "{} Failed to fetch shipping method catalog for company_provider_id={}; "
-            "ship_options names may be blank for unnamed codes this run.".format(
-                _LOG_PREFIX, company_provider_id
-            )
+            "ship_options names may be blank for unnamed codes this run.".format(_LOG_PREFIX, company_provider_id)
         )
         return {}
 
@@ -216,9 +215,7 @@ def _get_shipping_method_names(
     except Exception:
         logger.warning(
             "{} Cache unavailable writing shipping method names for company_provider_id={}; "
-            "will re-fetch live next time instead of using the cache.".format(
-                _LOG_PREFIX, company_provider_id
-            )
+            "will re-fetch live next time instead of using the cache.".format(_LOG_PREFIX, company_provider_id)
         )
     return names
 
@@ -271,7 +268,7 @@ def _run_quote(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrde
         True,
         request_payload=result.request_payload,
         response_payload=result.raw_response,
-        duration_ms=duration_ms
+        duration_ms=duration_ms,
     )
 
     method_names = _get_shipping_method_names(adapter, po.company_provider_id)
@@ -297,11 +294,7 @@ def _run_quote(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrde
         key = (ql.warehouse_code, status) if ql.warehouse_code else ("__no_warehouse__", idx)
         shipment = shipments_by_key.get(key)
         if shipment is None:
-            shipment_id = (
-                "{}-{}".format(ql.warehouse_code, status)
-                if ql.warehouse_code
-                else "shipment-{}".format(idx)
-            )
+            shipment_id = "{}-{}".format(ql.warehouse_code, status) if ql.warehouse_code else "shipment-{}".format(idx)
             shipment = {
                 "id": shipment_id,
                 "warehouse_code": ql.warehouse_code,
@@ -356,9 +349,7 @@ def _run_quote(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrde
                 # "backordered"/"not_orderable" fall back to the unavailable-quantity bucket
                 # (see keystone.py's ShipFlag handling for why "not_orderable" also populates
                 # quantity_backordered, not a separate field).
-                "quantity": (
-                    ql.quantity_available if status in ("in_stock", "transfer") else ql.quantity_backordered
-                ),
+                "quantity": (ql.quantity_available if status in ("in_stock", "transfer") else ql.quantity_backordered),
                 "unit_price": float(ql.distributor_unit_price) if ql.distributor_unit_price is not None else None,
                 "line_total": float(ql.distributor_line_total) if ql.distributor_line_total is not None else None,
             }
@@ -561,9 +552,7 @@ def compute_totals(po: src_models.PurchaseOrder) -> None:
         selected_id = shipment.get("selected_ship_option_id")
         if not selected_id:
             continue
-        option = next(
-            (o for o in (shipment.get("ship_options") or []) if o.get("id") == selected_id), None
-        )
+        option = next((o for o in (shipment.get("ship_options") or []) if o.get("id") == selected_id), None)
         if option and option.get("cost") is not None:
             shipment_costs.append(decimal.Decimal(str(option["cost"])))
 
@@ -669,13 +658,9 @@ def _run_submit(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrd
     # True preserves exact prior behavior for every adapter that existed before this field.
     is_confirmed = bool(result.distributor_order_numbers and result.distributor_confirmed)
     po.status = (
-        src_enums.PurchaseOrderStatus.CONFIRMED.value
-        if is_confirmed
-        else src_enums.PurchaseOrderStatus.SUBMITTED.value
+        src_enums.PurchaseOrderStatus.CONFIRMED.value if is_confirmed else src_enums.PurchaseOrderStatus.SUBMITTED.value
     )
-    po.status_name = src_enums.PurchaseOrderStatus.__members__[
-        "CONFIRMED" if is_confirmed else "SUBMITTED"
-    ].name
+    po.status_name = src_enums.PurchaseOrderStatus.__members__["CONFIRMED" if is_confirmed else "SUBMITTED"].name
     po.submitted_at = timezone.now()
     po.error_message = None
     po.save(update_fields=["status", "status_name", "submitted_at", "error_message", "updated_at"])
@@ -727,9 +712,7 @@ def _sync_invoices(po: src_models.PurchaseOrder, adapter: order_base.Distributor
     try:
         invoices = adapter.get_invoices(po)
     except order_exceptions.OrderAdapterError as e:
-        logger.warning(
-            "{} Invoice fetch failed for purchase_order_id={}: {}".format(_LOG_PREFIX, po.id, e)
-        )
+        logger.warning("{} Invoice fetch failed for purchase_order_id={}: {}".format(_LOG_PREFIX, po.id, e))
         return
 
     for invoice in invoices:
@@ -746,8 +729,7 @@ def _sync_invoices(po: src_models.PurchaseOrder, adapter: order_base.Distributor
                 "paid_amount": invoice.paid_amount,
                 "amount_due": invoice.amount_due,
                 "tracking": [
-                    {"ship_method": t.ship_method, "tracking_number": t.tracking_number}
-                    for t in invoice.tracking
+                    {"ship_method": t.ship_method, "tracking_number": t.tracking_number} for t in invoice.tracking
                 ],
                 "line_items": [
                     {
@@ -769,9 +751,7 @@ def _sync_invoices(po: src_models.PurchaseOrder, adapter: order_base.Distributor
 def _run_cancel(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrderAdapter) -> None:
     if not adapter.supports_cancel():
         raise order_exceptions.OrderNotSupportedError(
-            "{} does not support cancelling an order via its API.".format(
-                po.company_provider.provider.kind_name
-            )
+            "{} does not support cancelling an order via its API.".format(po.company_provider.provider.kind_name)
         )
     started = time.monotonic()
     try:
@@ -781,7 +761,11 @@ def _run_cancel(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrd
         raise
     duration_ms = int((time.monotonic() - started) * 1000)
     _record_attempt(
-        po, src_enums.PurchaseOrderOperation.CANCEL, cancelled, response_payload={"cancelled": cancelled}, duration_ms=duration_ms
+        po,
+        src_enums.PurchaseOrderOperation.CANCEL,
+        cancelled,
+        response_payload={"cancelled": cancelled},
+        duration_ms=duration_ms,
     )
     if cancelled:
         po.status = src_enums.PurchaseOrderStatus.CANCELLED.value
@@ -809,7 +793,9 @@ _AUTO_RETRYABLE_OPERATIONS = {
 
 def _resolve_po_and_adapter(
     purchase_order_id: int,
-) -> typing.Tuple[typing.Optional[src_models.PurchaseOrder], typing.Optional[order_base.DistributorOrderAdapter], typing.Optional[str]]:
+) -> typing.Tuple[
+    typing.Optional[src_models.PurchaseOrder], typing.Optional[order_base.DistributorOrderAdapter], typing.Optional[str]
+]:
     """Returns (po, adapter, error_message). error_message is set (and the other two may be
     None/partial) when resolution failed — same lookup used by both the job runner and the
     synchronous quote path so they fail the same way."""
@@ -879,7 +865,9 @@ def run_submit_synchronously(purchase_order_id: int) -> src_models.PurchaseOrder
     try:
         _run_submit(po, adapter)
     except Exception as e:
-        logger.exception("{} Synchronous submit failed for purchase_order_id={}.".format(_LOG_PREFIX, purchase_order_id))
+        logger.exception(
+            "{} Synchronous submit failed for purchase_order_id={}.".format(_LOG_PREFIX, purchase_order_id)
+        )
         # _run_submit already marks FAILED (with error_message) for OrderAdapterError before
         # re-raising; this only covers an unexpected non-adapter bug, so the PO never gets
         # stuck at SUBMITTING if that happens.
@@ -992,9 +980,7 @@ def process_purchase_order_jobs(
             local_count += 1
         return local_count
 
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=workers, thread_name_prefix="po_job"
-    ) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers, thread_name_prefix="po_job") as executor:
         futs = [executor.submit(_worker) for _ in range(workers)]
         total = sum(f.result() for f in concurrent.futures.as_completed(futs))
     return total
