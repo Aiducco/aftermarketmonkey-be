@@ -7,6 +7,9 @@ CompanyBrands, CompanyBrandDestinations, and all per-company pricing tables
 AtechCompanyPricing, DlgCompanyPricing, WheelProsCompanyPricing,
 RoughCountryCompanyPricing, SbCompanyPricing, ProviderPartCompanyPricing).
 
+Feed tenants (the hidden companies that hold a space's own distributor feeds, ADR 0002) are NOT cloned: only the
+source company's own connections are copied, and the clone starts with its main space only.
+
 Usage:
     python manage.py clone_company --source-id 16 --email gojko@aftermarketscout.com
     python manage.py clone_company --source-id 16 --email gojko@aftermarketscout.com --name "Demo Company"
@@ -67,7 +70,10 @@ def _bulk_clone_pricing(model, company_fk_field, source_company, new_company, la
 
 
 class Command(BaseCommand):
-    help = "Clone a company into a new demo account, copying all provider credentials and pricing."
+    help = (
+        "Clone a company into a new demo account, copying all provider credentials and pricing. "
+        "Feed tenants (a space's own feeds) are not cloned."
+    )
 
     def add_arguments(self, parser):
         parser.add_argument("--source-id", type=int, required=True, help="ID of the source company to clone.")

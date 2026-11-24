@@ -19,7 +19,10 @@ class Command(BaseCommand):
     help = "Provision a dedicated relay SFTP account for any company that doesn't have one yet."
 
     def handle(self, *args, **options):
-        companies = src_models.Company.objects.filter(Q(relay_sftp_username__isnull=True) | Q(relay_sftp_username=""))
+        # Feed tenants are skipped: connecting a relay feed in a space provisions the tenant's login on demand.
+        companies = src_models.Company.objects.filter(
+            Q(relay_sftp_username__isnull=True) | Q(relay_sftp_username=""), parent_company__isnull=True
+        )
         total = companies.count()
         if not total:
             self.stdout.write("No companies pending SFTP provisioning.")

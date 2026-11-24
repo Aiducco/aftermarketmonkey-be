@@ -497,6 +497,12 @@ def delete_all_company_data(user, company_id: int) -> tuple[bool, str | None]:
     if not ok:
         return False, err
 
+    # Feed tenants hold full copies of distributor pricing: never deleted inside a request (ADR 0002).
+    if src_models.Company.objects.filter(parent_company_id=company_id).exists():
+        return False, (
+            "This company has space feeds that must be removed first. Contact support to delete the account."
+        )
+
     with transaction.atomic():
         # Collect all Django auth user IDs in the company before deleting profiles
         user_ids = list(src_models.UserProfile.objects.filter(company_id=company_id).values_list("user_id", flat=True))

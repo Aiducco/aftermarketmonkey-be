@@ -15,6 +15,7 @@ from src import enums as src_enums
 from src import models as src_models
 from src.api.services import billing as billing_services
 from src.api.services import plan_lifecycle as plan_lifecycle_services
+from src.api.services import spaces as spaces_services
 
 _LOG_PREFIX = "[ADMIN-SERVICE]"
 
@@ -109,6 +110,7 @@ def list_all_companies_for_admin() -> typing.List[typing.Dict]:
 
     companies = (
         src_models.Company.objects.exclude(slug=ADMIN_COMPANY_SLUG)
+        .filter(parent_company__isnull=True)  # feed tenants are not customers (ADR 0002)
         .annotate(
             total_providers_count=Count("company_providers"),
             connected_providers_count=Count("company_providers", filter=Q(company_providers__status_name="CONNECTED")),
@@ -150,7 +152,7 @@ def get_admin_company_detail(company_id: int) -> typing.Optional[typing.Dict]:
     logger.info("{} Fetching company detail for company_id: {}.".format(_LOG_PREFIX, company_id))
 
     company = (
-        src_models.Company.objects.filter(id=company_id)
+        src_models.Company.objects.filter(id=company_id, parent_company__isnull=True)
         .annotate(
             total_providers_count=Count("company_providers"),
             connected_providers_count=Count("company_providers", filter=Q(company_providers__status_name="CONNECTED")),
@@ -162,18 +164,28 @@ def get_admin_company_detail(company_id: int) -> typing.Optional[typing.Dict]:
     if not company:
         return None
 
+    # The company's own connections and its feed tenants' (a space's own feeds), each tagged with its space.
+    family_ids = spaces_services.family_company_ids(company_id)
+    owner_space_by_company = {}
+    for space in src_models.Space.objects.filter(company_id=company_id).only(
+        "id", "name", "is_main", "feed_company_id"
+    ):
+        owner_space_by_company[space.feed_company_id if not space.is_main else company_id] = space
     company_providers = (
-        src_models.CompanyProviders.objects.filter(company_id=company_id)
+        src_models.CompanyProviders.objects.filter(company_id__in=family_ids)
         .select_related("provider")
-        .order_by("provider__name")
+        .order_by("provider__name", "id")
     )
 
     providers = []
     for cp in company_providers:
+        owner_space = owner_space_by_company.get(cp.company_id)
         providers.append(
             {
                 "id": cp.id,
                 "provider_id": cp.provider_id,
+                "space_id": owner_space.id if owner_space else None,
+                "space_name": owner_space.name if owner_space else None,
                 "provider_name": cp.provider.name if cp.provider else None,
                 "status": cp.status,
                 "status_name": cp.status_name,
@@ -278,19 +290,21 @@ def get_admin_provider_detail(provider_id: int) -> typing.Optional[typing.Dict]:
     company_providers = (
         src_models.CompanyProviders.objects.filter(provider_id=provider_id)
         .exclude(company__slug=ADMIN_COMPANY_SLUG)
-        .select_related("company")
+        .select_related("company", "company__parent_company")
         .order_by("company__name")
     )
 
     companies = []
     for cp in company_providers:
+        # A tenant's feed is listed under the customer it belongs to (ADR 0002).
+        customer = cp.company.customer_company if cp.company else None
         companies.append(
             {
                 "id": cp.id,
-                "company_id": cp.company_id,
-                "company_name": cp.company.name if cp.company else None,
-                "company_slug": cp.company.slug if cp.company else None,
-                "subscription_plan": cp.company.subscription_plan if cp.company else None,
+                "company_id": customer.id if customer else cp.company_id,
+                "company_name": customer.name if customer else None,
+                "company_slug": customer.slug if customer else None,
+                "subscription_plan": customer.subscription_plan if customer else None,
                 "status": cp.status,
                 "status_name": cp.status_name,
                 "status_reason": cp.status_reason,
