@@ -217,6 +217,7 @@ def set_user_spaces(company_id: int, admin_user, target_user_id: int, space_ids:
     profile = src_models.UserProfile.objects.filter(user_id=target_user_id, company_id=company_id).first()
     if profile is None:
         raise spaces_services.SpaceError("User not found in company", "user_not_found", status_code=404)
+    spaces_services._lock_company(company_id)  # same lock as delete_space, so a delete cannot race this
     ids = _checked_space_ids(company_id, space_ids)
     profile.spaces.set(ids)
     return {"id": target_user_id, "space_ids": ids}
@@ -251,7 +252,10 @@ def add_company_user(
 
     # Flagged: a non-admin gets exactly the given spaces; an admin sees every space and ignores space_ids.
     spaces_enabled = _spaces_enabled(company_id)
-    member_space_ids = _checked_space_ids(company_id, space_ids) if spaces_enabled and not is_company_admin else []
+    member_space_ids = []
+    if spaces_enabled and not is_company_admin:
+        spaces_services._lock_company(company_id)  # same lock as delete_space, so a delete cannot race this
+        member_space_ids = _checked_space_ids(company_id, space_ids)
 
     existing_user = auth_models.User.objects.filter(email=email).first()
 
@@ -373,6 +377,7 @@ def update_company_user_role(
     }
 
 
+@transaction.atomic
 def remove_company_user(
     company_id: int,
     target_user_id: int,
