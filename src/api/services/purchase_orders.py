@@ -482,7 +482,12 @@ def _resolve_user_profile_id(user_id: typing.Optional[int]) -> typing.Optional[i
     return profile.id if profile else None
 
 
-def _get_company_provider(company_id: int, provider_id: int) -> src_models.CompanyProviders:
+def _get_company_provider(
+    company_id: int,
+    provider_id: int,
+    scope: typing.Optional[spaces_services.SpaceScope] = None,
+    space_id: typing.Optional[int] = None,
+) -> src_models.CompanyProviders:
     """
     Resolve this company's connection (CompanyProviders) to a distributor, from the
     distributor's public catalog id (Providers.id — what part-detail responses expose as
@@ -498,12 +503,21 @@ def _get_company_provider(company_id: int, provider_id: int) -> src_models.Compa
     order_account) for the actually-resolved account instead, once _resolve_order_account has
     run — that's the only check that knows whether THIS connection, through whichever account
     ends up being used, can really place an order.
+
+    Flagged companies (``scope.enabled``) resolve the connection the write space uses for the distributor
+    (``spaces.feeds_for``: the company's own, a shared one or the space's own feed tenant's), active ones only;
+    everyone else gets the company's own connection, exactly as before.
     """
-    cp = (
-        src_models.CompanyProviders.objects.filter(company_id=company_id, provider_id=provider_id)
-        .select_related("provider")
-        .first()
-    )
+    if scope is not None and scope.enabled and space_id is not None:
+        cp = spaces_services.feeds_for(space_id).get(provider_id)
+        if cp is not None:
+            cp = src_models.CompanyProviders.objects.select_related("provider").get(id=cp.id)
+    else:
+        cp = (
+            src_models.CompanyProviders.objects.filter(company_id=company_id, provider_id=provider_id)
+            .select_related("provider")
+            .first()
+        )
     if not cp:
         raise PurchaseOrderServiceError("This distributor isn't connected for your company.")
     if cp.paused_at is not None:
@@ -745,7 +759,7 @@ def _get_or_create_draft(
 
 def _add_or_increment_line_item(
     po: src_models.PurchaseOrder,
-    company_id: int,
+    pricing_company_id: int,
     provider_part: src_models.ProviderPart,
     quantity: int,
     kit_source_provider_part: typing.Optional[src_models.ProviderPart] = None,
@@ -757,7 +771,7 @@ def _add_or_increment_line_item(
     an expanded kit, so both go through the identical select_for_update/create-or-increment path.
     """
     pricing = src_models.ProviderPartCompanyPricing.objects.filter(
-        provider_part=provider_part, company_id=company_id
+        provider_part=provider_part, company_id=pricing_company_id
     ).first()
     unit_cost = pricing.cost if pricing else None
 
@@ -833,7 +847,7 @@ def add_cart_item(
     if not isinstance(quantity, int) or quantity <= 0:
         raise PurchaseOrderServiceError("Quantity must be a positive integer.")
 
-    cp = _get_company_provider(company_id, provider_id)
+    cp = _get_company_provider(company_id, provider_id, scope, space_id)
     order_account = _resolve_order_account(cp, order_account_id)
     _ensure_account_in_space(scope, cp, order_account, space_id)
     if order_registry.get_adapter(cp, order_account) is None:
@@ -855,13 +869,13 @@ def add_cart_item(
             for component in kit_components:
                 _add_or_increment_line_item(
                     po,
-                    company_id,
+                    cp.company_id,
                     component.component_part,
                     quantity * component.quantity,
                     kit_source_provider_part=provider_part,
                 )
         else:
-            _add_or_increment_line_item(po, company_id, provider_part, quantity)
+            _add_or_increment_line_item(po, cp.company_id, provider_part, quantity)
 
     return get_cart(company_id, scope)
 
@@ -1969,11 +1983,34 @@ def get_order_capabilities(
     multi_spaces flag (``scope.enabled``) the accounts are the ones the current space uses (every visible
     space's in "all"), and each has ``space_ids``, limited to the spaces the caller can see.
     """
-    company_providers = (
-        src_models.CompanyProviders.objects.filter(company_id=company_id, active=True)
-        .select_related("provider")
-        .prefetch_related(_active_accounts_prefetch())
-    )
+    flagged = scope is not None and scope.enabled
+    if flagged:
+        # The connections the space uses (every visible space's in "all"), one row per distributor: the main
+        # space's connection when visible, else the lowest id; its accounts are those of every such connection.
+        used_by_provider: typing.Dict[int, typing.Dict[int, typing.Set[int]]] = {}
+        for space_id in scope.list_space_ids:
+            for provider_id, used_cp in spaces_services.feeds_for(space_id).items():
+                used_by_provider.setdefault(provider_id, {}).setdefault(used_cp.id, set()).add(space_id)
+        used_ids = [cp_id for per_provider in used_by_provider.values() for cp_id in per_provider]
+        loaded_by_id = {
+            cp.id: cp
+            for cp in src_models.CompanyProviders.objects.filter(id__in=used_ids)
+            .select_related("provider")
+            .prefetch_related(_active_accounts_prefetch())
+        }
+        company_providers = []
+        siblings_of: typing.Dict[int, typing.List[src_models.CompanyProviders]] = {}
+        for provider_id in sorted(used_by_provider):
+            group = [loaded_by_id[cp_id] for cp_id in sorted(used_by_provider[provider_id])]
+            row_cp = next((cp for cp in group if scope.main_space_id in used_by_provider[provider_id][cp.id]), group[0])
+            company_providers.append(row_cp)
+            siblings_of[row_cp.id] = group
+    else:
+        company_providers = (
+            src_models.CompanyProviders.objects.filter(company_id=company_id, active=True)
+            .select_related("provider")
+            .prefetch_related(_active_accounts_prefetch())
+        )
     ordering_enabled = billing_services.check_po_checkout_allowed(company_id)[0]
     results = []
     for cp in company_providers:
@@ -1985,8 +2022,13 @@ def get_order_capabilities(
         # abstract) would tell the FE ordering is available for connections that would
         # actually fail the moment a quote/order was attempted.
         adapter = order_registry.get_adapter(cp)
-        if scope is not None and scope.enabled:
-            order_accounts, has_active_accounts = _accounts_for_scope(scope, cp)
+        if flagged:
+            order_accounts = []
+            has_active_accounts = False
+            for sibling in siblings_of[cp.id]:
+                sibling_accounts, sibling_has_active = _accounts_for_scope(scope, sibling)
+                order_accounts.extend(sibling_accounts)
+                has_active_accounts = has_active_accounts or sibling_has_active
             # A connection the space uses none of the accounts of stays listed but cannot order for this space.
             used_by_none = not order_accounts and has_active_accounts
         else:

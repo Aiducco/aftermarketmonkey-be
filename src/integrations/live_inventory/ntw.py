@@ -47,12 +47,22 @@ def _ship_to_for(company_provider: src_models.CompanyProviders) -> typing.Option
     The company's own address as TBC's ``shipTo``. Documented mandatory; measured as not enforced
     for a stock read, so this returns None rather than failing when a company has no location on
     file -- a missing address must not block a product page from showing availability.
+
+    A space's own feed lives on a hidden feed-tenant company that has no address of its own: its ship-to is
+    the address of the space that owns the feed (None for an Online store, which has none). Every other
+    connection reads the company's primary location, as before.
     """
-    location = (
-        src_models.CompanyLocation.objects.filter(company_id=company_provider.company_id)
-        .order_by("-is_primary", "id")
-        .first()
+    owner_space = (
+        src_models.Space.objects.filter(feed_company_id=company_provider.company_id).select_related("location").first()
     )
+    if owner_space is not None:
+        location = owner_space.location
+    else:
+        location = (
+            src_models.CompanyLocation.objects.filter(company_id=company_provider.company_id)
+            .order_by("-is_primary", "id")
+            .first()
+        )
     if not location:
         return None
     return [
