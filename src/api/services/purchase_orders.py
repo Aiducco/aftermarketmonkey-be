@@ -25,6 +25,7 @@ from src import enums as src_enums
 from src import models as src_models
 from src.api.services import address as address_services
 from src.api.services import billing as billing_services
+from src.api.services import spaces as spaces_services
 from src.integrations import credentials as credentials_helper
 from src.integrations.orders import base as order_base
 from src.integrations.orders import history_registry as order_history_registry
@@ -36,6 +37,8 @@ from src.integrations.services import purchase_order_pdf
 
 logger = logging.getLogger(__name__)
 _LOG_PREFIX = "[PURCHASE-ORDERS-API]"
+
+ERROR_MIXED_SPACES = "mixed_spaces"
 
 _REQUIRED_SHIP_TO_FIELDS = ("name", "address1", "city", "state", "postal_code", "country")
 
@@ -54,6 +57,24 @@ class PurchaseOrderServiceError(Exception):
     def __init__(self, message: str, error_code: typing.Optional[str] = None) -> None:
         super().__init__(message)
         self.error_code = error_code
+
+
+# -- Spaces -------------------------------------------------------------------------------
+
+
+def _list_space_ids(scope: spaces_services.SpaceScope) -> typing.Optional[typing.List[int]]:
+    """The space ids a list filters by; None (no filter at all) for a company without the flag."""
+    return scope.list_space_ids if scope.enabled else None
+
+
+def _add_space_fields(
+    data: typing.Dict, space_id: int, scope: typing.Optional[spaces_services.SpaceScope]
+) -> typing.Dict:
+    """space_id / space_name on a response row, only for a company with the flag."""
+    if scope is not None and scope.enabled:
+        data["space_id"] = space_id
+        data["space_name"] = scope.space_names.get(space_id)
+    return data
 
 
 # -- Serialization ------------------------------------------------------------------------
@@ -290,7 +311,11 @@ def _fulfillment_channels_by_po_id(
     return channels
 
 
-def _serialize_purchase_order(po: src_models.PurchaseOrder, include_line_items: bool = True) -> typing.Dict:
+def _serialize_purchase_order(
+    po: src_models.PurchaseOrder,
+    include_line_items: bool = True,
+    scope: typing.Optional[spaces_services.SpaceScope] = None,
+) -> typing.Dict:
     provider = po.company_provider.provider
     result = {
         "id": po.id,
@@ -396,7 +421,7 @@ def _serialize_purchase_order(po: src_models.PurchaseOrder, include_line_items: 
             ).all()
         ]
         result["item_count"] = sum(li["quantity"] for li in result["line_items"])
-    return result
+    return _add_space_fields(result, po.space_id, scope)
 
 
 def _serialize_purchase_order_list_item(
@@ -525,7 +550,7 @@ def _serialize_order_accounts(cp: src_models.CompanyProviders) -> typing.List[ty
     ]
 
 
-def _cart_queryset(company_id: int):
+def _cart_queryset(company_id: int, space_ids: typing.Optional[typing.List[int]]):
     """
     POs that still belong to the "cart" world, as opposed to order history: never-submitted
     DRAFT/QUOTED carts, AND any FAILED PO regardless of whether the failure ever actually
@@ -538,8 +563,11 @@ def _cart_queryset(company_id: int):
     _get_or_create_draft / _revert_to_draft) — a fresh cart edit implicitly means "never mind,
     starting over." DISCARDED is deliberately excluded — once a user discards a PO it's a dead
     end, never resurrected as a draft.
+
+    ``space_ids`` limits it to those spaces; None means every space of the company (a company
+    without the multi_spaces flag, or an object lookup that checks the space itself afterwards).
     """
-    return src_models.PurchaseOrder.objects.filter(
+    qs = src_models.PurchaseOrder.objects.filter(
         company_id=company_id,
         status__in=[
             src_enums.PurchaseOrderStatus.DRAFT.value,
@@ -547,6 +575,9 @@ def _cart_queryset(company_id: int):
             src_enums.PurchaseOrderStatus.FAILED.value,
         ],
     )
+    if space_ids is not None:
+        qs = qs.filter(space_id__in=space_ids)
+    return qs
 
 
 def _revert_to_draft(po: src_models.PurchaseOrder) -> None:
@@ -593,15 +624,16 @@ def _get_or_create_draft(
     company_id: int,
     user_id: typing.Optional[int],
     cp: src_models.CompanyProviders,
-    order_account: typing.Optional[src_models.CompanyProviderOrderAccount] = None,
+    order_account: typing.Optional[src_models.CompanyProviderOrderAccount],
+    space_id: int,
 ) -> src_models.PurchaseOrder:
     """
-    Each (company_provider, order_account) pair has its own independent open draft — items
+    Each (space, company_provider, order_account) triple has its own independent open draft — items
     added under two different accounts of the same distributor never land in the same cart (see
     PurchaseOrder.order_account's docstring and its two open-draft uniqueness constraints).
     """
     existing = (
-        _cart_queryset(company_id)
+        _cart_queryset(company_id, [space_id])
         .filter(company_provider=cp, order_account=order_account)
         .order_by("-created_at")
         .first()
@@ -616,6 +648,7 @@ def _get_or_create_draft(
         with transaction.atomic():
             po, _created = src_models.PurchaseOrder.objects.get_or_create(
                 company_id=company_id,
+                space_id=space_id,
                 company_provider=cp,
                 order_account=order_account,
                 status=src_enums.PurchaseOrderStatus.DRAFT.value,
@@ -629,6 +662,7 @@ def _get_or_create_draft(
     except IntegrityError:
         po = src_models.PurchaseOrder.objects.get(
             company_id=company_id,
+            space_id=space_id,
             company_provider=cp,
             order_account=order_account,
             status=src_enums.PurchaseOrderStatus.DRAFT.value,
@@ -684,6 +718,7 @@ def _add_or_increment_line_item(
 
 def add_cart_item(
     company_id: int,
+    scope: spaces_services.SpaceScope,
     user_id: typing.Optional[int],
     provider_id: int,
     master_part_id: int,
@@ -715,6 +750,9 @@ def add_cart_item(
     if not allowed:
         raise PurchaseOrderServiceError(plan_reason, error_code=billing_services.PLAN_LIMIT_ERROR_CODE)
 
+    # The space the cart belongs to (raises space_required / space_access_denied); main for an unflagged company.
+    space_id = spaces_services.write_space(scope)
+
     if not provider_id:
         raise PurchaseOrderServiceError("provider_id is required.")
     if not master_part_id:
@@ -735,7 +773,7 @@ def add_cart_item(
     if not provider_part:
         raise PurchaseOrderServiceError("Part not found for this distributor.")
 
-    po = _get_or_create_draft(company_id, user_id, cp, order_account)
+    po = _get_or_create_draft(company_id, user_id, cp, order_account, space_id)
 
     with transaction.atomic():
         if provider_part.is_kit:
@@ -757,18 +795,21 @@ def add_cart_item(
         else:
             _add_or_increment_line_item(po, company_id, provider_part, quantity)
 
-    return get_cart(company_id)
+    return get_cart(company_id, scope)
 
 
-def update_cart_item(company_id: int, line_item_id: int, quantity: int) -> typing.Dict:
+def update_cart_item(
+    company_id: int, scope: spaces_services.SpaceScope, line_item_id: int, quantity: int
+) -> typing.Dict:
     if not isinstance(quantity, int) or quantity <= 0:
         raise PurchaseOrderServiceError("Quantity must be a positive integer.")
 
     li = src_models.PurchaseOrderLineItem.objects.filter(
-        id=line_item_id, purchase_order_id__in=_cart_queryset(company_id).values("id")
+        id=line_item_id, purchase_order_id__in=_cart_queryset(company_id, None).values("id")
     ).select_related("purchase_order").first()
     if not li:
         raise PurchaseOrderServiceError("Cart item not found.")
+    spaces_services.ensure_visible(scope, li.purchase_order.space_id)
 
     li.quantity = quantity
     if li.unit_cost is not None:
@@ -776,24 +817,25 @@ def update_cart_item(company_id: int, line_item_id: int, quantity: int) -> typin
     li.save(update_fields=["quantity", "line_total", "updated_at"])
     if li.purchase_order.status != src_enums.PurchaseOrderStatus.DRAFT.value:
         _revert_to_draft(li.purchase_order)
-    return get_cart(company_id)
+    return get_cart(company_id, scope)
 
 
-def remove_cart_item(company_id: int, line_item_id: int) -> typing.Dict:
+def remove_cart_item(company_id: int, scope: spaces_services.SpaceScope, line_item_id: int) -> typing.Dict:
     li = src_models.PurchaseOrderLineItem.objects.filter(
-        id=line_item_id, purchase_order_id__in=_cart_queryset(company_id).values("id")
+        id=line_item_id, purchase_order_id__in=_cart_queryset(company_id, None).values("id")
     ).select_related("purchase_order").first()
     if not li:
         raise PurchaseOrderServiceError("Cart item not found.")
     po = li.purchase_order
+    spaces_services.ensure_visible(scope, po.space_id)
     li.delete()
     if po.status != src_enums.PurchaseOrderStatus.DRAFT.value:
         _revert_to_draft(po)
-    return get_cart(company_id)
+    return get_cart(company_id, scope)
 
 
 def set_cart_order_account(
-    company_id: int, purchase_order_id: int, order_account_id: typing.Optional[int]
+    company_id: int, scope: spaces_services.SpaceScope, purchase_order_id: int, order_account_id: typing.Optional[int]
 ) -> typing.Dict:
     """
     Moves an existing cart-side PO to a different order account of the SAME connection — lets a
@@ -806,20 +848,21 @@ def set_cart_order_account(
     means nothing once the account backing it changes; a fresh review/quote is required.
     """
     po = (
-        _cart_queryset(company_id)
+        _cart_queryset(company_id, None)
         .filter(id=purchase_order_id)
         .select_related("company_provider")
         .first()
     )
     if not po:
         raise PurchaseOrderServiceError("Cart not found.")
+    spaces_services.ensure_visible(scope, po.space_id)
 
     order_account = _resolve_order_account(po.company_provider, order_account_id)
     if order_account == po.order_account:
-        return get_cart(company_id)
+        return get_cart(company_id, scope)
 
     conflict = (
-        _cart_queryset(company_id)
+        _cart_queryset(company_id, [po.space_id])
         .filter(company_provider=po.company_provider, order_account=order_account)
         .exclude(id=po.id)
         .exists()
@@ -834,17 +877,17 @@ def set_cart_order_account(
     po.save(update_fields=["order_account", "updated_at"])
     if po.status != src_enums.PurchaseOrderStatus.DRAFT.value:
         _revert_to_draft(po)
-    return get_cart(company_id)
+    return get_cart(company_id, scope)
 
 
-def get_cart(company_id: int) -> typing.Dict:
+def get_cart(company_id: int, scope: spaces_services.SpaceScope) -> typing.Dict:
     drafts = (
-        _cart_queryset(company_id)
+        _cart_queryset(company_id, _list_space_ids(scope))
         .select_related("company_provider__provider", "group", "order_account")
         .prefetch_related("line_items__provider_part__master_part__brand", "distributor_orders")
         .order_by("company_provider__provider__name")
     )
-    serialized = [_serialize_purchase_order(po) for po in drafts]
+    serialized = [_serialize_purchase_order(po, scope=scope) for po in drafts]
     # Only carts that actually have line items count toward the badge/review flow — an empty
     # DRAFT can exist momentarily (e.g. after removing the last item) without being "active".
     active = [po for po in serialized if po["line_items"]]
@@ -859,6 +902,7 @@ def get_cart(company_id: int) -> typing.Dict:
 
 def review_cart(
     company_id: int,
+    scope: spaces_services.SpaceScope,
     user_id: typing.Optional[int],
     ship_to: typing.Dict,
     purchase_order_ids: typing.Optional[typing.List[int]] = None,
@@ -921,10 +965,21 @@ def review_cart(
     # pricing — rather than silently treating "already quoted" as "nothing to do" (which used
     # to raise "No cart items to review" on a cart that's entirely already-quoted, even though
     # a perfectly valid line item existed).
-    qs = _cart_queryset(company_id).filter(line_items__isnull=False)
     if purchase_order_ids:
-        qs = qs.filter(id__in=purchase_order_ids)
+        qs = _cart_queryset(company_id, None).filter(line_items__isnull=False, id__in=purchase_order_ids)
+    else:
+        # No ids: the carts of the write space (raises space_required / space_access_denied); every cart
+        # for a company without the flag.
+        qs = _cart_queryset(company_id, [spaces_services.write_space(scope)] if scope.enabled else None).filter(
+            line_items__isnull=False
+        )
     purchase_orders = list(qs.distinct())
+    for po in purchase_orders:
+        spaces_services.ensure_visible(scope, po.space_id)
+    if len({po.space_id for po in purchase_orders}) > 1:
+        raise spaces_services.SpaceError(
+            "These carts belong to different spaces. Review one space at a time.", ERROR_MIXED_SPACES
+        )
     if not purchase_orders:
         raise PurchaseOrderServiceError("No cart items to review.")
 
@@ -975,7 +1030,7 @@ def review_cart(
             ]
         )
         quoted_po = purchase_order_jobs.run_quote_synchronously(po.id)
-        results.append(_serialize_purchase_order(quoted_po))
+        results.append(_serialize_purchase_order(quoted_po, scope=scope))
 
     return {"group_id": group.id, "purchase_orders": results}
 
@@ -1308,7 +1363,7 @@ def list_purchase_orders(
     carries."""
     qs = (
         src_models.PurchaseOrder.objects.filter(company_id=company_id)
-        .exclude(id__in=_cart_queryset(company_id).values("id"))
+        .exclude(id__in=_cart_queryset(company_id, None).values("id"))
         .exclude(status=src_enums.PurchaseOrderStatus.DISCARDED.value)
         .select_related("company_provider__provider", "order_account")
         .order_by("-created_at")

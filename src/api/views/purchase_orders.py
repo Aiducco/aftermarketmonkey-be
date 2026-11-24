@@ -7,6 +7,7 @@ from django import http, views
 
 from src.api.services import billing as billing_services
 from src.api.services import purchase_orders as purchase_orders_services
+from src.api.services import spaces as spaces_services
 
 logger = logging.getLogger(__name__)
 _LOG_PREFIX = "[PURCHASE-ORDERS]"
@@ -69,6 +70,16 @@ def _error_response_for(e: purchase_orders_services.PurchaseOrderServiceError) -
     )
 
 
+def _space_error_response(e: spaces_services.SpaceError) -> http.HttpResponse:
+    """A space rule refused the request: 403 space_access_denied (naming the space and nothing else of the
+    object) or 400 space_required / mixed_spaces. Never a logout, upgrade or suspension for the fe."""
+    return http.HttpResponse(
+        headers={"Content-Type": "application/json"},
+        content=simplejson.dumps(e.body()),
+        status=e.status_code,
+    )
+
+
 def _parse_json_body(request: http.HttpRequest) -> typing.Tuple[typing.Optional[dict], typing.Optional[http.HttpResponse]]:
     try:
         body = json.loads(request.body) if request.body else {}
@@ -88,7 +99,8 @@ class CartView(views.View):
         if err:
             return err
         try:
-            return _json_response(purchase_orders_services.get_cart(company_id))
+            scope = spaces_services.resolve_scope(request)
+            return _json_response(purchase_orders_services.get_cart(company_id, scope))
         except Exception:
             logger.exception("{} Error fetching cart for company_id={}".format(_LOG_PREFIX, company_id))
             return _error_response("Error fetching cart", status=500)
@@ -111,14 +123,18 @@ class CartItemsView(views.View):
             return err
 
         try:
+            scope = spaces_services.resolve_scope(request)
             result = purchase_orders_services.add_cart_item(
                 company_id=company_id,
+                scope=scope,
                 user_id=user_id,
                 provider_id=body.get("provider_id"),
                 master_part_id=body.get("master_part_id"),
                 quantity=body.get("quantity"),
                 order_account_id=body.get("order_account_id"),
             )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response_for(e)
         except Exception:
@@ -142,9 +158,12 @@ class CartItemDetailView(views.View):
 
         line_item_id = kwargs.get("line_item_id")
         try:
+            scope = spaces_services.resolve_scope(request)
             result = purchase_orders_services.update_cart_item(
-                company_id=company_id, line_item_id=line_item_id, quantity=body.get("quantity")
+                company_id=company_id, scope=scope, line_item_id=line_item_id, quantity=body.get("quantity")
             )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e), status=404)
         except Exception:
@@ -160,7 +179,12 @@ class CartItemDetailView(views.View):
 
         line_item_id = kwargs.get("line_item_id")
         try:
-            result = purchase_orders_services.remove_cart_item(company_id=company_id, line_item_id=line_item_id)
+            scope = spaces_services.resolve_scope(request)
+            result = purchase_orders_services.remove_cart_item(
+                company_id=company_id, scope=scope, line_item_id=line_item_id
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e), status=404)
         except Exception:
@@ -196,8 +220,10 @@ class CartReviewView(views.View):
             return err
 
         try:
+            scope = spaces_services.resolve_scope(request)
             result = purchase_orders_services.review_cart(
                 company_id=company_id,
+                scope=scope,
                 user_id=user_id,
                 ship_to=body.get("ship_to") or {},
                 purchase_order_ids=body.get("purchase_order_ids"),
@@ -206,6 +232,8 @@ class CartReviewView(views.View):
                 ship_methods=body.get("ship_methods"),
                 shipping_method_id=body.get("shipping_method_id"),
             )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response_for(e)
         except Exception:
@@ -231,11 +259,15 @@ class PurchaseOrderOrderAccountView(views.View):
 
         purchase_order_id = kwargs.get("id")
         try:
+            scope = spaces_services.resolve_scope(request)
             result = purchase_orders_services.set_cart_order_account(
                 company_id=company_id,
+                scope=scope,
                 purchase_order_id=purchase_order_id,
                 order_account_id=body.get("order_account_id"),
             )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e))
         except Exception:
