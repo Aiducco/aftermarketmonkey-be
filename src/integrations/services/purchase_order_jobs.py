@@ -571,6 +571,10 @@ def _run_submit(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrd
         # outside this block the PO would be left stuck at SUBMITTING with no error_message —
         # silently un-actionable instead of visibly FAILED.
         _ensure_po_number(po)
+        # The space's prefix is taken again on every attempt, so a failed PO whose space was renamed or
+        # re-prefixed is resent under the current one. After a successful submit this is not reached again.
+        po.po_prefix = po.space.prefix
+        po.save(update_fields=["po_prefix", "updated_at"])
         ship_to = _ship_to_from_purchase_order(po)
         line_items = _line_item_requests(po)
         result = adapter.submit_order(po, line_items, ship_to)
@@ -608,6 +612,9 @@ def _run_submit(po: src_models.PurchaseOrder, adapter: order_base.DistributorOrd
         po_number = premier_adapter.extract_po_reference(result.raw_response)
     else:
         po_number = None
+    if po_number is None and po.po_prefix:
+        # A prefixed PO records the exact PO it sent, so dedup and EDI matching can find it.
+        po_number = order_base.resolve_po_number(po)
 
     distributor_orders_by_number = {}
     for order_number in result.distributor_order_numbers:

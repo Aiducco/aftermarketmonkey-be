@@ -408,6 +408,7 @@ class SubmitTests(_AdapterHarness):
         id = 1
         po_number = "PO-100293"
         po_name = None
+        po_prefix = None
         ship_method = None
 
     def _submit(self, payload=ORDERCONF):
@@ -479,6 +480,7 @@ class InvoiceTests(_AdapterHarness):
         id = 1
         po_number = "PO-1"
         po_name = None
+        po_prefix = None
 
     def setUp(self):
         rows = self.ROWS

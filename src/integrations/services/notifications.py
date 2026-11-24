@@ -13,6 +13,7 @@ from django.template.loader import render_to_string
 
 from src import enums as src_enums
 from src import models as src_models
+from src.integrations.orders import base as order_base
 from src.integrations.orders import exceptions as order_exceptions
 
 logger = logging.getLogger(__name__)
@@ -155,7 +156,7 @@ def send_purchase_order_email(
     company = company_provider.company
     provider = company_provider.provider
     from_email = settings.NOTIFICATIONS_FROM_EMAIL
-    po_reference = purchase_order.po_name or purchase_order.po_number
+    po_reference = order_base.resolve_po_number(purchase_order)
     subject = "Purchase Order {} — {}".format(po_reference, company.name)
     context = {
         "provider_name": provider.name,

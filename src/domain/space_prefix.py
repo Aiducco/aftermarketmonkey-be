@@ -35,3 +35,11 @@ def conflicting_prefix(prefix: str, others: typing.Iterable[typing.Optional[str]
         if mine.startswith(theirs) or theirs.startswith(mine):
             return other
     return None
+
+
+def apply_prefix(prefix: typing.Optional[str], po_number: str) -> str:
+    """The PO number sent to a distributor: ``prefix`` in front of ``po_number``. Unchanged when there is no
+    prefix, or when ``po_number`` already starts with it (compared without case). Nothing is ever stripped."""
+    if not prefix or po_number.upper().startswith(prefix.upper()):
+        return po_number
+    return prefix + po_number

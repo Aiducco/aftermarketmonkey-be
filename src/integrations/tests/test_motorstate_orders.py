@@ -390,6 +390,7 @@ class _PO:
     id = 1
     po_number = "PO-77"
     po_name = None
+    po_prefix = None
     ship_method = "PFXG"
 
 
