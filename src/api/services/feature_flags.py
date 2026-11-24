@@ -28,9 +28,7 @@ FEATURE_MULTI_SPACES = "multi_spaces"
 def company_has_feature(company_id: typing.Optional[int], feature: str) -> bool:
     if not company_id:
         return False
-    return src_models.CompanyFeatureFlags.objects.filter(
-        company_id=company_id, feature=feature, enabled=True
-    ).exists()
+    return src_models.CompanyFeatureFlags.objects.filter(company_id=company_id, feature=feature, enabled=True).exists()
 
 
 def enable_company_feature(company_id: int, feature: str) -> None:
