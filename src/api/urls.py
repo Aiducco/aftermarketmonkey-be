@@ -1,90 +1,78 @@
 from django.contrib import admin
-from django.urls import path, include
+from django.urls import include, path
+
+from src.api.views.account import (
+    DowngradeAcknowledgeView,
+    KeptIntegrationsView,
+    PlanStatusView,
+)
 from src.api.views.address import (
     AddressResolveView,
     AddressSuggestView,
     AddressValidateView,
 )
-from src.api.views.apollo import ApolloPhoneWebhookView
-from src.api.views.authentication import LoginView, ChangePasswordView
-from src.api.views.account import DowngradeAcknowledgeView, KeptIntegrationsView, PlanStatusView
 from src.api.views.admin import (
     AdminCompaniesView,
     AdminCompanyDetailView,
     AdminCompanyKeptIntegrationsView,
     AdminCreateCompanyView,
-    AdminResetUserPasswordView,
-    AdminSpaceAllowanceView,
     AdminExtendTrialView,
     AdminIngestionAuditHistoryView,
     AdminIngestionAuditView,
-    AdminProvidersView,
     AdminProviderDetailView,
+    AdminProvidersView,
+    AdminResetUserPasswordView,
+    AdminSpaceAllowanceView,
     AdminUnpauseIntegrationView,
 )
-from src.api.views.company import CompanyDestinationsView
-from src.api.views.company_locations import CompanyLocationsView, CompanyLocationDetailView
-from src.api.views.spaces import SpaceDetailView, SpacesView
-from src.api.views.integrations import (
-    ProvidersCatalogView,
-    ProviderConnectView,
-    ProviderConnectionView,
-    ProviderConnectionDetailView,
-    OrderAccountsView,
-    OrderAccountDetailView,
-    CompanyProvidersView,
-    CompanyProviderDetailView,
-    BrandsWithProvidersView,
-    CompanyDestinationsWithBrandsView,
-    CompanyDestinationDetailView,
-    ExecutionRunsView,
-    ExecutionRunPartsHistoryView,
-    IntegrationRequestsView,
-    CustomIntegrationRequestsView,
-)
-from src.api.views.company_settings import (
-    ProfileView,
-    CompanySettingsView,
-    CompanyTeamView,
-    CompanyTeamMemberView,
-    CompanyTeamMemberResetPasswordView,
-    CompanyTeamMemberSpacesView,
-    DeleteAccountView,
-    DeleteCompanyDataView,
-)
-from src.api.views.shop_management import (
-    ShopManagementCatalogView,
-    ShopManagementProviderConnectView,
-    ShopManagementConnectionView,
-    ShopManagementConnectionDetailView,
-    CompanyShopManagementProvidersView,
-    CompanyShopManagementProviderDetailView,
-)
-from src.api.views.shopmonkey_inventory import (
-    ShopMonkeyAvailableBrandsView,
-    ShopMonkeyInventoryStateView,
-    ShopMonkeySyncBrandsView,
-    ShopMonkeySyncBrandDetailView,
-    ShopMonkeySyncBrandRunView,
-    ShopMonkeySyncBrandPartsView,
-    ShopMonkeySyncExecutionsView,
-)
-from src.api.views.search import SearchFacetsView, SearchView
-from src.api.views.support import SupportTicketsView
+from src.api.views.apollo import ApolloPhoneWebhookView
+from src.api.views.authentication import ChangePasswordView, LoginView
 from src.api.views.billing import (
-    CreatePortalSessionView,
     CreateCheckoutSessionView,
+    CreatePortalSessionView,
     SubscriptionView,
     SwitchTrialPlanView,
     UsageView,
     WebhookView,
 )
+from src.api.views.company import CompanyDestinationsView
+from src.api.views.company_locations import (
+    CompanyLocationDetailView,
+    CompanyLocationsView,
+)
+from src.api.views.company_settings import (
+    CompanySettingsView,
+    CompanyTeamMemberResetPasswordView,
+    CompanyTeamMemberSpacesView,
+    CompanyTeamMemberView,
+    CompanyTeamView,
+    DeleteAccountView,
+    DeleteCompanyDataView,
+    ProfileView,
+)
+from src.api.views.integrations import (
+    BrandsWithProvidersView,
+    CompanyDestinationDetailView,
+    CompanyDestinationsWithBrandsView,
+    CompanyProviderDetailView,
+    CompanyProvidersView,
+    CustomIntegrationRequestsView,
+    ExecutionRunPartsHistoryView,
+    ExecutionRunsView,
+    IntegrationRequestsView,
+    OrderAccountDetailView,
+    OrderAccountsView,
+    ProviderConnectionDetailView,
+    ProviderConnectionView,
+    ProviderConnectView,
+    ProvidersCatalogView,
+)
 from src.api.views.onboarding import (
-    RegisterView,
     CompanyDetailsView,
-    PersonalizationView,
-    OnboardingStatusView,
     DistributorCredentialsInfoView,
+    OnboardingStatusView,
+    PersonalizationView,
+    RegisterView,
 )
 from src.api.views.parts import (
     PartAuditCompanyHistoryView,
@@ -94,34 +82,54 @@ from src.api.views.parts import (
     PartsBulkPricingView,
     PartsSearchView,
 )
-from src.api.views.turn14_locations import Turn14LocationsView
 from src.api.views.purchase_orders import (
-    CartView,
-    CartItemsView,
     CartItemDetailView,
+    CartItemsView,
     CartReviewView,
-    PurchaseOrderOrderAccountView,
-    PurchaseOrdersView,
-    PurchaseOrdersExternalView,
-    PurchaseOrderExternalDetailView,
-    PurchaseOrderDetailView,
-    PurchaseOrderConfirmedDetailView,
-    PurchaseOrderPdfView,
-    PurchaseOrderSubmitView,
-    PurchaseOrderShippingSelectionView,
+    CartView,
     PurchaseOrderCancelView,
+    PurchaseOrderCapabilitiesView,
+    PurchaseOrderConfirmedDetailView,
+    PurchaseOrderDetailView,
     PurchaseOrderDiscardView,
-    PurchaseOrderRefreshStatusView,
-    PurchaseOrderRequoteView,
-    PurchaseOrderJobView,
+    PurchaseOrderExternalDetailView,
     PurchaseOrderGroupDetailView,
     PurchaseOrderGroupSubmitView,
-    PurchaseOrderCapabilitiesView,
-    PurchaseOrderInvoicesView,
     PurchaseOrderInvoiceDetailView,
+    PurchaseOrderInvoicesView,
+    PurchaseOrderJobView,
+    PurchaseOrderOrderAccountView,
+    PurchaseOrderPdfView,
+    PurchaseOrderRefreshStatusView,
+    PurchaseOrderRequoteView,
+    PurchaseOrdersExternalView,
+    PurchaseOrderShippingSelectionView,
+    PurchaseOrderSubmitView,
+    PurchaseOrdersView,
     PurchaseOrderTrackingView,
     ShippingMethodsView,
 )
+from src.api.views.search import SearchFacetsView, SearchView
+from src.api.views.shop_management import (
+    CompanyShopManagementProviderDetailView,
+    CompanyShopManagementProvidersView,
+    ShopManagementCatalogView,
+    ShopManagementConnectionDetailView,
+    ShopManagementConnectionView,
+    ShopManagementProviderConnectView,
+)
+from src.api.views.shopmonkey_inventory import (
+    ShopMonkeyAvailableBrandsView,
+    ShopMonkeyInventoryStateView,
+    ShopMonkeySyncBrandDetailView,
+    ShopMonkeySyncBrandPartsView,
+    ShopMonkeySyncBrandRunView,
+    ShopMonkeySyncBrandsView,
+    ShopMonkeySyncExecutionsView,
+)
+from src.api.views.spaces import SpaceDetailView, SpacesView
+from src.api.views.support import SupportTicketsView
+from src.api.views.turn14_locations import Turn14LocationsView
 
 urlpatterns = [
     path("auth/login/", LoginView.as_view(), name="login"),
