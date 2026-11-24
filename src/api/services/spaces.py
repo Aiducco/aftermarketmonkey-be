@@ -274,6 +274,13 @@ class ExternalOrderSorter:
             key=lambda pair: -len(pair[0]),
         )
         self._connection_space: typing.Dict[int, typing.Optional[int]] = {}
+        # A feed tenant's connection is owned by the space the tenant belongs to (ADR 0002); every other
+        # connection of the customer company is owned by the main space.
+        self._tenant_space = dict(
+            src_models.Space.objects.filter(company_id=company_id, feed_company_id__isnull=False).values_list(
+                "feed_company_id", "id"
+            )
+        )
 
     def _unambiguous_space(self, account: src_models.CompanyProviderOrderAccount) -> typing.Optional[int]:
         """The one space every active account of the account's connection is used by, else None."""
@@ -284,7 +291,8 @@ class ExternalOrderSorter:
         )
         if not any(a.id == account.id for a in accounts):
             accounts.append(account)
-        used_by = {tuple(order_account_space_ids(a, self.main_space_id)) for a in accounts}
+        owner_space_id = self._tenant_space.get(account.company_provider.company_id, self.main_space_id)
+        used_by = {tuple(order_account_space_ids(a, owner_space_id)) for a in accounts}
         if len(used_by) == 1:
             space_ids = next(iter(used_by))
             if len(space_ids) == 1:
@@ -309,7 +317,7 @@ class ExternalOrderSorter:
 
 
 def external_order_sorter(company_id: int) -> typing.Optional[ExternalOrderSorter]:
-    """The sorter for a flagged company; None for an unflagged one (its orders keep going to the main space with
+    """The sorter for a flagged company (the customer company, never a feed tenant); None for an unflagged one (its orders keep going to the main space with
     no reason, exactly as before)."""
     if not feature_flags_services.company_has_feature(company_id, feature_flags_services.FEATURE_MULTI_SPACES):
         return None

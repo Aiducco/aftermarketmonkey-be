@@ -170,7 +170,7 @@ class EmailOrderAdapter(base.DistributorOrderAdapter):
 
         return {
             "po_reference": po_reference,
-            "company_name": self.company_provider.company.name,
+            "company_name": self.company_provider.company.customer_company.name,
             "provider_name": self.company_provider.provider.name,
             "account_number": self.account_number,
             "order_date": datetime.date.today().isoformat(),

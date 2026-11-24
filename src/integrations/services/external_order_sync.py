@@ -401,7 +401,12 @@ def _apply_results(
     results = list(deduped_by_number.values())
 
     # A flagged company's new orders are sorted into a space; None leaves every new row to save()'s main space.
-    sorter = spaces_services.external_order_sorter(company_provider.company_id) if results and not dry_run else None
+    # The flag and the spaces belong to the customer company: the parent for a feed tenant's connection.
+    sorter = (
+        spaces_services.external_order_sorter(company_provider.company.customer_company.id)
+        if results and not dry_run
+        else None
+    )
 
     # Meyer is excluded deliberately, matching _self_heal_existing_rows' own docstring: its rows
     # are classified by the authoritative "API Order" flag, never by PO-matching inference, so
@@ -531,7 +536,8 @@ def _active_accounts(
         active=True, company_provider__active=True
     ).select_related("company_provider__provider", "company_provider__company")
     if company_id is not None:
-        qs = qs.filter(company_provider__company_id=company_id)
+        # The company's own accounts and its feed tenants' (so ``--company 16`` polls a space's own accounts too).
+        qs = qs.filter(company_provider__company_id__in=spaces_services.family_company_ids(company_id))
     if provider_kind is not None:
         qs = qs.filter(company_provider__provider__kind=provider_kind)
     return list(qs.order_by("company_provider_id", "id"))

@@ -57,7 +57,8 @@ def _log_email(
 
 def send_first_sync_completed_email(company_provider: src_models.CompanyProviders) -> None:
     """Notify the company admin the first time a distributor integration finishes syncing."""
-    company = company_provider.company
+    # The customer: the parent for a feed tenant's connection, so the admin and the name are the shop's.
+    company = company_provider.company.customer_company
     provider = company_provider.provider
 
     to_email = _company_admin_email(company)
@@ -153,7 +154,8 @@ def send_purchase_order_email(
             "Refusing to send the purchase order email: no recipient (rep) email address."
         )
 
-    company = company_provider.company
+    # The customer: the parent for a feed tenant's connection, so the admin and the name are the shop's.
+    company = company_provider.company.customer_company
     provider = company_provider.provider
     from_email = settings.NOTIFICATIONS_FROM_EMAIL
     po_reference = order_base.resolve_po_number(purchase_order)
