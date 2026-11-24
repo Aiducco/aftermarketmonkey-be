@@ -39,6 +39,9 @@ ERROR_MAIN_SPACE_PROTECTED = "main_space_protected"
 ERROR_SPACE_NOT_EMPTY = "space_not_empty"
 ERROR_ONLY_SPACE_OF_USERS = "only_space_of_users"
 ERROR_ONLY_SPACE_OF_ACCOUNTS = "only_space_of_accounts"
+ERROR_FEED_IN_USE = "feed_in_use"
+ERROR_OWN_FEED_USE_DISCONNECT = "own_feed_use_disconnect"
+ERROR_SPACE_FEED_NOT_FOUND = "space_feed_not_found"
 ERROR_SPACE_NOT_ON_FEED = "space_not_on_feed"
 
 _ADDRESS_FIELDS = ("name", "attention", "address1", "address2", "city", "state", "postal_code", "country", "phone")
@@ -331,6 +334,46 @@ def connection_ids_used_by(scope: SpaceScope, space_ids: typing.List[int]) -> ty
         src_models.SpaceProvider.objects.filter(space_id__in=space_ids).values_list("company_provider_id", flat=True)
     )
     return ids
+
+
+def other_spaces_using(company_provider: src_models.CompanyProviders, scope: SpaceScope) -> typing.List[dict]:
+    """The spaces other than the connection's owner that use it, as ``{"id", "name"}`` refs, limited to the
+    spaces the caller can see."""
+    owner_space_id = owner_space_id_of_connection(company_provider, scope.main_space_id)
+    space_ids = (
+        src_models.SpaceProvider.objects.filter(company_provider=company_provider)
+        .exclude(space_id=owner_space_id)
+        .values_list("space_id", flat=True)
+    )
+    return [
+        {"id": space_id, "name": scope.space_names.get(space_id)}
+        for space_id in sorted(space_ids)
+        if space_id in scope.visible_space_ids
+    ]
+
+
+def stop_using_feed(scope: SpaceScope, space_id: int, provider_id: int) -> None:
+    """DELETE /spaces/<id>/feeds/<provider_id>/: a space stops using a feed another space owns. Its
+    ``SpaceProvider`` row and its Used-by rows on that connection's order accounts go; the feed, its owner and the
+    other sharers are untouched. Admin only, flagged companies only."""
+    require_admin(scope)
+    with transaction.atomic():
+        space = _get_space(scope.company_id, space_id)
+        row = (
+            src_models.SpaceProvider.objects.select_related("company_provider")
+            .filter(space=space, provider_id=provider_id)
+            .first()
+        )
+        if row is None:
+            raise SpaceError("This space uses no feed of that distributor.", ERROR_SPACE_FEED_NOT_FOUND, 404)
+        connection = row.company_provider
+        if owner_space_id_of_connection(connection, scope.main_space_id) == space.id:
+            raise SpaceError(
+                "This is the space's own account. Disconnect it instead.", ERROR_OWN_FEED_USE_DISCONNECT, 400
+            )
+        for account in connection.order_accounts.filter(spaces=space):
+            account.spaces.remove(space)
+        row.delete()
 
 
 # ---------------------------------------------------------------------------

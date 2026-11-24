@@ -155,3 +155,23 @@ class SpaceResortView(views.View):
         except spaces_services.SpaceError as e:
             return _json_response(e.body(), status=e.status_code)
         return _json_response({"data": data})
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class SpaceFeedView(views.View):
+    """DELETE /spaces/<id>/feeds/<provider_id>/ - The space stops using a feed another space owns (company admin,
+    flagged). The feed, its owner and the other spaces that use it are untouched."""
+
+    def delete(
+        self, request: http.HttpRequest, id: int, provider_id: int, *args: typing.Any, **kwargs: typing.Any
+    ) -> http.HttpResponse:
+        company_id, err = _auth_and_company(request)
+        if err:
+            return _json_response({"message": err}, status=401 if "authenticated" in err else 400)
+
+        scope = spaces_services.resolve_scope(request)
+        try:
+            spaces_services.stop_using_feed(scope, id, provider_id)
+        except spaces_services.SpaceError as e:
+            return _json_response(e.body(), status=e.status_code)
+        return http.HttpResponse(status=204)

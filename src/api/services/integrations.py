@@ -2456,10 +2456,65 @@ def update_connection(
     return result, None, None
 
 
+def _deactivate_tenant_connection(cp: src_models.CompanyProviders) -> None:
+    """A feed tenant's connection that has orders cannot be deleted (purchase orders protect it, and its
+    distributor orders would cascade): it is deactivated instead, with its feed and order credentials, statuses and
+    ``SpaceProvider`` rows cleared. The distributor then reads as not connected in the space; a later connect
+    reactivates the row."""
+    with transaction.atomic():
+        for account in cp.order_accounts.all():
+            # An account with orders is kept (cleared and inactive): deleting it would cascade to its
+            # distributor orders, and purchase orders protect it.
+            has_orders = account.purchase_orders.exists() or account.external_purchase_orders.exists()
+            try:
+                if has_orders:
+                    raise ProtectedError("account has orders", [])
+                with transaction.atomic():
+                    account.delete()
+            except ProtectedError:
+                account.credentials = {}
+                account.active = False
+                account.is_default = False
+                status_fields = _order_connection_status_fields(None, None)
+                for field, value in status_fields.items():
+                    setattr(account, field, value)
+                account.save(
+                    update_fields=["credentials", "active", "is_default"] + list(status_fields.keys()) + ["updated_at"]
+                )
+        cp.active = False
+        cp.credentials = {}
+        for field, value in {
+            **_connection_status_fields(None, None),
+            **_order_connection_status_fields(None, None),
+        }.items():
+            setattr(cp, field, value)
+        cp.initial_sync_completed = False
+        cp.save()
+        src_models.SpaceProvider.objects.filter(company_provider=cp).delete()
+        cp.pricing_sync_jobs.filter(status=src_enums.IntegrationPricingSyncJobStatus.OPEN.value).delete()
+
+
+def _delete_connection(cp: src_models.CompanyProviders, is_tenant: bool) -> None:
+    """``cp.delete()``. A feed tenant's connection with orders is deactivated instead (see above); the real
+    company's connection is deleted as before (a connection with purchase orders still raises ProtectedError)."""
+    if not is_tenant:
+        cp.delete()
+        return
+    if cp.purchase_orders.exists() or cp.external_purchase_orders.exists():
+        _deactivate_tenant_connection(cp)
+        return
+    try:
+        with transaction.atomic():
+            cp.delete()
+    except ProtectedError:
+        _deactivate_tenant_connection(cp)
+
+
 def disconnect_provider(
     company_id: int,
     company_provider_id: int,
     namespace: typing.Optional[str] = None,
+    scope: typing.Optional[spaces_services.SpaceScope] = None,
 ) -> typing.Tuple[bool, typing.Optional[str]]:
     """
     Disconnect a ``CompanyProviders`` connection. Must belong to company.
@@ -2472,17 +2527,41 @@ def disconnect_provider(
     connect_provider). If clearing a namespace leaves BOTH empty, the whole row is deleted, same
     as the no-namespace case — an all-empty connection has no reason to exist.
 
+    With a ``scope`` of a company that has the multi_spaces flag (admin only) the connection is looked up among the
+    company's and its feed tenants' and must be visible. A connection another space also uses is refused (SpaceError
+    400 feed_in_use) unless only the order side is disconnected. A feed tenant's connection is the only thing that
+    changes for that space, and with orders it is deactivated instead of deleted (AC-39).
+
     Returns (success, error_message). On success error_message is None.
     """
-    cp = src_models.CompanyProviders.objects.filter(
-        id=company_provider_id,
-        company_id=company_id,
-    ).first()
+    if scope is not None and scope.enabled:
+        spaces_services.require_admin(scope)
+    cp = (
+        src_models.CompanyProviders.objects.filter(
+            id=company_provider_id,
+            company_id__in=_connection_company_ids(company_id, scope),
+        )
+        .select_related("provider")
+        .first()
+    )
     if not cp:
         return False, "Connection not found"
+    is_tenant = cp.company_id != company_id
+    if scope is not None:
+        spaces_services.ensure_connection_visible(scope, cp)
+        if scope.enabled and namespace in (None, "feed"):
+            others = spaces_services.other_spaces_using(cp, scope)
+            if others:
+                raise spaces_services.SpaceError(
+                    "{} is also used by {}. They must stop using it first.".format(
+                        cp.provider.name if cp.provider else "This distributor", ", ".join(o["name"] for o in others)
+                    ),
+                    spaces_services.ERROR_FEED_IN_USE,
+                    extra={"spaces": others},
+                )
 
     if namespace is None:
-        cp.delete()
+        _delete_connection(cp, is_tenant)
         return True, None
 
     if namespace not in ("feed", "order"):
@@ -2554,7 +2633,7 @@ def disconnect_provider(
     feed_empty = not (cp.credentials or {}).get("feed")
     order_empty = not credentials_helper.get_order_credentials(cp)
     if feed_empty and order_empty:
-        cp.delete()
+        _delete_connection(cp, is_tenant)
         return True, None
 
     cp.save()

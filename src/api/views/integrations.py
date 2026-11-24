@@ -197,11 +197,15 @@ class ProviderConnectionView(views.View):
                 status=400,
             )
 
-        success, err = integrations_services.disconnect_provider(
-            company_id=company_id,
-            company_provider_id=company_provider_id,
-            namespace=namespace,
-        )
+        try:
+            success, err = integrations_services.disconnect_provider(
+                company_id=company_id,
+                company_provider_id=company_provider_id,
+                namespace=namespace,
+                scope=spaces_services.resolve_scope(request),
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         if not success:
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},

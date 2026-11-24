@@ -131,6 +131,7 @@ from src.api.views.shopmonkey_inventory import (
 )
 from src.api.views.spaces import (
     SpaceDetailView,
+    SpaceFeedView,
     SpaceResortPreviewView,
     SpaceResortView,
     SpacesView,
@@ -660,6 +661,11 @@ urlpatterns = [
         "spaces/<int:id>/",
         SpaceDetailView.as_view(),
         name="space_detail",
+    ),
+    path(
+        "spaces/<int:id>/feeds/<int:provider_id>/",
+        SpaceFeedView.as_view(),
+        name="space_feed",
     ),
     path(
         "spaces/<int:id>/resort-preview/",
