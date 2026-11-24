@@ -1038,7 +1038,7 @@ def review_cart(
 # -- PO / group reads -----------------------------------------------------------------------
 
 
-def get_purchase_order_detail(company_id: int, purchase_order_id: int) -> typing.Dict:
+def get_purchase_order_detail(company_id: int, scope: spaces_services.SpaceScope, purchase_order_id: int) -> typing.Dict:
     po = (
         src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id)
         .select_related("company_provider__provider", "group", "order_account")
@@ -1047,10 +1047,11 @@ def get_purchase_order_detail(company_id: int, purchase_order_id: int) -> typing
     )
     if not po:
         raise PurchaseOrderServiceError("Purchase order not found.")
-    return _serialize_purchase_order(po)
+    spaces_services.ensure_visible(scope, po.space_id)
+    return _serialize_purchase_order(po, scope=scope)
 
 
-def get_purchase_order_pdf_bytes(company_id: int, purchase_order_id: int) -> bytes:
+def get_purchase_order_pdf_bytes(company_id: int, scope: spaces_services.SpaceScope, purchase_order_id: int) -> bytes:
     """
     Regenerates the PDF that was emailed for an EmailOrderAdapter-submitted PO — see
     src.integrations.orders.email_order.EmailOrderAdapter.submit_order(), which sets
@@ -1062,6 +1063,7 @@ def get_purchase_order_pdf_bytes(company_id: int, purchase_order_id: int) -> byt
     po = src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id).first()
     if not po:
         raise PurchaseOrderServiceError("Purchase order not found.")
+    spaces_services.ensure_visible(scope, po.space_id)
 
     attempt = (
         po.submission_attempts.filter(
@@ -1248,7 +1250,9 @@ def _serialize_local_distributor_orders(
     return serialized
 
 
-def get_confirmed_purchase_order_detail(company_id: int, purchase_order_id: int) -> typing.Dict:
+def get_confirmed_purchase_order_detail(
+    company_id: int, scope: spaces_services.SpaceScope, purchase_order_id: int
+) -> typing.Dict:
     """
     Standardized, distributor-agnostic view of a placed order: reads distributor_status/
     tracking/invoice ids/line items straight off PurchaseOrderDistributorOrder.raw_response via
@@ -1264,6 +1268,7 @@ def get_confirmed_purchase_order_detail(company_id: int, purchase_order_id: int)
     )
     if not po:
         raise PurchaseOrderServiceError("Purchase order not found.")
+    spaces_services.ensure_visible(scope, po.space_id)
 
     provider = po.company_provider.provider
     provider_kind = provider.kind
@@ -1431,7 +1436,7 @@ def list_purchase_order_invoices(
     return [_serialize_invoice_flat(inv) for inv in qs[:200]]
 
 
-def get_purchase_order_invoice_detail(company_id: int, invoice_id: int) -> typing.Dict:
+def get_purchase_order_invoice_detail(company_id: int, scope: spaces_services.SpaceScope, invoice_id: int) -> typing.Dict:
     inv = (
         src_models.PurchaseOrderInvoice.objects.filter(id=invoice_id, purchase_order__company_id=company_id)
         .select_related("purchase_order__company_provider__provider")
@@ -1439,10 +1444,13 @@ def get_purchase_order_invoice_detail(company_id: int, invoice_id: int) -> typin
     )
     if not inv:
         raise PurchaseOrderServiceError("Invoice not found.")
-    return _serialize_invoice_flat(inv)
+    spaces_services.ensure_visible(scope, inv.purchase_order.space_id)
+    return _serialize_invoice_flat(inv, scope)
 
 
-def _serialize_invoice_flat(inv: src_models.PurchaseOrderInvoice) -> typing.Dict:
+def _serialize_invoice_flat(
+    inv: src_models.PurchaseOrderInvoice, scope: typing.Optional[spaces_services.SpaceScope] = None
+) -> typing.Dict:
     po = inv.purchase_order
     provider = po.company_provider.provider
     result = _serialize_invoice(inv)
@@ -1455,7 +1463,7 @@ def _serialize_invoice_flat(inv: src_models.PurchaseOrderInvoice) -> typing.Dict
             "provider_kind_name": provider.kind_name,
         }
     )
-    return result
+    return _add_space_fields(result, po.space_id, scope)
 
 
 def list_purchase_order_tracking(
@@ -1505,7 +1513,7 @@ def list_purchase_order_tracking(
     return rows
 
 
-def get_purchase_order_group_detail(company_id: int, group_id: int) -> typing.Dict:
+def get_purchase_order_group_detail(company_id: int, scope: spaces_services.SpaceScope, group_id: int) -> typing.Dict:
     group = src_models.PurchaseOrderGroup.objects.filter(id=group_id, company_id=company_id).first()
     if not group:
         raise PurchaseOrderServiceError("Purchase order group not found.")
@@ -1514,11 +1522,13 @@ def get_purchase_order_group_detail(company_id: int, group_id: int) -> typing.Di
         .prefetch_related("line_items__provider_part__master_part__brand", "distributor_orders")
         .all()
     )
+    for po in pos:
+        spaces_services.ensure_visible(scope, po.space_id)
     return {
         "id": group.id,
         "reference": group.reference,
         "created_at": group.created_at.isoformat(),
-        "purchase_orders": [_serialize_purchase_order(po) for po in pos],
+        "purchase_orders": [_serialize_purchase_order(po, scope=scope) for po in pos],
     }
 
 
@@ -1534,6 +1544,7 @@ def _quote_is_stale(po: src_models.PurchaseOrder) -> bool:
 
 def submit_purchase_order(
     company_id: int,
+    scope: spaces_services.SpaceScope,
     purchase_order_id: int,
     ship_method: typing.Optional[str] = None,
     notes: typing.Optional[str] = None,
@@ -1572,6 +1583,7 @@ def submit_purchase_order(
     po = src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id).first()
     if not po:
         raise PurchaseOrderServiceError("Purchase order not found.")
+    spaces_services.ensure_visible(scope, po.space_id)
     if ship_method is not None:
         po.ship_method = ship_method
         po.save(update_fields=["ship_method", "updated_at"])
@@ -1598,11 +1610,11 @@ def submit_purchase_order(
     po.status_name = src_enums.PurchaseOrderStatus.SUBMITTING.name
     po.save(update_fields=["status", "status_name", "updated_at"])
     submitted_po = purchase_order_jobs.run_submit_synchronously(po.id)
-    return _serialize_purchase_order(submitted_po)
+    return _serialize_purchase_order(submitted_po, scope=scope)
 
 
 def select_shipping_options(
-    company_id: int, purchase_order_id: int, selections: typing.Dict[str, str]
+    company_id: int, scope: spaces_services.SpaceScope, purchase_order_id: int, selections: typing.Dict[str, str]
 ) -> typing.Dict:
     """
     Applies the customer's per-shipment shipping-method choice, made after seeing the quote's
@@ -1637,6 +1649,7 @@ def select_shipping_options(
     po = src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id).first()
     if not po:
         raise PurchaseOrderServiceError("Purchase order not found.")
+    spaces_services.ensure_visible(scope, po.space_id)
     if not po.shipments:
         raise PurchaseOrderServiceError("This purchase order has no quoted shipments yet — quote it first.")
 
@@ -1664,10 +1677,10 @@ def select_shipping_options(
         update_fields.append("ship_method")
     purchase_order_jobs.compute_totals(po)
     po.save(update_fields=update_fields)
-    return _serialize_purchase_order(po)
+    return _serialize_purchase_order(po, scope=scope)
 
 
-def requote_purchase_order(company_id: int, purchase_order_id: int) -> typing.Dict:
+def requote_purchase_order(company_id: int, scope: spaces_services.SpaceScope, purchase_order_id: int) -> typing.Dict:
     """Re-runs the quote for an already-reviewed PO (stale QUOTED, or a FAILED quote attempt)
     without rebuilding the cart — reuses the ship-to/ship-method already stored on it."""
     # Ordering is off for the plan (Scout, so also a downgraded company) -- same 402 gate as
@@ -1680,6 +1693,7 @@ def requote_purchase_order(company_id: int, purchase_order_id: int) -> typing.Di
     po = src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id).first()
     if not po:
         raise PurchaseOrderServiceError("Purchase order not found.")
+    spaces_services.ensure_visible(scope, po.space_id)
     requotable = {
         src_enums.PurchaseOrderStatus.QUOTED.value,
         src_enums.PurchaseOrderStatus.FAILED.value,
@@ -1693,11 +1707,14 @@ def requote_purchase_order(company_id: int, purchase_order_id: int) -> typing.Di
     if not po.ship_to_address1:
         raise PurchaseOrderServiceError("Purchase order has no ship-to address on file yet — review the cart first.")
     quoted_po = purchase_order_jobs.run_quote_synchronously(po.id)
-    return _serialize_purchase_order(quoted_po)
+    return _serialize_purchase_order(quoted_po, scope=scope)
 
 
 def submit_purchase_order_group(
-    company_id: int, group_id: int, ship_methods: typing.Optional[typing.Dict[str, str]] = None
+    company_id: int,
+    scope: spaces_services.SpaceScope,
+    group_id: int,
+    ship_methods: typing.Optional[typing.Dict[str, str]] = None,
 ) -> typing.Dict:
     """``ship_methods``: optional {purchase_order_id (as string): shipping_method_code} —
     same per-PO keying as review_cart, since each distributor has its own method-code
@@ -1733,6 +1750,9 @@ def submit_purchase_order_group(
     group = src_models.PurchaseOrderGroup.objects.filter(id=group_id, company_id=company_id).first()
     if not group:
         raise PurchaseOrderServiceError("Purchase order group not found.")
+    # Every PO of the group must be visible before any is submitted (a group is one space, but check each).
+    for group_po in group.purchase_orders.all():
+        spaces_services.ensure_visible(scope, group_po.space_id)
     quoted_ids = list(
         group.purchase_orders.filter(status=src_enums.PurchaseOrderStatus.QUOTED.value)
         .order_by("id")
@@ -1744,21 +1764,22 @@ def submit_purchase_order_group(
     results = []
     for po_id in quoted_ids:
         try:
-            results.append(submit_purchase_order(company_id, po_id, ship_method=ship_methods.get(str(po_id))))
+            results.append(submit_purchase_order(company_id, scope, po_id, ship_method=ship_methods.get(str(po_id))))
         except PurchaseOrderServiceError as e:
             po = src_models.PurchaseOrder.objects.filter(id=po_id, company_id=company_id).first()
-            result = _serialize_purchase_order(po) if po else {"id": po_id}
+            result = _serialize_purchase_order(po, scope=scope) if po else {"id": po_id}
             result["error_message"] = str(e)
             results.append(result)
     return {"group_id": group_id, "purchase_orders": results}
 
 
-def get_job_status(company_id: int, purchase_order_id: int, job_id: int) -> typing.Dict:
+def get_job_status(company_id: int, scope: spaces_services.SpaceScope, purchase_order_id: int, job_id: int) -> typing.Dict:
     job = src_models.PurchaseOrderJob.objects.filter(
         id=job_id, purchase_order_id=purchase_order_id, purchase_order__company_id=company_id
-    ).first()
+    ).select_related("purchase_order").first()
     if not job:
         raise PurchaseOrderServiceError("Job not found.")
+    spaces_services.ensure_visible(scope, job.purchase_order.space_id)
     return {
         "id": job.id,
         "purchase_order_id": job.purchase_order_id,
@@ -1774,10 +1795,11 @@ def get_job_status(company_id: int, purchase_order_id: int, job_id: int) -> typi
     }
 
 
-def cancel_purchase_order(company_id: int, purchase_order_id: int) -> typing.Dict:
+def cancel_purchase_order(company_id: int, scope: spaces_services.SpaceScope, purchase_order_id: int) -> typing.Dict:
     po = src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id).first()
     if not po:
         raise PurchaseOrderServiceError("Purchase order not found.")
+    spaces_services.ensure_visible(scope, po.space_id)
     terminal = {
         src_enums.PurchaseOrderStatus.CANCELLED.value,
         src_enums.PurchaseOrderStatus.FAILED.value,
@@ -1790,7 +1812,7 @@ def cancel_purchase_order(company_id: int, purchase_order_id: int) -> typing.Dic
     return {"purchase_order_id": po.id, "job_id": job.id}
 
 
-def discard_purchase_order(company_id: int, purchase_order_id: int) -> typing.Dict:
+def discard_purchase_order(company_id: int, scope: spaces_services.SpaceScope, purchase_order_id: int) -> typing.Dict:
     """
     Abandons a PO that never became — and now never will become — a real distributor order:
     a never-submitted DRAFT/QUOTED cart the user doesn't want anymore, or a FAILED submission
@@ -1811,6 +1833,7 @@ def discard_purchase_order(company_id: int, purchase_order_id: int) -> typing.Di
     po = src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id).first()
     if not po:
         raise PurchaseOrderServiceError("Purchase order not found.")
+    spaces_services.ensure_visible(scope, po.space_id)
     discardable = {
         src_enums.PurchaseOrderStatus.DRAFT.value,
         src_enums.PurchaseOrderStatus.QUOTED.value,
@@ -1824,10 +1847,12 @@ def discard_purchase_order(company_id: int, purchase_order_id: int) -> typing.Di
     po.status = src_enums.PurchaseOrderStatus.DISCARDED.value
     po.status_name = src_enums.PurchaseOrderStatus.DISCARDED.name
     po.save(update_fields=["status", "status_name", "updated_at"])
-    return _serialize_purchase_order(po)
+    return _serialize_purchase_order(po, scope=scope)
 
 
-def refresh_purchase_order_status(company_id: int, purchase_order_id: int) -> typing.Dict:
+def refresh_purchase_order_status(
+    company_id: int, scope: spaces_services.SpaceScope, purchase_order_id: int
+) -> typing.Dict:
     """
     Refreshes this PO's distributor order(s) synchronously using the same per-distributor logic
     as the refresh_confirmed_purchase_orders command (see confirmed_purchase_order_sync.
@@ -1845,8 +1870,9 @@ def refresh_purchase_order_status(company_id: int, purchase_order_id: int) -> ty
     )
     if not po:
         raise PurchaseOrderServiceError("Purchase order not found.")
+    spaces_services.ensure_visible(scope, po.space_id)
     confirmed_purchase_order_sync.refresh_purchase_order_now(po)
-    return get_confirmed_purchase_order_detail(company_id=company_id, purchase_order_id=purchase_order_id)
+    return get_confirmed_purchase_order_detail(company_id=company_id, scope=scope, purchase_order_id=purchase_order_id)
 
 
 # -- Capabilities ---------------------------------------------------------------------------

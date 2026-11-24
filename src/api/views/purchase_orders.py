@@ -397,9 +397,12 @@ class PurchaseOrderInvoiceDetailView(views.View):
 
         invoice_id = kwargs.get("id")
         try:
+            scope = spaces_services.resolve_scope(request)
             result = purchase_orders_services.get_purchase_order_invoice_detail(
-                company_id=company_id, invoice_id=invoice_id
+                company_id=company_id, scope=scope, invoice_id=invoice_id
             )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e), status=404)
         except Exception:
@@ -445,7 +448,12 @@ class PurchaseOrderDetailView(views.View):
 
         po_id = kwargs.get("id")
         try:
-            result = purchase_orders_services.get_purchase_order_detail(company_id=company_id, purchase_order_id=po_id)
+            scope = spaces_services.resolve_scope(request)
+            result = purchase_orders_services.get_purchase_order_detail(
+                company_id=company_id, scope=scope, purchase_order_id=po_id
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e), status=404)
         except Exception:
@@ -467,9 +475,12 @@ class PurchaseOrderPdfView(views.View):
 
         po_id = kwargs.get("id")
         try:
+            scope = spaces_services.resolve_scope(request)
             pdf_bytes = purchase_orders_services.get_purchase_order_pdf_bytes(
-                company_id=company_id, purchase_order_id=po_id
+                company_id=company_id, scope=scope, purchase_order_id=po_id
             )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e), status=404)
         except Exception:
@@ -494,9 +505,12 @@ class PurchaseOrderConfirmedDetailView(views.View):
 
         po_id = kwargs.get("id")
         try:
+            scope = spaces_services.resolve_scope(request)
             result = purchase_orders_services.get_confirmed_purchase_order_detail(
-                company_id=company_id, purchase_order_id=po_id
+                company_id=company_id, scope=scope, purchase_order_id=po_id
             )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e), status=404)
         except Exception:
@@ -532,13 +546,17 @@ class PurchaseOrderSubmitView(views.View):
 
         po_id = kwargs.get("id")
         try:
+            scope = spaces_services.resolve_scope(request)
             result = purchase_orders_services.submit_purchase_order(
                 company_id=company_id,
+                scope=scope,
                 purchase_order_id=po_id,
                 ship_method=body.get("ship_method"),
                 notes=body.get("notes"),
                 po_name=body.get("po_name"),
             )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response_for(e)
         except Exception:
@@ -569,9 +587,12 @@ class PurchaseOrderShippingSelectionView(views.View):
 
         po_id = kwargs.get("id")
         try:
+            scope = spaces_services.resolve_scope(request)
             result = purchase_orders_services.select_shipping_options(
-                company_id=company_id, purchase_order_id=po_id, selections=selections
+                company_id=company_id, scope=scope, purchase_order_id=po_id, selections=selections
             )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response_for(e)
         except Exception:
@@ -591,7 +612,12 @@ class PurchaseOrderCancelView(views.View):
 
         po_id = kwargs.get("id")
         try:
-            result = purchase_orders_services.cancel_purchase_order(company_id=company_id, purchase_order_id=po_id)
+            scope = spaces_services.resolve_scope(request)
+            result = purchase_orders_services.cancel_purchase_order(
+                company_id=company_id, scope=scope, purchase_order_id=po_id
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e))
         except Exception:
@@ -612,7 +638,12 @@ class PurchaseOrderDiscardView(views.View):
 
         po_id = kwargs.get("id")
         try:
-            result = purchase_orders_services.discard_purchase_order(company_id=company_id, purchase_order_id=po_id)
+            scope = spaces_services.resolve_scope(request)
+            result = purchase_orders_services.discard_purchase_order(
+                company_id=company_id, scope=scope, purchase_order_id=po_id
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e))
         except Exception:
@@ -635,9 +666,12 @@ class PurchaseOrderRefreshStatusView(views.View):
 
         po_id = kwargs.get("id")
         try:
+            scope = spaces_services.resolve_scope(request)
             result = purchase_orders_services.refresh_purchase_order_status(
-                company_id=company_id, purchase_order_id=po_id
+                company_id=company_id, scope=scope, purchase_order_id=po_id
             )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e), status=404)
         except Exception:
@@ -659,7 +693,12 @@ class PurchaseOrderRequoteView(views.View):
 
         po_id = kwargs.get("id")
         try:
-            result = purchase_orders_services.requote_purchase_order(company_id=company_id, purchase_order_id=po_id)
+            scope = spaces_services.resolve_scope(request)
+            result = purchase_orders_services.requote_purchase_order(
+                company_id=company_id, scope=scope, purchase_order_id=po_id
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response_for(e)
         except Exception:
@@ -680,9 +719,12 @@ class PurchaseOrderJobView(views.View):
         po_id = kwargs.get("id")
         job_id = kwargs.get("job_id")
         try:
+            scope = spaces_services.resolve_scope(request)
             result = purchase_orders_services.get_job_status(
-                company_id=company_id, purchase_order_id=po_id, job_id=job_id
+                company_id=company_id, scope=scope, purchase_order_id=po_id, job_id=job_id
             )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e), status=404)
         except Exception:
@@ -702,7 +744,12 @@ class PurchaseOrderGroupDetailView(views.View):
 
         group_id = kwargs.get("id")
         try:
-            result = purchase_orders_services.get_purchase_order_group_detail(company_id=company_id, group_id=group_id)
+            scope = spaces_services.resolve_scope(request)
+            result = purchase_orders_services.get_purchase_order_group_detail(
+                company_id=company_id, scope=scope, group_id=group_id
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e), status=404)
         except Exception:
@@ -731,9 +778,12 @@ class PurchaseOrderGroupSubmitView(views.View):
 
         group_id = kwargs.get("id")
         try:
+            scope = spaces_services.resolve_scope(request)
             result = purchase_orders_services.submit_purchase_order_group(
-                company_id=company_id, group_id=group_id, ship_methods=body.get("ship_methods")
+                company_id=company_id, scope=scope, group_id=group_id, ship_methods=body.get("ship_methods")
             )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response_for(e)
         except Exception:
