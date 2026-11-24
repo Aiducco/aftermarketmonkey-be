@@ -80,14 +80,22 @@ def _space_allowance_fields(company: src_models.Company) -> typing.Dict:
     }
 
 
-def set_company_space_base(company_id: int, space_base: typing.Optional[int]) -> typing.Optional[typing.Dict]:
+def set_company_space_base(
+    company_id: int, space_base: typing.Optional[int], staff_user_id: typing.Optional[int] = None
+) -> typing.Optional[typing.Dict]:
     """Staff base for a company's space allowance (space_base_override): replaces the plan's base while set,
     None clears it. The paid add-ons stay on top. Returns the allowance fields, or None if no such company."""
     company = src_models.Company.objects.filter(id=company_id).annotate(spaces_count=_spaces_used_annotation()).first()
     if not company:
         return None
+    old_base = company.space_base_override
     company.space_base_override = space_base
     company.save(update_fields=["space_base_override", "updated_at"])
+    logger.info(
+        "{} Staff user {} set space_base_override of company {}: {} -> {}.".format(
+            _LOG_PREFIX, staff_user_id, company.id, old_base, space_base
+        )
+    )
     return {"company_id": company.id, **_space_allowance_fields(company)}
 
 

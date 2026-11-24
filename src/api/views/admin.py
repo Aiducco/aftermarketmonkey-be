@@ -4,8 +4,8 @@ import typing
 
 import simplejson
 from django import http, views
-from django.views.decorators.csrf import csrf_exempt
 from django.utils.decorators import method_decorator
+from django.views.decorators.csrf import csrf_exempt
 
 from common import exceptions as common_exceptions
 from common import utils as common_utils
@@ -225,7 +225,7 @@ class AdminSpaceAllowanceView(views.View):
         if err_response:
             return err_response
 
-        data = admin_services.set_company_space_base(company_id, validated["space_base"])
+        data = admin_services.set_company_space_base(company_id, validated["space_base"], request.user.id)
         if data is None:
             return _json_response({"message": "Company not found"}, status=404)
 
