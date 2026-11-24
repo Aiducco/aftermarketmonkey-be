@@ -160,9 +160,7 @@ class CompanyLocation(django_db_models.Model):
 
     # Every address belongs to a space (see Space). save() fills the company's main space when the
     # caller sets none, so the address book's creation path stays untouched.
-    space = django_db_models.ForeignKey(
-        "Space", on_delete=django_db_models.CASCADE, related_name="locations"
-    )
+    space = django_db_models.ForeignKey("Space", on_delete=django_db_models.CASCADE, related_name="locations")
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
@@ -520,9 +518,7 @@ class CompanyFeatureFlags(django_db_models.Model):
     internal account) while it's being built out.
     """
 
-    company = django_db_models.ForeignKey(
-        Company, on_delete=django_db_models.CASCADE, related_name="feature_flags"
-    )
+    company = django_db_models.ForeignKey(Company, on_delete=django_db_models.CASCADE, related_name="feature_flags")
     feature = django_db_models.CharField(max_length=64)
     enabled = django_db_models.BooleanField(default=True)
 
@@ -1889,7 +1885,9 @@ class TSECompanyPricing(django_db_models.Model):
     """
 
     part = django_db_models.ForeignKey(TSEParts, on_delete=django_db_models.CASCADE, related_name="company_pricing")
-    company = django_db_models.ForeignKey(Company, on_delete=django_db_models.CASCADE, related_name="tse_company_pricing")
+    company = django_db_models.ForeignKey(
+        Company, on_delete=django_db_models.CASCADE, related_name="tse_company_pricing"
+    )
     # account_price from get_inventory_and_pricing -- what THIS company's account actually pays.
     cost = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
     # list_price from the same response -- Tri-State's own MSRP/list, not a separate dealer tier
@@ -1929,7 +1927,9 @@ class AllProBrand(django_db_models.Model):
 
 
 class BrandAllProBrandMapping(django_db_models.Model):
-    brand = django_db_models.ForeignKey(Brands, on_delete=django_db_models.CASCADE, related_name="allpro_brand_mappings")
+    brand = django_db_models.ForeignKey(
+        Brands, on_delete=django_db_models.CASCADE, related_name="allpro_brand_mappings"
+    )
     allpro_brand = django_db_models.ForeignKey(
         AllProBrand, on_delete=django_db_models.CASCADE, related_name="brand_mappings"
     )
@@ -2008,7 +2008,9 @@ class AllProCompanyPricing(django_db_models.Model):
     """
 
     part = django_db_models.ForeignKey(AllProParts, on_delete=django_db_models.CASCADE, related_name="company_pricing")
-    company = django_db_models.ForeignKey(Company, on_delete=django_db_models.CASCADE, related_name="allpro_company_pricing")
+    company = django_db_models.ForeignKey(
+        Company, on_delete=django_db_models.CASCADE, related_name="allpro_company_pricing"
+    )
     cost = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True)
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
@@ -4240,9 +4242,7 @@ class PurchaseOrder(django_db_models.Model):
         blank=True,
     )
     # The space this PO belongs to (see Space); save() fills the company's main space when unset.
-    space = django_db_models.ForeignKey(
-        "Space", on_delete=django_db_models.PROTECT, related_name="purchase_orders"
-    )
+    space = django_db_models.ForeignKey("Space", on_delete=django_db_models.PROTECT, related_name="purchase_orders")
     # The space's prefix, taken on every submit attempt and frozen once submitted; null for the main
     # space, every PO that existed before spaces and every unflagged company (see resolve_po_number).
     po_prefix = django_db_models.CharField(max_length=16, null=True, blank=True)
@@ -8892,7 +8892,9 @@ class ATDCompanyPricing(django_db_models.Model):
     """
 
     part = django_db_models.ForeignKey(ATDPart, on_delete=django_db_models.CASCADE, related_name="company_pricing")
-    company = django_db_models.ForeignKey(Company, on_delete=django_db_models.CASCADE, related_name="atd_company_pricing")
+    company = django_db_models.ForeignKey(
+        Company, on_delete=django_db_models.CASCADE, related_name="atd_company_pricing"
+    )
 
     cost = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     fet = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
@@ -9476,6 +9478,8 @@ class PaceMwwPart(PacePartBase):
             django_db_models.Index(fields=["aaia_brand_code", "part"], name="pwp_brand_part_idx"),
             django_db_models.Index(fields=["aaia_brand_code", "price"], name="pwp_brand_price_idx"),
         ]
+
+
 # =============================================================================================
 # CONSOLIDATED PACE CATALOG -- one deduplicated set of tables built from the nine per-member
 # pace_<member>_* landing tables by the `consolidate_pace_catalog` command. Replaces reading
@@ -9683,9 +9687,7 @@ class BrandPaceBrandMapping(django_db_models.Model):
     reverted without disturbing the exact-code ones.
     """
 
-    brand = django_db_models.ForeignKey(
-        Brands, on_delete=django_db_models.CASCADE, related_name="pace_brand_mappings"
-    )
+    brand = django_db_models.ForeignKey(Brands, on_delete=django_db_models.CASCADE, related_name="pace_brand_mappings")
     pace_brand = django_db_models.ForeignKey(
         PaceBrand, on_delete=django_db_models.CASCADE, related_name="brand_mappings"
     )
@@ -9756,9 +9758,7 @@ class ApolloPhoneReveal(django_db_models.Model):
 
     # The callback body verbatim. Apollo's phone payload shape is undocumented and has changed
     # before; keeping it means a reshape can be re-derived without re-spending credits.
-    raw_payload = django_db_models.JSONField(
-        default=dict, blank=True, encoder=DjangoJSONEncoder
-    )
+    raw_payload = django_db_models.JSONField(default=dict, blank=True, encoder=DjangoJSONEncoder)
 
     requested_at = django_db_models.DateTimeField(default=timezone.now)
     received_at = django_db_models.DateTimeField(null=True, blank=True)
@@ -9792,6 +9792,7 @@ class EdiControlNumber(django_db_models.Model):
     from Rough Country keep independent sequences, which is required, since each has its own
     interchange history with the partner.
     """
+
     KIND_INTERCHANGE = "isa"  # ISA13 -- 9 digits, unique per partner for the life of the account
     KIND_GROUP = "gs"  # GS06
     KIND_TRANSACTION = "st"  # ST02
@@ -9830,6 +9831,7 @@ class EdiDocument(django_db_models.Model):
     naming a PO we do not have must still land somewhere a human can find it (status
     UNMATCHED), never be dropped on the floor.
     """
+
     direction = django_db_models.PositiveSmallIntegerField()
     direction_name = django_db_models.CharField(max_length=16)
     # The other side's ISA id: who sent it to us, or who we sent it to.
@@ -9890,6 +9892,7 @@ class ThoroughbredBrand(django_db_models.Model):
     HawkSearch has no separate brand-list endpoint, so brands are only known by crawling the
     catalog itself. name is the natural key, same shape as WheelProsBrand (no AAIA code --
     Thoroughbred brands are bare names, not AAIA-coded)."""
+
     name = django_db_models.CharField(max_length=255, unique=True)
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
@@ -9927,6 +9930,7 @@ class ThoroughbredParts(django_db_models.Model):
     string. inventory has the 99999999 unlimited/dropship sentinel clamped to NULL before
     storage, never persisted raw. vehicleid is the raw int list straight off the doc -- fitment
     sync reads it directly, no junction table."""
+
     brand = django_db_models.ForeignKey(
         ThoroughbredBrand, on_delete=django_db_models.CASCADE, related_name="parts", null=True
     )
@@ -9961,6 +9965,7 @@ class ThoroughbredCompanyPricing(django_db_models.Model):
     CompanyProviders.credentials["markup"] -- see services/thoroughbred.py:dealer_cost_from_retail.
     markup_percent_applied is kept purely as an audit trail of what percentage produced it (no
     raw per-company feed exists to reconcile against, unlike AllPro/TSE)."""
+
     part = django_db_models.ForeignKey(
         ThoroughbredParts, on_delete=django_db_models.CASCADE, related_name="company_pricing"
     )
@@ -9968,9 +9973,7 @@ class ThoroughbredCompanyPricing(django_db_models.Model):
         Company, on_delete=django_db_models.CASCADE, related_name="thoroughbred_company_pricing"
     )
     cost = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
-    markup_percent_applied = django_db_models.DecimalField(
-        max_digits=5, decimal_places=2, null=True, blank=True
-    )
+    markup_percent_applied = django_db_models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
 
@@ -9987,6 +9990,7 @@ class ThoroughbredVehicle(django_db_models.Model):
     carry "" for those three fields). A decode miss (e.g. the confirmed orphan vehicle id 1678,
     referenced by products but unreachable via the picker walk) is simply absent here -- callers
     must treat it as "drop this fitment edge," never a hard failure."""
+
     vehicle_id = django_db_models.IntegerField(unique=True)
     year = django_db_models.IntegerField()
     make = django_db_models.CharField(max_length=128)
@@ -10012,6 +10016,7 @@ class XdpBrand(django_db_models.Model):
 
     XDP's own house brand is one row here, named "XDP", and is the only brand with a real dealer
     cost feed behind it (see XdpCompanyPricing.cost_source)."""
+
     name = django_db_models.CharField(max_length=255, unique=True)
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
@@ -10024,12 +10029,8 @@ class XdpBrand(django_db_models.Model):
 
 
 class BrandXdpBrandMapping(django_db_models.Model):
-    brand = django_db_models.ForeignKey(
-        Brands, on_delete=django_db_models.CASCADE, related_name="xdp_brand_mappings"
-    )
-    xdp_brand = django_db_models.ForeignKey(
-        XdpBrand, on_delete=django_db_models.CASCADE, related_name="brand_mappings"
-    )
+    brand = django_db_models.ForeignKey(Brands, on_delete=django_db_models.CASCADE, related_name="xdp_brand_mappings")
+    xdp_brand = django_db_models.ForeignKey(XdpBrand, on_delete=django_db_models.CASCADE, related_name="brand_mappings")
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
 
@@ -10071,9 +10072,8 @@ class XdpPart(django_db_models.Model):
     that covers the whole catalog, and it is a boolean, not a count. Per-company quantity lives
     on XdpCompanyPricing.quantity, same split NtwParts/NtwCompanyPricing uses.
     """
-    brand = django_db_models.ForeignKey(
-        XdpBrand, on_delete=django_db_models.CASCADE, related_name="parts", null=True
-    )
+
+    brand = django_db_models.ForeignKey(XdpBrand, on_delete=django_db_models.CASCADE, related_name="parts", null=True)
     code = django_db_models.CharField(max_length=64, unique=True)
     product_id = django_db_models.CharField(max_length=64, null=True, blank=True, db_index=True)
     sku = django_db_models.CharField(max_length=255, null=True, blank=True, db_index=True)
@@ -10146,9 +10146,8 @@ class XdpCompanyPricing(django_db_models.Model):
     ``quantity`` is this company's own feed quantity, already clamped at >= 0 (the feed reports
     negatives for oversold lines). Null for resold brands.
     """
-    part = django_db_models.ForeignKey(
-        XdpPart, on_delete=django_db_models.CASCADE, related_name="company_pricing"
-    )
+
+    part = django_db_models.ForeignKey(XdpPart, on_delete=django_db_models.CASCADE, related_name="company_pricing")
     company = django_db_models.ForeignKey(
         Company, on_delete=django_db_models.CASCADE, related_name="xdp_company_pricing"
     )
@@ -10156,9 +10155,7 @@ class XdpCompanyPricing(django_db_models.Model):
     map_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     retail_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     quantity = django_db_models.IntegerField(null=True, blank=True)
-    markup_percent_applied = django_db_models.DecimalField(
-        max_digits=5, decimal_places=2, null=True, blank=True
-    )
+    markup_percent_applied = django_db_models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
     # "feed" | "markup" -- see class docstring.
     cost_source = django_db_models.CharField(max_length=16, null=True, blank=True)
     created_at = django_db_models.DateTimeField(auto_now_add=True)
@@ -10181,6 +10178,7 @@ class RandysBrand(django_db_models.Model):
     "Yukon Gear & Axle" (11). They are separate vendor values on RANDYS' side, so they get
     separate rows here and the brand-mapping step is what collapses them onto one ``Brands`` row.
     """
+
     name = django_db_models.CharField(max_length=255, unique=True)
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
@@ -10233,6 +10231,7 @@ class RandysPart(django_db_models.Model):
     ("1992 - 1994, 1996 - 1997, 1999, 2001 - 2003") and must be expanded, never parsed as an int;
     services.randys.expand_randys_year_field is the only thing that should read it.
     """
+
     brand = django_db_models.ForeignKey(
         RandysBrand, on_delete=django_db_models.CASCADE, related_name="parts", null=True
     )
@@ -10246,9 +10245,7 @@ class RandysPart(django_db_models.Model):
     image_urls = django_db_models.JSONField(null=True, blank=True)
     # RANDYS' published retail price -- NOT a dealer cost. See class docstring.
     price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
-    compare_at_price = django_db_models.DecimalField(
-        max_digits=12, decimal_places=2, null=True, blank=True
-    )
+    compare_at_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     # Coarse catalogue-wide stock flag from the index; the only stock signal that exists publicly.
     in_stock = django_db_models.BooleanField(null=True, blank=True)
     # RANDYS-wide quantity from the SFTP inventory push. Null until the first file arrives.
@@ -10305,26 +10302,16 @@ class RandysCompanyPricing(django_db_models.Model):
     alongside a real cost.
     """
 
-    part = django_db_models.ForeignKey(
-        RandysPart, on_delete=django_db_models.CASCADE, related_name="company_pricing"
-    )
+    part = django_db_models.ForeignKey(RandysPart, on_delete=django_db_models.CASCADE, related_name="company_pricing")
     company = django_db_models.ForeignKey(
         Company, on_delete=django_db_models.CASCADE, related_name="randys_company_pricing"
     )
     cost = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
-    jobber_price = django_db_models.DecimalField(
-        max_digits=12, decimal_places=2, null=True, blank=True
-    )
-    map_price = django_db_models.DecimalField(
-        max_digits=12, decimal_places=2, null=True, blank=True
-    )
-    retail_price = django_db_models.DecimalField(
-        max_digits=12, decimal_places=2, null=True, blank=True
-    )
+    jobber_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    map_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    retail_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     # Markup percent used when cost_source == "markup"; null when cost came from a feed.
-    markup_percent_applied = django_db_models.DecimalField(
-        max_digits=5, decimal_places=2, null=True, blank=True
-    )
+    markup_percent_applied = django_db_models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
     # "feed" (real per-dealer cost RANDYS delivered) | "markup" (derived from the company's own
     # markup off RANDYS' retail). Never null when cost is set, so the two can't be confused.
     cost_source = django_db_models.CharField(max_length=16, null=True, blank=True)
