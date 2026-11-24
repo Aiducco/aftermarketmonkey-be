@@ -2449,11 +2449,14 @@ def list_order_accounts(
     accounts = cp.order_accounts.prefetch_related("spaces").order_by("-is_default", "created_at")
     rows = [_serialize_order_account(catalog_entry, account) for account in accounts]
     if scope is not None and scope.enabled:
-        owner_space_id = spaces_services.owner_space_id_of_connection(cp)
+        owner_space_id = spaces_services.owner_space_id_of_connection(cp, scope.main_space_id)
         for row, account in zip(rows, accounts):
             space_ids = spaces_services.order_account_space_ids(account, owner_space_id)
             row["space_ids"] = [space_id for space_id in space_ids if space_id in scope.visible_space_ids]
     return rows
+
+
+_MAX_ORDER_ACCOUNT_SPACE_IDS = 50
 
 
 def set_order_account_spaces(
@@ -2466,7 +2469,11 @@ def set_order_account_spaces(
     space uses every connection of the company, so space_not_on_feed cannot happen yet.
     """
     spaces_services.require_admin(scope)
-    if not isinstance(space_ids, list) or any(isinstance(i, bool) or not isinstance(i, int) for i in space_ids):
+    if (
+        not isinstance(space_ids, list)
+        or len(space_ids) > _MAX_ORDER_ACCOUNT_SPACE_IDS
+        or any(isinstance(i, bool) or not isinstance(i, int) or not 0 < i < 2**31 for i in space_ids)
+    ):
         raise spaces_services.SpaceError("space_ids must be a list of space ids", "invalid_payload")
     ids = sorted(set(space_ids))
     if not ids:

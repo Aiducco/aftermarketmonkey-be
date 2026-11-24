@@ -18,7 +18,7 @@ import typing
 
 from django.conf import settings
 from django.db import IntegrityError, transaction
-from django.db.models import F
+from django.db.models import F, Prefetch
 from django.utils import timezone as django_timezone
 
 from src import enums as src_enums
@@ -547,7 +547,7 @@ def _ensure_account_in_space(
     if not scope.enabled:
         return
     account = order_account or credentials_helper.get_default_order_account(cp)
-    owner_space_id = spaces_services.owner_space_id_of_connection(cp)
+    owner_space_id = spaces_services.owner_space_id_of_connection(cp, scope.main_space_id)
     if account is None:
         used_by = [owner_space_id]
     else:
@@ -555,9 +555,34 @@ def _ensure_account_in_space(
     if space_id not in used_by:
         label = account.label if account else "the default account"
         raise spaces_services.SpaceError(
-            "{} is not used by {}.".format(label, scope.space_names.get(space_id, "this space")),
+            "{} is not used by {}. An admin can add it under Integrations > {} > Used by.".format(
+                label, scope.space_names.get(space_id, "this space"), cp.provider.name
+            ),
             ERROR_ORDER_ACCOUNT_NOT_IN_SPACE,
         )
+
+
+_PREFETCHED_ACCOUNTS_ATTR = "active_order_accounts_prefetched"
+
+
+def _active_accounts_prefetch() -> Prefetch:
+    """Prefetch of every connection's active order accounts (default first) with their spaces, so a list of
+    connections reads them in two queries."""
+    return Prefetch(
+        "order_accounts",
+        queryset=src_models.CompanyProviderOrderAccount.objects.filter(active=True)
+        .prefetch_related("spaces")
+        .order_by("-is_default", "created_at"),
+        to_attr=_PREFETCHED_ACCOUNTS_ATTR,
+    )
+
+
+def _active_accounts(cp: src_models.CompanyProviders) -> typing.List[src_models.CompanyProviderOrderAccount]:
+    """The connection's active accounts, default first: from the prefetch when there is one, else queried."""
+    prefetched = getattr(cp, _PREFETCHED_ACCOUNTS_ATTR, None)
+    if prefetched is not None:
+        return prefetched
+    return list(cp.order_accounts.filter(active=True).prefetch_related("spaces").order_by("-is_default", "created_at"))
 
 
 def _serialize_order_accounts(cp: src_models.CompanyProviders) -> typing.List[typing.Dict]:
@@ -569,18 +594,21 @@ def _serialize_order_accounts(cp: src_models.CompanyProviders) -> typing.List[ty
     when no account is specified — purely informational, not needed to place an order via the
     default (leave ``order_account_id`` unset for that).
     """
-    accounts = cp.order_accounts.filter(active=True).order_by("-is_default", "created_at")
+    accounts = _active_accounts(cp)
     return [{"id": account.id, "label": account.label, "is_default": account.is_default} for account in accounts]
 
 
-def _accounts_for_scope(scope: spaces_services.SpaceScope, cp: src_models.CompanyProviders) -> typing.List[typing.Dict]:
+def _accounts_for_scope(
+    scope: spaces_services.SpaceScope, cp: src_models.CompanyProviders
+) -> typing.Tuple[typing.List[typing.Dict], bool]:
     """_serialize_order_accounts limited to the accounts used by the scope's spaces, each + ``space_ids``
-    (the spaces that use it, among the ones the caller can see)."""
-    owner_space_id = spaces_services.owner_space_id_of_connection(cp)
+    (the spaces that use it, among the ones the caller can see). Also whether the connection has any active
+    account at all (so "the space uses none of them" needs no further query)."""
+    owner_space_id = spaces_services.owner_space_id_of_connection(cp, scope.main_space_id)
     shown = set(scope.list_space_ids)
     visible = set(scope.visible_space_ids)
     rows = []
-    accounts = cp.order_accounts.filter(active=True).prefetch_related("spaces").order_by("-is_default", "created_at")
+    accounts = _active_accounts(cp)
     for account in accounts:
         used_by = spaces_services.order_account_space_ids(account, owner_space_id)
         if shown.intersection(used_by):
@@ -592,7 +620,7 @@ def _accounts_for_scope(scope: spaces_services.SpaceScope, cp: src_models.Compan
                     "space_ids": [space_id for space_id in used_by if space_id in visible],
                 }
             )
-    return rows
+    return rows, bool(accounts)
 
 
 def _cart_queryset(company_id: int, space_ids: typing.Optional[typing.List[int]]):
@@ -1024,6 +1052,9 @@ def review_cart(
         )
     if not purchase_orders:
         raise PurchaseOrderServiceError("No cart items to review.")
+    # Before any quote: a distributor is not asked for a price on an account the space does not use.
+    for po in purchase_orders:
+        _ensure_account_in_space(scope, po.company_provider, po.order_account, po.space_id)
 
     created_by_id = _resolve_user_profile_id(user_id)
     group = src_models.PurchaseOrderGroup.objects.create(
@@ -1749,6 +1780,7 @@ def requote_purchase_order(company_id: int, scope: spaces_services.SpaceScope, p
         )
     if not po.ship_to_address1:
         raise PurchaseOrderServiceError("Purchase order has no ship-to address on file yet — review the cart first.")
+    _ensure_account_in_space(scope, po.company_provider, po.order_account, po.space_id)
     quoted_po = purchase_order_jobs.run_quote_synchronously(po.id)
     return _serialize_purchase_order(quoted_po, scope=scope)
 
@@ -1810,7 +1842,7 @@ def submit_purchase_order_group(
     for po_id in quoted_ids:
         try:
             results.append(submit_purchase_order(company_id, scope, po_id, ship_method=ship_methods.get(str(po_id))))
-        except PurchaseOrderServiceError as e:
+        except (PurchaseOrderServiceError, spaces_services.SpaceError) as e:
             po = src_models.PurchaseOrder.objects.filter(id=po_id, company_id=company_id).first()
             result = _serialize_purchase_order(po, scope=scope) if po else {"id": po_id}
             result["error_message"] = str(e)
@@ -1937,8 +1969,10 @@ def get_order_capabilities(
     multi_spaces flag (``scope.enabled``) the accounts are the ones the current space uses (every visible
     space's in "all"), and each has ``space_ids``, limited to the spaces the caller can see.
     """
-    company_providers = src_models.CompanyProviders.objects.filter(company_id=company_id, active=True).select_related(
-        "provider"
+    company_providers = (
+        src_models.CompanyProviders.objects.filter(company_id=company_id, active=True)
+        .select_related("provider")
+        .prefetch_related(_active_accounts_prefetch())
     )
     ordering_enabled = billing_services.check_po_checkout_allowed(company_id)[0]
     results = []
@@ -1952,16 +1986,12 @@ def get_order_capabilities(
         # actually fail the moment a quote/order was attempted.
         adapter = order_registry.get_adapter(cp)
         if scope is not None and scope.enabled:
-            order_accounts = _accounts_for_scope(scope, cp)
+            order_accounts, has_active_accounts = _accounts_for_scope(scope, cp)
+            # A connection the space uses none of the accounts of stays listed but cannot order for this space.
+            used_by_none = not order_accounts and has_active_accounts
         else:
             order_accounts = _serialize_order_accounts(cp)
-        # A connection the space uses none of the accounts of stays listed but cannot order for this space.
-        used_by_none = (
-            scope is not None
-            and scope.enabled
-            and not order_accounts
-            and cp.order_accounts.filter(active=True).exists()
-        )
+            used_by_none = False
         results.append(
             {
                 "company_provider_id": cp.id,

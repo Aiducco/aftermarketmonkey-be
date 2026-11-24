@@ -191,9 +191,14 @@ def write_space(scope: SpaceScope) -> int:
 # ---------------------------------------------------------------------------
 
 
-def owner_space_id_of_connection(company_provider: src_models.CompanyProviders) -> int:
+def owner_space_id_of_connection(
+    company_provider: src_models.CompanyProviders, main_space_id: typing.Optional[int] = None
+) -> int:
     """The space that owns a connection: the company's main space (every connection is the company's own
-    until a space can have its own feed)."""
+    until a space can have its own feed). Pass the scope's ``main_space_id`` to skip the lookup (a read
+    must not get-or-create per connection)."""
+    if main_space_id is not None:
+        return main_space_id
     return src_models.Space.objects.main_for(company_provider.company_id).id
 
 
