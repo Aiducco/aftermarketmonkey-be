@@ -54,6 +54,7 @@ class PurchaseOrderServiceError(Exception):
     currently only used for billing_services.PLAN_LIMIT_ERROR_CODE (see add_cart_item /
     submit_purchase_order), so the view can return 402 + upgrade_required instead of a plain 400.
     """
+
     def __init__(self, message: str, error_code: typing.Optional[str] = None) -> None:
         super().__init__(message)
         self.error_code = error_code
@@ -256,7 +257,9 @@ def _po_fulfillment_channel(po: src_models.PurchaseOrder) -> str:
     enough from an HTTP API that the FE has to be able to tell them apart — submitting delivers
     a document, and confirmation arrives separately, hours later.
     """
-    account = po.order_account if po.order_account_id else credentials_helper.get_default_order_account(po.company_provider)
+    account = (
+        po.order_account if po.order_account_id else credentials_helper.get_default_order_account(po.company_provider)
+    )
     method = account.order_method_name.lower() if account else "api"
     if method == "email":
         return "email"
@@ -281,18 +284,14 @@ def _fulfillment_channels_by_po_id(
             company_provider_id__in=cp_ids, is_default=True, active=True
         ).values("company_provider_id", "order_method_name")
         for row in default_rows:
-            default_method_by_cp_id.setdefault(
-                row["company_provider_id"], row["order_method_name"]
-            )
+            default_method_by_cp_id.setdefault(row["company_provider_id"], row["order_method_name"])
 
     # Provider kind per connection, for the API-channel branch below — one query for the whole
     # page rather than walking po.company_provider.provider on every row.
     kind_by_cp_id: typing.Dict[int, int] = {}
     all_cp_ids = {po.company_provider_id for po in pos}
     if all_cp_ids:
-        for row in src_models.CompanyProviders.objects.filter(id__in=all_cp_ids).values(
-            "id", "provider__kind"
-        ):
+        for row in src_models.CompanyProviders.objects.filter(id__in=all_cp_ids).values("id", "provider__kind"):
             kind_by_cp_id[row["id"]] = row["provider__kind"]
 
     channels: typing.Dict[int, str] = {}
@@ -305,9 +304,7 @@ def _fulfillment_channels_by_po_id(
             channels[po.id] = "email"
             continue
         kind = kind_by_cp_id.get(po.company_provider_id)
-        channels[po.id] = (
-            order_registry.fulfillment_channel_for_kind(kind) if kind is not None else "api"
-        )
+        channels[po.id] = order_registry.fulfillment_channel_for_kind(kind) if kind is not None else "api"
     return channels
 
 
@@ -362,9 +359,7 @@ def _serialize_purchase_order(
             # "valid" | "corrected" | "unverified", or None when the address never went
             # through POST /api/address/validate/ (saved location, ship-to-my-shop, or an
             # older client) -- see src.enums.AddressValidationStatus.
-            "validation_status": address_services.status_to_api_from_value(
-                po.ship_to_validation_status
-            ),
+            "validation_status": address_services.status_to_api_from_value(po.ship_to_validation_status),
         }
         if po.ship_to_address1
         else None,
@@ -390,9 +385,7 @@ def _serialize_purchase_order(
         # field instead of our own po_number above (see base.resolve_po_number).
         "po_name": po.po_name,
         "quoted_at": po.quoted_at.isoformat() if po.quoted_at else None,
-        "quote_is_stale": (
-            _quote_is_stale(po) if po.status == src_enums.PurchaseOrderStatus.QUOTED.value else None
-        ),
+        "quote_is_stale": (_quote_is_stale(po) if po.status == src_enums.PurchaseOrderStatus.QUOTED.value else None),
         "submitted_at": po.submitted_at.isoformat() if po.submitted_at else None,
         "created_at": po.created_at.isoformat(),
         "updated_at": po.updated_at.isoformat(),
@@ -404,7 +397,8 @@ def _serialize_purchase_order(
         # Turn14/Keystone's own multi-warehouse orders still carry a single order number).
         "distributor_order_number": ", ".join(
             pdo.distributor_order_number for pdo in po.distributor_orders.all() if pdo.distributor_order_number
-        ) or None,
+        )
+        or None,
         "distributor_orders": [_serialize_distributor_order(pdo) for pdo in po.distributor_orders.all()],
         # Distributor-issued invoices (see PurchaseOrderInvoice) — only populated for
         # distributors whose adapter supports it (currently Turn14) and only once items
@@ -546,10 +540,7 @@ def _serialize_order_accounts(cp: src_models.CompanyProviders) -> typing.List[ty
     default (leave ``order_account_id`` unset for that).
     """
     accounts = cp.order_accounts.filter(active=True).order_by("-is_default", "created_at")
-    return [
-        {"id": account.id, "label": account.label, "is_default": account.is_default}
-        for account in accounts
-    ]
+    return [{"id": account.id, "label": account.label, "is_default": account.is_default} for account in accounts]
 
 
 def _cart_queryset(company_id: int, space_ids: typing.Optional[typing.List[int]]):
@@ -765,9 +756,7 @@ def add_cart_item(
     cp = _get_company_provider(company_id, provider_id)
     order_account = _resolve_order_account(cp, order_account_id)
     if order_registry.get_adapter(cp, order_account) is None:
-        raise PurchaseOrderServiceError(
-            order_registry.get_adapter_unavailable_reason(cp, order_account)
-        )
+        raise PurchaseOrderServiceError(order_registry.get_adapter_unavailable_reason(cp, order_account))
 
     provider_part = src_models.ProviderPart.objects.filter(
         master_part_id=master_part_id, provider_id=provider_id
@@ -779,13 +768,9 @@ def add_cart_item(
 
     with transaction.atomic():
         if provider_part.is_kit:
-            kit_components = list(
-                provider_part.kit_components.select_related("component_part").all()
-            )
+            kit_components = list(provider_part.kit_components.select_related("component_part").all())
             if not kit_components:
-                raise PurchaseOrderServiceError(
-                    "This kit's components aren't available to order individually yet."
-                )
+                raise PurchaseOrderServiceError("This kit's components aren't available to order individually yet.")
             for component in kit_components:
                 _add_or_increment_line_item(
                     po,
@@ -806,9 +791,13 @@ def update_cart_item(
     if not isinstance(quantity, int) or quantity <= 0:
         raise PurchaseOrderServiceError("Quantity must be a positive integer.")
 
-    li = src_models.PurchaseOrderLineItem.objects.filter(
-        id=line_item_id, purchase_order_id__in=_cart_queryset(company_id, None).values("id")
-    ).select_related("purchase_order").first()
+    li = (
+        src_models.PurchaseOrderLineItem.objects.filter(
+            id=line_item_id, purchase_order_id__in=_cart_queryset(company_id, None).values("id")
+        )
+        .select_related("purchase_order")
+        .first()
+    )
     if not li:
         raise PurchaseOrderServiceError("Cart item not found.")
     spaces_services.ensure_visible(scope, li.purchase_order.space_id)
@@ -823,9 +812,13 @@ def update_cart_item(
 
 
 def remove_cart_item(company_id: int, scope: spaces_services.SpaceScope, line_item_id: int) -> typing.Dict:
-    li = src_models.PurchaseOrderLineItem.objects.filter(
-        id=line_item_id, purchase_order_id__in=_cart_queryset(company_id, None).values("id")
-    ).select_related("purchase_order").first()
+    li = (
+        src_models.PurchaseOrderLineItem.objects.filter(
+            id=line_item_id, purchase_order_id__in=_cart_queryset(company_id, None).values("id")
+        )
+        .select_related("purchase_order")
+        .first()
+    )
     if not li:
         raise PurchaseOrderServiceError("Cart item not found.")
     po = li.purchase_order
@@ -849,12 +842,7 @@ def set_cart_order_account(
     (same as update_cart_item/remove_cart_item) since a quote priced against the OLD account
     means nothing once the account backing it changes; a fresh review/quote is required.
     """
-    po = (
-        _cart_queryset(company_id, None)
-        .filter(id=purchase_order_id)
-        .select_related("company_provider")
-        .first()
-    )
+    po = _cart_queryset(company_id, None).filter(id=purchase_order_id).select_related("company_provider").first()
     if not po:
         raise PurchaseOrderServiceError("Cart not found.")
     spaces_services.ensure_visible(scope, po.space_id)
@@ -871,9 +859,7 @@ def set_cart_order_account(
     )
     if conflict:
         label = order_account.label if order_account else "the default account"
-        raise PurchaseOrderServiceError(
-            "You already have an open cart for {} — remove its items first.".format(label)
-        )
+        raise PurchaseOrderServiceError("You already have an open cart for {} — remove its items first.".format(label))
 
     po.order_account = order_account
     po.save(update_fields=["order_account", "updated_at"])
@@ -1040,7 +1026,9 @@ def review_cart(
 # -- PO / group reads -----------------------------------------------------------------------
 
 
-def get_purchase_order_detail(company_id: int, scope: spaces_services.SpaceScope, purchase_order_id: int) -> typing.Dict:
+def get_purchase_order_detail(
+    company_id: int, scope: spaces_services.SpaceScope, purchase_order_id: int
+) -> typing.Dict:
     po = (
         src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id)
         .select_related("company_provider__provider", "group", "order_account")
@@ -1068,9 +1056,7 @@ def get_purchase_order_pdf_bytes(company_id: int, scope: spaces_services.SpaceSc
     spaces_services.ensure_visible(scope, po.space_id)
 
     attempt = (
-        po.submission_attempts.filter(
-            operation=src_enums.PurchaseOrderOperation.SUBMIT.value, success=True
-        )
+        po.submission_attempts.filter(operation=src_enums.PurchaseOrderOperation.SUBMIT.value, success=True)
         .order_by("-created_at")
         .first()
     )
@@ -1294,9 +1280,7 @@ def get_confirmed_purchase_order_detail(
         # True for the first _RECENT_ORDER_WINDOW after submission -- lets the FE flag a PO as
         # "just placed" (e.g. to explain why distributor status/tracking might still be sparse)
         # without it having to do its own submitted_at math against the current time.
-        "recent_order": bool(
-            po.submitted_at and (django_timezone.now() - po.submitted_at) <= _RECENT_ORDER_WINDOW
-        ),
+        "recent_order": bool(po.submitted_at and (django_timezone.now() - po.submitted_at) <= _RECENT_ORDER_WINDOW),
         # API orders keep reading straight off the distributor's stored raw_response. 'email'
         # and 'edi' have no parseable order body there, so parsing yields an empty order and a
         # blank screen; both are served from our own line items instead -- see
@@ -1330,7 +1314,6 @@ def _parse_status_filter(value: typing.Optional[typing.Union[int, str]]) -> typi
         raise PurchaseOrderServiceError(
             "Unknown status '{}'. Valid values: {} (or their numeric codes).".format(value, valid)
         )
-
 
 
 # "Placed but not yet fully closed out" — the FE's "Open" tab alias (see list_purchase_orders'
@@ -1402,9 +1385,7 @@ def list_purchase_orders(
         .values("purchase_order_id", "distributor_order_status_name")
     )
     for row in distributor_rows:
-        distributor_status_by_po_id.setdefault(
-            row["purchase_order_id"], row["distributor_order_status_name"]
-        )
+        distributor_status_by_po_id.setdefault(row["purchase_order_id"], row["distributor_order_status_name"])
 
     fulfillment_channel_by_po_id = _fulfillment_channels_by_po_id(pos)
 
@@ -1445,7 +1426,9 @@ def list_purchase_order_invoices(
     return [_serialize_invoice_flat(inv, scope) for inv in qs[:200]]
 
 
-def get_purchase_order_invoice_detail(company_id: int, scope: spaces_services.SpaceScope, invoice_id: int) -> typing.Dict:
+def get_purchase_order_invoice_detail(
+    company_id: int, scope: spaces_services.SpaceScope, invoice_id: int
+) -> typing.Dict:
     inv = (
         src_models.PurchaseOrderInvoice.objects.filter(id=invoice_id, purchase_order__company_id=company_id)
         .select_related("purchase_order__company_provider__provider")
@@ -1608,16 +1591,12 @@ def submit_purchase_order(
         po.save(update_fields=["po_name", "updated_at"])
     if po.status != src_enums.PurchaseOrderStatus.QUOTED.value:
         raise PurchaseOrderServiceError(
-            "Purchase order must be quoted before it can be submitted (current status: {}).".format(
-                po.status_name
-            )
+            "Purchase order must be quoted before it can be submitted (current status: {}).".format(po.status_name)
         )
     if _quote_is_stale(po):
         raise PurchaseOrderServiceError(
             "This quote is more than {} minute(s) old and may no longer reflect current "
-            "price/availability. Re-quote before submitting.".format(
-                settings.PURCHASE_ORDER_QUOTE_TTL_MINUTES
-            )
+            "price/availability. Re-quote before submitting.".format(settings.PURCHASE_ORDER_QUOTE_TTL_MINUTES)
         )
     po.status = src_enums.PurchaseOrderStatus.SUBMITTING.value
     po.status_name = src_enums.PurchaseOrderStatus.SUBMITTING.name
@@ -1672,9 +1651,7 @@ def select_shipping_options(
         shipment = shipments_by_id.get(shipment_id)
         if shipment is None:
             raise PurchaseOrderServiceError("Unknown shipment_id: {}".format(shipment_id))
-        matched_option = next(
-            (o for o in (shipment.get("ship_options") or []) if o.get("id") == ship_option_id), None
-        )
+        matched_option = next((o for o in (shipment.get("ship_options") or []) if o.get("id") == ship_option_id), None)
         if matched_option is None:
             raise PurchaseOrderServiceError(
                 "Unknown ship_option_id '{}' for shipment '{}'.".format(ship_option_id, shipment_id)
@@ -1713,9 +1690,7 @@ def requote_purchase_order(company_id: int, scope: spaces_services.SpaceScope, p
     }
     if po.status not in requotable:
         raise PurchaseOrderServiceError(
-            "Purchase order can only be re-quoted from QUOTED or FAILED (current status: {}).".format(
-                po.status_name
-            )
+            "Purchase order can only be re-quoted from QUOTED or FAILED (current status: {}).".format(po.status_name)
         )
     if not po.ship_to_address1:
         raise PurchaseOrderServiceError("Purchase order has no ship-to address on file yet — review the cart first.")
@@ -1786,10 +1761,16 @@ def submit_purchase_order_group(
     return {"group_id": group_id, "purchase_orders": results}
 
 
-def get_job_status(company_id: int, scope: spaces_services.SpaceScope, purchase_order_id: int, job_id: int) -> typing.Dict:
-    job = src_models.PurchaseOrderJob.objects.filter(
-        id=job_id, purchase_order_id=purchase_order_id, purchase_order__company_id=company_id
-    ).select_related("purchase_order").first()
+def get_job_status(
+    company_id: int, scope: spaces_services.SpaceScope, purchase_order_id: int, job_id: int
+) -> typing.Dict:
+    job = (
+        src_models.PurchaseOrderJob.objects.filter(
+            id=job_id, purchase_order_id=purchase_order_id, purchase_order__company_id=company_id
+        )
+        .select_related("purchase_order")
+        .first()
+    )
     if not job:
         raise PurchaseOrderServiceError("Job not found.")
     spaces_services.ensure_visible(scope, job.purchase_order.space_id)
@@ -1892,9 +1873,9 @@ def refresh_purchase_order_status(
 
 
 def get_order_capabilities(company_id: int) -> typing.List[typing.Dict]:
-    company_providers = src_models.CompanyProviders.objects.filter(
-        company_id=company_id, active=True
-    ).select_related("provider")
+    company_providers = src_models.CompanyProviders.objects.filter(company_id=company_id, active=True).select_related(
+        "provider"
+    )
     ordering_enabled = billing_services.check_po_checkout_allowed(company_id)[0]
     results = []
     for cp in company_providers:
@@ -1923,9 +1904,7 @@ def get_order_capabilities(company_id: int) -> typing.List[typing.Dict]:
                 # which provider kinds are email-based (that's a per-order-account choice now,
                 # not fixed per distributor — see src.enums.OrderMethod).
                 "fulfillment_channel": adapter.fulfillment_channel() if adapter else None,
-                "supports_shipping_method_selection": bool(
-                    adapter and adapter.supports_shipping_method_selection()
-                ),
+                "supports_shipping_method_selection": bool(adapter and adapter.supports_shipping_method_selection()),
                 "supports_cancel": bool(adapter and adapter.supports_cancel()),
                 # Lets the FE hide/grey out the Invoices tab for a connection whose distributor
                 # has no invoice API at all (e.g. WheelPros) instead of just always rendering an
@@ -1953,10 +1932,7 @@ def get_shipping_methods(company_id: int, company_provider_id: int) -> typing.Li
     adapter = order_registry.get_adapter(cp)
     if not adapter or not adapter.supports_shipping_method_selection():
         raise PurchaseOrderServiceError("{} does not support choosing a shipping method.".format(cp.provider.name))
-    return [
-        {"code": m.code, "name": m.name, "carrier_name": m.carrier_name}
-        for m in adapter.list_shipping_methods()
-    ]
+    return [{"code": m.code, "name": m.name, "carrier_name": m.carrier_name} for m in adapter.list_shipping_methods()]
 
 
 # -- External (distributor-placed) orders -----------------------------------------------------
