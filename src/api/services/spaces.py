@@ -231,12 +231,18 @@ def pricing_company_for(space: typing.Union[src_models.Space, int], provider_id:
 def owner_space_id_of_connection(
     company_provider: src_models.CompanyProviders, main_space_id: typing.Optional[int] = None
 ) -> int:
-    """The space that owns a connection: the company's main space (every connection is the company's own
-    until a space can have its own feed). Pass the scope's ``main_space_id`` to skip the lookup (a read
-    must not get-or-create per connection)."""
+    """The space that owns a connection. A feed tenant's connection is owned by the space whose ``feed_company``
+    is that tenant (ADR 0002); every other connection is the company's own and belongs to its main space. Pass
+    the scope's ``main_space_id`` to skip the main-space lookup (a read must not get-or-create per connection)."""
+    company_id = company_provider.company_id
+    is_tenant = src_models.Company.objects.filter(id=company_id, parent_company_id__isnull=False).exists()
+    if is_tenant:
+        space_id = src_models.Space.objects.filter(feed_company_id=company_id).values_list("id", flat=True).first()
+        if space_id is not None:
+            return space_id
     if main_space_id is not None:
         return main_space_id
-    return src_models.Space.objects.main_for(company_provider.company_id).id
+    return src_models.Space.objects.main_for(company_id).id
 
 
 def order_account_space_ids(account: src_models.CompanyProviderOrderAccount, owner_space_id: int) -> typing.List[int]:
