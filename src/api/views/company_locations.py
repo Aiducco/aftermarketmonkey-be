@@ -12,7 +12,6 @@ from django.views.decorators.csrf import csrf_exempt
 
 from common import exceptions as common_exceptions
 from common import utils as common_utils
-
 from src.api.schemas import company_locations as company_locations_schema
 from src.api.services import company_locations as company_locations_services
 from src.api.services import feature_flags as feature_flags_services
@@ -65,17 +64,10 @@ class CompanyLocationsView(views.View):
         if err:
             return _json_response({"message": err}, status=401 if "authenticated" in err else 400)
 
-        if feature_flags_services.company_has_feature(company_id, feature_flags_services.FEATURE_MULTI_SPACES):
-            scope = spaces_services.resolve_scope(request)
-            if scope.requested_space_id is not None:
-                try:
-                    spaces_services.ensure_visible(scope, scope.requested_space_id)
-                except spaces_services.SpaceError as e:
-                    return _json_response(e.body(), status=e.status_code)
-            data = company_locations_services.list_space_addresses(company_id, scope.list_space_ids)
-            return _json_response({"data": data})
-
-        data = company_locations_services.list_company_locations(company_id)
+        try:
+            data = company_locations_services.list_for_request(request, company_id)
+        except spaces_services.SpaceError as e:
+            return _json_response(e.body(), status=e.status_code)
         return _json_response({"data": data})
 
     def post(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:

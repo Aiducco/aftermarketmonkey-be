@@ -50,6 +50,21 @@ def list_space_addresses(company_id: int, space_ids: list) -> list:
     return rows
 
 
+def list_for_request(request, company_id: int) -> list:
+    """GET /company/locations/: a flagged company gets the addresses of the spaces the caller can see (raises
+    SpaceError 403 when the header names a space they cannot); any other company gets its address book."""
+    # Imported here: services.spaces imports this module.
+    from src.api.services import feature_flags as feature_flags_services
+    from src.api.services import spaces as spaces_services
+
+    if not feature_flags_services.company_has_feature(company_id, feature_flags_services.FEATURE_MULTI_SPACES):
+        return list_company_locations(company_id)
+    scope = spaces_services.resolve_scope(request)
+    if scope.requested_space_id is not None:
+        spaces_services.ensure_visible(scope, scope.requested_space_id)
+    return list_space_addresses(company_id, scope.list_space_ids)
+
+
 @transaction.atomic
 def create_company_location(company_id: int, **fields) -> dict:
     is_primary = bool(fields.pop("is_primary", False))
