@@ -33,9 +33,7 @@ def _serialize(location: src_models.CompanyLocation) -> dict:
 
 
 def list_company_locations(company_id: int) -> list:
-    locations = src_models.CompanyLocation.objects.filter(company_id=company_id).order_by(
-        "-is_primary", "label"
-    )
+    locations = src_models.CompanyLocation.objects.filter(company_id=company_id).order_by("-is_primary", "label")
     return [_serialize(loc) for loc in locations]
 
 
@@ -56,25 +54,19 @@ def list_space_addresses(company_id: int, space_ids: list) -> list:
 def create_company_location(company_id: int, **fields) -> dict:
     is_primary = bool(fields.pop("is_primary", False))
     if is_primary:
-        src_models.CompanyLocation.objects.filter(company_id=company_id, is_primary=True).update(
-            is_primary=False
-        )
+        src_models.CompanyLocation.objects.filter(company_id=company_id, is_primary=True).update(is_primary=False)
     elif not src_models.CompanyLocation.objects.filter(company_id=company_id).exists():
         # First location for a company defaults to primary so there's always one to fall back to.
         is_primary = True
 
-    location = src_models.CompanyLocation.objects.create(
-        company_id=company_id, is_primary=is_primary, **fields
-    )
+    location = src_models.CompanyLocation.objects.create(company_id=company_id, is_primary=is_primary, **fields)
     return _serialize(location)
 
 
 @transaction.atomic
 def update_company_location(company_id: int, location_id: int, **fields) -> dict | str:
     location = (
-        src_models.CompanyLocation.objects.select_for_update()
-        .filter(id=location_id, company_id=company_id)
-        .first()
+        src_models.CompanyLocation.objects.select_for_update().filter(id=location_id, company_id=company_id).first()
     )
     if not location:
         return "Location not found"
@@ -98,9 +90,7 @@ def update_company_location(company_id: int, location_id: int, **fields) -> dict
 @transaction.atomic
 def delete_company_location(company_id: int, location_id: int) -> str | None:
     location = (
-        src_models.CompanyLocation.objects.select_for_update()
-        .filter(id=location_id, company_id=company_id)
-        .first()
+        src_models.CompanyLocation.objects.select_for_update().filter(id=location_id, company_id=company_id).first()
     )
     if not location:
         return "Location not found"
@@ -109,9 +99,7 @@ def delete_company_location(company_id: int, location_id: int) -> str | None:
     location.delete()
 
     if was_primary:
-        next_location = (
-            src_models.CompanyLocation.objects.filter(company_id=company_id).order_by("label").first()
-        )
+        next_location = src_models.CompanyLocation.objects.filter(company_id=company_id).order_by("label").first()
         if next_location:
             next_location.is_primary = True
             next_location.save(update_fields=["is_primary", "updated_at"])
