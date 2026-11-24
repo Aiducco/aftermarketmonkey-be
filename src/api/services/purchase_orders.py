@@ -2067,14 +2067,23 @@ def get_order_capabilities(
     return results
 
 
-def get_shipping_methods(company_id: int, company_provider_id: int) -> typing.List[typing.Dict]:
+def get_shipping_methods(
+    company_id: int, company_provider_id: int, scope: typing.Optional[spaces_services.SpaceScope] = None
+) -> typing.List[typing.Dict]:
+    """With a ``scope`` of a flagged company the connection is looked up among the company's and its feed tenants'
+    and must be visible (SpaceError 403 space_access_denied)."""
+    company_ids = (
+        spaces_services.family_company_ids(company_id) if scope is not None and scope.enabled else [company_id]
+    )
     cp = (
-        src_models.CompanyProviders.objects.filter(id=company_provider_id, company_id=company_id)
+        src_models.CompanyProviders.objects.filter(id=company_provider_id, company_id__in=company_ids)
         .select_related("provider")
         .first()
     )
     if not cp:
         raise PurchaseOrderServiceError("Distributor connection not found for this company.")
+    if scope is not None:
+        spaces_services.ensure_connection_visible(scope, cp)
     adapter = order_registry.get_adapter(cp)
     if not adapter or not adapter.supports_shipping_method_selection():
         raise PurchaseOrderServiceError("{} does not support choosing a shipping method.".format(cp.provider.name))
@@ -2235,18 +2244,26 @@ def _polled_connection_status(
     return "error", last_synced_at_iso, watermark.last_error
 
 
-def _polled_connections(company_id: int) -> typing.List[typing.Dict]:
+def _polled_connections(
+    company_id: int, scope: typing.Optional[spaces_services.SpaceScope] = None
+) -> typing.List[typing.Dict]:
     """One row per ACTIVE order account on the company -- including ones that can't discover at
     all (Motor State et al., status="not_supported") -- that's what lets the FE say "this
     distributor can't report outside orders" instead of showing silence. See contract.md's
-    PolledConnection section."""
-    accounts = (
-        src_models.CompanyProviderOrderAccount.objects.filter(
+    PolledConnection section. For a flagged company (``scope``) the accounts are those of the company's and its
+    feed tenants' connections that a space in the list scope uses."""
+    if scope is not None and scope.enabled:
+        accounts = src_models.CompanyProviderOrderAccount.objects.filter(
+            company_provider__company_id__in=spaces_services.family_company_ids(company_id),
+            company_provider__active=True,
+            company_provider_id__in=spaces_services.connection_ids_used_by(scope, scope.list_space_ids),
+            active=True,
+        )
+    else:
+        accounts = src_models.CompanyProviderOrderAccount.objects.filter(
             company_provider__company_id=company_id, company_provider__active=True, active=True
         )
-        .select_related("company_provider__provider")
-        .order_by("company_provider_id", "id")
-    )
+    accounts = accounts.select_related("company_provider__provider").order_by("company_provider_id", "id")
     watermarks_by_account_id = {
         w.order_account_id: w for w in src_models.ExternalOrderSyncWatermark.objects.filter(order_account__in=accounts)
     }
@@ -2313,7 +2330,7 @@ def list_external_purchase_orders(
         _serialize_external_purchase_order(order, scope)
         for order in qs.order_by(F("order_date").desc(nulls_last=True), "-discovered_at")
     ]
-    result = {"orders": orders, "polled_connections": _polled_connections(company_id)}
+    result = {"orders": orders, "polled_connections": _polled_connections(company_id, scope)}
     if scope.enabled:
         result["space_summary"] = _external_space_summary(company_id, scope)
     return result

@@ -39,6 +39,7 @@ ERROR_MAIN_SPACE_PROTECTED = "main_space_protected"
 ERROR_SPACE_NOT_EMPTY = "space_not_empty"
 ERROR_ONLY_SPACE_OF_USERS = "only_space_of_users"
 ERROR_ONLY_SPACE_OF_ACCOUNTS = "only_space_of_accounts"
+ERROR_SPACE_NOT_ON_FEED = "space_not_on_feed"
 
 _ADDRESS_FIELDS = ("name", "attention", "address1", "address2", "city", "state", "postal_code", "country", "phone")
 
@@ -274,6 +275,62 @@ def order_account_space_ids(account: src_models.CompanyProviderOrderAccount, own
     none (ADR 0001). Reads ``account.spaces.all()``, so a prefetch avoids a query per account."""
     ids = sorted(space.id for space in account.spaces.all())
     return ids or [owner_space_id]
+
+
+def owner_spaces_by_company(company_id: int, main_space_id: int) -> typing.Dict[int, int]:
+    """``{company id: owner space id}`` for a customer company and its feed tenants: the company's own connections
+    belong to its main space, a tenant's to the space whose ``feed_company`` it is."""
+    owners = {company_id: main_space_id}
+    owners.update(
+        src_models.Space.objects.filter(company_id=company_id, feed_company_id__isnull=False).values_list(
+            "feed_company_id", "id"
+        )
+    )
+    return owners
+
+
+def ensure_connection_visible(scope: SpaceScope, company_provider: src_models.CompanyProviders) -> None:
+    """Object check for a connection of the family: visible when its owner space or any space that uses it is
+    visible, else 403 space_access_denied naming the owner space. Always passes for a company without the flag."""
+    if not scope.enabled:
+        return
+    owner_space_id = owner_space_id_of_connection(company_provider, scope.main_space_id)
+    if owner_space_id in scope.visible_space_ids:
+        return
+    if src_models.SpaceProvider.objects.filter(
+        company_provider=company_provider, space_id__in=scope.visible_space_ids
+    ).exists():
+        return
+    raise _access_denied(scope, owner_space_id)
+
+
+def visible_connections(
+    scope: SpaceScope, connections: typing.List[src_models.CompanyProviders]
+) -> typing.List[src_models.CompanyProviders]:
+    """The connections of the family the caller can see (same rule as ``ensure_connection_visible``)."""
+    owners = owner_spaces_by_company(scope.company_id, scope.main_space_id)
+    visible = set(scope.visible_space_ids)
+    used_by_visible = set(
+        src_models.SpaceProvider.objects.filter(
+            company_provider_id__in=[cp.id for cp in connections], space_id__in=visible
+        ).values_list("company_provider_id", flat=True)
+    )
+    return [
+        cp
+        for cp in connections
+        if owners.get(cp.company_id, scope.main_space_id) in visible or cp.id in used_by_visible
+    ]
+
+
+def connection_ids_used_by(scope: SpaceScope, space_ids: typing.List[int]) -> typing.Set[int]:
+    """Ids of the family's connections that one of the spaces uses: owns, or has a ``SpaceProvider`` row for."""
+    owners = owner_spaces_by_company(scope.company_id, scope.main_space_id)
+    owned_companies = [company_id for company_id, space_id in owners.items() if space_id in space_ids]
+    ids = set(src_models.CompanyProviders.objects.filter(company_id__in=owned_companies).values_list("id", flat=True))
+    ids.update(
+        src_models.SpaceProvider.objects.filter(space_id__in=space_ids).values_list("company_provider_id", flat=True)
+    )
+    return ids
 
 
 # ---------------------------------------------------------------------------

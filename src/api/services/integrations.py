@@ -7,7 +7,7 @@ from django.core import exceptions as django_core_exceptions
 from django.core import validators as django_validators
 from django.core.paginator import Paginator
 from django.db import IntegrityError, transaction
-from django.db.models import ProtectedError
+from django.db.models import ProtectedError, Q
 from django.utils import timezone
 
 from src import constants as src_constants
@@ -2261,10 +2261,19 @@ def _connect_company_provider(
     )
 
 
+def _connection_company_ids(company_id: int, scope: typing.Optional[spaces_services.SpaceScope]) -> typing.List[int]:
+    """The companies whose connections an id-addressed lookup may find: the company's own, or for a flagged company
+    its feed tenants' too (family lookup, ADR 0002). Another company's connection is never found."""
+    if scope is not None and scope.enabled:
+        return spaces_services.family_company_ids(company_id)
+    return [company_id]
+
+
 def update_connection(
     company_id: int,
     company_provider_id: int,
     credentials: typing.Dict[str, typing.Any],
+    scope: typing.Optional[spaces_services.SpaceScope] = None,
 ) -> typing.Tuple[typing.Optional[typing.Dict], typing.Optional[str], typing.Optional[str]]:
     """
     Patch credentials for an existing connection (``CompanyProviders`` by id and company).
@@ -2272,17 +2281,25 @@ def update_connection(
     :func:`integration_pricing_sync_jobs.enqueue_company_provider_pricing_sync` the same
     way as :func:`connect_provider` on success. Returns (data, error_message, error_code) —
     error_code is one of the ``CONNECTION_ERROR_*`` constants, for the frontend to branch on.
+
+    With a ``scope`` of a company that has the multi_spaces flag, the connection is looked up among the company's
+    and its feed tenants' (admin only; raises SpaceError 403 admin_required or space_access_denied) and the
+    response ``company_id`` stays the customer company's.
     """
+    if scope is not None and scope.enabled:
+        spaces_services.require_admin(scope)
     cp = (
         src_models.CompanyProviders.objects.filter(
             id=company_provider_id,
-            company_id=company_id,
+            company_id__in=_connection_company_ids(company_id, scope),
         )
         .select_related("provider", "company")
         .first()
     )
     if not cp or not cp.provider:
         return None, "Connection not found", CONNECTION_ERROR_NOT_FOUND
+    if scope is not None:
+        spaces_services.ensure_connection_visible(scope, cp)
     if cp.paused_at is not None:
         return None, INTEGRATION_PAUSED_MESSAGE, CONNECTION_ERROR_INTEGRATION_PAUSED
 
@@ -2413,7 +2430,7 @@ def update_connection(
     result = {
         "id": cp.id,
         "company_provider_id": cp.id,
-        "company_id": cp.company_id,
+        "company_id": company_id,
         "provider_id": cp.provider_id,
         "provider_name": cp.provider.name,
         "primary": cp.primary,
@@ -2708,15 +2725,20 @@ def list_order_accounts(
 
     With a ``scope`` of a company that has the multi_spaces flag, each row also has ``space_ids``: the spaces
     that use the account (the connection's owner space when none are set), limited to the spaces the caller
-    can see.
+    can see. The connection is looked up among the company's and its feed tenants' (SpaceError 403
+    space_access_denied when none of its spaces is visible).
     """
     cp = (
-        src_models.CompanyProviders.objects.filter(id=company_provider_id, company_id=company_id)
+        src_models.CompanyProviders.objects.filter(
+            id=company_provider_id, company_id__in=_connection_company_ids(company_id, scope)
+        )
         .select_related("provider")
         .first()
     )
     if not cp or not cp.provider:
         return None
+    if scope is not None:
+        spaces_services.ensure_connection_visible(scope, cp)
     catalog_entry = _get_catalog_entry_for_provider(cp.provider_id) or {}
     accounts = cp.order_accounts.prefetch_related("spaces").order_by("-is_default", "created_at")
     rows = [_serialize_order_account(catalog_entry, account) for account in accounts]
@@ -2736,9 +2758,9 @@ def set_order_account_spaces(
 ) -> typing.Dict[str, typing.Any]:
     """
     PUT /integrations/order-accounts/<id>/spaces/: replaces the spaces that use an order account. Admin
-    only, flagged companies only. Raises SpaceError: 403, 404 account not found, 400 space_required (no
-    space) or space_not_found (not a space of this company). Before spaces can have their own feeds every
-    space uses every connection of the company, so space_not_on_feed cannot happen yet.
+    only, flagged companies only. Raises SpaceError: 403, 404 account not found (also found among a feed
+    tenant's connections), 400 space_required (no space), space_not_found (not a space of this company) or
+    space_not_on_feed (a space that neither owns nor uses the account's connection).
     """
     spaces_services.require_admin(scope)
     if (
@@ -2753,13 +2775,22 @@ def set_order_account_spaces(
     with transaction.atomic():
         spaces_services._lock_company(company_id)  # same lock as delete_space, so a delete cannot race this
         account = src_models.CompanyProviderOrderAccount.objects.filter(
-            id=order_account_id, company_provider__company_id=company_id
+            id=order_account_id, company_provider__company_id__in=spaces_services.family_company_ids(company_id)
         ).first()
         if account is None:
             raise spaces_services.SpaceError("Order account not found", "order_account_not_found", status_code=404)
         found = set(src_models.Space.objects.filter(company_id=company_id, id__in=ids).values_list("id", flat=True))
         if found != set(ids):
             raise spaces_services.SpaceError("Space not found", spaces_services.ERROR_SPACE_NOT_FOUND)
+        connection = account.company_provider
+        on_feed = set(
+            src_models.SpaceProvider.objects.filter(company_provider=connection).values_list("space_id", flat=True)
+        )
+        on_feed.add(spaces_services.owner_space_id_of_connection(connection, scope.main_space_id))
+        if not set(ids) <= on_feed:
+            raise spaces_services.SpaceError(
+                "Share the feed with that space first.", spaces_services.ERROR_SPACE_NOT_ON_FEED
+            )
         account.spaces.set(ids)
     return {"id": account.id, "space_ids": ids}
 
@@ -2771,6 +2802,7 @@ def create_order_account(
     credentials: typing.Dict[str, typing.Any],
     is_default: typing.Optional[bool] = None,
     order_method: typing.Optional[str] = None,
+    scope: typing.Optional[spaces_services.SpaceScope] = None,
 ) -> typing.Tuple[typing.Optional[typing.Dict], typing.Optional[str], typing.Optional[str]]:
     """
     Adds an order account to a connection — this is the ONE path for creating an order account,
@@ -2803,12 +2835,16 @@ def create_order_account(
     )
 
     cp = (
-        src_models.CompanyProviders.objects.filter(id=company_provider_id, company_id=company_id)
+        src_models.CompanyProviders.objects.filter(
+            id=company_provider_id, company_id__in=_connection_company_ids(company_id, scope)
+        )
         .select_related("provider")
         .first()
     )
     if not cp or not cp.provider:
         return None, "Connection not found", CONNECTION_ERROR_NOT_FOUND
+    if scope is not None:
+        spaces_services.ensure_connection_visible(scope, cp)
     if cp.paused_at is not None:
         return None, INTEGRATION_PAUSED_MESSAGE, CONNECTION_ERROR_INTEGRATION_PAUSED
 
@@ -2875,6 +2911,7 @@ def update_order_account(
     active: typing.Optional[bool] = None,
     is_default: typing.Optional[bool] = None,
     order_method: typing.Optional[str] = None,
+    scope: typing.Optional[spaces_services.SpaceScope] = None,
 ) -> typing.Tuple[typing.Optional[typing.Dict], typing.Optional[str], typing.Optional[str]]:
     """
     Partial update of ANY order account, including the default one — label/credentials/active/
@@ -2900,7 +2937,7 @@ def update_order_account(
     """
     account = (
         src_models.CompanyProviderOrderAccount.objects.filter(
-            id=order_account_id, company_provider__company_id=company_id
+            id=order_account_id, company_provider__company_id__in=_connection_company_ids(company_id, scope)
         )
         .select_related("company_provider__provider")
         .first()
@@ -2909,6 +2946,8 @@ def update_order_account(
         return None, "Order account not found", CONNECTION_ERROR_NOT_FOUND
 
     cp = account.company_provider
+    if scope is not None:
+        spaces_services.ensure_connection_visible(scope, cp)
     if cp.paused_at is not None:
         return None, INTEGRATION_PAUSED_MESSAGE, CONNECTION_ERROR_INTEGRATION_PAUSED
     catalog_entry = _get_catalog_entry_for_provider(cp.provider_id)
@@ -3007,7 +3046,9 @@ def update_order_account(
     return result, None, None
 
 
-def delete_order_account(company_id: int, order_account_id: int) -> typing.Tuple[bool, typing.Optional[str]]:
+def delete_order_account(
+    company_id: int, order_account_id: int, scope: typing.Optional[spaces_services.SpaceScope] = None
+) -> typing.Tuple[bool, typing.Optional[str]]:
     """
     Deletes ANY order account, including the default (promoting the oldest remaining active
     account to be the new default, if any — see _promote_next_default_order_account). Blocked
@@ -3017,7 +3058,7 @@ def delete_order_account(company_id: int, order_account_id: int) -> typing.Tuple
     """
     account = (
         src_models.CompanyProviderOrderAccount.objects.filter(
-            id=order_account_id, company_provider__company_id=company_id
+            id=order_account_id, company_provider__company_id__in=_connection_company_ids(company_id, scope)
         )
         .select_related("company_provider")
         .first()
@@ -3025,6 +3066,8 @@ def delete_order_account(company_id: int, order_account_id: int) -> typing.Tuple
     if not account:
         return False, "Order account not found"
     cp = account.company_provider
+    if scope is not None:
+        spaces_services.ensure_connection_visible(scope, cp)
     if cp.paused_at is not None:
         return False, INTEGRATION_PAUSED_MESSAGE
     was_default = account.is_default
@@ -3038,10 +3081,14 @@ def delete_order_account(company_id: int, order_account_id: int) -> typing.Tuple
     return True, None
 
 
-def get_company_providers(company_id: int) -> typing.List[typing.Dict]:
+def get_company_providers(
+    company_id: int, scope: typing.Optional[spaces_services.SpaceScope] = None
+) -> typing.List[typing.Dict]:
     """
     Get company providers for a given company_id.
     Left joins with Providers to get provider details.
+    For a company with the multi_spaces flag (``scope``) the family's connections the caller can see are listed:
+    the company's own, and its feed tenants' active ones; every row's ``company_id`` is the customer company's.
 
     Args:
         company_id: The ID of the company
@@ -3051,16 +3098,28 @@ def get_company_providers(company_id: int) -> typing.List[typing.Dict]:
     """
     logger.info("{} Fetching company providers for company_id: {}.".format(_LOG_PREFIX, company_id))
 
-    company_providers = (
-        src_models.CompanyProviders.objects.filter(company_id=company_id).select_related("provider").all()
-    )
+    if scope is not None and scope.enabled:
+        family_ids = spaces_services.family_company_ids(company_id)
+        company_providers = spaces_services.visible_connections(
+            scope,
+            list(
+                src_models.CompanyProviders.objects.filter(company_id__in=family_ids)
+                .filter(Q(company_id=company_id) | Q(active=True))
+                .select_related("provider")
+                .order_by("id")
+            ),
+        )
+    else:
+        company_providers = (
+            src_models.CompanyProviders.objects.filter(company_id=company_id).select_related("provider").all()
+        )
 
     data = []
     for cp in company_providers:
         provider = cp.provider
         row = {
             "id": cp.id,
-            "company_id": cp.company_id,
+            "company_id": company_id,
             "provider_id": cp.provider_id,
             "provider_name": provider.name if provider else None,
             "provider_status": provider.status if provider else None,
@@ -3094,10 +3153,14 @@ def get_company_providers(company_id: int) -> typing.List[typing.Dict]:
     return data
 
 
-def get_company_provider_by_id(company_id: int, provider_id: int) -> typing.Optional[typing.Dict]:
+def get_company_provider_by_id(
+    company_id: int, provider_id: int, scope: typing.Optional[spaces_services.SpaceScope] = None
+) -> typing.Optional[typing.Dict]:
     """
     Get a single company provider by ID for a given company_id.
     Left joins with Providers to get provider details.
+    For a company with the multi_spaces flag (``scope``) the connection is looked up among the company's and its
+    feed tenants' (SpaceError 403 space_access_denied when not visible); ``company_id`` stays the customer company's.
 
     Args:
         company_id: The ID of the company
@@ -3112,7 +3175,9 @@ def get_company_provider_by_id(company_id: int, provider_id: int) -> typing.Opti
 
     try:
         company_provider = (
-            src_models.CompanyProviders.objects.filter(id=provider_id, company_id=company_id)
+            src_models.CompanyProviders.objects.filter(
+                id=provider_id, company_id__in=_connection_company_ids(company_id, scope)
+            )
             .select_related("provider")
             .first()
         )
@@ -3124,6 +3189,8 @@ def get_company_provider_by_id(company_id: int, provider_id: int) -> typing.Opti
                 )
             )
             return None
+        if scope is not None:
+            spaces_services.ensure_connection_visible(scope, company_provider)
 
         provider = company_provider.provider
         catalog_entry = {}
@@ -3134,7 +3201,7 @@ def get_company_provider_by_id(company_id: int, provider_id: int) -> typing.Opti
                     break
         data = {
             "id": company_provider.id,
-            "company_id": company_provider.company_id,
+            "company_id": company_id,
             "provider_id": company_provider.provider_id,
             "provider_name": provider.name if provider else None,
             "provider_status": provider.status if provider else None,
@@ -3176,6 +3243,8 @@ def get_company_provider_by_id(company_id: int, provider_id: int) -> typing.Opti
         )
 
         return data
+    except spaces_services.SpaceError:
+        raise
     except Exception as e:
         logger.error(
             "{} Error fetching company provider with id: {} for company_id: {}. Error: {}.".format(
@@ -3276,11 +3345,16 @@ def _redacted_credentials_for_catalog_entry(
 def get_company_provider_connection_detail(
     company_id: int,
     company_provider_id: int,
+    scope: typing.Optional[spaces_services.SpaceScope] = None,
 ) -> typing.Optional[typing.Dict[str, typing.Any]]:
     """
     One connection: provider row, ``company_provider_id`` (same as ``id``, for PATCH URL),
     catalog copy, ``connection_required_fields`` / ``connection_optional_fields``,
     and ``credentials`` (secrets redacted; see ``secrets_configured`` for sensitive fields that are set).
+
+    With a ``scope`` of a company that has the multi_spaces flag the connection is looked up among the company's and
+    its feed tenants' (SpaceError 403 space_access_denied when not visible), ``company_id`` is the customer
+    company's, and the owner_space / used_by / kept_apart_by keys and the accounts' ``space_ids`` are added.
     """
     logger.info(
         "{} Fetching connection detail for company_provider_id={} company_id={}.".format(
@@ -3292,13 +3366,15 @@ def get_company_provider_connection_detail(
     company_provider = (
         src_models.CompanyProviders.objects.filter(
             id=company_provider_id,
-            company_id=company_id,
+            company_id__in=_connection_company_ids(company_id, scope),
         )
         .select_related("provider")
         .first()
     )
     if not company_provider:
         return None
+    if scope is not None:
+        spaces_services.ensure_connection_visible(scope, company_provider)
 
     provider = company_provider.provider
     if not provider:
@@ -3311,7 +3387,7 @@ def get_company_provider_connection_detail(
     base: typing.Dict[str, typing.Any] = {
         "id": company_provider.id,
         "company_provider_id": company_provider.id,
-        "company_id": company_provider.company_id,
+        "company_id": company_id,
         "provider_id": company_provider.provider_id,
         "provider_name": provider.name,
         "provider_status": provider.status,
@@ -3369,8 +3445,29 @@ def get_company_provider_connection_detail(
             catalog_entry, company_provider.credentials, credentials_helper.get_order_credentials(company_provider)
         )
     )
-    out["order_accounts"] = list_order_accounts(company_id=company_id, company_provider_id=company_provider_id)
+    out["order_accounts"] = list_order_accounts(
+        company_id=company_id, company_provider_id=company_provider_id, scope=scope
+    )
+    if scope is not None and scope.enabled:
+        out.update(_space_feed_info(company_id, scope, company_provider))
     return out
+
+
+def _space_feed_info(
+    company_id: int, scope: spaces_services.SpaceScope, company_provider: src_models.CompanyProviders
+) -> typing.Dict[str, typing.Any]:
+    """owner_space, used_by, kept_apart_by and kept_apart_by_prefixes of a connection (the catalog's keys). A
+    deactivated tenant connection is used by no space."""
+    feeds = _SpaceFeedCatalog(src_models.Company.objects.get(id=company_id), scope)
+    if company_provider.id in feeds.connections:
+        return feeds.info(company_provider.id)
+    owner_space_id = spaces_services.owner_space_id_of_connection(company_provider, scope.main_space_id)
+    return {
+        "owner_space": feeds.ref(owner_space_id),
+        "used_by": [],
+        "kept_apart_by": "own_account",
+        "kept_apart_by_prefixes": [],
+    }
 
 
 def get_all_brands_with_providers() -> typing.List[typing.Dict]:

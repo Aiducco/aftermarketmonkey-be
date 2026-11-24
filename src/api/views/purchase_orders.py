@@ -879,8 +879,12 @@ class ShippingMethodsView(views.View):
 
         try:
             result = purchase_orders_services.get_shipping_methods(
-                company_id=company_id, company_provider_id=int(company_provider_id)
+                company_id=company_id,
+                company_provider_id=int(company_provider_id),
+                scope=spaces_services.resolve_scope(request),
             )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e))
         except Exception:

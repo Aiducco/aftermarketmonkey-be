@@ -12,6 +12,15 @@ logger = logging.getLogger(__name__)
 _LOG_PREFIX = "[INTEGRATIONS]"
 
 
+def _space_error_response(e: spaces_services.SpaceError) -> http.HttpResponse:
+    """A space rule's answer: status, message, ``error_code`` and any extra keys (``spaces``)."""
+    return http.HttpResponse(
+        headers={"Content-Type": "application/json"},
+        content=simplejson.dumps(e.body()),
+        status=e.status_code,
+    )
+
+
 class ProvidersCatalogView(views.View):
     """GET /integrations/catalog/ - Returns all providers with connection status for the company."""
 
@@ -246,11 +255,15 @@ class ProviderConnectionView(views.View):
             )
 
         patch = body if isinstance(body, dict) else {}
-        data, err, error_code = integrations_services.update_connection(
-            company_id=company_id,
-            company_provider_id=cpi,
-            credentials=patch,
-        )
+        try:
+            data, err, error_code = integrations_services.update_connection(
+                company_id=company_id,
+                company_provider_id=cpi,
+                credentials=patch,
+                scope=spaces_services.resolve_scope(request),
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         integrations_services.log_connection_attempt(
             company_id=company_id,
             user_id=request.user.id,
@@ -326,7 +339,10 @@ class ProviderConnectionDetailView(views.View):
             data = integrations_services.get_company_provider_connection_detail(
                 company_id=company_id,
                 company_provider_id=cpi,
+                scope=spaces_services.resolve_scope(request),
             )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except Exception as e:
             logger.error(
                 f"{_LOG_PREFIX} Error fetching connection detail company_provider_id={cpi} company_id={company_id}: {e}"
@@ -407,9 +423,12 @@ class OrderAccountsView(views.View):
                 status=400,
             )
 
-        data = integrations_services.list_order_accounts(
-            company_id=company_id, company_provider_id=cpi, scope=spaces_services.resolve_scope(request)
-        )
+        try:
+            data = integrations_services.list_order_accounts(
+                company_id=company_id, company_provider_id=cpi, scope=spaces_services.resolve_scope(request)
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         if data is None:
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
@@ -464,14 +483,18 @@ class OrderAccountsView(views.View):
         if not isinstance(body, dict):
             body = {}
 
-        data, err, error_code = integrations_services.create_order_account(
-            company_id=company_id,
-            company_provider_id=cpi,
-            label=body.get("label"),
-            credentials=body.get("credentials") or {},
-            is_default=body.get("is_default"),
-            order_method=body.get("order_method"),
-        )
+        try:
+            data, err, error_code = integrations_services.create_order_account(
+                company_id=company_id,
+                company_provider_id=cpi,
+                label=body.get("label"),
+                credentials=body.get("credentials") or {},
+                is_default=body.get("is_default"),
+                order_method=body.get("order_method"),
+                scope=spaces_services.resolve_scope(request),
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         if err:
             if error_code == integrations_services.CONNECTION_ERROR_INTEGRATION_PAUSED:
                 return http.HttpResponse(
@@ -549,15 +572,19 @@ class OrderAccountDetailView(views.View):
         if not isinstance(body, dict):
             body = {}
 
-        data, err, error_code = integrations_services.update_order_account(
-            company_id=company_id,
-            order_account_id=oai,
-            label=body.get("label"),
-            credentials=body.get("credentials"),
-            active=body.get("active"),
-            is_default=body.get("is_default"),
-            order_method=body.get("order_method"),
-        )
+        try:
+            data, err, error_code = integrations_services.update_order_account(
+                company_id=company_id,
+                order_account_id=oai,
+                label=body.get("label"),
+                credentials=body.get("credentials"),
+                active=body.get("active"),
+                is_default=body.get("is_default"),
+                order_method=body.get("order_method"),
+                scope=spaces_services.resolve_scope(request),
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         if err:
             if error_code == integrations_services.CONNECTION_ERROR_INTEGRATION_PAUSED:
                 return http.HttpResponse(
@@ -608,7 +635,12 @@ class OrderAccountDetailView(views.View):
                 status=400,
             )
 
-        success, err = integrations_services.delete_order_account(company_id=company_id, order_account_id=oai)
+        try:
+            success, err = integrations_services.delete_order_account(
+                company_id=company_id, order_account_id=oai, scope=spaces_services.resolve_scope(request)
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         if not success:
             if err == integrations_services.INTEGRATION_PAUSED_MESSAGE:
                 return http.HttpResponse(
@@ -656,7 +688,9 @@ class CompanyProvidersView(views.View):
             )
 
         try:
-            data = integrations_services.get_company_providers(company_id=company_id)
+            data = integrations_services.get_company_providers(
+                company_id=company_id, scope=spaces_services.resolve_scope(request)
+            )
         except Exception as e:
             logger.error(
                 f"{_LOG_PREFIX} Error fetching company providers for company_id: {company_id}. Error: {str(e)}"
@@ -715,7 +749,11 @@ class CompanyProviderDetailView(views.View):
             )
 
         try:
-            data = integrations_services.get_company_provider_by_id(company_id=company_id, provider_id=provider_id_int)
+            data = integrations_services.get_company_provider_by_id(
+                company_id=company_id, provider_id=provider_id_int, scope=spaces_services.resolve_scope(request)
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except Exception as e:
             logger.error(
                 f"{_LOG_PREFIX} Error fetching company provider with id: {provider_id_int} for company_id: {company_id}. Error: {str(e)}"
