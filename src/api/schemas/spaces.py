@@ -23,7 +23,7 @@ class SpaceAddressSchema(Schema):
 
 class CreateSpaceSchema(Schema):
     kind = fields.String(required=True, validate=validate.OneOf(["location", "online_store"]))
-    name = fields.String(required=True, validate=validate.Length(min=1, max=255))
+    name = fields.String(required=True, validate=validate.Length(min=1, max=100))
     # Optional here so a missing prefix answers 400 prefix_required (a code the fe branches on), not a
     # generic invalid-payload error.
     prefix = fields.String(required=False, allow_none=True)
@@ -31,6 +31,6 @@ class CreateSpaceSchema(Schema):
 
 
 class UpdateSpaceSchema(Schema):
-    name = fields.String(required=False, validate=validate.Length(min=1, max=255))
+    name = fields.String(required=False, validate=validate.Length(min=1, max=100))
     prefix = fields.String(required=False, allow_none=True)
     address = fields.Nested(SpaceAddressSchema, required=False, allow_none=True)
