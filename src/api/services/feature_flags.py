@@ -21,6 +21,9 @@ FEATURE_SHOP_MANAGEMENT = "shop_management"
 # this is being proven out; other companies later.
 FEATURE_SHOPMONKEY_INVENTORY_SYNC = "shopmonkey_inventory_sync"
 
+# Multi-space support (spaces, the switcher, per-space carts). Off for every company until a human enables it.
+FEATURE_MULTI_SPACES = "multi_spaces"
+
 
 def company_has_feature(company_id: typing.Optional[int], feature: str) -> bool:
     if not company_id:

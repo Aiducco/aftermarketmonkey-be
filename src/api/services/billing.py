@@ -11,6 +11,7 @@ from django.conf import settings
 from django.utils import timezone as django_tz
 
 from src import models as src_models
+from src.api.services import feature_flags
 
 logger = logging.getLogger(__name__)
 
@@ -127,9 +128,10 @@ def _clear_company_subscription(company: src_models.Company) -> None:
     company.subscription_status = "canceled"
     company.subscription_period_end = None
     company.manual_trial_granted_at = None
+    company.additional_spaces = None
     company.save(update_fields=[
         "subscription_id", "subscription_plan",
-        "subscription_status", "subscription_period_end", "manual_trial_granted_at",
+        "subscription_status", "subscription_period_end", "manual_trial_granted_at", "additional_spaces",
     ])
 
 
@@ -313,6 +315,65 @@ def switch_comped_trial_plan(company_id: int, plan_id: str) -> tuple[Optional[di
 # Subscription state (local-first, Stripe as fallback)
 # ---------------------------------------------------------------------------
 
+def _space_base(company: src_models.Company) -> int:
+    """The allowance before add-ons: the staff base if set, else 5 on a comp'd trial, else 1."""
+    if company.space_base_override:
+        return company.space_base_override
+    # Imported here: plan_lifecycle imports this module for the plan limits.
+    from src.api.services import plan_lifecycle
+
+    if plan_lifecycle.plan_state(company) == plan_lifecycle.STATE_TRIALING:
+        return settings.COMPED_TRIAL_SPACE_ALLOWANCE
+    return 1
+
+
+def space_allowance(company: src_models.Company) -> int:
+    """How many spaces the company may have: its base plus the paid add-ons (null on Scout, comp'd
+    trials and cancelled subscriptions, so those get the base only)."""
+    return _space_base(company) + (company.additional_spaces or 0)
+
+
+def spaces_in_use(company_id: int) -> int:
+    """The main space counts even before its row exists (it is created on first use)."""
+    return max(1, src_models.Space.objects.filter(company_id=company_id).count())
+
+
+def _space_usage(company: src_models.Company) -> dict:
+    return {
+        "used": spaces_in_use(company.id),
+        "limit": space_allowance(company),
+        "base": _space_base(company),
+    }
+
+
+def _space_addon_info(company: src_models.Company, interval: Optional[str] = None) -> dict:
+    addon = getattr(settings, "SPACE_ADDON", {})
+    return {
+        "amount_monthly": addon.get("amount_monthly"),
+        "amount_annual": addon.get("amount_annual"),
+        "currency": addon.get("currency", "usd"),
+        "quantity": company.additional_spaces or 0,
+        "interval": interval,
+    }
+
+
+def check_space_limit(company_id: int) -> tuple[bool, str]:
+    """
+    Check if company can add one more space. Run only when a space is created: spaces over the
+    allowance (a converted comp'd trial, a lowered add-on) stay and keep working, only adding is refused.
+    Returns (allowed: bool, reason: str).
+    """
+    company = src_models.Company.objects.filter(id=company_id).first()
+    if not company:
+        return False, "Company not found"
+
+    used = spaces_in_use(company_id)
+    limit = space_allowance(company)
+    if used >= limit:
+        return False, f"Space limit reached ({used}/{limit}). Add more spaces to create another."
+    return True, ""
+
+
 def _live_price_display(company: src_models.Company, plan_key: str) -> tuple[str, Optional[str]]:
     """
     One extra live Stripe call to read the real current price/interval off the company's active
@@ -374,7 +435,7 @@ def get_subscription(company_id: int) -> Optional[dict]:
             company.subscription_period_end.strftime("%Y-%m-%d")
             if company.subscription_period_end else None
         )
-        return {
+        result = {
             "plan_id": company.subscription_plan,
             "plan": _plan_name(plan_key),
             "price": price_display,
@@ -392,6 +453,10 @@ def get_subscription(company_id: int) -> Optional[dict]:
             "is_comped_trial": bool(company.manual_trial_granted_at),
             "has_stripe_subscription": bool(company.subscription_id),
         }
+        if feature_flags.company_has_feature(company.id, feature_flags.FEATURE_MULTI_SPACES):
+            result["spaces"] = _space_usage(company)
+            result["space_addon"] = _space_addon_info(company, billing_period)
+        return result
 
     if not company.stripe_customer_id:
         return None
@@ -486,7 +551,7 @@ def get_usage(company_id: int) -> dict:
         created_at__gte=period_start,
     ).count()
 
-    return {
+    usage = {
         "plan_id": company.subscription_plan,
         "plan": _plan_name(plan_key),
         "period_start": period_start.strftime("%Y-%m-%d"),
@@ -508,6 +573,10 @@ def get_usage(company_id: int) -> dict:
             "limit": features.get("seats", 0),
         },
     }
+    if feature_flags.company_has_feature(company_id, feature_flags.FEATURE_MULTI_SPACES):
+        usage["spaces"] = _space_usage(company)
+        usage["space_addon"] = _space_addon_info(company)
+    return usage
 
 
 def check_detail_view_limit(company_id: int) -> tuple[bool, str]:

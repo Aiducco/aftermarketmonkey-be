@@ -94,7 +94,9 @@ class GetSubscriptionCompedTrialFlagsTests(SimpleTestCase):
         company = _company()
         with mock.patch.object(src_models.Company, "objects") as objects:
             objects.filter.return_value.first.return_value = company
-            with mock.patch.object(billing_services, "_live_price_display", return_value=("$49/mo", "monthly")):
+            with mock.patch.object(
+                billing_services, "_live_price_display", return_value=("$49/mo", "monthly")
+            ), mock.patch.object(billing_services.feature_flags, "company_has_feature", return_value=False):
                 subscription = billing_services.get_subscription(67)
         self.assertTrue(subscription["is_comped_trial"])
         self.assertFalse(subscription["has_stripe_subscription"])
@@ -103,7 +105,9 @@ class GetSubscriptionCompedTrialFlagsTests(SimpleTestCase):
         company = _company(manual_trial_granted_at=None, subscription_id="sub_123", subscription_status="active")
         with mock.patch.object(src_models.Company, "objects") as objects:
             objects.filter.return_value.first.return_value = company
-            with mock.patch.object(billing_services, "_live_price_display", return_value=("$49/mo", "monthly")):
+            with mock.patch.object(
+                billing_services, "_live_price_display", return_value=("$49/mo", "monthly")
+            ), mock.patch.object(billing_services.feature_flags, "company_has_feature", return_value=False):
                 subscription = billing_services.get_subscription(67)
         self.assertFalse(subscription["is_comped_trial"])
         self.assertTrue(subscription["has_stripe_subscription"])
