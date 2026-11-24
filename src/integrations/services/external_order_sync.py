@@ -400,7 +400,7 @@ def _apply_results(
     results = list(deduped_by_number.values())
 
     # A flagged company's new orders are sorted into a space; None leaves every new row to save()'s main space.
-    sorter = spaces_services.external_order_sorter(company_provider.company_id)
+    sorter = spaces_services.external_order_sorter(company_provider.company_id) if results and not dry_run else None
 
     # Meyer is excluded deliberately, matching _self_heal_existing_rows' own docstring: its rows
     # are classified by the authoritative "API Order" flag, never by PO-matching inference, so
@@ -467,18 +467,21 @@ def _apply_results(
         # the same order history, so keying on the account stored every one of its orders twice.
         # The account that found it is still recorded, as a plain attribute.
         defaults["order_account"] = account
-        if existing is None and sorter is not None:
-            # Space and reason are set on create only: a later poll (or a hand move) never changes them.
-            space_id, reason, matched_prefix = sorter.sort(account, result.customer_po_number)
-            defaults["space_id"] = space_id
-            defaults["space_reason"] = reason.value
-            defaults["space_reason_name"] = reason.name
-            defaults["space_reason_prefix"] = matched_prefix
-        _, created = src_models.ExternalPurchaseOrder.objects.update_or_create(
+        row, created = src_models.ExternalPurchaseOrder.objects.update_or_create(
             company_provider=company_provider,
             distributor_order_number=normalized_number,
             defaults=defaults,
         )
+        if created and sorter is not None:
+            # Set after the upsert, and only while still unset, so a hand Move between two polls is never
+            # overwritten. A later poll (an update) never touches the space.
+            space_id, reason, matched_prefix = sorter.sort(account, result.customer_po_number)
+            src_models.ExternalPurchaseOrder.objects.filter(pk=row.pk, space_reason__isnull=True).update(
+                space_id=space_id,
+                space_reason=reason.value,
+                space_reason_name=reason.name,
+                space_reason_prefix=matched_prefix,
+            )
         if created:
             discovered += 1
         else:

@@ -12,6 +12,7 @@ import typing
 
 from django.db import IntegrityError, transaction
 from django.db.models import Count, ProtectedError, Sum
+from django.db.models.functions import Trim, Upper
 
 from src import enums as src_enums
 from src import models as src_models
@@ -217,8 +218,11 @@ def order_account_space_ids(account: src_models.CompanyProviderOrderAccount, own
 class ExternalOrderSorter:
     """The sorting rule for an order from a distributor that we did not place (spec Definitions). Step 1 (placed
     in the app) never applies here: those orders are dropped before they get this far. Then, in order:
-    2. the PO number starts with a space's prefix; 3. the order account that found it is used by exactly one
-    space; 4. the main space. Built once per batch (it caches prefixes and each account's spaces)."""
+    2. the PO number starts with a space's prefix; 3. the connection's space is unambiguous (every active order
+    account of the connection is used by the same single space, or it has only one account, used by one space);
+    4. the main space. Step 3 looks at the connection, not the account that polled: Keystone gives every account of
+    a company the same history, so the polling account says nothing about where the order was placed. Built once
+    per batch (it caches prefixes and each connection's spaces)."""
 
     def __init__(self, company_id: int) -> None:
         self.main_space_id = src_models.Space.objects.main_for(company_id).id
@@ -233,7 +237,23 @@ class ExternalOrderSorter:
             ),
             key=lambda pair: -len(pair[0]),
         )
-        self._account_spaces: typing.Dict[int, typing.List[int]] = {}
+        self._connection_space: typing.Dict[int, typing.Optional[int]] = {}
+
+    def _unambiguous_space(self, account: src_models.CompanyProviderOrderAccount) -> typing.Optional[int]:
+        """The one space every active account of the account's connection is used by, else None."""
+        accounts = list(
+            src_models.CompanyProviderOrderAccount.objects.filter(
+                company_provider_id=account.company_provider_id, active=True
+            ).prefetch_related("spaces")
+        )
+        if not any(a.id == account.id for a in accounts):
+            accounts.append(account)
+        used_by = {tuple(order_account_space_ids(a, self.main_space_id)) for a in accounts}
+        if len(used_by) == 1:
+            space_ids = next(iter(used_by))
+            if len(space_ids) == 1:
+                return space_ids[0]
+        return None
 
     def sort(
         self, account: src_models.CompanyProviderOrderAccount, customer_po_number: typing.Optional[str]
@@ -244,11 +264,11 @@ class ExternalOrderSorter:
             for prefix, space_id in self._prefixes:
                 if po.startswith(prefix.upper()):
                     return space_id, src_enums.ExternalOrderSpaceReason.PREFIX, prefix
-        if account.id not in self._account_spaces:
-            self._account_spaces[account.id] = order_account_space_ids(account, self.main_space_id)
-        space_ids = self._account_spaces[account.id]
-        if len(space_ids) == 1:
-            return space_ids[0], src_enums.ExternalOrderSpaceReason.ACCOUNT, None
+        if account.company_provider_id not in self._connection_space:
+            self._connection_space[account.company_provider_id] = self._unambiguous_space(account)
+        space_id = self._connection_space[account.company_provider_id]
+        if space_id is not None:
+            return space_id, src_enums.ExternalOrderSpaceReason.ACCOUNT, None
         return self.main_space_id, src_enums.ExternalOrderSpaceReason.MAIN, None
 
 
@@ -265,10 +285,10 @@ def _resort_candidates(company_id: int, space: src_models.Space):
     space. Orders an admin moved by hand are never re-sorted (spec OQ-5)."""
     if not space.prefix:
         return src_models.ExternalPurchaseOrder.objects.none()
+    # Same matching as ingest (ExternalOrderSorter.sort): the PO is trimmed and compared in upper case.
     return (
-        src_models.ExternalPurchaseOrder.objects.filter(
-            company_id=company_id, customer_po_number__istartswith=space.prefix
-        )
+        src_models.ExternalPurchaseOrder.objects.annotate(_po=Upper(Trim("customer_po_number")))
+        .filter(company_id=company_id, _po__startswith=space.prefix.strip().upper())
         .exclude(space_id=space.id)
         .exclude(space_reason=src_enums.ExternalOrderSpaceReason.MOVED.value)
     )
@@ -291,13 +311,13 @@ def resort_preview(scope: SpaceScope, space_id: int) -> dict:
             "order_account_label": r["order_account__label"],
             "provider_name": r["company_provider__provider__name"],
             "count": r["count"],
-            "total": float(r["total"] or 0),
+            "total": round(float(r["total"] or 0), 2),
         }
         for r in rows
     ]
     return {
         "count": sum(r["count"] for r in by_account),
-        "total": sum(r["total"] for r in by_account),
+        "total": round(sum(r["total"] for r in by_account), 2),
         "by_account": by_account,
     }
 
@@ -305,8 +325,9 @@ def resort_preview(scope: SpaceScope, space_id: int) -> dict:
 def resort_apply(scope: SpaceScope, space_id: int) -> dict:
     """POST /spaces/<id>/resort/ (admin): move those orders into the space, reason prefix. Returns {"moved": n}."""
     require_admin(scope)
-    space = _get_space(scope.company_id, space_id)
     with transaction.atomic():
+        _lock_company(scope.company_id)
+        space = _get_space(scope.company_id, space_id)
         ids = list(_resort_candidates(scope.company_id, space).select_for_update().values_list("id", flat=True))
         moved = src_models.ExternalPurchaseOrder.objects.filter(id__in=ids).update(
             space_id=space.id,

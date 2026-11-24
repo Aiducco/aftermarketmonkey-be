@@ -2286,7 +2286,9 @@ def _external_space_summary(company_id: int, scope: spaces_services.SpaceScope) 
     counts = {str(space_id): 0 for space_id in scope.visible_space_ids}
     for row in visible.values("space_id").annotate(n=Count("id")):
         counts[str(row["space_id"])] = row["n"]
-    main_default = visible.filter(space_reason=src_enums.ExternalOrderSpaceReason.MAIN.value).count()
+    main_default = visible.filter(
+        space_id=scope.main_space_id, space_reason=src_enums.ExternalOrderSpaceReason.MAIN.value
+    ).count()
     return {"counts": counts, "main_default_count": main_default}
 
 
@@ -2317,6 +2319,8 @@ def move_external_purchase_orders(
         raise PurchaseOrderServiceError(
             "external_order_ids must be a list of 1 to {} order ids.".format(MAX_MOVE_ORDERS)
         )
+    if len(set(ids)) != len(ids):
+        raise PurchaseOrderServiceError("external_order_ids must not repeat an order id.")
     if not isinstance(space_id, int) or isinstance(space_id, bool) or space_id not in scope.space_names:
         raise PurchaseOrderServiceError("space_id is not a space of this company.")
     with transaction.atomic():
