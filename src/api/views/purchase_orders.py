@@ -348,6 +348,34 @@ class PurchaseOrdersExternalView(views.View):
         return _json_response(result)
 
 
+class PurchaseOrdersExternalMoveView(views.View):
+    """POST /purchase-orders/external/move/ -- {external_order_ids, space_id}: an admin moves orders from
+    distributors to another space (reason "moved"). 403 for a non-admin or an unflagged company."""
+
+    def post(self, request: http.HttpRequest, *args, **kwargs) -> http.HttpResponse:
+        company_id, user_id, err = _require_auth(request)
+        if err:
+            return err
+        body, err = _parse_json_body(request)
+        if err:
+            return err
+
+        try:
+            scope = spaces_services.resolve_scope(request)
+            result = purchase_orders_services.move_external_purchase_orders(
+                company_id, user_id, scope, body.get("external_order_ids"), body.get("space_id")
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
+        except purchase_orders_services.PurchaseOrderServiceError as e:
+            return _error_response(str(e))
+        except Exception:
+            logger.exception("{} Error moving external orders for company_id={}".format(_LOG_PREFIX, company_id))
+            return _error_response("Error moving external orders", status=500)
+
+        return _json_response(result)
+
+
 class PurchaseOrderExternalDetailView(views.View):
     """GET /purchase-orders/external/<id>/ — one distributor-placed order in full: everything the
     list row carries plus the dated status progression. A route of its own rather than an id

@@ -18,7 +18,7 @@ import typing
 
 from django.conf import settings
 from django.db import IntegrityError, transaction
-from django.db.models import F, Prefetch
+from django.db.models import Count, F, Prefetch
 from django.utils import timezone as django_timezone
 
 from src import enums as src_enums
@@ -2157,7 +2157,12 @@ def _serialize_external_purchase_order(
         "discovered_at": _iso_utc_z(order.discovered_at),
         "last_synced_at": _iso_utc_z(order.last_synced_at),
     }
-    return _add_space_fields(row, order.space_id, scope)
+    row = _add_space_fields(row, order.space_id, scope)
+    if scope is not None and scope.enabled:
+        # Why the order sits in its space ("Why this space"); null for a row stored before the company was flagged.
+        row["space_reason"] = order.space_reason_name.lower() if order.space_reason_name else None
+        row["space_reason_prefix"] = order.space_reason_prefix
+    return row
 
 
 def _serialize_external_purchase_order_detail(
@@ -2266,7 +2271,78 @@ def list_external_purchase_orders(
         _serialize_external_purchase_order(order, scope)
         for order in qs.order_by(F("order_date").desc(nulls_last=True), "-discovered_at")
     ]
-    return {"orders": orders, "polled_connections": _polled_connections(company_id)}
+    result = {"orders": orders, "polled_connections": _polled_connections(company_id)}
+    if scope.enabled:
+        result["space_summary"] = _external_space_summary(company_id, scope)
+    return result
+
+
+def _external_space_summary(company_id: int, scope: spaces_services.SpaceScope) -> typing.Dict:
+    """Orders per visible space (whatever space is picked) and how many sit in the main space only by default
+    (reason main). Pre-migration rows carry reason account, so they never count as default (spec OQ-10)."""
+    visible = src_models.ExternalPurchaseOrder.objects.filter(
+        company_id=company_id, space_id__in=scope.visible_space_ids
+    )
+    counts = {str(space_id): 0 for space_id in scope.visible_space_ids}
+    for row in visible.values("space_id").annotate(n=Count("id")):
+        counts[str(row["space_id"])] = row["n"]
+    main_default = visible.filter(space_reason=src_enums.ExternalOrderSpaceReason.MAIN.value).count()
+    return {"counts": counts, "main_default_count": main_default}
+
+
+MAX_MOVE_ORDERS = 500
+
+
+def move_external_purchase_orders(
+    company_id: int,
+    user_id: int,
+    scope: spaces_services.SpaceScope,
+    external_order_ids: typing.Any,
+    space_id: typing.Any,
+) -> typing.Dict:
+    """
+    POST /purchase-orders/external/move/ (company admin of a flagged company, AC-29/AC-30): the orders belong to
+    ``space_id`` from now on, with reason "moved", so a later sync or re-sort never moves them back. Tracking and
+    invoices are columns of the row, so they go with it (D6). Orders already in that space are left alone.
+    Returns {"moved": n}.
+    """
+    spaces_services.require_admin(scope)
+    ids = external_order_ids
+    if (
+        not isinstance(ids, list)
+        or not ids
+        or len(ids) > MAX_MOVE_ORDERS
+        or not all(isinstance(i, int) and not isinstance(i, bool) for i in ids)
+    ):
+        raise PurchaseOrderServiceError(
+            "external_order_ids must be a list of 1 to {} order ids.".format(MAX_MOVE_ORDERS)
+        )
+    if not isinstance(space_id, int) or isinstance(space_id, bool) or space_id not in scope.space_names:
+        raise PurchaseOrderServiceError("space_id is not a space of this company.")
+    with transaction.atomic():
+        orders = list(
+            src_models.ExternalPurchaseOrder.objects.select_for_update().filter(company_id=company_id, id__in=set(ids))
+        )
+        if len(orders) != len(set(ids)):
+            raise PurchaseOrderServiceError("Some of those orders were not found.")
+        to_move = [order.id for order in orders if order.space_id != space_id]
+        moved = src_models.ExternalPurchaseOrder.objects.filter(id__in=to_move).update(
+            space_id=space_id,
+            space_reason=src_enums.ExternalOrderSpaceReason.MOVED.value,
+            space_reason_name=src_enums.ExternalOrderSpaceReason.MOVED.name,
+            space_reason_prefix=None,
+            space_moved_by_id=_profile_id(company_id, user_id),
+            space_moved_at=django_timezone.now(),
+        )
+    return {"moved": moved}
+
+
+def _profile_id(company_id: int, user_id: int) -> typing.Optional[int]:
+    return (
+        src_models.UserProfile.objects.filter(company_id=company_id, user_id=user_id)
+        .values_list("id", flat=True)
+        .first()
+    )
 
 
 def get_external_purchase_order(

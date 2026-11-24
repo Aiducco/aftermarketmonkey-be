@@ -103,6 +103,7 @@ from src.api.views.purchase_orders import (
     PurchaseOrderPdfView,
     PurchaseOrderRefreshStatusView,
     PurchaseOrderRequoteView,
+    PurchaseOrdersExternalMoveView,
     PurchaseOrdersExternalView,
     PurchaseOrderShippingSelectionView,
     PurchaseOrderSubmitView,
@@ -469,6 +470,11 @@ urlpatterns = [
         "purchase-orders/external/",
         PurchaseOrdersExternalView.as_view(),
         name="purchase_orders_external",
+    ),
+    path(
+        "purchase-orders/external/move/",
+        PurchaseOrdersExternalMoveView.as_view(),
+        name="purchase_orders_external_move",
     ),
     path(
         "purchase-orders/external/<int:id>/",
