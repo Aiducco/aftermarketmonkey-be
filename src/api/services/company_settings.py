@@ -446,6 +446,7 @@ def reset_company_user_password(
 # Account deletion
 # ---------------------------------------------------------------------------
 
+
 def delete_user_account(user, company_id: int) -> tuple[bool, str | None]:
     """
     Hard-delete the authenticated user's own account.
@@ -459,10 +460,14 @@ def delete_user_account(user, company_id: int) -> tuple[bool, str | None]:
         profile = None
 
     if profile and profile.is_company_admin:
-        remaining_admins = src_models.UserProfile.objects.filter(
-            company_id=company_id,
-            is_company_admin=True,
-        ).exclude(user=user).count()
+        remaining_admins = (
+            src_models.UserProfile.objects.filter(
+                company_id=company_id,
+                is_company_admin=True,
+            )
+            .exclude(user=user)
+            .count()
+        )
         if remaining_admins == 0:
             return False, "Cannot delete account: you are the last admin. Transfer admin rights first."
 
@@ -474,6 +479,7 @@ def delete_user_account(user, company_id: int) -> tuple[bool, str | None]:
 # ---------------------------------------------------------------------------
 # Company data wipe
 # ---------------------------------------------------------------------------
+
 
 def delete_all_company_data(user, company_id: int) -> tuple[bool, str | None]:
     """
@@ -488,10 +494,7 @@ def delete_all_company_data(user, company_id: int) -> tuple[bool, str | None]:
 
     with transaction.atomic():
         # Collect all Django auth user IDs in the company before deleting profiles
-        user_ids = list(
-            src_models.UserProfile.objects.filter(company_id=company_id)
-            .values_list("user_id", flat=True)
-        )
+        user_ids = list(src_models.UserProfile.objects.filter(company_id=company_id).values_list("user_id", flat=True))
 
         # Company-scoped data — Django cascades handle most FK children,
         # but we delete explicitly for clarity and safety.
