@@ -31,9 +31,11 @@ from src.integrations.orders import base as order_base
 from src.integrations.orders import history_registry as order_history_registry
 from src.integrations.orders import raw_response_parsers
 from src.integrations.orders import registry as order_registry
-from src.integrations.services import confirmed_purchase_order_sync
-from src.integrations.services import purchase_order_jobs
-from src.integrations.services import purchase_order_pdf
+from src.integrations.services import (
+    confirmed_purchase_order_sync,
+    purchase_order_jobs,
+    purchase_order_pdf,
+)
 
 logger = logging.getLogger(__name__)
 _LOG_PREFIX = "[PURCHASE-ORDERS-API]"
@@ -964,7 +966,7 @@ def review_cart(
     purchase_orders = list(qs.distinct())
     for po in purchase_orders:
         spaces_services.ensure_visible(scope, po.space_id)
-    if len({po.space_id for po in purchase_orders}) > 1:
+    if scope.enabled and len({po.space_id for po in purchase_orders}) > 1:
         raise spaces_services.SpaceError(
             "These carts belong to different spaces. Review one space at a time.", ERROR_MIXED_SPACES
         )
