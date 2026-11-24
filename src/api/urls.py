@@ -24,6 +24,7 @@ from src.api.views.admin import (
 )
 from src.api.views.company import CompanyDestinationsView
 from src.api.views.company_locations import CompanyLocationsView, CompanyLocationDetailView
+from src.api.views.spaces import SpacesView
 from src.api.views.integrations import (
     ProvidersCatalogView,
     ProviderConnectView,
@@ -626,6 +627,11 @@ urlpatterns = [
         "admin/companies/<int:company_id>/integrations/<int:company_provider_id>/unpause/",
         AdminUnpauseIntegrationView.as_view(),
         name="admin_unpause_integration",
+    ),
+    path(
+        "spaces/",
+        SpacesView.as_view(),
+        name="spaces",
     ),
     path(
         "admin/providers/",
