@@ -334,6 +334,22 @@ class ProviderConnectionDetailView(views.View):
         )
 
 
+def _require_admin_when_flagged(request: http.HttpRequest) -> typing.Optional[http.HttpResponse]:
+    """Order accounts hold credentials: for a company with the multi_spaces flag only its admins change them
+    (403, read from the DB). An unflagged company is unchanged. Returns the error response, else None."""
+    try:
+        scope = spaces_services.resolve_scope(request)
+        if scope.enabled:
+            spaces_services.require_admin(scope)
+    except spaces_services.SpaceError as e:
+        return http.HttpResponse(
+            headers={"Content-Type": "application/json"},
+            content=simplejson.dumps(e.body()),
+            status=e.status_code,
+        )
+    return None
+
+
 class OrderAccountsView(views.View):
     """
     The ONE endpoint pair for managing a connection's order accounts — every account, including
@@ -405,6 +421,10 @@ class OrderAccountsView(views.View):
                 content=simplejson.dumps({"message": "No company found in token"}),
                 status=400,
             )
+
+        denied = _require_admin_when_flagged(request)
+        if denied:
+            return denied
 
         company_provider_id = kwargs.get("company_provider_id")
         try:
@@ -487,6 +507,10 @@ class OrderAccountDetailView(views.View):
                 status=400,
             )
 
+        denied = _require_admin_when_flagged(request)
+        if denied:
+            return denied
+
         order_account_id = kwargs.get("order_account_id")
         try:
             oai = int(order_account_id)
@@ -552,6 +576,10 @@ class OrderAccountDetailView(views.View):
                 content=simplejson.dumps({"message": "No company found in token"}),
                 status=400,
             )
+
+        denied = _require_admin_when_flagged(request)
+        if denied:
+            return denied
 
         order_account_id = kwargs.get("order_account_id")
         try:
