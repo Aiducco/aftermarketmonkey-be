@@ -30,6 +30,7 @@ _GENERATED_PASSWORD_LENGTH = 24
 def _generate_password() -> str:
     return "".join(secrets.choice(_GENERATED_PASSWORD_ALPHABET) for _ in range(_GENERATED_PASSWORD_LENGTH))
 
+
 # The internal company used to group staff/ops users — see seed_admin_company management command.
 # Excluded from the "all companies" list since it's not a real customer.
 ADMIN_COMPANY_SLUG = "aftermarketscout"
@@ -82,11 +83,7 @@ def _space_allowance_fields(company: src_models.Company) -> typing.Dict:
 def set_company_space_base(company_id: int, space_base: typing.Optional[int]) -> typing.Optional[typing.Dict]:
     """Staff base for a company's space allowance (space_base_override): replaces the plan's base while set,
     None clears it. The paid add-ons stay on top. Returns the allowance fields, or None if no such company."""
-    company = (
-        src_models.Company.objects.filter(id=company_id)
-        .annotate(spaces_count=_spaces_used_annotation())
-        .first()
-    )
+    company = src_models.Company.objects.filter(id=company_id).annotate(spaces_count=_spaces_used_annotation()).first()
     if not company:
         return None
     company.space_base_override = space_base
@@ -106,12 +103,8 @@ def list_all_companies_for_admin() -> typing.List[typing.Dict]:
         src_models.Company.objects.exclude(slug=ADMIN_COMPANY_SLUG)
         .annotate(
             total_providers_count=Count("company_providers"),
-            connected_providers_count=Count(
-                "company_providers", filter=Q(company_providers__status_name="CONNECTED")
-            ),
-            paused_providers_count=Count(
-                "company_providers", filter=Q(company_providers__paused_at__isnull=False)
-            ),
+            connected_providers_count=Count("company_providers", filter=Q(company_providers__status_name="CONNECTED")),
+            paused_providers_count=Count("company_providers", filter=Q(company_providers__paused_at__isnull=False)),
             spaces_count=_spaces_used_annotation(),
         )
         .order_by("-created_at")
@@ -152,12 +145,8 @@ def get_admin_company_detail(company_id: int) -> typing.Optional[typing.Dict]:
         src_models.Company.objects.filter(id=company_id)
         .annotate(
             total_providers_count=Count("company_providers"),
-            connected_providers_count=Count(
-                "company_providers", filter=Q(company_providers__status_name="CONNECTED")
-            ),
-            paused_providers_count=Count(
-                "company_providers", filter=Q(company_providers__paused_at__isnull=False)
-            ),
+            connected_providers_count=Count("company_providers", filter=Q(company_providers__status_name="CONNECTED")),
+            paused_providers_count=Count("company_providers", filter=Q(company_providers__paused_at__isnull=False)),
             spaces_count=_spaces_used_annotation(),
         )
         .first()
@@ -241,9 +230,7 @@ def list_all_providers_for_admin() -> typing.List[typing.Dict]:
 
     providers = src_models.Providers.objects.annotate(
         total_companies_count=Count("brand_providers"),
-        connected_companies_count=Count(
-            "brand_providers", filter=Q(brand_providers__status_name="CONNECTED")
-        ),
+        connected_companies_count=Count("brand_providers", filter=Q(brand_providers__status_name="CONNECTED")),
     ).order_by("name")
 
     data = []
@@ -273,9 +260,7 @@ def get_admin_provider_detail(provider_id: int) -> typing.Optional[typing.Dict]:
         src_models.Providers.objects.filter(id=provider_id)
         .annotate(
             total_companies_count=Count("brand_providers"),
-            connected_companies_count=Count(
-                "brand_providers", filter=Q(brand_providers__status_name="CONNECTED")
-            ),
+            connected_companies_count=Count("brand_providers", filter=Q(brand_providers__status_name="CONNECTED")),
         )
         .first()
     )
@@ -425,9 +410,7 @@ def admin_reset_user_password(
     create_company_for_admin, and is never logged.
     """
     try:
-        profile = src_models.UserProfile.objects.select_related("user").get(
-            user_id=user_id, company_id=company_id
-        )
+        profile = src_models.UserProfile.objects.select_related("user").get(user_id=user_id, company_id=company_id)
     except src_models.UserProfile.DoesNotExist:
         return None, "User not found in company"
 
@@ -436,9 +419,7 @@ def admin_reset_user_password(
     profile.user.save(update_fields=["password"])
 
     logger.info(
-        "{} Reset password for user_id={} (company_id={}) via admin panel.".format(
-            _LOG_PREFIX, user_id, company_id
-        )
+        "{} Reset password for user_id={} (company_id={}) via admin panel.".format(_LOG_PREFIX, user_id, company_id)
     )
 
     return {"user_id": user_id, "email": profile.user.email, "password": resolved_password}, None
@@ -551,9 +532,7 @@ def get_ingestion_audit_overview() -> typing.List[typing.Dict]:
     """
     logger.info("{} Fetching ingestion audit overview.".format(_LOG_PREFIX))
 
-    latest_per_name = (
-        src_models.ScheduledTaskExecution.objects.order_by("name", "-created_at").distinct("name")
-    )
+    latest_per_name = src_models.ScheduledTaskExecution.objects.order_by("name", "-created_at").distinct("name")
     data = [_serialize_scheduled_task_execution(row) for row in latest_per_name]
     data.sort(key=lambda row: (row["status_name"] not in ("FAILED", "STARTED"), row["name"]))
 
@@ -570,10 +549,9 @@ def get_ingestion_audit_history(task_name: str) -> typing.List[typing.Dict]:
     same "no data" shape a typo'd query param should get."""
     logger.info("{} Fetching ingestion audit history for task_name={}.".format(_LOG_PREFIX, task_name))
 
-    rows = (
-        src_models.ScheduledTaskExecution.objects.filter(name=task_name)
-        .order_by("-created_at")[:_INGESTION_AUDIT_HISTORY_LIMIT]
-    )
+    rows = src_models.ScheduledTaskExecution.objects.filter(name=task_name).order_by("-created_at")[
+        :_INGESTION_AUDIT_HISTORY_LIMIT
+    ]
     data = [_serialize_scheduled_task_execution(row) for row in rows]
 
     logger.info("{} Found {} row(s) for task_name={}.".format(_LOG_PREFIX, len(data), task_name))
