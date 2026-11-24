@@ -391,6 +391,7 @@ def check_space_limit(company_id: int) -> tuple[bool, str]:
     allowance (a converted comp'd trial, a lowered add-on) stay and keep working, only adding is refused.
     Returns (allowed: bool, reason: str).
     """
+    company_id = billing_company_id(company_id)
     company = src_models.Company.objects.filter(id=company_id).first()
     if not company:
         return False, "Company not found"
@@ -532,6 +533,14 @@ def _period_start(company: src_models.Company):
     return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
 
+def billing_company_id(company_id: int) -> int:
+    """The company that is billed for ``company_id``: the parent for a feed tenant (ADR 0002), else the id itself.
+    Every plan check below resolves it first, so a caller holding a tenant's id (``connect_provider`` on a space's
+    own feed) is judged by the parent's plan. Own feeds are not counted toward the connection limit (spec OQ-6)."""
+    parent_id = src_models.Company.objects.values_list("parent_company_id", flat=True).filter(id=company_id).first()
+    return parent_id or company_id
+
+
 def _connected_distributor_count(company_id: int) -> int:
     """Count ACTIVE CompanyProviders rows whose credentials carry a truthy "feed" namespace — the same
     "connected" convention used at integrations.py:282,1553 and parts.py:275,581. Order-only rows
@@ -565,6 +574,7 @@ def get_usage(company_id: int) -> dict:
     monthly), distributor connections and seats (point-in-time counts, not usage-counted — plan
     tier just caps how many can exist, no reset window). Searches are always unlimited.
     """
+    company_id = billing_company_id(company_id)
     company = src_models.Company.objects.filter(id=company_id).first()
     if not company:
         return {}
@@ -614,6 +624,7 @@ def check_detail_view_limit(company_id: int) -> tuple[bool, str]:
     Returns (allowed: bool, reason: str).
     -1 limit means unlimited.
     """
+    company_id = billing_company_id(company_id)
     company = (
         src_models.Company.objects.filter(id=company_id)
         .only("subscription_plan", "subscription_status", "subscription_period_end")
@@ -646,6 +657,7 @@ def check_distributor_connection_limit(company_id: int) -> tuple[bool, str]:
     Check if company can connect one more distributor's product feed.
     Returns (allowed: bool, reason: str). -1 limit means unlimited.
     """
+    company_id = billing_company_id(company_id)
     company = (
         src_models.Company.objects.filter(id=company_id)
         .only(
@@ -686,6 +698,7 @@ def check_seat_limit(company_id: int) -> tuple[bool, str]:
     Check if company can add one more user account.
     Returns (allowed: bool, reason: str). -1 limit means unlimited.
     """
+    company_id = billing_company_id(company_id)
     company = (
         src_models.Company.objects.filter(id=company_id)
         .only(
@@ -717,6 +730,7 @@ def check_po_checkout_allowed(company_id: int) -> tuple[bool, str]:
     Unlike the other checks here, this isn't a usage counter — it's a binary feature gate.
     Returns (allowed: bool, reason: str).
     """
+    company_id = billing_company_id(company_id)
     company = (
         src_models.Company.objects.filter(id=company_id)
         .only(
@@ -746,6 +760,7 @@ def has_multi_warehouse_visibility(company_id: Optional[int]) -> bool:
     """
     if company_id is None:
         return False
+    company_id = billing_company_id(company_id)
     company = (
         src_models.Company.objects.filter(id=company_id)
         .only(
@@ -766,6 +781,7 @@ def has_inventory_management(company_id: Optional[int]) -> bool:
     src.api.services.inventory_access.company_has_inventory_access, which also honours the per-company flag."""
     if company_id is None:
         return False
+    company_id = billing_company_id(company_id)
     company = (
         src_models.Company.objects.filter(id=company_id)
         .only(
