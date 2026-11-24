@@ -564,12 +564,29 @@ class CompanyShopManagementProviders(django_db_models.Model):
     status_reason = django_db_models.TextField(null=True, blank=True)
     status_checked_at = django_db_models.DateTimeField(null=True, blank=True)
 
+    # The one space this connection belongs to (ADR 0002): one shop-system account serves exactly one space, and a
+    # space has at most one connection. Nothing here names a system. ``save()`` fills the main space when unset.
+    space = django_db_models.OneToOneField(Space, on_delete=django_db_models.PROTECT, related_name="shop_connection")
+    # sha256 of the credential fields the system's catalog entry names as the account identity
+    # (src.domain.account_fingerprint); null when the account cannot be recognised.
+    credentials_fingerprint = django_db_models.CharField(max_length=64, null=True, blank=True)
+
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
 
+    def save(self, *args, **kwargs):
+        if self.space_id is None:
+            self.space = Space.objects.main_for(self.company_id)
+        super().save(*args, **kwargs)
+
     class Meta:
         db_table = "company_shop_management_providers"
-        unique_together = ["company", "provider"]
+        constraints = [
+            django_db_models.UniqueConstraint(
+                fields=["company", "provider", "credentials_fingerprint"],
+                name="shop_connection_account_unique",
+            ),
+        ]
 
 
 class IntegrationRequest(django_db_models.Model):
@@ -661,12 +678,24 @@ class ShopMonkeySyncVendor(django_db_models.Model):
     status = django_db_models.PositiveSmallIntegerField()
     status_name = django_db_models.CharField(max_length=32)
 
+    # The space whose shop-system connection this row syncs to; ``save()`` fills the main space when unset.
+    space = django_db_models.ForeignKey(
+        Space, on_delete=django_db_models.PROTECT, related_name="shopmonkey_sync_vendors"
+    )
+
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
 
+    def save(self, *args, **kwargs):
+        if self.space_id is None:
+            self.space = Space.objects.main_for(self.company_id)
+        super().save(*args, **kwargs)
+
     class Meta:
         db_table = "shopmonkey_sync_vendor"
-        unique_together = ["company", "provider"]
+        constraints = [
+            django_db_models.UniqueConstraint(fields=["space", "provider"], name="shopmonkey_vendor_space_provider"),
+        ]
 
 
 class ShopMonkeySyncBrand(django_db_models.Model):
@@ -705,12 +734,24 @@ class ShopMonkeySyncBrand(django_db_models.Model):
     status = django_db_models.PositiveSmallIntegerField()
     status_name = django_db_models.CharField(max_length=32)
 
+    # The space whose shop-system connection this row syncs to; ``save()`` fills the main space when unset.
+    space = django_db_models.ForeignKey(
+        Space, on_delete=django_db_models.PROTECT, related_name="shopmonkey_sync_brands"
+    )
+
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
 
+    def save(self, *args, **kwargs):
+        if self.space_id is None:
+            self.space = Space.objects.main_for(self.company_id)
+        super().save(*args, **kwargs)
+
     class Meta:
         db_table = "shopmonkey_sync_brand"
-        unique_together = ["company", "brand"]
+        constraints = [
+            django_db_models.UniqueConstraint(fields=["space", "brand"], name="shopmonkey_brand_space_brand"),
+        ]
 
 
 class ShopMonkeySyncBrandVendor(django_db_models.Model):
@@ -843,8 +884,18 @@ class ShopMonkeySyncExecution(django_db_models.Model):
     message = django_db_models.TextField(null=True, blank=True)
     metadata = django_db_models.JSONField(default=dict)
 
+    # The space whose shop-system connection this run belongs to; ``save()`` fills the main space when unset.
+    space = django_db_models.ForeignKey(
+        Space, on_delete=django_db_models.PROTECT, related_name="shopmonkey_sync_executions"
+    )
+
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    def save(self, *args, **kwargs):
+        if self.space_id is None:
+            self.space = Space.objects.main_for(self.company_id)
+        super().save(*args, **kwargs)
 
     class Meta:
         db_table = "shopmonkey_sync_execution"
