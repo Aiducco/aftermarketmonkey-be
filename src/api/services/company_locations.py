@@ -39,6 +39,19 @@ def list_company_locations(company_id: int) -> list:
     return [_serialize(loc) for loc in locations]
 
 
+def list_space_addresses(company_id: int, space_ids: list) -> list:
+    """Flagged companies: the one address of each given space (never the old extra rows), each with its space_id."""
+    locations = src_models.CompanyLocation.objects.filter(
+        company_id=company_id, address_of_space__in=space_ids
+    ).order_by("-is_primary", "label")
+    rows = []
+    for loc in locations:
+        row = _serialize(loc)
+        row["space_id"] = loc.space_id
+        rows.append(row)
+    return rows
+
+
 @transaction.atomic
 def create_company_location(company_id: int, **fields) -> dict:
     is_primary = bool(fields.pop("is_primary", False))
