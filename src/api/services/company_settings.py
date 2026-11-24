@@ -8,6 +8,8 @@ from django.db import transaction
 
 from src import models as src_models
 from src.api.services import billing as billing_services
+from src.api.services import feature_flags as feature_flags_services
+from src.api.services import spaces as spaces_services
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +157,7 @@ def list_company_users(company_id: int, user) -> list | None:
         return None
 
     profiles = src_models.UserProfile.objects.filter(company_id=company_id).select_related("user")
+    space_ids_of = _space_ids_by_profile(company_id, profiles) if _spaces_enabled(company_id) else None
     return [
         {
             "id": p.user_id,
@@ -167,9 +170,57 @@ def list_company_users(company_id: int, user) -> list | None:
             "state": "suspended" if p.suspended_at else "active",
             "suspended_at": p.suspended_at.strftime("%Y-%m-%dT%H:%M:%SZ") if p.suspended_at else None,
             "created_at": p.created_at.isoformat() if p.created_at else None,
+            **({"space_ids": space_ids_of[p.id]} if space_ids_of is not None else {}),
         }
         for p in profiles
     ]
+
+
+def _spaces_enabled(company_id: int) -> bool:
+    return feature_flags_services.company_has_feature(company_id, feature_flags_services.FEATURE_MULTI_SPACES)
+
+
+def _space_ids_by_profile(company_id: int, profiles) -> dict:
+    """profile id -> space ids: an admin has every space, a member their rows, else the main space (ADR 0001)."""
+    all_ids = sorted(src_models.Space.objects.filter(company_id=company_id).values_list("id", flat=True))
+    main_id = src_models.Space.objects.main_for(company_id).id
+    linked: dict = {}
+    for profile_id, space_id in src_models.Space.members.through.objects.filter(
+        userprofile__company_id=company_id, space__company_id=company_id
+    ).values_list("userprofile_id", "space_id"):
+        linked.setdefault(profile_id, []).append(space_id)
+    return {p.id: all_ids if p.is_company_admin else sorted(linked.get(p.id, [])) or [main_id] for p in profiles}
+
+
+def _checked_space_ids(company_id: int, space_ids: list | None) -> list:
+    """Distinct ids, each a space of the company; empty is space_required (a user has at least one space)."""
+    ids = sorted(set(space_ids or []))
+    if not ids:
+        raise spaces_services.SpaceError("Choose at least one space.", spaces_services.ERROR_SPACE_REQUIRED)
+    found = set(src_models.Space.objects.filter(company_id=company_id, id__in=ids).values_list("id", flat=True))
+    if found != set(ids):
+        raise spaces_services.SpaceError("Space not found", spaces_services.ERROR_SPACE_NOT_FOUND)
+    return ids
+
+
+@transaction.atomic
+def set_user_spaces(company_id: int, admin_user, target_user_id: int, space_ids: list) -> dict:
+    """PUT .../team/<id>/spaces/: replaces a member's spaces. Admin only, flagged companies only.
+    Raises SpaceError (403, 400 space_required / space_not_found, 404 user not in company)."""
+    ok, err = _is_company_admin(admin_user, company_id)
+    if not ok:
+        raise spaces_services.SpaceError(err or "Company admin access required", "admin_required", status_code=403)
+    if not _spaces_enabled(company_id):
+        raise spaces_services.SpaceError(
+            "Spaces are not available for this company.", spaces_services.ERROR_FEATURE_NOT_AVAILABLE, status_code=403
+        )
+    profile = src_models.UserProfile.objects.filter(user_id=target_user_id, company_id=company_id).first()
+    if profile is None:
+        raise spaces_services.SpaceError("User not found in company", "user_not_found", status_code=404)
+    spaces_services._lock_company(company_id)  # same lock as delete_space, so a delete cannot race this
+    ids = _checked_space_ids(company_id, space_ids)
+    profile.spaces.set(ids)
+    return {"id": target_user_id, "space_ids": ids}
 
 
 @transaction.atomic
@@ -181,9 +232,10 @@ def add_company_user(
     last_name: str,
     password: str,
     is_company_admin: bool = False,
+    space_ids: list | None = None,
 ) -> dict | str:
     """
-    Add user to company. Admin only.
+    Add user to company. Admin only. Flagged company: a non-admin needs space_ids (SpaceError space_required).
     - If user exists: add them to company (update profile).
     - If user doesn't exist: create user + profile in one atomic transaction.
     Returns user dict on success, error message string on failure.
@@ -197,6 +249,13 @@ def add_company_user(
         company = src_models.Company.objects.get(id=company_id)
     except src_models.Company.DoesNotExist:
         return "Company not found"
+
+    # Flagged: a non-admin gets exactly the given spaces; an admin sees every space and ignores space_ids.
+    spaces_enabled = _spaces_enabled(company_id)
+    member_space_ids = []
+    if spaces_enabled and not is_company_admin:
+        spaces_services._lock_company(company_id)  # same lock as delete_space, so a delete cannot race this
+        member_space_ids = _checked_space_ids(company_id, space_ids)
 
     existing_user = auth_models.User.objects.filter(email=email).first()
 
@@ -223,20 +282,23 @@ def add_company_user(
             profile.company = company
             profile.is_company_admin = is_company_admin
             profile.save()
+            # Space rows belong to the company the profile was in.
+            profile.spaces.clear()
         else:
-            src_models.UserProfile.objects.create(
+            profile = src_models.UserProfile.objects.create(
                 user=existing_user,
                 company=company,
                 is_company_admin=is_company_admin,
             )
 
-        return {
+        result = {
             "id": existing_user.id,
             "email": existing_user.email,
             "first_name": existing_user.first_name,
             "last_name": existing_user.last_name,
             "is_company_admin": is_company_admin,
         }
+        return _with_space_ids(result, profile, company_id, spaces_enabled, member_space_ids)
 
     # New user: create user + profile atomically
     user = auth_models.User(
@@ -248,19 +310,34 @@ def add_company_user(
     user.set_password(password)
     user.save()
 
-    src_models.UserProfile.objects.create(
+    profile = src_models.UserProfile.objects.create(
         user=user,
         company=company,
         is_company_admin=is_company_admin,
     )
 
-    return {
+    result = {
         "id": user.id,
         "email": user.email,
         "first_name": user.first_name,
         "last_name": user.last_name,
         "is_company_admin": is_company_admin,
     }
+    return _with_space_ids(result, profile, company_id, spaces_enabled, member_space_ids)
+
+
+def _with_space_ids(result: dict, profile, company_id: int, spaces_enabled: bool, member_space_ids: list) -> dict:
+    """Flagged: stores a non-admin's spaces and adds space_ids to the response. Unflagged: result as is."""
+    if not spaces_enabled:
+        return result
+    if profile.is_company_admin:
+        result["space_ids"] = sorted(
+            src_models.Space.objects.filter(company_id=company_id).values_list("id", flat=True)
+        )
+    else:
+        profile.spaces.set(member_space_ids)
+        result["space_ids"] = member_space_ids
+    return result
 
 
 def update_company_user_role(
@@ -300,6 +377,7 @@ def update_company_user_role(
     }
 
 
+@transaction.atomic
 def remove_company_user(
     company_id: int,
     target_user_id: int,
@@ -333,6 +411,8 @@ def remove_company_user(
 
     profile.company_id = None
     profile.save()
+    # Space rows belong to the company the profile left.
+    profile.spaces.clear()
 
     return None
 
@@ -371,6 +451,7 @@ def reset_company_user_password(
 # Account deletion
 # ---------------------------------------------------------------------------
 
+
 def delete_user_account(user, company_id: int) -> tuple[bool, str | None]:
     """
     Hard-delete the authenticated user's own account.
@@ -384,10 +465,14 @@ def delete_user_account(user, company_id: int) -> tuple[bool, str | None]:
         profile = None
 
     if profile and profile.is_company_admin:
-        remaining_admins = src_models.UserProfile.objects.filter(
-            company_id=company_id,
-            is_company_admin=True,
-        ).exclude(user=user).count()
+        remaining_admins = (
+            src_models.UserProfile.objects.filter(
+                company_id=company_id,
+                is_company_admin=True,
+            )
+            .exclude(user=user)
+            .count()
+        )
         if remaining_admins == 0:
             return False, "Cannot delete account: you are the last admin. Transfer admin rights first."
 
@@ -400,6 +485,7 @@ def delete_user_account(user, company_id: int) -> tuple[bool, str | None]:
 # Company data wipe
 # ---------------------------------------------------------------------------
 
+
 def delete_all_company_data(user, company_id: int) -> tuple[bool, str | None]:
     """
     Admin-only: wipe all data for the company inside a single transaction.
@@ -411,12 +497,15 @@ def delete_all_company_data(user, company_id: int) -> tuple[bool, str | None]:
     if not ok:
         return False, err
 
+    # Feed tenants hold full copies of distributor pricing: never deleted inside a request (ADR 0002).
+    if src_models.Company.objects.filter(parent_company_id=company_id).exists():
+        return False, (
+            "This company has space feeds that must be removed first. Contact support to delete the account."
+        )
+
     with transaction.atomic():
         # Collect all Django auth user IDs in the company before deleting profiles
-        user_ids = list(
-            src_models.UserProfile.objects.filter(company_id=company_id)
-            .values_list("user_id", flat=True)
-        )
+        user_ids = list(src_models.UserProfile.objects.filter(company_id=company_id).values_list("user_id", flat=True))
 
         # Company-scoped data — Django cascades handle most FK children,
         # but we delete explicitly for clarity and safety.

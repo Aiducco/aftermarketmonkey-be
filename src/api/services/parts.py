@@ -1,6 +1,7 @@
 """
 API services for parts search and detail.
 """
+import dataclasses
 import decimal
 import logging
 import re
@@ -13,6 +14,7 @@ from src import constants as src_constants
 from src import enums as src_enums
 from src import models as src_models
 from src.api.services import billing as billing_services
+from src.api.services import spaces as spaces_services
 from src.domain import tire_spec_display, wheel_spec_display
 from src.integrations import credentials as credentials_helper
 from src.integrations.live_inventory import exceptions as live_inventory_exceptions
@@ -66,7 +68,8 @@ def _map_turn14_warehouse_availability(
 
 
 def _atd_company_inventory(
-    warehouse_availability: typing.Optional[typing.Dict], company_id: typing.Optional[int],
+    warehouse_availability: typing.Optional[typing.Dict],
+    company_id: typing.Optional[int],
 ) -> typing.Tuple[typing.Optional[typing.Dict[str, typing.Union[int, float]]], typing.Optional[int]]:
     """
     Decode ATD's per-company stock out of ProviderPartInventory.warehouse_availability, which --
@@ -91,6 +94,132 @@ def _atd_company_inventory(
         "Ship-to-Home Eligible": entry.get("sthinventory") or 0,
     }
     return display, entry.get("nationwide") or 0
+
+
+@dataclasses.dataclass
+class _Connections:
+    """The connections Parts Search reads for one request.
+
+    ``by_provider`` is ``{provider_id: connection}`` for the company's own connections (an unflagged company),
+    or for the one connection the current space uses per distributor. ``candidates`` is set only in "all"
+    for a flagged company: per distributor, every distinct connection a visible space uses, with those spaces.
+    """
+
+    by_provider: typing.Dict[int, src_models.CompanyProviders]
+    candidates: typing.Optional[
+        typing.Dict[int, typing.List[typing.Tuple[src_models.CompanyProviders, typing.List[dict]]]]
+    ]
+
+
+def _resolve_connections(company_id: int, scope: typing.Optional[spaces_services.SpaceScope]) -> _Connections:
+    """Unflagged (no scope or scope not enabled): the company's own connections, exactly as before. Flagged: the
+    connections the current space uses (``spaces.feeds_for``), or in "all" every connection a visible space uses."""
+    active_provider = src_enums.BrandProviderStatus.ACTIVE.value
+    if scope is None or not scope.enabled:
+        own = src_models.CompanyProviders.objects.filter(company_id=company_id, provider__status=active_provider)
+        return _Connections({cp.provider_id: cp for cp in own.select_related("provider")}, None)
+
+    current = scope.current_space_id
+    space_ids = [current] if current is not None else list(scope.list_space_ids)
+    used: typing.Dict[int, typing.Dict[int, typing.List[int]]] = {}
+    for space_id in space_ids:
+        for provider_id, cp in spaces_services.feeds_for(space_id).items():
+            used.setdefault(provider_id, {}).setdefault(cp.id, []).append(space_id)
+    connection_ids = {cp_id for per_provider in used.values() for cp_id in per_provider}
+    loaded = {
+        cp.id: cp
+        for cp in src_models.CompanyProviders.objects.filter(
+            id__in=connection_ids, provider__status=active_provider
+        ).select_related("provider")
+    }
+    if current is not None:
+        return _Connections({cp.provider_id: cp for cp in loaded.values()}, None)
+
+    # A feed tenant's connection is owned by the tenant's space; the real company's by the main space.
+    owner_by_company = {scope.company_id: scope.main_space_id}
+    owner_by_company.update(
+        src_models.Space.objects.filter(company_id=scope.company_id, feed_company__isnull=False).values_list(
+            "feed_company_id", "id"
+        )
+    )
+    candidates: typing.Dict[int, typing.List[typing.Tuple[src_models.CompanyProviders, typing.List[dict]]]] = {}
+    for provider_id, per_provider in used.items():
+        for cp_id, sids in per_provider.items():
+            cp = loaded.get(cp_id)
+            if cp is None:
+                continue
+            owner = owner_by_company.get(cp.company_id)
+            ordered = sorted(sids, key=lambda sid: (sid != owner, scope.space_names.get(sid, "").lower(), sid))
+            candidates.setdefault(provider_id, []).append(
+                (cp, [{"id": sid, "name": scope.space_names.get(sid)} for sid in ordered])
+            )
+        candidates[provider_id].sort(key=lambda item: item[0].id)
+    return _Connections({}, candidates)
+
+
+def _company_provider_info(cp: src_models.CompanyProviders) -> typing.Dict[str, typing.Any]:
+    return {
+        "initial_sync_completed": cp.initial_sync_completed,
+        "status": cp.status,
+        "status_name": cp.status_name,
+        "order_status": cp.order_status,
+        "order_status_name": cp.order_status_name,
+    }
+
+
+def _feed_cost_and_stock(
+    pp: src_models.ProviderPart, inv_obj: typing.Optional[src_models.ProviderPartInventory], pricing_company_id: int
+) -> typing.Tuple[typing.Optional[float], typing.Optional[int], typing.Optional[bool]]:
+    """(cost, warehouse_total_qty, in_stock) of one feed for a provider part, as get_part_detail shows them: the
+    pricing company's price row, and the stock (ATD's own entry for that company, else the shared total)."""
+    cost = None
+    for row in pp.company_pricing.all():
+        if row.company_id == pricing_company_id:
+            cost = float(row.cost) if row.cost else None
+            break
+    if inv_obj is None:
+        return cost, None, None
+    qty = inv_obj.warehouse_total_qty
+    if pp.provider is not None and pp.provider.kind_name == "ATD":
+        _display, atd_total = _atd_company_inventory(inv_obj.warehouse_availability, pricing_company_id)
+        if atd_total is not None:
+            qty = atd_total
+    return cost, qty, bool(qty)
+
+
+def _feed_rank(cost: typing.Optional[float], qty: typing.Optional[int]) -> typing.Tuple:
+    """Best buy first: priced before unpriced, in stock before out of stock, cheapest, then most stock (the
+    ordering get_part_detail has always used for its rows)."""
+    return (cost is None, not bool(qty), cost or 0, -(qty or 0))
+
+
+def _pick_all_mode_connection(
+    candidates: typing.List[typing.Tuple[src_models.CompanyProviders, typing.List[dict]]],
+    cost_and_qty: typing.Callable[
+        [src_models.CompanyProviders], typing.Tuple[typing.Optional[float], typing.Optional[int], typing.Optional[bool]]
+    ],
+) -> typing.Tuple[typing.List[dict], typing.Optional[src_models.CompanyProviders], typing.Optional[typing.Tuple]]:
+    """In "all": the ranked ``feeds`` of one distributor row (one entry per connected, unpaused connection), the
+    connection the row's own fields come from (feeds[0]'s, else a paused connection that has a feed, else None)
+    and that feed's (cost, qty) for callers that need the quantity."""
+    ranked = []
+    paused = []
+    for cp, spaces in candidates:
+        if not (cp.credentials or {}).get("feed"):
+            continue
+        if cp.paused_at is not None:
+            paused.append(cp)
+            continue
+        cost, qty, in_stock = cost_and_qty(cp)
+        ranked.append((_feed_rank(cost, qty), cp, cost, qty, in_stock, spaces))
+    ranked.sort(key=lambda item: (item[0], item[1].id))
+    feeds = [
+        {"company_provider_id": cp.id, "cost": cost, "in_stock": in_stock, "spaces": spaces}
+        for _rank, cp, cost, _qty, in_stock, spaces in ranked
+    ]
+    if ranked:
+        return feeds, ranked[0][1], (ranked[0][2], ranked[0][3])
+    return feeds, (min(paused, key=lambda cp: cp.id) if paused else None), None
 
 
 _LOG_PREFIX = "[PARTS-SERVICES]"
@@ -294,7 +423,11 @@ def _build_wheel_specs(
     return wheel_spec_display.build_wheel_specs(row)
 
 
-def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None) -> typing.Optional[typing.Dict]:
+def get_part_detail(
+    master_part_id: int,
+    company_id: typing.Optional[int] = None,
+    scope: typing.Optional[spaces_services.SpaceScope] = None,
+) -> typing.Optional[typing.Dict]:
     """
     Get detailed info for one MasterPart.
 
@@ -402,23 +535,14 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
 
     company_provider_map: typing.Dict[int, typing.Dict[str, typing.Any]] = {}
     company_provider_objs: typing.Dict[int, src_models.CompanyProviders] = {}
+    # Flagged "all" only: each distributor's candidate connections; the row's connection is picked per part below.
+    all_mode_candidates: typing.Optional[typing.Dict[int, list]] = None
     if company_id is not None:
-        company_provider_objs = {
-            cp.provider_id: cp
-            for cp in src_models.CompanyProviders.objects.filter(
-                company_id=company_id,
-                provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
-            ).select_related("provider")
-        }
+        connections = _resolve_connections(company_id, scope)
+        company_provider_objs = connections.by_provider
+        all_mode_candidates = connections.candidates
         company_provider_map = {
-            provider_id: {
-                "initial_sync_completed": cp.initial_sync_completed,
-                "status": cp.status,
-                "status_name": cp.status_name,
-                "order_status": cp.order_status,
-                "order_status_name": cp.order_status_name,
-            }
-            for provider_id, cp in company_provider_objs.items()
+            provider_id: _company_provider_info(cp) for provider_id, cp in company_provider_objs.items()
         }
     # "Connected" (gates pricing/inventory/product_details below, and company_integration.connected
     # in the response) means the Product feed is actually configured, not just that a
@@ -508,6 +632,25 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
             inv_obj = pp.inventory
         except src_models.ProviderPartInventory.DoesNotExist:
             inv_obj = None
+
+        feeds: typing.Optional[typing.List[dict]] = None
+        if all_mode_candidates is not None:
+            # Flagged "all": every connection a visible space uses is a feed; the row reads from the best one.
+            feeds, row_cp, _picked = _pick_all_mode_connection(
+                all_mode_candidates.get(pp.provider_id, []),
+                lambda cp: _feed_cost_and_stock(pp, inv_obj, cp.company_id),
+            )
+            company_provider_objs.pop(pp.provider_id, None)
+            company_provider_map.pop(pp.provider_id, None)
+            paused_provider_ids.discard(pp.provider_id)
+            connected_provider_ids.discard(pp.provider_id)
+            if row_cp is not None:
+                company_provider_objs[pp.provider_id] = row_cp
+                company_provider_map[pp.provider_id] = _company_provider_info(row_cp)
+                if row_cp.paused_at is not None:
+                    paused_provider_ids.add(pp.provider_id)
+                else:
+                    connected_provider_ids.add(pp.provider_id)
 
         kind_name = pp.provider.kind_name if pp.provider else None
         integrated = company_id is not None and pp.provider_id is not None and pp.provider_id in connected_provider_ids
@@ -629,8 +772,13 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
             "pricing": None,
             "product_details": None,
         }
+        if feeds is not None:
+            provider_info["feeds"] = feeds
 
         if integrated:
+            # Prices and ATD stock are read with the connection's own company: the real company for every
+            # unflagged connection, a feed tenant for a space's own feed.
+            pricing_company_id = company_provider_objs[pp.provider_id].company_id
             provider_info["product_details"] = pp.product_details
             if inv_obj:
                 wh_avail = inv_obj.warehouse_availability
@@ -641,7 +789,7 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
                     # ATD's warehouse_availability is keyed by company_id, not warehouse name (see
                     # _atd_company_inventory's docstring) -- decode this specific company's own
                     # entry and use it to override the global approximation in warehouse_total_qty.
-                    atd_display, atd_total = _atd_company_inventory(wh_avail, company_id)
+                    atd_display, atd_total = _atd_company_inventory(wh_avail, pricing_company_id)
                     wh_avail = atd_display
                     if atd_total is not None:
                         warehouse_total_qty = atd_total
@@ -658,7 +806,7 @@ def get_part_detail(master_part_id: int, company_id: typing.Optional[int] = None
             pricing_row = None
             if company_id is not None:
                 for p in pp.company_pricing.all():
-                    if p.company_id == company_id:
+                    if p.company_id == pricing_company_id:
                         pricing_row = p
                         break
             if pricing_row:
@@ -697,7 +845,9 @@ _BULK_PRICING_MAX_IDS = 50
 
 
 def get_parts_bulk_pricing(
-    master_part_ids: typing.List[int], company_id: int
+    master_part_ids: typing.List[int],
+    company_id: int,
+    scope: typing.Optional[spaces_services.SpaceScope] = None,
 ) -> typing.Dict[int, typing.Dict[str, typing.Any]]:
     """
     Price-by-provider plus best cost/provider for up to _BULK_PRICING_MAX_IDS MasterParts at
@@ -762,15 +912,31 @@ def get_parts_bulk_pricing(
     # not "connected" (no cost, never a best-cost pick) and their rows come back ``locked`` with no
     # cost, stock or quantity at all -- unlike a never-connected row, whose stock stays visible --
     # because a paused distributor must not leak data the plan no longer includes.
+    #
+    # Flagged companies read the connection the current space uses per distributor (``spaces.feeds_for``) and
+    # price it with that connection's own company; in "all" every connection a visible space uses is a feed
+    # (see _Connections). Unflagged companies read their own connections, as before.
+    connections = _resolve_connections(company_id, scope)
     connected_provider_ids = set()
     paused_provider_ids = set()
-    for cp in src_models.CompanyProviders.objects.filter(
-        company_id=company_id,
-        provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
-    ).only("provider_id", "credentials", "paused_at"):
+    pricing_company_by_provider: typing.Dict[int, int] = {}
+    for cp in connections.by_provider.values():
         if not (cp.credentials or {}).get("feed"):
             continue
+        pricing_company_by_provider[cp.provider_id] = cp.company_id
         (paused_provider_ids if cp.paused_at is not None else connected_provider_ids).add(cp.provider_id)
+    pricing_company_ids = set(pricing_company_by_provider.values())
+    for provider_id, candidates in (connections.candidates or {}).items():
+        for cp, _spaces in candidates:
+            if not (cp.credentials or {}).get("feed"):
+                continue
+            if cp.paused_at is None:
+                connected_provider_ids.add(provider_id)
+                pricing_company_ids.add(cp.company_id)
+            else:
+                paused_provider_ids.add(provider_id)
+    # A distributor with a usable feed is connected; the paused ones only lock a row that has none.
+    paused_provider_ids -= connected_provider_ids
 
     provider_parts = list(
         src_models.ProviderPart.objects.filter(master_part_id__in=ids).values(
@@ -786,11 +952,11 @@ def get_parts_bulk_pricing(
 
     connected_provider_part_ids = [pp["id"] for pp in provider_parts if pp["provider_id"] in connected_provider_ids]
     cost_by_provider_part_id = {
-        row["provider_part_id"]: row["cost"]
+        (row["provider_part_id"], row["company_id"]): row["cost"]
         for row in src_models.ProviderPartCompanyPricing.objects.filter(
-            company_id=company_id,
+            company_id__in=pricing_company_ids or [company_id],
             provider_part_id__in=connected_provider_part_ids,
-        ).values("provider_part_id", "cost")
+        ).values("provider_part_id", "company_id", "cost")
         if row["cost"] is not None
     }
     # Not company-scoped like cost -- shown regardless of connection, see docstring. ATD is the
@@ -804,30 +970,54 @@ def get_parts_bulk_pricing(
         ).values("provider_part_id", "warehouse_total_qty", "warehouse_availability")
     }
 
+    def _stock(pp: dict, stock_company_id: int) -> int:
+        qty, wh_avail = qty_by_provider_part_id.get(pp["id"]) or (0, None)
+        qty = qty or 0
+        if pp["provider__kind_name"] == "ATD":
+            _, atd_total = _atd_company_inventory(wh_avail, stock_company_id)
+            qty = atd_total if atd_total is not None else 0
+        return qty
+
     for pp in provider_parts:
         mpid = pp["master_part_id"]
         connected = pp["provider_id"] in connected_provider_ids
         locked = pp["provider_id"] in paused_provider_ids
-        cost = cost_by_provider_part_id.get(pp["id"]) if connected else None
-        qty, wh_avail = qty_by_provider_part_id.get(pp["id"]) or (0, None)
-        qty = qty or 0
-        if pp["provider__kind_name"] == "ATD":
-            _, atd_total = _atd_company_inventory(wh_avail, company_id)
-            qty = atd_total if atd_total is not None else 0
+        feeds = None
+        if connections.candidates is not None:
+            feeds, row_cp, picked = _pick_all_mode_connection(
+                connections.candidates.get(pp["provider_id"], []),
+                lambda cp: (
+                    cost_by_provider_part_id.get((pp["id"], cp.company_id)),
+                    _stock(pp, cp.company_id),
+                    _stock(pp, cp.company_id) > 0,
+                ),
+            )
+            connected = picked is not None
+            locked = not connected and row_cp is not None
+            feeds = [{**feed, "cost": float(feed["cost"]) if feed["cost"] is not None else None} for feed in feeds]
+            if connected:
+                cost, qty = picked
+            else:
+                cost, qty = None, _stock(pp, company_id)
+        else:
+            stock_company_id = pricing_company_by_provider.get(pp["provider_id"], company_id)
+            cost = cost_by_provider_part_id.get((pp["id"], stock_company_id)) if connected else None
+            qty = _stock(pp, stock_company_id)
         in_stock = qty > 0
         entry = result[mpid]
-        entry["providers"].append(
-            {
-                "provider_id": pp["provider_id"],
-                "provider_name": pp["provider__name"],
-                "provider_kind_name": pp["provider__kind_name"],
-                "connected": connected,
-                "locked": locked,
-                "cost": float(cost) if cost is not None else None,
-                "in_stock": None if locked else in_stock,
-                "warehouse_total_qty": None if locked else qty,
-            }
-        )
+        row = {
+            "provider_id": pp["provider_id"],
+            "provider_name": pp["provider__name"],
+            "provider_kind_name": pp["provider__kind_name"],
+            "connected": connected,
+            "locked": locked,
+            "cost": float(cost) if cost is not None else None,
+            "in_stock": None if locked else in_stock,
+            "warehouse_total_qty": None if locked else qty,
+        }
+        if feeds is not None:
+            row["feeds"] = feeds
+        entry["providers"].append(row)
         if cost is None:
             continue
         candidate_key = (0 if in_stock else 1, float(cost), -qty)
@@ -843,8 +1033,44 @@ def get_parts_bulk_pricing(
     return result
 
 
+def _live_refresh_connection(
+    master_part_id: int, provider_id: int, company_id: int, scope: typing.Optional[spaces_services.SpaceScope]
+) -> typing.Optional[src_models.CompanyProviders]:
+    """The connection a live refresh pulls with. Unflagged: the company's own, as before. Flagged: the one the
+    current space uses; in "all", the best feed's (the connection get_part_detail's row is computed from)."""
+    if scope is None or not scope.enabled:
+        return (
+            src_models.CompanyProviders.objects.filter(
+                company_id=company_id,
+                provider_id=provider_id,
+                provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
+            )
+            .select_related("provider")
+            .first()
+        )
+    connections = _resolve_connections(company_id, scope)
+    if connections.candidates is None:
+        return connections.by_provider.get(provider_id)
+    detail = get_part_detail(master_part_id=master_part_id, company_id=company_id, scope=scope)
+    row = next((r for r in (detail or {}).get("providers", []) if r["provider_id"] == provider_id), None)
+    if row is None:
+        return None
+    if row["feeds"]:
+        wanted = row["feeds"][0]["company_provider_id"]
+    elif row["locked"]:
+        # No usable feed, but a visible space has a paused one: the paused refusal below applies.
+        paused = [cp for cp, _spaces in connections.candidates.get(provider_id, []) if cp.paused_at is not None]
+        return min(paused, key=lambda cp: cp.id) if paused else None
+    else:
+        return None
+    return next((cp for cp, _spaces in connections.candidates.get(provider_id, []) if cp.id == wanted), None)
+
+
 def refresh_provider_live_inventory(
-    master_part_id: int, provider_id: int, company_id: int
+    master_part_id: int,
+    provider_id: int,
+    company_id: int,
+    scope: typing.Optional[spaces_services.SpaceScope] = None,
 ) -> typing.Optional[typing.Dict]:
     """
     Pulls this item's current inventory directly from the distributor (see
@@ -864,15 +1090,7 @@ def refresh_provider_live_inventory(
     except src_models.ProviderPart.DoesNotExist:
         return None
 
-    company_provider = (
-        src_models.CompanyProviders.objects.filter(
-            company_id=company_id,
-            provider_id=provider_id,
-            provider__status=src_enums.BrandProviderStatus.ACTIVE.value,
-        )
-        .select_related("provider")
-        .first()
-    )
+    company_provider = _live_refresh_connection(master_part_id, provider_id, company_id, scope)
     if company_provider is None:
         raise PartsServiceError("Not connected to this distributor.", status=400)
     if company_provider.paused_at is not None:
@@ -900,7 +1118,7 @@ def refresh_provider_live_inventory(
         )
         raise PartsServiceError("Error contacting the distributor. Try again shortly.", status=502)
 
-    part_detail = get_part_detail(master_part_id=master_part_id, company_id=company_id)
+    part_detail = get_part_detail(master_part_id=master_part_id, company_id=company_id, scope=scope)
     if part_detail is None:
         return None
     for row in part_detail["providers"]:

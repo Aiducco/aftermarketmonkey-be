@@ -42,11 +42,17 @@ INQUIRY = {
     "InvoiceAmount": 38.5099879,
     "ShippingRate": 16.42,
     "SalesTaxAmount": 0.0,
-    "Lines": [{
-        "LineNumber": 1, "PartNumber": "MAH4065MS-112-1", "QuantityShip": 1,
-        "QuantityBackOrder": 0, "QuantityAvailable": 4,
-        "Price": 22.0899879, "LineTotal": 22.0899879,
-    }],
+    "Lines": [
+        {
+            "LineNumber": 1,
+            "PartNumber": "MAH4065MS-112-1",
+            "QuantityShip": 1,
+            "QuantityBackOrder": 0,
+            "QuantityAvailable": 4,
+            "Price": 22.0899879,
+            "LineTotal": 22.0899879,
+        }
+    ],
     "AvailableShippingMethodRates": [
         {"ShippingMethodCode": "PFXG", "Description": "FedEx Ground", "Rate": 16.42},
         {"ShippingMethodCode": "PFO2", "Description": "FedEx OneRate 2 Day", "Rate": 9.99},
@@ -101,7 +107,8 @@ class ClientContractTests(SimpleTestCase):
     def test_both_mandatory_fields_are_always_in_the_body(self):
         body = self.client._purchase_order(
             [{"part_number": "A", "quantity": 2}, {"part_number": "B", "quantity": 1}],
-            payment_method_code="CREDITCARD", purchase_order_number="PO-1",
+            payment_method_code="CREDITCARD",
+            purchase_order_number="PO-1",
         )
         self.assertEqual(body["PaymentMethodCode"], "CREDITCARD")
         self.assertEqual(body["PurchaseOrderNumber"], "PO-1")
@@ -111,10 +118,17 @@ class ClientContractTests(SimpleTestCase):
     def test_optional_fields_are_omitted_rather_than_sent_empty(self):
         body = self.client._purchase_order(
             [{"part_number": "A", "quantity": 1}],
-            payment_method_code="CREDITCARD", purchase_order_number="PO-1",
+            payment_method_code="CREDITCARD",
+            purchase_order_number="PO-1",
         )
-        for absent in ("ShippingMethodCode", "DropShipAddress", "CreditCardLast4",
-                       "SpecialInstructions", "SignatureRequired", "FreightOptions"):
+        for absent in (
+            "ShippingMethodCode",
+            "DropShipAddress",
+            "CreditCardLast4",
+            "SpecialInstructions",
+            "SignatureRequired",
+            "FreightOptions",
+        ):
             self.assertNotIn(absent, body)
 
     def test_a_quote_reference_is_unique_and_obviously_not_a_real_po(self):
@@ -142,10 +156,12 @@ class PaymentMethodTests(SimpleTestCase):
         self.assertEqual(last4, "2517")
 
     def test_terms_accounts_win_over_a_card(self):
-        code, _ = self._client([
-            {"Code": "CREDITCARD", "Description": "card", "CreditCardLast4": "1111"},
-            {"Code": "ON ACCOUNT", "Description": "terms"},
-        ]).default_payment_method()
+        code, _ = self._client(
+            [
+                {"Code": "CREDITCARD", "Description": "card", "CreditCardLast4": "1111"},
+                {"Code": "ON ACCOUNT", "Description": "terms"},
+            ]
+        ).default_payment_method()
         self.assertEqual(code, "ON ACCOUNT")
 
     def test_cod_is_used_only_when_it_is_the_only_option(self):
@@ -163,10 +179,9 @@ class _ProviderPart:
     an earlier version of these tests passed a bare part number and so happily passed while the
     adapter was sending "322_MAH4065MS-112-1" to Motor State as a part number.
     """
+
     def __init__(self, part_number, pk=1, brand_id=322, external_id=None):
-        self.provider_external_id = (
-            external_id if external_id is not None else "{}_{}".format(brand_id, part_number)
-        )
+        self.provider_external_id = external_id if external_id is not None else "{}_{}".format(brand_id, part_number)
         self.id = pk
 
 
@@ -184,12 +199,24 @@ def _line(line_item_id, part_number, quantity):
 
 
 SHIP_TO = order_base.ShipToAddress(
-    name="Shop", address1="1 Main", city="Tampa", state="FL",
-    postal_code="33601", country="US", is_shop_address=True,
+    name="Shop",
+    address1="1 Main",
+    city="Tampa",
+    state="FL",
+    postal_code="33601",
+    country="US",
+    is_shop_address=True,
 )
 DROP_SHIP_TO = order_base.ShipToAddress(
-    name="Jane", address1="2 Oak", city="Tampa", state="FL",
-    postal_code="33601", country="US", is_shop_address=False, phone="555", email="j@x.com",
+    name="Jane",
+    address1="2 Oak",
+    city="Tampa",
+    state="FL",
+    postal_code="33601",
+    country="US",
+    is_shop_address=False,
+    phone="555",
+    email="j@x.com",
 )
 
 
@@ -244,8 +271,7 @@ class _Client:
 class QuoteTests(_AdapterHarness):
     def setUp(self):
         self.client = _Client()
-        self.result = self.adapter(self.client).get_shipping_quote(
-            [_line(11, "MAH4065MS-112-1", 1)], SHIP_TO)
+        self.result = self.adapter(self.client).get_shipping_quote([_line(11, "MAH4065MS-112-1", 1)], SHIP_TO)
 
     def test_a_quote_sends_a_throwaway_po_number(self):
         """Required by Motor State even though an inquiry creates nothing."""
@@ -279,20 +305,22 @@ class QuoteTests(_AdapterHarness):
         self.assertEqual([f.fee_type for f in self.result.fees], [])
 
     def test_a_business_rejection_surfaces_motor_states_own_words(self):
-        rejected = dict(INQUIRY, HasErrors=True, HeaderErrors=[
-            {"Message": "COD payment is not available for drop shipment orders.", "Code": 17},
-            {"Message": "FedEx has retired All COD services as of July 31st, 2023.", "Code": 20},
-        ])
+        rejected = dict(
+            INQUIRY,
+            HasErrors=True,
+            HeaderErrors=[
+                {"Message": "COD payment is not available for drop shipment orders.", "Code": 17},
+                {"Message": "FedEx has retired All COD services as of July 31st, 2023.", "Code": 20},
+            ],
+        )
         with self.assertRaises(order_exceptions.OrderValidationError) as ctx:
-            self.adapter(_Client(inquiry=rejected)).get_shipping_quote(
-                [_line(11, "MAH4065MS-112-1", 1)], SHIP_TO)
+            self.adapter(_Client(inquiry=rejected)).get_shipping_quote([_line(11, "MAH4065MS-112-1", 1)], SHIP_TO)
         self.assertIn("COD payment is not available", str(ctx.exception))
 
     def test_a_rejected_api_key_says_it_is_not_the_feed_login(self):
         err = ms_exceptions.MotorStatePermissionError(message="nope", code=403)
         with self.assertRaises(order_exceptions.OrderValidationError) as ctx:
-            self.adapter(_Client(raises=err)).get_shipping_quote(
-                [_line(11, "X", 1)], SHIP_TO)
+            self.adapter(_Client(raises=err)).get_shipping_quote([_line(11, "X", 1)], SHIP_TO)
         self.assertIn("separately from the FTP feed login", str(ctx.exception))
 
     def test_a_transport_failure_is_not_a_validation_error(self):
@@ -309,38 +337,52 @@ class LineLevelErrorTests(_AdapterHarness):
     explanation on Lines[].Errors. Read only the header and the dealer sees a quote with no
     shipping options and no reason.
     """
+
     TRUCK_ONLY = {
         "InvoiceAmount": 119.9902348,
-        "Lines": [{
-            "LineNumber": 1, "PartNumber": "ALL22202", "QuantityShip": 1,
-            "QuantityBackOrder": 0, "QuantityAvailable": 100,
-            "Price": 119.9902348, "LineTotal": 119.9902348,
-            "Errors": [{"Code": 1, "Message": (
-                "The selected Shipping Method is not valid for the product ALL22202. Please "
-                "select an allowable shipping method for this order.")}],
-        }],
+        "Lines": [
+            {
+                "LineNumber": 1,
+                "PartNumber": "ALL22202",
+                "QuantityShip": 1,
+                "QuantityBackOrder": 0,
+                "QuantityAvailable": 100,
+                "Price": 119.9902348,
+                "LineTotal": 119.9902348,
+                "Errors": [
+                    {
+                        "Code": 1,
+                        "Message": (
+                            "The selected Shipping Method is not valid for the product ALL22202. Please "
+                            "select an allowable shipping method for this order."
+                        ),
+                    }
+                ],
+            }
+        ],
         "AvailableShippingMethodRates": [],
         "HeaderErrors": [],
     }
 
     def test_an_unshippable_cart_raises_with_motor_states_own_wording(self):
         with self.assertRaises(order_exceptions.OrderValidationError) as ctx:
-            self.adapter(_Client(inquiry=self.TRUCK_ONLY)).get_shipping_quote(
-                [_line(11, "ALL22202", 1)], SHIP_TO)
+            self.adapter(_Client(inquiry=self.TRUCK_ONLY)).get_shipping_quote([_line(11, "ALL22202", 1)], SHIP_TO)
         self.assertIn("not valid for the product ALL22202", str(ctx.exception))
 
     def test_line_errors_ride_on_the_line_when_shipping_is_still_possible(self):
         """A warning on one line must not hide a cart the rest of which can ship."""
-        payload = dict(self.TRUCK_ONLY, AvailableShippingMethodRates=[
-            {"ShippingMethodCode": "tkpp", "Description": "Truck Freight", "Rate": 229.28}])
-        result = self.adapter(_Client(inquiry=payload)).get_shipping_quote(
-            [_line(11, "ALL22202", 1)], SHIP_TO)
+        payload = dict(
+            self.TRUCK_ONLY,
+            AvailableShippingMethodRates=[
+                {"ShippingMethodCode": "tkpp", "Description": "Truck Freight", "Rate": 229.28}
+            ],
+        )
+        result = self.adapter(_Client(inquiry=payload)).get_shipping_quote([_line(11, "ALL22202", 1)], SHIP_TO)
         self.assertEqual(result.lines[0].ship_options[0].service_level_code, "tkpp")
         self.assertIn("not valid for the product ALL22202", result.lines[0].flags[0])
 
     def test_a_clean_line_carries_no_flags(self):
-        result = self.adapter(_Client()).get_shipping_quote(
-            [_line(11, "MAH4065MS-112-1", 1)], SHIP_TO)
+        result = self.adapter(_Client()).get_shipping_quote([_line(11, "MAH4065MS-112-1", 1)], SHIP_TO)
         self.assertEqual(result.lines[0].flags, [])
 
 
@@ -361,8 +403,7 @@ class DropShipTests(_AdapterHarness):
 
 class PinnedPaymentMethodTests(_AdapterHarness):
     def test_an_account_can_pin_a_payment_method(self):
-        a = self.adapter(_Client(), order_credentials={
-            "api_key": "k", "payment_method_code": "ON ACCOUNT"})
+        a = self.adapter(_Client(), order_credentials={"api_key": "k", "payment_method_code": "ON ACCOUNT"})
         self.assertEqual(a._payment_method(), ("ON ACCOUNT", None))
 
     def test_otherwise_the_accounts_own_options_decide(self):
@@ -376,13 +417,21 @@ class PinnedPaymentMethodTests(_AdapterHarness):
 
 
 ORDER_RESULT = {
-    "OrderNumber": "4455667", "PurchaseOrderNumber": "PO-77", "Held": False,
-    "InvoiceAmount": 38.51, "ShippingRate": 16.42, "ShippingMethod": "FedEx Ground",
-    "TrackingNumbers": "1Z999AA1,1Z999AA2", "StatusDescription": "Shipped",
-    "ShipDate": "2026-10-29T00:00:00", "InvoiceDate": "2026-10-30T00:00:00",
-    "Lines": [{"PartNumber": "MAH4065MS-112-1", "QuantityShip": 1, "QuantityBackOrder": 0,
-               "Price": 22.09, "LineTotal": 22.09}],
-    "HeaderErrors": [], "Warnings": [],
+    "OrderNumber": "4455667",
+    "PurchaseOrderNumber": "PO-77",
+    "Held": False,
+    "InvoiceAmount": 38.51,
+    "ShippingRate": 16.42,
+    "ShippingMethod": "FedEx Ground",
+    "TrackingNumbers": "1Z999AA1,1Z999AA2",
+    "StatusDescription": "Shipped",
+    "ShipDate": "2026-10-29T00:00:00",
+    "InvoiceDate": "2026-10-30T00:00:00",
+    "Lines": [
+        {"PartNumber": "MAH4065MS-112-1", "QuantityShip": 1, "QuantityBackOrder": 0, "Price": 22.09, "LineTotal": 22.09}
+    ],
+    "HeaderErrors": [],
+    "Warnings": [],
 }
 
 
@@ -390,13 +439,15 @@ class _PO:
     id = 1
     po_number = "PO-77"
     po_name = None
+    po_prefix = None
     ship_method = "PFXG"
 
 
 class SubmitTests(_AdapterHarness):
     def test_a_placed_order_records_the_order_number_and_quantities(self):
         result = self.adapter(_Client(order=ORDER_RESULT)).submit_order(
-            _PO(), [_line(11, "MAH4065MS-112-1", 1)], SHIP_TO)
+            _PO(), [_line(11, "MAH4065MS-112-1", 1)], SHIP_TO
+        )
         self.assertEqual(result.distributor_order_numbers, ["4455667"])
         self.assertEqual(result.line_item_placements[0].quantity_confirmed, 1)
         self.assertTrue(result.distributor_confirmed)
@@ -404,20 +455,20 @@ class SubmitTests(_AdapterHarness):
     def test_a_held_order_is_not_reported_as_confirmed(self):
         """Held means Motor State parked it for review -- accepted, but not yet an order."""
         result = self.adapter(_Client(order=dict(ORDER_RESULT, Held=True))).submit_order(
-            _PO(), [_line(11, "MAH4065MS-112-1", 1)], SHIP_TO)
+            _PO(), [_line(11, "MAH4065MS-112-1", 1)], SHIP_TO
+        )
         self.assertFalse(result.distributor_confirmed)
 
     def test_no_order_number_is_an_error_not_a_silent_success(self):
         with self.assertRaises(order_exceptions.OrderValidationError):
             self.adapter(_Client(order=dict(ORDER_RESULT, OrderNumber=""))).submit_order(
-                _PO(), [_line(11, "MAH4065MS-112-1", 1)], SHIP_TO)
+                _PO(), [_line(11, "MAH4065MS-112-1", 1)], SHIP_TO
+            )
 
     def test_a_rejection_on_submit_surfaces_the_reason(self):
-        bad = dict(ORDER_RESULT, HasErrors=True, OrderNumber="",
-                   HeaderErrors=[{"Message": "Credit hold", "Code": 9}])
+        bad = dict(ORDER_RESULT, HasErrors=True, OrderNumber="", HeaderErrors=[{"Message": "Credit hold", "Code": 9}])
         with self.assertRaises(order_exceptions.OrderValidationError) as ctx:
-            self.adapter(_Client(order=bad)).submit_order(
-                _PO(), [_line(11, "MAH4065MS-112-1", 1)], SHIP_TO)
+            self.adapter(_Client(order=bad)).submit_order(_PO(), [_line(11, "MAH4065MS-112-1", 1)], SHIP_TO)
         self.assertIn("Credit hold", str(ctx.exception))
 
 
@@ -445,8 +496,9 @@ class StatusAndInvoiceTests(_AdapterHarness):
         self.assertEqual(inv.freight, Decimal("16.42"))
 
     def test_an_uninvoiced_order_produces_no_invoice(self):
-        a = self.adapter(_Client(orders=[{"Found": True, "Order": dict(
-            ORDER_RESULT, InvoiceDate=None, InvoiceAmount=None)}]))
+        a = self.adapter(
+            _Client(orders=[{"Found": True, "Order": dict(ORDER_RESULT, InvoiceDate=None, InvoiceAmount=None)}])
+        )
         self.assertEqual(a.get_invoices(_PO()), [])
 
 
@@ -456,11 +508,11 @@ class PartNumberUnpackingTests(SimpleTestCase):
     Motor State brand row id joined to the part number, and sending it unsplit means every
     order line names a part that does not exist.
     """
+
     databases = []
 
     def _unpack(self, external_id):
-        return ms_orders.MotorStateOrderAdapter.motorstate_part_number(
-            _ProviderPart(None, external_id=external_id))
+        return ms_orders.MotorStateOrderAdapter.motorstate_part_number(_ProviderPart(None, external_id=external_id))
 
     def test_the_brand_id_prefix_is_stripped(self):
         self.assertEqual(self._unpack("322_MAH4065MS-112-1"), "MAH4065MS-112-1")
@@ -476,7 +528,8 @@ class PartNumberUnpackingTests(SimpleTestCase):
 
     def test_the_cart_sends_the_unpacked_number(self):
         lines, index = ms_orders.MotorStateOrderAdapter._cart_lines(
-            [_line(11, "MAH4065MS-112-1", 1), _line(12, "AAA00004", 2)])
+            [_line(11, "MAH4065MS-112-1", 1), _line(12, "AAA00004", 2)]
+        )
         self.assertEqual([l["part_number"] for l in lines], ["MAH4065MS-112-1", "AAA00004"])
         self.assertEqual(index["MAH4065MS-112-1"], 11)
         self.assertNotIn("322_MAH4065MS-112-1", index)

@@ -27,6 +27,12 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument("--company-id", type=int, required=True)
+        parser.add_argument(
+            "--space-id",
+            type=int,
+            default=None,
+            help="The space whose ShopMonkey account to import into (default Main).",
+        )
         parser.add_argument("--old-brand", required=True, help="Exact name in the old tool's inventory_brand.")
         parser.add_argument("--our-brand-id", type=int, required=True, help="Our Brands.id. Explicit, never fuzzy.")
         parser.add_argument("--old-vendor", default=None, help="Old vendor name, if the brand exists under several.")
@@ -42,6 +48,7 @@ class Command(BaseCommand):
         parser.add_argument("--apply", action="store_true", help="Write. Without it nothing is written.")
 
     def handle(self, *args, **options):
+        space_id = import_services.resolve_space_id(options["company_id"], options["space_id"])
         plan = import_services.plan_brand_import(
             company_id=options["company_id"],
             old_brand_name=options["old_brand"],
@@ -49,9 +56,8 @@ class Command(BaseCommand):
             old_repo=options["old_repo"],
             old_vendor_name=options["old_vendor"],
             provider_kinds=options["provider"],
-            live_client=None
-            if options["skip_live_check"]
-            else shopmonkey_sync_services._client_for_company(options["company_id"]),
+            live_client=None if options["skip_live_check"] else shopmonkey_sync_services._client_for_space(space_id),
+            space_id=space_id,
         )
         old = plan.old_brand
         parts = old["parts"]

@@ -33,35 +33,55 @@ def _serialize(location: src_models.CompanyLocation) -> dict:
 
 
 def list_company_locations(company_id: int) -> list:
-    locations = src_models.CompanyLocation.objects.filter(company_id=company_id).order_by(
-        "-is_primary", "label"
-    )
+    locations = src_models.CompanyLocation.objects.filter(company_id=company_id).order_by("-is_primary", "label")
     return [_serialize(loc) for loc in locations]
+
+
+def list_space_addresses(company_id: int, space_ids: list) -> list:
+    """Flagged companies: the one address of each given space (never the old extra rows), each with its space_id."""
+    locations = src_models.CompanyLocation.objects.filter(
+        company_id=company_id, address_of_space__in=space_ids
+    ).order_by("-is_primary", "label")
+    rows = []
+    for loc in locations:
+        row = _serialize(loc)
+        row["space_id"] = loc.space_id
+        rows.append(row)
+    return rows
+
+
+def list_for_request(request, company_id: int) -> list:
+    """GET /company/locations/: a flagged company gets the addresses of the spaces the caller can see (raises
+    SpaceError 403 when the header names a space they cannot); any other company gets its address book."""
+    # Imported here: services.spaces imports this module.
+    from src.api.services import feature_flags as feature_flags_services
+    from src.api.services import spaces as spaces_services
+
+    if not feature_flags_services.company_has_feature(company_id, feature_flags_services.FEATURE_MULTI_SPACES):
+        return list_company_locations(company_id)
+    scope = spaces_services.resolve_scope(request)
+    if scope.requested_space_id is not None:
+        spaces_services.ensure_visible(scope, scope.requested_space_id)
+    return list_space_addresses(company_id, scope.list_space_ids)
 
 
 @transaction.atomic
 def create_company_location(company_id: int, **fields) -> dict:
     is_primary = bool(fields.pop("is_primary", False))
     if is_primary:
-        src_models.CompanyLocation.objects.filter(company_id=company_id, is_primary=True).update(
-            is_primary=False
-        )
+        src_models.CompanyLocation.objects.filter(company_id=company_id, is_primary=True).update(is_primary=False)
     elif not src_models.CompanyLocation.objects.filter(company_id=company_id).exists():
         # First location for a company defaults to primary so there's always one to fall back to.
         is_primary = True
 
-    location = src_models.CompanyLocation.objects.create(
-        company_id=company_id, is_primary=is_primary, **fields
-    )
+    location = src_models.CompanyLocation.objects.create(company_id=company_id, is_primary=is_primary, **fields)
     return _serialize(location)
 
 
 @transaction.atomic
 def update_company_location(company_id: int, location_id: int, **fields) -> dict | str:
     location = (
-        src_models.CompanyLocation.objects.select_for_update()
-        .filter(id=location_id, company_id=company_id)
-        .first()
+        src_models.CompanyLocation.objects.select_for_update().filter(id=location_id, company_id=company_id).first()
     )
     if not location:
         return "Location not found"
@@ -85,9 +105,7 @@ def update_company_location(company_id: int, location_id: int, **fields) -> dict
 @transaction.atomic
 def delete_company_location(company_id: int, location_id: int) -> str | None:
     location = (
-        src_models.CompanyLocation.objects.select_for_update()
-        .filter(id=location_id, company_id=company_id)
-        .first()
+        src_models.CompanyLocation.objects.select_for_update().filter(id=location_id, company_id=company_id).first()
     )
     if not location:
         return "Location not found"
@@ -96,9 +114,7 @@ def delete_company_location(company_id: int, location_id: int) -> str | None:
     location.delete()
 
     if was_primary:
-        next_location = (
-            src_models.CompanyLocation.objects.filter(company_id=company_id).order_by("label").first()
-        )
+        next_location = src_models.CompanyLocation.objects.filter(company_id=company_id).order_by("label").first()
         if next_location:
             next_location.is_primary = True
             next_location.save(update_fields=["is_primary", "updated_at"])

@@ -4,8 +4,13 @@ import enum
 from django.contrib.auth import models as auth_models
 from django.contrib.postgres import fields as pg_fields
 from django.core.serializers.json import DjangoJSONEncoder
+from django.db import IntegrityError
 from django.db import models as django_db_models
+from django.db import transaction
+from django.db.models import functions as django_db_models_functions
 from django.utils import timezone
+
+from src.enums import SpaceKind
 
 
 class Company(django_db_models.Model):
@@ -96,8 +101,34 @@ class Company(django_db_models.Model):
     # for the same person) rather than opening a second one.
     freshsales_deal_id = django_db_models.TextField(null=True, blank=True)
 
+    # Space allowance (see billing.space_allowance). additional_spaces is the paid "additional space"
+    # add-on quantity, written only by the Stripe subscription sync and cleared with the subscription;
+    # space_base_override is the base a staff member set (>= 1), replacing the plan's base while set.
+    additional_spaces = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+    space_base_override = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+
+    # Feed tenant (ADR 0002): a hidden child row that holds one space's OWN distributor connections and their
+    # pricing rows. NULL for every real company. PROTECT: a parent with tenants is never deleted in a request
+    # (delete_all_company_data refuses; purge_feed_tenants is the only path).
+    parent_company = django_db_models.ForeignKey(
+        "self",
+        on_delete=django_db_models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="feed_tenants",
+        db_index=True,
+    )
+
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    @property
+    def customer_company(self) -> "Company":
+        """The company that is the customer: itself, or the parent for a feed tenant. Responses, emails and rows
+        created "for the company" use this, never the tenant."""
+        if self.parent_company_id is None:
+            return self
+        return self.parent_company
 
     class Meta:
         db_table = "company"
@@ -148,11 +179,158 @@ class CompanyLocation(django_db_models.Model):
 
     is_primary = django_db_models.BooleanField(default=False)
 
+    # Every address belongs to a space (see Space). save() fills the company's main space when the
+    # caller sets none, so the address book's creation path stays untouched.
+    space = django_db_models.ForeignKey("Space", on_delete=django_db_models.CASCADE, related_name="locations")
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    def save(self, *args, **kwargs):
+        if self.space_id is None:
+            self.space = Space.objects.main_for(self.company_id)
+        super().save(*args, **kwargs)
+        if self.is_primary:
+            self._main_space_follows_primary()
+
+    def _main_space_follows_primary(self) -> None:
+        """While the company is unflagged (multi_spaces off) its main space's address is simply its
+        primary location, so turning the flag on finds the right one. Flagged companies edit a space's
+        address through the spaces API instead."""
+        # Imported here: feature_flags imports this module.
+        from src.api.services import feature_flags
+
+        if feature_flags.company_has_feature(self.company_id, feature_flags.FEATURE_MULTI_SPACES):
+            return
+        Space.objects.filter(company_id=self.company_id, is_main=True).exclude(location_id=self.id).update(
+            location=self
+        )
+
+    class Meta:
+        db_table = "company_locations"
+
+
+class SpaceManager(django_db_models.Manager):
+    def main_for(self, company_id: int) -> "Space":
+        """The company's main space, created on first use (so no company-creation path has to remember
+        to make one). Named after the primary location's label (else the company name) and linked to
+        that location. Safe under concurrency: the partial unique index lets one creator win and the
+        loser reads its row."""
+        space = self.filter(company_id=company_id, is_main=True).first()
+        if space:
+            return space
+        # A feed tenant never has a space of its own (ADR 0002); only a bug could ask for one.
+        if Company.objects.filter(id=company_id, parent_company__isnull=False).exists():
+            raise ValueError("Company {} is a feed tenant and has no main space.".format(company_id))
+        primary = CompanyLocation.objects.filter(company_id=company_id, is_primary=True).order_by("id").first()
+        name = primary.label if primary else Company.objects.values_list("name", flat=True).get(id=company_id)
+        try:
+            with transaction.atomic():
+                return self.create(
+                    company_id=company_id,
+                    kind=SpaceKind.LOCATION.value,
+                    kind_name=SpaceKind.LOCATION.name,
+                    name=name,
+                    is_main=True,
+                    location=primary,
+                )
+        except IntegrityError:
+            space = self.filter(company_id=company_id, is_main=True).first()
+            if space is None:
+                raise
+            return space
+
+
+class Space(django_db_models.Model):
+    """
+    A part of a company that orders on its own: a shop (Location, exactly one address) or an Online
+    store (no address). Every company has one main space, created on first use (Space.objects.main_for);
+    purchase orders, external orders and addresses each belong to one space. Only companies with the
+    multi_spaces feature flag see or filter by spaces: unflagged, everything sits in the main space.
+
+    No rows means the owner (ADR 0001): an order account with no ``order_accounts`` rows is used by the
+    space that owns its connection, and a non-admin member with no ``members`` rows sees the main space
+    only. A reader that counts rows sees zero; the API never writes an empty set.
+    """
+
+    company = django_db_models.ForeignKey(Company, on_delete=django_db_models.CASCADE, related_name="spaces")
+
+    kind = django_db_models.PositiveSmallIntegerField()
+    kind_name = django_db_models.CharField(max_length=32)
+    name = django_db_models.CharField(max_length=255)
+    # Letters/digits put in front of the PO numbers sent to distributors; null only for the main space.
+    prefix = django_db_models.CharField(max_length=16, null=True, blank=True)
+    is_main = django_db_models.BooleanField(default=False)
+
+    # The space's one address (a Location); deleting the address leaves the space, deleting the space
+    # deletes the address (CompanyLocation.space is CASCADE).
+    location = django_db_models.OneToOneField(
+        CompanyLocation,
+        on_delete=django_db_models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="address_of_space",
+    )
+    # The hidden feed tenant that holds this space's own distributor connections (ADR 0002); null until the
+    # space's first own feed. PROTECT: a tenant with rows is removed only by purge_feed_tenants.
+    feed_company = django_db_models.OneToOneField(
+        Company,
+        on_delete=django_db_models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="feed_of_space",
+    )
+    members = django_db_models.ManyToManyField(
+        "UserProfile", related_name="spaces", blank=True, db_table="space_members"
+    )
+    order_accounts = django_db_models.ManyToManyField(
+        "CompanyProviderOrderAccount", related_name="spaces", blank=True, db_table="space_order_accounts"
+    )
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    objects = SpaceManager()
+
+    class Meta:
+        db_table = "spaces"
+        constraints = [
+            django_db_models.UniqueConstraint(
+                fields=["company"],
+                condition=django_db_models.Q(is_main=True),
+                name="space_one_main_per_company",
+            ),
+            django_db_models.UniqueConstraint(
+                django_db_models_functions.Lower("name"),
+                "company",
+                name="space_name_unique_per_company",
+            ),
+        ]
+
+
+class SpaceProvider(django_db_models.Model):
+    """
+    Which connection a space uses for a distributor (ADR 0002): exactly one per (space, provider). The owner
+    space's row points at its own connection (added by CompanyProviders.save() on create); a space that shares
+    another space's feed has a row pointing at that connection. Flag off: readers ignore this table.
+    """
+
+    space = django_db_models.ForeignKey(Space, on_delete=django_db_models.CASCADE, related_name="space_providers")
+    provider = django_db_models.ForeignKey(
+        "Providers", on_delete=django_db_models.CASCADE, related_name="space_providers"
+    )
+    company_provider = django_db_models.ForeignKey(
+        "CompanyProviders", on_delete=django_db_models.CASCADE, related_name="space_providers"
+    )
+
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
 
     class Meta:
-        db_table = "company_locations"
+        db_table = "space_providers"
+        constraints = [
+            django_db_models.UniqueConstraint(fields=["space", "provider"], name="space_provider_unique"),
+        ]
 
 
 class CompanyDestinations(django_db_models.Model):
@@ -263,6 +441,26 @@ class CompanyProviders(django_db_models.Model):
     # Null means "never propagated" -- process everything. Only wired for Meyer so far.
     pricing_propagation_watermark = django_db_models.DateTimeField(null=True, blank=True)
 
+    def save(self, *args, **kwargs):
+        creating = self._state.adding
+        super().save(*args, **kwargs)
+        if creating:
+            self._add_owner_space_row()
+
+    def _add_owner_space_row(self) -> None:
+        """On create, record the owner space's use of this connection (ADR 0002): the main space for a real
+        company, the tenant's space for a tenant. Only when that space has no row for the provider: an existing
+        row (a share, or the owner's own) is never replaced here, the connect path records the owner's use.
+        bulk_create and queryset update() skip this: no code creates connections that way."""
+        owner = Space.objects.filter(feed_company_id=self.company_id).first()
+        if owner is None:
+            if Company.objects.filter(id=self.company_id, parent_company__isnull=False).exists():
+                return  # a tenant that no space points at yet: the space claims it when it is linked
+            owner = Space.objects.main_for(self.company_id)
+        SpaceProvider.objects.get_or_create(
+            space=owner, provider_id=self.provider_id, defaults={"company_provider": self}
+        )
+
     class Meta:
         db_table = "company_providers"
         unique_together = ["company", "provider"]
@@ -366,12 +564,29 @@ class CompanyShopManagementProviders(django_db_models.Model):
     status_reason = django_db_models.TextField(null=True, blank=True)
     status_checked_at = django_db_models.DateTimeField(null=True, blank=True)
 
+    # The one space this connection belongs to (ADR 0002): one shop-system account serves exactly one space, and a
+    # space has at most one connection. Nothing here names a system. ``save()`` fills the main space when unset.
+    space = django_db_models.OneToOneField(Space, on_delete=django_db_models.PROTECT, related_name="shop_connection")
+    # sha256 of the credential fields the system's catalog entry names as the account identity
+    # (src.domain.account_fingerprint); null when the account cannot be recognised.
+    credentials_fingerprint = django_db_models.CharField(max_length=64, null=True, blank=True)
+
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
 
+    def save(self, *args, **kwargs):
+        if self.space_id is None:
+            self.space = Space.objects.main_for(self.company_id)
+        super().save(*args, **kwargs)
+
     class Meta:
         db_table = "company_shop_management_providers"
-        unique_together = ["company", "provider"]
+        constraints = [
+            django_db_models.UniqueConstraint(
+                fields=["company", "provider", "credentials_fingerprint"],
+                name="shop_connection_account_unique",
+            ),
+        ]
 
 
 class IntegrationRequest(django_db_models.Model):
@@ -398,9 +613,7 @@ class CompanyFeatureFlags(django_db_models.Model):
     internal account) while it's being built out.
     """
 
-    company = django_db_models.ForeignKey(
-        Company, on_delete=django_db_models.CASCADE, related_name="feature_flags"
-    )
+    company = django_db_models.ForeignKey(Company, on_delete=django_db_models.CASCADE, related_name="feature_flags")
     feature = django_db_models.CharField(max_length=64)
     enabled = django_db_models.BooleanField(default=True)
 
@@ -465,12 +678,24 @@ class ShopMonkeySyncVendor(django_db_models.Model):
     status = django_db_models.PositiveSmallIntegerField()
     status_name = django_db_models.CharField(max_length=32)
 
+    # The space whose shop-system connection this row syncs to; ``save()`` fills the main space when unset.
+    space = django_db_models.ForeignKey(
+        Space, on_delete=django_db_models.PROTECT, related_name="shopmonkey_sync_vendors"
+    )
+
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
 
+    def save(self, *args, **kwargs):
+        if self.space_id is None:
+            self.space = Space.objects.main_for(self.company_id)
+        super().save(*args, **kwargs)
+
     class Meta:
         db_table = "shopmonkey_sync_vendor"
-        unique_together = ["company", "provider"]
+        constraints = [
+            django_db_models.UniqueConstraint(fields=["space", "provider"], name="shopmonkey_vendor_space_provider"),
+        ]
 
 
 class ShopMonkeySyncBrand(django_db_models.Model):
@@ -509,12 +734,24 @@ class ShopMonkeySyncBrand(django_db_models.Model):
     status = django_db_models.PositiveSmallIntegerField()
     status_name = django_db_models.CharField(max_length=32)
 
+    # The space whose shop-system connection this row syncs to; ``save()`` fills the main space when unset.
+    space = django_db_models.ForeignKey(
+        Space, on_delete=django_db_models.PROTECT, related_name="shopmonkey_sync_brands"
+    )
+
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
 
+    def save(self, *args, **kwargs):
+        if self.space_id is None:
+            self.space = Space.objects.main_for(self.company_id)
+        super().save(*args, **kwargs)
+
     class Meta:
         db_table = "shopmonkey_sync_brand"
-        unique_together = ["company", "brand"]
+        constraints = [
+            django_db_models.UniqueConstraint(fields=["space", "brand"], name="shopmonkey_brand_space_brand"),
+        ]
 
 
 class ShopMonkeySyncBrandVendor(django_db_models.Model):
@@ -647,8 +884,18 @@ class ShopMonkeySyncExecution(django_db_models.Model):
     message = django_db_models.TextField(null=True, blank=True)
     metadata = django_db_models.JSONField(default=dict)
 
+    # The space whose shop-system connection this run belongs to; ``save()`` fills the main space when unset.
+    space = django_db_models.ForeignKey(
+        Space, on_delete=django_db_models.PROTECT, related_name="shopmonkey_sync_executions"
+    )
+
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    def save(self, *args, **kwargs):
+        if self.space_id is None:
+            self.space = Space.objects.main_for(self.company_id)
+        super().save(*args, **kwargs)
 
     class Meta:
         db_table = "shopmonkey_sync_execution"
@@ -1767,7 +2014,9 @@ class TSECompanyPricing(django_db_models.Model):
     """
 
     part = django_db_models.ForeignKey(TSEParts, on_delete=django_db_models.CASCADE, related_name="company_pricing")
-    company = django_db_models.ForeignKey(Company, on_delete=django_db_models.CASCADE, related_name="tse_company_pricing")
+    company = django_db_models.ForeignKey(
+        Company, on_delete=django_db_models.CASCADE, related_name="tse_company_pricing"
+    )
     # account_price from get_inventory_and_pricing -- what THIS company's account actually pays.
     cost = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True)
     # list_price from the same response -- Tri-State's own MSRP/list, not a separate dealer tier
@@ -1807,7 +2056,9 @@ class AllProBrand(django_db_models.Model):
 
 
 class BrandAllProBrandMapping(django_db_models.Model):
-    brand = django_db_models.ForeignKey(Brands, on_delete=django_db_models.CASCADE, related_name="allpro_brand_mappings")
+    brand = django_db_models.ForeignKey(
+        Brands, on_delete=django_db_models.CASCADE, related_name="allpro_brand_mappings"
+    )
     allpro_brand = django_db_models.ForeignKey(
         AllProBrand, on_delete=django_db_models.CASCADE, related_name="brand_mappings"
     )
@@ -1886,7 +2137,9 @@ class AllProCompanyPricing(django_db_models.Model):
     """
 
     part = django_db_models.ForeignKey(AllProParts, on_delete=django_db_models.CASCADE, related_name="company_pricing")
-    company = django_db_models.ForeignKey(Company, on_delete=django_db_models.CASCADE, related_name="allpro_company_pricing")
+    company = django_db_models.ForeignKey(
+        Company, on_delete=django_db_models.CASCADE, related_name="allpro_company_pricing"
+    )
     cost = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True)
 
     created_at = django_db_models.DateTimeField(auto_now_add=True)
@@ -4117,6 +4370,11 @@ class PurchaseOrder(django_db_models.Model):
         null=True,
         blank=True,
     )
+    # The space this PO belongs to (see Space); save() fills the company's main space when unset.
+    space = django_db_models.ForeignKey("Space", on_delete=django_db_models.PROTECT, related_name="purchase_orders")
+    # The space's prefix, taken on every submit attempt and frozen once submitted; null for the main
+    # space, every PO that existed before spaces and every unflagged company (see resolve_po_number).
+    po_prefix = django_db_models.CharField(max_length=16, null=True, blank=True)
     group = django_db_models.ForeignKey(
         PurchaseOrderGroup,
         on_delete=django_db_models.SET_NULL,
@@ -4229,6 +4487,11 @@ class PurchaseOrder(django_db_models.Model):
     # its own module docstring for the exact policy.
     distributor_status_checked_at = django_db_models.DateTimeField(null=True, blank=True)
 
+    def save(self, *args, **kwargs):
+        if self.space_id is None:
+            self.space = Space.objects.main_for(self.company_id)
+        super().save(*args, **kwargs)
+
     class Meta:
         db_table = "purchase_orders"
         indexes = [
@@ -4249,15 +4512,17 @@ class PurchaseOrder(django_db_models.Model):
             # *default* account (order_account=None, still the overwhelming majority of
             # connections) coexist silently, which is exactly the bug this constraint exists to
             # prevent. The two conditions partition every PO into exactly one of them.
+            # Per space as well: two spaces of one company may each have an open cart on the same
+            # connection and account (a company with one space is unchanged).
             django_db_models.UniqueConstraint(
-                fields=["company", "company_provider"],
+                fields=["company", "space", "company_provider"],
                 condition=django_db_models.Q(status__in=[1, 2], order_account__isnull=True),
-                name="po_one_open_draft_per_company_provider",
+                name="po_one_open_draft_per_space_company_provider",
             ),
             django_db_models.UniqueConstraint(
-                fields=["company", "company_provider", "order_account"],
+                fields=["company", "space", "company_provider", "order_account"],
                 condition=django_db_models.Q(status__in=[1, 2], order_account__isnull=False),
-                name="po_one_open_draft_per_company_provider_order_account",
+                name="po_one_open_draft_per_space_company_provider_order_account",
             ),
         ]
 
@@ -4664,8 +4929,27 @@ class ExternalPurchaseOrder(django_db_models.Model):
 
     raw_response = django_db_models.JSONField(null=True, blank=True, encoder=DjangoJSONEncoder)
 
+    # The space this order sits in (see Space); save() fills the company's main space when unset.
+    space = django_db_models.ForeignKey(
+        "Space", on_delete=django_db_models.PROTECT, related_name="external_purchase_orders"
+    )
+    # Why it sits there (src.enums.ExternalOrderSpaceReason); null until a flagged sync or a move sets it.
+    space_reason = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+    space_reason_name = django_db_models.CharField(max_length=16, null=True, blank=True)
+    # The prefix that matched, when the reason is PREFIX.
+    space_reason_prefix = django_db_models.CharField(max_length=16, null=True, blank=True)
+    space_moved_by = django_db_models.ForeignKey(
+        "UserProfile", on_delete=django_db_models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    space_moved_at = django_db_models.DateTimeField(null=True, blank=True)
+
     discovered_at = django_db_models.DateTimeField(auto_now_add=True)
     last_synced_at = django_db_models.DateTimeField(auto_now=True)
+
+    def save(self, *args, **kwargs):
+        if self.space_id is None:
+            self.space = Space.objects.main_for(self.company_id)
+        super().save(*args, **kwargs)
 
     class Meta:
         db_table = "external_purchase_orders"
@@ -8737,7 +9021,9 @@ class ATDCompanyPricing(django_db_models.Model):
     """
 
     part = django_db_models.ForeignKey(ATDPart, on_delete=django_db_models.CASCADE, related_name="company_pricing")
-    company = django_db_models.ForeignKey(Company, on_delete=django_db_models.CASCADE, related_name="atd_company_pricing")
+    company = django_db_models.ForeignKey(
+        Company, on_delete=django_db_models.CASCADE, related_name="atd_company_pricing"
+    )
 
     cost = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     fet = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
@@ -9321,6 +9607,8 @@ class PaceMwwPart(PacePartBase):
             django_db_models.Index(fields=["aaia_brand_code", "part"], name="pwp_brand_part_idx"),
             django_db_models.Index(fields=["aaia_brand_code", "price"], name="pwp_brand_price_idx"),
         ]
+
+
 # =============================================================================================
 # CONSOLIDATED PACE CATALOG -- one deduplicated set of tables built from the nine per-member
 # pace_<member>_* landing tables by the `consolidate_pace_catalog` command. Replaces reading
@@ -9528,9 +9816,7 @@ class BrandPaceBrandMapping(django_db_models.Model):
     reverted without disturbing the exact-code ones.
     """
 
-    brand = django_db_models.ForeignKey(
-        Brands, on_delete=django_db_models.CASCADE, related_name="pace_brand_mappings"
-    )
+    brand = django_db_models.ForeignKey(Brands, on_delete=django_db_models.CASCADE, related_name="pace_brand_mappings")
     pace_brand = django_db_models.ForeignKey(
         PaceBrand, on_delete=django_db_models.CASCADE, related_name="brand_mappings"
     )
@@ -9601,9 +9887,7 @@ class ApolloPhoneReveal(django_db_models.Model):
 
     # The callback body verbatim. Apollo's phone payload shape is undocumented and has changed
     # before; keeping it means a reshape can be re-derived without re-spending credits.
-    raw_payload = django_db_models.JSONField(
-        default=dict, blank=True, encoder=DjangoJSONEncoder
-    )
+    raw_payload = django_db_models.JSONField(default=dict, blank=True, encoder=DjangoJSONEncoder)
 
     requested_at = django_db_models.DateTimeField(default=timezone.now)
     received_at = django_db_models.DateTimeField(null=True, blank=True)
@@ -9637,6 +9921,7 @@ class EdiControlNumber(django_db_models.Model):
     from Rough Country keep independent sequences, which is required, since each has its own
     interchange history with the partner.
     """
+
     KIND_INTERCHANGE = "isa"  # ISA13 -- 9 digits, unique per partner for the life of the account
     KIND_GROUP = "gs"  # GS06
     KIND_TRANSACTION = "st"  # ST02
@@ -9675,6 +9960,7 @@ class EdiDocument(django_db_models.Model):
     naming a PO we do not have must still land somewhere a human can find it (status
     UNMATCHED), never be dropped on the floor.
     """
+
     direction = django_db_models.PositiveSmallIntegerField()
     direction_name = django_db_models.CharField(max_length=16)
     # The other side's ISA id: who sent it to us, or who we sent it to.
@@ -9735,6 +10021,7 @@ class ThoroughbredBrand(django_db_models.Model):
     HawkSearch has no separate brand-list endpoint, so brands are only known by crawling the
     catalog itself. name is the natural key, same shape as WheelProsBrand (no AAIA code --
     Thoroughbred brands are bare names, not AAIA-coded)."""
+
     name = django_db_models.CharField(max_length=255, unique=True)
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
@@ -9772,6 +10059,7 @@ class ThoroughbredParts(django_db_models.Model):
     string. inventory has the 99999999 unlimited/dropship sentinel clamped to NULL before
     storage, never persisted raw. vehicleid is the raw int list straight off the doc -- fitment
     sync reads it directly, no junction table."""
+
     brand = django_db_models.ForeignKey(
         ThoroughbredBrand, on_delete=django_db_models.CASCADE, related_name="parts", null=True
     )
@@ -9806,6 +10094,7 @@ class ThoroughbredCompanyPricing(django_db_models.Model):
     CompanyProviders.credentials["markup"] -- see services/thoroughbred.py:dealer_cost_from_retail.
     markup_percent_applied is kept purely as an audit trail of what percentage produced it (no
     raw per-company feed exists to reconcile against, unlike AllPro/TSE)."""
+
     part = django_db_models.ForeignKey(
         ThoroughbredParts, on_delete=django_db_models.CASCADE, related_name="company_pricing"
     )
@@ -9813,9 +10102,7 @@ class ThoroughbredCompanyPricing(django_db_models.Model):
         Company, on_delete=django_db_models.CASCADE, related_name="thoroughbred_company_pricing"
     )
     cost = django_db_models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
-    markup_percent_applied = django_db_models.DecimalField(
-        max_digits=5, decimal_places=2, null=True, blank=True
-    )
+    markup_percent_applied = django_db_models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
 
@@ -9832,6 +10119,7 @@ class ThoroughbredVehicle(django_db_models.Model):
     carry "" for those three fields). A decode miss (e.g. the confirmed orphan vehicle id 1678,
     referenced by products but unreachable via the picker walk) is simply absent here -- callers
     must treat it as "drop this fitment edge," never a hard failure."""
+
     vehicle_id = django_db_models.IntegerField(unique=True)
     year = django_db_models.IntegerField()
     make = django_db_models.CharField(max_length=128)
@@ -9857,6 +10145,7 @@ class XdpBrand(django_db_models.Model):
 
     XDP's own house brand is one row here, named "XDP", and is the only brand with a real dealer
     cost feed behind it (see XdpCompanyPricing.cost_source)."""
+
     name = django_db_models.CharField(max_length=255, unique=True)
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
@@ -9869,12 +10158,8 @@ class XdpBrand(django_db_models.Model):
 
 
 class BrandXdpBrandMapping(django_db_models.Model):
-    brand = django_db_models.ForeignKey(
-        Brands, on_delete=django_db_models.CASCADE, related_name="xdp_brand_mappings"
-    )
-    xdp_brand = django_db_models.ForeignKey(
-        XdpBrand, on_delete=django_db_models.CASCADE, related_name="brand_mappings"
-    )
+    brand = django_db_models.ForeignKey(Brands, on_delete=django_db_models.CASCADE, related_name="xdp_brand_mappings")
+    xdp_brand = django_db_models.ForeignKey(XdpBrand, on_delete=django_db_models.CASCADE, related_name="brand_mappings")
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
 
@@ -9916,9 +10201,8 @@ class XdpPart(django_db_models.Model):
     that covers the whole catalog, and it is a boolean, not a count. Per-company quantity lives
     on XdpCompanyPricing.quantity, same split NtwParts/NtwCompanyPricing uses.
     """
-    brand = django_db_models.ForeignKey(
-        XdpBrand, on_delete=django_db_models.CASCADE, related_name="parts", null=True
-    )
+
+    brand = django_db_models.ForeignKey(XdpBrand, on_delete=django_db_models.CASCADE, related_name="parts", null=True)
     code = django_db_models.CharField(max_length=64, unique=True)
     product_id = django_db_models.CharField(max_length=64, null=True, blank=True, db_index=True)
     sku = django_db_models.CharField(max_length=255, null=True, blank=True, db_index=True)
@@ -9991,9 +10275,8 @@ class XdpCompanyPricing(django_db_models.Model):
     ``quantity`` is this company's own feed quantity, already clamped at >= 0 (the feed reports
     negatives for oversold lines). Null for resold brands.
     """
-    part = django_db_models.ForeignKey(
-        XdpPart, on_delete=django_db_models.CASCADE, related_name="company_pricing"
-    )
+
+    part = django_db_models.ForeignKey(XdpPart, on_delete=django_db_models.CASCADE, related_name="company_pricing")
     company = django_db_models.ForeignKey(
         Company, on_delete=django_db_models.CASCADE, related_name="xdp_company_pricing"
     )
@@ -10001,9 +10284,7 @@ class XdpCompanyPricing(django_db_models.Model):
     map_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     retail_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     quantity = django_db_models.IntegerField(null=True, blank=True)
-    markup_percent_applied = django_db_models.DecimalField(
-        max_digits=5, decimal_places=2, null=True, blank=True
-    )
+    markup_percent_applied = django_db_models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
     # "feed" | "markup" -- see class docstring.
     cost_source = django_db_models.CharField(max_length=16, null=True, blank=True)
     created_at = django_db_models.DateTimeField(auto_now_add=True)
@@ -10026,6 +10307,7 @@ class RandysBrand(django_db_models.Model):
     "Yukon Gear & Axle" (11). They are separate vendor values on RANDYS' side, so they get
     separate rows here and the brand-mapping step is what collapses them onto one ``Brands`` row.
     """
+
     name = django_db_models.CharField(max_length=255, unique=True)
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
@@ -10078,6 +10360,7 @@ class RandysPart(django_db_models.Model):
     ("1992 - 1994, 1996 - 1997, 1999, 2001 - 2003") and must be expanded, never parsed as an int;
     services.randys.expand_randys_year_field is the only thing that should read it.
     """
+
     brand = django_db_models.ForeignKey(
         RandysBrand, on_delete=django_db_models.CASCADE, related_name="parts", null=True
     )
@@ -10091,9 +10374,7 @@ class RandysPart(django_db_models.Model):
     image_urls = django_db_models.JSONField(null=True, blank=True)
     # RANDYS' published retail price -- NOT a dealer cost. See class docstring.
     price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
-    compare_at_price = django_db_models.DecimalField(
-        max_digits=12, decimal_places=2, null=True, blank=True
-    )
+    compare_at_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     # Coarse catalogue-wide stock flag from the index; the only stock signal that exists publicly.
     in_stock = django_db_models.BooleanField(null=True, blank=True)
     # RANDYS-wide quantity from the SFTP inventory push. Null until the first file arrives.
@@ -10150,26 +10431,16 @@ class RandysCompanyPricing(django_db_models.Model):
     alongside a real cost.
     """
 
-    part = django_db_models.ForeignKey(
-        RandysPart, on_delete=django_db_models.CASCADE, related_name="company_pricing"
-    )
+    part = django_db_models.ForeignKey(RandysPart, on_delete=django_db_models.CASCADE, related_name="company_pricing")
     company = django_db_models.ForeignKey(
         Company, on_delete=django_db_models.CASCADE, related_name="randys_company_pricing"
     )
     cost = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
-    jobber_price = django_db_models.DecimalField(
-        max_digits=12, decimal_places=2, null=True, blank=True
-    )
-    map_price = django_db_models.DecimalField(
-        max_digits=12, decimal_places=2, null=True, blank=True
-    )
-    retail_price = django_db_models.DecimalField(
-        max_digits=12, decimal_places=2, null=True, blank=True
-    )
+    jobber_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    map_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    retail_price = django_db_models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     # Markup percent used when cost_source == "markup"; null when cost came from a feed.
-    markup_percent_applied = django_db_models.DecimalField(
-        max_digits=5, decimal_places=2, null=True, blank=True
-    )
+    markup_percent_applied = django_db_models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
     # "feed" (real per-dealer cost RANDYS delivered) | "markup" (derived from the company's own
     # markup off RANDYS' retail). Never null when cost is set, so the two can't be confused.
     cost_source = django_db_models.CharField(max_length=16, null=True, blank=True)

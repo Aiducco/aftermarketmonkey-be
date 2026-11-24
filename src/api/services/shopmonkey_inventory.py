@@ -8,10 +8,13 @@ src.api.services.shop_management gates the whole Shop Management category.
 import logging
 import typing
 
-from src import enums as src_enums
+from django.db import models as django_db_models
+
 from src import constants as src_constants
+from src import enums as src_enums
 from src import models as src_models
 from src.api.services import inventory_access as inventory_access_services
+from src.api.services import spaces as spaces_services
 from src.integrations.services import shopmonkey_sync as shopmonkey_sync_services
 
 logger = logging.getLogger(__name__)
@@ -21,6 +24,8 @@ ERROR_FEATURE_NOT_AVAILABLE = "feature_not_available"
 ERROR_NOT_FOUND = "not_found"
 ERROR_INVALID_INPUT = "invalid_input"
 ERROR_CONFLICT = "conflict"
+# Raised as spaces_services.SpaceError (multi-spaces S5, AC-46).
+ERROR_NO_SHOP_SYSTEM = "no_shop_system"
 
 # Paging ceilings -- same shape as list_part_detail_audit_history (src/api/services/parts.py).
 _PARTS_MAX_LIMIT = 500
@@ -31,6 +36,72 @@ _EXECUTIONS_DEFAULT_LIMIT = 50
 
 def _feature_enabled(company_id: int) -> bool:
     return inventory_access_services.company_has_inventory_access(company_id)
+
+
+def _spaced(scope: typing.Optional[spaces_services.SpaceScope]) -> bool:
+    """True for a company with the multi_spaces flag; everyone else is answered exactly as before."""
+    return scope is not None and scope.enabled
+
+
+def _space_ref(scope: spaces_services.SpaceScope, space_id: int) -> typing.Dict[str, typing.Any]:
+    return {"id": space_id, "name": scope.space_names.get(space_id)}
+
+
+# No space has this id: filtering by it answers "nothing". A caller who can see no space (a removed member's token)
+# gets that, never the main space's data.
+_NO_SPACE_ID = 0
+
+
+def _inventory_space_id(scope: spaces_services.SpaceScope) -> int:
+    """The space an inventory read answers for: the header's space when visible; in "all" (or absent, or not visible)
+    the main space when visible, else the lowest-id visible space with a shop connection, else the lowest-id visible
+    space, else _NO_SPACE_ID when the caller can see none. Sync brands and executions belong to one shop account, so
+    "all" is not a merge of spaces."""
+    current = scope.current_space_id
+    if current is not None:
+        return current
+    if not scope.visible_space_ids:
+        return _NO_SPACE_ID
+    if scope.main_space_id in scope.visible_space_ids:
+        return scope.main_space_id
+    visible = sorted(scope.visible_space_ids)
+    with_connection = sorted(
+        src_models.CompanyShopManagementProviders.objects.filter(active=True, space_id__in=visible).values_list(
+            "space_id", flat=True
+        )
+    )
+    if with_connection:
+        return with_connection[0]
+    return visible[0] if visible else _NO_SPACE_ID
+
+
+def _read_space_id(scope: typing.Optional[spaces_services.SpaceScope]) -> typing.Optional[int]:
+    """The space a read is filtered to: the inventory space for a flagged company, the main space for an unflagged one
+    (a company whose flag was turned off after use never mixes other spaces' rows in); None only with no scope."""
+    if scope is None:
+        return None
+    return _inventory_space_id(scope) if scope.enabled else scope.main_space_id
+
+
+def _spaces_main_first(scope: spaces_services.SpaceScope, space_ids: typing.Iterable[int]) -> typing.List[int]:
+    return sorted(
+        space_ids, key=lambda sid: (sid != scope.main_space_id, (scope.space_names.get(sid) or "").casefold(), sid)
+    )
+
+
+def _find_sync_brand(
+    company_id: int,
+    sync_brand_id: int,
+    scope: typing.Optional[spaces_services.SpaceScope],
+    queryset=None,
+) -> typing.Optional[src_models.ShopMonkeySyncBrand]:
+    """The company's sync brand by id (None: 404); a flagged caller must be able to see its space, else
+    SpaceError 403 space_access_denied."""
+    qs = queryset if queryset is not None else src_models.ShopMonkeySyncBrand.objects
+    sync_brand = qs.filter(id=sync_brand_id, company_id=company_id).first()
+    if sync_brand and _spaced(scope):
+        spaces_services.ensure_visible(scope, sync_brand.space_id)
+    return sync_brand
 
 
 # Shop-management systems the inventory sync can actually push to. The catalog may list more (they can be connected for
@@ -44,20 +115,27 @@ STATE_NOT_SUPPORTED = "NOT_SUPPORTED"
 STATE_READY = "READY"
 
 
-def get_inventory_state(company_id: int) -> typing.Tuple[typing.Optional[typing.Dict], typing.Optional[str]]:
+def get_inventory_state(
+    company_id: int, scope: typing.Optional[spaces_services.SpaceScope] = None
+) -> typing.Tuple[typing.Optional[typing.Dict], typing.Optional[str]]:
     """GET .../inventory/state/ -- what the Inventory Management page should show before it loads anything.
     One row per shop-management system in the catalog, each with the state the page needs: not connected (send the
     user to connect it), connection failing (reconnect), no distributors connected (nothing to sync from), not
     supported (listed, but no inventory sync for it yet) or ready. The page's selector is built from ``systems``;
-    ``default_kind`` is the system to preselect (the first ready one, else the first connected one)."""
+    ``default_kind`` is the system to preselect (the first ready one, else the first connected one).
+
+    A company with the multi_spaces flag gets it for the inventory space (its own connection and connected feeds)
+    plus ``space``, ``has_shop_system``, ``spaces_with_shop_system`` and, in "all", the per-space ``spaces`` overview.
+    """
     if not _feature_enabled(company_id):
         return None, ERROR_FEATURE_NOT_AVAILABLE
-    connections = {
-        c.provider_id: c
-        for c in src_models.CompanyShopManagementProviders.objects.filter(company_id=company_id, active=True)
-    }
+    space_id = _read_space_id(scope)
+    connection_rows = src_models.CompanyShopManagementProviders.objects.filter(company_id=company_id, active=True)
+    if space_id is not None:
+        connection_rows = connection_rows.filter(space_id=space_id)
+    connections = {c.provider_id: c for c in connection_rows}
     providers_by_kind = {p.kind: p for p in src_models.ShopManagementProviders.objects.all()}
-    has_distributors = bool(shopmonkey_sync_services.company_connected_provider_ids(company_id))
+    has_distributors = bool(shopmonkey_sync_services.company_connected_provider_ids(company_id, space_id))
 
     systems = []
     for entry in src_constants.SHOP_MANAGEMENT_PROVIDER_CATALOG:
@@ -95,16 +173,99 @@ def get_inventory_state(company_id: int) -> typing.Tuple[typing.Optional[typing.
     )
     if default is None and systems:
         default = next((s for s in systems if s["inventory_supported"]), systems[0])
-    return {"systems": systems, "default_kind": default["kind"] if default else None}, None
+    data = {"systems": systems, "default_kind": default["kind"] if default else None}
+    if _spaced(scope) and space_id is not None:
+        data.update(_space_state_keys(company_id, scope, space_id, has_shop_system=bool(connections)))
+    return data, None
+
+
+def _space_state_keys(
+    company_id: int, scope: spaces_services.SpaceScope, space_id: int, has_shop_system: bool
+) -> typing.Dict[str, typing.Any]:
+    """The keys a flagged company's state adds (AC-46, AC-47)."""
+    keys: typing.Dict[str, typing.Any] = {
+        "has_shop_system": has_shop_system,
+        "spaces_with_shop_system": [],
+        "space": _space_ref(scope, space_id) if space_id != _NO_SPACE_ID else None,
+    }
+    connections = list(
+        src_models.CompanyShopManagementProviders.objects.filter(
+            company_id=company_id, active=True, space_id__in=scope.visible_space_ids
+        ).select_related("provider")
+    )
+    if not has_shop_system:
+        keys["spaces_with_shop_system"] = [
+            _space_ref(scope, sid) for sid in _spaces_main_first(scope, {c.space_id for c in connections})
+        ]
+    if scope.current_space_id is None:
+        keys["spaces"] = _overview_rows(company_id, scope, connections)
+    return keys
+
+
+def _overview_rows(
+    company_id: int,
+    scope: spaces_services.SpaceScope,
+    connections: typing.List[src_models.CompanyShopManagementProviders],
+) -> typing.List[typing.Dict[str, typing.Any]]:
+    """AC-47: one row per visible space, with its shop system, connection and newest non-delete execution."""
+    by_space = {c.space_id: c for c in connections}
+    last_by_space: typing.Dict[int, typing.Dict[str, typing.Any]] = {}
+    for sid in scope.visible_space_ids:
+        newest = (
+            src_models.ShopMonkeySyncExecution.objects.filter(company_id=company_id, space_id=sid)
+            # An execution with no "kind" key is a sync; a plain exclude() would drop it too (NULL = value is not true).
+            .filter(
+                django_db_models.Q(metadata__kind__isnull=True)
+                | ~django_db_models.Q(metadata__kind=shopmonkey_sync_services.EXECUTION_KIND_DELETE_BRAND)
+            )
+            .values("status", "updated_at")
+            .order_by("-created_at", "-id")
+            .first()
+        )
+        if newest is not None:
+            last_by_space[sid] = newest
+    finished = {
+        src_enums.ShopMonkeySyncExecutionStatus.FINISHED.value,
+        src_enums.ShopMonkeySyncExecutionStatus.FAILURE.value,
+    }
+    rows = []
+    for sid in _spaces_main_first(scope, scope.visible_space_ids):
+        connection = by_space.get(sid)
+        last = last_by_space.get(sid)
+        rows.append(
+            {
+                "space": _space_ref(scope, sid),
+                "system": {"kind": connection.provider.kind, "name": connection.provider.name} if connection else None,
+                "connection": (
+                    {"id": connection.id, "status": connection.status, "status_name": connection.status_name}
+                    if connection
+                    else None
+                ),
+                "last_sync": (
+                    {
+                        "status": last["status"],
+                        "finished_at": last["updated_at"].isoformat()
+                        if last["status"] in finished and last["updated_at"]
+                        else None,
+                    }
+                    if last
+                    else None
+                ),
+            }
+        )
+    return rows
 
 
 def get_available_brands(
-    company_id: int,
+    company_id: int, scope: typing.Optional[spaces_services.SpaceScope] = None
 ) -> typing.Tuple[typing.Optional[typing.List[typing.Dict]], typing.Optional[str]]:
     """Returns (data, error_code)."""
     if not _feature_enabled(company_id):
         return None, ERROR_FEATURE_NOT_AVAILABLE
-    return shopmonkey_sync_services.available_brands_for_company(company_id), None
+    space_id = _read_space_id(scope)
+    if space_id == _NO_SPACE_ID:
+        return [], None
+    return shopmonkey_sync_services.available_brands_for_company(company_id, space_id), None
 
 
 def _sync_brand_row(
@@ -165,10 +326,16 @@ def _sync_brand_queryset():
     ).prefetch_related("additional_vendors__vendor__provider")
 
 
-def list_sync_brands(company_id: int) -> typing.Tuple[typing.Optional[typing.List[typing.Dict]], typing.Optional[str]]:
+def list_sync_brands(
+    company_id: int, scope: typing.Optional[spaces_services.SpaceScope] = None
+) -> typing.Tuple[typing.Optional[typing.List[typing.Dict]], typing.Optional[str]]:
     if not _feature_enabled(company_id):
         return None, ERROR_FEATURE_NOT_AVAILABLE
-    rows = list(_sync_brand_queryset().filter(company_id=company_id))
+    qs = _sync_brand_queryset().filter(company_id=company_id)
+    space_id = _read_space_id(scope)
+    if space_id is not None:
+        qs = qs.filter(space_id=space_id)
+    rows = list(qs)
     deleting_ids = set(
         shopmonkey_sync_services.active_delete_executions([r.id for r in rows]).values_list("sync_brand_id", flat=True)
     )
@@ -176,40 +343,61 @@ def list_sync_brands(company_id: int) -> typing.Tuple[typing.Optional[typing.Lis
 
 
 def get_sync_brand(
-    company_id: int, sync_brand_id: int
+    company_id: int, sync_brand_id: int, scope: typing.Optional[spaces_services.SpaceScope] = None
 ) -> typing.Tuple[typing.Optional[typing.Dict], typing.Optional[str]]:
     """GET .../sync-brands/<id>/ -- the new single-brand lookup (Phase 3), so the FE detail page
     stops fetching every brand just to find one. A brand belonging to another company is 404,
     never 403 -- same not-found-vs-forbidden handling as every other per-id lookup here."""
     if not _feature_enabled(company_id):
         return None, ERROR_FEATURE_NOT_AVAILABLE
-    sync_brand = _sync_brand_queryset().filter(id=sync_brand_id, company_id=company_id).first()
+    sync_brand = _find_sync_brand(company_id, sync_brand_id, scope, _sync_brand_queryset())
     if not sync_brand:
         return None, ERROR_NOT_FOUND
     return _sync_brand_row(sync_brand), None
 
 
 def _validate_provider_ids(
-    company_id: int, provider_ids: typing.List[int], primary_provider_id: int
+    company_id: int, provider_ids: typing.List[int], primary_provider_id: int, space_id: typing.Optional[int] = None
 ) -> typing.Optional[str]:
     if not provider_ids:
         return ERROR_INVALID_INPUT
     if primary_provider_id not in provider_ids:
         return ERROR_INVALID_INPUT
-    connected = shopmonkey_sync_services.company_connected_provider_ids(company_id)
+    connected = shopmonkey_sync_services.company_connected_provider_ids(company_id, space_id)
     if any(pid not in connected for pid in provider_ids):
         return ERROR_INVALID_INPUT
     return None
 
 
+def _ensure_shopmonkey_connection(company_id: int, space_id: int) -> None:
+    """AC-46: nothing is configured in a space with no ShopMonkey connection (SpaceError 400 no_shop_system)."""
+    if not src_models.CompanyShopManagementProviders.objects.filter(
+        company_id=company_id,
+        space_id=space_id,
+        active=True,
+        provider__kind=src_enums.ShopManagementProviderKind.SHOPMONKEY.value,
+    ).exists():
+        raise spaces_services.SpaceError(
+            "This space has no shop system to sync inventory to.", ERROR_NO_SHOP_SYSTEM, status_code=400
+        )
+
+
 def create_sync_brand(
-    company_id: int, brand_id: int, provider_ids: typing.List[int], primary_provider_id: int
+    company_id: int,
+    brand_id: int,
+    provider_ids: typing.List[int],
+    primary_provider_id: int,
+    scope: typing.Optional[spaces_services.SpaceScope] = None,
 ) -> typing.Tuple[typing.Optional[typing.Dict], typing.Optional[str]]:
     if not _feature_enabled(company_id):
         return None, ERROR_FEATURE_NOT_AVAILABLE
+    space_id = None
+    if _spaced(scope):
+        space_id = spaces_services.write_space(scope)
+        _ensure_shopmonkey_connection(company_id, space_id)
     if not src_models.Brands.objects.filter(id=brand_id).exists():
         return None, ERROR_NOT_FOUND
-    error_code = _validate_provider_ids(company_id, provider_ids, primary_provider_id)
+    error_code = _validate_provider_ids(company_id, provider_ids, primary_provider_id, space_id)
     if error_code:
         return None, error_code
     sync_brand = shopmonkey_sync_services.configure_sync_brand(
@@ -218,8 +406,9 @@ def create_sync_brand(
         provider_ids=provider_ids,
         primary_provider_id=primary_provider_id,
         enabled=True,
+        space_id=space_id,
     )
-    return get_sync_brand(company_id, sync_brand.id)
+    return get_sync_brand(company_id, sync_brand.id, scope)
 
 
 def update_sync_brand(
@@ -228,13 +417,14 @@ def update_sync_brand(
     enabled: typing.Optional[bool],
     provider_ids: typing.Optional[typing.List[int]],
     primary_provider_id: typing.Optional[int],
+    scope: typing.Optional[spaces_services.SpaceScope] = None,
 ) -> typing.Tuple[typing.Optional[typing.Dict], typing.Optional[str]]:
     """PATCH resolves any omitted field from the current row, then calls the same
     configure_sync_brand() that POST calls -- there is no separate toggle-only write path. A body
     of {"enabled": false} alone must leave the existing provider set untouched (contract.md)."""
     if not _feature_enabled(company_id):
         return None, ERROR_FEATURE_NOT_AVAILABLE
-    sync_brand = _sync_brand_queryset().filter(id=sync_brand_id, company_id=company_id).first()
+    sync_brand = _find_sync_brand(company_id, sync_brand_id, scope, _sync_brand_queryset())
     if not sync_brand:
         return None, ERROR_NOT_FOUND
     if shopmonkey_sync_services.active_delete_executions([sync_brand.id]).exists():
@@ -249,7 +439,9 @@ def update_sync_brand(
     if primary_provider_id is None:
         primary_provider_id = sync_brand.vendor.provider_id
 
-    error_code = _validate_provider_ids(company_id, provider_ids, primary_provider_id)
+    error_code = _validate_provider_ids(
+        company_id, provider_ids, primary_provider_id, sync_brand.space_id if _spaced(scope) else None
+    )
     if error_code:
         return None, error_code
 
@@ -259,18 +451,19 @@ def update_sync_brand(
         provider_ids=provider_ids,
         primary_provider_id=primary_provider_id,
         enabled=enabled,
+        space_id=sync_brand.space_id,
     )
-    return get_sync_brand(company_id, sync_brand_id)
+    return get_sync_brand(company_id, sync_brand_id, scope)
 
 
 def run_sync_brand_now(
-    company_id: int, sync_brand_id: int
+    company_id: int, sync_brand_id: int, scope: typing.Optional[spaces_services.SpaceScope] = None
 ) -> typing.Tuple[typing.Optional[typing.Dict], typing.Optional[str]]:
     """Enqueues a QUEUED execution and returns immediately (Phase 3) -- process_shopmonkey_sync_jobs
     is what actually calls sync_brand_parts(). Never run the sync inline on the request thread."""
     if not _feature_enabled(company_id):
         return None, ERROR_FEATURE_NOT_AVAILABLE
-    sync_brand = src_models.ShopMonkeySyncBrand.objects.filter(id=sync_brand_id, company_id=company_id).first()
+    sync_brand = _find_sync_brand(company_id, sync_brand_id, scope)
     if not sync_brand:
         return None, ERROR_NOT_FOUND
     if not sync_brand.enabled:
@@ -280,7 +473,10 @@ def run_sync_brand_now(
 
 
 def delete_sync_brand(
-    company_id: int, sync_brand_id: int, confirm_brand_name: typing.Optional[str]
+    company_id: int,
+    sync_brand_id: int,
+    confirm_brand_name: typing.Optional[str],
+    scope: typing.Optional[spaces_services.SpaceScope] = None,
 ) -> typing.Tuple[typing.Optional[typing.Dict], typing.Optional[str]]:
     """Queues the deletion of a configured brand: its parts are soft-deleted on ShopMonkey (by process_shopmonkey_sync_jobs,
     in slices) and then the brand's sync config is removed. Destructive and not undoable on ShopMonkey's side, so the
@@ -288,10 +484,8 @@ def delete_sync_brand(
     QUEUED execution. A brand with a sync or delete already queued/running is a conflict (409)."""
     if not _feature_enabled(company_id):
         return None, ERROR_FEATURE_NOT_AVAILABLE
-    sync_brand = (
-        src_models.ShopMonkeySyncBrand.objects.select_related("brand")
-        .filter(id=sync_brand_id, company_id=company_id)
-        .first()
+    sync_brand = _find_sync_brand(
+        company_id, sync_brand_id, scope, src_models.ShopMonkeySyncBrand.objects.select_related("brand")
     )
     if not sync_brand:
         return None, ERROR_NOT_FOUND
@@ -322,10 +516,14 @@ def list_executions(
     status: typing.Optional[str] = None,
     limit: int = _EXECUTIONS_DEFAULT_LIMIT,
     offset: int = 0,
+    scope: typing.Optional[spaces_services.SpaceScope] = None,
 ) -> typing.Tuple[typing.Optional[typing.Dict[str, typing.Any]], typing.Optional[str]]:
     if not _feature_enabled(company_id):
         return None, ERROR_FEATURE_NOT_AVAILABLE
     qs = src_models.ShopMonkeySyncExecution.objects.filter(company_id=company_id)
+    space_id = _read_space_id(scope)
+    if space_id is not None:
+        qs = qs.filter(space_id=space_id)
     if sync_brand_id:
         qs = qs.filter(sync_brand_id=sync_brand_id)
     if status:
@@ -349,10 +547,11 @@ def list_sync_brand_parts(
     limit: int = _PARTS_DEFAULT_LIMIT,
     offset: int = 0,
     status: typing.Optional[int] = None,
+    scope: typing.Optional[spaces_services.SpaceScope] = None,
 ) -> typing.Tuple[typing.Optional[typing.Dict[str, typing.Any]], typing.Optional[str]]:
     if not _feature_enabled(company_id):
         return None, ERROR_FEATURE_NOT_AVAILABLE
-    sync_brand = src_models.ShopMonkeySyncBrand.objects.filter(id=sync_brand_id, company_id=company_id).first()
+    sync_brand = _find_sync_brand(company_id, sync_brand_id, scope)
     if not sync_brand:
         return None, ERROR_NOT_FOUND
 

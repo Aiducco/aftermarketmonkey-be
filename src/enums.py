@@ -1,5 +1,6 @@
 import enum
 
+
 class CompanyStatus(enum.Enum):
     ACTIVE = 1
     INACTIVE = 2
@@ -7,6 +8,7 @@ class CompanyStatus(enum.Enum):
 
 class IntegrationDestinationType(enum.Enum):
     BIGCOMMERCE = 1
+
 
 class IntegrationDestinationStatus(enum.Enum):
     ACTIVE = 1
@@ -16,6 +18,7 @@ class IntegrationDestinationStatus(enum.Enum):
 class ShopManagementProviderKind(enum.Enum):
     """Specific shop-management vendor. Separate from BrandProviderKind on purpose — a shop
     management system isn't a parts source and shouldn't share the distributor kind namespace."""
+
     SHOPMONKEY = 1
 
 
@@ -28,6 +31,7 @@ class ShopManagementConnectionStatus(enum.Enum):
     """Connectivity status for a CompanyShopManagementProviders connection, set synchronously
     from test_connection() at connect/update time. Simpler than CompanyProviderConnectionStatus
     (no INGESTING/WAITING) since there's no background feed to sync — just an API key check."""
+
     CONNECTED = 1
     FAILING = 2
 
@@ -36,6 +40,7 @@ class ShopMonkeySyncStatus(enum.Enum):
     """Status for ShopMonkeySyncVendor/ShopMonkeySyncBrand -- mirrors the old standalone tool's
     InventoryVendorStatus/InventoryBrandStatus one-for-one. INACTIVE until the vendor/brand is
     actually created on ShopMonkey (shopmonkey_external_id set), ACTIVE after."""
+
     ACTIVE = 1
     INACTIVE = 2
 
@@ -43,6 +48,7 @@ class ShopMonkeySyncStatus(enum.Enum):
 class ShopMonkeySyncPartStatus(enum.Enum):
     """Mirrors the old tool's InventoryPartStatus one-for-one, including the ERROR state for a
     part whose last push to ShopMonkey failed."""
+
     ACTIVE = 1
     INACTIVE = 2
     ERROR = 3
@@ -68,6 +74,7 @@ class ShopMonkeySyncExecutionStatus(enum.Enum):
 class BrandProvider(enum.Enum):
     CATALOG = 1
     DISTRIBUTOR = 2
+
 
 class BrandProviderKind(enum.Enum):
     TURN_14 = 1
@@ -114,6 +121,7 @@ class BrandProviderKind(enum.Enum):
     NTW = 41
     RANDYS_WORLDWIDE = 42
 
+
 class ProductType(enum.Enum):
     """
     What a ``MasterPart`` physically is. Stored on ``MasterPart.product_type``.
@@ -130,6 +138,7 @@ class ProductType(enum.Enum):
     There is deliberately no ``UNKNOWN`` member: a part we cannot classify is left NULL rather
     than labelled, so the gap stays measurable instead of being absorbed into ``PART``.
     """
+
     PART = "part"
     WHEEL = "wheel"
     TIRE = "tire"
@@ -139,9 +148,11 @@ class BrandProviderStatus(enum.Enum):
     ACTIVE = 1
     INACTIVE = 2
 
+
 class CompanyBrandStatus(enum.Enum):
     ACTIVE = 1
     INACTIVE = 2
+
 
 class DestinationExecutionRunStatus(enum.Enum):
     STARTED = 1
@@ -151,6 +162,7 @@ class DestinationExecutionRunStatus(enum.Enum):
 
 class ScheduledTaskExecutionStatus(enum.Enum):
     """Status for scheduled task / cron execution audit records."""
+
     STARTED = 1
     COMPLETED = 2
     FAILED = 3
@@ -159,6 +171,7 @@ class ScheduledTaskExecutionStatus(enum.Enum):
 
 class IntegrationPricingSyncJobStatus(enum.Enum):
     """Queue status for per-company-provider pricing sync jobs (cron-processed)."""
+
     OPEN = 1
     RUNNING = 2
     COMPLETED = 3
@@ -171,10 +184,11 @@ class CompanyProviderConnectionStatus(enum.Enum):
     check_company_provider_connections cron for rows where initial_sync_completed is False;
     set to CONNECTED directly by integration_pricing_sync_jobs once that flips True.
     """
+
     CONNECTED = 1  # credentials valid and the initial pricing sync has completed
     INGESTING = 2  # credentials valid (or relay file received); initial sync not finished yet
-    WAITING = 3    # credentials valid, but relay-provisioned and the distributor's file hasn't arrived yet
-    FAILING = 4    # credentials/connectivity check failed
+    WAITING = 3  # credentials valid, but relay-provisioned and the distributor's file hasn't arrived yet
+    FAILING = 4  # credentials/connectivity check failed
 
 
 class CompanyProviderOrderConnectionStatus(enum.Enum):
@@ -187,9 +201,10 @@ class CompanyProviderOrderConnectionStatus(enum.Enum):
     the check_company_provider_connections cron (independently of feed initial_sync_completed,
     since order credentials can go stale on their own — e.g. a rotated API key).
     """
+
     CONNECTED = 1  # order credentials valid AND feed status is CONNECTED
-    WAITING = 2    # order credentials valid, but feed status isn't CONNECTED yet
-    ERROR = 3      # order credentials invalid, or the order connectivity check failed
+    WAITING = 2  # order credentials valid, but feed status isn't CONNECTED yet
+    ERROR = 3  # order credentials invalid, or the order connectivity check failed
 
 
 class OrderMethod(enum.Enum):
@@ -203,12 +218,14 @@ class OrderMethod(enum.Enum):
     loses previously-entered values, and subsystems that read order credentials directly rather
     than through orders.registry (e.g. src.integrations.live_inventory) are unaffected either way.
     """
+
     API = 1
     EMAIL = 2
 
 
 class NotificationEmailType(enum.Enum):
     """Kind of transactional notification email logged in NotificationEmailLog."""
+
     FIRST_SYNC_COMPLETED = 1
     PURCHASE_ORDER_EMAILED = 2
     # Plan expiry / downgrade lifecycle (src.api.services.plan_lifecycle).
@@ -229,6 +246,7 @@ class PurchaseOrderStatus(enum.Enum):
     "Add to PO" cart (see purchase_order_jobs / cart API) until a staff user reviews and
     quotes it — it is not just a pre-submission state.
     """
+
     DRAFT = 1
     QUOTED = 2
     SUBMITTING = 3
@@ -291,6 +309,7 @@ class PurchaseOrderOperation(enum.Enum):
 class PurchaseOrderJobStatus(enum.Enum):
     """Queue status for PurchaseOrderJob rows (cron-processed), same shape as
     IntegrationPricingSyncJobStatus."""
+
     OPEN = 1
     RUNNING = 2
     COMPLETED = 3
@@ -299,6 +318,7 @@ class PurchaseOrderJobStatus(enum.Enum):
 
 class PurchaseOrderDistributorOrderStatus(enum.Enum):
     """Status of one distributor-side order slice (PurchaseOrderDistributorOrder)."""
+
     SUBMITTED = 1
     CONFIRMED = 2
     PARTIALLY_SHIPPED = 3
@@ -311,12 +331,15 @@ class DistributorOrderRawStatus(enum.Enum):
     from PurchaseOrderDistributorOrderStatus, which is our internal fulfillment lifecycle.
     Currently only populated for Turn14, whose orders/po lookup reports exactly these two
     strings (see turn_14.translate_order_status)."""
+
     OPEN = 1
     CLOSED = 2
+
 
 class EdiDirection(enum.Enum):
     """Which way an EdiDocument travelled. Named from OUR point of view, deliberately the
     opposite of Alluvia's folder names (their /Inbound is what we write to)."""
+
     OUTBOUND = 1
     INBOUND = 2
 
@@ -336,6 +359,7 @@ class EdiDocumentStatus(enum.Enum):
     PO we do not have, which is a real condition worth alerting on rather than an error, and
     ERROR means it would not parse at all. Neither is ever silently dropped.
     """
+
     RECEIVED = 1
     PARSED = 2
     APPLIED = 3
@@ -359,6 +383,23 @@ class AddressValidationStatus(enum.Enum):
     UNVERIFIED  provider could not confirm the address, was unreachable, or is not
                 configured at all. Carries no judgement that the address is wrong.
     """
+
     VALID = 1
     CORRECTED = 2
     UNVERIFIED = 3
+
+
+class SpaceKind(enum.Enum):
+    """What a Space is: a physical shop (needs one address) or an online store (none)."""
+
+    LOCATION = 1
+    ONLINE_STORE = 2
+
+
+class ExternalOrderSpaceReason(enum.Enum):
+    """Why an ExternalPurchaseOrder sits in its space (shown to admins as "Why this space")."""
+
+    PREFIX = 1  # its PO number starts with the space's prefix
+    ACCOUNT = 2  # the order account that found it is used by that space only (or pre-spaces data)
+    MAIN = 3  # no rule matched: it went to the main space by default
+    MOVED = 4  # an admin moved it by hand

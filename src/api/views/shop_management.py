@@ -6,9 +6,19 @@ import simplejson
 from django import http, views
 
 from src.api.services import shop_management as shop_management_services
+from src.api.services import spaces as spaces_services
 
 logger = logging.getLogger(__name__)
 _LOG_PREFIX = "[SHOP-MANAGEMENT]"
+
+
+def _space_error_response(e: spaces_services.SpaceError) -> http.HttpResponse:
+    """A space rule's answer: status, message, ``error_code`` and any extra keys (``space``)."""
+    return http.HttpResponse(
+        headers={"Content-Type": "application/json"},
+        content=simplejson.dumps(e.body()),
+        status=e.status_code,
+    )
 
 
 class ShopManagementCatalogView(views.View):
@@ -32,9 +42,13 @@ class ShopManagementCatalogView(views.View):
             )
 
         try:
-            result = shop_management_services.get_shop_management_catalog(company_id=company_id)
+            result = shop_management_services.get_shop_management_catalog(
+                company_id=company_id, scope=spaces_services.resolve_scope(request)
+            )
         except Exception as e:
-            logger.error(f"{_LOG_PREFIX} Error fetching shop management catalog for company_id: {company_id}. Error: {str(e)}")
+            logger.error(
+                f"{_LOG_PREFIX} Error fetching shop management catalog for company_id: {company_id}. Error: {str(e)}"
+            )
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
                 content=simplejson.dumps({"message": "Error fetching shop management catalog"}),
@@ -86,11 +100,15 @@ class ShopManagementProviderConnectView(views.View):
             )
 
         credentials = body if isinstance(body, dict) else {}
-        data, err, error_code = shop_management_services.connect_provider(
-            company_id=company_id,
-            provider_id=provider_id,
-            credentials=credentials,
-        )
+        try:
+            data, err, error_code = shop_management_services.connect_provider(
+                company_id=company_id,
+                provider_id=provider_id,
+                credentials=credentials,
+                scope=spaces_services.resolve_scope(request),
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         if err:
             if error_code == shop_management_services.CONNECTION_ERROR_NOT_FOUND:
                 status = 404
@@ -142,10 +160,14 @@ class ShopManagementConnectionView(views.View):
                 status=400,
             )
 
-        success, err = shop_management_services.disconnect(
-            company_id=company_id,
-            company_provider_id=company_provider_id,
-        )
+        try:
+            success, err = shop_management_services.disconnect(
+                company_id=company_id,
+                company_provider_id=company_provider_id,
+                scope=spaces_services.resolve_scope(request),
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         if not success:
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
@@ -199,11 +221,15 @@ class ShopManagementConnectionView(views.View):
             )
 
         patch = body if isinstance(body, dict) else {}
-        data, err, error_code = shop_management_services.update_connection(
-            company_id=company_id,
-            company_provider_id=cpi,
-            credentials=patch,
-        )
+        try:
+            data, err, error_code = shop_management_services.update_connection(
+                company_id=company_id,
+                company_provider_id=cpi,
+                credentials=patch,
+                scope=spaces_services.resolve_scope(request),
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         if err:
             if error_code == shop_management_services.CONNECTION_ERROR_NOT_FOUND:
                 status = 404
@@ -265,7 +291,10 @@ class ShopManagementConnectionDetailView(views.View):
             data = shop_management_services.get_connection_detail(
                 company_id=company_id,
                 company_provider_id=cpi,
+                scope=spaces_services.resolve_scope(request),
             )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except Exception as e:
             logger.error(
                 f"{_LOG_PREFIX} Error fetching connection detail company_provider_id={cpi} company_id={company_id}: {e}"
@@ -311,9 +340,13 @@ class CompanyShopManagementProvidersView(views.View):
             )
 
         try:
-            data = shop_management_services.list_company_connections(company_id=company_id)
+            data = shop_management_services.list_company_connections(
+                company_id=company_id, scope=spaces_services.resolve_scope(request)
+            )
         except Exception as e:
-            logger.error(f"{_LOG_PREFIX} Error fetching shop management providers for company_id: {company_id}. Error: {str(e)}")
+            logger.error(
+                f"{_LOG_PREFIX} Error fetching shop management providers for company_id: {company_id}. Error: {str(e)}"
+            )
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
                 content=simplejson.dumps({"message": "Error fetching shop management providers"}),
@@ -368,9 +401,14 @@ class CompanyShopManagementProviderDetailView(views.View):
             data = shop_management_services.get_connection_detail(
                 company_id=company_id,
                 company_provider_id=cpi,
+                scope=spaces_services.resolve_scope(request),
             )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except Exception as e:
-            logger.error(f"{_LOG_PREFIX} Error fetching shop management provider id={cpi} for company_id: {company_id}. Error: {str(e)}")
+            logger.error(
+                f"{_LOG_PREFIX} Error fetching shop management provider id={cpi} for company_id: {company_id}. Error: {str(e)}"
+            )
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
                 content=simplejson.dumps({"message": "Error fetching shop management provider"}),

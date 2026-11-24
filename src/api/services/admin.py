@@ -7,12 +7,15 @@ import typing
 from django.conf import settings
 from django.contrib.auth import models as auth_models
 from django.db import transaction
-from django.db.models import Count, Q
+from django.db.models import Count, IntegerField, OuterRef, Q, Subquery
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 
 from src import enums as src_enums
 from src import models as src_models
+from src.api.services import billing as billing_services
 from src.api.services import plan_lifecycle as plan_lifecycle_services
+from src.api.services import spaces as spaces_services
 
 _LOG_PREFIX = "[ADMIN-SERVICE]"
 
@@ -27,6 +30,7 @@ _GENERATED_PASSWORD_LENGTH = 24
 
 def _generate_password() -> str:
     return "".join(secrets.choice(_GENERATED_PASSWORD_ALPHABET) for _ in range(_GENERATED_PASSWORD_LENGTH))
+
 
 # The internal company used to group staff/ops users — see seed_admin_company management command.
 # Excluded from the "all companies" list since it's not a real customer.
@@ -49,6 +53,57 @@ def _plan_lifecycle_fields(company: src_models.Company) -> typing.Dict:
     }
 
 
+def _spaces_used_annotation():
+    """Spaces per company as a correlated subquery: a second Count() join would multiply the provider
+    counts annotated next to it."""
+    return Coalesce(
+        Subquery(
+            src_models.Space.objects.filter(company_id=OuterRef("pk"))
+            .order_by()
+            .values("company_id")
+            .annotate(n=Count("id"))
+            .values("n"),
+            output_field=IntegerField(),
+        ),
+        0,
+    )
+
+
+def _space_allowance_fields(company: src_models.Company) -> typing.Dict:
+    """Space allowance for the staff views (``company`` must carry the ``spaces_count`` annotation)."""
+    return {
+        "space_allowance": billing_services.space_allowance(company),
+        "space_base": billing_services._space_base(company),
+        "space_base_override": company.space_base_override,
+        "additional_spaces": company.additional_spaces or 0,
+        # The main space counts before its row exists (billing.spaces_in_use).
+        "spaces_used": max(1, company.spaces_count),
+    }
+
+
+def set_company_space_base(
+    company_id: int, space_base: typing.Optional[int], staff_user_id: typing.Optional[int] = None
+) -> typing.Optional[typing.Dict]:
+    """Staff base for a company's space allowance (space_base_override): replaces the plan's base while set,
+    None clears it. The paid add-ons stay on top. Returns the allowance fields, or None if no such company."""
+    company = (
+        src_models.Company.objects.filter(id=company_id, parent_company__isnull=True)
+        .annotate(spaces_count=_spaces_used_annotation())
+        .first()
+    )
+    if not company:
+        return None
+    old_base = company.space_base_override
+    company.space_base_override = space_base
+    company.save(update_fields=["space_base_override", "updated_at"])
+    logger.info(
+        "{} Staff user {} set space_base_override of company {}: {} -> {}.".format(
+            _LOG_PREFIX, staff_user_id, company.id, old_base, space_base
+        )
+    )
+    return {"company_id": company.id, **_space_allowance_fields(company)}
+
+
 def list_all_companies_for_admin() -> typing.List[typing.Dict]:
     """
     Every company (excluding the internal admin company itself) with its subscription state and
@@ -59,14 +114,12 @@ def list_all_companies_for_admin() -> typing.List[typing.Dict]:
 
     companies = (
         src_models.Company.objects.exclude(slug=ADMIN_COMPANY_SLUG)
+        .filter(parent_company__isnull=True)  # feed tenants are not customers (ADR 0002)
         .annotate(
             total_providers_count=Count("company_providers"),
-            connected_providers_count=Count(
-                "company_providers", filter=Q(company_providers__status_name="CONNECTED")
-            ),
-            paused_providers_count=Count(
-                "company_providers", filter=Q(company_providers__paused_at__isnull=False)
-            ),
+            connected_providers_count=Count("company_providers", filter=Q(company_providers__status_name="CONNECTED")),
+            paused_providers_count=Count("company_providers", filter=Q(company_providers__paused_at__isnull=False)),
+            spaces_count=_spaces_used_annotation(),
         )
         .order_by("-created_at")
     )
@@ -90,6 +143,7 @@ def list_all_companies_for_admin() -> typing.List[typing.Dict]:
                 "connected_providers_count": company.connected_providers_count,
                 "total_providers_count": company.total_providers_count,
                 **_plan_lifecycle_fields(company),
+                **_space_allowance_fields(company),
             }
         )
 
@@ -102,33 +156,40 @@ def get_admin_company_detail(company_id: int) -> typing.Optional[typing.Dict]:
     logger.info("{} Fetching company detail for company_id: {}.".format(_LOG_PREFIX, company_id))
 
     company = (
-        src_models.Company.objects.filter(id=company_id)
+        src_models.Company.objects.filter(id=company_id, parent_company__isnull=True)
         .annotate(
             total_providers_count=Count("company_providers"),
-            connected_providers_count=Count(
-                "company_providers", filter=Q(company_providers__status_name="CONNECTED")
-            ),
-            paused_providers_count=Count(
-                "company_providers", filter=Q(company_providers__paused_at__isnull=False)
-            ),
+            connected_providers_count=Count("company_providers", filter=Q(company_providers__status_name="CONNECTED")),
+            paused_providers_count=Count("company_providers", filter=Q(company_providers__paused_at__isnull=False)),
+            spaces_count=_spaces_used_annotation(),
         )
         .first()
     )
     if not company:
         return None
 
+    # The company's own connections and its feed tenants' (a space's own feeds), each tagged with its space.
+    family_ids = spaces_services.family_company_ids(company_id)
+    owner_space_by_company = {}
+    for space in src_models.Space.objects.filter(company_id=company_id).only(
+        "id", "name", "is_main", "feed_company_id"
+    ):
+        owner_space_by_company[space.feed_company_id if not space.is_main else company_id] = space
     company_providers = (
-        src_models.CompanyProviders.objects.filter(company_id=company_id)
+        src_models.CompanyProviders.objects.filter(company_id__in=family_ids)
         .select_related("provider")
-        .order_by("provider__name")
+        .order_by("provider__name", "id")
     )
 
     providers = []
     for cp in company_providers:
+        owner_space = owner_space_by_company.get(cp.company_id)
         providers.append(
             {
                 "id": cp.id,
                 "provider_id": cp.provider_id,
+                "space_id": owner_space.id if owner_space else None,
+                "space_name": owner_space.name if owner_space else None,
                 "provider_name": cp.provider.name if cp.provider else None,
                 "status": cp.status,
                 "status_name": cp.status_name,
@@ -181,6 +242,7 @@ def get_admin_company_detail(company_id: int) -> typing.Optional[typing.Dict]:
         "connected_providers_count": company.connected_providers_count,
         "total_providers_count": company.total_providers_count,
         **_plan_lifecycle_fields(company),
+        **_space_allowance_fields(company),
         "providers": providers,
         "users": users,
     }
@@ -192,9 +254,7 @@ def list_all_providers_for_admin() -> typing.List[typing.Dict]:
 
     providers = src_models.Providers.objects.annotate(
         total_companies_count=Count("brand_providers"),
-        connected_companies_count=Count(
-            "brand_providers", filter=Q(brand_providers__status_name="CONNECTED")
-        ),
+        connected_companies_count=Count("brand_providers", filter=Q(brand_providers__status_name="CONNECTED")),
     ).order_by("name")
 
     data = []
@@ -224,9 +284,7 @@ def get_admin_provider_detail(provider_id: int) -> typing.Optional[typing.Dict]:
         src_models.Providers.objects.filter(id=provider_id)
         .annotate(
             total_companies_count=Count("brand_providers"),
-            connected_companies_count=Count(
-                "brand_providers", filter=Q(brand_providers__status_name="CONNECTED")
-            ),
+            connected_companies_count=Count("brand_providers", filter=Q(brand_providers__status_name="CONNECTED")),
         )
         .first()
     )
@@ -236,19 +294,21 @@ def get_admin_provider_detail(provider_id: int) -> typing.Optional[typing.Dict]:
     company_providers = (
         src_models.CompanyProviders.objects.filter(provider_id=provider_id)
         .exclude(company__slug=ADMIN_COMPANY_SLUG)
-        .select_related("company")
+        .select_related("company", "company__parent_company")
         .order_by("company__name")
     )
 
     companies = []
     for cp in company_providers:
+        # A tenant's feed is listed under the customer it belongs to (ADR 0002).
+        customer = cp.company.customer_company if cp.company else None
         companies.append(
             {
                 "id": cp.id,
-                "company_id": cp.company_id,
-                "company_name": cp.company.name if cp.company else None,
-                "company_slug": cp.company.slug if cp.company else None,
-                "subscription_plan": cp.company.subscription_plan if cp.company else None,
+                "company_id": customer.id if customer else cp.company_id,
+                "company_name": customer.name if customer else None,
+                "company_slug": customer.slug if customer else None,
+                "subscription_plan": customer.subscription_plan if customer else None,
                 "status": cp.status,
                 "status_name": cp.status_name,
                 "status_reason": cp.status_reason,
@@ -376,9 +436,7 @@ def admin_reset_user_password(
     create_company_for_admin, and is never logged.
     """
     try:
-        profile = src_models.UserProfile.objects.select_related("user").get(
-            user_id=user_id, company_id=company_id
-        )
+        profile = src_models.UserProfile.objects.select_related("user").get(user_id=user_id, company_id=company_id)
     except src_models.UserProfile.DoesNotExist:
         return None, "User not found in company"
 
@@ -387,9 +445,7 @@ def admin_reset_user_password(
     profile.user.save(update_fields=["password"])
 
     logger.info(
-        "{} Reset password for user_id={} (company_id={}) via admin panel.".format(
-            _LOG_PREFIX, user_id, company_id
-        )
+        "{} Reset password for user_id={} (company_id={}) via admin panel.".format(_LOG_PREFIX, user_id, company_id)
     )
 
     return {"user_id": user_id, "email": profile.user.email, "password": resolved_password}, None
@@ -421,7 +477,9 @@ def extend_company_trial(
     Returns (result, error) -- result is None on failure (company not found), with error set.
     """
     with transaction.atomic():
-        company = src_models.Company.objects.select_for_update().filter(id=company_id).first()
+        company = (
+            src_models.Company.objects.select_for_update().filter(id=company_id, parent_company__isnull=True).first()
+        )
         if company is None:
             return None, "Company not found"
 
@@ -502,9 +560,7 @@ def get_ingestion_audit_overview() -> typing.List[typing.Dict]:
     """
     logger.info("{} Fetching ingestion audit overview.".format(_LOG_PREFIX))
 
-    latest_per_name = (
-        src_models.ScheduledTaskExecution.objects.order_by("name", "-created_at").distinct("name")
-    )
+    latest_per_name = src_models.ScheduledTaskExecution.objects.order_by("name", "-created_at").distinct("name")
     data = [_serialize_scheduled_task_execution(row) for row in latest_per_name]
     data.sort(key=lambda row: (row["status_name"] not in ("FAILED", "STARTED"), row["name"]))
 
@@ -521,10 +577,9 @@ def get_ingestion_audit_history(task_name: str) -> typing.List[typing.Dict]:
     same "no data" shape a typo'd query param should get."""
     logger.info("{} Fetching ingestion audit history for task_name={}.".format(_LOG_PREFIX, task_name))
 
-    rows = (
-        src_models.ScheduledTaskExecution.objects.filter(name=task_name)
-        .order_by("-created_at")[:_INGESTION_AUDIT_HISTORY_LIMIT]
-    )
+    rows = src_models.ScheduledTaskExecution.objects.filter(name=task_name).order_by("-created_at")[
+        :_INGESTION_AUDIT_HISTORY_LIMIT
+    ]
     data = [_serialize_scheduled_task_execution(row) for row in rows]
 
     logger.info("{} Found {} row(s) for task_name={}.".format(_LOG_PREFIX, len(data), task_name))

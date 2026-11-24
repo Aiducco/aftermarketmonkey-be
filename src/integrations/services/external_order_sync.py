@@ -23,6 +23,7 @@ from django.utils import timezone
 
 from src import enums as src_enums
 from src import models as src_models
+from src.api.services import spaces as spaces_services
 from src.integrations.orders import history, history_registry
 
 logger = logging.getLogger(__name__)
@@ -118,8 +119,41 @@ def _match_our_order_account_id(
         )
         if po is not None:
             return True, po.order_account_id
+        po = _match_prefixed_purchase_order(company_provider_id, customer_po_number)
+        if po is not None:
+            return True, po.order_account_id
 
     return False, None
+
+
+def _match_prefixed_purchase_order(
+    company_provider_id: int, customer_po_number: str
+) -> typing.Optional[src_models.PurchaseOrder]:
+    """The PO of this connection that was sent as ``customer_po_number`` with its space's prefix in front
+    (base.resolve_po_number), for an order whose distributor-order row was never recorded. The value must start
+    with a prefix of this connection's customer company; the rest is then matched against po_name / po_number of a PO
+    with that po_prefix. Nothing is stripped anywhere else."""
+    value = customer_po_number.strip()
+    company_provider = src_models.CompanyProviders.objects.select_related("company").get(id=company_provider_id)
+    prefixes = (
+        # The customer company's spaces: a feed tenant's own connection has the real company's prefixes.
+        src_models.Space.objects.filter(company_id=company_provider.company.customer_company.id)
+        .exclude(prefix__isnull=True)
+        .exclude(prefix="")
+        .values_list("prefix", flat=True)
+    )
+    for prefix in prefixes:
+        if not value.upper().startswith(prefix.upper()) or len(value) == len(prefix):
+            continue
+        rest = value[len(prefix) :]
+        po = (
+            src_models.PurchaseOrder.objects.filter(company_provider_id=company_provider_id, po_prefix__iexact=prefix)
+            .filter(Q(po_name=rest) | Q(po_number=rest))
+            .first()
+        )
+        if po is not None:
+            return po
+    return None
 
 
 def _is_ours(
@@ -312,7 +346,8 @@ def _result_to_defaults(
 ) -> typing.Dict:
     ship_to = result.ship_to or {}
     return {
-        "company": company_provider.company,
+        # The customer: the parent for a feed tenant's connection (ADR 0002), so the order shows up for the shop.
+        "company": company_provider.company.customer_company,
         "company_provider": company_provider,
         "customer_po_number": _clip(result.customer_po_number or None, 128),
         "origin_signal": origin_signal.value,
@@ -367,6 +402,14 @@ def _apply_results(
             deduped_by_number[key] = result
     results = list(deduped_by_number.values())
 
+    # A flagged company's new orders are sorted into a space; None leaves every new row to save()'s main space.
+    # The flag and the spaces belong to the customer company: the parent for a feed tenant's connection.
+    sorter = (
+        spaces_services.external_order_sorter(company_provider.company.customer_company.id)
+        if results and not dry_run
+        else None
+    )
+
     # Meyer is excluded deliberately, matching _self_heal_existing_rows' own docstring: its rows
     # are classified by the authoritative "API Order" flag, never by PO-matching inference, so
     # there is nothing for a re-check to correct -- and letting an inference delete a row Meyer
@@ -403,8 +446,9 @@ def _apply_results(
         # (confirmed live).
         result.distributor_order_number = normalized_number
 
+        # Looked up by connection, like the upsert below: the same order may have been found by another account.
         existing = src_models.ExternalPurchaseOrder.objects.filter(
-            order_account=account, distributor_order_number=normalized_number
+            company_provider=company_provider, distributor_order_number=normalized_number
         ).first()
 
         if existing is None:
@@ -431,11 +475,21 @@ def _apply_results(
         # the same order history, so keying on the account stored every one of its orders twice.
         # The account that found it is still recorded, as a plain attribute.
         defaults["order_account"] = account
-        _, created = src_models.ExternalPurchaseOrder.objects.update_or_create(
+        row, created = src_models.ExternalPurchaseOrder.objects.update_or_create(
             company_provider=company_provider,
             distributor_order_number=normalized_number,
             defaults=defaults,
         )
+        if created and sorter is not None:
+            # Set after the upsert, and only while still unset, so a hand Move between two polls is never
+            # overwritten. A later poll (an update) never touches the space.
+            space_id, reason, matched_prefix = sorter.sort(account, result.customer_po_number)
+            src_models.ExternalPurchaseOrder.objects.filter(pk=row.pk, space_reason__isnull=True).update(
+                space_id=space_id,
+                space_reason=reason.value,
+                space_reason_name=reason.name,
+                space_reason_prefix=matched_prefix,
+            )
         if created:
             discovered += 1
         else:
@@ -484,7 +538,8 @@ def _active_accounts(
         active=True, company_provider__active=True
     ).select_related("company_provider__provider", "company_provider__company")
     if company_id is not None:
-        qs = qs.filter(company_provider__company_id=company_id)
+        # The company's own accounts and its feed tenants' (so ``--company 16`` polls a space's own accounts too).
+        qs = qs.filter(company_provider__company_id__in=spaces_services.family_company_ids(company_id))
     if provider_kind is not None:
         qs = qs.filter(company_provider__provider__kind=provider_kind)
     return list(qs.order_by("company_provider_id", "id"))

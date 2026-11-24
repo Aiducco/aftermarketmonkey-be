@@ -13,6 +13,7 @@ from django.template.loader import render_to_string
 
 from src import enums as src_enums
 from src import models as src_models
+from src.integrations.orders import base as order_base
 from src.integrations.orders import exceptions as order_exceptions
 
 logger = logging.getLogger(__name__)
@@ -22,9 +23,7 @@ RESEND_API_URL = "https://api.resend.com/emails"
 
 def _company_admin_email(company: src_models.Company) -> str | None:
     profile = (
-        src_models.UserProfile.objects.filter(company=company, is_company_admin=True)
-        .select_related("user")
-        .first()
+        src_models.UserProfile.objects.filter(company=company, is_company_admin=True).select_related("user").first()
     )
     return profile.user.email if profile and profile.user.email else None
 
@@ -58,7 +57,8 @@ def _log_email(
 
 def send_first_sync_completed_email(company_provider: src_models.CompanyProviders) -> None:
     """Notify the company admin the first time a distributor integration finishes syncing."""
-    company = company_provider.company
+    # The customer: the parent for a feed tenant's connection, so the admin and the name are the shop's.
+    company = company_provider.company.customer_company
     provider = company_provider.provider
 
     to_email = _company_admin_email(company)
@@ -92,9 +92,7 @@ def send_first_sync_completed_email(company_provider: src_models.CompanyProvider
         )
         response.raise_for_status()
     except Exception as e:
-        logger.exception(
-            "Failed to send first-sync email for company_provider_id=%s.", company_provider.id
-        )
+        logger.exception("Failed to send first-sync email for company_provider_id=%s.", company_provider.id)
         _log_email(
             email_type=src_enums.NotificationEmailType.FIRST_SYNC_COMPLETED,
             to_email=to_email,
@@ -156,10 +154,11 @@ def send_purchase_order_email(
             "Refusing to send the purchase order email: no recipient (rep) email address."
         )
 
-    company = company_provider.company
+    # The customer: the parent for a feed tenant's connection, so the admin and the name are the shop's.
+    company = company_provider.company.customer_company
     provider = company_provider.provider
     from_email = settings.NOTIFICATIONS_FROM_EMAIL
-    po_reference = purchase_order.po_name or purchase_order.po_number
+    po_reference = order_base.resolve_po_number(purchase_order)
     subject = "Purchase Order {} — {}".format(po_reference, company.name)
     context = {
         "provider_name": provider.name,
@@ -195,9 +194,7 @@ def send_purchase_order_email(
         )
         response.raise_for_status()
     except Exception as e:
-        logger.exception(
-            "Failed to email purchase order id=%s to %s.", purchase_order.id, to_email
-        )
+        logger.exception("Failed to email purchase order id=%s to %s.", purchase_order.id, to_email)
         _log_email(
             email_type=src_enums.NotificationEmailType.PURCHASE_ORDER_EMAILED,
             to_email=to_email,
@@ -208,9 +205,7 @@ def send_purchase_order_email(
             status=src_enums.NotificationEmailStatus.FAILED,
             error_message=str(e)[:4000],
         )
-        raise order_exceptions.OrderValidationError(
-            "Failed to email the purchase order to {}: {}".format(to_email, e)
-        )
+        raise order_exceptions.OrderValidationError("Failed to email the purchase order to {}: {}".format(to_email, e))
 
     message_id = response.json().get("id")
     _log_email(

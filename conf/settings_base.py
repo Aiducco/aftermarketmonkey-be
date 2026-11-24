@@ -13,6 +13,8 @@ https://docs.djangoproject.com/en/4.1/ref/settings/
 import os
 from pathlib import Path
 
+from corsheaders.defaults import default_headers
+
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -45,9 +47,9 @@ MIGRATION_MODULES = {
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
-    'corsheaders.middleware.CorsMiddleware',
+    "corsheaders.middleware.CorsMiddleware",
     "django.middleware.common.CommonMiddleware",
-    #"django.middleware.csrf.CsrfViewMiddleware",
+    # "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "src.authentication.middleware.JWTAuthenticationMiddleware",
     "src.authentication.middleware.SuspendedMemberMiddleware",
@@ -56,27 +58,29 @@ MIDDLEWARE = [
 ]
 
 CORS_ALLOWED_ORIGINS = [
-    'http://localhost:8080',
-    'http://localhost:80',
-    'http://142.132.187.151:8005',
-    'http://142.132.187.151:8007',
-    'http://142.132.187.151:8000',
-    'http://142.132.187.151:8080',
-    'http://142.132.187.151:80',
-    'https://142.132.187.151:443',
-    'http://49.13.0.20:8005',
-    'http://49.13.0.20:8007',
-    'http://49.13.0.20:8000',
-    'https://shopifyanalytics.netlify.app',
-    'http://frontend:8000',
-    'http://frontend:8080',
-    'http://frontend:80',
-    'https://dashboard.crotechflow.com',
-    'https://www.dashboard.crotechflow.com',
+    "http://localhost:8080",
+    "http://localhost:80",
+    "http://142.132.187.151:8005",
+    "http://142.132.187.151:8007",
+    "http://142.132.187.151:8000",
+    "http://142.132.187.151:8080",
+    "http://142.132.187.151:80",
+    "https://142.132.187.151:443",
+    "http://49.13.0.20:8005",
+    "http://49.13.0.20:8007",
+    "http://49.13.0.20:8000",
+    "https://shopifyanalytics.netlify.app",
+    "http://frontend:8000",
+    "http://frontend:8080",
+    "http://frontend:80",
+    "https://dashboard.crotechflow.com",
+    "https://www.dashboard.crotechflow.com",
 ]
 
 CORS_ALLOW_ALL_ORIGINS = True
 CORS_ALLOW_CREDENTIALS = True
+# The fe sends the space switcher's choice as X-Space-Id (see src/api/services/spaces.py).
+CORS_ALLOW_HEADERS = (*default_headers, "x-space-id")
 
 ROOT_URLCONF = "urls"
 
@@ -160,9 +164,7 @@ LOGGING = {
         },
     },
     "formatters": {
-        "verbose": {
-            "format": "%(levelname)s %(asctime)s %(name)s.%(funcName)s:%(lineno)s %(message)s"
-        },
+        "verbose": {"format": "%(levelname)s %(asctime)s %(name)s.%(funcName)s:%(lineno)s %(message)s"},
     },
 }
 
@@ -208,7 +210,7 @@ PURCHASE_ORDER_INTERNAL_CC_EMAIL = os.environ.get("PURCHASE_ORDER_INTERNAL_CC_EM
 # Frontend app base URL, used to build links in transactional emails.
 FRONTEND_BASE_URL = os.environ.get("FRONTEND_BASE_URL", "https://app.aftermarketscout.com")
 
-TURN14_BASE_URL = 'https://api.turn14.com/v1'
+TURN14_BASE_URL = "https://api.turn14.com/v1"
 
 # Base URL for the shared/global Turn 14 client (get_global_client() -- brands, items,
 # items/data, inventory, dropship, shipping estimates) AND every per-company pricing sweep
@@ -236,7 +238,9 @@ MOTOR_STATE_BASE_URL = os.environ.get("MOTOR_STATE_BASE_URL", "https://api.motor
 # order. It does NOT affect the feed, which always reads production. Note that the sandbox host
 # only serves 3_4, so its responses may lack 3_6 fields.
 ATD_ORDERS_USE_SANDBOX = os.environ.get("ATD_ORDERS_USE_SANDBOX", "").strip().lower() in (
-    "1", "true", "yes",
+    "1",
+    "true",
+    "yes",
 )
 
 # AllPro's "Fulfillment Master" API -- stock check, ordering, cancellation, tracking and billing
@@ -248,7 +252,9 @@ ATD_ORDERS_USE_SANDBOX = os.environ.get("ATD_ORDERS_USE_SANDBOX", "").strip().lo
 # allpro-sandbox.myshipzone.com instead, or ALLPRO_FM_BASE_URL to override the host outright.
 ALLPRO_FM_BASE_URL = os.environ.get("ALLPRO_FM_BASE_URL", "")
 ALLPRO_FM_USE_SANDBOX = os.environ.get("ALLPRO_FM_USE_SANDBOX", "").strip().lower() in (
-    "1", "true", "yes",
+    "1",
+    "true",
+    "yes",
 )
 
 # Helmet House price/stock feed (see src.integrations.clients.helmet_house). Plain FTP, port 21 --
@@ -257,24 +263,16 @@ ALLPRO_FM_USE_SANDBOX = os.environ.get("ALLPRO_FM_USE_SANDBOX", "").strip().lowe
 # password (the HELMHOUSE entry in PROVIDER_CATALOG asks for nothing else).
 HELMET_HOUSE_FTP_HOST = os.environ.get("HELMET_HOUSE_FTP_HOST", "ftp.helmethouse.com")
 HELMET_HOUSE_FTP_PORT = int(os.environ.get("HELMET_HOUSE_FTP_PORT", "21"))
-HELMET_HOUSE_LOCAL_PATH = os.environ.get(
-    "HELMET_HOUSE_LOCAL_PATH", "/tmp/helmet_house_masterv.csv"
-)
+HELMET_HOUSE_LOCAL_PATH = os.environ.get("HELMET_HOUSE_LOCAL_PATH", "/tmp/helmet_house_masterv.csv")
 
 # Elite Wheel & Tire (see src.integrations.clients.elite_wheel). Elite's SFTPGo server exposes the
 # same TriWeeklyUpdate*.xlsx drop folder both as per-dealer SFTP accounts and as a public,
 # inventory-only share; the shared catalog reads the public share, and a connected dealer's own
 # SFTP account is what adds their pricing. ELITE_WHEEL_FORCE_PUBLIC_SHARE=True pins every
 # connection to the public share (useful while dealer accounts are still being provisioned).
-ELITE_WHEEL_PUBLIC_SHARE_URL = os.environ.get(
-    "ELITE_WHEEL_PUBLIC_SHARE_URL", "https://sftp.elitewheelandtire.com"
-)
-ELITE_WHEEL_PUBLIC_SHARE_ID = os.environ.get(
-    "ELITE_WHEEL_PUBLIC_SHARE_ID", "84ypjmAqgkiZn9T2V4DboM"
-)
-ELITE_WHEEL_FORCE_PUBLIC_SHARE = (
-    os.environ.get("ELITE_WHEEL_FORCE_PUBLIC_SHARE", "false").strip().lower() == "true"
-)
+ELITE_WHEEL_PUBLIC_SHARE_URL = os.environ.get("ELITE_WHEEL_PUBLIC_SHARE_URL", "https://sftp.elitewheelandtire.com")
+ELITE_WHEEL_PUBLIC_SHARE_ID = os.environ.get("ELITE_WHEEL_PUBLIC_SHARE_ID", "84ypjmAqgkiZn9T2V4DboM")
+ELITE_WHEEL_FORCE_PUBLIC_SHARE = os.environ.get("ELITE_WHEEL_FORCE_PUBLIC_SHARE", "false").strip().lower() == "true"
 
 # The Wheel Group (see src.integrations.clients.the_wheel_group). TWG is a relay-provisioned
 # integration -- the long-term source is each company's own drop on our SFTP relay, the same
@@ -304,8 +302,8 @@ THE_WHEEL_GROUP_RELAY_DIRECTORY = os.environ.get("THE_WHEEL_GROUP_RELAY_DIRECTOR
 # an authenticated POST .../submit/ request) has been validated end-to-end against
 # apitest.turn14.com, so quote/order/submit calls now go to Turn 14's real environment —
 # submit_order() places genuine live orders from here on, not Turn 14 test orders.
-TURN14_ORDER_TEST_BASE_URL = 'https://apitest.turn14.com/v1'
-TURN14_ORDER_PRODUCTION_BASE_URL = 'https://api.turn14.com/v1'
+TURN14_ORDER_TEST_BASE_URL = "https://apitest.turn14.com/v1"
+TURN14_ORDER_PRODUCTION_BASE_URL = "https://api.turn14.com/v1"
 TURN14_ORDER_ENVIRONMENT = os.environ.get("TURN14_ORDER_ENVIRONMENT", "production")
 
 # Credentials used to populate the SHARED Turn 14 tables (items, items/data, fitment,
@@ -333,9 +331,7 @@ NTW_API_CLIENT_ID = os.environ.get("NTW_API_CLIENT_ID", "")
 NTW_API_CLIENT_SECRET = os.environ.get("NTW_API_CLIENT_SECRET", "")
 # QA is the only base URL TBC has given us; their docs list it for "Production, Development"
 # both, which cannot be right for production. Ask before pointing this at anything live.
-NTW_API_BASE_URL = os.environ.get(
-    "NTW_API_BASE_URL", "https://tbcservicesqa.tbccorp.com/tbccorp/qa/tbc/api"
-)
+NTW_API_BASE_URL = os.environ.get("NTW_API_BASE_URL", "https://tbcservicesqa.tbccorp.com/tbccorp/qa/tbc/api")
 # Path to a PEM bundle containing the "Go Daddy Secure Certificate Authority - G2" intermediate.
 # TBC's gateway serves only its leaf certificate, so without this requests cannot build a chain
 # and every call fails with "unable to get local issuer certificate". Browsers hide the problem
@@ -351,11 +347,11 @@ NTW_API_SIGNING_SECRET = os.environ.get("NTW_API_SIGNING_SECRET", "")
 PURCHASE_ORDER_QUOTE_TTL_MINUTES = int(os.environ.get("PURCHASE_ORDER_QUOTE_TTL_MINUTES", "15"))
 
 # Keystone FTP (implicit FTPS, port 990)
-KEYSTONE_FTP_HOST = 'ftp.ekeystone.com'
+KEYSTONE_FTP_HOST = "ftp.ekeystone.com"
 KEYSTONE_FTP_PORT = 990
-KEYSTONE_FTP_USER = ''  # Set via env or CompanyProviders.credentials
-KEYSTONE_FTP_PASSWORD = ''
-KEYSTONE_INVENTORY_LOCAL_PATH = '/tmp/keystone_inventory.csv'
+KEYSTONE_FTP_USER = ""  # Set via env or CompanyProviders.credentials
+KEYSTONE_FTP_PASSWORD = ""
+KEYSTONE_INVENTORY_LOCAL_PATH = "/tmp/keystone_inventory.csv"
 
 # Keystone Electronic Order Web Service (SOAP order placement) — a single fixed endpoint for
 # both test and production use; unlike Turn14, there's no separate host per environment, only a
@@ -386,7 +382,7 @@ PLANS = {
     "scout": {
         "name": "Scout",
         "description": "Run real jobs through it before you commit.",
-        "stripe_product_id": None,       # free plan — no Stripe object, no checkout
+        "stripe_product_id": None,  # free plan — no Stripe object, no checkout
         "stripe_price_id_monthly": None,
         "stripe_price_id_annual": None,
         "amount_monthly": 0,
@@ -419,8 +415,8 @@ PLANS = {
         "stripe_product_id": "prod_V5tmPy9cjgjE2A",
         "stripe_price_id_monthly": "price_1U5hzP70L1K5o6zmnvvTaD3o",
         "stripe_price_id_annual": "price_1U5hzP70L1K5o6zmrbMYaC24",
-        "amount_monthly": 4900,   # $49.00
-        "amount_annual": 48000,   # $480.00 ($40/mo effective)
+        "amount_monthly": 4900,  # $49.00
+        "amount_annual": 48000,  # $480.00 ($40/mo effective)
         "currency": "usd",
         "features": {
             "detail_views_per_month": -1,
@@ -440,8 +436,8 @@ PLANS = {
         "stripe_product_id": "prod_V5tnkLcrXX8s96",
         "stripe_price_id_monthly": "price_1U5hzQ70L1K5o6zmMinCigsO",
         "stripe_price_id_annual": "price_1U5hzR70L1K5o6zmXlU6sCxR",
-        "amount_monthly": 9900,   # $99.00
-        "amount_annual": 96000,   # $960.00 ($80/mo effective)
+        "amount_monthly": 9900,  # $99.00
+        "amount_annual": 96000,  # $960.00 ($80/mo effective)
         "currency": "usd",
         "features": {
             "detail_views_per_month": -1,
@@ -466,8 +462,8 @@ PLANS = {
         "stripe_product_id": "prod_V5tnEO5lXp7jcK",
         "stripe_price_id_monthly": "price_1U5hzS70L1K5o6zmlwXNiOgu",
         "stripe_price_id_annual": "price_1U5hzT70L1K5o6zmvfUkwr8J",
-        "amount_monthly": 7900,   # $79.00 per unit/location
-        "amount_annual": 78000,   # $780.00 per unit/location ($65/mo effective)
+        "amount_monthly": 7900,  # $79.00 per unit/location
+        "amount_annual": 78000,  # $780.00 per unit/location ($65/mo effective)
         "currency": "usd",
         "features": {
             "detail_views_per_month": -1,
@@ -491,8 +487,24 @@ EXTRA_SEAT_ADDON = {
     "stripe_product_id": "prod_V5tnSrAWWtMYAf",
     "stripe_price_id_monthly": "price_1U5hzU70L1K5o6zmze3QzwI5",
     "stripe_price_id_annual": "price_1U5hzU70L1K5o6zmP6lVBzzv",
-    "amount_monthly": 900,   # $9.00
-    "amount_annual": 9000,   # $90.00
+    "amount_monthly": 900,  # $9.00
+    "amount_annual": 9000,  # $90.00
+    "currency": "usd",
+}
+
+# Space allowance (billing.space_allowance = base + paid add-ons). A company on a comp'd trial gets this many
+# spaces as its base; otherwise the base is 1 (the main space) unless staff set Company.space_base_override.
+COMPED_TRIAL_SPACE_ALLOWANCE = 5
+
+# "Additional space" add-on (Tracker/Hunter): monthly price on monthly subscriptions, yearly on annual ones.
+# Like EXTRA_SEAT_ADDON it is never a plan_id. The ids and amounts stay None until the human runs
+# `provision_stripe_billing_catalog` and pastes its output here; None means "not for sale yet".
+SPACE_ADDON = {
+    "stripe_product_id": None,
+    "stripe_price_id_monthly": None,
+    "stripe_price_id_annual": None,
+    "amount_monthly": None,
+    "amount_annual": None,
     "currency": "usd",
 }
 
@@ -525,9 +537,15 @@ WHEELPROS_SFTP_PASSWORD = os.environ.get("WHEELPROS_SFTP_PASSWORD", "")
 WHEELPROS_SFTP_PATH = os.environ.get("WHEELPROS_SFTP_PATH", "CommonFeed/USD/WHEEL/wheelInvPriceData.csv")
 WHEELPROS_INVENTORY_LOCAL_PATH = os.environ.get("WHEELPROS_INVENTORY_LOCAL_PATH", "/tmp/wheelpros_wheel_inventory.csv")
 WHEELPROS_TIRE_LOCAL_PATH = os.environ.get("WHEELPROS_TIRE_LOCAL_PATH", "/tmp/wheelpros_tire_inventory.csv")
-WHEELPROS_ACCESSORIES_LOCAL_PATH = os.environ.get("WHEELPROS_ACCESSORIES_LOCAL_PATH", "/tmp/wheelpros_accessories_inventory.csv")
+WHEELPROS_ACCESSORIES_LOCAL_PATH = os.environ.get(
+    "WHEELPROS_ACCESSORIES_LOCAL_PATH", "/tmp/wheelpros_accessories_inventory.csv"
+)
 # Set to False to verify host keys against ~/.ssh/known_hosts (recommended for production).
-WHEELPROS_SFTP_AUTO_ADD_HOST_KEY = os.environ.get("WHEELPROS_SFTP_AUTO_ADD_HOST_KEY", "true").lower() in ("true", "1", "yes")
+WHEELPROS_SFTP_AUTO_ADD_HOST_KEY = os.environ.get("WHEELPROS_SFTP_AUTO_ADD_HOST_KEY", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
 
 # Wheel Pros Order API (REST, Product Data Portal username/password -> 1hr Bearer JWT via
 # POST /auth/v1/authorize) — single host for both "auth" and "orders" API areas; "testing" points
@@ -862,9 +880,7 @@ ROUGH_COUNTRY_EDI_LOCAL_DIR = os.environ.get("ROUGH_COUNTRY_EDI_LOCAL_DIR", "/tm
 # company can be live while another is still testing. An 850 addressed to the production id is
 # a real purchase order that ships real product, which is why "test" is the default everywhere
 # and going live is a deliberate per-company change.
-ROUGH_COUNTRY_EDI_RECEIVER_ID_TEST = (
-    os.environ.get("ROUGH_COUNTRY_EDI_RECEIVER_ID_TEST") or "64ROUGHCT"
-).strip()
+ROUGH_COUNTRY_EDI_RECEIVER_ID_TEST = (os.environ.get("ROUGH_COUNTRY_EDI_RECEIVER_ID_TEST") or "64ROUGHCT").strip()
 ROUGH_COUNTRY_EDI_RECEIVER_ID_PRODUCTION = (
     os.environ.get("ROUGH_COUNTRY_EDI_RECEIVER_ID_PRODUCTION") or "64ROUGHC"
 ).strip()
@@ -937,9 +953,7 @@ except ValueError:
 # Minimum rank.confidence_building_level for a match to count as "valid". Tunable because it
 # trades false "unverified" warnings against waving through addresses that don't exist.
 try:
-    ADDRESS_VALIDATION_CONFIDENCE_THRESHOLD = float(
-        os.environ.get("ADDRESS_VALIDATION_CONFIDENCE_THRESHOLD") or "0.9"
-    )
+    ADDRESS_VALIDATION_CONFIDENCE_THRESHOLD = float(os.environ.get("ADDRESS_VALIDATION_CONFIDENCE_THRESHOLD") or "0.9")
 except ValueError:
     ADDRESS_VALIDATION_CONFIDENCE_THRESHOLD = 0.9
 
@@ -949,9 +963,7 @@ except ValueError:
 # far too high to tell the user we have no idea what they typed. Below this, we stay silent
 # rather than suggesting an address we can't stand behind.
 try:
-    ADDRESS_VALIDATION_CORRECTION_FLOOR = float(
-        os.environ.get("ADDRESS_VALIDATION_CORRECTION_FLOOR") or "0.5"
-    )
+    ADDRESS_VALIDATION_CORRECTION_FLOOR = float(os.environ.get("ADDRESS_VALIDATION_CORRECTION_FLOOR") or "0.5")
 except ValueError:
     ADDRESS_VALIDATION_CORRECTION_FLOOR = 0.5
 
@@ -982,9 +994,7 @@ ADDRESS_SUGGEST_DEFAULT_COUNTRY = (os.environ.get("ADDRESS_SUGGEST_DEFAULT_COUNT
 # "which countries do we actually ship to?" is still open: once product answers, set the env
 # var and /suggest stops returning results for anywhere else. No code change needed.
 ADDRESS_ALLOWED_COUNTRIES = [
-    code.strip().upper()
-    for code in (os.environ.get("ADDRESS_ALLOWED_COUNTRIES") or "").split(",")
-    if code.strip()
+    code.strip().upper() for code in (os.environ.get("ADDRESS_ALLOWED_COUNTRIES") or "").split(",") if code.strip()
 ]
 
 
@@ -1082,9 +1092,12 @@ FRESHSALES_AUTO_PROVISION_PLATFORM_ACCOUNT = (
 # A company that finished onboarding becomes a sales account and each of its users a contact, so
 # somebody who signed up through any channel is in the CRM alongside the Instantly repliers.
 # ---------------------------------------------------------------------------------------------
-FRESHSALES_SYNC_PLATFORM_SIGNUPS = (
-    os.environ.get("FRESHSALES_SYNC_PLATFORM_SIGNUPS") or "true"
-).strip().lower() in ("1", "true", "yes", "on")
+FRESHSALES_SYNC_PLATFORM_SIGNUPS = (os.environ.get("FRESHSALES_SYNC_PLATFORM_SIGNUPS") or "true").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 # Only companies at this onboarding step are mirrored. 4 = complete. A company that stopped at
 # step 2 has an account but never finished setup, and most such rows are test signups.
@@ -1103,9 +1116,12 @@ FRESHSALES_SIGNUP_CONTACT_STATUS = os.environ.get("FRESHSALES_SIGNUP_CONTACT_STA
 # the stage that already means "they have an account", which is exactly this case. Independent
 # flag, off by default, same reasoning as FRESHSALES_CREATE_DEALS -- an auto-opened deal in a
 # shared pipeline is somebody else's forecast, so it is a deliberate choice, not a default.
-FRESHSALES_SIGNUP_CREATE_DEALS = (
-    os.environ.get("FRESHSALES_SIGNUP_CREATE_DEALS") or ""
-).strip().lower() in ("1", "true", "yes", "on")
+FRESHSALES_SIGNUP_CREATE_DEALS = (os.environ.get("FRESHSALES_SIGNUP_CREATE_DEALS") or "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 FRESHSALES_SIGNUP_DEAL_STAGE_ID = int(os.environ.get("FRESHSALES_SIGNUP_DEAL_STAGE_ID") or 127003680895)
 FRESHSALES_SIGNUP_DEAL_SOURCE = os.environ.get("FRESHSALES_SIGNUP_DEAL_SOURCE") or "Self sign-up"
 

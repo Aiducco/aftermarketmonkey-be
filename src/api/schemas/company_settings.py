@@ -23,6 +23,12 @@ class AddCompanyUserSchema(Schema):
     last_name = fields.String(required=True, validate=validate.Length(min=1, max=150))
     password = fields.String(required=True, validate=validate.Length(min=8))
     is_company_admin = fields.Boolean(required=False, load_default=False)
+    # Multi-spaces companies only; not read for the others.
+    space_ids = fields.List(fields.Integer(), required=False, load_default=None)
+
+
+class SetCompanyUserSpacesSchema(Schema):
+    space_ids = fields.List(fields.Integer(), required=True)
 
 
 class UpdateCompanyUserRoleSchema(Schema):

@@ -49,9 +49,19 @@ class Command(BaseCommand):
                 )
                 return
 
+            # A space's list is its own: the main space (what "all" reads) and every space with a shop connection.
+            connection_space_ids = {}
+            for company_id, space_id in src_models.CompanyShopManagementProviders.objects.filter(
+                active=True, company_id__in=company_ids
+            ).values_list("company_id", "space_id"):
+                connection_space_ids.setdefault(company_id, set()).add(space_id)
             for company_id in company_ids:
-                count = shopmonkey_sync_services.refresh_available_brands_cache(company_id)
-                self.stdout.write(f"company_id={company_id}: cached {count} brands")
+                space_ids = {src_models.Space.objects.main_for(company_id).id} | connection_space_ids.get(
+                    company_id, set()
+                )
+                for space_id in sorted(space_ids):
+                    count = shopmonkey_sync_services.refresh_available_brands_cache(company_id, space_id)
+                    self.stdout.write(f"company_id={company_id} space_id={space_id}: cached {count} brands")
 
             message = f"Warmed {len(company_ids)} compan{'y' if len(company_ids) == 1 else 'ies'}."
             self.stdout.write(self.style.SUCCESS(f"Done. {message}"))

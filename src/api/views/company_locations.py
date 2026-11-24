@@ -12,9 +12,10 @@ from django.views.decorators.csrf import csrf_exempt
 
 from common import exceptions as common_exceptions
 from common import utils as common_utils
-
 from src.api.schemas import company_locations as company_locations_schema
 from src.api.services import company_locations as company_locations_services
+from src.api.services import feature_flags as feature_flags_services
+from src.api.services import spaces as spaces_services
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,16 @@ def _auth_and_company(request) -> typing.Tuple[typing.Optional[int], typing.Opti
     return company_id, None
 
 
+def _address_book_removed(company_id: int) -> typing.Optional[http.HttpResponse]:
+    """Flagged companies edit a space's address through /api/spaces/<id>/, not the address book."""
+    if feature_flags_services.company_has_feature(company_id, feature_flags_services.FEATURE_MULTI_SPACES):
+        return _json_response(
+            {"message": "Edit a space's address in Settings > Spaces.", "error_code": "address_book_removed"},
+            status=400,
+        )
+    return None
+
+
 @method_decorator(csrf_exempt, name="dispatch")
 class CompanyLocationsView(views.View):
     """
@@ -53,13 +64,20 @@ class CompanyLocationsView(views.View):
         if err:
             return _json_response({"message": err}, status=401 if "authenticated" in err else 400)
 
-        data = company_locations_services.list_company_locations(company_id)
+        try:
+            data = company_locations_services.list_for_request(request, company_id)
+        except spaces_services.SpaceError as e:
+            return _json_response(e.body(), status=e.status_code)
         return _json_response({"data": data})
 
     def post(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
         company_id, err = _auth_and_company(request)
         if err:
             return _json_response({"message": err}, status=401 if "authenticated" in err else 400)
+
+        removed = _address_book_removed(company_id)
+        if removed:
+            return removed
 
         try:
             body = json.loads(request.body) if request.body else {}
@@ -92,6 +110,10 @@ class CompanyLocationDetailView(views.View):
         if err:
             return _json_response({"message": err}, status=401 if "authenticated" in err else 400)
 
+        removed = _address_book_removed(company_id)
+        if removed:
+            return removed
+
         location_id = kwargs.get("id")
         try:
             body = json.loads(request.body) if request.body else {}
@@ -121,6 +143,10 @@ class CompanyLocationDetailView(views.View):
         company_id, err = _auth_and_company(request)
         if err:
             return _json_response({"message": err}, status=401 if "authenticated" in err else 400)
+
+        removed = _address_book_removed(company_id)
+        if removed:
+            return removed
 
         location_id = kwargs.get("id")
         err = company_locations_services.delete_company_location(company_id=company_id, location_id=location_id)

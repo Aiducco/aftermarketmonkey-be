@@ -37,8 +37,7 @@ from src import models as src_models
 from src.integrations import credentials as credentials_helper
 from src.integrations.orders import base
 from src.integrations.orders import exceptions as order_exceptions
-from src.integrations.services import notifications
-from src.integrations.services import purchase_order_pdf
+from src.integrations.services import notifications, purchase_order_pdf
 
 logger = logging.getLogger(__name__)
 
@@ -68,9 +67,7 @@ class EmailOrderAdapter(base.DistributorOrderAdapter):
         # "_email" suffix every other email-channel field uses -- the FE's field-type inference
         # keyed off that suffix, and "reply_to" alone was rendering as a password input). Still
         # read the old key for any account saved before the rename.
-        self._reply_to_raw = (
-            (creds.get("reply_to_email") or creds.get("reply_to") or "").strip() or None
-        )
+        self._reply_to_raw = (creds.get("reply_to_email") or creds.get("reply_to") or "").strip() or None
         # Optional -- shown on the PO PDF/email so the distributor knows which of the company's
         # accounts to bill, independent of which email account placed the order.
         self.account_number = (creds.get("account_number") or "").strip() or None
@@ -173,7 +170,7 @@ class EmailOrderAdapter(base.DistributorOrderAdapter):
 
         return {
             "po_reference": po_reference,
-            "company_name": self.company_provider.company.name,
+            "company_name": self.company_provider.company.customer_company.name,
             "provider_name": self.company_provider.provider.name,
             "account_number": self.account_number,
             "order_date": datetime.date.today().isoformat(),
@@ -202,9 +199,7 @@ class EmailOrderAdapter(base.DistributorOrderAdapter):
         ship_to: base.ShipToAddress,
     ) -> base.DistributorOrderResult:
         po_reference = base.resolve_po_number(purchase_order)
-        cc_email, reply_to = self._effective_cc_and_reply_to(
-            self._cc_email_raw, self._reply_to_raw, purchase_order
-        )
+        cc_email, reply_to = self._effective_cc_and_reply_to(self._cc_email_raw, self._reply_to_raw, purchase_order)
         pdf_context = self._build_pdf_context(purchase_order, line_items, ship_to, cc_email)
 
         try:

@@ -37,6 +37,7 @@ from dotenv import dotenv_values
 
 from src import enums as src_enums
 from src import models as src_models
+from src.integrations.services import shopmonkey_import as import_services
 from src.integrations.services import shopmonkey_sync as shopmonkey_sync_services
 
 logger = logging.getLogger(__name__)
@@ -101,9 +102,9 @@ def _read_old_vendors(old_repo: str) -> typing.List[typing.Dict[str, typing.Any]
         connection.close()
 
 
-def _live_vendors_by_name(company_id: int) -> typing.Tuple[typing.Dict[str, typing.List[str]], typing.Set[str]]:
+def _live_vendors_by_name(space_id: int) -> typing.Tuple[typing.Dict[str, typing.List[str]], typing.Set[str]]:
     """GET only. Returns (normalised name -> [vendor ids], all vendor ids)."""
-    client = shopmonkey_sync_services._client_for_company(company_id)
+    client = shopmonkey_sync_services._client_for_space(space_id)
     by_name: typing.Dict[str, typing.List[str]] = {}
     ids: typing.Set[str] = set()
     for vendor in client.get_vendors():
@@ -114,6 +115,7 @@ def _live_vendors_by_name(company_id: int) -> typing.Tuple[typing.Dict[str, typi
 
 def _plan(
     company_id: int,
+    space_id: int,
     old_vendors: typing.List[typing.Dict[str, typing.Any]],
     live_by_name: typing.Dict[str, typing.List[str]],
     live_ids: typing.Set[str],
@@ -128,7 +130,7 @@ def _plan(
             continue
         old_by_kind[kind] = old
 
-    connected_ids = shopmonkey_sync_services.company_connected_provider_ids(company_id)
+    connected_ids = shopmonkey_sync_services.company_connected_provider_ids(company_id, space_id)
     providers = {p.kind: p for p in src_models.Providers.objects.filter(id__in=connected_ids)}
     # A mapped provider is ported even if it were not currently connected: its vendor id is history.
     for kind in old_by_kind:
@@ -137,7 +139,7 @@ def _plan(
             if provider:
                 providers[kind] = provider
 
-    existing = {v.provider_id: v for v in src_models.ShopMonkeySyncVendor.objects.filter(company_id=company_id)}
+    existing = {v.provider_id: v for v in src_models.ShopMonkeySyncVendor.objects.filter(space_id=space_id)}
 
     rows = []
     for kind, provider in sorted(providers.items(), key=lambda kv: kv[1].id):
@@ -221,6 +223,9 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument("--company-id", type=int, required=True)
+        parser.add_argument(
+            "--space-id", type=int, default=None, help="The space whose ShopMonkey account to port into (default Main)."
+        )
         parser.add_argument("--old-repo", default=_DEFAULT_OLD_REPO, help="Path to the old standalone tool.")
         parser.add_argument("--apply", action="store_true", help="Write. Without it nothing is written.")
         parser.add_argument(
@@ -236,13 +241,14 @@ class Command(BaseCommand):
         if not company:
             raise CommandError("No company with id {}.".format(company_id))
         self.stdout.write("Company {}: {} ({})".format(company.id, company.name, company.slug))
+        space_id = import_services.resolve_space_id(company_id, options["space_id"])
 
         old_vendors = _read_old_vendors(options["old_repo"])
         self.stdout.write("Old inventory_vendor rows: {}".format(len(old_vendors)))
-        live_by_name, live_ids = _live_vendors_by_name(company_id)
+        live_by_name, live_ids = _live_vendors_by_name(space_id)
         self.stdout.write("Vendors in the live ShopMonkey account: {}\n".format(len(live_ids)))
 
-        rows, skipped = _plan(company_id, old_vendors, live_by_name, live_ids)
+        rows, skipped = _plan(company_id, space_id, old_vendors, live_by_name, live_ids)
 
         self.stdout.write(
             "{:<4} {:<26} {:<24} {:<5} {:<38} {:<10} {}".format(
@@ -295,6 +301,7 @@ class Command(BaseCommand):
                 if r["action"] == "create":
                     src_models.ShopMonkeySyncVendor.objects.create(
                         company_id=company_id,
+                        space_id=space_id,
                         provider=r["provider"],
                         shopmonkey_external_id=r["sm_id"],
                         bin_name=r["bin_name"],
@@ -310,18 +317,18 @@ class Command(BaseCommand):
         self.stdout.write(self.style.SUCCESS("Applied."))
 
         if options["create_on_shopmonkey"]:
-            self._create_missing_on_shopmonkey(company_id)
+            self._create_missing_on_shopmonkey(space_id)
 
-    def _create_missing_on_shopmonkey(self, company_id: int) -> None:
+    def _create_missing_on_shopmonkey(self, space_id: int) -> None:
         """
         Goes through the sync path's own _ensure_vendor_created_on_shopmonkey rather than a second
         create implementation, so a vendor is created by exactly one piece of code, named the same
         way (the provider's kind_name, matching the old tool's enum names), and recorded the same way.
         Each vendor is independent: one failure is reported and the rest still go ahead.
         """
-        client = shopmonkey_sync_services._client_for_company(company_id)
+        client = shopmonkey_sync_services._client_for_space(space_id)
         pending = src_models.ShopMonkeySyncVendor.objects.filter(
-            company_id=company_id, shopmonkey_external_id__isnull=True
+            space_id=space_id, shopmonkey_external_id__isnull=True
         ).select_related("provider")
         created = failed = 0
         for vendor in pending:

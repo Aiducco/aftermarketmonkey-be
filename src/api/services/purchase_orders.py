@@ -18,24 +18,30 @@ import typing
 
 from django.conf import settings
 from django.db import IntegrityError, transaction
-from django.db.models import F
+from django.db.models import Count, F, Prefetch
 from django.utils import timezone as django_timezone
 
 from src import enums as src_enums
 from src import models as src_models
 from src.api.services import address as address_services
 from src.api.services import billing as billing_services
+from src.api.services import spaces as spaces_services
 from src.integrations import credentials as credentials_helper
 from src.integrations.orders import base as order_base
 from src.integrations.orders import history_registry as order_history_registry
 from src.integrations.orders import raw_response_parsers
 from src.integrations.orders import registry as order_registry
-from src.integrations.services import confirmed_purchase_order_sync
-from src.integrations.services import purchase_order_jobs
-from src.integrations.services import purchase_order_pdf
+from src.integrations.services import (
+    confirmed_purchase_order_sync,
+    purchase_order_jobs,
+    purchase_order_pdf,
+)
 
 logger = logging.getLogger(__name__)
 _LOG_PREFIX = "[PURCHASE-ORDERS-API]"
+
+ERROR_MIXED_SPACES = "mixed_spaces"
+ERROR_ORDER_ACCOUNT_NOT_IN_SPACE = "order_account_not_in_space"
 
 _REQUIRED_SHIP_TO_FIELDS = ("name", "address1", "city", "state", "postal_code", "country")
 
@@ -51,9 +57,28 @@ class PurchaseOrderServiceError(Exception):
     currently only used for billing_services.PLAN_LIMIT_ERROR_CODE (see add_cart_item /
     submit_purchase_order), so the view can return 402 + upgrade_required instead of a plain 400.
     """
+
     def __init__(self, message: str, error_code: typing.Optional[str] = None) -> None:
         super().__init__(message)
         self.error_code = error_code
+
+
+# -- Spaces -------------------------------------------------------------------------------
+
+
+def _list_space_ids(scope: spaces_services.SpaceScope) -> typing.Optional[typing.List[int]]:
+    """The space ids a list filters by; None (no filter at all) for a company without the flag."""
+    return scope.list_space_ids if scope.enabled else None
+
+
+def _add_space_fields(
+    data: typing.Dict, space_id: int, scope: typing.Optional[spaces_services.SpaceScope]
+) -> typing.Dict:
+    """space_id / space_name on a response row, only for a company with the flag."""
+    if scope is not None and scope.enabled:
+        data["space_id"] = space_id
+        data["space_name"] = scope.space_names.get(space_id)
+    return data
 
 
 # -- Serialization ------------------------------------------------------------------------
@@ -235,7 +260,9 @@ def _po_fulfillment_channel(po: src_models.PurchaseOrder) -> str:
     enough from an HTTP API that the FE has to be able to tell them apart — submitting delivers
     a document, and confirmation arrives separately, hours later.
     """
-    account = po.order_account if po.order_account_id else credentials_helper.get_default_order_account(po.company_provider)
+    account = (
+        po.order_account if po.order_account_id else credentials_helper.get_default_order_account(po.company_provider)
+    )
     method = account.order_method_name.lower() if account else "api"
     if method == "email":
         return "email"
@@ -260,18 +287,14 @@ def _fulfillment_channels_by_po_id(
             company_provider_id__in=cp_ids, is_default=True, active=True
         ).values("company_provider_id", "order_method_name")
         for row in default_rows:
-            default_method_by_cp_id.setdefault(
-                row["company_provider_id"], row["order_method_name"]
-            )
+            default_method_by_cp_id.setdefault(row["company_provider_id"], row["order_method_name"])
 
     # Provider kind per connection, for the API-channel branch below — one query for the whole
     # page rather than walking po.company_provider.provider on every row.
     kind_by_cp_id: typing.Dict[int, int] = {}
     all_cp_ids = {po.company_provider_id for po in pos}
     if all_cp_ids:
-        for row in src_models.CompanyProviders.objects.filter(id__in=all_cp_ids).values(
-            "id", "provider__kind"
-        ):
+        for row in src_models.CompanyProviders.objects.filter(id__in=all_cp_ids).values("id", "provider__kind"):
             kind_by_cp_id[row["id"]] = row["provider__kind"]
 
     channels: typing.Dict[int, str] = {}
@@ -284,13 +307,15 @@ def _fulfillment_channels_by_po_id(
             channels[po.id] = "email"
             continue
         kind = kind_by_cp_id.get(po.company_provider_id)
-        channels[po.id] = (
-            order_registry.fulfillment_channel_for_kind(kind) if kind is not None else "api"
-        )
+        channels[po.id] = order_registry.fulfillment_channel_for_kind(kind) if kind is not None else "api"
     return channels
 
 
-def _serialize_purchase_order(po: src_models.PurchaseOrder, include_line_items: bool = True) -> typing.Dict:
+def _serialize_purchase_order(
+    po: src_models.PurchaseOrder,
+    include_line_items: bool = True,
+    scope: typing.Optional[spaces_services.SpaceScope] = None,
+) -> typing.Dict:
     provider = po.company_provider.provider
     result = {
         "id": po.id,
@@ -337,9 +362,7 @@ def _serialize_purchase_order(po: src_models.PurchaseOrder, include_line_items: 
             # "valid" | "corrected" | "unverified", or None when the address never went
             # through POST /api/address/validate/ (saved location, ship-to-my-shop, or an
             # older client) -- see src.enums.AddressValidationStatus.
-            "validation_status": address_services.status_to_api_from_value(
-                po.ship_to_validation_status
-            ),
+            "validation_status": address_services.status_to_api_from_value(po.ship_to_validation_status),
         }
         if po.ship_to_address1
         else None,
@@ -365,9 +388,7 @@ def _serialize_purchase_order(po: src_models.PurchaseOrder, include_line_items: 
         # field instead of our own po_number above (see base.resolve_po_number).
         "po_name": po.po_name,
         "quoted_at": po.quoted_at.isoformat() if po.quoted_at else None,
-        "quote_is_stale": (
-            _quote_is_stale(po) if po.status == src_enums.PurchaseOrderStatus.QUOTED.value else None
-        ),
+        "quote_is_stale": (_quote_is_stale(po) if po.status == src_enums.PurchaseOrderStatus.QUOTED.value else None),
         "submitted_at": po.submitted_at.isoformat() if po.submitted_at else None,
         "created_at": po.created_at.isoformat(),
         "updated_at": po.updated_at.isoformat(),
@@ -379,7 +400,8 @@ def _serialize_purchase_order(po: src_models.PurchaseOrder, include_line_items: 
         # Turn14/Keystone's own multi-warehouse orders still carry a single order number).
         "distributor_order_number": ", ".join(
             pdo.distributor_order_number for pdo in po.distributor_orders.all() if pdo.distributor_order_number
-        ) or None,
+        )
+        or None,
         "distributor_orders": [_serialize_distributor_order(pdo) for pdo in po.distributor_orders.all()],
         # Distributor-issued invoices (see PurchaseOrderInvoice) — only populated for
         # distributors whose adapter supports it (currently Turn14) and only once items
@@ -396,13 +418,14 @@ def _serialize_purchase_order(po: src_models.PurchaseOrder, include_line_items: 
             ).all()
         ]
         result["item_count"] = sum(li["quantity"] for li in result["line_items"])
-    return result
+    return _add_space_fields(result, po.space_id, scope)
 
 
 def _serialize_purchase_order_list_item(
     po: src_models.PurchaseOrder,
     distributor_order_status_name: typing.Optional[str] = None,
     fulfillment_channel: str = "api",
+    scope: typing.Optional[spaces_services.SpaceScope] = None,
 ) -> typing.Dict:
     """
     Lean row shape for GET /purchase-orders/ (the order-history table) -- exactly the columns
@@ -429,7 +452,7 @@ def _serialize_purchase_order_list_item(
     indefinitely, which reads as a stuck API order unless the channel is shown.
     """
     provider = po.company_provider.provider
-    return {
+    row = {
         "id": po.id,
         "po_number": po.po_number,
         "po_name": po.po_name,
@@ -446,6 +469,7 @@ def _serialize_purchase_order_list_item(
         "submitted_at": po.submitted_at.isoformat() if po.submitted_at else None,
         "created_at": po.created_at.isoformat(),
     }
+    return _add_space_fields(row, po.space_id, scope)
 
 
 # -- Cart -----------------------------------------------------------------------------------
@@ -458,7 +482,12 @@ def _resolve_user_profile_id(user_id: typing.Optional[int]) -> typing.Optional[i
     return profile.id if profile else None
 
 
-def _get_company_provider(company_id: int, provider_id: int) -> src_models.CompanyProviders:
+def _get_company_provider(
+    company_id: int,
+    provider_id: int,
+    scope: typing.Optional[spaces_services.SpaceScope] = None,
+    space_id: typing.Optional[int] = None,
+) -> src_models.CompanyProviders:
     """
     Resolve this company's connection (CompanyProviders) to a distributor, from the
     distributor's public catalog id (Providers.id — what part-detail responses expose as
@@ -474,12 +503,21 @@ def _get_company_provider(company_id: int, provider_id: int) -> src_models.Compa
     order_account) for the actually-resolved account instead, once _resolve_order_account has
     run — that's the only check that knows whether THIS connection, through whichever account
     ends up being used, can really place an order.
+
+    Flagged companies (``scope.enabled``) resolve the connection the write space uses for the distributor
+    (``spaces.feeds_for``: the company's own, a shared one or the space's own feed tenant's), active ones only;
+    everyone else gets the company's own connection, exactly as before.
     """
-    cp = (
-        src_models.CompanyProviders.objects.filter(company_id=company_id, provider_id=provider_id)
-        .select_related("provider")
-        .first()
-    )
+    if scope is not None and scope.enabled and space_id is not None:
+        cp = spaces_services.feeds_for(space_id).get(provider_id)
+        if cp is not None:
+            cp = src_models.CompanyProviders.objects.select_related("provider").get(id=cp.id)
+    else:
+        cp = (
+            src_models.CompanyProviders.objects.filter(company_id=company_id, provider_id=provider_id)
+            .select_related("provider")
+            .first()
+        )
     if not cp:
         raise PurchaseOrderServiceError("This distributor isn't connected for your company.")
     if cp.paused_at is not None:
@@ -509,6 +547,58 @@ def _resolve_order_account(
     return account
 
 
+def _ensure_account_in_space(
+    scope: spaces_services.SpaceScope,
+    cp: src_models.CompanyProviders,
+    order_account: typing.Optional[src_models.CompanyProviderOrderAccount],
+    space_id: int,
+) -> None:
+    """
+    Flagged companies only (AC-41): the account the order goes through must be used by the space. None means
+    the connection's implicit default account, which is held to the same rule; a connection with no default
+    account is used by its owner space only.
+    """
+    if not scope.enabled:
+        return
+    account = order_account or credentials_helper.get_default_order_account(cp)
+    owner_space_id = spaces_services.owner_space_id_of_connection(cp, scope.main_space_id)
+    if account is None:
+        used_by = [owner_space_id]
+    else:
+        used_by = spaces_services.order_account_space_ids(account, owner_space_id)
+    if space_id not in used_by:
+        label = account.label if account else "the default account"
+        raise spaces_services.SpaceError(
+            "{} is not used by {}. An admin can add it under Integrations > {} > Used by.".format(
+                label, scope.space_names.get(space_id, "this space"), cp.provider.name
+            ),
+            ERROR_ORDER_ACCOUNT_NOT_IN_SPACE,
+        )
+
+
+_PREFETCHED_ACCOUNTS_ATTR = "active_order_accounts_prefetched"
+
+
+def _active_accounts_prefetch() -> Prefetch:
+    """Prefetch of every connection's active order accounts (default first) with their spaces, so a list of
+    connections reads them in two queries."""
+    return Prefetch(
+        "order_accounts",
+        queryset=src_models.CompanyProviderOrderAccount.objects.filter(active=True)
+        .prefetch_related("spaces")
+        .order_by("-is_default", "created_at"),
+        to_attr=_PREFETCHED_ACCOUNTS_ATTR,
+    )
+
+
+def _active_accounts(cp: src_models.CompanyProviders) -> typing.List[src_models.CompanyProviderOrderAccount]:
+    """The connection's active accounts, default first: from the prefetch when there is one, else queried."""
+    prefetched = getattr(cp, _PREFETCHED_ACCOUNTS_ATTR, None)
+    if prefetched is not None:
+        return prefetched
+    return list(cp.order_accounts.filter(active=True).prefetch_related("spaces").order_by("-is_default", "created_at"))
+
+
 def _serialize_order_accounts(cp: src_models.CompanyProviders) -> typing.List[typing.Dict]:
     """
     Every account this connection can order through, for the "choose which account" picker at
@@ -518,14 +608,36 @@ def _serialize_order_accounts(cp: src_models.CompanyProviders) -> typing.List[ty
     when no account is specified — purely informational, not needed to place an order via the
     default (leave ``order_account_id`` unset for that).
     """
-    accounts = cp.order_accounts.filter(active=True).order_by("-is_default", "created_at")
-    return [
-        {"id": account.id, "label": account.label, "is_default": account.is_default}
-        for account in accounts
-    ]
+    accounts = _active_accounts(cp)
+    return [{"id": account.id, "label": account.label, "is_default": account.is_default} for account in accounts]
 
 
-def _cart_queryset(company_id: int):
+def _accounts_for_scope(
+    scope: spaces_services.SpaceScope, cp: src_models.CompanyProviders
+) -> typing.Tuple[typing.List[typing.Dict], bool]:
+    """_serialize_order_accounts limited to the accounts used by the scope's spaces, each + ``space_ids``
+    (the spaces that use it, among the ones the caller can see). Also whether the connection has any active
+    account at all (so "the space uses none of them" needs no further query)."""
+    owner_space_id = spaces_services.owner_space_id_of_connection(cp, scope.main_space_id)
+    shown = set(scope.list_space_ids)
+    visible = set(scope.visible_space_ids)
+    rows = []
+    accounts = _active_accounts(cp)
+    for account in accounts:
+        used_by = spaces_services.order_account_space_ids(account, owner_space_id)
+        if shown.intersection(used_by):
+            rows.append(
+                {
+                    "id": account.id,
+                    "label": account.label,
+                    "is_default": account.is_default,
+                    "space_ids": [space_id for space_id in used_by if space_id in visible],
+                }
+            )
+    return rows, bool(accounts)
+
+
+def _cart_queryset(company_id: int, space_ids: typing.Optional[typing.List[int]]):
     """
     POs that still belong to the "cart" world, as opposed to order history: never-submitted
     DRAFT/QUOTED carts, AND any FAILED PO regardless of whether the failure ever actually
@@ -538,8 +650,11 @@ def _cart_queryset(company_id: int):
     _get_or_create_draft / _revert_to_draft) — a fresh cart edit implicitly means "never mind,
     starting over." DISCARDED is deliberately excluded — once a user discards a PO it's a dead
     end, never resurrected as a draft.
+
+    ``space_ids`` limits it to those spaces; None means every space of the company (a company
+    without the multi_spaces flag, or an object lookup that checks the space itself afterwards).
     """
-    return src_models.PurchaseOrder.objects.filter(
+    qs = src_models.PurchaseOrder.objects.filter(
         company_id=company_id,
         status__in=[
             src_enums.PurchaseOrderStatus.DRAFT.value,
@@ -547,6 +662,9 @@ def _cart_queryset(company_id: int):
             src_enums.PurchaseOrderStatus.FAILED.value,
         ],
     )
+    if space_ids is not None:
+        qs = qs.filter(space_id__in=space_ids)
+    return qs
 
 
 def _revert_to_draft(po: src_models.PurchaseOrder) -> None:
@@ -593,15 +711,16 @@ def _get_or_create_draft(
     company_id: int,
     user_id: typing.Optional[int],
     cp: src_models.CompanyProviders,
-    order_account: typing.Optional[src_models.CompanyProviderOrderAccount] = None,
+    order_account: typing.Optional[src_models.CompanyProviderOrderAccount],
+    space_id: int,
 ) -> src_models.PurchaseOrder:
     """
-    Each (company_provider, order_account) pair has its own independent open draft — items
+    Each (space, company_provider, order_account) triple has its own independent open draft — items
     added under two different accounts of the same distributor never land in the same cart (see
     PurchaseOrder.order_account's docstring and its two open-draft uniqueness constraints).
     """
     existing = (
-        _cart_queryset(company_id)
+        _cart_queryset(company_id, [space_id])
         .filter(company_provider=cp, order_account=order_account)
         .order_by("-created_at")
         .first()
@@ -616,6 +735,7 @@ def _get_or_create_draft(
         with transaction.atomic():
             po, _created = src_models.PurchaseOrder.objects.get_or_create(
                 company_id=company_id,
+                space_id=space_id,
                 company_provider=cp,
                 order_account=order_account,
                 status=src_enums.PurchaseOrderStatus.DRAFT.value,
@@ -629,6 +749,7 @@ def _get_or_create_draft(
     except IntegrityError:
         po = src_models.PurchaseOrder.objects.get(
             company_id=company_id,
+            space_id=space_id,
             company_provider=cp,
             order_account=order_account,
             status=src_enums.PurchaseOrderStatus.DRAFT.value,
@@ -638,7 +759,7 @@ def _get_or_create_draft(
 
 def _add_or_increment_line_item(
     po: src_models.PurchaseOrder,
-    company_id: int,
+    pricing_company_id: int,
     provider_part: src_models.ProviderPart,
     quantity: int,
     kit_source_provider_part: typing.Optional[src_models.ProviderPart] = None,
@@ -650,7 +771,7 @@ def _add_or_increment_line_item(
     an expanded kit, so both go through the identical select_for_update/create-or-increment path.
     """
     pricing = src_models.ProviderPartCompanyPricing.objects.filter(
-        provider_part=provider_part, company_id=company_id
+        provider_part=provider_part, company_id=pricing_company_id
     ).first()
     unit_cost = pricing.cost if pricing else None
 
@@ -684,6 +805,7 @@ def _add_or_increment_line_item(
 
 def add_cart_item(
     company_id: int,
+    scope: spaces_services.SpaceScope,
     user_id: typing.Optional[int],
     provider_id: int,
     master_part_id: int,
@@ -715,6 +837,9 @@ def add_cart_item(
     if not allowed:
         raise PurchaseOrderServiceError(plan_reason, error_code=billing_services.PLAN_LIMIT_ERROR_CODE)
 
+    # The space the cart belongs to (raises space_required / space_access_denied); main for an unflagged company.
+    space_id = spaces_services.write_space(scope)
+
     if not provider_id:
         raise PurchaseOrderServiceError("provider_id is required.")
     if not master_part_id:
@@ -722,12 +847,11 @@ def add_cart_item(
     if not isinstance(quantity, int) or quantity <= 0:
         raise PurchaseOrderServiceError("Quantity must be a positive integer.")
 
-    cp = _get_company_provider(company_id, provider_id)
+    cp = _get_company_provider(company_id, provider_id, scope, space_id)
     order_account = _resolve_order_account(cp, order_account_id)
+    _ensure_account_in_space(scope, cp, order_account, space_id)
     if order_registry.get_adapter(cp, order_account) is None:
-        raise PurchaseOrderServiceError(
-            order_registry.get_adapter_unavailable_reason(cp, order_account)
-        )
+        raise PurchaseOrderServiceError(order_registry.get_adapter_unavailable_reason(cp, order_account))
 
     provider_part = src_models.ProviderPart.objects.filter(
         master_part_id=master_part_id, provider_id=provider_id
@@ -735,40 +859,43 @@ def add_cart_item(
     if not provider_part:
         raise PurchaseOrderServiceError("Part not found for this distributor.")
 
-    po = _get_or_create_draft(company_id, user_id, cp, order_account)
+    po = _get_or_create_draft(company_id, user_id, cp, order_account, space_id)
 
     with transaction.atomic():
         if provider_part.is_kit:
-            kit_components = list(
-                provider_part.kit_components.select_related("component_part").all()
-            )
+            kit_components = list(provider_part.kit_components.select_related("component_part").all())
             if not kit_components:
-                raise PurchaseOrderServiceError(
-                    "This kit's components aren't available to order individually yet."
-                )
+                raise PurchaseOrderServiceError("This kit's components aren't available to order individually yet.")
             for component in kit_components:
                 _add_or_increment_line_item(
                     po,
-                    company_id,
+                    cp.company_id,
                     component.component_part,
                     quantity * component.quantity,
                     kit_source_provider_part=provider_part,
                 )
         else:
-            _add_or_increment_line_item(po, company_id, provider_part, quantity)
+            _add_or_increment_line_item(po, cp.company_id, provider_part, quantity)
 
-    return get_cart(company_id)
+    return get_cart(company_id, scope)
 
 
-def update_cart_item(company_id: int, line_item_id: int, quantity: int) -> typing.Dict:
+def update_cart_item(
+    company_id: int, scope: spaces_services.SpaceScope, line_item_id: int, quantity: int
+) -> typing.Dict:
     if not isinstance(quantity, int) or quantity <= 0:
         raise PurchaseOrderServiceError("Quantity must be a positive integer.")
 
-    li = src_models.PurchaseOrderLineItem.objects.filter(
-        id=line_item_id, purchase_order_id__in=_cart_queryset(company_id).values("id")
-    ).select_related("purchase_order").first()
+    li = (
+        src_models.PurchaseOrderLineItem.objects.filter(
+            id=line_item_id, purchase_order_id__in=_cart_queryset(company_id, None).values("id")
+        )
+        .select_related("purchase_order")
+        .first()
+    )
     if not li:
         raise PurchaseOrderServiceError("Cart item not found.")
+    spaces_services.ensure_visible(scope, li.purchase_order.space_id)
 
     li.quantity = quantity
     if li.unit_cost is not None:
@@ -776,24 +903,29 @@ def update_cart_item(company_id: int, line_item_id: int, quantity: int) -> typin
     li.save(update_fields=["quantity", "line_total", "updated_at"])
     if li.purchase_order.status != src_enums.PurchaseOrderStatus.DRAFT.value:
         _revert_to_draft(li.purchase_order)
-    return get_cart(company_id)
+    return get_cart(company_id, scope)
 
 
-def remove_cart_item(company_id: int, line_item_id: int) -> typing.Dict:
-    li = src_models.PurchaseOrderLineItem.objects.filter(
-        id=line_item_id, purchase_order_id__in=_cart_queryset(company_id).values("id")
-    ).select_related("purchase_order").first()
+def remove_cart_item(company_id: int, scope: spaces_services.SpaceScope, line_item_id: int) -> typing.Dict:
+    li = (
+        src_models.PurchaseOrderLineItem.objects.filter(
+            id=line_item_id, purchase_order_id__in=_cart_queryset(company_id, None).values("id")
+        )
+        .select_related("purchase_order")
+        .first()
+    )
     if not li:
         raise PurchaseOrderServiceError("Cart item not found.")
     po = li.purchase_order
+    spaces_services.ensure_visible(scope, po.space_id)
     li.delete()
     if po.status != src_enums.PurchaseOrderStatus.DRAFT.value:
         _revert_to_draft(po)
-    return get_cart(company_id)
+    return get_cart(company_id, scope)
 
 
 def set_cart_order_account(
-    company_id: int, purchase_order_id: int, order_account_id: typing.Optional[int]
+    company_id: int, scope: spaces_services.SpaceScope, purchase_order_id: int, order_account_id: typing.Optional[int]
 ) -> typing.Dict:
     """
     Moves an existing cart-side PO to a different order account of the SAME connection — lets a
@@ -805,46 +937,41 @@ def set_cart_order_account(
     (same as update_cart_item/remove_cart_item) since a quote priced against the OLD account
     means nothing once the account backing it changes; a fresh review/quote is required.
     """
-    po = (
-        _cart_queryset(company_id)
-        .filter(id=purchase_order_id)
-        .select_related("company_provider")
-        .first()
-    )
+    po = _cart_queryset(company_id, None).filter(id=purchase_order_id).select_related("company_provider").first()
     if not po:
         raise PurchaseOrderServiceError("Cart not found.")
+    spaces_services.ensure_visible(scope, po.space_id)
 
     order_account = _resolve_order_account(po.company_provider, order_account_id)
+    _ensure_account_in_space(scope, po.company_provider, order_account, po.space_id)
     if order_account == po.order_account:
-        return get_cart(company_id)
+        return get_cart(company_id, scope)
 
     conflict = (
-        _cart_queryset(company_id)
+        _cart_queryset(company_id, [po.space_id])
         .filter(company_provider=po.company_provider, order_account=order_account)
         .exclude(id=po.id)
         .exists()
     )
     if conflict:
         label = order_account.label if order_account else "the default account"
-        raise PurchaseOrderServiceError(
-            "You already have an open cart for {} — remove its items first.".format(label)
-        )
+        raise PurchaseOrderServiceError("You already have an open cart for {} — remove its items first.".format(label))
 
     po.order_account = order_account
     po.save(update_fields=["order_account", "updated_at"])
     if po.status != src_enums.PurchaseOrderStatus.DRAFT.value:
         _revert_to_draft(po)
-    return get_cart(company_id)
+    return get_cart(company_id, scope)
 
 
-def get_cart(company_id: int) -> typing.Dict:
+def get_cart(company_id: int, scope: spaces_services.SpaceScope) -> typing.Dict:
     drafts = (
-        _cart_queryset(company_id)
+        _cart_queryset(company_id, _list_space_ids(scope))
         .select_related("company_provider__provider", "group", "order_account")
         .prefetch_related("line_items__provider_part__master_part__brand", "distributor_orders")
         .order_by("company_provider__provider__name")
     )
-    serialized = [_serialize_purchase_order(po) for po in drafts]
+    serialized = [_serialize_purchase_order(po, scope=scope) for po in drafts]
     # Only carts that actually have line items count toward the badge/review flow — an empty
     # DRAFT can exist momentarily (e.g. after removing the last item) without being "active".
     active = [po for po in serialized if po["line_items"]]
@@ -859,6 +986,7 @@ def get_cart(company_id: int) -> typing.Dict:
 
 def review_cart(
     company_id: int,
+    scope: spaces_services.SpaceScope,
     user_id: typing.Optional[int],
     ship_to: typing.Dict,
     purchase_order_ids: typing.Optional[typing.List[int]] = None,
@@ -921,12 +1049,26 @@ def review_cart(
     # pricing — rather than silently treating "already quoted" as "nothing to do" (which used
     # to raise "No cart items to review" on a cart that's entirely already-quoted, even though
     # a perfectly valid line item existed).
-    qs = _cart_queryset(company_id).filter(line_items__isnull=False)
     if purchase_order_ids:
-        qs = qs.filter(id__in=purchase_order_ids)
+        qs = _cart_queryset(company_id, None).filter(line_items__isnull=False, id__in=purchase_order_ids)
+    else:
+        # No ids: the carts of the write space (raises space_required / space_access_denied); every cart
+        # for a company without the flag.
+        qs = _cart_queryset(company_id, [spaces_services.write_space(scope)] if scope.enabled else None).filter(
+            line_items__isnull=False
+        )
     purchase_orders = list(qs.distinct())
+    for po in purchase_orders:
+        spaces_services.ensure_visible(scope, po.space_id)
+    if scope.enabled and len({po.space_id for po in purchase_orders}) > 1:
+        raise spaces_services.SpaceError(
+            "These carts belong to different spaces. Review one space at a time.", ERROR_MIXED_SPACES
+        )
     if not purchase_orders:
         raise PurchaseOrderServiceError("No cart items to review.")
+    # Before any quote: a distributor is not asked for a price on an account the space does not use.
+    for po in purchase_orders:
+        _ensure_account_in_space(scope, po.company_provider, po.order_account, po.space_id)
 
     created_by_id = _resolve_user_profile_id(user_id)
     group = src_models.PurchaseOrderGroup.objects.create(
@@ -975,7 +1117,7 @@ def review_cart(
             ]
         )
         quoted_po = purchase_order_jobs.run_quote_synchronously(po.id)
-        results.append(_serialize_purchase_order(quoted_po))
+        results.append(_serialize_purchase_order(quoted_po, scope=scope))
 
     return {"group_id": group.id, "purchase_orders": results}
 
@@ -983,7 +1125,9 @@ def review_cart(
 # -- PO / group reads -----------------------------------------------------------------------
 
 
-def get_purchase_order_detail(company_id: int, purchase_order_id: int) -> typing.Dict:
+def get_purchase_order_detail(
+    company_id: int, scope: spaces_services.SpaceScope, purchase_order_id: int
+) -> typing.Dict:
     po = (
         src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id)
         .select_related("company_provider__provider", "group", "order_account")
@@ -992,10 +1136,11 @@ def get_purchase_order_detail(company_id: int, purchase_order_id: int) -> typing
     )
     if not po:
         raise PurchaseOrderServiceError("Purchase order not found.")
-    return _serialize_purchase_order(po)
+    spaces_services.ensure_visible(scope, po.space_id)
+    return _serialize_purchase_order(po, scope=scope)
 
 
-def get_purchase_order_pdf_bytes(company_id: int, purchase_order_id: int) -> bytes:
+def get_purchase_order_pdf_bytes(company_id: int, scope: spaces_services.SpaceScope, purchase_order_id: int) -> bytes:
     """
     Regenerates the PDF that was emailed for an EmailOrderAdapter-submitted PO — see
     src.integrations.orders.email_order.EmailOrderAdapter.submit_order(), which sets
@@ -1007,11 +1152,10 @@ def get_purchase_order_pdf_bytes(company_id: int, purchase_order_id: int) -> byt
     po = src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id).first()
     if not po:
         raise PurchaseOrderServiceError("Purchase order not found.")
+    spaces_services.ensure_visible(scope, po.space_id)
 
     attempt = (
-        po.submission_attempts.filter(
-            operation=src_enums.PurchaseOrderOperation.SUBMIT.value, success=True
-        )
+        po.submission_attempts.filter(operation=src_enums.PurchaseOrderOperation.SUBMIT.value, success=True)
         .order_by("-created_at")
         .first()
     )
@@ -1193,7 +1337,9 @@ def _serialize_local_distributor_orders(
     return serialized
 
 
-def get_confirmed_purchase_order_detail(company_id: int, purchase_order_id: int) -> typing.Dict:
+def get_confirmed_purchase_order_detail(
+    company_id: int, scope: spaces_services.SpaceScope, purchase_order_id: int
+) -> typing.Dict:
     """
     Standardized, distributor-agnostic view of a placed order: reads distributor_status/
     tracking/invoice ids/line items straight off PurchaseOrderDistributorOrder.raw_response via
@@ -1209,6 +1355,7 @@ def get_confirmed_purchase_order_detail(company_id: int, purchase_order_id: int)
     )
     if not po:
         raise PurchaseOrderServiceError("Purchase order not found.")
+    spaces_services.ensure_visible(scope, po.space_id)
 
     provider = po.company_provider.provider
     provider_kind = provider.kind
@@ -1232,9 +1379,7 @@ def get_confirmed_purchase_order_detail(company_id: int, purchase_order_id: int)
         # True for the first _RECENT_ORDER_WINDOW after submission -- lets the FE flag a PO as
         # "just placed" (e.g. to explain why distributor status/tracking might still be sparse)
         # without it having to do its own submitted_at math against the current time.
-        "recent_order": bool(
-            po.submitted_at and (django_timezone.now() - po.submitted_at) <= _RECENT_ORDER_WINDOW
-        ),
+        "recent_order": bool(po.submitted_at and (django_timezone.now() - po.submitted_at) <= _RECENT_ORDER_WINDOW),
         # API orders keep reading straight off the distributor's stored raw_response. 'email'
         # and 'edi' have no parseable order body there, so parsing yields an empty order and a
         # blank screen; both are served from our own line items instead -- see
@@ -1270,7 +1415,6 @@ def _parse_status_filter(value: typing.Optional[typing.Union[int, str]]) -> typi
         )
 
 
-
 # "Placed but not yet fully closed out" — the FE's "Open" tab alias (see list_purchase_orders'
 # status param). Deliberately excludes FULFILLED/CANCELLED/FAILED, same as it excludes
 # DRAFT/QUOTED by virtue of _cart_queryset already filtering those out beforehand.
@@ -1283,6 +1427,7 @@ _OPEN_STATUSES = [
 
 def list_purchase_orders(
     company_id: int,
+    scope: spaces_services.SpaceScope,
     status: typing.Optional[typing.Union[int, str]] = None,
     company_provider_id: typing.Optional[int] = None,
 ) -> typing.List[typing.Dict]:
@@ -1308,11 +1453,13 @@ def list_purchase_orders(
     carries."""
     qs = (
         src_models.PurchaseOrder.objects.filter(company_id=company_id)
-        .exclude(id__in=_cart_queryset(company_id).values("id"))
+        .exclude(id__in=_cart_queryset(company_id, None).values("id"))
         .exclude(status=src_enums.PurchaseOrderStatus.DISCARDED.value)
         .select_related("company_provider__provider", "order_account")
         .order_by("-created_at")
     )
+    if scope.enabled:
+        qs = qs.filter(space_id__in=scope.list_space_ids)
     if isinstance(status, str) and status.strip().lower() == "open":
         qs = qs.filter(status__in=_OPEN_STATUSES)
     else:
@@ -1337,9 +1484,7 @@ def list_purchase_orders(
         .values("purchase_order_id", "distributor_order_status_name")
     )
     for row in distributor_rows:
-        distributor_status_by_po_id.setdefault(
-            row["purchase_order_id"], row["distributor_order_status_name"]
-        )
+        distributor_status_by_po_id.setdefault(row["purchase_order_id"], row["distributor_order_status_name"])
 
     fulfillment_channel_by_po_id = _fulfillment_channels_by_po_id(pos)
 
@@ -1348,6 +1493,7 @@ def list_purchase_orders(
             po,
             distributor_status_by_po_id.get(po.id),
             fulfillment_channel_by_po_id.get(po.id, "api"),
+            scope,
         )
         for po in pos
     ]
@@ -1355,6 +1501,7 @@ def list_purchase_orders(
 
 def list_purchase_order_invoices(
     company_id: int,
+    scope: spaces_services.SpaceScope,
     company_provider_id: typing.Optional[int] = None,
     start_date: typing.Optional[str] = None,
     end_date: typing.Optional[str] = None,
@@ -1367,16 +1514,20 @@ def list_purchase_order_invoices(
         .select_related("purchase_order__company_provider__provider")
         .order_by("-invoice_date", "-created_at")
     )
+    if scope.enabled:
+        qs = qs.filter(purchase_order__space_id__in=scope.list_space_ids)
     if company_provider_id is not None:
         qs = qs.filter(purchase_order__company_provider_id=company_provider_id)
     if start_date:
         qs = qs.filter(invoice_date__gte=start_date)
     if end_date:
         qs = qs.filter(invoice_date__lte=end_date)
-    return [_serialize_invoice_flat(inv) for inv in qs[:200]]
+    return [_serialize_invoice_flat(inv, scope) for inv in qs[:200]]
 
 
-def get_purchase_order_invoice_detail(company_id: int, invoice_id: int) -> typing.Dict:
+def get_purchase_order_invoice_detail(
+    company_id: int, scope: spaces_services.SpaceScope, invoice_id: int
+) -> typing.Dict:
     inv = (
         src_models.PurchaseOrderInvoice.objects.filter(id=invoice_id, purchase_order__company_id=company_id)
         .select_related("purchase_order__company_provider__provider")
@@ -1384,10 +1535,13 @@ def get_purchase_order_invoice_detail(company_id: int, invoice_id: int) -> typin
     )
     if not inv:
         raise PurchaseOrderServiceError("Invoice not found.")
-    return _serialize_invoice_flat(inv)
+    spaces_services.ensure_visible(scope, inv.purchase_order.space_id)
+    return _serialize_invoice_flat(inv, scope)
 
 
-def _serialize_invoice_flat(inv: src_models.PurchaseOrderInvoice) -> typing.Dict:
+def _serialize_invoice_flat(
+    inv: src_models.PurchaseOrderInvoice, scope: typing.Optional[spaces_services.SpaceScope] = None
+) -> typing.Dict:
     po = inv.purchase_order
     provider = po.company_provider.provider
     result = _serialize_invoice(inv)
@@ -1400,11 +1554,12 @@ def _serialize_invoice_flat(inv: src_models.PurchaseOrderInvoice) -> typing.Dict
             "provider_kind_name": provider.kind_name,
         }
     )
-    return result
+    return _add_space_fields(result, po.space_id, scope)
 
 
 def list_purchase_order_tracking(
     company_id: int,
+    scope: spaces_services.SpaceScope,
     company_provider_id: typing.Optional[int] = None,
     delivery_status: typing.Optional[str] = None,
 ) -> typing.List[typing.Dict]:
@@ -1417,6 +1572,8 @@ def list_purchase_order_tracking(
         .select_related("purchase_order__company_provider__provider")
         .order_by("-updated_at")
     )
+    if scope.enabled:
+        qs = qs.filter(purchase_order__space_id__in=scope.list_space_ids)
     if company_provider_id is not None:
         qs = qs.filter(purchase_order__company_provider_id=company_provider_id)
     if delivery_status:
@@ -1445,12 +1602,13 @@ def list_purchase_order_tracking(
             "status_name": pdo.status_name,
             "updated_at": pdo.updated_at.isoformat(),
         }
+        _add_space_fields(row, po.space_id, scope)
         for tracking_number in pdo.tracking_numbers or [None]:
             rows.append({**row, "tracking_number": tracking_number})
     return rows
 
 
-def get_purchase_order_group_detail(company_id: int, group_id: int) -> typing.Dict:
+def get_purchase_order_group_detail(company_id: int, scope: spaces_services.SpaceScope, group_id: int) -> typing.Dict:
     group = src_models.PurchaseOrderGroup.objects.filter(id=group_id, company_id=company_id).first()
     if not group:
         raise PurchaseOrderServiceError("Purchase order group not found.")
@@ -1459,11 +1617,13 @@ def get_purchase_order_group_detail(company_id: int, group_id: int) -> typing.Di
         .prefetch_related("line_items__provider_part__master_part__brand", "distributor_orders")
         .all()
     )
+    for po in pos:
+        spaces_services.ensure_visible(scope, po.space_id)
     return {
         "id": group.id,
         "reference": group.reference,
         "created_at": group.created_at.isoformat(),
-        "purchase_orders": [_serialize_purchase_order(po) for po in pos],
+        "purchase_orders": [_serialize_purchase_order(po, scope=scope) for po in pos],
     }
 
 
@@ -1479,6 +1639,7 @@ def _quote_is_stale(po: src_models.PurchaseOrder) -> bool:
 
 def submit_purchase_order(
     company_id: int,
+    scope: spaces_services.SpaceScope,
     purchase_order_id: int,
     ship_method: typing.Optional[str] = None,
     notes: typing.Optional[str] = None,
@@ -1517,6 +1678,8 @@ def submit_purchase_order(
     po = src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id).first()
     if not po:
         raise PurchaseOrderServiceError("Purchase order not found.")
+    spaces_services.ensure_visible(scope, po.space_id)
+    _ensure_account_in_space(scope, po.company_provider, po.order_account, po.space_id)
     if ship_method is not None:
         po.ship_method = ship_method
         po.save(update_fields=["ship_method", "updated_at"])
@@ -1528,26 +1691,22 @@ def submit_purchase_order(
         po.save(update_fields=["po_name", "updated_at"])
     if po.status != src_enums.PurchaseOrderStatus.QUOTED.value:
         raise PurchaseOrderServiceError(
-            "Purchase order must be quoted before it can be submitted (current status: {}).".format(
-                po.status_name
-            )
+            "Purchase order must be quoted before it can be submitted (current status: {}).".format(po.status_name)
         )
     if _quote_is_stale(po):
         raise PurchaseOrderServiceError(
             "This quote is more than {} minute(s) old and may no longer reflect current "
-            "price/availability. Re-quote before submitting.".format(
-                settings.PURCHASE_ORDER_QUOTE_TTL_MINUTES
-            )
+            "price/availability. Re-quote before submitting.".format(settings.PURCHASE_ORDER_QUOTE_TTL_MINUTES)
         )
     po.status = src_enums.PurchaseOrderStatus.SUBMITTING.value
     po.status_name = src_enums.PurchaseOrderStatus.SUBMITTING.name
     po.save(update_fields=["status", "status_name", "updated_at"])
     submitted_po = purchase_order_jobs.run_submit_synchronously(po.id)
-    return _serialize_purchase_order(submitted_po)
+    return _serialize_purchase_order(submitted_po, scope=scope)
 
 
 def select_shipping_options(
-    company_id: int, purchase_order_id: int, selections: typing.Dict[str, str]
+    company_id: int, scope: spaces_services.SpaceScope, purchase_order_id: int, selections: typing.Dict[str, str]
 ) -> typing.Dict:
     """
     Applies the customer's per-shipment shipping-method choice, made after seeing the quote's
@@ -1582,6 +1741,7 @@ def select_shipping_options(
     po = src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id).first()
     if not po:
         raise PurchaseOrderServiceError("Purchase order not found.")
+    spaces_services.ensure_visible(scope, po.space_id)
     if not po.shipments:
         raise PurchaseOrderServiceError("This purchase order has no quoted shipments yet — quote it first.")
 
@@ -1591,9 +1751,7 @@ def select_shipping_options(
         shipment = shipments_by_id.get(shipment_id)
         if shipment is None:
             raise PurchaseOrderServiceError("Unknown shipment_id: {}".format(shipment_id))
-        matched_option = next(
-            (o for o in (shipment.get("ship_options") or []) if o.get("id") == ship_option_id), None
-        )
+        matched_option = next((o for o in (shipment.get("ship_options") or []) if o.get("id") == ship_option_id), None)
         if matched_option is None:
             raise PurchaseOrderServiceError(
                 "Unknown ship_option_id '{}' for shipment '{}'.".format(ship_option_id, shipment_id)
@@ -1609,10 +1767,10 @@ def select_shipping_options(
         update_fields.append("ship_method")
     purchase_order_jobs.compute_totals(po)
     po.save(update_fields=update_fields)
-    return _serialize_purchase_order(po)
+    return _serialize_purchase_order(po, scope=scope)
 
 
-def requote_purchase_order(company_id: int, purchase_order_id: int) -> typing.Dict:
+def requote_purchase_order(company_id: int, scope: spaces_services.SpaceScope, purchase_order_id: int) -> typing.Dict:
     """Re-runs the quote for an already-reviewed PO (stale QUOTED, or a FAILED quote attempt)
     without rebuilding the cart — reuses the ship-to/ship-method already stored on it."""
     # Ordering is off for the plan (Scout, so also a downgraded company) -- same 402 gate as
@@ -1625,24 +1783,27 @@ def requote_purchase_order(company_id: int, purchase_order_id: int) -> typing.Di
     po = src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id).first()
     if not po:
         raise PurchaseOrderServiceError("Purchase order not found.")
+    spaces_services.ensure_visible(scope, po.space_id)
     requotable = {
         src_enums.PurchaseOrderStatus.QUOTED.value,
         src_enums.PurchaseOrderStatus.FAILED.value,
     }
     if po.status not in requotable:
         raise PurchaseOrderServiceError(
-            "Purchase order can only be re-quoted from QUOTED or FAILED (current status: {}).".format(
-                po.status_name
-            )
+            "Purchase order can only be re-quoted from QUOTED or FAILED (current status: {}).".format(po.status_name)
         )
     if not po.ship_to_address1:
         raise PurchaseOrderServiceError("Purchase order has no ship-to address on file yet — review the cart first.")
+    _ensure_account_in_space(scope, po.company_provider, po.order_account, po.space_id)
     quoted_po = purchase_order_jobs.run_quote_synchronously(po.id)
-    return _serialize_purchase_order(quoted_po)
+    return _serialize_purchase_order(quoted_po, scope=scope)
 
 
 def submit_purchase_order_group(
-    company_id: int, group_id: int, ship_methods: typing.Optional[typing.Dict[str, str]] = None
+    company_id: int,
+    scope: spaces_services.SpaceScope,
+    group_id: int,
+    ship_methods: typing.Optional[typing.Dict[str, str]] = None,
 ) -> typing.Dict:
     """``ship_methods``: optional {purchase_order_id (as string): shipping_method_code} —
     same per-PO keying as review_cart, since each distributor has its own method-code
@@ -1678,6 +1839,11 @@ def submit_purchase_order_group(
     group = src_models.PurchaseOrderGroup.objects.filter(id=group_id, company_id=company_id).first()
     if not group:
         raise PurchaseOrderServiceError("Purchase order group not found.")
+    # Every PO of the group must be visible before any is submitted (a group is one space, but check each).
+    for group_po in group.purchase_orders.select_related("company_provider", "order_account"):
+        spaces_services.ensure_visible(scope, group_po.space_id)
+        if group_po.status == src_enums.PurchaseOrderStatus.QUOTED.value:
+            _ensure_account_in_space(scope, group_po.company_provider, group_po.order_account, group_po.space_id)
     quoted_ids = list(
         group.purchase_orders.filter(status=src_enums.PurchaseOrderStatus.QUOTED.value)
         .order_by("id")
@@ -1689,21 +1855,28 @@ def submit_purchase_order_group(
     results = []
     for po_id in quoted_ids:
         try:
-            results.append(submit_purchase_order(company_id, po_id, ship_method=ship_methods.get(str(po_id))))
-        except PurchaseOrderServiceError as e:
+            results.append(submit_purchase_order(company_id, scope, po_id, ship_method=ship_methods.get(str(po_id))))
+        except (PurchaseOrderServiceError, spaces_services.SpaceError) as e:
             po = src_models.PurchaseOrder.objects.filter(id=po_id, company_id=company_id).first()
-            result = _serialize_purchase_order(po) if po else {"id": po_id}
+            result = _serialize_purchase_order(po, scope=scope) if po else {"id": po_id}
             result["error_message"] = str(e)
             results.append(result)
     return {"group_id": group_id, "purchase_orders": results}
 
 
-def get_job_status(company_id: int, purchase_order_id: int, job_id: int) -> typing.Dict:
-    job = src_models.PurchaseOrderJob.objects.filter(
-        id=job_id, purchase_order_id=purchase_order_id, purchase_order__company_id=company_id
-    ).first()
+def get_job_status(
+    company_id: int, scope: spaces_services.SpaceScope, purchase_order_id: int, job_id: int
+) -> typing.Dict:
+    job = (
+        src_models.PurchaseOrderJob.objects.filter(
+            id=job_id, purchase_order_id=purchase_order_id, purchase_order__company_id=company_id
+        )
+        .select_related("purchase_order")
+        .first()
+    )
     if not job:
         raise PurchaseOrderServiceError("Job not found.")
+    spaces_services.ensure_visible(scope, job.purchase_order.space_id)
     return {
         "id": job.id,
         "purchase_order_id": job.purchase_order_id,
@@ -1719,10 +1892,11 @@ def get_job_status(company_id: int, purchase_order_id: int, job_id: int) -> typi
     }
 
 
-def cancel_purchase_order(company_id: int, purchase_order_id: int) -> typing.Dict:
+def cancel_purchase_order(company_id: int, scope: spaces_services.SpaceScope, purchase_order_id: int) -> typing.Dict:
     po = src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id).first()
     if not po:
         raise PurchaseOrderServiceError("Purchase order not found.")
+    spaces_services.ensure_visible(scope, po.space_id)
     terminal = {
         src_enums.PurchaseOrderStatus.CANCELLED.value,
         src_enums.PurchaseOrderStatus.FAILED.value,
@@ -1735,7 +1909,7 @@ def cancel_purchase_order(company_id: int, purchase_order_id: int) -> typing.Dic
     return {"purchase_order_id": po.id, "job_id": job.id}
 
 
-def discard_purchase_order(company_id: int, purchase_order_id: int) -> typing.Dict:
+def discard_purchase_order(company_id: int, scope: spaces_services.SpaceScope, purchase_order_id: int) -> typing.Dict:
     """
     Abandons a PO that never became — and now never will become — a real distributor order:
     a never-submitted DRAFT/QUOTED cart the user doesn't want anymore, or a FAILED submission
@@ -1756,6 +1930,7 @@ def discard_purchase_order(company_id: int, purchase_order_id: int) -> typing.Di
     po = src_models.PurchaseOrder.objects.filter(id=purchase_order_id, company_id=company_id).first()
     if not po:
         raise PurchaseOrderServiceError("Purchase order not found.")
+    spaces_services.ensure_visible(scope, po.space_id)
     discardable = {
         src_enums.PurchaseOrderStatus.DRAFT.value,
         src_enums.PurchaseOrderStatus.QUOTED.value,
@@ -1769,10 +1944,12 @@ def discard_purchase_order(company_id: int, purchase_order_id: int) -> typing.Di
     po.status = src_enums.PurchaseOrderStatus.DISCARDED.value
     po.status_name = src_enums.PurchaseOrderStatus.DISCARDED.name
     po.save(update_fields=["status", "status_name", "updated_at"])
-    return _serialize_purchase_order(po)
+    return _serialize_purchase_order(po, scope=scope)
 
 
-def refresh_purchase_order_status(company_id: int, purchase_order_id: int) -> typing.Dict:
+def refresh_purchase_order_status(
+    company_id: int, scope: spaces_services.SpaceScope, purchase_order_id: int
+) -> typing.Dict:
     """
     Refreshes this PO's distributor order(s) synchronously using the same per-distributor logic
     as the refresh_confirmed_purchase_orders command (see confirmed_purchase_order_sync.
@@ -1790,17 +1967,50 @@ def refresh_purchase_order_status(company_id: int, purchase_order_id: int) -> ty
     )
     if not po:
         raise PurchaseOrderServiceError("Purchase order not found.")
+    spaces_services.ensure_visible(scope, po.space_id)
     confirmed_purchase_order_sync.refresh_purchase_order_now(po)
-    return get_confirmed_purchase_order_detail(company_id=company_id, purchase_order_id=purchase_order_id)
+    return get_confirmed_purchase_order_detail(company_id=company_id, scope=scope, purchase_order_id=purchase_order_id)
 
 
 # -- Capabilities ---------------------------------------------------------------------------
 
 
-def get_order_capabilities(company_id: int) -> typing.List[typing.Dict]:
-    company_providers = src_models.CompanyProviders.objects.filter(
-        company_id=company_id, active=True
-    ).select_related("provider")
+def get_order_capabilities(
+    company_id: int, scope: typing.Optional[spaces_services.SpaceScope] = None
+) -> typing.List[typing.Dict]:
+    """
+    Per connected distributor, whether it can order and through which accounts. For a company with the
+    multi_spaces flag (``scope.enabled``) the accounts are the ones the current space uses (every visible
+    space's in "all"), and each has ``space_ids``, limited to the spaces the caller can see.
+    """
+    flagged = scope is not None and scope.enabled
+    if flagged:
+        # The connections the space uses (every visible space's in "all"), one row per distributor: the main
+        # space's connection when visible, else the lowest id; its accounts are those of every such connection.
+        used_by_provider: typing.Dict[int, typing.Dict[int, typing.Set[int]]] = {}
+        for space_id in scope.list_space_ids:
+            for provider_id, used_cp in spaces_services.feeds_for(space_id).items():
+                used_by_provider.setdefault(provider_id, {}).setdefault(used_cp.id, set()).add(space_id)
+        used_ids = [cp_id for per_provider in used_by_provider.values() for cp_id in per_provider]
+        loaded_by_id = {
+            cp.id: cp
+            for cp in src_models.CompanyProviders.objects.filter(id__in=used_ids)
+            .select_related("provider")
+            .prefetch_related(_active_accounts_prefetch())
+        }
+        company_providers = []
+        siblings_of: typing.Dict[int, typing.List[src_models.CompanyProviders]] = {}
+        for provider_id in sorted(used_by_provider):
+            group = [loaded_by_id[cp_id] for cp_id in sorted(used_by_provider[provider_id])]
+            row_cp = next((cp for cp in group if scope.main_space_id in used_by_provider[provider_id][cp.id]), group[0])
+            company_providers.append(row_cp)
+            siblings_of[row_cp.id] = group
+    else:
+        company_providers = (
+            src_models.CompanyProviders.objects.filter(company_id=company_id, active=True)
+            .select_related("provider")
+            .prefetch_related(_active_accounts_prefetch())
+        )
     ordering_enabled = billing_services.check_po_checkout_allowed(company_id)[0]
     results = []
     for cp in company_providers:
@@ -1812,7 +2022,18 @@ def get_order_capabilities(company_id: int) -> typing.List[typing.Dict]:
         # abstract) would tell the FE ordering is available for connections that would
         # actually fail the moment a quote/order was attempted.
         adapter = order_registry.get_adapter(cp)
-        order_accounts = _serialize_order_accounts(cp)
+        if flagged:
+            order_accounts = []
+            has_active_accounts = False
+            for sibling in siblings_of[cp.id]:
+                sibling_accounts, sibling_has_active = _accounts_for_scope(scope, sibling)
+                order_accounts.extend(sibling_accounts)
+                has_active_accounts = has_active_accounts or sibling_has_active
+            # A connection the space uses none of the accounts of stays listed but cannot order for this space.
+            used_by_none = not order_accounts and has_active_accounts
+        else:
+            order_accounts = _serialize_order_accounts(cp)
+            used_by_none = False
         results.append(
             {
                 "company_provider_id": cp.id,
@@ -1821,7 +2042,7 @@ def get_order_capabilities(company_id: int) -> typing.List[typing.Dict]:
                 "provider_name": cp.provider.name,
                 # False while this connection is paused for plan limits or the plan has no
                 # ordering at all (Scout) -- "paused" / "ordering_enabled" say which.
-                "can_order_in_app": bool(adapter) and cp.paused_at is None and ordering_enabled,
+                "can_order_in_app": bool(adapter) and cp.paused_at is None and ordering_enabled and not used_by_none,
                 "paused": cp.paused_at is not None,
                 "ordering_enabled": ordering_enabled,
                 # 'api' | 'email' | 'edi' | None — see base.DistributorOrderAdapter.fulfillment_channel.
@@ -1829,9 +2050,7 @@ def get_order_capabilities(company_id: int) -> typing.List[typing.Dict]:
                 # which provider kinds are email-based (that's a per-order-account choice now,
                 # not fixed per distributor — see src.enums.OrderMethod).
                 "fulfillment_channel": adapter.fulfillment_channel() if adapter else None,
-                "supports_shipping_method_selection": bool(
-                    adapter and adapter.supports_shipping_method_selection()
-                ),
+                "supports_shipping_method_selection": bool(adapter and adapter.supports_shipping_method_selection()),
                 "supports_cancel": bool(adapter and adapter.supports_cancel()),
                 # Lets the FE hide/grey out the Invoices tab for a connection whose distributor
                 # has no invoice API at all (e.g. WheelPros) instead of just always rendering an
@@ -1848,21 +2067,27 @@ def get_order_capabilities(company_id: int) -> typing.List[typing.Dict]:
     return results
 
 
-def get_shipping_methods(company_id: int, company_provider_id: int) -> typing.List[typing.Dict]:
+def get_shipping_methods(
+    company_id: int, company_provider_id: int, scope: typing.Optional[spaces_services.SpaceScope] = None
+) -> typing.List[typing.Dict]:
+    """With a ``scope`` of a flagged company the connection is looked up among the company's and its feed tenants'
+    and must be visible (SpaceError 403 space_access_denied)."""
+    company_ids = (
+        spaces_services.family_company_ids(company_id) if scope is not None and scope.enabled else [company_id]
+    )
     cp = (
-        src_models.CompanyProviders.objects.filter(id=company_provider_id, company_id=company_id)
+        src_models.CompanyProviders.objects.filter(id=company_provider_id, company_id__in=company_ids)
         .select_related("provider")
         .first()
     )
     if not cp:
         raise PurchaseOrderServiceError("Distributor connection not found for this company.")
+    if scope is not None:
+        spaces_services.ensure_connection_visible(scope, cp)
     adapter = order_registry.get_adapter(cp)
     if not adapter or not adapter.supports_shipping_method_selection():
         raise PurchaseOrderServiceError("{} does not support choosing a shipping method.".format(cp.provider.name))
-    return [
-        {"code": m.code, "name": m.name, "carrier_name": m.carrier_name}
-        for m in adapter.list_shipping_methods()
-    ]
+    return [{"code": m.code, "name": m.name, "carrier_name": m.carrier_name} for m in adapter.list_shipping_methods()]
 
 
 # -- External (distributor-placed) orders -----------------------------------------------------
@@ -1912,7 +2137,9 @@ _SHIP_TO_REPORTABLE_KINDS = {
 }
 
 
-def _serialize_external_purchase_order(order: src_models.ExternalPurchaseOrder) -> typing.Dict:
+def _serialize_external_purchase_order(
+    order: src_models.ExternalPurchaseOrder, scope: typing.Optional[spaces_services.SpaceScope] = None
+) -> typing.Dict:
     has_ship_to = any(
         [
             order.ship_to_name,
@@ -1948,7 +2175,7 @@ def _serialize_external_purchase_order(order: src_models.ExternalPurchaseOrder) 
         else "inferred"
     )
 
-    return {
+    row = {
         "id": order.id,
         "company_provider_id": order.company_provider_id,
         "provider_kind_name": order.company_provider.provider.kind_name,
@@ -1981,15 +2208,23 @@ def _serialize_external_purchase_order(order: src_models.ExternalPurchaseOrder) 
         "discovered_at": _iso_utc_z(order.discovered_at),
         "last_synced_at": _iso_utc_z(order.last_synced_at),
     }
+    row = _add_space_fields(row, order.space_id, scope)
+    if scope is not None and scope.enabled:
+        # Why the order sits in its space ("Why this space"); null for a row stored before the company was flagged.
+        row["space_reason"] = order.space_reason_name.lower() if order.space_reason_name else None
+        row["space_reason_prefix"] = order.space_reason_prefix
+    return row
 
 
-def _serialize_external_purchase_order_detail(order: src_models.ExternalPurchaseOrder) -> typing.Dict:
+def _serialize_external_purchase_order_detail(
+    order: src_models.ExternalPurchaseOrder, scope: typing.Optional[spaces_services.SpaceScope] = None
+) -> typing.Dict:
     """The list row plus everything only the detail screen needs. Mirrors what
     _serialize_confirmed_distributor_order gives an app-placed order, with one addition that has
     no app-placed equivalent: status_history. A PurchaseOrder carries a single current status,
     but Keystone returns one row per stage transition, so a discovered order can show its whole
     dated progression (RCV ORD -> ORDER -> PICK -> PACKAGE -> INVOICE -> OUT4DLV -> DELIVRD)."""
-    detail = _serialize_external_purchase_order(order)
+    detail = _serialize_external_purchase_order(order, scope)
     detail["status_history"] = order.status_history or []
     return detail
 
@@ -2009,18 +2244,26 @@ def _polled_connection_status(
     return "error", last_synced_at_iso, watermark.last_error
 
 
-def _polled_connections(company_id: int) -> typing.List[typing.Dict]:
+def _polled_connections(
+    company_id: int, scope: typing.Optional[spaces_services.SpaceScope] = None
+) -> typing.List[typing.Dict]:
     """One row per ACTIVE order account on the company -- including ones that can't discover at
     all (Motor State et al., status="not_supported") -- that's what lets the FE say "this
     distributor can't report outside orders" instead of showing silence. See contract.md's
-    PolledConnection section."""
-    accounts = (
-        src_models.CompanyProviderOrderAccount.objects.filter(
+    PolledConnection section. For a flagged company (``scope``) the accounts are those of the company's and its
+    feed tenants' connections that a space in the list scope uses."""
+    if scope is not None and scope.enabled:
+        accounts = src_models.CompanyProviderOrderAccount.objects.filter(
+            company_provider__company_id__in=spaces_services.family_company_ids(company_id),
+            company_provider__active=True,
+            company_provider_id__in=spaces_services.connection_ids_used_by(scope, scope.list_space_ids),
+            active=True,
+        )
+    else:
+        accounts = src_models.CompanyProviderOrderAccount.objects.filter(
             company_provider__company_id=company_id, company_provider__active=True, active=True
         )
-        .select_related("company_provider__provider")
-        .order_by("company_provider_id", "id")
-    )
+    accounts = accounts.select_related("company_provider__provider").order_by("company_provider_id", "id")
     watermarks_by_account_id = {
         w.order_account_id: w for w in src_models.ExternalOrderSyncWatermark.objects.filter(order_account__in=accounts)
     }
@@ -2050,6 +2293,7 @@ def _polled_connections(company_id: int) -> typing.List[typing.Dict]:
 
 def list_external_purchase_orders(
     company_id: int,
+    scope: spaces_services.SpaceScope,
     provider: typing.Optional[str] = None,
     since: typing.Optional[str] = None,
 ) -> typing.Dict:
@@ -2062,6 +2306,8 @@ def list_external_purchase_orders(
     qs = src_models.ExternalPurchaseOrder.objects.filter(company_id=company_id).select_related(
         "company_provider__provider", "order_account"
     )
+    if scope.enabled:
+        qs = qs.filter(space_id__in=scope.list_space_ids)
     if provider:
         try:
             provider_kind = src_enums.BrandProviderKind[provider.strip().upper()].value
@@ -2081,13 +2327,90 @@ def list_external_purchase_orders(
     # the distributor has not dated yet (Premier before it invoices) is not the newest thing that
     # happened; discovered_at breaks ties and orders the undated ones among themselves.
     orders = [
-        _serialize_external_purchase_order(order)
+        _serialize_external_purchase_order(order, scope)
         for order in qs.order_by(F("order_date").desc(nulls_last=True), "-discovered_at")
     ]
-    return {"orders": orders, "polled_connections": _polled_connections(company_id)}
+    result = {"orders": orders, "polled_connections": _polled_connections(company_id, scope)}
+    if scope.enabled:
+        result["space_summary"] = _external_space_summary(company_id, scope)
+    return result
 
 
-def get_external_purchase_order(company_id: int, external_order_id: int) -> typing.Dict:
+def _external_space_summary(company_id: int, scope: spaces_services.SpaceScope) -> typing.Dict:
+    """Orders per visible space (whatever space is picked) and how many sit in the main space only by default
+    (reason main). Pre-migration rows carry reason account, so they never count as default (spec OQ-10)."""
+    visible = src_models.ExternalPurchaseOrder.objects.filter(
+        company_id=company_id, space_id__in=scope.visible_space_ids
+    )
+    counts = {str(space_id): 0 for space_id in scope.visible_space_ids}
+    for row in visible.values("space_id").annotate(n=Count("id")):
+        counts[str(row["space_id"])] = row["n"]
+    main_default = visible.filter(
+        space_id=scope.main_space_id, space_reason=src_enums.ExternalOrderSpaceReason.MAIN.value
+    ).count()
+    return {"counts": counts, "main_default_count": main_default}
+
+
+MAX_MOVE_ORDERS = 500
+
+
+def move_external_purchase_orders(
+    company_id: int,
+    user_id: int,
+    scope: spaces_services.SpaceScope,
+    external_order_ids: typing.Any,
+    space_id: typing.Any,
+) -> typing.Dict:
+    """
+    POST /purchase-orders/external/move/ (company admin of a flagged company, AC-29/AC-30): the orders belong to
+    ``space_id`` from now on, with reason "moved", so a later sync or re-sort never moves them back. Tracking and
+    invoices are columns of the row, so they go with it (D6). Orders already in that space are left alone.
+    Returns {"moved": n}.
+    """
+    spaces_services.require_admin(scope)
+    ids = external_order_ids
+    if (
+        not isinstance(ids, list)
+        or not ids
+        or len(ids) > MAX_MOVE_ORDERS
+        or not all(isinstance(i, int) and not isinstance(i, bool) for i in ids)
+    ):
+        raise PurchaseOrderServiceError(
+            "external_order_ids must be a list of 1 to {} order ids.".format(MAX_MOVE_ORDERS)
+        )
+    if len(set(ids)) != len(ids):
+        raise PurchaseOrderServiceError("external_order_ids must not repeat an order id.")
+    if not isinstance(space_id, int) or isinstance(space_id, bool) or space_id not in scope.space_names:
+        raise PurchaseOrderServiceError("space_id is not a space of this company.")
+    with transaction.atomic():
+        orders = list(
+            src_models.ExternalPurchaseOrder.objects.select_for_update().filter(company_id=company_id, id__in=set(ids))
+        )
+        if len(orders) != len(set(ids)):
+            raise PurchaseOrderServiceError("Some of those orders were not found.")
+        to_move = [order.id for order in orders if order.space_id != space_id]
+        moved = src_models.ExternalPurchaseOrder.objects.filter(id__in=to_move).update(
+            space_id=space_id,
+            space_reason=src_enums.ExternalOrderSpaceReason.MOVED.value,
+            space_reason_name=src_enums.ExternalOrderSpaceReason.MOVED.name,
+            space_reason_prefix=None,
+            space_moved_by_id=_profile_id(company_id, user_id),
+            space_moved_at=django_timezone.now(),
+        )
+    return {"moved": moved}
+
+
+def _profile_id(company_id: int, user_id: int) -> typing.Optional[int]:
+    return (
+        src_models.UserProfile.objects.filter(company_id=company_id, user_id=user_id)
+        .values_list("id", flat=True)
+        .first()
+    )
+
+
+def get_external_purchase_order(
+    company_id: int, scope: spaces_services.SpaceScope, external_order_id: int
+) -> typing.Dict:
     """
     GET /purchase-orders/external/<id>/. Scoped by company_id from the caller's token, never from
     a request parameter -- an id belonging to another tenant reads as not found rather than
@@ -2100,4 +2423,5 @@ def get_external_purchase_order(company_id: int, external_order_id: int) -> typi
     )
     if order is None:
         raise PurchaseOrderServiceError("External order {} was not found.".format(external_order_id))
-    return _serialize_external_purchase_order_detail(order)
+    spaces_services.ensure_visible(scope, order.space_id)
+    return _serialize_external_purchase_order_detail(order, scope)

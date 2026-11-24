@@ -113,9 +113,19 @@ def _rows(connection, sql: str, params: typing.Sequence = ()) -> typing.List[typ
         return [dict(zip(columns, row)) for row in cursor.fetchall()]
 
 
+def resolve_space_id(company_id: int, space_id: typing.Optional[int]) -> int:
+    """The space a command works on: ``--space-id`` if it is one of the company's spaces, else the main space."""
+    if space_id is None:
+        return src_models.Space.objects.main_for(company_id).id
+    if not src_models.Space.objects.filter(id=space_id, company_id=company_id).exists():
+        raise CommandError("Space {} is not a space of company {}.".format(space_id, company_id))
+    return space_id
+
+
 @dataclasses.dataclass
 class BrandImportPlan:
     company_id: int
+    space_id: int
     old_brand: typing.Dict[str, typing.Any]
     our_brand: src_models.Brands
     provider: src_models.Providers
@@ -147,6 +157,7 @@ def plan_brand_import(
     live_index: typing.Optional[typing.Dict[str, str]] = None,
     provider_kinds: typing.Optional[typing.List[str]] = None,
     live_client=None,
+    space_id: typing.Optional[int] = None,
 ) -> BrandImportPlan:
     connection = connect_old_db(old_repo)
     try:
@@ -181,6 +192,7 @@ def plan_brand_import(
     if live_index is None and live_client is not None:
         live_index = build_live_index(live_client, old_parts)
 
+    space_id = resolve_space_id(company_id, space_id)
     kind = OLD_PROVIDER_TO_KIND.get(old_brand["provider"])
     our_brand = src_models.Brands.objects.filter(id=our_brand_id).first()
     if not our_brand:
@@ -209,15 +221,16 @@ def plan_brand_import(
         providers = [src_models.Providers.objects.get(kind=kind)]
     vendors = []
     for prov in providers:
-        v = src_models.ShopMonkeySyncVendor.objects.filter(company_id=company_id, provider=prov).first()
+        v = src_models.ShopMonkeySyncVendor.objects.filter(space_id=space_id, provider=prov).first()
         if not v or not v.shopmonkey_external_id:
             raise CommandError("No linked vendor for {} -- run import_shopmonkey_vendors first.".format(prov.kind_name))
         vendors.append(v)
     provider, vendor = providers[0], vendors[0]
 
-    existing = src_models.ShopMonkeySyncBrand.objects.filter(company_id=company_id, brand=our_brand).first()
+    existing = src_models.ShopMonkeySyncBrand.objects.filter(space_id=space_id, brand=our_brand).first()
     plan = BrandImportPlan(
         company_id=company_id,
+        space_id=space_id,
         old_brand=dict(old_brand, parts=old_parts),
         our_brand=our_brand,
         provider=provider,
@@ -343,6 +356,7 @@ def apply_brand_import(plan: BrandImportPlan) -> typing.Dict[str, int]:
                 provider_ids=[v.provider_id for v in plan.vendors],
                 primary_provider_id=plan.vendors[0].provider_id,
                 enabled=False,
+                space_id=plan.space_id,
             )
             sync_brand.shopmonkey_external_id = old_brand["sm_brand_id"]
             sync_brand.status = src_enums.ShopMonkeySyncStatus.ACTIVE.value

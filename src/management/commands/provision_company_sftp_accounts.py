@@ -19,8 +19,9 @@ class Command(BaseCommand):
     help = "Provision a dedicated relay SFTP account for any company that doesn't have one yet."
 
     def handle(self, *args, **options):
+        # Feed tenants are skipped: connecting a relay feed in a space provisions the tenant's login on demand.
         companies = src_models.Company.objects.filter(
-            Q(relay_sftp_username__isnull=True) | Q(relay_sftp_username="")
+            Q(relay_sftp_username__isnull=True) | Q(relay_sftp_username=""), parent_company__isnull=True
         )
         total = companies.count()
         if not total:
@@ -35,15 +36,15 @@ class Command(BaseCommand):
                 username = relay_sftp_provisioning.provision_company_sftp_account(company)
                 if username:
                     succeeded += 1
-                    self.stdout.write(self.style.SUCCESS(
-                        "  company_id={} ({}): provisioned as '{}'".format(company.id, company.name, username)
-                    ))
+                    self.stdout.write(
+                        self.style.SUCCESS(
+                            "  company_id={} ({}): provisioned as '{}'".format(company.id, company.name, username)
+                        )
+                    )
             except Exception as e:
                 failed += 1
-                self.stderr.write(self.style.ERROR(
-                    "  company_id={} ({}): FAILED — {}".format(company.id, company.name, e)
-                ))
+                self.stderr.write(
+                    self.style.ERROR("  company_id={} ({}): FAILED — {}".format(company.id, company.name, e))
+                )
 
-        self.stdout.write(self.style.SUCCESS(
-            "Done. Provisioned: {}, failed: {}.".format(succeeded, failed)
-        ))
+        self.stdout.write(self.style.SUCCESS("Done. Provisioned: {}, failed: {}.".format(succeeded, failed)))

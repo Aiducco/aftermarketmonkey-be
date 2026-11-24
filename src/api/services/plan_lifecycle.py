@@ -33,6 +33,7 @@ from src import models as src_models
 from src.api.services import billing as billing_services
 from src.api.services import company_settings as company_settings_services
 from src.api.services import integrations as integrations_services
+from src.api.services import spaces as spaces_services
 from src.integrations.services import integration_pricing_sync_jobs
 from src.integrations.services import notifications as notifications_services
 
@@ -110,6 +111,21 @@ def feed_connected_providers(company_id: int) -> typing.List[src_models.CompanyP
     return [
         cp
         for cp in src_models.CompanyProviders.objects.filter(company_id=company_id)
+        .select_related("provider")
+        .order_by("id")
+        if is_feed_connected(cp)
+    ]
+
+
+def family_feed_connected_providers(company_id: int) -> typing.List[src_models.CompanyProviders]:
+    """Feed-connected connections of the company AND its feed tenants (spec OQ-2: a space's own feeds pause and
+    restore with the company's). Only pausing and restoring use it: counts, the keep picker and the status page
+    stay on ``feed_connected_providers``, because own feeds do not count toward the connection limit (OQ-6)."""
+    return [
+        cp
+        for cp in src_models.CompanyProviders.objects.filter(
+            company_id__in=spaces_services.family_company_ids(company_id)
+        )
         .select_related("provider")
         .order_by("id")
         if is_feed_connected(cp)
@@ -452,7 +468,8 @@ def _apply_pause_state(
     company_id: int, kept_ids: typing.Iterable[int], now: datetime.datetime
 ) -> typing.List[src_models.CompanyProviders]:
     """
-    Makes every feed-connected connection in ``kept_ids`` active and every other one paused.
+    Makes every feed-connected connection in ``kept_ids`` active and every other one paused. Feed tenants'
+    connections are not in the pick (it is the company's own), so they are paused with the rest.
 
     A row that is already paused keeps its ORIGINAL paused_at (the 60-day sync clock must not
     restart each time the choice is re-applied). Returns the kept rows that were paused for longer
@@ -463,7 +480,7 @@ def _apply_pause_state(
     kept_set = set(kept_ids)
     cutoff = now - datetime.timedelta(days=settings.PAUSED_INTEGRATION_SYNC_DAYS)
     to_unpause, to_pause, stale = [], [], []
-    for cp in feed_connected_providers(company_id):
+    for cp in family_feed_connected_providers(company_id):
         if cp.id in kept_set:
             if cp.paused_at is not None:
                 to_unpause.append(cp.id)
@@ -728,9 +745,9 @@ def restore_company(
         # downgrade for this company.
         src_models.Company.objects.select_for_update().filter(id=company_id).first()
         paused = list(
-            src_models.CompanyProviders.objects.filter(company_id=company_id, paused_at__isnull=False).select_related(
-                "provider"
-            )
+            src_models.CompanyProviders.objects.filter(
+                company_id__in=spaces_services.family_company_ids(company_id), paused_at__isnull=False
+            ).select_related("provider")
         )
         stale = [cp for cp in paused if cp.paused_at <= cutoff]
         if paused:
@@ -897,7 +914,7 @@ def admin_unpause_integration(company_id: int, company_provider_id: int) -> bool
         cp = (
             src_models.CompanyProviders.objects.select_for_update()
             .select_related("provider")
-            .filter(id=company_provider_id, company_id=company_id)
+            .filter(id=company_provider_id, company_id__in=spaces_services.family_company_ids(company_id))
             .first()
         )
         if not cp:
@@ -945,7 +962,8 @@ def _email_context(company: src_models.Company, now: typing.Optional[datetime.da
         paused_names = []
     else:
         kept_names = [_display_name(cp) for cp in active]
-        paused_names = [_display_name(cp) for cp in paused]
+        # Names come from the family: a space's paused own feeds are named too. Usage counts stay parent-only (OQ-6).
+        paused_names = [_display_name(cp) for cp in family_feed_connected_providers(company.id) if is_paused(cp)]
     trial_plan = company.subscription_plan if state == STATE_TRIALING else company.downgraded_from_plan
     plan_key = billing_services._plan_key(company)
     return {

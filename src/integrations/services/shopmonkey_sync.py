@@ -49,7 +49,9 @@ from django.utils import timezone
 
 from src import enums as src_enums
 from src import models as src_models
+from src.api.services import feature_flags as feature_flags_services
 from src.api.services import inventory_access as inventory_access_services
+from src.api.services import spaces as spaces_services
 from src.integrations.clients.shopmonkey import client as shopmonkey_client
 from src.integrations.clients.shopmonkey import exceptions as shopmonkey_exceptions
 
@@ -64,7 +66,7 @@ _LOG_PREFIX = "[SHOPMONKEY-SYNC]"
 # warm_shopmonkey_available_brands_cache management command (same cadence as
 # sync_shopmonkey_inventory) so a live request should always hit a warm cache; the TTL below is
 # just a safety net in case warming ever falls behind.
-_AVAILABLE_BRANDS_CACHE_KEY_FMT = "shopmonkey:available_brands_base:{company_id}"
+_AVAILABLE_BRANDS_CACHE_KEY_FMT = "shopmonkey:available_brands_base:{company_id}:{space_id}"
 _AVAILABLE_BRANDS_CACHE_TTL_SECONDS = 6 * 60 * 60
 
 _OBSOLETE_PREFIX = "[OBSOLETE] "
@@ -101,25 +103,43 @@ def _bin_name_for_provider(provider: src_models.Providers) -> str:
 # --------------------------------------------------------------------------------------
 # Company <-> connected providers <-> available brands
 # --------------------------------------------------------------------------------------
-def company_connected_provider_ids(company_id: int) -> typing.Set[int]:
+def connected_feeds(
+    company_id: int, space_id: typing.Optional[int] = None
+) -> typing.Dict[int, src_models.CompanyProviders]:
     """
-    Provider ids this company has an active connection to, with real feed credentials -- the
-    same "connected" definition used by the distributor integrations catalog (see
+    ``{provider_id: connection}`` for the distributors this company has an active connection to, with real feed
+    credentials -- the same "connected" definition used by the distributor integrations catalog (see
     src.api.services.integrations.get_providers_catalog's own "connected" comment).
 
     Excludes connections paused for plan limits (CompanyProviders.paused_at, see
-    src.api.services.plan_lifecycle). Used by available_brands_for_company (what can be configured)
-    and by sync_brand_parts, which intersects each brand's configured vendors with this set so a
+    src.api.services.plan_lifecycle). A company with the multi_spaces flag, asked for a space, gets the connections
+    that space uses (``spaces.feeds_for``: its own, a shared one or its feed tenant's), so the connection's own
+    company is the one whose prices apply; everyone else gets the company's own connections, as before.
+    """
+    if space_id is not None and feature_flags_services.company_has_feature(
+        company_id, feature_flags_services.FEATURE_MULTI_SPACES
+    ):
+        candidates = [cp for cp in spaces_services.feeds_for(space_id).values() if cp.paused_at is None]
+    else:
+        candidates = src_models.CompanyProviders.objects.filter(
+            company_id=company_id, active=True, paused_at__isnull=True
+        )
+    return {cp.provider_id: cp for cp in candidates if (cp.credentials or {}).get("feed")}
+
+
+def company_connected_provider_ids(company_id: int, space_id: typing.Optional[int] = None) -> typing.Set[int]:
+    """
+    Provider ids this company has an active connection to, with real feed credentials (see connected_feeds; pass
+    ``space_id`` for the connections that space uses). Used by available_brands_for_company (what can be
+    configured) and by sync_brand_parts, which intersects each brand's configured vendors with this set so a
     downgraded company does not keep pushing a paused distributor's prices and stock into ShopMonkey.
     """
-    return {
-        cp.provider_id
-        for cp in src_models.CompanyProviders.objects.filter(company_id=company_id, active=True, paused_at__isnull=True)
-        if (cp.credentials or {}).get("feed")
-    }
+    return set(connected_feeds(company_id, space_id))
 
 
-def _compute_available_brands_base(company_id: int) -> typing.List[typing.Dict[str, typing.Any]]:
+def _compute_available_brands_base(
+    company_id: int, space_id: typing.Optional[int] = None
+) -> typing.List[typing.Dict[str, typing.Any]]:
     """
     The expensive(-ish) part of available_brands_for_company: brand/provider/part_count, with
     none of this company's own sync-configuration state overlaid (that part is cheap and always
@@ -133,8 +153,10 @@ def _compute_available_brands_base(company_id: int) -> typing.List[typing.Dict[s
     enough by itself if what it's caching is still this expensive to *compute* on every warm
     cycle). part_count on BrandProviders is precomputed by refresh_brand_provider_part_counts,
     not live here -- see that field's own docstring in src/models.py.
+
+    ``space_id`` is the space whose connected distributors are offered (see connected_feeds).
     """
-    connected_provider_ids = company_connected_provider_ids(company_id)
+    connected_provider_ids = company_connected_provider_ids(company_id, space_id)
     if not connected_provider_ids:
         return []
 
@@ -191,14 +213,22 @@ def _cache_set(cache_key: str, value: typing.Any, ttl_seconds: int) -> None:
         )
 
 
-def refresh_available_brands_cache(company_id: int) -> int:
-    """Forces recomputation of the slow base list and overwrites the cache. Returns the brand count. Called by warm_shopmonkey_available_brands_cache; also safe to call ad hoc after a distributor catalog re-sync."""
-    base = _compute_available_brands_base(company_id)
-    _cache_set(_AVAILABLE_BRANDS_CACHE_KEY_FMT.format(company_id=company_id), base, _AVAILABLE_BRANDS_CACHE_TTL_SECONDS)
+def refresh_available_brands_cache(company_id: int, space_id: typing.Optional[int] = None) -> int:
+    """Forces recomputation of the slow base list of a space (the main space when unset) and overwrites the cache. Returns the brand count. Called by warm_shopmonkey_available_brands_cache; also safe to call ad hoc after a distributor catalog re-sync."""
+    if space_id is None:
+        space_id = src_models.Space.objects.main_for(company_id).id
+    base = _compute_available_brands_base(company_id, space_id)
+    _cache_set(
+        _AVAILABLE_BRANDS_CACHE_KEY_FMT.format(company_id=company_id, space_id=space_id),
+        base,
+        _AVAILABLE_BRANDS_CACHE_TTL_SECONDS,
+    )
     return len(base)
 
 
-def available_brands_for_company(company_id: int) -> typing.List[typing.Dict[str, typing.Any]]:
+def available_brands_for_company(
+    company_id: int, space_id: typing.Optional[int] = None
+) -> typing.List[typing.Dict[str, typing.Any]]:
     """
     Brands this company could sync to ShopMonkey, and which of its own connected providers carry
     each one -- the choice set the brand-picker UI needs. A fixed allowlist the way the old tool
@@ -211,14 +241,19 @@ def available_brands_for_company(company_id: int) -> typing.List[typing.Dict[str
     current_provider_ids/primary_provider_id) is NOT part of that cache -- it's a small, fast,
     per-company query, always run fresh here so toggling a brand on/off (or changing its vendor
     set) is reflected immediately rather than waiting on the cache TTL.
+
+    Per space: the cache, the connected distributors and the sync configuration are the space's own
+    (``space_id``; the main space when unset).
     """
-    cache_key = _AVAILABLE_BRANDS_CACHE_KEY_FMT.format(company_id=company_id)
+    if space_id is None:
+        space_id = src_models.Space.objects.main_for(company_id).id
+    cache_key = _AVAILABLE_BRANDS_CACHE_KEY_FMT.format(company_id=company_id, space_id=space_id)
     base = _cache_get(cache_key)
     if base is None:
         # Cache miss (not yet warmed, TTL lapsed with warming behind, or the cache itself is
         # unreachable) -- falls back to the slow live path rather than returning nothing or
         # failing the request, and populates the cache for next time.
-        base = _compute_available_brands_base(company_id)
+        base = _compute_available_brands_base(company_id, space_id)
         _cache_set(cache_key, base, _AVAILABLE_BRANDS_CACHE_TTL_SECONDS)
     if not base:
         return []
@@ -226,7 +261,9 @@ def available_brands_for_company(company_id: int) -> typing.List[typing.Dict[str
     brand_ids = [row["brand_id"] for row in base]
     existing_sync_brands = {
         sb.brand_id: sb
-        for sb in src_models.ShopMonkeySyncBrand.objects.filter(company_id=company_id, brand_id__in=brand_ids)
+        for sb in src_models.ShopMonkeySyncBrand.objects.filter(
+            company_id=company_id, space_id=space_id, brand_id__in=brand_ids
+        )
         .select_related("vendor")
         .prefetch_related("additional_vendors__vendor")
     }
@@ -256,12 +293,13 @@ def available_brands_for_company(company_id: int) -> typing.List[typing.Dict[str
 # --------------------------------------------------------------------------------------
 # Configuration: enabling/disabling a brand and choosing its vendor set
 # --------------------------------------------------------------------------------------
-def _get_or_create_vendor(company_id: int, provider_id: int) -> src_models.ShopMonkeySyncVendor:
+def _get_or_create_vendor(company_id: int, provider_id: int, space_id: int) -> src_models.ShopMonkeySyncVendor:
     provider = src_models.Providers.objects.get(id=provider_id)
     vendor, _created = src_models.ShopMonkeySyncVendor.objects.get_or_create(
-        company_id=company_id,
+        space_id=space_id,
         provider_id=provider_id,
         defaults={
+            "company_id": company_id,
             "status": src_enums.ShopMonkeySyncStatus.INACTIVE.value,
             "status_name": src_enums.ShopMonkeySyncStatus.INACTIVE.name,
             "bin_name": _bin_name_for_provider(provider),
@@ -276,6 +314,7 @@ def configure_sync_brand(
     provider_ids: typing.List[int],
     primary_provider_id: int,
     enabled: bool = True,
+    space_id: typing.Optional[int] = None,
 ) -> src_models.ShopMonkeySyncBrand:
     """
     Enable (or reconfigure) a brand for sync against a set of providers. Idempotent and fully
@@ -284,16 +323,19 @@ def configure_sync_brand(
     enable). shopmonkey_external_id on the brand and on every already-created vendor is untouched
     either way. This is the ONLY function that writes a ShopMonkeySyncBrand's vendor set --
     both POST and PATCH on the API side resolve down to this one call, never a separate
-    toggle-only reconciliation path.
+    toggle-only reconciliation path. The brand and its vendors belong to ``space_id`` (the main space when unset).
     """
     if primary_provider_id not in provider_ids:
         raise ValueError("primary_provider_id must be one of provider_ids.")
 
-    primary_vendor = _get_or_create_vendor(company_id, primary_provider_id)
+    if space_id is None:
+        space_id = src_models.Space.objects.main_for(company_id).id
+    primary_vendor = _get_or_create_vendor(company_id, primary_provider_id, space_id)
     sync_brand, created = src_models.ShopMonkeySyncBrand.objects.get_or_create(
-        company_id=company_id,
+        space_id=space_id,
         brand_id=brand_id,
         defaults={
+            "company_id": company_id,
             "vendor": primary_vendor,
             "enabled": enabled,
             "status": src_enums.ShopMonkeySyncStatus.INACTIVE.value,
@@ -318,7 +360,7 @@ def configure_sync_brand(
         ).delete()
     # Upsert the rest, priority = position in the given list.
     for priority, provider_id in enumerate(additional_provider_ids, start=1):
-        vendor = _get_or_create_vendor(company_id, provider_id)
+        vendor = _get_or_create_vendor(company_id, provider_id, space_id)
         link = existing_links.get(provider_id)
         if link:
             if link.priority != priority:
@@ -330,11 +372,11 @@ def configure_sync_brand(
 
 
 # --------------------------------------------------------------------------------------
-# ShopMonkey client per company
+# ShopMonkey client per space
 # --------------------------------------------------------------------------------------
-def _client_for_company(company_id: int) -> shopmonkey_client.ShopMonkeyApiClient:
+def _client_for_space(space_id: int) -> shopmonkey_client.ShopMonkeyApiClient:
     connection = src_models.CompanyShopManagementProviders.objects.filter(
-        company_id=company_id,
+        space_id=space_id,
         provider__kind=src_enums.ShopManagementProviderKind.SHOPMONKEY.value,
         active=True,
     ).first()
@@ -846,6 +888,7 @@ def sync_brand_parts(
     if execution is None:
         execution = src_models.ShopMonkeySyncExecution.objects.create(
             company_id=sync_brand.company_id,
+            space_id=sync_brand.space_id,
             sync_brand=sync_brand,
             status=src_enums.ShopMonkeySyncExecutionStatus.RUNNING.value,
             message="Starting sync for brand {!r}.".format(sync_brand.brand.name),
@@ -858,7 +901,7 @@ def sync_brand_parts(
 
     started_at = timezone.now()
     try:
-        client = _client_for_company(sync_brand.company_id)
+        client = _client_for_space(sync_brand.space_id)
     except ValueError as e:
         return _fail_execution(execution, str(e))
 
@@ -883,7 +926,8 @@ def sync_brand_parts(
     # distributor paused for plan limits (CompanyProviders.paused_at, see plan_lifecycle) must not keep
     # pushing its price/stock into the shop's inventory. The configured vendors themselves are left
     # untouched, so an upgrade resumes them with no reconfiguration.
-    connected_provider_ids = company_connected_provider_ids(sync_brand.company_id)
+    feeds = connected_feeds(sync_brand.company_id, sync_brand.space_id)
+    connected_provider_ids = set(feeds)
     ordered_vendors = [
         v for v in [sync_brand.vendor] + [link.vendor for link in additional] if v.provider_id in connected_provider_ids
     ]
@@ -925,11 +969,14 @@ def sync_brand_parts(
     for master_part, pp_by_provider in _master_parts_for_sync_brand(sync_brand.brand_id, provider_ids):
         seen_master_part_ids.add(master_part.id)
         pp_ids = [pp.id for pp in pp_by_provider.values()]
+        # Prices are the connection's own company's: the company itself, or the feed tenant of the space's own feed.
+        pricing_company_by_pp_id = {pp.id: feeds[provider_id].company_id for provider_id, pp in pp_by_provider.items()}
         pricing_by_pp_id = {
             p.provider_part_id: p
             for p in src_models.ProviderPartCompanyPricing.objects.filter(
-                provider_part_id__in=pp_ids, company_id=sync_brand.company_id
+                provider_part_id__in=pp_ids, company_id__in=set(pricing_company_by_pp_id.values())
             )
+            if p.company_id == pricing_company_by_pp_id[p.provider_part_id]
         }
         part_quantity = 0
         for provider_id, pp in pp_by_provider.items():
@@ -1012,7 +1059,13 @@ def sync_all_enabled_brands() -> None:
     access_by_company: typing.Dict[int, bool] = {}
     sync_brand_ids = []
     for sync_brand_id, company_id in (
-        src_models.ShopMonkeySyncBrand.objects.filter(enabled=True).order_by("id").values_list("id", "company_id")
+        src_models.ShopMonkeySyncBrand.objects.filter(
+            enabled=True,
+            space__shop_connection__provider__kind=src_enums.ShopManagementProviderKind.SHOPMONKEY.value,
+            space__shop_connection__active=True,
+        )
+        .order_by("id")
+        .values_list("id", "company_id")
     ):
         if company_id not in access_by_company:
             access_by_company[company_id] = inventory_access_services.company_has_inventory_access(company_id)
@@ -1036,6 +1089,7 @@ def enqueue_sync_brand_run(company_id: int, sync_brand_id: int) -> src_models.Sh
     sync_brand = src_models.ShopMonkeySyncBrand.objects.get(id=sync_brand_id, company_id=company_id)
     return src_models.ShopMonkeySyncExecution.objects.create(
         company_id=company_id,
+        space_id=sync_brand.space_id,
         sync_brand=sync_brand,
         status=src_enums.ShopMonkeySyncExecutionStatus.QUEUED.value,
         message="Queued.",
@@ -1130,6 +1184,7 @@ def enqueue_brand_delete(company_id: int, sync_brand_id: int) -> typing.Optional
         )
         return src_models.ShopMonkeySyncExecution.objects.create(
             company_id=company_id,
+            space_id=sync_brand.space_id,
             sync_brand=sync_brand,
             status=src_enums.ShopMonkeySyncExecutionStatus.QUEUED.value,
             message="Queued: delete brand {!r} and its {} part(s) from ShopMonkey.".format(
@@ -1166,7 +1221,7 @@ def run_brand_delete(
     if not sync_brand:
         return _fail_execution(execution, "The brand no longer exists; nothing to delete.")
     try:
-        client = _client_for_company(sync_brand.company_id)
+        client = _client_for_space(sync_brand.space_id)
     except ValueError as e:
         return _fail_execution(execution, str(e))
 

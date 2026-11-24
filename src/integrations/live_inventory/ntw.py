@@ -47,26 +47,38 @@ def _ship_to_for(company_provider: src_models.CompanyProviders) -> typing.Option
     The company's own address as TBC's ``shipTo``. Documented mandatory; measured as not enforced
     for a stock read, so this returns None rather than failing when a company has no location on
     file -- a missing address must not block a product page from showing availability.
+
+    A space's own feed lives on a hidden feed-tenant company that has no address of its own: its ship-to is
+    the address of the space that owns the feed (None for an Online store, which has none). Every other
+    connection reads the company's primary location, as before.
     """
-    location = (
-        src_models.CompanyLocation.objects.filter(company_id=company_provider.company_id)
-        .order_by("-is_primary", "id")
-        .first()
+    owner_space = (
+        src_models.Space.objects.filter(feed_company_id=company_provider.company_id).select_related("location").first()
     )
+    if owner_space is not None:
+        location = owner_space.location
+    else:
+        location = (
+            src_models.CompanyLocation.objects.filter(company_id=company_provider.company_id)
+            .order_by("-is_primary", "id")
+            .first()
+        )
     if not location:
         return None
-    return [{
-        "address": {
-            "name": location.name or "",
-            "address": location.address1 or "",
-            "address2": location.address2 or "",
-            "city": location.city or "",
-            "state": location.state or "",
-            "country": location.country or "US",
-            "zipCode": location.postal_code or "",
-        },
-        "phoneNumber": location.phone or "",
-    }]
+    return [
+        {
+            "address": {
+                "name": location.name or "",
+                "address": location.address1 or "",
+                "address2": location.address2 or "",
+                "city": location.city or "",
+                "state": location.state or "",
+                "country": location.country or "US",
+                "zipCode": location.postal_code or "",
+            },
+            "phoneNumber": location.phone or "",
+        }
+    ]
 
 
 class NtwLiveInventoryProvider(base.LiveInventoryProvider):
@@ -75,9 +87,7 @@ class NtwLiveInventoryProvider(base.LiveInventoryProvider):
     def __init__(self, company_provider: src_models.CompanyProviders) -> None:
         base.LiveInventoryProvider.__init__(self, company_provider)
         order_credentials = credentials_helper.get_order_credentials(company_provider)
-        self._customer_id = (
-            order_credentials.get(constants.NTW_ORDER_CREDENTIALS_CUSTOMER_ID) or ""
-        ).strip()
+        self._customer_id = (order_credentials.get(constants.NTW_ORDER_CREDENTIALS_CUSTOMER_ID) or "").strip()
         client_id = (order_credentials.get(constants.NTW_ORDER_CREDENTIALS_CLIENT_ID) or "").strip()
         client_secret = (order_credentials.get(constants.NTW_ORDER_CREDENTIALS_CLIENT_SECRET) or "").strip()
 
@@ -91,9 +101,7 @@ class NtwLiveInventoryProvider(base.LiveInventoryProvider):
         if not client_id or not client_secret:
             raise ValueError(
                 "NTW connection {} has no TBC API key/secret. Each dealer creates their own "
-                "application in TBC's developer portal; add it under Ordering.".format(
-                    company_provider.id
-                )
+                "application in TBC's developer portal; add it under Ordering.".format(company_provider.id)
             )
         self._client = ntw_api.NtwApiClient(client_id=client_id, client_secret=client_secret)
         self._ship_to = _ship_to_for(company_provider)

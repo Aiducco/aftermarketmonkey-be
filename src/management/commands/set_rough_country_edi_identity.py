@@ -27,7 +27,9 @@ class Command(BaseCommand):
     help = (
         "Set the Rough Country EDI trading-partner id (ISA06/GS02) and optionally the "
         "environment on a company's Rough Country order account. Use --show to print the "
-        "current state without changing anything."
+        "current state without changing anything. A space's own Rough Country feed lives on a hidden feed "
+        "tenant company: give that connection's --company-provider-id, or the tenant's slug "
+        "(<company slug>-space-<space id>-feeds) as --company-slug, not the shop's own."
     )
 
     def add_arguments(self, parser):

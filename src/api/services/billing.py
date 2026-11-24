@@ -6,11 +6,12 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import stripe
-
 from django.conf import settings
+from django.db.models import Q
 from django.utils import timezone as django_tz
 
 from src import models as src_models
+from src.api.services import feature_flags
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,7 @@ PLAN_LIMIT_ERROR_CODE = "plan_limit_reached"
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
 
 def _api_key() -> Optional[str]:
     key = getattr(settings, "STRIPE_SECRET_KEY", None)
@@ -56,11 +58,7 @@ def _plan_name(plan_key: str) -> str:
 
 def _product_to_plan_map() -> dict:
     plans = getattr(settings, "PLANS", {})
-    return {
-        entry["stripe_product_id"]: plan_id
-        for plan_id, entry in plans.items()
-        if entry.get("stripe_product_id")
-    }
+    return {entry["stripe_product_id"]: plan_id for plan_id, entry in plans.items() if entry.get("stripe_product_id")}
 
 
 def _sync_company_subscription(company: src_models.Company, sub: dict) -> None:
@@ -90,10 +88,15 @@ def _sync_company_subscription(company: src_models.Company, sub: dict) -> None:
     # A real Stripe subscription is now the source of truth -- clear any comp'd-trial marker so
     # demote_expired_trials.py leaves this company alone.
     company.manual_trial_granted_at = None
-    company.save(update_fields=[
-        "subscription_id", "subscription_plan",
-        "subscription_status", "subscription_period_end", "manual_trial_granted_at",
-    ])
+    company.save(
+        update_fields=[
+            "subscription_id",
+            "subscription_plan",
+            "subscription_status",
+            "subscription_period_end",
+            "manual_trial_granted_at",
+        ]
+    )
 
     # Upgrade restore (see plan_lifecycle): a real subscription un-pauses every paused distributor
     # and suspended member. invoice.payment_succeeded re-syncs on EVERY renewal, so the guard keeps
@@ -127,15 +130,23 @@ def _clear_company_subscription(company: src_models.Company) -> None:
     company.subscription_status = "canceled"
     company.subscription_period_end = None
     company.manual_trial_granted_at = None
-    company.save(update_fields=[
-        "subscription_id", "subscription_plan",
-        "subscription_status", "subscription_period_end", "manual_trial_granted_at",
-    ])
+    company.additional_spaces = None
+    company.save(
+        update_fields=[
+            "subscription_id",
+            "subscription_plan",
+            "subscription_status",
+            "subscription_period_end",
+            "manual_trial_granted_at",
+            "additional_spaces",
+        ]
+    )
 
 
 # ---------------------------------------------------------------------------
 # Customer management
 # ---------------------------------------------------------------------------
+
 
 def get_or_create_stripe_customer(company_id: int, email: str, name: str) -> Optional[str]:
     company = src_models.Company.objects.filter(id=company_id).first()
@@ -172,6 +183,7 @@ def get_or_create_stripe_customer(company_id: int, email: str, name: str) -> Opt
 # Checkout / Portal
 # ---------------------------------------------------------------------------
 
+
 def create_portal_session(
     company_id: int,
     return_url: str,
@@ -183,7 +195,9 @@ def create_portal_session(
         return None
 
     customer_id = get_or_create_stripe_customer(
-        company_id=company_id, email=customer_email, name=customer_name,
+        company_id=company_id,
+        email=customer_email,
+        name=customer_name,
     )
     if not customer_id:
         return None
@@ -233,7 +247,9 @@ def create_checkout_session(
         return None
 
     customer_id = get_or_create_stripe_customer(
-        company_id=company_id, email=customer_email, name=customer_name,
+        company_id=company_id,
+        email=customer_email,
+        name=customer_name,
     )
     if not customer_id:
         return None
@@ -254,7 +270,9 @@ def create_checkout_session(
             success_url=success_url,
             cancel_url=cancel_url,
             metadata={
-                "company_id": str(company_id), "plan_id": plan_id, "billing_period": billing_period,
+                "company_id": str(company_id),
+                "plan_id": plan_id,
+                "billing_period": billing_period,
             },
         )
         return session.url
@@ -313,6 +331,79 @@ def switch_comped_trial_plan(company_id: int, plan_id: str) -> tuple[Optional[di
 # Subscription state (local-first, Stripe as fallback)
 # ---------------------------------------------------------------------------
 
+
+def _space_base(company: src_models.Company) -> int:
+    """The allowance before add-ons: the staff base if set, else 5 on a comp'd trial, else 1."""
+    if company.space_base_override:
+        return company.space_base_override
+    # Imported here: plan_lifecycle imports this module for the plan limits.
+    from src.api.services import plan_lifecycle
+
+    if plan_lifecycle.plan_state(company) == plan_lifecycle.STATE_TRIALING:
+        return settings.COMPED_TRIAL_SPACE_ALLOWANCE
+    return 1
+
+
+def space_allowance(company: src_models.Company) -> int:
+    """How many spaces the company may have: its base plus the paid add-ons (null on Scout, comp'd
+    trials and cancelled subscriptions, so those get the base only)."""
+    return _space_base(company) + (company.additional_spaces or 0)
+
+
+def spaces_in_use(company_id: int) -> int:
+    """The main space counts even before its row exists (it is created on first use)."""
+    return max(1, src_models.Space.objects.filter(company_id=company_id).count())
+
+
+def _space_usage(company: src_models.Company) -> dict:
+    return {
+        "used": spaces_in_use(company.id),
+        "limit": space_allowance(company),
+        "base": _space_base(company),
+    }
+
+
+def _space_addon_info(company: src_models.Company, interval: Optional[str] = None) -> dict:
+    addon = getattr(settings, "SPACE_ADDON", {})
+    return {
+        "amount_monthly": addon.get("amount_monthly"),
+        "amount_annual": addon.get("amount_annual"),
+        "currency": addon.get("currency", "usd"),
+        "quantity": company.additional_spaces or 0,
+        "interval": interval,
+    }
+
+
+def can_buy_space_addon(company: src_models.Company) -> bool:
+    """Whether the company can buy the "additional space" add-on: the multi_spaces flag and an active Stripe
+    Tracker or Hunter subscription (not Scout, not a comp'd trial)."""
+    return bool(
+        company.subscription_id
+        and company.subscription_status in ACTIVE_STATUSES
+        and _plan_key(company) in ("tracker", "hunter")
+        and getattr(settings, "SPACE_ADDON", {}).get("stripe_product_id")
+        and feature_flags.company_has_feature(company.id, feature_flags.FEATURE_MULTI_SPACES)
+    )
+
+
+def check_space_limit(company_id: int) -> tuple[bool, str]:
+    """
+    Check if company can add one more space. Run only when a space is created: spaces over the
+    allowance (a converted comp'd trial, a lowered add-on) stay and keep working, only adding is refused.
+    Returns (allowed: bool, reason: str).
+    """
+    company_id = billing_company_id(company_id)
+    company = src_models.Company.objects.filter(id=company_id).first()
+    if not company:
+        return False, "Company not found"
+
+    used = spaces_in_use(company_id)
+    limit = space_allowance(company)
+    if used >= limit:
+        return False, f"Space limit reached ({used}/{limit}). Add more spaces to create another."
+    return True, ""
+
+
 def _live_price_display(company: src_models.Company, plan_key: str) -> tuple[str, Optional[str]]:
     """
     One extra live Stripe call to read the real current price/interval off the company's active
@@ -335,7 +426,9 @@ def _live_price_display(company: src_models.Company, plan_key: str) -> tuple[str
 
     try:
         sub = stripe.Subscription.retrieve(
-            company.subscription_id, expand=["items.data.price"], api_key=api_key,
+            company.subscription_id,
+            expand=["items.data.price"],
+            api_key=api_key,
         )
         items = sub.get("items", {}).get("data", [])
         if not items:
@@ -370,11 +463,8 @@ def get_subscription(company_id: int) -> Optional[dict]:
         price_display, billing_period = (
             _live_price_display(company, plan_key) if plan_key != "scout" else ("Free", None)
         )
-        renewal_date = (
-            company.subscription_period_end.strftime("%Y-%m-%d")
-            if company.subscription_period_end else None
-        )
-        return {
+        renewal_date = company.subscription_period_end.strftime("%Y-%m-%d") if company.subscription_period_end else None
+        result = {
             "plan_id": company.subscription_plan,
             "plan": _plan_name(plan_key),
             "price": price_display,
@@ -392,6 +482,10 @@ def get_subscription(company_id: int) -> Optional[dict]:
             "is_comped_trial": bool(company.manual_trial_granted_at),
             "has_stripe_subscription": bool(company.subscription_id),
         }
+        if feature_flags.company_has_feature(company.id, feature_flags.FEATURE_MULTI_SPACES):
+            result["spaces"] = _space_usage(company)
+            result["space_addon"] = _space_addon_info(company, billing_period)
+        return result
 
     if not company.stripe_customer_id:
         return None
@@ -428,14 +522,24 @@ def get_subscription(company_id: int) -> Optional[dict]:
 # Usage tracking
 # ---------------------------------------------------------------------------
 
+
 def _period_start(company: src_models.Company):
     """Return the start of the current billing period."""
     from datetime import timedelta
+
     now = django_tz.now()
     period_end = company.subscription_period_end
     if period_end and period_end > now:
         return period_end - timedelta(days=30)
     return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+def billing_company_id(company_id: int) -> int:
+    """The company that is billed for ``company_id``: the parent for a feed tenant (ADR 0002), else the id itself.
+    Every plan check below resolves it first, so a caller holding a tenant's id (``connect_provider`` on a space's
+    own feed) is judged by the parent's plan. Own feeds are not counted toward the connection limit (spec OQ-6)."""
+    parent_id = src_models.Company.objects.values_list("parent_company_id", flat=True).filter(id=company_id).first()
+    return parent_id or company_id
 
 
 def _connected_distributor_count(company_id: int) -> int:
@@ -444,16 +548,17 @@ def _connected_distributor_count(company_id: int) -> int:
     (feed empty) don't count, and neither do connections paused for plan limits (paused_at set, see
     plan_lifecycle): a downgraded company with 9 paused connections and 2 active ones is at 2/2, so
     it is blocked from connecting more and is not shown as permanently over its cap."""
-    creds_list = src_models.CompanyProviders.objects.filter(
-        company_id=company_id, paused_at__isnull=True
-    ).values_list("credentials", flat=True)
+    creds_list = src_models.CompanyProviders.objects.filter(company_id=company_id, paused_at__isnull=True).values_list(
+        "credentials", flat=True
+    )
     return sum(1 for c in creds_list if (c or {}).get("feed"))
 
 
 def _paused_distributor_count(company_id: int) -> int:
-    """Feed-connected CompanyProviders rows paused for plan limits (see plan_lifecycle)."""
+    """Feed-connected CompanyProviders rows paused for plan limits (see plan_lifecycle), across the whole family:
+    the company's own and its feed tenants'."""
     creds_list = src_models.CompanyProviders.objects.filter(
-        company_id=company_id, paused_at__isnull=False
+        Q(company_id=company_id) | Q(company__parent_company_id=company_id), paused_at__isnull=False
     ).values_list("credentials", flat=True)
     return sum(1 for c in creds_list if (c or {}).get("feed"))
 
@@ -471,6 +576,7 @@ def get_usage(company_id: int) -> dict:
     monthly), distributor connections and seats (point-in-time counts, not usage-counted — plan
     tier just caps how many can exist, no reset window). Searches are always unlimited.
     """
+    company_id = billing_company_id(company_id)
     company = src_models.Company.objects.filter(id=company_id).first()
     if not company:
         return {}
@@ -486,7 +592,7 @@ def get_usage(company_id: int) -> dict:
         created_at__gte=period_start,
     ).count()
 
-    return {
+    usage = {
         "plan_id": company.subscription_plan,
         "plan": _plan_name(plan_key),
         "period_start": period_start.strftime("%Y-%m-%d"),
@@ -508,6 +614,10 @@ def get_usage(company_id: int) -> dict:
             "limit": features.get("seats", 0),
         },
     }
+    if feature_flags.company_has_feature(company_id, feature_flags.FEATURE_MULTI_SPACES):
+        usage["spaces"] = _space_usage(company)
+        usage["space_addon"] = _space_addon_info(company)
+    return usage
 
 
 def check_detail_view_limit(company_id: int) -> tuple[bool, str]:
@@ -516,9 +626,12 @@ def check_detail_view_limit(company_id: int) -> tuple[bool, str]:
     Returns (allowed: bool, reason: str).
     -1 limit means unlimited.
     """
-    company = src_models.Company.objects.filter(id=company_id).only(
-        "subscription_plan", "subscription_status", "subscription_period_end"
-    ).first()
+    company_id = billing_company_id(company_id)
+    company = (
+        src_models.Company.objects.filter(id=company_id)
+        .only("subscription_plan", "subscription_status", "subscription_period_end")
+        .first()
+    )
     if not company:
         return False, "Company not found"
 
@@ -546,9 +659,15 @@ def check_distributor_connection_limit(company_id: int) -> tuple[bool, str]:
     Check if company can connect one more distributor's product feed.
     Returns (allowed: bool, reason: str). -1 limit means unlimited.
     """
-    company = src_models.Company.objects.filter(id=company_id).only(
-        "subscription_plan", "subscription_status",
-    ).first()
+    company_id = billing_company_id(company_id)
+    company = (
+        src_models.Company.objects.filter(id=company_id)
+        .only(
+            "subscription_plan",
+            "subscription_status",
+        )
+        .first()
+    )
     if not company:
         return False, "Company not found"
 
@@ -576,14 +695,42 @@ def check_distributor_connection_limit(company_id: int) -> tuple[bool, str]:
     return True, ""
 
 
+def check_new_own_feed_allowed(company_id: int) -> tuple[bool, str]:
+    """
+    Whether a company with spaces may connect a NEW own feed (in any space; sharing an existing feed is not
+    refused). Refused while the company is downgraded, has any paused connection in its family, or has more
+    spaces than its allowance. Returns (allowed: bool, reason: str).
+    """
+    company_id = billing_company_id(company_id)
+    company = src_models.Company.objects.filter(id=company_id).first()
+    if not company:
+        return False, "Company not found"
+    if (
+        company.subscription_status == "downgraded"
+        or _paused_distributor_count(company_id) > 0
+        or spaces_in_use(company_id) > space_allowance(company)
+    ):
+        return False, (
+            "Your plan has paused distributors or has more spaces than it includes, so a new distributor feed "
+            "can't be connected. Upgrade, or share a feed that is already connected."
+        )
+    return True, ""
+
+
 def check_seat_limit(company_id: int) -> tuple[bool, str]:
     """
     Check if company can add one more user account.
     Returns (allowed: bool, reason: str). -1 limit means unlimited.
     """
-    company = src_models.Company.objects.filter(id=company_id).only(
-        "subscription_plan", "subscription_status",
-    ).first()
+    company_id = billing_company_id(company_id)
+    company = (
+        src_models.Company.objects.filter(id=company_id)
+        .only(
+            "subscription_plan",
+            "subscription_status",
+        )
+        .first()
+    )
     if not company:
         return False, "Company not found"
 
@@ -607,9 +754,15 @@ def check_po_checkout_allowed(company_id: int) -> tuple[bool, str]:
     Unlike the other checks here, this isn't a usage counter — it's a binary feature gate.
     Returns (allowed: bool, reason: str).
     """
-    company = src_models.Company.objects.filter(id=company_id).only(
-        "subscription_plan", "subscription_status",
-    ).first()
+    company_id = billing_company_id(company_id)
+    company = (
+        src_models.Company.objects.filter(id=company_id)
+        .only(
+            "subscription_plan",
+            "subscription_status",
+        )
+        .first()
+    )
     if not company:
         return False, "Company not found"
 
@@ -631,9 +784,15 @@ def has_multi_warehouse_visibility(company_id: Optional[int]) -> bool:
     """
     if company_id is None:
         return False
-    company = src_models.Company.objects.filter(id=company_id).only(
-        "subscription_plan", "subscription_status",
-    ).first()
+    company_id = billing_company_id(company_id)
+    company = (
+        src_models.Company.objects.filter(id=company_id)
+        .only(
+            "subscription_plan",
+            "subscription_status",
+        )
+        .first()
+    )
     if not company:
         return False
     plan_key = _plan_key(company)
@@ -646,9 +805,15 @@ def has_inventory_management(company_id: Optional[int]) -> bool:
     src.api.services.inventory_access.company_has_inventory_access, which also honours the per-company flag."""
     if company_id is None:
         return False
-    company = src_models.Company.objects.filter(id=company_id).only(
-        "subscription_plan", "subscription_status",
-    ).first()
+    company_id = billing_company_id(company_id)
+    company = (
+        src_models.Company.objects.filter(id=company_id)
+        .only(
+            "subscription_plan",
+            "subscription_status",
+        )
+        .first()
+    )
     if not company:
         return False
     return bool(_plan_features(_plan_key(company)).get("inventory_management", False))
@@ -657,6 +822,7 @@ def has_inventory_management(company_id: Optional[int]) -> bool:
 # ---------------------------------------------------------------------------
 # Webhook event handlers
 # ---------------------------------------------------------------------------
+
 
 def handle_webhook_event(payload: bytes, sig_header: str) -> tuple[bool, str]:
     """
@@ -749,7 +915,9 @@ def _handle_checkout_completed(obj: dict, api_key: str) -> None:
         _sync_company_subscription(company, sub)
         logger.info(
             "checkout.session.completed: synced company %s → plan=%s status=%s",
-            company.id, company.subscription_plan, company.subscription_status,
+            company.id,
+            company.subscription_plan,
+            company.subscription_status,
         )
 
 
@@ -762,7 +930,9 @@ def _handle_subscription_upsert(obj: dict, api_key: str) -> None:
     _sync_company_subscription(company, obj)
     logger.info(
         "subscription upsert: company %s → plan=%s status=%s",
-        company.id, company.subscription_plan, company.subscription_status,
+        company.id,
+        company.subscription_plan,
+        company.subscription_status,
     )
 
 

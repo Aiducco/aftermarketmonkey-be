@@ -7,6 +7,7 @@ from django import http, views
 
 from src.api.services import billing as billing_services
 from src.api.services import purchase_orders as purchase_orders_services
+from src.api.services import spaces as spaces_services
 
 logger = logging.getLogger(__name__)
 _LOG_PREFIX = "[PURCHASE-ORDERS]"
@@ -18,17 +19,25 @@ def _require_auth(
     """Returns (company_id, user_id, error_response). error_response is None on success."""
     if not request.user or not request.user.is_authenticated:
         logger.warning("{} User not authenticated for {}".format(_LOG_PREFIX, request.path))
-        return None, None, http.HttpResponse(
-            headers={"Content-Type": "application/json"},
-            content=simplejson.dumps({"message": "User not authenticated"}),
-            status=401,
+        return (
+            None,
+            None,
+            http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "User not authenticated"}),
+                status=401,
+            ),
         )
     company_id = getattr(request, "company_id", None)
     if not company_id:
-        return None, None, http.HttpResponse(
-            headers={"Content-Type": "application/json"},
-            content=simplejson.dumps({"message": "No company found in token"}),
-            status=400,
+        return (
+            None,
+            None,
+            http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "No company found in token"}),
+                status=400,
+            ),
         )
     return company_id, request.user.id, None
 
@@ -61,15 +70,29 @@ def _error_response_for(e: purchase_orders_services.PurchaseOrderServiceError) -
     is_plan_limit = error_code == billing_services.PLAN_LIMIT_ERROR_CODE
     return http.HttpResponse(
         headers={"Content-Type": "application/json"},
-        content=simplejson.dumps({
-            "message": str(e),
-            **({"error_code": error_code, "upgrade_required": True} if is_plan_limit else {}),
-        }),
+        content=simplejson.dumps(
+            {
+                "message": str(e),
+                **({"error_code": error_code, "upgrade_required": True} if is_plan_limit else {}),
+            }
+        ),
         status=402 if is_plan_limit else 400,
     )
 
 
-def _parse_json_body(request: http.HttpRequest) -> typing.Tuple[typing.Optional[dict], typing.Optional[http.HttpResponse]]:
+def _space_error_response(e: spaces_services.SpaceError) -> http.HttpResponse:
+    """A space rule refused the request: 403 space_access_denied (naming the space and nothing else of the
+    object) or 400 space_required / mixed_spaces. Never a logout, upgrade or suspension for the fe."""
+    return http.HttpResponse(
+        headers={"Content-Type": "application/json"},
+        content=simplejson.dumps(e.body()),
+        status=e.status_code,
+    )
+
+
+def _parse_json_body(
+    request: http.HttpRequest,
+) -> typing.Tuple[typing.Optional[dict], typing.Optional[http.HttpResponse]]:
     try:
         body = json.loads(request.body) if request.body else {}
     except json.JSONDecodeError:
@@ -88,7 +111,8 @@ class CartView(views.View):
         if err:
             return err
         try:
-            return _json_response(purchase_orders_services.get_cart(company_id))
+            scope = spaces_services.resolve_scope(request)
+            return _json_response(purchase_orders_services.get_cart(company_id, scope))
         except Exception:
             logger.exception("{} Error fetching cart for company_id={}".format(_LOG_PREFIX, company_id))
             return _error_response("Error fetching cart", status=500)
@@ -111,14 +135,18 @@ class CartItemsView(views.View):
             return err
 
         try:
+            scope = spaces_services.resolve_scope(request)
             result = purchase_orders_services.add_cart_item(
                 company_id=company_id,
+                scope=scope,
                 user_id=user_id,
                 provider_id=body.get("provider_id"),
                 master_part_id=body.get("master_part_id"),
                 quantity=body.get("quantity"),
                 order_account_id=body.get("order_account_id"),
             )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response_for(e)
         except Exception:
@@ -142,9 +170,12 @@ class CartItemDetailView(views.View):
 
         line_item_id = kwargs.get("line_item_id")
         try:
+            scope = spaces_services.resolve_scope(request)
             result = purchase_orders_services.update_cart_item(
-                company_id=company_id, line_item_id=line_item_id, quantity=body.get("quantity")
+                company_id=company_id, scope=scope, line_item_id=line_item_id, quantity=body.get("quantity")
             )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e), status=404)
         except Exception:
@@ -160,7 +191,12 @@ class CartItemDetailView(views.View):
 
         line_item_id = kwargs.get("line_item_id")
         try:
-            result = purchase_orders_services.remove_cart_item(company_id=company_id, line_item_id=line_item_id)
+            scope = spaces_services.resolve_scope(request)
+            result = purchase_orders_services.remove_cart_item(
+                company_id=company_id, scope=scope, line_item_id=line_item_id
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e), status=404)
         except Exception:
@@ -196,8 +232,10 @@ class CartReviewView(views.View):
             return err
 
         try:
+            scope = spaces_services.resolve_scope(request)
             result = purchase_orders_services.review_cart(
                 company_id=company_id,
+                scope=scope,
                 user_id=user_id,
                 ship_to=body.get("ship_to") or {},
                 purchase_order_ids=body.get("purchase_order_ids"),
@@ -206,6 +244,8 @@ class CartReviewView(views.View):
                 ship_methods=body.get("ship_methods"),
                 shipping_method_id=body.get("shipping_method_id"),
             )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response_for(e)
         except Exception:
@@ -231,11 +271,15 @@ class PurchaseOrderOrderAccountView(views.View):
 
         purchase_order_id = kwargs.get("id")
         try:
+            scope = spaces_services.resolve_scope(request)
             result = purchase_orders_services.set_cart_order_account(
                 company_id=company_id,
+                scope=scope,
                 purchase_order_id=purchase_order_id,
                 order_account_id=body.get("order_account_id"),
             )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e))
         except Exception:
@@ -258,8 +302,10 @@ class PurchaseOrdersView(views.View):
         status_param = request.GET.get("status")
         cp_param = request.GET.get("company_provider_id")
         try:
+            scope = spaces_services.resolve_scope(request)
             result = purchase_orders_services.list_purchase_orders(
                 company_id=company_id,
+                scope=scope,
                 status=status_param,
                 company_provider_id=int(cp_param) if cp_param else None,
             )
@@ -284,8 +330,10 @@ class PurchaseOrdersExternalView(views.View):
             return err
 
         try:
+            scope = spaces_services.resolve_scope(request)
             result = purchase_orders_services.list_external_purchase_orders(
                 company_id=company_id,
+                scope=scope,
                 provider=request.GET.get("provider"),
                 since=request.GET.get("since"),
             )
@@ -296,6 +344,34 @@ class PurchaseOrdersExternalView(views.View):
                 "{} Error listing external purchase orders for company_id={}".format(_LOG_PREFIX, company_id)
             )
             return _error_response("Error listing external purchase orders", status=500)
+
+        return _json_response(result)
+
+
+class PurchaseOrdersExternalMoveView(views.View):
+    """POST /purchase-orders/external/move/ -- {external_order_ids, space_id}: an admin moves orders from
+    distributors to another space (reason "moved"). 403 for a non-admin or an unflagged company."""
+
+    def post(self, request: http.HttpRequest, *args, **kwargs) -> http.HttpResponse:
+        company_id, user_id, err = _require_auth(request)
+        if err:
+            return err
+        body, err = _parse_json_body(request)
+        if err:
+            return err
+
+        try:
+            scope = spaces_services.resolve_scope(request)
+            result = purchase_orders_services.move_external_purchase_orders(
+                company_id, user_id, scope, body.get("external_order_ids"), body.get("space_id")
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
+        except purchase_orders_services.PurchaseOrderServiceError as e:
+            return _error_response(str(e))
+        except Exception:
+            logger.exception("{} Error moving external orders for company_id={}".format(_LOG_PREFIX, company_id))
+            return _error_response("Error moving external orders", status=500)
 
         return _json_response(result)
 
@@ -312,10 +388,14 @@ class PurchaseOrderExternalDetailView(views.View):
             return err
 
         try:
+            scope = spaces_services.resolve_scope(request)
             result = purchase_orders_services.get_external_purchase_order(
                 company_id=company_id,
+                scope=scope,
                 external_order_id=kwargs["id"],
             )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e), status=404)
         except Exception:
@@ -340,8 +420,10 @@ class PurchaseOrderInvoicesView(views.View):
 
         cp_param = request.GET.get("company_provider_id")
         try:
+            scope = spaces_services.resolve_scope(request)
             result = purchase_orders_services.list_purchase_order_invoices(
                 company_id=company_id,
+                scope=scope,
                 company_provider_id=int(cp_param) if cp_param else None,
                 start_date=request.GET.get("start_date"),
                 end_date=request.GET.get("end_date"),
@@ -365,9 +447,12 @@ class PurchaseOrderInvoiceDetailView(views.View):
 
         invoice_id = kwargs.get("id")
         try:
+            scope = spaces_services.resolve_scope(request)
             result = purchase_orders_services.get_purchase_order_invoice_detail(
-                company_id=company_id, invoice_id=invoice_id
+                company_id=company_id, scope=scope, invoice_id=invoice_id
             )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e), status=404)
         except Exception:
@@ -389,8 +474,10 @@ class PurchaseOrderTrackingView(views.View):
 
         cp_param = request.GET.get("company_provider_id")
         try:
+            scope = spaces_services.resolve_scope(request)
             result = purchase_orders_services.list_purchase_order_tracking(
                 company_id=company_id,
+                scope=scope,
                 company_provider_id=int(cp_param) if cp_param else None,
                 delivery_status=request.GET.get("delivery_status"),
             )
@@ -413,7 +500,12 @@ class PurchaseOrderDetailView(views.View):
 
         po_id = kwargs.get("id")
         try:
-            result = purchase_orders_services.get_purchase_order_detail(company_id=company_id, purchase_order_id=po_id)
+            scope = spaces_services.resolve_scope(request)
+            result = purchase_orders_services.get_purchase_order_detail(
+                company_id=company_id, scope=scope, purchase_order_id=po_id
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e), status=404)
         except Exception:
@@ -435,9 +527,12 @@ class PurchaseOrderPdfView(views.View):
 
         po_id = kwargs.get("id")
         try:
+            scope = spaces_services.resolve_scope(request)
             pdf_bytes = purchase_orders_services.get_purchase_order_pdf_bytes(
-                company_id=company_id, purchase_order_id=po_id
+                company_id=company_id, scope=scope, purchase_order_id=po_id
             )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e), status=404)
         except Exception:
@@ -462,9 +557,12 @@ class PurchaseOrderConfirmedDetailView(views.View):
 
         po_id = kwargs.get("id")
         try:
+            scope = spaces_services.resolve_scope(request)
             result = purchase_orders_services.get_confirmed_purchase_order_detail(
-                company_id=company_id, purchase_order_id=po_id
+                company_id=company_id, scope=scope, purchase_order_id=po_id
             )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e), status=404)
         except Exception:
@@ -500,13 +598,17 @@ class PurchaseOrderSubmitView(views.View):
 
         po_id = kwargs.get("id")
         try:
+            scope = spaces_services.resolve_scope(request)
             result = purchase_orders_services.submit_purchase_order(
                 company_id=company_id,
+                scope=scope,
                 purchase_order_id=po_id,
                 ship_method=body.get("ship_method"),
                 notes=body.get("notes"),
                 po_name=body.get("po_name"),
             )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response_for(e)
         except Exception:
@@ -537,9 +639,12 @@ class PurchaseOrderShippingSelectionView(views.View):
 
         po_id = kwargs.get("id")
         try:
+            scope = spaces_services.resolve_scope(request)
             result = purchase_orders_services.select_shipping_options(
-                company_id=company_id, purchase_order_id=po_id, selections=selections
+                company_id=company_id, scope=scope, purchase_order_id=po_id, selections=selections
             )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response_for(e)
         except Exception:
@@ -559,7 +664,12 @@ class PurchaseOrderCancelView(views.View):
 
         po_id = kwargs.get("id")
         try:
-            result = purchase_orders_services.cancel_purchase_order(company_id=company_id, purchase_order_id=po_id)
+            scope = spaces_services.resolve_scope(request)
+            result = purchase_orders_services.cancel_purchase_order(
+                company_id=company_id, scope=scope, purchase_order_id=po_id
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e))
         except Exception:
@@ -580,7 +690,12 @@ class PurchaseOrderDiscardView(views.View):
 
         po_id = kwargs.get("id")
         try:
-            result = purchase_orders_services.discard_purchase_order(company_id=company_id, purchase_order_id=po_id)
+            scope = spaces_services.resolve_scope(request)
+            result = purchase_orders_services.discard_purchase_order(
+                company_id=company_id, scope=scope, purchase_order_id=po_id
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e))
         except Exception:
@@ -603,9 +718,12 @@ class PurchaseOrderRefreshStatusView(views.View):
 
         po_id = kwargs.get("id")
         try:
+            scope = spaces_services.resolve_scope(request)
             result = purchase_orders_services.refresh_purchase_order_status(
-                company_id=company_id, purchase_order_id=po_id
+                company_id=company_id, scope=scope, purchase_order_id=po_id
             )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e), status=404)
         except Exception:
@@ -627,7 +745,12 @@ class PurchaseOrderRequoteView(views.View):
 
         po_id = kwargs.get("id")
         try:
-            result = purchase_orders_services.requote_purchase_order(company_id=company_id, purchase_order_id=po_id)
+            scope = spaces_services.resolve_scope(request)
+            result = purchase_orders_services.requote_purchase_order(
+                company_id=company_id, scope=scope, purchase_order_id=po_id
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response_for(e)
         except Exception:
@@ -648,9 +771,12 @@ class PurchaseOrderJobView(views.View):
         po_id = kwargs.get("id")
         job_id = kwargs.get("job_id")
         try:
+            scope = spaces_services.resolve_scope(request)
             result = purchase_orders_services.get_job_status(
-                company_id=company_id, purchase_order_id=po_id, job_id=job_id
+                company_id=company_id, scope=scope, purchase_order_id=po_id, job_id=job_id
             )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e), status=404)
         except Exception:
@@ -670,7 +796,12 @@ class PurchaseOrderGroupDetailView(views.View):
 
         group_id = kwargs.get("id")
         try:
-            result = purchase_orders_services.get_purchase_order_group_detail(company_id=company_id, group_id=group_id)
+            scope = spaces_services.resolve_scope(request)
+            result = purchase_orders_services.get_purchase_order_group_detail(
+                company_id=company_id, scope=scope, group_id=group_id
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e), status=404)
         except Exception:
@@ -699,9 +830,12 @@ class PurchaseOrderGroupSubmitView(views.View):
 
         group_id = kwargs.get("id")
         try:
+            scope = spaces_services.resolve_scope(request)
             result = purchase_orders_services.submit_purchase_order_group(
-                company_id=company_id, group_id=group_id, ship_methods=body.get("ship_methods")
+                company_id=company_id, scope=scope, group_id=group_id, ship_methods=body.get("ship_methods")
             )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response_for(e)
         except Exception:
@@ -720,7 +854,8 @@ class PurchaseOrderCapabilitiesView(views.View):
             return err
 
         try:
-            result = purchase_orders_services.get_order_capabilities(company_id=company_id)
+            scope = spaces_services.resolve_scope(request)
+            result = purchase_orders_services.get_order_capabilities(company_id=company_id, scope=scope)
         except Exception:
             logger.exception("{} Error fetching order capabilities for company_id={}".format(_LOG_PREFIX, company_id))
             return _error_response("Error fetching order capabilities", status=500)
@@ -744,15 +879,17 @@ class ShippingMethodsView(views.View):
 
         try:
             result = purchase_orders_services.get_shipping_methods(
-                company_id=company_id, company_provider_id=int(company_provider_id)
+                company_id=company_id,
+                company_provider_id=int(company_provider_id),
+                scope=spaces_services.resolve_scope(request),
             )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e))
         except Exception:
             logger.exception(
-                "{} Error fetching shipping methods for company_provider_id={}".format(
-                    _LOG_PREFIX, company_provider_id
-                )
+                "{} Error fetching shipping methods for company_provider_id={}".format(_LOG_PREFIX, company_provider_id)
             )
             return _error_response("Error fetching shipping methods", status=500)
 

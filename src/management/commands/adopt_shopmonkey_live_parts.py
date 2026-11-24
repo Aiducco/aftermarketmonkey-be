@@ -30,13 +30,17 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument("--company-id", type=int, required=True)
+        parser.add_argument(
+            "--space-id", type=int, default=None, help="The space whose ShopMonkey account to read (default Main)."
+        )
         parser.add_argument("--brand", action="append", default=None, help="Our brand name; repeat for several.")
         parser.add_argument("--all", action="store_true", help="Every disabled sync brand for the company.")
         parser.add_argument("--apply", action="store_true", help="Write. Without it nothing is written.")
 
     def handle(self, *args, **options):
         company_id = options["company_id"]
-        brands = src_models.ShopMonkeySyncBrand.objects.filter(company_id=company_id).select_related(
+        space_id = import_services.resolve_space_id(company_id, options["space_id"])
+        brands = src_models.ShopMonkeySyncBrand.objects.filter(space_id=space_id).select_related(
             "brand", "vendor__provider"
         )
         if options["brand"]:
@@ -50,7 +54,7 @@ class Command(BaseCommand):
             raise CommandError("No matching sync brands.")
 
         self.stdout.write("Reading the live ShopMonkey account (about 8 minutes)...")
-        records = self._scan(company_id)
+        records = self._scan(space_id)
         self.stdout.write("Account holds {} parts.\n".format(len(records)))
 
         total_adopted = 0
@@ -73,8 +77,8 @@ class Command(BaseCommand):
         if not options["apply"]:
             self.stdout.write(self.style.WARNING("DRY RUN -- nothing written. Re-run with --apply."))
 
-    def _scan(self, company_id: int) -> typing.List[typing.Dict[str, typing.Any]]:
-        client = shopmonkey_sync_services._client_for_company(company_id)
+    def _scan(self, space_id: int) -> typing.List[typing.Dict[str, typing.Any]]:
+        client = shopmonkey_sync_services._client_for_space(space_id)
         records: typing.Dict[str, typing.Dict[str, typing.Any]] = {}
         skip = 0
         while True:

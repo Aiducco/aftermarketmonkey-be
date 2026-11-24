@@ -45,6 +45,7 @@ from src.integrations.clients.rough_country import edi_config, inbound
 from src.integrations.edi import control_numbers
 from src.integrations.edi import exceptions as edi_exceptions
 from src.integrations.edi import x12
+from src.integrations.orders import base as order_base
 
 logger = logging.getLogger(__name__)
 
@@ -142,18 +143,42 @@ def match_purchase_order(
     Find the PO a document names, scoped to this company.
 
     Matched on ``po_name`` as well as ``po_number`` because ``base.resolve_po_number`` sends
-    whichever of the two the shop supplied, and that is the value Rough Country echoes back.
+    whichever of the two the shop supplied, and that is the value Rough Country echoes back. A
+    prefixed PO is sent as prefix + that value, which is recorded on its distributor-order row, so
+    that row's ``po_number`` / ``distributor_order_number`` is matched too. Nothing is stripped.
     Scoped by company so one shop's acknowledgment can never land on another's order.
     """
     reference = (po_number or "").strip()
     if not reference:
         return None
-    return (
+    candidates = list(
         src_models.PurchaseOrder.objects.filter(company_provider=company_provider)
-        .filter(Q(po_name=reference) | Q(po_number=reference))
+        .filter(
+            Q(po_name=reference)
+            | Q(po_number=reference)
+            | Q(distributor_orders__po_number=reference)
+            | Q(distributor_orders__distributor_order_number=reference)
+        )
         .order_by("-id")
-        .first()
+        .distinct()
     )
+    if len(candidates) < 2:
+        return candidates[0] if candidates else None
+    # Several POs match (a main-space "TRU555" and a TRU-space "555" both read TRU555). The PO sent as exactly
+    # this reference wins; among those a prefixed PO first (a distributor-side "TRU555" is that prefix at
+    # work), then the newest. Then the one whose distributor-order row recorded it, then the newest.
+    exact = [c for c in candidates if order_base.resolve_po_number(c) == reference]
+    if exact:
+        return next((c for c in exact if c.po_prefix), exact[0])
+    recorded = set(
+        src_models.PurchaseOrderDistributorOrder.objects.filter(
+            purchase_order_id__in=[c.id for c in candidates], po_number=reference
+        ).values_list("purchase_order_id", flat=True)
+    )
+    for candidate in candidates:
+        if candidate.id in recorded:
+            return candidate
+    return candidates[0]
 
 
 # -- applying --------------------------------------------------------------------------------

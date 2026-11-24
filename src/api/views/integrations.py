@@ -6,9 +6,19 @@ import simplejson
 from django import http, views
 
 from src.api.services import integrations as integrations_services
+from src.api.services import spaces as spaces_services
 
 logger = logging.getLogger(__name__)
 _LOG_PREFIX = "[INTEGRATIONS]"
+
+
+def _space_error_response(e: spaces_services.SpaceError) -> http.HttpResponse:
+    """A space rule's answer: status, message, ``error_code`` and any extra keys (``spaces``)."""
+    return http.HttpResponse(
+        headers={"Content-Type": "application/json"},
+        content=simplejson.dumps(e.body()),
+        status=e.status_code,
+    )
 
 
 class ProvidersCatalogView(views.View):
@@ -32,7 +42,9 @@ class ProvidersCatalogView(views.View):
             )
 
         try:
-            result = integrations_services.get_providers_catalog(company_id=company_id)
+            result = integrations_services.get_providers_catalog(
+                company_id=company_id, scope=spaces_services.resolve_scope(request)
+            )
         except Exception as e:
             logger.error(
                 f"{_LOG_PREFIX} Error fetching providers catalog for company_id: {company_id}. Error: {str(e)}"
@@ -88,11 +100,26 @@ class ProviderConnectView(views.View):
             )
 
         credentials = body if isinstance(body, dict) else {}
-        data, err, error_code = integrations_services.connect_provider(
-            company_id=company_id,
-            provider_id=provider_id,
-            credentials=credentials,
-        )
+        share_company_provider_id = None
+        try:
+            scope = spaces_services.resolve_scope(request)
+            if scope.enabled:
+                # Read only for a company with the multi_spaces flag; it is not part of the credentials.
+                share_company_provider_id = credentials.get("share_company_provider_id")
+                credentials = {k: v for k, v in credentials.items() if k != "share_company_provider_id"}
+            data, err, error_code = integrations_services.connect_provider(
+                company_id=company_id,
+                provider_id=provider_id,
+                credentials=credentials,
+                scope=scope,
+                share_company_provider_id=share_company_provider_id,
+            )
+        except spaces_services.SpaceError as e:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps(e.body()),
+                status=e.status_code,
+            )
         integrations_services.log_connection_attempt(
             company_id=company_id,
             provider_id=provider_id,
@@ -113,11 +140,13 @@ class ProviderConnectView(views.View):
             )
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
-                content=simplejson.dumps({
-                    "message": err,
-                    "error_code": error_code,
-                    **({"upgrade_required": True} if is_plan_limit else {}),
-                }),
+                content=simplejson.dumps(
+                    {
+                        "message": err,
+                        "error_code": error_code,
+                        **({"upgrade_required": True} if is_plan_limit else {}),
+                    }
+                ),
                 status=402 if is_plan_limit else 400,
             )
 
@@ -168,11 +197,15 @@ class ProviderConnectionView(views.View):
                 status=400,
             )
 
-        success, err = integrations_services.disconnect_provider(
-            company_id=company_id,
-            company_provider_id=company_provider_id,
-            namespace=namespace,
-        )
+        try:
+            success, err = integrations_services.disconnect_provider(
+                company_id=company_id,
+                company_provider_id=company_provider_id,
+                namespace=namespace,
+                scope=spaces_services.resolve_scope(request),
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         if not success:
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
@@ -226,11 +259,15 @@ class ProviderConnectionView(views.View):
             )
 
         patch = body if isinstance(body, dict) else {}
-        data, err, error_code = integrations_services.update_connection(
-            company_id=company_id,
-            company_provider_id=cpi,
-            credentials=patch,
-        )
+        try:
+            data, err, error_code = integrations_services.update_connection(
+                company_id=company_id,
+                company_provider_id=cpi,
+                credentials=patch,
+                scope=spaces_services.resolve_scope(request),
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         integrations_services.log_connection_attempt(
             company_id=company_id,
             user_id=request.user.id,
@@ -306,7 +343,10 @@ class ProviderConnectionDetailView(views.View):
             data = integrations_services.get_company_provider_connection_detail(
                 company_id=company_id,
                 company_provider_id=cpi,
+                scope=spaces_services.resolve_scope(request),
             )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except Exception as e:
             logger.error(
                 f"{_LOG_PREFIX} Error fetching connection detail company_provider_id={cpi} company_id={company_id}: {e}"
@@ -329,6 +369,22 @@ class ProviderConnectionDetailView(views.View):
             content=simplejson.dumps({"data": data}),
             status=200,
         )
+
+
+def _require_admin_when_flagged(request: http.HttpRequest) -> typing.Optional[http.HttpResponse]:
+    """Order accounts hold credentials: for a company with the multi_spaces flag only its admins change them
+    (403, read from the DB). An unflagged company is unchanged. Returns the error response, else None."""
+    try:
+        scope = spaces_services.resolve_scope(request)
+        if scope.enabled:
+            spaces_services.require_admin(scope)
+    except spaces_services.SpaceError as e:
+        return http.HttpResponse(
+            headers={"Content-Type": "application/json"},
+            content=simplejson.dumps(e.body()),
+            status=e.status_code,
+        )
+    return None
 
 
 class OrderAccountsView(views.View):
@@ -371,7 +427,12 @@ class OrderAccountsView(views.View):
                 status=400,
             )
 
-        data = integrations_services.list_order_accounts(company_id=company_id, company_provider_id=cpi)
+        try:
+            data = integrations_services.list_order_accounts(
+                company_id=company_id, company_provider_id=cpi, scope=spaces_services.resolve_scope(request)
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         if data is None:
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
@@ -401,6 +462,10 @@ class OrderAccountsView(views.View):
                 status=400,
             )
 
+        denied = _require_admin_when_flagged(request)
+        if denied:
+            return denied
+
         company_provider_id = kwargs.get("company_provider_id")
         try:
             cpi = int(company_provider_id)
@@ -422,14 +487,18 @@ class OrderAccountsView(views.View):
         if not isinstance(body, dict):
             body = {}
 
-        data, err, error_code = integrations_services.create_order_account(
-            company_id=company_id,
-            company_provider_id=cpi,
-            label=body.get("label"),
-            credentials=body.get("credentials") or {},
-            is_default=body.get("is_default"),
-            order_method=body.get("order_method"),
-        )
+        try:
+            data, err, error_code = integrations_services.create_order_account(
+                company_id=company_id,
+                company_provider_id=cpi,
+                label=body.get("label"),
+                credentials=body.get("credentials") or {},
+                is_default=body.get("is_default"),
+                order_method=body.get("order_method"),
+                scope=spaces_services.resolve_scope(request),
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         if err:
             if error_code == integrations_services.CONNECTION_ERROR_INTEGRATION_PAUSED:
                 return http.HttpResponse(
@@ -482,6 +551,10 @@ class OrderAccountDetailView(views.View):
                 status=400,
             )
 
+        denied = _require_admin_when_flagged(request)
+        if denied:
+            return denied
+
         order_account_id = kwargs.get("order_account_id")
         try:
             oai = int(order_account_id)
@@ -503,15 +576,19 @@ class OrderAccountDetailView(views.View):
         if not isinstance(body, dict):
             body = {}
 
-        data, err, error_code = integrations_services.update_order_account(
-            company_id=company_id,
-            order_account_id=oai,
-            label=body.get("label"),
-            credentials=body.get("credentials"),
-            active=body.get("active"),
-            is_default=body.get("is_default"),
-            order_method=body.get("order_method"),
-        )
+        try:
+            data, err, error_code = integrations_services.update_order_account(
+                company_id=company_id,
+                order_account_id=oai,
+                label=body.get("label"),
+                credentials=body.get("credentials"),
+                active=body.get("active"),
+                is_default=body.get("is_default"),
+                order_method=body.get("order_method"),
+                scope=spaces_services.resolve_scope(request),
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         if err:
             if error_code == integrations_services.CONNECTION_ERROR_INTEGRATION_PAUSED:
                 return http.HttpResponse(
@@ -548,6 +625,10 @@ class OrderAccountDetailView(views.View):
                 status=400,
             )
 
+        denied = _require_admin_when_flagged(request)
+        if denied:
+            return denied
+
         order_account_id = kwargs.get("order_account_id")
         try:
             oai = int(order_account_id)
@@ -558,7 +639,12 @@ class OrderAccountDetailView(views.View):
                 status=400,
             )
 
-        success, err = integrations_services.delete_order_account(company_id=company_id, order_account_id=oai)
+        try:
+            success, err = integrations_services.delete_order_account(
+                company_id=company_id, order_account_id=oai, scope=spaces_services.resolve_scope(request)
+            )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         if not success:
             if err == integrations_services.INTEGRATION_PAUSED_MESSAGE:
                 return http.HttpResponse(
@@ -584,15 +670,12 @@ class OrderAccountDetailView(views.View):
 
 class CompanyProvidersView(views.View):
     def get(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
-
         # AUTH CHECK
         logger.info(
             f"{_LOG_PREFIX} Auth check - user: {request.user}, is_authenticated: {getattr(request.user, 'is_authenticated', False) if request.user else False}"
         )
         if not request.user or not request.user.is_authenticated:
-            logger.warning(
-                f"{_LOG_PREFIX} User not authenticated for {request.path}"
-            )
+            logger.warning(f"{_LOG_PREFIX} User not authenticated for {request.path}")
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
                 content=simplejson.dumps({"message": "User not authenticated"}),
@@ -609,7 +692,9 @@ class CompanyProvidersView(views.View):
             )
 
         try:
-            data = integrations_services.get_company_providers(company_id=company_id)
+            data = integrations_services.get_company_providers(
+                company_id=company_id, scope=spaces_services.resolve_scope(request)
+            )
         except Exception as e:
             logger.error(
                 f"{_LOG_PREFIX} Error fetching company providers for company_id: {company_id}. Error: {str(e)}"
@@ -629,15 +714,12 @@ class CompanyProvidersView(views.View):
 
 class CompanyProviderDetailView(views.View):
     def get(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
-
         # AUTH CHECK
         logger.info(
             f"{_LOG_PREFIX} Auth check - user: {request.user}, is_authenticated: {getattr(request.user, 'is_authenticated', False) if request.user else False}"
         )
         if not request.user or not request.user.is_authenticated:
-            logger.warning(
-                f"{_LOG_PREFIX} User not authenticated for {request.path}"
-            )
+            logger.warning(f"{_LOG_PREFIX} User not authenticated for {request.path}")
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
                 content=simplejson.dumps({"message": "User not authenticated"}),
@@ -653,7 +735,7 @@ class CompanyProviderDetailView(views.View):
                 status=400,
             )
 
-        provider_id = kwargs.get('id')
+        provider_id = kwargs.get("id")
         if not provider_id:
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
@@ -672,9 +754,10 @@ class CompanyProviderDetailView(views.View):
 
         try:
             data = integrations_services.get_company_provider_by_id(
-                company_id=company_id,
-                provider_id=provider_id_int
+                company_id=company_id, provider_id=provider_id_int, scope=spaces_services.resolve_scope(request)
             )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except Exception as e:
             logger.error(
                 f"{_LOG_PREFIX} Error fetching company provider with id: {provider_id_int} for company_id: {company_id}. Error: {str(e)}"
@@ -701,15 +784,12 @@ class CompanyProviderDetailView(views.View):
 
 class BrandsWithProvidersView(views.View):
     def get(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
-
         # AUTH CHECK
         logger.info(
             f"{_LOG_PREFIX} Auth check - user: {request.user}, is_authenticated: {getattr(request.user, 'is_authenticated', False) if request.user else False}"
         )
         if not request.user or not request.user.is_authenticated:
-            logger.warning(
-                f"{_LOG_PREFIX} User not authenticated for {request.path}"
-            )
+            logger.warning(f"{_LOG_PREFIX} User not authenticated for {request.path}")
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
                 content=simplejson.dumps({"message": "User not authenticated"}),
@@ -719,9 +799,7 @@ class BrandsWithProvidersView(views.View):
         try:
             data = integrations_services.get_all_brands_with_providers()
         except Exception as e:
-            logger.error(
-                f"{_LOG_PREFIX} Error fetching brands with providers. Error: {str(e)}"
-            )
+            logger.error(f"{_LOG_PREFIX} Error fetching brands with providers. Error: {str(e)}")
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
                 content=simplejson.dumps({"message": "Error fetching brands with providers"}),
@@ -737,15 +815,12 @@ class BrandsWithProvidersView(views.View):
 
 class CompanyDestinationsWithBrandsView(views.View):
     def get(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
-
         # AUTH CHECK
         logger.info(
             f"{_LOG_PREFIX} Auth check - user: {request.user}, is_authenticated: {getattr(request.user, 'is_authenticated', False) if request.user else False}"
         )
         if not request.user or not request.user.is_authenticated:
-            logger.warning(
-                f"{_LOG_PREFIX} User not authenticated for {request.path}"
-            )
+            logger.warning(f"{_LOG_PREFIX} User not authenticated for {request.path}")
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
                 content=simplejson.dumps({"message": "User not authenticated"}),
@@ -782,15 +857,12 @@ class CompanyDestinationsWithBrandsView(views.View):
 
 class CompanyDestinationDetailView(views.View):
     def get(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
-
         # AUTH CHECK
         logger.info(
             f"{_LOG_PREFIX} Auth check - user: {request.user}, is_authenticated: {getattr(request.user, 'is_authenticated', False) if request.user else False}"
         )
         if not request.user or not request.user.is_authenticated:
-            logger.warning(
-                f"{_LOG_PREFIX} User not authenticated for {request.path}"
-            )
+            logger.warning(f"{_LOG_PREFIX} User not authenticated for {request.path}")
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
                 content=simplejson.dumps({"message": "User not authenticated"}),
@@ -806,7 +878,7 @@ class CompanyDestinationDetailView(views.View):
                 status=400,
             )
 
-        destination_id = kwargs.get('id')
+        destination_id = kwargs.get("id")
         if not destination_id:
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
@@ -825,8 +897,7 @@ class CompanyDestinationDetailView(views.View):
 
         try:
             data = integrations_services.get_company_destination_by_id(
-                company_id=company_id,
-                destination_id=destination_id_int
+                company_id=company_id, destination_id=destination_id_int
             )
         except Exception as e:
             logger.error(
@@ -854,15 +925,12 @@ class CompanyDestinationDetailView(views.View):
 
 class ExecutionRunsView(views.View):
     def get(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
-
         # AUTH CHECK
         logger.info(
             f"{_LOG_PREFIX} Auth check - user: {request.user}, is_authenticated: {getattr(request.user, 'is_authenticated', False) if request.user else False}"
         )
         if not request.user or not request.user.is_authenticated:
-            logger.warning(
-                f"{_LOG_PREFIX} User not authenticated for {request.path}"
-            )
+            logger.warning(f"{_LOG_PREFIX} User not authenticated for {request.path}")
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
                 content=simplejson.dumps({"message": "User not authenticated"}),
@@ -879,7 +947,7 @@ class ExecutionRunsView(views.View):
             )
 
         # Get destination_id from URL path (optional)
-        destination_id = kwargs.get('destination_id')
+        destination_id = kwargs.get("destination_id")
         if destination_id:
             try:
                 destination_id_int = int(destination_id)
@@ -894,12 +962,12 @@ class ExecutionRunsView(views.View):
 
         # Get pagination parameters from query string
         try:
-            page = int(request.GET.get('page', 1))
+            page = int(request.GET.get("page", 1))
         except (ValueError, TypeError):
             page = 1
 
         try:
-            page_size = int(request.GET.get('page_size', 20))
+            page_size = int(request.GET.get("page_size", 20))
             # Limit page_size to prevent abuse
             if page_size > 100:
                 page_size = 100
@@ -910,15 +978,10 @@ class ExecutionRunsView(views.View):
 
         try:
             result = integrations_services.get_company_execution_runs(
-                company_id=company_id,
-                destination_id=destination_id_int,
-                page=page,
-                page_size=page_size
+                company_id=company_id, destination_id=destination_id_int, page=page, page_size=page_size
             )
         except Exception as e:
-            logger.error(
-                f"{_LOG_PREFIX} Error fetching execution runs for company_id: {company_id}. Error: {str(e)}"
-            )
+            logger.error(f"{_LOG_PREFIX} Error fetching execution runs for company_id: {company_id}. Error: {str(e)}")
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
                 content=simplejson.dumps({"message": "Error fetching execution runs"}),
@@ -934,15 +997,12 @@ class ExecutionRunsView(views.View):
 
 class ExecutionRunPartsHistoryView(views.View):
     def get(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
-
         # AUTH CHECK
         logger.info(
             f"{_LOG_PREFIX} Auth check - user: {request.user}, is_authenticated: {getattr(request.user, 'is_authenticated', False) if request.user else False}"
         )
         if not request.user or not request.user.is_authenticated:
-            logger.warning(
-                f"{_LOG_PREFIX} User not authenticated for {request.path}"
-            )
+            logger.warning(f"{_LOG_PREFIX} User not authenticated for {request.path}")
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
                 content=simplejson.dumps({"message": "User not authenticated"}),
@@ -958,7 +1018,7 @@ class ExecutionRunPartsHistoryView(views.View):
                 status=400,
             )
 
-        execution_run_id = kwargs.get('execution_run_id')
+        execution_run_id = kwargs.get("execution_run_id")
         if not execution_run_id:
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
@@ -977,12 +1037,12 @@ class ExecutionRunPartsHistoryView(views.View):
 
         # Get pagination parameters from query string
         try:
-            page = int(request.GET.get('page', 1))
+            page = int(request.GET.get("page", 1))
         except (ValueError, TypeError):
             page = 1
 
         try:
-            page_size = int(request.GET.get('page_size', 20))
+            page_size = int(request.GET.get("page_size", 20))
             # Limit page_size to prevent abuse
             if page_size > 100:
                 page_size = 100
@@ -993,10 +1053,7 @@ class ExecutionRunPartsHistoryView(views.View):
 
         try:
             result = integrations_services.get_execution_run_parts_history(
-                company_id=company_id,
-                execution_run_id=execution_run_id_int,
-                page=page,
-                page_size=page_size
+                company_id=company_id, execution_run_id=execution_run_id_int, page=page, page_size=page_size
             )
         except Exception as e:
             logger.error(
@@ -1170,3 +1227,54 @@ class CustomIntegrationRequestsView(views.View):
             status=200,
         )
 
+
+class OrderAccountSpacesView(views.View):
+    """PUT /integrations/order-accounts/<order_account_id>/spaces/ - {space_ids: [int]}. Replaces the spaces
+    that use this order account (company admins of a company with the multi_spaces flag)."""
+
+    def put(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
+        if not request.user or not request.user.is_authenticated:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "User not authenticated"}),
+                status=401,
+            )
+
+        company_id = getattr(request, "company_id", None)
+        if not company_id:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "No company found in token"}),
+                status=400,
+            )
+
+        try:
+            body = json.loads(request.body) if request.body else {}
+        except json.JSONDecodeError:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "Invalid JSON body"}),
+                status=400,
+            )
+        if not isinstance(body, dict):
+            body = {}
+
+        try:
+            data = integrations_services.set_order_account_spaces(
+                company_id=company_id,
+                scope=spaces_services.resolve_scope(request),
+                order_account_id=kwargs.get("order_account_id"),
+                space_ids=body.get("space_ids"),
+            )
+        except spaces_services.SpaceError as e:
+            return http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps(e.body()),
+                status=e.status_code,
+            )
+
+        return http.HttpResponse(
+            headers={"Content-Type": "application/json"},
+            content=simplejson.dumps({"data": data}),
+            status=200,
+        )
