@@ -188,6 +188,42 @@ def write_space(scope: SpaceScope) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Feeds per space (ADR 0002)
+# ---------------------------------------------------------------------------
+
+
+def family_company_ids(company_id: int) -> typing.List[int]:
+    """The customer company's id followed by its feed tenants' ids, for any company id of the family (a tenant
+    maps to its parent first). A company with no tenants returns just its own id."""
+    parent_id = src_models.Company.objects.values_list("parent_company_id", flat=True).filter(id=company_id).first()
+    customer_id = parent_id or company_id
+    tenant_ids = (
+        src_models.Company.objects.filter(parent_company_id=customer_id).order_by("id").values_list("id", flat=True)
+    )
+    return [customer_id, *tenant_ids]
+
+
+def feeds_for(space: typing.Union[src_models.Space, int]) -> typing.Dict[int, src_models.CompanyProviders]:
+    """The connections a space uses, ``{provider_id: connection}``, active connections only (a deactivated
+    tenant connection reads as not connected). Callers read it only for flagged companies; an unflagged company
+    keeps reading its own connections."""
+    space_id = space.id if isinstance(space, src_models.Space) else space
+    rows = (
+        src_models.SpaceProvider.objects.filter(space_id=space_id, company_provider__active=True)
+        .select_related("company_provider")
+        .order_by("provider_id")
+    )
+    return {row.provider_id: row.company_provider for row in rows}
+
+
+def pricing_company_for(space: typing.Union[src_models.Space, int], provider_id: int) -> typing.Optional[int]:
+    """The company whose price rows the space reads for a distributor: the used connection's ``company_id`` (the
+    real company, or a feed tenant for an own feed). None when the space uses no active connection for it."""
+    connection = feeds_for(space).get(provider_id)
+    return connection.company_id if connection is not None else None
+
+
+# ---------------------------------------------------------------------------
 # Order accounts per space
 # ---------------------------------------------------------------------------
 

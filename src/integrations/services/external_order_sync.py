@@ -344,7 +344,8 @@ def _result_to_defaults(
 ) -> typing.Dict:
     ship_to = result.ship_to or {}
     return {
-        "company": company_provider.company,
+        # The customer: the parent for a feed tenant's connection (ADR 0002), so the order shows up for the shop.
+        "company": company_provider.company.customer_company,
         "company_provider": company_provider,
         "customer_po_number": _clip(result.customer_po_number or None, 128),
         "origin_signal": origin_signal.value,
