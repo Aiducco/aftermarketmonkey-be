@@ -7,6 +7,7 @@ from typing import Optional
 
 import stripe
 from django.conf import settings
+from django.db.models import Q
 from django.utils import timezone as django_tz
 
 from src import models as src_models
@@ -554,10 +555,11 @@ def _connected_distributor_count(company_id: int) -> int:
 
 
 def _paused_distributor_count(company_id: int) -> int:
-    """Feed-connected CompanyProviders rows paused for plan limits (see plan_lifecycle)."""
-    creds_list = src_models.CompanyProviders.objects.filter(company_id=company_id, paused_at__isnull=False).values_list(
-        "credentials", flat=True
-    )
+    """Feed-connected CompanyProviders rows paused for plan limits (see plan_lifecycle), across the whole family:
+    the company's own and its feed tenants'."""
+    creds_list = src_models.CompanyProviders.objects.filter(
+        Q(company_id=company_id) | Q(company__parent_company_id=company_id), paused_at__isnull=False
+    ).values_list("credentials", flat=True)
     return sum(1 for c in creds_list if (c or {}).get("feed"))
 
 
@@ -689,6 +691,28 @@ def check_distributor_connection_limit(company_id: int) -> tuple[bool, str]:
         return False, (
             f"Distributor connection limit reached for {_plan_name(plan_key)} plan "
             f"({used}/{limit}). Upgrade to connect more distributors."
+        )
+    return True, ""
+
+
+def check_new_own_feed_allowed(company_id: int) -> tuple[bool, str]:
+    """
+    Whether a company with spaces may connect a NEW own feed (in any space; sharing an existing feed is not
+    refused). Refused while the company is downgraded, has any paused connection in its family, or has more
+    spaces than its allowance. Returns (allowed: bool, reason: str).
+    """
+    company_id = billing_company_id(company_id)
+    company = src_models.Company.objects.filter(id=company_id).first()
+    if not company:
+        return False, "Company not found"
+    if (
+        company.subscription_status == "downgraded"
+        or _paused_distributor_count(company_id) > 0
+        or spaces_in_use(company_id) > space_allowance(company)
+    ):
+        return False, (
+            "Your plan has paused distributors or has more spaces than it includes, so a new distributor feed "
+            "can't be connected. Upgrade, or share a feed that is already connected."
         )
     return True, ""
 

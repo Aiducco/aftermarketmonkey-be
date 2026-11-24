@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import socket
 import typing
@@ -123,15 +124,19 @@ _SPACE_ALREADY_HAS_FEED_MESSAGE = (
 def _render_relay_instructions_html(
     catalog_entry: typing.Dict[str, typing.Any],
     company: typing.Optional[src_models.Company],
+    show_login: bool = True,
 ) -> typing.Optional[str]:
     """
     For ``relay_provisioned`` catalog entries, substitute the company's own auto-provisioned
     relay SFTP username/password into the ``{{SFTP_USER}}`` / ``{{SFTP_PASSWORD}}`` placeholders
     so the distributor rep gets real, ready-to-use credentials instead of a request-by-email flow.
+    ``show_login=False`` (a non-admin member of a company with spaces) leaves the login out.
     """
     template = catalog_entry.get("installation_instructions_html") or ""
     if not catalog_entry.get("relay_provisioned"):
         return template or None
+    if not show_login:
+        return "<p>Ask an admin for the SFTP login.</p>"
     username = getattr(company, "relay_sftp_username", None) if company else None
     password = getattr(company, "relay_sftp_password", None) if company else None
     if not username or not password:
@@ -372,10 +377,12 @@ class _SpaceFeedCatalog:
         """owner_space, used_by, kept_apart_by and its prefixes for one connection."""
         used = self.used_by(cp_id)
         owner = self.owner[cp_id]
-        prefixes = sorted({self.prefix[s] for s in used if s != owner and self.prefix.get(s)})
+        # A member sees only the spaces they can see; kept_apart_by still counts every space.
+        shown = used if self.scope.is_admin else [s for s in used if s in self.scope.visible_space_ids]
+        prefixes = sorted({self.prefix[s] for s in shown if s != owner and self.prefix.get(s)})
         return {
             "owner_space": self.ref(owner),
-            "used_by": [self.ref(s) for s in used],
+            "used_by": [self.ref(s) for s in shown],
             "kept_apart_by": "prefix" if len(used) >= 2 else "own_account",
             "kept_apart_by_prefixes": prefixes,
         }
@@ -392,8 +399,6 @@ class _SpaceFeedCatalog:
             "status_checked_at": cp.status_checked_at.isoformat() if cp.status_checked_at else None,
             "order_status": cp.order_status,
             "order_status_name": cp.order_status_name,
-            "order_status_reason": cp.order_status_reason,
-            "order_status_checked_at": cp.order_status_checked_at.isoformat() if cp.order_status_checked_at else None,
         }
 
     def resolve(
@@ -541,7 +546,9 @@ def get_providers_catalog(company_id: int, scope: typing.Optional[spaces_service
                 "order_connection_optional_fields": entry.get("order_connection_optional_fields", []),
                 "email_order_connection_required_fields": entry.get("email_order_connection_required_fields", []),
                 "email_order_connection_optional_fields": entry.get("email_order_connection_optional_fields", []),
-                "installation_instructions_html": _render_relay_instructions_html(entry, instructions_company),
+                "installation_instructions_html": _render_relay_instructions_html(
+                    entry, instructions_company, show_login=scope is None or not scope.enabled or scope.is_admin
+                ),
                 "relay_provisioned": bool(entry.get("relay_provisioned")),
                 "connected": connected,
                 "company_provider_id": company_provider.id if company_provider else None,
@@ -1951,50 +1958,113 @@ def connect_provider(
     if share:
         if isinstance(share_company_provider_id, bool) or not isinstance(share_company_provider_id, int):
             return None, "share_company_provider_id must be an integer", CONNECTION_ERROR_INVALID_INPUT
-        target = src_models.CompanyProviders.objects.filter(
-            id=share_company_provider_id,
-            company_id__in=spaces_services.family_company_ids(company_id),
-            active=True,
-        ).first()
-        if target is None:
-            return None, "Connection not found", CONNECTION_ERROR_NOT_FOUND
-        if target.provider_id != provider_id:
-            return None, "That connection is for a different distributor", CONNECTION_ERROR_INVALID_INPUT
-        if not (target.credentials or {}).get("feed"):
-            return None, "That connection has no product feed to share", CONNECTION_ERROR_INVALID_INPUT
-        if spaces_services.owner_space_id_of_connection(target, scope.main_space_id) == space.id:
-            return None, "That connection already belongs to this space", CONNECTION_ERROR_INVALID_INPUT
-        if target.paused_at is not None:
-            return None, INTEGRATION_PAUSED_MESSAGE, CONNECTION_ERROR_INTEGRATION_PAUSED
-        if uses is not None:
-            return None, _SPACE_ALREADY_HAS_FEED_MESSAGE, CONNECTION_ERROR_SPACE_ALREADY_HAS_FEED
-        src_models.SpaceProvider.objects.update_or_create(
-            space=space, provider=provider, defaults={"company_provider": target}
-        )
-        return _connection_save_payload(target, provider, catalog_entry, company_id, None, None), None, None
+        # The connection row is locked until the share is saved, so a disconnect of it (which checks that no
+        # other space uses it) cannot run in between.
+        with transaction.atomic():
+            target = (
+                src_models.CompanyProviders.objects.select_for_update(of=("self",))
+                .filter(
+                    id=share_company_provider_id,
+                    company_id__in=spaces_services.family_company_ids(company_id),
+                    active=True,
+                )
+                .first()
+            )
+            if target is None:
+                return None, "Connection not found", CONNECTION_ERROR_NOT_FOUND
+            if target.provider_id != provider_id:
+                return None, "That connection is for a different distributor", CONNECTION_ERROR_INVALID_INPUT
+            if not (target.credentials or {}).get("feed"):
+                return None, "That connection has no product feed to share", CONNECTION_ERROR_INVALID_INPUT
+            if spaces_services.owner_space_id_of_connection(target, scope.main_space_id) == space.id:
+                return None, "That connection already belongs to this space", CONNECTION_ERROR_INVALID_INPUT
+            if target.paused_at is not None:
+                return None, INTEGRATION_PAUSED_MESSAGE, CONNECTION_ERROR_INTEGRATION_PAUSED
+            if uses is not None:
+                return None, _SPACE_ALREADY_HAS_FEED_MESSAGE, CONNECTION_ERROR_SPACE_ALREADY_HAS_FEED
+            src_models.SpaceProvider.objects.update_or_create(
+                space=space, provider=provider, defaults={"company_provider": target}
+            )
+            return _connection_save_payload(target, provider, catalog_entry, company_id, None, None), None, None
 
     if uses is not None and spaces_services.owner_space_id_of_connection(uses, scope.main_space_id) != space.id:
         return None, _SPACE_ALREADY_HAS_FEED_MESSAGE, CONNECTION_ERROR_SPACE_ALREADY_HAS_FEED
     if space.is_main:
         target_company_id, is_tenant = company_id, False
-    elif space.feed_company_id:
-        target_company_id, is_tenant = space.feed_company_id, True
     else:
-        # First own feed of this space: the tenant is created with the connection or not at all.
-        with transaction.atomic():
-            tenant = spaces_services.ensure_feed_tenant(space)
-            result = _connect_company_provider(tenant.id, provider_id, credentials, company_id, True)
-            if result[1] is not None:
-                transaction.set_rollback(True)
-        if result[1] is not None:
-            space.feed_company = None
-        else:
-            _record_owner_use(space, provider, result[0])
+        target_company_id, is_tenant = space.feed_company_id, True
+    # A NEW own feed (not a credential update of one the space already has) is refused while the plan is
+    # downgraded, paused or over its space allowance (AC-53), which also closes disconnect-then-reconnect.
+    own = (
+        src_models.CompanyProviders.objects.filter(company_id=target_company_id, provider_id=provider_id, active=True)
+        .only("credentials")
+        .first()
+        if target_company_id is not None
+        else None
+    )
+    has_feed = bool(own and (own.credentials or {}).get("feed"))
+    if not has_feed:
+        allowed, plan_reason = billing_services.check_new_own_feed_allowed(company_id)
+        if not allowed:
+            return None, plan_reason, CONNECTION_ERROR_PLAN_LIMIT_REACHED
+
+    def write_guard():
+        return _space_write_guard(company_id, space.id)
+
+    new_tenant = None
+    if target_company_id is None:
+        # First own feed of this space: the tenant (a short transaction of its own) is created here, outside the
+        # space lock, and removed again if the connect fails.
+        new_tenant = spaces_services.ensure_feed_tenant(space)
+        target_company_id = new_tenant.id
+    try:
+        result = _connect_company_provider(
+            target_company_id, provider_id, credentials, company_id, is_tenant, write_guard=write_guard
+        )
+    except BaseException:
+        _discard_new_tenant(company_id, space, new_tenant)
+        raise
+    if result[1] is not None:
+        _discard_new_tenant(company_id, space, new_tenant)
         return result
-    result = _connect_company_provider(target_company_id, provider_id, credentials, company_id, is_tenant)
-    if result[1] is None:
+    with write_guard():
         _record_owner_use(space, provider, result[0])
     return result
+
+
+@contextlib.contextmanager
+def _space_write_guard(company_id: int, space_id: int):
+    """One short transaction that holds the company lock while a space's connection is saved, so a concurrent
+    ``delete_space`` cannot remove the space (and its tenant) under a live connection. Raises SpaceError 404 when
+    the space is gone."""
+    with transaction.atomic():
+        spaces_services._lock_company(company_id)
+        if not src_models.Space.objects.filter(id=space_id, company_id=company_id).exists():
+            raise spaces_services.SpaceError("Space not found", spaces_services.ERROR_SPACE_NOT_FOUND, status_code=404)
+        yield
+
+
+def _discard_new_tenant(company_id: int, space: src_models.Space, tenant: typing.Optional[src_models.Company]) -> None:
+    """Remove a feed tenant this connect created when the connect did not save a connection on it. A relay SFTP
+    user that was provisioned for the tenant is not removed (the relay host is not called): it may remain."""
+    if tenant is None:
+        return
+    try:
+        with transaction.atomic():
+            spaces_services._lock_company(company_id)
+            if src_models.CompanyProviders.objects.filter(company_id=tenant.id).exists():
+                return  # a concurrent connect saved a connection on it
+            src_models.Space.objects.filter(id=space.id, feed_company_id=tenant.id).update(feed_company=None)
+            if tenant.relay_sftp_username:
+                logger.warning(
+                    "{} Relay SFTP user {} provisioned for discarded feed tenant {} may remain.".format(
+                        _LOG_PREFIX, tenant.relay_sftp_username, tenant.id
+                    )
+                )
+            tenant.delete()
+        space.feed_company = None
+    except Exception as e:
+        logger.error("{} Could not discard feed tenant {}: {}".format(_LOG_PREFIX, tenant.id, e))
 
 
 def _record_owner_use(space: src_models.Space, provider: src_models.Providers, data: typing.Dict[str, typing.Any]):
@@ -2011,12 +2081,15 @@ def _connect_company_provider(
     credentials: typing.Dict[str, typing.Any],
     response_company_id: typing.Optional[int] = None,
     is_feed_tenant: bool = False,
+    write_guard: typing.Optional[typing.Callable[[], typing.ContextManager]] = None,
 ) -> _ConnectResult:
     """
     Create, or idempotently update, a ``CompanyProviders`` row (keyed by company + provider).
     ``response_company_id`` is the ``company_id`` the response carries (the customer company when ``company_id`` is
     a feed tenant). A feed tenant's connection is never refused by the connection cap (own feeds are outside it),
-    and an inactive one is reactivated and treated as never synced.
+    and an inactive one is reactivated and treated as never synced. ``write_guard`` is a context manager entered
+    around the save only, after the credentials were validated (the space connect uses it to hold the company lock
+    for the write and not for the live validation).
     ``credentials`` is shaped ``{"feed": {...}, "order": {...}}`` — either namespace may be
     omitted (at least one must be present), and each is validated/stored independently via
     :func:`_merge_update_credentials`, the same merge this uses for PATCH. This is what lets a
@@ -2228,29 +2301,31 @@ def _connect_company_provider(
     # placement after save/create below rather than folding it into `creds` first.
     order_creds_to_sync = creds.pop("order", None)
 
-    if existing:
-        existing.credentials = creds
-        existing.active = True
-        for field, value in status_fields.items():
-            setattr(existing, field, value)
-        existing.save()
-        cp = existing
-    else:
-        cp = src_models.CompanyProviders.objects.create(
-            company_id=company_id,
-            provider_id=provider_id,
-            credentials=creds,
-            primary=False,
-            **status_fields,
-        )
-    if order_fields_touched:
-        _sync_default_order_account(cp, order_creds_to_sync or {}, order_status_enum, order_status_reason)
+    with write_guard() if write_guard else contextlib.nullcontext():
+        if existing:
+            existing.credentials = creds
+            if is_feed_tenant:
+                existing.active = True
+            for field, value in status_fields.items():
+                setattr(existing, field, value)
+            existing.save()
+            cp = existing
+        else:
+            cp = src_models.CompanyProviders.objects.create(
+                company_id=company_id,
+                provider_id=provider_id,
+                credentials=creds,
+                primary=False,
+                **status_fields,
+            )
+        if order_fields_touched:
+            _sync_default_order_account(cp, order_creds_to_sync or {}, order_status_enum, order_status_reason)
 
-    # Only (re-)enqueue a pricing sync when feed was actually part of this request (or the
-    # initial sync hasn't completed yet) — an order-only save has nothing to do with the feed
-    # and shouldn't trigger a full re-sync against the distributor's API.
-    if feed_fields_touched and integration_pricing_sync_jobs.should_enqueue_pricing_sync(provider.kind):
-        integration_pricing_sync_jobs.enqueue_company_provider_pricing_sync(cp.id)
+        # Only (re-)enqueue a pricing sync when feed was actually part of this request (or the
+        # initial sync hasn't completed yet) — an order-only save has nothing to do with the feed
+        # and shouldn't trigger a full re-sync against the distributor's API.
+        if feed_fields_touched and integration_pricing_sync_jobs.should_enqueue_pricing_sync(provider.kind):
+            integration_pricing_sync_jobs.enqueue_company_provider_pricing_sync(cp.id)
 
     return (
         _connection_save_payload(
@@ -2536,14 +2611,26 @@ def disconnect_provider(
     """
     if scope is not None and scope.enabled:
         spaces_services.require_admin(scope)
-    cp = (
-        src_models.CompanyProviders.objects.filter(
-            id=company_provider_id,
-            company_id__in=_connection_company_ids(company_id, scope),
-        )
-        .select_related("provider")
-        .first()
+        # One transaction with the connection row locked, so a share of it cannot land between the feed_in_use
+        # check and the delete.
+        with transaction.atomic():
+            return _disconnect_provider(company_id, company_provider_id, namespace, scope)
+    return _disconnect_provider(company_id, company_provider_id, namespace, scope)
+
+
+def _disconnect_provider(
+    company_id: int,
+    company_provider_id: int,
+    namespace: typing.Optional[str],
+    scope: typing.Optional[spaces_services.SpaceScope],
+) -> typing.Tuple[bool, typing.Optional[str]]:
+    connections = src_models.CompanyProviders.objects.filter(
+        id=company_provider_id,
+        company_id__in=_connection_company_ids(company_id, scope),
     )
+    if scope is not None and scope.enabled:
+        connections = connections.select_for_update(of=("self",))
+    cp = connections.select_related("provider").first()
     if not cp:
         return False, "Connection not found"
     is_tenant = cp.company_id != company_id
@@ -3516,7 +3603,9 @@ def get_company_provider_connection_detail(
         # These credentials are meant to be handed to the distributor's rep, not kept secret from
         # the company itself — show them plainly instead of redacting like a normal password field.
         company = src_models.Company.objects.filter(id=company_provider.company_id).first()
-        out["installation_instructions_html"] = _render_relay_instructions_html(catalog_entry, company)
+        out["installation_instructions_html"] = _render_relay_instructions_html(
+            catalog_entry, company, show_login=scope is None or not scope.enabled or scope.is_admin
+        )
     else:
         out["installation_instructions_html"] = catalog_entry.get("installation_instructions_html") or None
     out.update(
