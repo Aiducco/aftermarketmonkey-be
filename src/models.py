@@ -4,8 +4,9 @@ import enum
 from django.contrib.auth import models as auth_models
 from django.contrib.postgres import fields as pg_fields
 from django.core.serializers.json import DjangoJSONEncoder
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError
 from django.db import models as django_db_models
+from django.db import transaction
 from django.db.models import functions as django_db_models_functions
 from django.utils import timezone
 
