@@ -69,10 +69,12 @@ class PartsSearchView(views.View):
 
         return http.HttpResponse(
             headers={"Content-Type": "application/json"},
-            content=simplejson.dumps({
-                "data": result["data"],
-                "provider_image_urls": result["provider_image_urls"],
-            }),
+            content=simplejson.dumps(
+                {
+                    "data": result["data"],
+                    "provider_image_urls": result["provider_image_urls"],
+                }
+            ),
             status=200,
         )
 
@@ -211,9 +213,7 @@ class PartsBulkPricingView(views.View):
             )
 
         master_part_ids = body.get("master_part_ids")
-        if not isinstance(master_part_ids, list) or not all(
-            isinstance(mpid, int) for mpid in master_part_ids
-        ):
+        if not isinstance(master_part_ids, list) or not all(isinstance(mpid, int) for mpid in master_part_ids):
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
                 content=simplejson.dumps({"message": "master_part_ids must be a list of integers"}),
@@ -221,9 +221,7 @@ class PartsBulkPricingView(views.View):
             )
 
         try:
-            data = parts_services.get_parts_bulk_pricing(
-                master_part_ids=master_part_ids, company_id=company_id
-            )
+            data = parts_services.get_parts_bulk_pricing(master_part_ids=master_part_ids, company_id=company_id)
         except parts_services.PartsServiceError as e:
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},

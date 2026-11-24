@@ -66,7 +66,8 @@ def _map_turn14_warehouse_availability(
 
 
 def _atd_company_inventory(
-    warehouse_availability: typing.Optional[typing.Dict], company_id: typing.Optional[int],
+    warehouse_availability: typing.Optional[typing.Dict],
+    company_id: typing.Optional[int],
 ) -> typing.Tuple[typing.Optional[typing.Dict[str, typing.Union[int, float]]], typing.Optional[int]]:
     """
     Decode ATD's per-company stock out of ProviderPartInventory.warehouse_availability, which --
