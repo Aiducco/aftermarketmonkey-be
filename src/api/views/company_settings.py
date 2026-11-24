@@ -17,6 +17,7 @@ from src import models as src_models
 from src.api.schemas import company_settings as company_settings_schema
 from src.api.services import billing as billing_services
 from src.api.services import company_settings as company_settings_services
+from src.api.services import spaces as spaces_services
 
 logger = logging.getLogger(__name__)
 
@@ -196,15 +197,19 @@ class CompanyTeamView(views.View):
         except json.JSONDecodeError:
             return _json_response({"message": "Invalid JSON body"}, status=400)
 
-        result = company_settings_services.add_company_user(
-            company_id=company_id,
-            admin_user=request.user,
-            email=validated["email"],
-            first_name=validated["first_name"],
-            last_name=validated["last_name"],
-            password=validated["password"],
-            is_company_admin=validated.get("is_company_admin", False),
-        )
+        try:
+            result = company_settings_services.add_company_user(
+                company_id=company_id,
+                admin_user=request.user,
+                email=validated["email"],
+                first_name=validated["first_name"],
+                last_name=validated["last_name"],
+                password=validated["password"],
+                is_company_admin=validated.get("is_company_admin", False),
+                space_ids=validated.get("space_ids"),
+            )
+        except spaces_services.SpaceError as e:
+            return _json_response(e.body(), status=e.status_code)
         if isinstance(result, str):
             return _json_response({"message": result}, status=400)
         return _json_response({"message": "User added", "data": result}, status=201)
@@ -283,6 +288,41 @@ class CompanyTeamMemberView(views.View):
         if err:
             return _json_response({"message": err}, status=400)
         return _json_response({"message": "User removed from company"})
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class CompanyTeamMemberSpacesView(views.View):
+    """PUT /api/settings/company/team/<user_id>/spaces/ - Replace a member's spaces (admin only, multi-spaces)."""
+
+    def put(self, request: http.HttpRequest, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
+        company_id, err = _auth_and_company(request)
+        if err:
+            return _json_response({"message": err}, status=401 if "authenticated" in err else 400)
+
+        try:
+            body = json.loads(request.body) if request.body else {}
+            validated = common_utils.validate_data_schema(
+                data=body,
+                schema=company_settings_schema.SetCompanyUserSpacesSchema(),
+            )
+        except common_exceptions.ValidationSchemaException as e:
+            return _json_response(
+                {"message": "Invalid payload", "data": common_utils.get_exception_message(exception=e)},
+                status=400,
+            )
+        except json.JSONDecodeError:
+            return _json_response({"message": "Invalid JSON body"}, status=400)
+
+        try:
+            data = company_settings_services.set_user_spaces(
+                company_id=company_id,
+                admin_user=request.user,
+                target_user_id=kwargs["user_id"],
+                space_ids=validated["space_ids"],
+            )
+        except spaces_services.SpaceError as e:
+            return _json_response(e.body(), status=e.status_code)
+        return _json_response({"data": data})
 
 
 @method_decorator(csrf_exempt, name="dispatch")

@@ -48,6 +48,7 @@ from src.api.views.company_settings import (
     CompanyTeamView,
     CompanyTeamMemberView,
     CompanyTeamMemberResetPasswordView,
+    CompanyTeamMemberSpacesView,
     DeleteAccountView,
     DeleteCompanyDataView,
 )
@@ -497,6 +498,11 @@ urlpatterns = [
         "settings/company/team/<int:user_id>/",
         CompanyTeamMemberView.as_view(),
         name="company_team_member",
+    ),
+    path(
+        "settings/company/team/<int:user_id>/spaces/",
+        CompanyTeamMemberSpacesView.as_view(),
+        name="company_team_member_spaces",
     ),
     path(
         "settings/company/team/<int:user_id>/reset-password/",
