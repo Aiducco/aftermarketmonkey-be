@@ -19,17 +19,25 @@ def _require_auth(
     """Returns (company_id, user_id, error_response). error_response is None on success."""
     if not request.user or not request.user.is_authenticated:
         logger.warning("{} User not authenticated for {}".format(_LOG_PREFIX, request.path))
-        return None, None, http.HttpResponse(
-            headers={"Content-Type": "application/json"},
-            content=simplejson.dumps({"message": "User not authenticated"}),
-            status=401,
+        return (
+            None,
+            None,
+            http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "User not authenticated"}),
+                status=401,
+            ),
         )
     company_id = getattr(request, "company_id", None)
     if not company_id:
-        return None, None, http.HttpResponse(
-            headers={"Content-Type": "application/json"},
-            content=simplejson.dumps({"message": "No company found in token"}),
-            status=400,
+        return (
+            None,
+            None,
+            http.HttpResponse(
+                headers={"Content-Type": "application/json"},
+                content=simplejson.dumps({"message": "No company found in token"}),
+                status=400,
+            ),
         )
     return company_id, request.user.id, None
 
@@ -62,10 +70,12 @@ def _error_response_for(e: purchase_orders_services.PurchaseOrderServiceError) -
     is_plan_limit = error_code == billing_services.PLAN_LIMIT_ERROR_CODE
     return http.HttpResponse(
         headers={"Content-Type": "application/json"},
-        content=simplejson.dumps({
-            "message": str(e),
-            **({"error_code": error_code, "upgrade_required": True} if is_plan_limit else {}),
-        }),
+        content=simplejson.dumps(
+            {
+                "message": str(e),
+                **({"error_code": error_code, "upgrade_required": True} if is_plan_limit else {}),
+            }
+        ),
         status=402 if is_plan_limit else 400,
     )
 
@@ -80,7 +90,9 @@ def _space_error_response(e: spaces_services.SpaceError) -> http.HttpResponse:
     )
 
 
-def _parse_json_body(request: http.HttpRequest) -> typing.Tuple[typing.Optional[dict], typing.Optional[http.HttpResponse]]:
+def _parse_json_body(
+    request: http.HttpRequest,
+) -> typing.Tuple[typing.Optional[dict], typing.Optional[http.HttpResponse]]:
     try:
         body = json.loads(request.body) if request.body else {}
     except json.JSONDecodeError:
@@ -844,9 +856,7 @@ class ShippingMethodsView(views.View):
             return _error_response(str(e))
         except Exception:
             logger.exception(
-                "{} Error fetching shipping methods for company_provider_id={}".format(
-                    _LOG_PREFIX, company_provider_id
-                )
+                "{} Error fetching shipping methods for company_provider_id={}".format(_LOG_PREFIX, company_provider_id)
             )
             return _error_response("Error fetching shipping methods", status=500)
 
