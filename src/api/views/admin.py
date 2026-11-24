@@ -26,7 +26,9 @@ def _json_response(data: dict, status: int = 200) -> http.HttpResponse:
     )
 
 
-def _parse_body(request: http.HttpRequest, schema) -> typing.Tuple[typing.Optional[dict], typing.Optional[http.HttpResponse]]:
+def _parse_body(
+    request: http.HttpRequest, schema
+) -> typing.Tuple[typing.Optional[dict], typing.Optional[http.HttpResponse]]:
     """Shared JSON-body + marshmallow-schema parsing for the POST admin views below. Returns
     (validated_data, None) on success, or (None, error_response) to short-circuit the view."""
     try:
@@ -56,9 +58,7 @@ def _require_staff(request: http.HttpRequest) -> typing.Optional[http.HttpRespon
             status=401,
         )
     if not request.user.is_staff:
-        logger.warning(
-            "{} User (id={}) is not staff, denying {}".format(_LOG_PREFIX, request.user.id, request.path)
-        )
+        logger.warning("{} User (id={}) is not staff, denying {}".format(_LOG_PREFIX, request.user.id, request.path))
         return http.HttpResponse(
             headers={"Content-Type": "application/json"},
             content=simplejson.dumps({"message": "Staff access required"}),
@@ -189,7 +189,9 @@ class AdminExtendTrialView(views.View):
     """POST /admin/companies/<company_id>/extend-trial/ - Extend (or (re)grant) a company's
     comp'd trial by N days. Staff only."""
 
-    def post(self, request: http.HttpRequest, company_id: int, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
+    def post(
+        self, request: http.HttpRequest, company_id: int, *args: typing.Any, **kwargs: typing.Any
+    ) -> http.HttpResponse:
         denied = _require_staff(request)
         if denied:
             return denied
@@ -212,7 +214,9 @@ class AdminSpaceAllowanceView(views.View):
     """POST /admin/companies/<company_id>/space-allowance/ - Staff base for a company's space allowance
     (``space_base`` >= 1, or null to clear). The paid add-ons stay on top. Staff only."""
 
-    def post(self, request: http.HttpRequest, company_id: int, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
+    def post(
+        self, request: http.HttpRequest, company_id: int, *args: typing.Any, **kwargs: typing.Any
+    ) -> http.HttpResponse:
         denied = _require_staff(request)
         if denied:
             return denied
@@ -235,7 +239,9 @@ class AdminCompanyKeptIntegrationsView(views.View):
     is already downgraded), ``unlock`` reopens the customer's one post-expiry change. Returns the
     company's plan-status object. Staff only."""
 
-    def post(self, request: http.HttpRequest, company_id: int, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
+    def post(
+        self, request: http.HttpRequest, company_id: int, *args: typing.Any, **kwargs: typing.Any
+    ) -> http.HttpResponse:
         denied = _require_staff(request)
         if denied:
             return denied
