@@ -4,8 +4,12 @@ import enum
 from django.contrib.auth import models as auth_models
 from django.contrib.postgres import fields as pg_fields
 from django.core.serializers.json import DjangoJSONEncoder
+from django.db import IntegrityError, transaction
 from django.db import models as django_db_models
+from django.db.models import functions as django_db_models_functions
 from django.utils import timezone
+
+from src.enums import SpaceKind
 
 
 class Company(django_db_models.Model):
@@ -154,11 +158,123 @@ class CompanyLocation(django_db_models.Model):
 
     is_primary = django_db_models.BooleanField(default=False)
 
+    # Every address belongs to a space (see Space). save() fills the company's main space when the
+    # caller sets none, so the address book's creation path stays untouched.
+    space = django_db_models.ForeignKey(
+        "Space", on_delete=django_db_models.CASCADE, related_name="locations"
+    )
+
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
 
+    def save(self, *args, **kwargs):
+        if self.space_id is None:
+            self.space = Space.objects.main_for(self.company_id)
+        super().save(*args, **kwargs)
+        if self.is_primary:
+            self._main_space_follows_primary()
+
+    def _main_space_follows_primary(self) -> None:
+        """While the company is unflagged (multi_spaces off) its main space's address is simply its
+        primary location, so turning the flag on finds the right one. Flagged companies edit a space's
+        address through the spaces API instead."""
+        # Imported here: feature_flags imports this module.
+        from src.api.services import feature_flags
+
+        if feature_flags.company_has_feature(self.company_id, feature_flags.FEATURE_MULTI_SPACES):
+            return
+        Space.objects.filter(company_id=self.company_id, is_main=True).exclude(location_id=self.id).update(
+            location=self
+        )
+
     class Meta:
         db_table = "company_locations"
+
+
+class SpaceManager(django_db_models.Manager):
+    def main_for(self, company_id: int) -> "Space":
+        """The company's main space, created on first use (so no company-creation path has to remember
+        to make one). Named after the primary location's label (else the company name) and linked to
+        that location. Safe under concurrency: the partial unique index lets one creator win and the
+        loser reads its row."""
+        space = self.filter(company_id=company_id, is_main=True).first()
+        if space:
+            return space
+        primary = CompanyLocation.objects.filter(company_id=company_id, is_primary=True).order_by("id").first()
+        name = primary.label if primary else Company.objects.values_list("name", flat=True).get(id=company_id)
+        try:
+            with transaction.atomic():
+                return self.create(
+                    company_id=company_id,
+                    kind=SpaceKind.LOCATION.value,
+                    kind_name=SpaceKind.LOCATION.name,
+                    name=name,
+                    is_main=True,
+                    location=primary,
+                )
+        except IntegrityError:
+            space = self.filter(company_id=company_id, is_main=True).first()
+            if space is None:
+                raise
+            return space
+
+
+class Space(django_db_models.Model):
+    """
+    A part of a company that orders on its own: a shop (Location, exactly one address) or an Online
+    store (no address). Every company has one main space, created on first use (Space.objects.main_for);
+    purchase orders, external orders and addresses each belong to one space. Only companies with the
+    multi_spaces feature flag see or filter by spaces: unflagged, everything sits in the main space.
+
+    No rows means the owner (ADR 0001): an order account with no ``order_accounts`` rows is used by the
+    space that owns its connection, and a non-admin member with no ``members`` rows sees the main space
+    only. A reader that counts rows sees zero; the API never writes an empty set.
+    """
+
+    company = django_db_models.ForeignKey(Company, on_delete=django_db_models.CASCADE, related_name="spaces")
+
+    kind = django_db_models.PositiveSmallIntegerField()
+    kind_name = django_db_models.CharField(max_length=32)
+    name = django_db_models.CharField(max_length=255)
+    # Letters/digits put in front of the PO numbers sent to distributors; null only for the main space.
+    prefix = django_db_models.CharField(max_length=16, null=True, blank=True)
+    is_main = django_db_models.BooleanField(default=False)
+
+    # The space's one address (a Location); deleting the address leaves the space, deleting the space
+    # deletes the address (CompanyLocation.space is CASCADE).
+    location = django_db_models.OneToOneField(
+        CompanyLocation,
+        on_delete=django_db_models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="address_of_space",
+    )
+    members = django_db_models.ManyToManyField(
+        "UserProfile", related_name="spaces", blank=True, db_table="space_members"
+    )
+    order_accounts = django_db_models.ManyToManyField(
+        "CompanyProviderOrderAccount", related_name="spaces", blank=True, db_table="space_order_accounts"
+    )
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    objects = SpaceManager()
+
+    class Meta:
+        db_table = "spaces"
+        constraints = [
+            django_db_models.UniqueConstraint(
+                fields=["company"],
+                condition=django_db_models.Q(is_main=True),
+                name="space_one_main_per_company",
+            ),
+            django_db_models.UniqueConstraint(
+                django_db_models_functions.Lower("name"),
+                "company",
+                name="space_name_unique_per_company",
+            ),
+        ]
 
 
 class CompanyDestinations(django_db_models.Model):
@@ -4123,6 +4239,13 @@ class PurchaseOrder(django_db_models.Model):
         null=True,
         blank=True,
     )
+    # The space this PO belongs to (see Space); save() fills the company's main space when unset.
+    space = django_db_models.ForeignKey(
+        "Space", on_delete=django_db_models.PROTECT, related_name="purchase_orders"
+    )
+    # The space's prefix, taken on every submit attempt and frozen once submitted; null for the main
+    # space, every PO that existed before spaces and every unflagged company (see resolve_po_number).
+    po_prefix = django_db_models.CharField(max_length=16, null=True, blank=True)
     group = django_db_models.ForeignKey(
         PurchaseOrderGroup,
         on_delete=django_db_models.SET_NULL,
@@ -4235,6 +4358,11 @@ class PurchaseOrder(django_db_models.Model):
     # its own module docstring for the exact policy.
     distributor_status_checked_at = django_db_models.DateTimeField(null=True, blank=True)
 
+    def save(self, *args, **kwargs):
+        if self.space_id is None:
+            self.space = Space.objects.main_for(self.company_id)
+        super().save(*args, **kwargs)
+
     class Meta:
         db_table = "purchase_orders"
         indexes = [
@@ -4255,15 +4383,17 @@ class PurchaseOrder(django_db_models.Model):
             # *default* account (order_account=None, still the overwhelming majority of
             # connections) coexist silently, which is exactly the bug this constraint exists to
             # prevent. The two conditions partition every PO into exactly one of them.
+            # Per space as well: two spaces of one company may each have an open cart on the same
+            # connection and account (a company with one space is unchanged).
             django_db_models.UniqueConstraint(
-                fields=["company", "company_provider"],
+                fields=["company", "space", "company_provider"],
                 condition=django_db_models.Q(status__in=[1, 2], order_account__isnull=True),
-                name="po_one_open_draft_per_company_provider",
+                name="po_one_open_draft_per_space_company_provider",
             ),
             django_db_models.UniqueConstraint(
-                fields=["company", "company_provider", "order_account"],
+                fields=["company", "space", "company_provider", "order_account"],
                 condition=django_db_models.Q(status__in=[1, 2], order_account__isnull=False),
-                name="po_one_open_draft_per_company_provider_order_account",
+                name="po_one_open_draft_per_space_company_provider_order_account",
             ),
         ]
 
@@ -4670,8 +4800,27 @@ class ExternalPurchaseOrder(django_db_models.Model):
 
     raw_response = django_db_models.JSONField(null=True, blank=True, encoder=DjangoJSONEncoder)
 
+    # The space this order sits in (see Space); save() fills the company's main space when unset.
+    space = django_db_models.ForeignKey(
+        "Space", on_delete=django_db_models.PROTECT, related_name="external_purchase_orders"
+    )
+    # Why it sits there (src.enums.ExternalOrderSpaceReason); null until a flagged sync or a move sets it.
+    space_reason = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
+    space_reason_name = django_db_models.CharField(max_length=16, null=True, blank=True)
+    # The prefix that matched, when the reason is PREFIX.
+    space_reason_prefix = django_db_models.CharField(max_length=16, null=True, blank=True)
+    space_moved_by = django_db_models.ForeignKey(
+        "UserProfile", on_delete=django_db_models.SET_NULL, null=True, blank=True, related_name="+"
+    )
+    space_moved_at = django_db_models.DateTimeField(null=True, blank=True)
+
     discovered_at = django_db_models.DateTimeField(auto_now_add=True)
     last_synced_at = django_db_models.DateTimeField(auto_now=True)
+
+    def save(self, *args, **kwargs):
+        if self.space_id is None:
+            self.space = Space.objects.main_for(self.company_id)
+        super().save(*args, **kwargs)
 
     class Meta:
         db_table = "external_purchase_orders"

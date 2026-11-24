@@ -362,3 +362,17 @@ class AddressValidationStatus(enum.Enum):
     VALID = 1
     CORRECTED = 2
     UNVERIFIED = 3
+
+
+class SpaceKind(enum.Enum):
+    """What a Space is: a physical shop (needs one address) or an online store (none)."""
+    LOCATION = 1
+    ONLINE_STORE = 2
+
+
+class ExternalOrderSpaceReason(enum.Enum):
+    """Why an ExternalPurchaseOrder sits in its space (shown to admins as "Why this space")."""
+    PREFIX = 1  # its PO number starts with the space's prefix
+    ACCOUNT = 2  # the order account that found it is used by that space only (or pre-spaces data)
+    MAIN = 3  # no rule matched: it went to the main space by default
+    MOVED = 4    # an admin moved it by hand
