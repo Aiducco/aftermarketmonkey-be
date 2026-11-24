@@ -107,8 +107,28 @@ class Company(django_db_models.Model):
     additional_spaces = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
     space_base_override = django_db_models.PositiveSmallIntegerField(null=True, blank=True)
 
+    # Feed tenant (ADR 0002): a hidden child row that holds one space's OWN distributor connections and their
+    # pricing rows. NULL for every real company. PROTECT: a parent with tenants is never deleted in a request
+    # (delete_all_company_data refuses; purge_feed_tenants is the only path).
+    parent_company = django_db_models.ForeignKey(
+        "self",
+        on_delete=django_db_models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="feed_tenants",
+        db_index=True,
+    )
+
     created_at = django_db_models.DateTimeField(auto_now_add=True)
     updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    @property
+    def customer_company(self) -> "Company":
+        """The company that is the customer: itself, or the parent for a feed tenant. Responses, emails and rows
+        created "for the company" use this, never the tenant."""
+        if self.parent_company_id is None:
+            return self
+        return self.parent_company
 
     class Meta:
         db_table = "company"
@@ -199,6 +219,9 @@ class SpaceManager(django_db_models.Manager):
         space = self.filter(company_id=company_id, is_main=True).first()
         if space:
             return space
+        # A feed tenant never has a space of its own (ADR 0002); only a bug could ask for one.
+        if Company.objects.filter(id=company_id, parent_company__isnull=False).exists():
+            raise ValueError("Company {} is a feed tenant and has no main space.".format(company_id))
         primary = CompanyLocation.objects.filter(company_id=company_id, is_primary=True).order_by("id").first()
         name = primary.label if primary else Company.objects.values_list("name", flat=True).get(id=company_id)
         try:
@@ -248,6 +271,15 @@ class Space(django_db_models.Model):
         blank=True,
         related_name="address_of_space",
     )
+    # The hidden feed tenant that holds this space's own distributor connections (ADR 0002); null until the
+    # space's first own feed. PROTECT: a tenant with rows is removed only by purge_feed_tenants.
+    feed_company = django_db_models.OneToOneField(
+        Company,
+        on_delete=django_db_models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="feed_of_space",
+    )
     members = django_db_models.ManyToManyField(
         "UserProfile", related_name="spaces", blank=True, db_table="space_members"
     )
@@ -273,6 +305,31 @@ class Space(django_db_models.Model):
                 "company",
                 name="space_name_unique_per_company",
             ),
+        ]
+
+
+class SpaceProvider(django_db_models.Model):
+    """
+    Which connection a space uses for a distributor (ADR 0002): exactly one per (space, provider). The owner
+    space's row points at its own connection (added by CompanyProviders.save() on create); a space that shares
+    another space's feed has a row pointing at that connection. Flag off: readers ignore this table.
+    """
+
+    space = django_db_models.ForeignKey(Space, on_delete=django_db_models.CASCADE, related_name="space_providers")
+    provider = django_db_models.ForeignKey(
+        "Providers", on_delete=django_db_models.CASCADE, related_name="space_providers"
+    )
+    company_provider = django_db_models.ForeignKey(
+        "CompanyProviders", on_delete=django_db_models.CASCADE, related_name="space_providers"
+    )
+
+    created_at = django_db_models.DateTimeField(auto_now_add=True)
+    updated_at = django_db_models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "space_providers"
+        constraints = [
+            django_db_models.UniqueConstraint(fields=["space", "provider"], name="space_provider_unique"),
         ]
 
 
@@ -383,6 +440,25 @@ class CompanyProviders(django_db_models.Model):
     # just what changed since last time instead of the whole raw pricing table every cycle.
     # Null means "never propagated" -- process everything. Only wired for Meyer so far.
     pricing_propagation_watermark = django_db_models.DateTimeField(null=True, blank=True)
+
+    def save(self, *args, **kwargs):
+        creating = self._state.adding
+        super().save(*args, **kwargs)
+        if creating:
+            self._add_owner_space_row()
+
+    def _add_owner_space_row(self) -> None:
+        """On create, record the owner space's use of this connection (ADR 0002): the main space for a real
+        company, the tenant's space for a tenant. Replaces a share row that space already had for the provider.
+        bulk_create and queryset update() skip this: no code creates connections that way."""
+        owner = Space.objects.filter(feed_company_id=self.company_id).first()
+        if owner is None:
+            if Company.objects.filter(id=self.company_id, parent_company__isnull=False).exists():
+                return  # a tenant that no space points at yet: the space claims it when it is linked
+            owner = Space.objects.main_for(self.company_id)
+        SpaceProvider.objects.update_or_create(
+            space=owner, provider_id=self.provider_id, defaults={"company_provider": self}
+        )
 
     class Meta:
         db_table = "company_providers"
