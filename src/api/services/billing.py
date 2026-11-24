@@ -357,6 +357,17 @@ def _space_addon_info(company: src_models.Company, interval: Optional[str] = Non
     }
 
 
+def can_buy_space_addon(company: src_models.Company) -> bool:
+    """Whether the company can buy the "additional space" add-on: the multi_spaces flag and an active Stripe
+    Tracker or Hunter subscription (not Scout, not a comp'd trial)."""
+    return bool(
+        company.subscription_id
+        and company.subscription_status in ACTIVE_STATUSES
+        and _plan_key(company) in ("tracker", "hunter")
+        and feature_flags.company_has_feature(company.id, feature_flags.FEATURE_MULTI_SPACES)
+    )
+
+
 def check_space_limit(company_id: int) -> tuple[bool, str]:
     """
     Check if company can add one more space. Run only when a space is created: spaces over the

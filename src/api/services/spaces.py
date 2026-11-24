@@ -10,11 +10,14 @@ import dataclasses
 import logging
 import typing
 
+from django.db import IntegrityError, transaction
+
 from src import enums as src_enums
 from src import models as src_models
 from src.api.services import billing as billing_services
 from src.api.services import company_locations as company_locations_services
 from src.api.services import feature_flags as feature_flags_services
+from src.domain import space_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +25,20 @@ SPACE_HEADER = "HTTP_X_SPACE_ID"
 
 ERROR_SPACE_ACCESS_DENIED = "space_access_denied"
 ERROR_SPACE_REQUIRED = "space_required"
+ERROR_FEATURE_NOT_AVAILABLE = "feature_not_available"
+ERROR_SPACE_NOT_FOUND = "space_not_found"
+ERROR_PREFIX_REQUIRED = "prefix_required"
+ERROR_PREFIX_INVALID = "prefix_invalid"
+ERROR_PREFIX_CONFLICT = "prefix_conflict"
+ERROR_ADDRESS_REQUIRED = "address_required"
+ERROR_NAME_TAKEN = "name_taken"
+ERROR_MAIN_SPACE_NO_PREFIX = "main_space_no_prefix"
+ERROR_MAIN_SPACE_PROTECTED = "main_space_protected"
+ERROR_SPACE_NOT_EMPTY = "space_not_empty"
+ERROR_ONLY_SPACE_OF_USERS = "only_space_of_users"
+ERROR_ONLY_SPACE_OF_ACCOUNTS = "only_space_of_accounts"
+
+_ADDRESS_FIELDS = ("name", "attention", "address1", "address2", "city", "state", "postal_code", "country", "phone")
 
 
 class SpaceError(Exception):
@@ -207,3 +224,207 @@ def get_spaces_overview(scope: SpaceScope) -> dict:
             "limit": billing_services.space_allowance(company),
         }
     return data
+
+
+# ---------------------------------------------------------------------------
+# Create, edit, delete (company admins of a flagged company)
+# ---------------------------------------------------------------------------
+
+
+def require_admin(scope: SpaceScope) -> None:
+    """403 unless the company has the flag and the caller is one of its admins (read from the DB)."""
+    if not scope.enabled:
+        raise SpaceError("Spaces are not available for this company.", ERROR_FEATURE_NOT_AVAILABLE, status_code=403)
+    if not scope.is_admin:
+        raise SpaceError("Company admin access required", "admin_required", status_code=403)
+
+
+def _lock_company(company_id: int) -> src_models.Company:
+    """Serializes the allowance check, the prefix and name checks and the write for one company."""
+    return src_models.Company.objects.select_for_update().get(id=company_id)
+
+
+def _get_space(company_id: int, space_id: int) -> src_models.Space:
+    space = src_models.Space.objects.select_related("location").filter(id=space_id, company_id=company_id).first()
+    if space is None:
+        raise SpaceError("Space not found", ERROR_SPACE_NOT_FOUND, status_code=404)
+    return space
+
+
+def _checked_prefix(company_id: int, prefix: typing.Optional[str], exclude_space_id: typing.Optional[int]) -> str:
+    prefix = (prefix or "").strip()
+    if not prefix:
+        raise SpaceError("A prefix is required.", ERROR_PREFIX_REQUIRED)
+    problem = space_prefix.format_error(prefix)
+    if problem:
+        raise SpaceError(problem, ERROR_PREFIX_INVALID)
+    others = src_models.Space.objects.filter(company_id=company_id).exclude(id=exclude_space_id)
+    clash = space_prefix.conflicting_prefix(prefix, others.values_list("prefix", flat=True))
+    if clash:
+        raise SpaceError(
+            "The prefix {} clashes with {}, which another space already uses.".format(prefix, clash),
+            ERROR_PREFIX_CONFLICT,
+        )
+    return prefix
+
+
+def _checked_name(company_id: int, name: str, exclude_space_id: typing.Optional[int]) -> str:
+    name = name.strip()
+    if not name:
+        raise SpaceError("Invalid payload", "invalid_payload")
+    taken = src_models.Space.objects.filter(company_id=company_id, name__iexact=name).exclude(id=exclude_space_id)
+    if taken.exists():
+        raise SpaceError("A space named {} already exists.".format(name), ERROR_NAME_TAKEN)
+    return name
+
+
+def _address_values(address: dict) -> dict:
+    return {key: address.get(key) for key in _ADDRESS_FIELDS}
+
+
+def create_space(scope: SpaceScope, data: dict) -> dict:
+    require_admin(scope)
+    is_location = data["kind"] == "location"
+    address = data.get("address")
+    if is_location and not address:
+        raise SpaceError("A Location needs an address.", ERROR_ADDRESS_REQUIRED)
+    if not is_location and address:
+        raise SpaceError("An Online store has no address.", "invalid_payload")
+
+    kind = src_enums.SpaceKind.LOCATION if is_location else src_enums.SpaceKind.ONLINE_STORE
+    with transaction.atomic():
+        company = _lock_company(scope.company_id)
+        name = _checked_name(company.id, data["name"], None)
+        prefix = _checked_prefix(company.id, data.get("prefix"), None)
+        allowed, reason = billing_services.check_space_limit(company.id)
+        if not allowed:
+            extra = {"upgrade_required": True}
+            if billing_services.can_buy_space_addon(company):
+                extra["upgrade_target"] = "additional_spaces"
+            raise SpaceError(reason, billing_services.PLAN_LIMIT_ERROR_CODE, status_code=402, extra=extra)
+        try:
+            with transaction.atomic():
+                space = src_models.Space.objects.create(
+                    company_id=company.id, kind=kind.value, kind_name=kind.name, name=name, prefix=prefix
+                )
+        except IntegrityError:
+            raise SpaceError("A space named {} already exists.".format(name), ERROR_NAME_TAKEN)
+        if is_location:
+            space.location = src_models.CompanyLocation.objects.create(
+                company_id=company.id, space=space, label=name, is_primary=False, **_address_values(address)
+            )
+            space.save(update_fields=["location", "updated_at"])
+    return serialize_space(space)
+
+
+def update_space(scope: SpaceScope, space_id: int, data: dict) -> dict:
+    require_admin(scope)
+    with transaction.atomic():
+        company = _lock_company(scope.company_id)
+        space = _get_space(company.id, space_id)
+
+        if "name" in data and data["name"].strip() != space.name:
+            space.name = _checked_name(company.id, data["name"], space.id)
+            if space.location_id:
+                # The address row is labelled with the space's name (the label sent by the fe is ignored).
+                space.location.label = space.name
+                space.location.save(update_fields=["label", "updated_at"])
+
+        if "prefix" in data:
+            if space.is_main:
+                if (data["prefix"] or "").strip():
+                    raise SpaceError("The main space has no prefix.", ERROR_MAIN_SPACE_NO_PREFIX)
+            else:
+                space.prefix = _checked_prefix(company.id, data["prefix"], space.id)
+
+        address = data.get("address")
+        if address:
+            if space.kind == src_enums.SpaceKind.ONLINE_STORE.value:
+                raise SpaceError("An Online store has no address.", "invalid_payload")
+            values = _address_values(address)
+            if space.location_id:
+                for key, value in values.items():
+                    setattr(space.location, key, value)
+                space.location.label = space.name
+                space.location.save()
+            else:
+                # A migrated main space without an address: the new row is the company's primary one, which
+                # is what NTW's ship-to reads.
+                space.location = src_models.CompanyLocation.objects.create(
+                    company_id=company.id, space=space, label=space.name, is_primary=space.is_main, **values
+                )
+
+        try:
+            with transaction.atomic():
+                space.save()
+        except IntegrityError:
+            raise SpaceError("A space named {} already exists.".format(space.name), ERROR_NAME_TAKEN)
+    return serialize_space(space)
+
+
+def _people_to_remove(space: src_models.Space) -> typing.List[dict]:
+    """Non-admin members whose only space is this one (deleting it would silently widen them to the main space)."""
+    profiles = (
+        src_models.UserProfile.objects.filter(company_id=space.company_id, is_company_admin=False, spaces=space)
+        .select_related("user")
+        .prefetch_related("spaces")
+    )
+    return [
+        {"id": p.user_id, "email": p.user.email, "first_name": p.user.first_name, "last_name": p.user.last_name}
+        for p in profiles
+        if [s.id for s in p.spaces.all()] == [space.id]
+    ]
+
+
+def _accounts_to_remove(space: src_models.Space) -> typing.List[dict]:
+    """Order accounts whose only Used-by space is this one (no rows would mean "the owner" instead)."""
+    accounts = (
+        src_models.CompanyProviderOrderAccount.objects.filter(spaces=space)
+        .select_related("company_provider__provider")
+        .prefetch_related("spaces")
+    )
+    return [
+        {
+            "id": a.id,
+            "label": a.label,
+            "provider_name": a.company_provider.provider.name if a.company_provider.provider_id else None,
+        }
+        for a in accounts
+        if [s.id for s in a.spaces.all()] == [space.id]
+    ]
+
+
+def delete_space(scope: SpaceScope, space_id: int) -> None:
+    """Deletes a space and its one address. Refused while it is the main space, holds orders or carts, or is
+    the only space of a non-admin member or of an order account."""
+    require_admin(scope)
+    with transaction.atomic():
+        company = _lock_company(scope.company_id)
+        space = _get_space(company.id, space_id)
+        if space.is_main:
+            raise SpaceError("The main space cannot be deleted.", ERROR_MAIN_SPACE_PROTECTED)
+        if (
+            src_models.PurchaseOrder.objects.filter(space=space).exists()
+            or src_models.ExternalPurchaseOrder.objects.filter(space=space).exists()
+        ):
+            raise SpaceError("This space has orders or open carts, so it cannot be deleted.", ERROR_SPACE_NOT_EMPTY)
+        users = _people_to_remove(space)
+        if users:
+            raise SpaceError(
+                "It is the only space of {}. Give them another space first.".format(
+                    ", ".join(u["email"] for u in users)
+                ),
+                ERROR_ONLY_SPACE_OF_USERS,
+                extra={"users": users},
+            )
+        accounts = _accounts_to_remove(space)
+        if accounts:
+            raise SpaceError(
+                "It is the only space that uses {}. Give them another space first.".format(
+                    ", ".join(a["label"] for a in accounts)
+                ),
+                ERROR_ONLY_SPACE_OF_ACCOUNTS,
+                extra={"accounts": accounts},
+            )
+        # The space's address rows go with it (CompanyLocation.space is CASCADE).
+        space.delete()

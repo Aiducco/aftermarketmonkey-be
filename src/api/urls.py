@@ -24,7 +24,7 @@ from src.api.views.admin import (
 )
 from src.api.views.company import CompanyDestinationsView
 from src.api.views.company_locations import CompanyLocationsView, CompanyLocationDetailView
-from src.api.views.spaces import SpacesView
+from src.api.views.spaces import SpaceDetailView, SpacesView
 from src.api.views.integrations import (
     ProvidersCatalogView,
     ProviderConnectView,
@@ -632,6 +632,11 @@ urlpatterns = [
         "spaces/",
         SpacesView.as_view(),
         name="spaces",
+    ),
+    path(
+        "spaces/<int:id>/",
+        SpaceDetailView.as_view(),
+        name="space_detail",
     ),
     path(
         "admin/providers/",
