@@ -78,7 +78,7 @@ from src.integrations.services import xdp as xdp_services
 
 logger = logging.getLogger(__name__)
 
-_LOG_PREFIX = '[INTEGRATIONS-SERVICES]'
+_LOG_PREFIX = "[INTEGRATIONS-SERVICES]"
 
 # Stable error codes returned alongside a human-readable "message" from connect_provider /
 # update_connection, so the frontend can branch on `error_code` (e.g. highlight the password
@@ -124,7 +124,7 @@ def _render_relay_instructions_html(
         return (
             "<p>Your dedicated SFTP account is being created and will appear here shortly &mdash; "
             "check back in a few minutes. Still missing? Contact "
-            "<a href=\"mailto:support@aftermarketscout.com\">support@aftermarketscout.com</a>.</p>"
+            '<a href="mailto:support@aftermarketscout.com">support@aftermarketscout.com</a>.</p>'
         )
     return template.replace("{{SFTP_USER}}", username).replace("{{SFTP_PASSWORD}}", password)
 
@@ -311,23 +311,18 @@ def get_providers_catalog(company_id: int) -> typing.Dict:
     Includes active integrations (coming_soon=False) and coming-soon distributors
     (coming_soon=True, always connected=False, no connection fields).
     """
-    logger.info('{} Fetching providers catalog for company_id: {}.'.format(
-        _LOG_PREFIX, company_id
-    ))
+    logger.info("{} Fetching providers catalog for company_id: {}.".format(_LOG_PREFIX, company_id))
 
     company = src_models.Company.objects.filter(id=company_id).first()
 
     # All connections for this company, keyed by provider_id — avoids an N+1 query in the
     # catalog loop below (one query total instead of one per connected provider).
     company_providers_by_provider_id = {
-        cp.provider_id: cp
-        for cp in src_models.CompanyProviders.objects.filter(company_id=company_id)
+        cp.provider_id: cp for cp in src_models.CompanyProviders.objects.filter(company_id=company_id)
     }
 
     # Get all providers from DB (by kind)
-    providers_by_kind = {
-        p.kind: p for p in src_models.Providers.objects.all()
-    }
+    providers_by_kind = {p.kind: p for p in src_models.Providers.objects.all()}
 
     catalog = []
 
@@ -354,62 +349,62 @@ def get_providers_catalog(company_id: int) -> typing.Dict:
         # from PROVIDER_DISPLAY_NAMES used to render as its raw enum name, so a newly added
         # distributor showed up in the UI as "RANDYS_WORLDWIDE" instead of "RANDYS Worldwide".
         # The old default made that unreachable, since kind_name is always truthy.
-        display_name = (
-            src_constants.PROVIDER_DISPLAY_NAMES.get(kind_name) or provider.name or kind_name
-        )
+        display_name = src_constants.PROVIDER_DISPLAY_NAMES.get(kind_name) or provider.name or kind_name
 
-        catalog.append({
-            "id": provider.id,
-            "name": provider.name,
-            "display_name": display_name,
-            "description": entry.get("description", ""),
-            "icon_url": entry.get("icon_url") or None,
-            "category": entry.get("category", ""),
-            "connection_required_fields": entry.get("connection_required_fields", []),
-            "connection_optional_fields": entry.get("connection_optional_fields", []),
-            # Alternative credential sets a provider's feed can be connected with (e.g. WheelPros'
-            # markup-% vs. Pricing-API pricing modes) -- empty for every provider with only one way
-            # to connect. The FE renders one form per entry and lets the company pick.
-            "feed_connection_modes": entry.get("feed_connection_modes", []),
-            "supports_ordering": _catalog_supports_ordering_display(entry),
-            "order_credentials_mirror_feed": _catalog_order_credentials_mirror_feed(entry),
-            "order_connection_required_fields": entry.get("order_connection_required_fields", []),
-            "order_connection_optional_fields": entry.get("order_connection_optional_fields", []),
-            "email_order_connection_required_fields": entry.get("email_order_connection_required_fields", []),
-            "email_order_connection_optional_fields": entry.get("email_order_connection_optional_fields", []),
-            "installation_instructions_html": _render_relay_instructions_html(entry, company),
-            "relay_provisioned": bool(entry.get("relay_provisioned")),
-            "connected": connected,
-            "company_provider_id": company_provider.id if company_provider else None,
-            # "connected" above stays true for a paused connection (its feed credentials are kept);
-            # "paused" is what tells the card to show a Paused badge instead of Manage.
-            **_paused_fields(company_provider),
-            "kind": kind_value,
-            "kind_name": kind_name,
-            "coming_soon": False,
-            "integration_time": entry.get("integration_time") or None,
-            # Live connectivity/sync status — see CompanyProviderConnectionStatus. Null when
-            # not connected, or when connected but not checked yet (e.g. just created, cron
-            # hasn't run). "connected"/"ingesting"/"waiting"/"failing".
-            "status": company_provider.status if company_provider else None,
-            "status_name": company_provider.status_name if company_provider else None,
-            "status_reason": company_provider.status_reason if company_provider else None,
-            "status_checked_at": (
-                company_provider.status_checked_at.isoformat()
-                if company_provider and company_provider.status_checked_at
-                else None
-            ),
-            # Order-placement connectivity — see CompanyProviderOrderConnectionStatus. Null when
-            # not connected, or connected but order credentials not configured.
-            "order_status": company_provider.order_status if company_provider else None,
-            "order_status_name": company_provider.order_status_name if company_provider else None,
-            "order_status_reason": company_provider.order_status_reason if company_provider else None,
-            "order_status_checked_at": (
-                company_provider.order_status_checked_at.isoformat()
-                if company_provider and company_provider.order_status_checked_at
-                else None
-            ),
-        })
+        catalog.append(
+            {
+                "id": provider.id,
+                "name": provider.name,
+                "display_name": display_name,
+                "description": entry.get("description", ""),
+                "icon_url": entry.get("icon_url") or None,
+                "category": entry.get("category", ""),
+                "connection_required_fields": entry.get("connection_required_fields", []),
+                "connection_optional_fields": entry.get("connection_optional_fields", []),
+                # Alternative credential sets a provider's feed can be connected with (e.g. WheelPros'
+                # markup-% vs. Pricing-API pricing modes) -- empty for every provider with only one way
+                # to connect. The FE renders one form per entry and lets the company pick.
+                "feed_connection_modes": entry.get("feed_connection_modes", []),
+                "supports_ordering": _catalog_supports_ordering_display(entry),
+                "order_credentials_mirror_feed": _catalog_order_credentials_mirror_feed(entry),
+                "order_connection_required_fields": entry.get("order_connection_required_fields", []),
+                "order_connection_optional_fields": entry.get("order_connection_optional_fields", []),
+                "email_order_connection_required_fields": entry.get("email_order_connection_required_fields", []),
+                "email_order_connection_optional_fields": entry.get("email_order_connection_optional_fields", []),
+                "installation_instructions_html": _render_relay_instructions_html(entry, company),
+                "relay_provisioned": bool(entry.get("relay_provisioned")),
+                "connected": connected,
+                "company_provider_id": company_provider.id if company_provider else None,
+                # "connected" above stays true for a paused connection (its feed credentials are kept);
+                # "paused" is what tells the card to show a Paused badge instead of Manage.
+                **_paused_fields(company_provider),
+                "kind": kind_value,
+                "kind_name": kind_name,
+                "coming_soon": False,
+                "integration_time": entry.get("integration_time") or None,
+                # Live connectivity/sync status — see CompanyProviderConnectionStatus. Null when
+                # not connected, or when connected but not checked yet (e.g. just created, cron
+                # hasn't run). "connected"/"ingesting"/"waiting"/"failing".
+                "status": company_provider.status if company_provider else None,
+                "status_name": company_provider.status_name if company_provider else None,
+                "status_reason": company_provider.status_reason if company_provider else None,
+                "status_checked_at": (
+                    company_provider.status_checked_at.isoformat()
+                    if company_provider and company_provider.status_checked_at
+                    else None
+                ),
+                # Order-placement connectivity — see CompanyProviderOrderConnectionStatus. Null when
+                # not connected, or connected but order credentials not configured.
+                "order_status": company_provider.order_status if company_provider else None,
+                "order_status_name": company_provider.order_status_name if company_provider else None,
+                "order_status_reason": company_provider.order_status_reason if company_provider else None,
+                "order_status_checked_at": (
+                    company_provider.order_status_checked_at.isoformat()
+                    if company_provider and company_provider.order_status_checked_at
+                    else None
+                ),
+            }
+        )
 
     # Coming soon distributors — driven by COMING_SOON_PROVIDERS
     for entry in src_constants.COMING_SOON_PROVIDERS:
@@ -418,37 +413,37 @@ def get_providers_catalog(company_id: int) -> typing.Dict:
         if not provider:
             continue
 
-        catalog.append({
-            "id": provider.id,
-            "name": provider.name,
-            "display_name": provider.name,
-            "description": "",
-            "icon_url": entry.get("icon_url") or None,
-            "category": entry.get("category", "Distributors"),
-            "connection_required_fields": [],
-            "connection_optional_fields": [],
-            "installation_instructions_html": None,
-            "connected": False,
-            "company_provider_id": None,
-            "kind": kind_value,
-            "kind_name": provider.kind_name or "",
-            "coming_soon": True,
-        })
+        catalog.append(
+            {
+                "id": provider.id,
+                "name": provider.name,
+                "display_name": provider.name,
+                "description": "",
+                "icon_url": entry.get("icon_url") or None,
+                "category": entry.get("category", "Distributors"),
+                "connection_required_fields": [],
+                "connection_optional_fields": [],
+                "installation_instructions_html": None,
+                "connected": False,
+                "company_provider_id": None,
+                "kind": kind_value,
+                "kind_name": provider.kind_name or "",
+                "coming_soon": True,
+            }
+        )
 
     # Order-capable distributors first (stable sort — preserves PROVIDER_CATALOG's declared
     # order within each group, and keeps coming-soon entries, which have no "supports_ordering"
     # key at all, at the back where they already were).
     catalog.sort(key=lambda row: not row.get("supports_ordering", False))
 
-    logger.info('{} Found {} providers in catalog for company_id: {}.'.format(
-        _LOG_PREFIX, len(catalog), company_id
-    ))
+    logger.info("{} Found {} providers in catalog for company_id: {}.".format(_LOG_PREFIX, len(catalog), company_id))
 
     return {
         "data": catalog,
-        "categories": list(dict.fromkeys(
-            e.get("category", "") for e in src_constants.PROVIDER_CATALOG if e.get("category")
-        )),
+        "categories": list(
+            dict.fromkeys(e.get("category", "") for e in src_constants.PROVIDER_CATALOG if e.get("category"))
+        ),
     }
 
 
@@ -546,11 +541,7 @@ def _validate_turn14_connection(credentials: typing.Dict[str, typing.Any]) -> _V
     except turn14_exceptions.Turn14PermissionError as e:
         return e.message, CONNECTION_ERROR_PERMISSION_DENIED
     except turn14_exceptions.Turn14APIBadResponseCodeError as e:
-        code = (
-            CONNECTION_ERROR_INVALID_CREDENTIALS
-            if e.code in (401, 403)
-            else CONNECTION_ERROR_CONNECTION_FAILED
-        )
+        code = CONNECTION_ERROR_INVALID_CREDENTIALS if e.code in (401, 403) else CONNECTION_ERROR_CONNECTION_FAILED
         return e.message, code
     except (turn14_exceptions.Turn14APIException, ValueError) as e:
         return str(e), CONNECTION_ERROR_CONNECTION_FAILED
@@ -620,7 +611,7 @@ def _validate_wheelpros_connection(credentials: typing.Dict[str, typing.Any]) ->
             return markup_error, CONNECTION_ERROR_INVALID_INPUT
         return None, None
     return (
-        "pricing_mode must be \"markup\" or \"api\" (got {!r}).".format(mode),
+        'pricing_mode must be "markup" or "api" (got {!r}).'.format(mode),
         CONNECTION_ERROR_INVALID_INPUT,
     )
 
@@ -969,11 +960,7 @@ def _validate_turn14_order_connection(credentials: typing.Dict[str, typing.Any])
     except turn14_exceptions.Turn14PermissionError as e:
         return e.message, CONNECTION_ERROR_PERMISSION_DENIED
     except turn14_exceptions.Turn14APIBadResponseCodeError as e:
-        code = (
-            CONNECTION_ERROR_INVALID_CREDENTIALS
-            if e.code in (401, 403)
-            else CONNECTION_ERROR_CONNECTION_FAILED
-        )
+        code = CONNECTION_ERROR_INVALID_CREDENTIALS if e.code in (401, 403) else CONNECTION_ERROR_CONNECTION_FAILED
         return e.message, code
     except (turn14_exceptions.Turn14APIException, ValueError) as e:
         return str(e), CONNECTION_ERROR_CONNECTION_FAILED
@@ -1073,9 +1060,9 @@ def _validate_rough_country_order_connection(credentials: typing.Dict[str, typin
             CONNECTION_ERROR_MISSING_FIELDS,
         )
 
-    host = (
-        credentials.get(src_constants.ROUGH_COUNTRY_EDI_CREDENTIALS_FTP_HOST) or ""
-    ).strip() or (getattr(settings, "ROUGH_COUNTRY_EDI_FTP_HOST", "") or "").strip()
+    host = (credentials.get(src_constants.ROUGH_COUNTRY_EDI_CREDENTIALS_FTP_HOST) or "").strip() or (
+        getattr(settings, "ROUGH_COUNTRY_EDI_FTP_HOST", "") or ""
+    ).strip()
     port = int(getattr(settings, "ROUGH_COUNTRY_EDI_FTP_PORT", 21) or 21)
     if not host:
         return "No Rough Country EDI host is configured.", CONNECTION_ERROR_CONNECTION_FAILED
@@ -1223,9 +1210,7 @@ def _validate_allpro_order_connection(credentials: typing.Dict[str, typing.Any])
         )
 
     try:
-        client = allpro_order_client.AllProFulfillmentClient(
-            credentials={"username": username, "password": password}
-        )
+        client = allpro_order_client.AllProFulfillmentClient(credentials={"username": username, "password": password})
     except ValueError as e:
         return str(e), CONNECTION_ERROR_INVALID_INPUT
 
@@ -1357,8 +1342,7 @@ def _validate_order_connection_for_method(
             # never place an order.
             return (
                 False,
-                "This distributor no longer accepts orders by email. Use their ordering "
-                "integration instead.",
+                "This distributor no longer accepts orders by email. Use their ordering " "integration instead.",
                 CONNECTION_ERROR_CHANNEL_UNAVAILABLE,
             )
         message, code = _validate_email_order_connection(credentials)
@@ -1489,7 +1473,7 @@ def _relay_feed_connection_status(
         # "ask your rep to push a file" is not how a dealer gets S&B stock.
         return (
             src_enums.CompanyProviderConnectionStatus.WAITING,
-            "Catalog, pricing and fitment are live. For stock, email {} with \"{}\" in the "
+            'Catalog, pricing and fitment are live. For stock, email {} with "{}" in the '
             "subject, then forward their reply to {}.".format(
                 src_constants.SB_INVENTORY_REQUEST_EMAIL,
                 src_constants.SB_INVENTORY_REQUEST_SUBJECT,
@@ -1565,8 +1549,7 @@ def _connection_status_fields(
 
 
 _ORDER_WAITING_ON_FEED_REASON = (
-    "Order credentials are valid, but ordering stays disabled until the feed connection "
-    "finishes syncing."
+    "Order credentials are valid, but ordering stays disabled until the feed connection " "finishes syncing."
 )
 
 
@@ -1593,9 +1576,7 @@ def _order_connection_status_fields(
 # ERROR: a null order_status is already how this model says "ordering isn't configured", and
 # showing a red error to a shop that simply has not been onboarded onto a channel yet is both
 # alarming and untrue. ERROR is reserved for credentials that were supplied and rejected.
-_ORDER_NOT_CONFIGURED_CODES = frozenset(
-    {CONNECTION_ERROR_MISSING_FIELDS, CONNECTION_ERROR_CHANNEL_UNAVAILABLE}
-)
+_ORDER_NOT_CONFIGURED_CODES = frozenset({CONNECTION_ERROR_MISSING_FIELDS, CONNECTION_ERROR_CHANNEL_UNAVAILABLE})
 
 
 def _resolve_order_status(
@@ -1699,9 +1680,11 @@ def log_connection_attempt(
     """
     try:
         if provider_id is None and company_provider_id is not None:
-            provider_id = src_models.CompanyProviders.objects.filter(
-                id=company_provider_id
-            ).values_list("provider_id", flat=True).first()
+            provider_id = (
+                src_models.CompanyProviders.objects.filter(id=company_provider_id)
+                .values_list("provider_id", flat=True)
+                .first()
+            )
         if provider_id is None:
             logger.warning(
                 "{} Skipping ConnectionAttempt log -- no resolvable provider_id "
@@ -1787,8 +1770,7 @@ def connect_provider(
     # later order-only call) never counts as "new" and is never blocked here.
     already_has_feed = bool(existing and (existing.credentials or {}).get("feed"))
     will_add_new_feed = not already_has_feed and (
-        bool(catalog_entry.get("relay_provisioned"))
-        or bool(isinstance(credentials, dict) and credentials.get("feed"))
+        bool(catalog_entry.get("relay_provisioned")) or bool(isinstance(credentials, dict) and credentials.get("feed"))
     )
     if will_add_new_feed:
         allowed, plan_reason = billing_services.check_distributor_connection_limit(company_id)
@@ -1803,9 +1785,9 @@ def connect_provider(
             try:
                 relay_sftp_provisioning.provision_company_sftp_account(company)
             except Exception as e:
-                logger.error("{} Relay SFTP provisioning failed for company_id={}: {}".format(
-                    _LOG_PREFIX, company_id, e
-                ))
+                logger.error(
+                    "{} Relay SFTP provisioning failed for company_id={}: {}".format(_LOG_PREFIX, company_id, e)
+                )
                 return (
                     None,
                     "Your SFTP account could not be created. Please contact support@aftermarketscout.com.",
@@ -1851,15 +1833,18 @@ def connect_provider(
         else:
             validated, status_enum, status_reason = None, None, None
         effective_feed_status_enum = (
-            status_enum if feed_fields_touched
-            else (_order_gating_feed_status_enum(existing) if existing else None)
+            status_enum if feed_fields_touched else (_order_gating_feed_status_enum(existing) if existing else None)
         )
 
         order_fields_touched = isinstance(credentials, dict) and "order" in credentials
         if order_fields_touched:
-            order_validated, order_status_enum, order_status_reason, order_val_error, order_val_error_code = (
-                _validate_and_resolve_order_status(provider.kind, order_creds, effective_feed_status_enum)
-            )
+            (
+                order_validated,
+                order_status_enum,
+                order_status_reason,
+                order_val_error,
+                order_val_error_code,
+            ) = _validate_and_resolve_order_status(provider.kind, order_creds, effective_feed_status_enum)
             if order_val_error:
                 return None, order_val_error, order_val_error_code
         else:
@@ -1894,17 +1879,18 @@ def connect_provider(
             # the same credentials still work (e.g. after a rotation).
             status_enum = (
                 (
-                    src_enums.CompanyProviderConnectionStatus.CONNECTED if already_synced
+                    src_enums.CompanyProviderConnectionStatus.CONNECTED
+                    if already_synced
                     else src_enums.CompanyProviderConnectionStatus.INGESTING
                 )
-                if validated else None
+                if validated
+                else None
             )
             status_reason = None
         else:
             validated, status_enum, status_reason = None, None, None
         effective_feed_status_enum = (
-            status_enum if feed_fields_touched
-            else (_order_gating_feed_status_enum(existing) if existing else None)
+            status_enum if feed_fields_touched else (_order_gating_feed_status_enum(existing) if existing else None)
         )
 
         # Order credentials are validated separately from feed credentials (different transport,
@@ -1914,9 +1900,13 @@ def connect_provider(
         # this when "order" was actually part of THIS request, for the same reason as feed above.
         order_fields_touched = isinstance(credentials, dict) and "order" in credentials
         if order_fields_touched:
-            order_validated, order_status_enum, order_status_reason, order_val_error, order_val_error_code = (
-                _validate_and_resolve_order_status(provider.kind, creds.get("order"), effective_feed_status_enum)
-            )
+            (
+                order_validated,
+                order_status_enum,
+                order_status_reason,
+                order_val_error,
+                order_val_error_code,
+            ) = _validate_and_resolve_order_status(provider.kind, creds.get("order"), effective_feed_status_enum)
             if order_val_error:
                 return None, order_val_error, order_val_error_code
         else:
@@ -2001,10 +1991,14 @@ def update_connection(
     way as :func:`connect_provider` on success. Returns (data, error_message, error_code) —
     error_code is one of the ``CONNECTION_ERROR_*`` constants, for the frontend to branch on.
     """
-    cp = src_models.CompanyProviders.objects.filter(
-        id=company_provider_id,
-        company_id=company_id,
-    ).select_related("provider", "company").first()
+    cp = (
+        src_models.CompanyProviders.objects.filter(
+            id=company_provider_id,
+            company_id=company_id,
+        )
+        .select_related("provider", "company")
+        .first()
+    )
     if not cp or not cp.provider:
         return None, "Connection not found", CONNECTION_ERROR_NOT_FOUND
     if cp.paused_at is not None:
@@ -2048,15 +2042,17 @@ def update_connection(
             status_enum, status_reason = _relay_feed_connection_status(cp.company, cp.provider.kind)
         else:
             validated, status_enum, status_reason = None, None, None
-        effective_feed_status_enum = (
-            status_enum if feed_fields_touched else _order_gating_feed_status_enum(cp)
-        )
+        effective_feed_status_enum = status_enum if feed_fields_touched else _order_gating_feed_status_enum(cp)
 
         order_fields_touched = order_submitted
         if order_fields_touched:
-            order_validated, order_status_enum, order_status_reason, order_val_error, order_val_error_code = (
-                _validate_and_resolve_order_status(cp.provider.kind, creds.get("order"), effective_feed_status_enum)
-            )
+            (
+                order_validated,
+                order_status_enum,
+                order_status_reason,
+                order_val_error,
+                order_val_error_code,
+            ) = _validate_and_resolve_order_status(cp.provider.kind, creds.get("order"), effective_feed_status_enum)
             if order_val_error:
                 return None, order_val_error, order_val_error_code
         else:
@@ -2081,26 +2077,30 @@ def update_connection(
             # changed, just re-confirmed the same credentials still work (e.g. after rotation).
             status_enum = (
                 (
-                    src_enums.CompanyProviderConnectionStatus.CONNECTED if already_synced
+                    src_enums.CompanyProviderConnectionStatus.CONNECTED
+                    if already_synced
                     else src_enums.CompanyProviderConnectionStatus.INGESTING
                 )
-                if validated else None
+                if validated
+                else None
             )
             status_reason = None
         else:
             validated, status_enum, status_reason = None, None, None
-        effective_feed_status_enum = (
-            status_enum if feed_fields_touched else _order_gating_feed_status_enum(cp)
-        )
+        effective_feed_status_enum = status_enum if feed_fields_touched else _order_gating_feed_status_enum(cp)
 
         # Order credentials validate independently of feed credentials — a failure here rejects
         # the whole request too, same as feed above; see connect_provider for the same logic.
         # Only run when "order" was actually part of THIS request, for the same reason as feed.
         order_fields_touched = order_submitted
         if order_fields_touched:
-            order_validated, order_status_enum, order_status_reason, order_val_error, order_val_error_code = (
-                _validate_and_resolve_order_status(cp.provider.kind, creds.get("order"), effective_feed_status_enum)
-            )
+            (
+                order_validated,
+                order_status_enum,
+                order_status_reason,
+                order_val_error,
+                order_val_error_code,
+            ) = _validate_and_resolve_order_status(cp.provider.kind, creds.get("order"), effective_feed_status_enum)
             if order_val_error:
                 return None, order_val_error, order_val_error_code
         else:
@@ -2212,7 +2212,10 @@ def disconnect_provider(
         # the default account's own row too (it's the source of truth for its status now), then
         # mirror the same values onto cp.
         default_account = credentials_helper.get_default_order_account(cp)
-        if default_account and default_account.order_status == src_enums.CompanyProviderOrderConnectionStatus.CONNECTED.value:
+        if (
+            default_account
+            and default_account.order_status == src_enums.CompanyProviderOrderConnectionStatus.CONNECTED.value
+        ):
             _set_order_account_status(
                 default_account,
                 src_enums.CompanyProviderOrderConnectionStatus.WAITING,
@@ -2241,9 +2244,7 @@ def disconnect_provider(
                 for field, value in status_fields.items():
                     setattr(default_account, field, value)
                 default_account.save(
-                    update_fields=["credentials", "active", "is_default"]
-                    + list(status_fields.keys())
-                    + ["updated_at"]
+                    update_fields=["credentials", "active", "is_default"] + list(status_fields.keys()) + ["updated_at"]
                 )
             _promote_next_default_order_account(cp)
         # Mirrors whichever account is now the default (freshly promoted, with its own already-
@@ -2622,7 +2623,9 @@ def update_order_account(
 
     validated = None
     if credentials or switching_method:
-        validated, val_error, val_error_code = _validate_order_connection_for_method(cp.provider.kind, method_value, creds)
+        validated, val_error, val_error_code = _validate_order_connection_for_method(
+            cp.provider.kind, method_value, creds
+        )
         if val_error:
             return None, val_error, val_error_code
         account.credentials = creds
@@ -2656,11 +2659,7 @@ def update_order_account(
         cp.order_accounts.filter(is_default=True).exclude(id=account.id).update(is_default=False)
         account.is_default = True
         account.save(update_fields=["is_default", "updated_at"])
-    elif (
-        (is_default is False or (is_default is None and active is False))
-        and was_default
-        and account.is_default
-    ):
+    elif (is_default is False or (is_default is None and active is False)) and was_default and account.is_default:
         # Deactivating the current default (or explicitly un-defaulting it) leaves ordering
         # silently unusable if this connection has other configured accounts that could serve
         # instead — demote and promote the next one, same as disconnect_provider does when the
@@ -2713,21 +2712,19 @@ def get_company_providers(company_id: int) -> typing.List[typing.Dict]:
     """
     Get company providers for a given company_id.
     Left joins with Providers to get provider details.
-    
+
     Args:
         company_id: The ID of the company
-        
+
     Returns:
         List of dictionaries containing company provider data with provider details
     """
-    logger.info('{} Fetching company providers for company_id: {}.'.format(
-        _LOG_PREFIX, company_id
-    ))
-    
-    company_providers = src_models.CompanyProviders.objects.filter(
-        company_id=company_id
-    ).select_related('provider').all()
-    
+    logger.info("{} Fetching company providers for company_id: {}.".format(_LOG_PREFIX, company_id))
+
+    company_providers = (
+        src_models.CompanyProviders.objects.filter(company_id=company_id).select_related("provider").all()
+    )
+
     data = []
     for cp in company_providers:
         provider = cp.provider
@@ -2761,11 +2758,9 @@ def get_company_providers(company_id: int) -> typing.List[typing.Dict]:
         if provider:
             row.update(_provider_ui_metadata(provider))
         data.append(row)
-    
-    logger.info('{} Found {} company providers for company_id: {}.'.format(
-        _LOG_PREFIX, len(data), company_id
-    ))
-    
+
+    logger.info("{} Found {} company providers for company_id: {}.".format(_LOG_PREFIX, len(data), company_id))
+
     return data
 
 
@@ -2773,30 +2768,33 @@ def get_company_provider_by_id(company_id: int, provider_id: int) -> typing.Opti
     """
     Get a single company provider by ID for a given company_id.
     Left joins with Providers to get provider details.
-    
+
     Args:
         company_id: The ID of the company
         provider_id: The ID of the company provider
-        
+
     Returns:
         Dictionary containing company provider data with provider details, or None if not found
     """
-    logger.info('{} Fetching company provider with id: {} for company_id: {}.'.format(
-        _LOG_PREFIX, provider_id, company_id
-    ))
-    
+    logger.info(
+        "{} Fetching company provider with id: {} for company_id: {}.".format(_LOG_PREFIX, provider_id, company_id)
+    )
+
     try:
-        company_provider = src_models.CompanyProviders.objects.filter(
-            id=provider_id,
-            company_id=company_id
-        ).select_related('provider').first()
-        
+        company_provider = (
+            src_models.CompanyProviders.objects.filter(id=provider_id, company_id=company_id)
+            .select_related("provider")
+            .first()
+        )
+
         if not company_provider:
-            logger.warning('{} Company provider with id: {} not found for company_id: {}.'.format(
-                _LOG_PREFIX, provider_id, company_id
-            ))
+            logger.warning(
+                "{} Company provider with id: {} not found for company_id: {}.".format(
+                    _LOG_PREFIX, provider_id, company_id
+                )
+            )
             return None
-        
+
         provider = company_provider.provider
         catalog_entry = {}
         if provider:
@@ -2822,8 +2820,12 @@ def get_company_provider_by_id(company_id: int, provider_id: int) -> typing.Opti
             "feed_connection_modes": list(catalog_entry.get("feed_connection_modes") or []),
             "order_connection_required_fields": list(catalog_entry.get("order_connection_required_fields") or []),
             "order_connection_optional_fields": list(catalog_entry.get("order_connection_optional_fields") or []),
-            "email_order_connection_required_fields": list(catalog_entry.get("email_order_connection_required_fields") or []),
-            "email_order_connection_optional_fields": list(catalog_entry.get("email_order_connection_optional_fields") or []),
+            "email_order_connection_required_fields": list(
+                catalog_entry.get("email_order_connection_required_fields") or []
+            ),
+            "email_order_connection_optional_fields": list(
+                catalog_entry.get("email_order_connection_optional_fields") or []
+            ),
             "supports_ordering": _catalog_supports_ordering_display(catalog_entry) if catalog_entry else False,
             "order_credentials_mirror_feed": (
                 _catalog_order_credentials_mirror_feed(catalog_entry) if catalog_entry else False
@@ -2839,15 +2841,17 @@ def get_company_provider_by_id(company_id: int, provider_id: int) -> typing.Opti
         if provider:
             data.update(_provider_ui_metadata(provider))
 
-        logger.info('{} Found company provider with id: {} for company_id: {}.'.format(
-            _LOG_PREFIX, provider_id, company_id
-        ))
-        
+        logger.info(
+            "{} Found company provider with id: {} for company_id: {}.".format(_LOG_PREFIX, provider_id, company_id)
+        )
+
         return data
     except Exception as e:
-        logger.error('{} Error fetching company provider with id: {} for company_id: {}. Error: {}.'.format(
-            _LOG_PREFIX, provider_id, company_id, str(e)
-        ))
+        logger.error(
+            "{} Error fetching company provider with id: {} for company_id: {}. Error: {}.".format(
+                _LOG_PREFIX, provider_id, company_id, str(e)
+            )
+        )
         raise
 
 
@@ -2950,7 +2954,9 @@ def get_company_provider_connection_detail(
     """
     logger.info(
         "{} Fetching connection detail for company_provider_id={} company_id={}.".format(
-            _LOG_PREFIX, company_provider_id, company_id,
+            _LOG_PREFIX,
+            company_provider_id,
+            company_id,
         )
     )
     company_provider = (
@@ -2996,8 +3002,7 @@ def get_company_provider_connection_detail(
         "order_status_name": company_provider.order_status_name,
         "order_status_reason": company_provider.order_status_reason,
         "order_status_checked_at": (
-            company_provider.order_status_checked_at.isoformat()
-            if company_provider.order_status_checked_at else None
+            company_provider.order_status_checked_at.isoformat() if company_provider.order_status_checked_at else None
         ),
         "created_at": company_provider.created_at.isoformat() if company_provider.created_at else None,
         "updated_at": company_provider.updated_at.isoformat() if company_provider.updated_at else None,
@@ -3012,8 +3017,12 @@ def get_company_provider_connection_detail(
     out["feed_connection_modes"] = list(catalog_entry.get("feed_connection_modes") or [])
     out["order_connection_required_fields"] = list(catalog_entry.get("order_connection_required_fields") or [])
     out["order_connection_optional_fields"] = list(catalog_entry.get("order_connection_optional_fields") or [])
-    out["email_order_connection_required_fields"] = list(catalog_entry.get("email_order_connection_required_fields") or [])
-    out["email_order_connection_optional_fields"] = list(catalog_entry.get("email_order_connection_optional_fields") or [])
+    out["email_order_connection_required_fields"] = list(
+        catalog_entry.get("email_order_connection_required_fields") or []
+    )
+    out["email_order_connection_optional_fields"] = list(
+        catalog_entry.get("email_order_connection_optional_fields") or []
+    )
     out["relay_provisioned"] = bool(catalog_entry.get("relay_provisioned"))
     out["supports_ordering"] = _catalog_supports_ordering_display(catalog_entry)
     out["order_credentials_mirror_feed"] = _catalog_order_credentials_mirror_feed(catalog_entry)
@@ -3038,49 +3047,49 @@ def get_all_brands_with_providers() -> typing.List[typing.Dict]:
     """
     Get all brands with their associated providers.
     Left joins with BrandProviders and Providers to get provider details.
-    
+
     Returns:
         List of dictionaries containing brand data with their providers
     """
-    logger.info('{} Fetching all brands with providers.'.format(_LOG_PREFIX))
-    
-    brands = src_models.Brands.objects.prefetch_related(
-        'providers__provider'
-    ).all()
-    
+    logger.info("{} Fetching all brands with providers.".format(_LOG_PREFIX))
+
+    brands = src_models.Brands.objects.prefetch_related("providers__provider").all()
+
     data = []
     for brand in brands:
         providers_data = []
         for brand_provider in brand.providers.all():
             provider = brand_provider.provider
-            providers_data.append({
-                "id": provider.id if provider else None,
-                "name": provider.name if provider else None,
-                "status": provider.status if provider else None,
-                "status_name": provider.status_name if provider else None,
-                "type": provider.type if provider else None,
-                "type_name": provider.type_name if provider else None,
-                "kind": provider.kind if provider else None,
-                "kind_name": provider.kind_name if provider else None,
-                "created_at": brand_provider.created_at.isoformat() if brand_provider.created_at else None,
-                "updated_at": brand_provider.updated_at.isoformat() if brand_provider.updated_at else None,
-            })
-        
-        data.append({
-            "id": brand.id,
-            "name": brand.name,
-            "status": brand.status,
-            "status_name": brand.status_name,
-            "data": brand.data,
-            "providers": providers_data,
-            "created_at": brand.created_at.isoformat() if brand.created_at else None,
-            "updated_at": brand.updated_at.isoformat() if brand.updated_at else None,
-        })
-    
-    logger.info('{} Found {} brands with providers.'.format(
-        _LOG_PREFIX, len(data)
-    ))
-    
+            providers_data.append(
+                {
+                    "id": provider.id if provider else None,
+                    "name": provider.name if provider else None,
+                    "status": provider.status if provider else None,
+                    "status_name": provider.status_name if provider else None,
+                    "type": provider.type if provider else None,
+                    "type_name": provider.type_name if provider else None,
+                    "kind": provider.kind if provider else None,
+                    "kind_name": provider.kind_name if provider else None,
+                    "created_at": brand_provider.created_at.isoformat() if brand_provider.created_at else None,
+                    "updated_at": brand_provider.updated_at.isoformat() if brand_provider.updated_at else None,
+                }
+            )
+
+        data.append(
+            {
+                "id": brand.id,
+                "name": brand.name,
+                "status": brand.status,
+                "status_name": brand.status_name,
+                "data": brand.data,
+                "providers": providers_data,
+                "created_at": brand.created_at.isoformat() if brand.created_at else None,
+                "updated_at": brand.updated_at.isoformat() if brand.updated_at else None,
+            }
+        )
+
+    logger.info("{} Found {} brands with providers.".format(_LOG_PREFIX, len(data)))
+
     return data
 
 
@@ -3088,58 +3097,58 @@ def get_company_destinations_with_brands(company_id: int) -> typing.List[typing.
     """
     Get all destinations for a company with their associated brands.
     Joins through CompanyBrandDestination -> CompanyBrands -> Brands.
-    
+
     Args:
         company_id: The ID of the company
-        
+
     Returns:
         List of dictionaries containing destination data with their brands
     """
-    logger.info('{} Fetching company destinations with brands for company_id: {}.'.format(
-        _LOG_PREFIX, company_id
-    ))
-    
-    destinations = src_models.CompanyDestinations.objects.filter(
-        company_id=company_id
-    ).prefetch_related(
-        'company_brands__company_brand__brand'
-    ).all()
-    
+    logger.info("{} Fetching company destinations with brands for company_id: {}.".format(_LOG_PREFIX, company_id))
+
+    destinations = (
+        src_models.CompanyDestinations.objects.filter(company_id=company_id)
+        .prefetch_related("company_brands__company_brand__brand")
+        .all()
+    )
+
     data = []
     for destination in destinations:
         brands_data = []
         for company_brand_destination in destination.company_brands.all():
             company_brand = company_brand_destination.company_brand
             brand = company_brand.brand
-            
-            brands_data.append({
-                "id": brand.id if brand else None,
-                "name": brand.name if brand else None,
-                "status": company_brand.status if company_brand else None,
-                "status_name": company_brand.status_name if company_brand else None,
-                "data": brand.data if brand else None,
-                "company_brand_id": company_brand.id if company_brand else None,
-                "created_at": company_brand.created_at.isoformat() if company_brand.created_at else None,
-                "updated_at": company_brand.updated_at.isoformat() if company_brand.updated_at else None,
-            })
-        
-        data.append({
-            "id": destination.id,
-            "status": destination.status,
-            "status_name": destination.status_name,
-            "destination_type": destination.destination_type,
-            "destination_type_name": destination.destination_type_name,
-            "credentials": destination.credentials,
-            "company_id": destination.company_id,
-            "brands": brands_data,
-            "created_at": destination.created_at.isoformat() if destination.created_at else None,
-            "updated_at": destination.updated_at.isoformat() if destination.updated_at else None,
-        })
-    
-    logger.info('{} Found {} destinations with brands for company_id: {}.'.format(
-        _LOG_PREFIX, len(data), company_id
-    ))
-    
+
+            brands_data.append(
+                {
+                    "id": brand.id if brand else None,
+                    "name": brand.name if brand else None,
+                    "status": company_brand.status if company_brand else None,
+                    "status_name": company_brand.status_name if company_brand else None,
+                    "data": brand.data if brand else None,
+                    "company_brand_id": company_brand.id if company_brand else None,
+                    "created_at": company_brand.created_at.isoformat() if company_brand.created_at else None,
+                    "updated_at": company_brand.updated_at.isoformat() if company_brand.updated_at else None,
+                }
+            )
+
+        data.append(
+            {
+                "id": destination.id,
+                "status": destination.status,
+                "status_name": destination.status_name,
+                "destination_type": destination.destination_type,
+                "destination_type_name": destination.destination_type_name,
+                "credentials": destination.credentials,
+                "company_id": destination.company_id,
+                "brands": brands_data,
+                "created_at": destination.created_at.isoformat() if destination.created_at else None,
+                "updated_at": destination.updated_at.isoformat() if destination.updated_at else None,
+            }
+        )
+
+    logger.info("{} Found {} destinations with brands for company_id: {}.".format(_LOG_PREFIX, len(data), company_id))
+
     return data
 
 
@@ -3147,30 +3156,31 @@ def get_company_destination_by_id(company_id: int, destination_id: int) -> typin
     """
     Get a single company destination by ID for a given company_id.
     Includes all destination details including credentials.
-    
+
     Args:
         company_id: The ID of the company
         destination_id: The ID of the company destination
-        
+
     Returns:
         Dictionary containing destination data, or None if not found
     """
-    logger.info('{} Fetching company destination with id: {} for company_id: {}.'.format(
-        _LOG_PREFIX, destination_id, company_id
-    ))
-    
+    logger.info(
+        "{} Fetching company destination with id: {} for company_id: {}.".format(
+            _LOG_PREFIX, destination_id, company_id
+        )
+    )
+
     try:
-        destination = src_models.CompanyDestinations.objects.filter(
-            id=destination_id,
-            company_id=company_id
-        ).first()
-        
+        destination = src_models.CompanyDestinations.objects.filter(id=destination_id, company_id=company_id).first()
+
         if not destination:
-            logger.warning('{} Company destination with id: {} not found for company_id: {}.'.format(
-                _LOG_PREFIX, destination_id, company_id
-            ))
+            logger.warning(
+                "{} Company destination with id: {} not found for company_id: {}.".format(
+                    _LOG_PREFIX, destination_id, company_id
+                )
+            )
             return None
-        
+
         data = {
             "id": destination.id,
             "status": destination.status,
@@ -3182,110 +3192,116 @@ def get_company_destination_by_id(company_id: int, destination_id: int) -> typin
             "created_at": destination.created_at.isoformat() if destination.created_at else None,
             "updated_at": destination.updated_at.isoformat() if destination.updated_at else None,
         }
-        
-        logger.info('{} Found company destination with id: {} for company_id: {}.'.format(
-            _LOG_PREFIX, destination_id, company_id
-        ))
-        
+
+        logger.info(
+            "{} Found company destination with id: {} for company_id: {}.".format(
+                _LOG_PREFIX, destination_id, company_id
+            )
+        )
+
         return data
     except Exception as e:
-        logger.error('{} Error fetching company destination with id: {} for company_id: {}. Error: {}.'.format(
-            _LOG_PREFIX, destination_id, company_id, str(e)
-        ))
+        logger.error(
+            "{} Error fetching company destination with id: {} for company_id: {}. Error: {}.".format(
+                _LOG_PREFIX, destination_id, company_id, str(e)
+            )
+        )
         raise
 
 
 def get_company_execution_runs(
-    company_id: int,
-    destination_id: typing.Optional[int] = None,
-    page: int = 1,
-    page_size: int = 20
+    company_id: int, destination_id: typing.Optional[int] = None, page: int = 1, page_size: int = 20
 ) -> typing.Dict:
     """
     Get execution runs for a company with pagination.
     Optionally filter by destination_id.
     Includes brand and destination information.
-    
+
     Args:
         company_id: The ID of the company
         destination_id: Optional destination ID to filter by
         page: Page number (default: 1)
         page_size: Number of items per page (default: 20)
-        
+
     Returns:
         Dictionary containing paginated execution runs data with brand and destination info
     """
-    logger.info('{} Fetching execution runs for company_id: {}, destination_id: {}, page: {}, page_size: {}.'.format(
-        _LOG_PREFIX, company_id, destination_id, page, page_size
-    ))
-    
+    logger.info(
+        "{} Fetching execution runs for company_id: {}, destination_id: {}, page: {}, page_size: {}.".format(
+            _LOG_PREFIX, company_id, destination_id, page, page_size
+        )
+    )
+
     # Filter execution runs by company_id through the relationships
     execution_runs = src_models.CompanyDestinationExecutionRun.objects.filter(
         company_brand_destination__company_brand__company_id=company_id
     )
-    
+
     # Optionally filter by destination_id
     if destination_id:
-        execution_runs = execution_runs.filter(
-            company_brand_destination__destination_id=destination_id
-        )
-    
+        execution_runs = execution_runs.filter(company_brand_destination__destination_id=destination_id)
+
     execution_runs = execution_runs.select_related(
-        'company_brand_destination__company_brand__brand',
-        'company_brand_destination__destination'
-    ).order_by('-created_at')
-    
+        "company_brand_destination__company_brand__brand", "company_brand_destination__destination"
+    ).order_by("-created_at")
+
     # Paginate the results
     paginator = Paginator(execution_runs, page_size)
-    
+
     try:
         page_obj = paginator.page(page)
     except Exception as e:
-        logger.warning('{} Invalid page number: {}. Error: {}. Returning first page.'.format(
-            _LOG_PREFIX, page, str(e)
-        ))
+        logger.warning("{} Invalid page number: {}. Error: {}. Returning first page.".format(_LOG_PREFIX, page, str(e)))
         page_obj = paginator.page(1)
-    
+
     data = []
     for execution_run in page_obj:
         company_brand_destination = execution_run.company_brand_destination
         company_brand = company_brand_destination.company_brand if company_brand_destination else None
         brand = company_brand.brand if company_brand else None
         destination = company_brand_destination.destination if company_brand_destination else None
-        
-        data.append({
-            "id": execution_run.id,
-            "status": execution_run.status,
-            "status_name": execution_run.status_name,
-            "products_processed": execution_run.products_processed,
-            "products_created": execution_run.products_created,
-            "products_updated": execution_run.products_updated,
-            "products_failed": execution_run.products_failed,
-            "error_message": execution_run.error_message,
-            "message": execution_run.message,
-            "brand": {
-                "id": brand.id if brand else None,
-                "name": brand.name if brand else None,
-                "status": brand.status if brand else None,
-                "status_name": brand.status_name if brand else None,
-            } if brand else None,
-            "company_brand": {
-                "id": company_brand.id if company_brand else None,
-                "status": company_brand.status if company_brand else None,
-                "status_name": company_brand.status_name if company_brand else None,
-            } if company_brand else None,
-            "destination": {
-                "id": destination.id if destination else None,
-                "status": destination.status if destination else None,
-                "status_name": destination.status_name if destination else None,
-                "destination_type": destination.destination_type if destination else None,
-                "destination_type_name": destination.destination_type_name if destination else None,
-            } if destination else None,
-            "created_at": execution_run.created_at.isoformat() if execution_run.created_at else None,
-            "updated_at": execution_run.updated_at.isoformat() if execution_run.updated_at else None,
-            "completed_at": execution_run.completed_at.isoformat() if execution_run.completed_at else None,
-        })
-    
+
+        data.append(
+            {
+                "id": execution_run.id,
+                "status": execution_run.status,
+                "status_name": execution_run.status_name,
+                "products_processed": execution_run.products_processed,
+                "products_created": execution_run.products_created,
+                "products_updated": execution_run.products_updated,
+                "products_failed": execution_run.products_failed,
+                "error_message": execution_run.error_message,
+                "message": execution_run.message,
+                "brand": {
+                    "id": brand.id if brand else None,
+                    "name": brand.name if brand else None,
+                    "status": brand.status if brand else None,
+                    "status_name": brand.status_name if brand else None,
+                }
+                if brand
+                else None,
+                "company_brand": {
+                    "id": company_brand.id if company_brand else None,
+                    "status": company_brand.status if company_brand else None,
+                    "status_name": company_brand.status_name if company_brand else None,
+                }
+                if company_brand
+                else None,
+                "destination": {
+                    "id": destination.id if destination else None,
+                    "status": destination.status if destination else None,
+                    "status_name": destination.status_name if destination else None,
+                    "destination_type": destination.destination_type if destination else None,
+                    "destination_type_name": destination.destination_type_name if destination else None,
+                }
+                if destination
+                else None,
+                "created_at": execution_run.created_at.isoformat() if execution_run.created_at else None,
+                "updated_at": execution_run.updated_at.isoformat() if execution_run.updated_at else None,
+                "completed_at": execution_run.completed_at.isoformat() if execution_run.completed_at else None,
+            }
+        )
+
     result = {
         "data": data,
         "pagination": {
@@ -3295,104 +3311,111 @@ def get_company_execution_runs(
             "total_count": paginator.count,
             "has_next": page_obj.has_next(),
             "has_previous": page_obj.has_previous(),
-        }
+        },
     }
-    
-    logger.info('{} Found {} execution runs for company_id: {} (page {} of {}).'.format(
-        _LOG_PREFIX, len(data), company_id, page_obj.number, paginator.num_pages
-    ))
-    
+
+    logger.info(
+        "{} Found {} execution runs for company_id: {} (page {} of {}).".format(
+            _LOG_PREFIX, len(data), company_id, page_obj.number, paginator.num_pages
+        )
+    )
+
     return result
 
 
 def get_execution_run_parts_history(
-    company_id: int,
-    execution_run_id: int,
-    page: int = 1,
-    page_size: int = 20
+    company_id: int, execution_run_id: int, page: int = 1, page_size: int = 20
 ) -> typing.Dict:
     """
     Get parts history for a specific execution run with pagination.
     Includes destination part, brand, and destination information.
-    
+
     Args:
         company_id: The ID of the company
         execution_run_id: The ID of the execution run
         page: Page number (default: 1)
         page_size: Number of items per page (default: 20)
-        
+
     Returns:
         Dictionary containing paginated parts history data with part, brand, and destination info
     """
-    logger.info('{} Fetching parts history for execution_run_id: {}, company_id: {}, page: {}, page_size: {}.'.format(
-        _LOG_PREFIX, execution_run_id, company_id, page, page_size
-    ))
-    
+    logger.info(
+        "{} Fetching parts history for execution_run_id: {}, company_id: {}, page: {}, page_size: {}.".format(
+            _LOG_PREFIX, execution_run_id, company_id, page, page_size
+        )
+    )
+
     # First verify the execution run belongs to the company
     execution_run = src_models.CompanyDestinationExecutionRun.objects.filter(
-        id=execution_run_id,
-        company_brand_destination__company_brand__company_id=company_id
+        id=execution_run_id, company_brand_destination__company_brand__company_id=company_id
     ).first()
-    
+
     if not execution_run:
-        logger.warning('{} Execution run with id: {} not found for company_id: {}.'.format(
-            _LOG_PREFIX, execution_run_id, company_id
-        ))
+        logger.warning(
+            "{} Execution run with id: {} not found for company_id: {}.".format(
+                _LOG_PREFIX, execution_run_id, company_id
+            )
+        )
         return None
-    
+
     # Get parts history for this execution run
-    parts_history = src_models.CompanyDestinationPartsHistory.objects.filter(
-        execution_run_id=execution_run_id
-    ).select_related(
-        'destination_part__brand',
-        'destination_part__company_destination'
-    ).order_by('-created_at')
-    
+    parts_history = (
+        src_models.CompanyDestinationPartsHistory.objects.filter(execution_run_id=execution_run_id)
+        .select_related("destination_part__brand", "destination_part__company_destination")
+        .order_by("-created_at")
+    )
+
     # Paginate the results
     paginator = Paginator(parts_history, page_size)
-    
+
     try:
         page_obj = paginator.page(page)
     except Exception as e:
-        logger.warning('{} Invalid page number: {}. Error: {}. Returning first page.'.format(
-            _LOG_PREFIX, page, str(e)
-        ))
+        logger.warning("{} Invalid page number: {}. Error: {}. Returning first page.".format(_LOG_PREFIX, page, str(e)))
         page_obj = paginator.page(1)
-    
+
     data = []
     for history in page_obj:
         destination_part = history.destination_part
         brand = destination_part.brand if destination_part else None
         destination = destination_part.company_destination if destination_part else None
-        
-        data.append({
-            "id": history.id,
-            "data": history.data,
-            "changes": history.changes,
-            "synced": history.synced,
-            "destination_part": {
-                "id": destination_part.id if destination_part else None,
-                "part_unique_key": destination_part.part_unique_key if destination_part else None,
-                "source_external_id": destination_part.source_external_id if destination_part else None,
-                "destination_external_id": destination_part.destination_external_id if destination_part else None,
-            } if destination_part else None,
-            "brand": {
-                "id": brand.id if brand else None,
-                "name": brand.name if brand else None,
-                "status": brand.status if brand else None,
-                "status_name": brand.status_name if brand else None,
-            } if brand else None,
-            "destination": {
-                "id": destination.id if destination else None,
-                "status": destination.status if destination else None,
-                "status_name": destination.status_name if destination else None,
-                "destination_type": destination.destination_type if destination else None,
-                "destination_type_name": destination.destination_type_name if destination else None,
-            } if destination else None,
-            "created_at": history.created_at.isoformat() if history.created_at else None,
-            "updated_at": history.updated_at.isoformat() if history.updated_at else None,
-        })
-    
+
+        data.append(
+            {
+                "id": history.id,
+                "data": history.data,
+                "changes": history.changes,
+                "synced": history.synced,
+                "destination_part": {
+                    "id": destination_part.id if destination_part else None,
+                    "part_unique_key": destination_part.part_unique_key if destination_part else None,
+                    "source_external_id": destination_part.source_external_id if destination_part else None,
+                    "destination_external_id": destination_part.destination_external_id if destination_part else None,
+                }
+                if destination_part
+                else None,
+                "brand": {
+                    "id": brand.id if brand else None,
+                    "name": brand.name if brand else None,
+                    "status": brand.status if brand else None,
+                    "status_name": brand.status_name if brand else None,
+                }
+                if brand
+                else None,
+                "destination": {
+                    "id": destination.id if destination else None,
+                    "status": destination.status if destination else None,
+                    "status_name": destination.status_name if destination else None,
+                    "destination_type": destination.destination_type if destination else None,
+                    "destination_type_name": destination.destination_type_name if destination else None,
+                }
+                if destination
+                else None,
+                "created_at": history.created_at.isoformat() if history.created_at else None,
+                "updated_at": history.updated_at.isoformat() if history.updated_at else None,
+            }
+        )
+
     result = {
         "data": data,
         "pagination": {
@@ -3402,12 +3425,14 @@ def get_execution_run_parts_history(
             "total_count": paginator.count,
             "has_next": page_obj.has_next(),
             "has_previous": page_obj.has_previous(),
-        }
+        },
     }
-    
-    logger.info('{} Found {} parts history records for execution_run_id: {} (page {} of {}).'.format(
-        _LOG_PREFIX, len(data), execution_run_id, page_obj.number, paginator.num_pages
-    ))
+
+    logger.info(
+        "{} Found {} parts history records for execution_run_id: {} (page {} of {}).".format(
+            _LOG_PREFIX, len(data), execution_run_id, page_obj.number, paginator.num_pages
+        )
+    )
 
     return result
 
@@ -3415,6 +3440,7 @@ def get_execution_run_parts_history(
 # ---------------------------------------------------------------------------
 # Integration requests
 # ---------------------------------------------------------------------------
+
 
 def create_integration_request(company_id: int, provider_id: int) -> typing.Tuple[bool, typing.Optional[str]]:
     """
@@ -3436,13 +3462,13 @@ def create_integration_request(company_id: int, provider_id: int) -> typing.Tupl
 def get_integration_requests(company_id: int) -> typing.List[int]:
     """Return list of provider IDs the company has already requested."""
     return list(
-        src_models.IntegrationRequest.objects.filter(company_id=company_id)
-        .values_list("provider_id", flat=True)
+        src_models.IntegrationRequest.objects.filter(company_id=company_id).values_list("provider_id", flat=True)
     )
 
 
 # Custom (free-text) integration requests
 # ---------------------------------------------------------------------------
+
 
 def create_custom_integration_request(
     company_id: int, distributor_name: str
@@ -3468,8 +3494,7 @@ def create_custom_integration_request(
 def get_custom_integration_requests(company_id: int) -> typing.List[str]:
     """Return list of distributor names the company has already requested."""
     return list(
-        src_models.CustomIntegrationRequest.objects.filter(company_id=company_id)
-        .values_list("distributor_name", flat=True)
+        src_models.CustomIntegrationRequest.objects.filter(company_id=company_id).values_list(
+            "distributor_name", flat=True
+        )
     )
-
-
