@@ -771,6 +771,16 @@ def delete_space(scope: SpaceScope, space_id: int) -> None:
         raise SpaceError("This space has orders or open carts, so it cannot be deleted.", ERROR_SPACE_NOT_EMPTY)
 
 
+def _delete_space_sync_rows(space: src_models.Space) -> None:
+    """The space's ShopMonkey sync rows (kept after a disconnect) go with it, children first: executions, parts,
+    brands (their extra vendors cascade), then vendors. Only this space's rows; the PROTECT on `space` would
+    otherwise block the delete forever."""
+    src_models.ShopMonkeySyncExecution.objects.filter(space=space).delete()
+    src_models.ShopMonkeySyncPart.objects.filter(sync_brand__space=space).delete()
+    src_models.ShopMonkeySyncBrand.objects.filter(space=space).delete()
+    src_models.ShopMonkeySyncVendor.objects.filter(space=space).delete()
+
+
 def _delete_space(scope: SpaceScope, space_id: int) -> None:
     with transaction.atomic():
         company = _lock_company(scope.company_id)
@@ -809,5 +819,6 @@ def _delete_space(scope: SpaceScope, space_id: int) -> None:
                 ERROR_ONLY_SPACE_OF_ACCOUNTS,
                 extra={"accounts": accounts},
             )
+        _delete_space_sync_rows(space)
         # The space's address rows go with it (CompanyLocation.space is CASCADE).
         space.delete()

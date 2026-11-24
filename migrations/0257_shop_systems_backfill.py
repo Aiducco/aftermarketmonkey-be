@@ -1,16 +1,19 @@
 # Shop systems per space, step 2 of 3 (data only): every existing shop-system connection and every ShopMonkey
 # sync vendor, brand and execution row is put in its company's main space (AC-16: the main space keeps today's
 # connection, brands and history), and each connection's account fingerprint is computed from the identity
-# fields its system's catalog entry names. Idempotent: only rows whose `space` is still NULL are touched, and a
+# fields frozen below (the catalog's at the time). Idempotent: only rows whose `space` is still NULL are touched, and a
 # fingerprint is only written where it is still NULL. The main space is the one 0252 made (a company without one
 # gets it created the same way). The sync tables are small: one UPDATE per company and table.
 # Reverse: NULL the four `space` columns and the fingerprints (the columns themselves go with 0256).
 from django.db import migrations
 
-from src import constants as src_constants
 from src.domain import account_fingerprint
 
 KIND_LOCATION = 1
+
+# Frozen copy of the catalog's `account_identity_fields` at the time of this migration (ShopMonkey kind -> fields).
+# Deliberately not imported from src.constants: that value may change later, and this migration must not.
+IDENTITY_FIELDS_BY_KIND = {1: ["api_key"]}
 
 SYNC_MODELS = ("ShopMonkeySyncVendor", "ShopMonkeySyncBrand", "ShopMonkeySyncExecution")
 
@@ -33,22 +36,12 @@ def _main_space_id(apps, company_id):
     return main.id
 
 
-def _identity_fields_by_kind():
-    out = {}
-    for entry in src_constants.SHOP_MANAGEMENT_PROVIDER_CATALOG:
-        fields = entry.get("account_identity_fields")
-        if fields is None:
-            fields = entry.get("connection_required_fields") or []
-        out[entry["kind"].value] = list(fields)
-    return out
-
-
 def backfill_shop_spaces(apps, schema_editor):
     Connection = apps.get_model("src", "CompanyShopManagementProviders")
     Provider = apps.get_model("src", "ShopManagementProviders")
 
     kinds = dict(Provider.objects.values_list("id", "kind"))
-    identity_fields = _identity_fields_by_kind()
+    identity_fields = IDENTITY_FIELDS_BY_KIND
 
     company_ids = set(Connection.objects.values_list("company_id", flat=True))
     for model_name in SYNC_MODELS:

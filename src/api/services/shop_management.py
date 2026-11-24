@@ -212,6 +212,39 @@ def _fingerprint(catalog_entry: typing.Dict[str, typing.Any], credentials: typin
     return account_fingerprint_domain.account_fingerprint(fields, credentials)
 
 
+def _reset_space_sync_ids(
+    company_id: int, space_id: int, old_fingerprint: typing.Optional[str], new_fingerprint: typing.Optional[str]
+) -> None:
+    """The space's connection now points at another shop account: its vendor, brand and part rows carry the old
+    account's ShopMonkey ids, so clear them (and their sync status) and let the next sync create them afresh.
+    Call inside the transaction that saves the new fingerprint. Logs ids only, never the key."""
+    if old_fingerprint is None or old_fingerprint == new_fingerprint:
+        return
+    inactive = {
+        "shopmonkey_external_id": None,
+        "status": src_enums.ShopMonkeySyncStatus.INACTIVE.value,
+        "status_name": src_enums.ShopMonkeySyncStatus.INACTIVE.name,
+    }
+    vendors = src_models.ShopMonkeySyncVendor.objects.filter(space_id=space_id).update(**inactive)
+    brands = src_models.ShopMonkeySyncBrand.objects.filter(space_id=space_id).update(**inactive)
+    parts = src_models.ShopMonkeySyncPart.objects.filter(sync_brand__space_id=space_id).update(
+        shopmonkey_external_id=None,
+        status=src_enums.ShopMonkeySyncPartStatus.INACTIVE.value,
+        status_name=src_enums.ShopMonkeySyncPartStatus.INACTIVE.name,
+        last_error=None,
+    )
+    if vendors or brands or parts:
+        logger.info(
+            "[SHOP-MANAGEMENT] Account changed for company %s space %s: cleared ShopMonkey ids on %s vendor(s), "
+            "%s brand(s), %s part(s).",
+            company_id,
+            space_id,
+            vendors,
+            brands,
+            parts,
+        )
+
+
 def _ensure_account_free(
     scope: spaces_services.SpaceScope,
     company_id: int,
@@ -435,6 +468,7 @@ def connect_provider(
             existing = _ensure_space_free_of_other_system(scope, space_id, provider_id)
             _ensure_account_free(scope, company_id, provider_id, fingerprint, space_id)
             if existing:
+                _reset_space_sync_ids(company_id, space_id, existing.credentials_fingerprint, fingerprint)
                 existing.credentials = creds
                 existing.credentials_fingerprint = fingerprint
                 for field, value in status_fields.items():
@@ -510,6 +544,7 @@ def update_connection(
         with transaction.atomic():
             spaces_services._lock_company(company_id)
             _ensure_account_free(scope, company_id, cp.provider_id, fingerprint, cp.space_id)
+            _reset_space_sync_ids(company_id, cp.space_id, cp.credentials_fingerprint, fingerprint)
             cp.credentials = creds
             cp.credentials_fingerprint = fingerprint
             for field, value in status_fields.items():

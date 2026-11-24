@@ -1062,6 +1062,7 @@ def sync_all_enabled_brands() -> None:
         src_models.ShopMonkeySyncBrand.objects.filter(
             enabled=True,
             space__shop_connection__provider__kind=src_enums.ShopManagementProviderKind.SHOPMONKEY.value,
+            space__shop_connection__active=True,
         )
         .order_by("id")
         .values_list("id", "company_id")

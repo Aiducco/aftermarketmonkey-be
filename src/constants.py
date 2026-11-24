@@ -3007,6 +3007,7 @@ SHOP_MANAGEMENT_PROVIDER_CATALOG = [
         "category": "Shop Management",
         "connection_required_fields": ["api_key"],
         # The credential fields that identify the external account: one account serves exactly one space.
+        # Changing this needs a data migration that recomputes the stored credentials_fingerprint values (see 0257).
         "account_identity_fields": ["api_key"],
         "installation_instructions_html": (
             "<p><strong>ShopMonkey</strong> connections use an API key issued from your ShopMonkey account.</p>"

@@ -47,13 +47,21 @@ def _space_ref(scope: spaces_services.SpaceScope, space_id: int) -> typing.Dict[
     return {"id": space_id, "name": scope.space_names.get(space_id)}
 
 
+# No space has this id: filtering by it answers "nothing". A caller who can see no space (a removed member's token)
+# gets that, never the main space's data.
+_NO_SPACE_ID = 0
+
+
 def _inventory_space_id(scope: spaces_services.SpaceScope) -> int:
     """The space an inventory read answers for: the header's space when visible; in "all" (or absent, or not visible)
     the main space when visible, else the lowest-id visible space with a shop connection, else the lowest-id visible
-    space. Sync brands and executions belong to one shop account, so "all" is not a merge of spaces."""
+    space, else _NO_SPACE_ID when the caller can see none. Sync brands and executions belong to one shop account, so
+    "all" is not a merge of spaces."""
     current = scope.current_space_id
     if current is not None:
         return current
+    if not scope.visible_space_ids:
+        return _NO_SPACE_ID
     if scope.main_space_id in scope.visible_space_ids:
         return scope.main_space_id
     visible = sorted(scope.visible_space_ids)
@@ -64,13 +72,15 @@ def _inventory_space_id(scope: spaces_services.SpaceScope) -> int:
     )
     if with_connection:
         return with_connection[0]
-    # A removed member sees nothing: the main space is the answer that exposes nothing of its own.
-    return visible[0] if visible else scope.main_space_id
+    return visible[0] if visible else _NO_SPACE_ID
 
 
 def _read_space_id(scope: typing.Optional[spaces_services.SpaceScope]) -> typing.Optional[int]:
-    """The space a read is filtered to; None for an unflagged company (its rows are all the main space's)."""
-    return _inventory_space_id(scope) if _spaced(scope) else None
+    """The space a read is filtered to: the inventory space for a flagged company, the main space for an unflagged one
+    (a company whose flag was turned off after use never mixes other spaces' rows in); None only with no scope."""
+    if scope is None:
+        return None
+    return _inventory_space_id(scope) if scope.enabled else scope.main_space_id
 
 
 def _spaces_main_first(scope: spaces_services.SpaceScope, space_ids: typing.Iterable[int]) -> typing.List[int]:
@@ -164,7 +174,7 @@ def get_inventory_state(
     if default is None and systems:
         default = next((s for s in systems if s["inventory_supported"]), systems[0])
     data = {"systems": systems, "default_kind": default["kind"] if default else None}
-    if space_id is not None:
+    if _spaced(scope) and space_id is not None:
         data.update(_space_state_keys(company_id, scope, space_id, has_shop_system=bool(connections)))
     return data, None
 
@@ -176,7 +186,7 @@ def _space_state_keys(
     keys: typing.Dict[str, typing.Any] = {
         "has_shop_system": has_shop_system,
         "spaces_with_shop_system": [],
-        "space": _space_ref(scope, space_id),
+        "space": _space_ref(scope, space_id) if space_id != _NO_SPACE_ID else None,
     }
     connections = list(
         src_models.CompanyShopManagementProviders.objects.filter(
@@ -199,17 +209,21 @@ def _overview_rows(
 ) -> typing.List[typing.Dict[str, typing.Any]]:
     """AC-47: one row per visible space, with its shop system, connection and newest non-delete execution."""
     by_space = {c.space_id: c for c in connections}
-    last_by_space: typing.Dict[int, src_models.ShopMonkeySyncExecution] = {}
-    executions = (
-        src_models.ShopMonkeySyncExecution.objects.filter(company_id=company_id, space_id__in=scope.visible_space_ids)
-        # An execution with no "kind" key is a sync; a plain exclude() would drop it too (NULL = value is not true).
-        .filter(
-            django_db_models.Q(metadata__kind__isnull=True)
-            | ~django_db_models.Q(metadata__kind=shopmonkey_sync_services.EXECUTION_KIND_DELETE_BRAND)
-        ).order_by("-created_at", "-id")
-    )
-    for execution in executions:
-        last_by_space.setdefault(execution.space_id, execution)
+    last_by_space: typing.Dict[int, typing.Dict[str, typing.Any]] = {}
+    for sid in scope.visible_space_ids:
+        newest = (
+            src_models.ShopMonkeySyncExecution.objects.filter(company_id=company_id, space_id=sid)
+            # An execution with no "kind" key is a sync; a plain exclude() would drop it too (NULL = value is not true).
+            .filter(
+                django_db_models.Q(metadata__kind__isnull=True)
+                | ~django_db_models.Q(metadata__kind=shopmonkey_sync_services.EXECUTION_KIND_DELETE_BRAND)
+            )
+            .values("status", "updated_at")
+            .order_by("-created_at", "-id")
+            .first()
+        )
+        if newest is not None:
+            last_by_space[sid] = newest
     finished = {
         src_enums.ShopMonkeySyncExecutionStatus.FINISHED.value,
         src_enums.ShopMonkeySyncExecutionStatus.FAILURE.value,
@@ -229,9 +243,9 @@ def _overview_rows(
                 ),
                 "last_sync": (
                     {
-                        "status": last.status,
-                        "finished_at": last.updated_at.isoformat()
-                        if last.status in finished and last.updated_at
+                        "status": last["status"],
+                        "finished_at": last["updated_at"].isoformat()
+                        if last["status"] in finished and last["updated_at"]
                         else None,
                     }
                     if last
@@ -248,7 +262,10 @@ def get_available_brands(
     """Returns (data, error_code)."""
     if not _feature_enabled(company_id):
         return None, ERROR_FEATURE_NOT_AVAILABLE
-    return shopmonkey_sync_services.available_brands_for_company(company_id, _read_space_id(scope)), None
+    space_id = _read_space_id(scope)
+    if space_id == _NO_SPACE_ID:
+        return [], None
+    return shopmonkey_sync_services.available_brands_for_company(company_id, space_id), None
 
 
 def _sync_brand_row(
