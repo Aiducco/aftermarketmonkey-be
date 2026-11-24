@@ -210,6 +210,57 @@ def order_account_space_ids(account: src_models.CompanyProviderOrderAccount, own
 
 
 # ---------------------------------------------------------------------------
+# Sorting orders from distributors into spaces
+# ---------------------------------------------------------------------------
+
+
+class ExternalOrderSorter:
+    """The sorting rule for an order from a distributor that we did not place (spec Definitions). Step 1 (placed
+    in the app) never applies here: those orders are dropped before they get this far. Then, in order:
+    2. the PO number starts with a space's prefix; 3. the order account that found it is used by exactly one
+    space; 4. the main space. Built once per batch (it caches prefixes and each account's spaces)."""
+
+    def __init__(self, company_id: int) -> None:
+        self.main_space_id = src_models.Space.objects.main_for(company_id).id
+        # Longest first; prefixes never start one another, so the order is only a safeguard.
+        self._prefixes = sorted(
+            (
+                (prefix, space_id)
+                for space_id, prefix in src_models.Space.objects.filter(company_id=company_id)
+                .exclude(prefix__isnull=True)
+                .exclude(prefix="")
+                .values_list("id", "prefix")
+            ),
+            key=lambda pair: -len(pair[0]),
+        )
+        self._account_spaces: typing.Dict[int, typing.List[int]] = {}
+
+    def sort(
+        self, account: src_models.CompanyProviderOrderAccount, customer_po_number: typing.Optional[str]
+    ) -> typing.Tuple[int, "src_enums.ExternalOrderSpaceReason", typing.Optional[str]]:
+        """(space id, reason, the prefix that matched or None)."""
+        po = (customer_po_number or "").strip().upper()
+        if po:
+            for prefix, space_id in self._prefixes:
+                if po.startswith(prefix.upper()):
+                    return space_id, src_enums.ExternalOrderSpaceReason.PREFIX, prefix
+        if account.id not in self._account_spaces:
+            self._account_spaces[account.id] = order_account_space_ids(account, self.main_space_id)
+        space_ids = self._account_spaces[account.id]
+        if len(space_ids) == 1:
+            return space_ids[0], src_enums.ExternalOrderSpaceReason.ACCOUNT, None
+        return self.main_space_id, src_enums.ExternalOrderSpaceReason.MAIN, None
+
+
+def external_order_sorter(company_id: int) -> typing.Optional[ExternalOrderSorter]:
+    """The sorter for a flagged company; None for an unflagged one (its orders keep going to the main space with
+    no reason, exactly as before)."""
+    if not feature_flags_services.company_has_feature(company_id, feature_flags_services.FEATURE_MULTI_SPACES):
+        return None
+    return ExternalOrderSorter(company_id)
+
+
+# ---------------------------------------------------------------------------
 # Serializing
 # ---------------------------------------------------------------------------
 

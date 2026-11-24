@@ -23,6 +23,7 @@ from django.utils import timezone
 
 from src import enums as src_enums
 from src import models as src_models
+from src.api.services import spaces as spaces_services
 from src.integrations.orders import history, history_registry
 
 logger = logging.getLogger(__name__)
@@ -398,6 +399,9 @@ def _apply_results(
             deduped_by_number[key] = result
     results = list(deduped_by_number.values())
 
+    # A flagged company's new orders are sorted into a space; None leaves every new row to save()'s main space.
+    sorter = spaces_services.external_order_sorter(company_provider.company_id)
+
     # Meyer is excluded deliberately, matching _self_heal_existing_rows' own docstring: its rows
     # are classified by the authoritative "API Order" flag, never by PO-matching inference, so
     # there is nothing for a re-check to correct -- and letting an inference delete a row Meyer
@@ -434,8 +438,9 @@ def _apply_results(
         # (confirmed live).
         result.distributor_order_number = normalized_number
 
+        # Looked up by connection, like the upsert below: the same order may have been found by another account.
         existing = src_models.ExternalPurchaseOrder.objects.filter(
-            order_account=account, distributor_order_number=normalized_number
+            company_provider=company_provider, distributor_order_number=normalized_number
         ).first()
 
         if existing is None:
@@ -462,6 +467,13 @@ def _apply_results(
         # the same order history, so keying on the account stored every one of its orders twice.
         # The account that found it is still recorded, as a plain attribute.
         defaults["order_account"] = account
+        if existing is None and sorter is not None:
+            # Space and reason are set on create only: a later poll (or a hand move) never changes them.
+            space_id, reason, matched_prefix = sorter.sort(account, result.customer_po_number)
+            defaults["space_id"] = space_id
+            defaults["space_reason"] = reason.value
+            defaults["space_reason_name"] = reason.name
+            defaults["space_reason_prefix"] = matched_prefix
         _, created = src_models.ExternalPurchaseOrder.objects.update_or_create(
             company_provider=company_provider,
             distributor_order_number=normalized_number,
