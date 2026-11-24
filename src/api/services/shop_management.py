@@ -204,14 +204,11 @@ def get_shop_management_catalog(company_id: int) -> typing.Dict:
     """
     logger.info("{} Fetching shop management catalog for company_id: {}.".format(_LOG_PREFIX, company_id))
 
-    if not feature_flags_services.company_has_feature(
-        company_id, feature_flags_services.FEATURE_SHOP_MANAGEMENT
-    ):
+    if not feature_flags_services.company_has_feature(company_id, feature_flags_services.FEATURE_SHOP_MANAGEMENT):
         return {"data": [], "categories": []}
 
     company_connections_by_provider_id = {
-        c.provider_id: c
-        for c in src_models.CompanyShopManagementProviders.objects.filter(company_id=company_id)
+        c.provider_id: c for c in src_models.CompanyShopManagementProviders.objects.filter(company_id=company_id)
     }
     providers_by_kind = {p.kind: p for p in src_models.ShopManagementProviders.objects.all()}
 
@@ -223,35 +220,37 @@ def get_shop_management_catalog(company_id: int) -> typing.Dict:
             continue
 
         connection = company_connections_by_provider_id.get(provider.id)
-        catalog.append({
-            "id": provider.id,
-            "name": provider.name,
-            "description": entry.get("description", ""),
-            "icon_url": entry.get("icon_url") or None,
-            "category": entry.get("category", ""),
-            "connection_required_fields": entry.get("connection_required_fields", []),
-            "connection_optional_fields": entry.get("connection_optional_fields", []),
-            "installation_instructions_html": entry.get("installation_instructions_html") or None,
-            "connected": connection is not None,
-            "company_provider_id": connection.id if connection else None,
-            "kind": kind_value,
-            "kind_name": provider.kind_name or "",
-            "coming_soon": bool(provider.coming_soon),
-            "status": connection.status if connection else None,
-            "status_name": connection.status_name if connection else None,
-            "status_reason": connection.status_reason if connection else None,
-            "status_checked_at": (
-                connection.status_checked_at.isoformat()
-                if connection and connection.status_checked_at
-                else None
-            ),
-        })
+        catalog.append(
+            {
+                "id": provider.id,
+                "name": provider.name,
+                "description": entry.get("description", ""),
+                "icon_url": entry.get("icon_url") or None,
+                "category": entry.get("category", ""),
+                "connection_required_fields": entry.get("connection_required_fields", []),
+                "connection_optional_fields": entry.get("connection_optional_fields", []),
+                "installation_instructions_html": entry.get("installation_instructions_html") or None,
+                "connected": connection is not None,
+                "company_provider_id": connection.id if connection else None,
+                "kind": kind_value,
+                "kind_name": provider.kind_name or "",
+                "coming_soon": bool(provider.coming_soon),
+                "status": connection.status if connection else None,
+                "status_name": connection.status_name if connection else None,
+                "status_reason": connection.status_reason if connection else None,
+                "status_checked_at": (
+                    connection.status_checked_at.isoformat() if connection and connection.status_checked_at else None
+                ),
+            }
+        )
 
     return {
         "data": catalog,
-        "categories": list(dict.fromkeys(
-            e.get("category", "") for e in src_constants.SHOP_MANAGEMENT_PROVIDER_CATALOG if e.get("category")
-        )),
+        "categories": list(
+            dict.fromkeys(
+                e.get("category", "") for e in src_constants.SHOP_MANAGEMENT_PROVIDER_CATALOG if e.get("category")
+            )
+        ),
     }
 
 
@@ -291,10 +290,12 @@ def connect_provider(
     Gated behind FEATURE_SHOP_MANAGEMENT independently of the catalog endpoint -- the catalog
     hides the option, but a direct API call must not be able to connect around that.
     """
-    if not feature_flags_services.company_has_feature(
-        company_id, feature_flags_services.FEATURE_SHOP_MANAGEMENT
-    ):
-        return None, "Shop management integrations are not available for this company yet.", CONNECTION_ERROR_FEATURE_NOT_AVAILABLE
+    if not feature_flags_services.company_has_feature(company_id, feature_flags_services.FEATURE_SHOP_MANAGEMENT):
+        return (
+            None,
+            "Shop management integrations are not available for this company yet.",
+            CONNECTION_ERROR_FEATURE_NOT_AVAILABLE,
+        )
 
     provider = src_models.ShopManagementProviders.objects.filter(id=provider_id).first()
     if not provider:
@@ -309,9 +310,7 @@ def connect_provider(
         provider_id=provider_id,
     ).first()
 
-    creds, err, err_code = _merge_credentials(
-        catalog_entry, existing.credentials if existing else None, credentials
-    )
+    creds, err, err_code = _merge_credentials(catalog_entry, existing.credentials if existing else None, credentials)
     if err:
         return None, err, err_code
 
@@ -346,9 +345,11 @@ def update_connection(
     credentials: typing.Dict[str, typing.Any],
 ) -> typing.Tuple[typing.Optional[typing.Dict], typing.Optional[str], typing.Optional[str]]:
     """PATCH equivalent of connect_provider, addressed by connection id."""
-    cp = src_models.CompanyShopManagementProviders.objects.filter(
-        id=company_provider_id, company_id=company_id
-    ).select_related("provider").first()
+    cp = (
+        src_models.CompanyShopManagementProviders.objects.filter(id=company_provider_id, company_id=company_id)
+        .select_related("provider")
+        .first()
+    )
     if not cp:
         return None, "Connection not found", CONNECTION_ERROR_NOT_FOUND
 
@@ -377,9 +378,7 @@ def update_connection(
 
 
 def disconnect(company_id: int, company_provider_id: int) -> typing.Tuple[bool, typing.Optional[str]]:
-    cp = src_models.CompanyShopManagementProviders.objects.filter(
-        id=company_provider_id, company_id=company_id
-    ).first()
+    cp = src_models.CompanyShopManagementProviders.objects.filter(id=company_provider_id, company_id=company_id).first()
     if not cp:
         return False, "Connection not found"
     cp.delete()
@@ -387,9 +386,9 @@ def disconnect(company_id: int, company_provider_id: int) -> typing.Tuple[bool, 
 
 
 def list_company_connections(company_id: int) -> typing.List[typing.Dict[str, typing.Any]]:
-    connections = src_models.CompanyShopManagementProviders.objects.filter(
-        company_id=company_id
-    ).select_related("provider")
+    connections = src_models.CompanyShopManagementProviders.objects.filter(company_id=company_id).select_related(
+        "provider"
+    )
 
     data = []
     for cp in connections:
@@ -415,12 +414,12 @@ def list_company_connections(company_id: int) -> typing.List[typing.Dict[str, ty
     return data
 
 
-def get_connection_detail(
-    company_id: int, company_provider_id: int
-) -> typing.Optional[typing.Dict[str, typing.Any]]:
-    cp = src_models.CompanyShopManagementProviders.objects.filter(
-        id=company_provider_id, company_id=company_id
-    ).select_related("provider").first()
+def get_connection_detail(company_id: int, company_provider_id: int) -> typing.Optional[typing.Dict[str, typing.Any]]:
+    cp = (
+        src_models.CompanyShopManagementProviders.objects.filter(id=company_provider_id, company_id=company_id)
+        .select_related("provider")
+        .first()
+    )
     if not cp:
         return None
 

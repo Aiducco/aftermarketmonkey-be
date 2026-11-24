@@ -34,7 +34,9 @@ class ShopManagementCatalogView(views.View):
         try:
             result = shop_management_services.get_shop_management_catalog(company_id=company_id)
         except Exception as e:
-            logger.error(f"{_LOG_PREFIX} Error fetching shop management catalog for company_id: {company_id}. Error: {str(e)}")
+            logger.error(
+                f"{_LOG_PREFIX} Error fetching shop management catalog for company_id: {company_id}. Error: {str(e)}"
+            )
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
                 content=simplejson.dumps({"message": "Error fetching shop management catalog"}),
@@ -313,7 +315,9 @@ class CompanyShopManagementProvidersView(views.View):
         try:
             data = shop_management_services.list_company_connections(company_id=company_id)
         except Exception as e:
-            logger.error(f"{_LOG_PREFIX} Error fetching shop management providers for company_id: {company_id}. Error: {str(e)}")
+            logger.error(
+                f"{_LOG_PREFIX} Error fetching shop management providers for company_id: {company_id}. Error: {str(e)}"
+            )
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
                 content=simplejson.dumps({"message": "Error fetching shop management providers"}),
@@ -370,7 +374,9 @@ class CompanyShopManagementProviderDetailView(views.View):
                 company_provider_id=cpi,
             )
         except Exception as e:
-            logger.error(f"{_LOG_PREFIX} Error fetching shop management provider id={cpi} for company_id: {company_id}. Error: {str(e)}")
+            logger.error(
+                f"{_LOG_PREFIX} Error fetching shop management provider id={cpi} for company_id: {company_id}. Error: {str(e)}"
+            )
             return http.HttpResponse(
                 headers={"Content-Type": "application/json"},
                 content=simplejson.dumps({"message": "Error fetching shop management provider"}),
