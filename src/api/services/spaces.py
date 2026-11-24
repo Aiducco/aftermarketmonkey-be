@@ -11,6 +11,7 @@ import logging
 import typing
 
 from django.db import IntegrityError, transaction
+from django.db.models import ProtectedError
 
 from src import enums as src_enums
 from src import models as src_models
@@ -93,7 +94,7 @@ def _parse_header(request) -> typing.Optional[int]:
     if raw is None:
         return None
     raw = raw.strip()
-    if not raw.isdigit():  # "all", empty or garbage: treated as absent
+    if not (raw.isascii() and raw.isdigit()):  # "all", empty or garbage: treated as absent
         return None
     return int(raw)
 
@@ -119,8 +120,11 @@ def resolve_scope(request) -> SpaceScope:
     is_admin = bool(profile and profile.is_company_admin)
     if is_admin:
         visible = sorted(space_names)
+    elif profile is None:
+        # A removed member with a still-valid token: nothing to see, and writes answer space_required.
+        visible = []
     else:
-        member_of = sorted(profile.spaces.filter(company_id=company_id).values_list("id", flat=True)) if profile else []
+        member_of = sorted(profile.spaces.filter(company_id=company_id).values_list("id", flat=True))
         # No rows means the main space only (ADR 0001).
         visible = member_of or [main.id]
 
@@ -170,6 +174,8 @@ def write_space(scope: SpaceScope) -> int:
     space_required, never the main space. A company without the flag always writes to the main space."""
     if not scope.enabled:
         return scope.main_space_id
+    if not scope.visible_space_ids:  # a removed member: nowhere to write, and no space to name in a 403
+        raise SpaceError("Choose a space for this.", ERROR_SPACE_REQUIRED, status_code=400)
     if len(scope.visible_space_ids) == 1:
         return scope.visible_space_ids[0]
     requested = scope.requested_space_id
@@ -372,7 +378,7 @@ def _people_to_remove(space: src_models.Space) -> typing.List[dict]:
     return [
         {"id": p.user_id, "email": p.user.email, "first_name": p.user.first_name, "last_name": p.user.last_name}
         for p in profiles
-        if [s.id for s in p.spaces.all()] == [space.id]
+        if [s.id for s in p.spaces.all() if s.company_id == space.company_id] == [space.id]
     ]
 
 
@@ -398,6 +404,14 @@ def delete_space(scope: SpaceScope, space_id: int) -> None:
     """Deletes a space and its one address. Refused while it is the main space, holds orders or carts, or is
     the only space of a non-admin member or of an order account."""
     require_admin(scope)
+    try:
+        _delete_space(scope, space_id)
+    except (ProtectedError, IntegrityError):
+        # Something referenced the space after the checks (a race): same answer as the check itself.
+        raise SpaceError("This space has orders or open carts, so it cannot be deleted.", ERROR_SPACE_NOT_EMPTY)
+
+
+def _delete_space(scope: SpaceScope, space_id: int) -> None:
     with transaction.atomic():
         company = _lock_company(scope.company_id)
         space = _get_space(company.id, space_id)
