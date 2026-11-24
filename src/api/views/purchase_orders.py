@@ -290,8 +290,10 @@ class PurchaseOrdersView(views.View):
         status_param = request.GET.get("status")
         cp_param = request.GET.get("company_provider_id")
         try:
+            scope = spaces_services.resolve_scope(request)
             result = purchase_orders_services.list_purchase_orders(
                 company_id=company_id,
+                scope=scope,
                 status=status_param,
                 company_provider_id=int(cp_param) if cp_param else None,
             )
@@ -316,8 +318,10 @@ class PurchaseOrdersExternalView(views.View):
             return err
 
         try:
+            scope = spaces_services.resolve_scope(request)
             result = purchase_orders_services.list_external_purchase_orders(
                 company_id=company_id,
+                scope=scope,
                 provider=request.GET.get("provider"),
                 since=request.GET.get("since"),
             )
@@ -344,10 +348,14 @@ class PurchaseOrderExternalDetailView(views.View):
             return err
 
         try:
+            scope = spaces_services.resolve_scope(request)
             result = purchase_orders_services.get_external_purchase_order(
                 company_id=company_id,
+                scope=scope,
                 external_order_id=kwargs["id"],
             )
+        except spaces_services.SpaceError as e:
+            return _space_error_response(e)
         except purchase_orders_services.PurchaseOrderServiceError as e:
             return _error_response(str(e), status=404)
         except Exception:
@@ -372,8 +380,10 @@ class PurchaseOrderInvoicesView(views.View):
 
         cp_param = request.GET.get("company_provider_id")
         try:
+            scope = spaces_services.resolve_scope(request)
             result = purchase_orders_services.list_purchase_order_invoices(
                 company_id=company_id,
+                scope=scope,
                 company_provider_id=int(cp_param) if cp_param else None,
                 start_date=request.GET.get("start_date"),
                 end_date=request.GET.get("end_date"),
@@ -424,8 +434,10 @@ class PurchaseOrderTrackingView(views.View):
 
         cp_param = request.GET.get("company_provider_id")
         try:
+            scope = spaces_services.resolve_scope(request)
             result = purchase_orders_services.list_purchase_order_tracking(
                 company_id=company_id,
+                scope=scope,
                 company_provider_id=int(cp_param) if cp_param else None,
                 delivery_status=request.GET.get("delivery_status"),
             )

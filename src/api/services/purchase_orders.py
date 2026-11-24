@@ -428,6 +428,7 @@ def _serialize_purchase_order_list_item(
     po: src_models.PurchaseOrder,
     distributor_order_status_name: typing.Optional[str] = None,
     fulfillment_channel: str = "api",
+    scope: typing.Optional[spaces_services.SpaceScope] = None,
 ) -> typing.Dict:
     """
     Lean row shape for GET /purchase-orders/ (the order-history table) -- exactly the columns
@@ -454,7 +455,7 @@ def _serialize_purchase_order_list_item(
     indefinitely, which reads as a stuck API order unless the channel is shown.
     """
     provider = po.company_provider.provider
-    return {
+    row = {
         "id": po.id,
         "po_number": po.po_number,
         "po_name": po.po_name,
@@ -471,6 +472,7 @@ def _serialize_purchase_order_list_item(
         "submitted_at": po.submitted_at.isoformat() if po.submitted_at else None,
         "created_at": po.created_at.isoformat(),
     }
+    return _add_space_fields(row, po.space_id, scope)
 
 
 # -- Cart -----------------------------------------------------------------------------------
@@ -1343,6 +1345,7 @@ _OPEN_STATUSES = [
 
 def list_purchase_orders(
     company_id: int,
+    scope: spaces_services.SpaceScope,
     status: typing.Optional[typing.Union[int, str]] = None,
     company_provider_id: typing.Optional[int] = None,
 ) -> typing.List[typing.Dict]:
@@ -1373,6 +1376,8 @@ def list_purchase_orders(
         .select_related("company_provider__provider", "order_account")
         .order_by("-created_at")
     )
+    if scope.enabled:
+        qs = qs.filter(space_id__in=scope.list_space_ids)
     if isinstance(status, str) and status.strip().lower() == "open":
         qs = qs.filter(status__in=_OPEN_STATUSES)
     else:
@@ -1408,6 +1413,7 @@ def list_purchase_orders(
             po,
             distributor_status_by_po_id.get(po.id),
             fulfillment_channel_by_po_id.get(po.id, "api"),
+            scope,
         )
         for po in pos
     ]
@@ -1415,6 +1421,7 @@ def list_purchase_orders(
 
 def list_purchase_order_invoices(
     company_id: int,
+    scope: spaces_services.SpaceScope,
     company_provider_id: typing.Optional[int] = None,
     start_date: typing.Optional[str] = None,
     end_date: typing.Optional[str] = None,
@@ -1427,13 +1434,15 @@ def list_purchase_order_invoices(
         .select_related("purchase_order__company_provider__provider")
         .order_by("-invoice_date", "-created_at")
     )
+    if scope.enabled:
+        qs = qs.filter(purchase_order__space_id__in=scope.list_space_ids)
     if company_provider_id is not None:
         qs = qs.filter(purchase_order__company_provider_id=company_provider_id)
     if start_date:
         qs = qs.filter(invoice_date__gte=start_date)
     if end_date:
         qs = qs.filter(invoice_date__lte=end_date)
-    return [_serialize_invoice_flat(inv) for inv in qs[:200]]
+    return [_serialize_invoice_flat(inv, scope) for inv in qs[:200]]
 
 
 def get_purchase_order_invoice_detail(company_id: int, scope: spaces_services.SpaceScope, invoice_id: int) -> typing.Dict:
@@ -1468,6 +1477,7 @@ def _serialize_invoice_flat(
 
 def list_purchase_order_tracking(
     company_id: int,
+    scope: spaces_services.SpaceScope,
     company_provider_id: typing.Optional[int] = None,
     delivery_status: typing.Optional[str] = None,
 ) -> typing.List[typing.Dict]:
@@ -1480,6 +1490,8 @@ def list_purchase_order_tracking(
         .select_related("purchase_order__company_provider__provider")
         .order_by("-updated_at")
     )
+    if scope.enabled:
+        qs = qs.filter(purchase_order__space_id__in=scope.list_space_ids)
     if company_provider_id is not None:
         qs = qs.filter(purchase_order__company_provider_id=company_provider_id)
     if delivery_status:
@@ -1508,6 +1520,7 @@ def list_purchase_order_tracking(
             "status_name": pdo.status_name,
             "updated_at": pdo.updated_at.isoformat(),
         }
+        _add_space_fields(row, po.space_id, scope)
         for tracking_number in pdo.tracking_numbers or [None]:
             rows.append({**row, "tracking_number": tracking_number})
     return rows
@@ -1993,7 +2006,9 @@ _SHIP_TO_REPORTABLE_KINDS = {
 }
 
 
-def _serialize_external_purchase_order(order: src_models.ExternalPurchaseOrder) -> typing.Dict:
+def _serialize_external_purchase_order(
+    order: src_models.ExternalPurchaseOrder, scope: typing.Optional[spaces_services.SpaceScope] = None
+) -> typing.Dict:
     has_ship_to = any(
         [
             order.ship_to_name,
@@ -2029,7 +2044,7 @@ def _serialize_external_purchase_order(order: src_models.ExternalPurchaseOrder) 
         else "inferred"
     )
 
-    return {
+    row = {
         "id": order.id,
         "company_provider_id": order.company_provider_id,
         "provider_kind_name": order.company_provider.provider.kind_name,
@@ -2062,15 +2077,18 @@ def _serialize_external_purchase_order(order: src_models.ExternalPurchaseOrder) 
         "discovered_at": _iso_utc_z(order.discovered_at),
         "last_synced_at": _iso_utc_z(order.last_synced_at),
     }
+    return _add_space_fields(row, order.space_id, scope)
 
 
-def _serialize_external_purchase_order_detail(order: src_models.ExternalPurchaseOrder) -> typing.Dict:
+def _serialize_external_purchase_order_detail(
+    order: src_models.ExternalPurchaseOrder, scope: typing.Optional[spaces_services.SpaceScope] = None
+) -> typing.Dict:
     """The list row plus everything only the detail screen needs. Mirrors what
     _serialize_confirmed_distributor_order gives an app-placed order, with one addition that has
     no app-placed equivalent: status_history. A PurchaseOrder carries a single current status,
     but Keystone returns one row per stage transition, so a discovered order can show its whole
     dated progression (RCV ORD -> ORDER -> PICK -> PACKAGE -> INVOICE -> OUT4DLV -> DELIVRD)."""
-    detail = _serialize_external_purchase_order(order)
+    detail = _serialize_external_purchase_order(order, scope)
     detail["status_history"] = order.status_history or []
     return detail
 
@@ -2131,6 +2149,7 @@ def _polled_connections(company_id: int) -> typing.List[typing.Dict]:
 
 def list_external_purchase_orders(
     company_id: int,
+    scope: spaces_services.SpaceScope,
     provider: typing.Optional[str] = None,
     since: typing.Optional[str] = None,
 ) -> typing.Dict:
@@ -2143,6 +2162,8 @@ def list_external_purchase_orders(
     qs = src_models.ExternalPurchaseOrder.objects.filter(company_id=company_id).select_related(
         "company_provider__provider", "order_account"
     )
+    if scope.enabled:
+        qs = qs.filter(space_id__in=scope.list_space_ids)
     if provider:
         try:
             provider_kind = src_enums.BrandProviderKind[provider.strip().upper()].value
@@ -2162,13 +2183,15 @@ def list_external_purchase_orders(
     # the distributor has not dated yet (Premier before it invoices) is not the newest thing that
     # happened; discovered_at breaks ties and orders the undated ones among themselves.
     orders = [
-        _serialize_external_purchase_order(order)
+        _serialize_external_purchase_order(order, scope)
         for order in qs.order_by(F("order_date").desc(nulls_last=True), "-discovered_at")
     ]
     return {"orders": orders, "polled_connections": _polled_connections(company_id)}
 
 
-def get_external_purchase_order(company_id: int, external_order_id: int) -> typing.Dict:
+def get_external_purchase_order(
+    company_id: int, scope: spaces_services.SpaceScope, external_order_id: int
+) -> typing.Dict:
     """
     GET /purchase-orders/external/<id>/. Scoped by company_id from the caller's token, never from
     a request parameter -- an id belonging to another tenant reads as not found rather than
@@ -2181,4 +2204,5 @@ def get_external_purchase_order(company_id: int, external_order_id: int) -> typi
     )
     if order is None:
         raise PurchaseOrderServiceError("External order {} was not found.".format(external_order_id))
-    return _serialize_external_purchase_order_detail(order)
+    spaces_services.ensure_visible(scope, order.space_id)
+    return _serialize_external_purchase_order_detail(order, scope)
