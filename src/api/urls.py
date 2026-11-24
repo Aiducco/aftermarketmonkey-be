@@ -129,7 +129,12 @@ from src.api.views.shopmonkey_inventory import (
     ShopMonkeySyncBrandsView,
     ShopMonkeySyncExecutionsView,
 )
-from src.api.views.spaces import SpaceDetailView, SpacesView
+from src.api.views.spaces import (
+    SpaceDetailView,
+    SpaceResortPreviewView,
+    SpaceResortView,
+    SpacesView,
+)
 from src.api.views.support import SupportTicketsView
 from src.api.views.turn14_locations import Turn14LocationsView
 
@@ -655,6 +660,16 @@ urlpatterns = [
         "spaces/<int:id>/",
         SpaceDetailView.as_view(),
         name="space_detail",
+    ),
+    path(
+        "spaces/<int:id>/resort-preview/",
+        SpaceResortPreviewView.as_view(),
+        name="space_resort_preview",
+    ),
+    path(
+        "spaces/<int:id>/resort/",
+        SpaceResortView.as_view(),
+        name="space_resort",
     ),
     path(
         "admin/providers/",

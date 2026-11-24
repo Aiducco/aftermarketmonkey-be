@@ -11,7 +11,7 @@ import logging
 import typing
 
 from django.db import IntegrityError, transaction
-from django.db.models import ProtectedError
+from django.db.models import Count, ProtectedError, Sum
 
 from src import enums as src_enums
 from src import models as src_models
@@ -258,6 +258,65 @@ def external_order_sorter(company_id: int) -> typing.Optional[ExternalOrderSorte
     if not feature_flags_services.company_has_feature(company_id, feature_flags_services.FEATURE_MULTI_SPACES):
         return None
     return ExternalOrderSorter(company_id)
+
+
+def _resort_candidates(company_id: int, space: src_models.Space):
+    """Past orders from distributors whose PO number starts with the space's prefix and that sit in another
+    space. Orders an admin moved by hand are never re-sorted (spec OQ-5)."""
+    if not space.prefix:
+        return src_models.ExternalPurchaseOrder.objects.none()
+    return (
+        src_models.ExternalPurchaseOrder.objects.filter(
+            company_id=company_id, customer_po_number__istartswith=space.prefix
+        )
+        .exclude(space_id=space.id)
+        .exclude(space_reason=src_enums.ExternalOrderSpaceReason.MOVED.value)
+    )
+
+
+def resort_preview(scope: SpaceScope, space_id: int) -> dict:
+    """GET /spaces/<id>/resort-preview/ (admin): how many past orders would move into the space, and their
+    value per order account (AC-31)."""
+    require_admin(scope)
+    space = _get_space(scope.company_id, space_id)
+    rows = (
+        _resort_candidates(scope.company_id, space)
+        .values("order_account_id", "order_account__label", "company_provider__provider__name")
+        .annotate(count=Count("id"), total=Sum("total"))
+        .order_by("company_provider__provider__name", "order_account__label", "order_account_id")
+    )
+    by_account = [
+        {
+            "order_account_id": r["order_account_id"],
+            "order_account_label": r["order_account__label"],
+            "provider_name": r["company_provider__provider__name"],
+            "count": r["count"],
+            "total": float(r["total"] or 0),
+        }
+        for r in rows
+    ]
+    return {
+        "count": sum(r["count"] for r in by_account),
+        "total": sum(r["total"] for r in by_account),
+        "by_account": by_account,
+    }
+
+
+def resort_apply(scope: SpaceScope, space_id: int) -> dict:
+    """POST /spaces/<id>/resort/ (admin): move those orders into the space, reason prefix. Returns {"moved": n}."""
+    require_admin(scope)
+    space = _get_space(scope.company_id, space_id)
+    with transaction.atomic():
+        ids = list(_resort_candidates(scope.company_id, space).select_for_update().values_list("id", flat=True))
+        moved = src_models.ExternalPurchaseOrder.objects.filter(id__in=ids).update(
+            space_id=space.id,
+            space_reason=src_enums.ExternalOrderSpaceReason.PREFIX.value,
+            space_reason_name=src_enums.ExternalOrderSpaceReason.PREFIX.name,
+            space_reason_prefix=space.prefix,
+            space_moved_by_id=None,
+            space_moved_at=None,
+        )
+    return {"moved": moved}
 
 
 # ---------------------------------------------------------------------------

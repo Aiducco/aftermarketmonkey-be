@@ -119,3 +119,39 @@ class SpaceDetailView(views.View):
         except spaces_services.SpaceError as e:
             return _json_response(e.body(), status=e.status_code)
         return http.HttpResponse(status=204)
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class SpaceResortPreviewView(views.View):
+    """GET /spaces/<id>/resort-preview/ - Past orders from distributors that start with the space's prefix and sit
+    in another space: count, value, and the same per order account (company admin, flagged)."""
+
+    def get(self, request: http.HttpRequest, id: int, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
+        company_id, err = _auth_and_company(request)
+        if err:
+            return _json_response({"message": err}, status=401 if "authenticated" in err else 400)
+
+        scope = spaces_services.resolve_scope(request)
+        try:
+            data = spaces_services.resort_preview(scope, id)
+        except spaces_services.SpaceError as e:
+            return _json_response(e.body(), status=e.status_code)
+        return _json_response({"data": data})
+
+
+@method_decorator(csrf_exempt, name="dispatch")
+class SpaceResortView(views.View):
+    """POST /spaces/<id>/resort/ - Move those orders into the space (company admin, flagged). Orders an admin
+    moved by hand stay where they are."""
+
+    def post(self, request: http.HttpRequest, id: int, *args: typing.Any, **kwargs: typing.Any) -> http.HttpResponse:
+        company_id, err = _auth_and_company(request)
+        if err:
+            return _json_response({"message": err}, status=401 if "authenticated" in err else 400)
+
+        scope = spaces_services.resolve_scope(request)
+        try:
+            data = spaces_services.resort_apply(scope, id)
+        except spaces_services.SpaceError as e:
+            return _json_response(e.body(), status=e.status_code)
+        return _json_response({"data": data})
