@@ -38,6 +38,9 @@ from src.models import (
 
 ALLOWED_SETTINGS = {"conf.settings_staging"}
 FAKE_CREDENTIALS = {"username": "staging-fake", "password": "staging-fake", "note": "staging: no live calls"}
+# Order-account credentials carry none of the fields any order adapter requires (account number, security key, rep
+# email, ...), so order_registry.get_adapter() is None for them: seeded ordering is display-only.
+FAKE_ORDER_CREDENTIALS = {"note": "staging: display-only ordering account, no live calls"}
 ORDER_ACCOUNT_LABEL = "Default"
 
 # (email, company, plan, connections). Scout's free plan allows 2 distributor connections.
@@ -62,7 +65,11 @@ def _synthetic_prices(provider_part_id: int) -> dict:
 
 
 class Command(BaseCommand):
-    help = "Seed staging with test companies/users per plan, fake provider connections and synthetic pricing."
+    help = (
+        "Seed staging with test companies/users per plan, fake provider connections and synthetic pricing. "
+        "Seeded ordering accounts are display-only: their fake credentials never yield an order adapter, so nothing "
+        "can quote or submit to a distributor."
+    )
 
     def add_arguments(self, parser):
         parser.add_argument("--password", default=os.environ.get("STAGING_SEED_PASSWORD", ""))
@@ -180,7 +187,7 @@ class Command(BaseCommand):
                 company_provider=connection,
                 label=ORDER_ACCOUNT_LABEL,
                 defaults=dict(
-                    credentials=dict(FAKE_CREDENTIALS),
+                    credentials=dict(FAKE_ORDER_CREDENTIALS),
                     is_default=True,
                     active=True,
                     order_status=ordered.value,

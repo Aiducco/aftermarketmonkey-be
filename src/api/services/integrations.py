@@ -1961,6 +1961,13 @@ def connect_provider(
         # The connection row is locked until the share is saved, so a disconnect of it (which checks that no
         # other space uses it) cannot run in between.
         with transaction.atomic():
+            # Same lock as delete_space (taken first, as _space_write_guard does), so the space cannot be removed
+            # between the check below and the share being saved.
+            spaces_services._lock_company(company_id)
+            if not src_models.Space.objects.filter(id=space.id, company_id=company_id).exists():
+                raise spaces_services.SpaceError(
+                    "Space not found", spaces_services.ERROR_SPACE_NOT_FOUND, status_code=404
+                )
             target = (
                 src_models.CompanyProviders.objects.select_for_update(of=("self",))
                 .filter(
