@@ -1961,6 +1961,13 @@ def connect_provider(
         # The connection row is locked until the share is saved, so a disconnect of it (which checks that no
         # other space uses it) cannot run in between.
         with transaction.atomic():
+            # Same lock as delete_space (taken first, as _space_write_guard does), so the space cannot be removed
+            # between the check below and the share being saved.
+            spaces_services._lock_company(company_id)
+            if not src_models.Space.objects.filter(id=space.id, company_id=company_id).exists():
+                raise spaces_services.SpaceError(
+                    "Space not found", spaces_services.ERROR_SPACE_NOT_FOUND, status_code=404
+                )
             target = (
                 src_models.CompanyProviders.objects.select_for_update(of=("self",))
                 .filter(
@@ -1985,6 +1992,7 @@ def connect_provider(
             src_models.SpaceProvider.objects.update_or_create(
                 space=space, provider=provider, defaults={"company_provider": target}
             )
+            _share_default_order_account(target, space.id, scope.main_space_id)
             return _connection_save_payload(target, provider, catalog_entry, company_id, None, None), None, None
 
     if uses is not None and spaces_services.owner_space_id_of_connection(uses, scope.main_space_id) != space.id:
@@ -2030,6 +2038,18 @@ def connect_provider(
     with write_guard():
         _record_owner_use(space, provider, result[0])
     return result
+
+
+def _share_default_order_account(target: src_models.CompanyProviders, space_id: int, main_space_id: int) -> None:
+    """Sharing a feed also shares the connection's active default order account (spec AC-32: same login, feed and
+    prices). An account with no Used-by rows counts as used by its owner space only, so the first explicit row
+    also adds the owner space. No-op when the connection has no active default account."""
+    account = credentials_helper.get_default_order_account(target)
+    if account is None:
+        return
+    if not account.spaces.exists():
+        account.spaces.add(spaces_services.owner_space_id_of_connection(target, main_space_id))
+    account.spaces.add(space_id)
 
 
 @contextlib.contextmanager
