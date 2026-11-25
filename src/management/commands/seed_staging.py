@@ -29,6 +29,7 @@ from src import enums as src_enums
 from src.api.services import onboarding as onboarding_services
 from src.models import (
     Company,
+    CompanyProviderOrderAccount,
     CompanyProviders,
     ProviderPart,
     ProviderPartCompanyPricing,
@@ -37,6 +38,7 @@ from src.models import (
 
 ALLOWED_SETTINGS = {"conf.settings_staging"}
 FAKE_CREDENTIALS = {"username": "staging-fake", "password": "staging-fake", "note": "staging: no live calls"}
+ORDER_ACCOUNT_LABEL = "Default"
 
 # (email, company, plan, connections). Scout's free plan allows 2 distributor connections.
 ACCOUNTS = [
@@ -151,18 +153,39 @@ class Command(BaseCommand):
     @staticmethod
     def _connect(company, provider_ids):
         connected = src_enums.CompanyProviderConnectionStatus.CONNECTED
+        ordered = src_enums.CompanyProviderOrderConnectionStatus.CONNECTED
         for i, provider_id in enumerate(provider_ids):
-            CompanyProviders.objects.update_or_create(
+            # "Connected" means a truthy credentials["feed"]; the fake values live there (older seeds stored them
+            # flat, which this rewrites). Nothing here calls a distributor.
+            connection, _ = CompanyProviders.objects.update_or_create(
                 company=company,
                 provider_id=provider_id,
                 defaults=dict(
-                    credentials=FAKE_CREDENTIALS,
+                    credentials={"feed": dict(FAKE_CREDENTIALS)},
                     primary=(i == 0),
                     active=True,
                     initial_sync_completed=True,
                     status=connected.value,
                     status_name=connected.name,
                     status_checked_at=timezone.now(),
+                    order_status=ordered.value,
+                    order_status_name=ordered.name,
+                    order_status_checked_at=timezone.now(),
+                ),
+            )
+            CompanyProviderOrderAccount.objects.filter(company_provider=connection, is_default=True).exclude(
+                label=ORDER_ACCOUNT_LABEL
+            ).update(is_default=False)
+            CompanyProviderOrderAccount.objects.update_or_create(
+                company_provider=connection,
+                label=ORDER_ACCOUNT_LABEL,
+                defaults=dict(
+                    credentials=dict(FAKE_CREDENTIALS),
+                    is_default=True,
+                    active=True,
+                    order_status=ordered.value,
+                    order_status_name=ordered.name,
+                    order_status_checked_at=timezone.now(),
                 ),
             )
 
